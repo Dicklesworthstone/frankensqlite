@@ -820,12 +820,11 @@ pub fn parse_candidate_registry_from_negative_results_ledger(
 
     for (idx, line) in markdown.lines().enumerate() {
         if line.starts_with("## ") {
-            if let Some((line_no, heading, body)) = current_heading.take() {
-                if let Some(record) =
+            if let Some((line_no, heading, body)) = current_heading.take()
+                && let Some(record) =
                     build_candidate_record_from_ledger_entry(ledger_path, line_no, &heading, &body)
-                {
-                    entries.push(record);
-                }
+            {
+                entries.push(record);
             }
             current_heading = Some((idx + 1, line.to_owned(), Vec::new()));
         } else if let Some((_line_no, _heading, body)) = current_heading.as_mut() {
@@ -833,12 +832,11 @@ pub fn parse_candidate_registry_from_negative_results_ledger(
         }
     }
 
-    if let Some((line_no, heading, body)) = current_heading {
-        if let Some(record) =
+    if let Some((line_no, heading, body)) = current_heading
+        && let Some(record) =
             build_candidate_record_from_ledger_entry(ledger_path, line_no, &heading, &body)
-        {
-            entries.push(record);
-        }
+    {
+        entries.push(record);
     }
 
     CandidateRegistry::from_records(entries)

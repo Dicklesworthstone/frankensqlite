@@ -1810,8 +1810,16 @@ fn load_strict_json<T: serde::de::DeserializeOwned>(
     })
 }
 
-fn sanitized_command(program: &str, inherited_environment: &[&str]) -> Command {
-    let mut command = Command::new(program);
+enum StrictEvidenceProgram {
+    Cargo,
+    Git,
+}
+
+fn sanitized_command(program: StrictEvidenceProgram, inherited_environment: &[&str]) -> Command {
+    let mut command = match program {
+        StrictEvidenceProgram::Cargo => Command::new("cargo"),
+        StrictEvidenceProgram::Git => Command::new("git"),
+    };
     command.env_clear();
     for name in inherited_environment {
         if let Some(value) = std::env::var_os(name) {
@@ -1823,7 +1831,10 @@ fn sanitized_command(program: &str, inherited_environment: &[&str]) -> Command {
 }
 
 fn sanitized_git_command(workspace_root: &Path) -> Command {
-    let mut command = sanitized_command("git", &["PATH", "SystemRoot", "WINDIR", "PATHEXT"]);
+    let mut command = sanitized_command(
+        StrictEvidenceProgram::Git,
+        &["PATH", "SystemRoot", "WINDIR", "PATHEXT"],
+    );
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .arg("-C")
@@ -2435,7 +2446,9 @@ fn validate_canonical_parity_evidence(
         &canonical_universe,
         &canonical_gate_config,
     );
-    expected_gate.verification_contract = gate.verification_contract.clone();
+    expected_gate
+        .verification_contract
+        .clone_from(&gate.verification_contract);
     let expected_ledger = build_evidence_ledger(&expected_gate, &expected_ranking);
     let canonical_stats = canonical_catalog.stats();
     let canonical_traceability = canonical_catalog.release_traceability();
@@ -2778,7 +2791,7 @@ fn validate_dependency_feature_graph(
 ) -> Result<String, String> {
     let (target, tree) = validate_dependency_feature_graph_document(graph)?;
     let mut command = sanitized_command(
-        "cargo",
+        StrictEvidenceProgram::Cargo,
         &[
             "PATH",
             "HOME",
@@ -3788,10 +3801,10 @@ fn phase5_parse_summary_line(line: &str) -> Option<Phase5RegressionCounts> {
             ("failed", &mut failed),
             ("ignored", &mut ignored),
         ] {
-            if let Some(count) = phase5_parse_count_segment(segment, label) {
-                if slot.replace(count).is_some() {
-                    return None;
-                }
+            if let Some(count) = phase5_parse_count_segment(segment, label)
+                && slot.replace(count).is_some()
+            {
+                return None;
             }
         }
     }
@@ -3810,10 +3823,12 @@ fn phase5_parse_summary_line(line: &str) -> Option<Phase5RegressionCounts> {
 }
 
 fn phase5_cargo_target_section(line: &str) -> Option<&str> {
-    if let Some(section) = line.strip_prefix("     Running ") {
-        if !section.is_empty() && section.contains(" (") && section.ends_with(')') {
-            return Some(section);
-        }
+    if let Some(section) = line.strip_prefix("     Running ")
+        && !section.is_empty()
+        && section.contains(" (")
+        && section.ends_with(')')
+    {
+        return Some(section);
     }
     let section = line.strip_prefix("   Doc-tests ")?;
     (!section.trim().is_empty() && section == section.trim_end()).then_some(section)
@@ -3878,8 +3893,7 @@ fn validate_phase5_exact_test_transcript(
     }
     let summary = transcript
         .lines()
-        .filter(|line| line.starts_with("test result: "))
-        .next_back()
+        .rfind(|line| line.starts_with("test result: "))
         .and_then(phase5_parse_summary_line)
         .ok_or_else(|| "phase5_exact_test_summary_missing".to_owned())?;
     if summary
@@ -4326,10 +4340,11 @@ fn validate_phase5_manifest(
         return Err("phase5_manifest_candidate_or_schema_mismatch".to_owned());
     }
     validate_phase5_performance_regression_gate(&manifest.performance_regression_gate)?;
-    let expected_signature_path =
+    let expected_minisig_path =
         format!("{PHASE5_EVIDENCE_PREFIX}/{candidate_git_sha}/signing/manifest.minisig");
-    if manifest.signature_path != expected_signature_path
-        || !manifest_index.contains_key(&manifest.signature_path)
+    let declared_minisig_path = manifest.signature_path.as_str();
+    if !PartialEq::eq(declared_minisig_path, expected_minisig_path.as_str())
+        || !manifest_index.contains_key(declared_minisig_path)
     {
         return Err("phase5_manifest_signature_path_not_candidate_bound".to_owned());
     }
@@ -4653,13 +4668,13 @@ fn reject_symlink_components(path: &Path) -> Result<(), String> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
-        if let Ok(metadata) = fs::symlink_metadata(&current) {
-            if metadata.file_type().is_symlink() {
-                return Err(format!(
-                    "certificate_output_alias_component path={}",
-                    current.display()
-                ));
-            }
+        if let Ok(metadata) = fs::symlink_metadata(&current)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(format!(
+                "certificate_output_alias_component path={}",
+                current.display()
+            ));
         }
     }
     Ok(())

@@ -11,10 +11,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, fs};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,6 +28,14 @@ pub const TEST_INVENTORY_REPORT_SCHEMA_VERSION: &str = "1.0.0";
 pub const TURSO_INVENTORY_BEAD_ID: &str = "bd-turso-test-adaptation-zu081.1";
 /// Stable scenario identifier used by the executable audit.
 pub const TURSO_INVENTORY_SCENARIO_ID: &str = "TURSO-TEST-INVENTORY-V1";
+/// Explicit Git revision metadata for RCH workers that do not receive `.git`.
+pub const TURSO_INVENTORY_GIT_REVISION_ENV: &str = "FSQLITE_TURSO_INVENTORY_GIT_REVISION";
+/// Newline- or semicolon-separated tracked `HEAD` paths for RCH workers without `.git`.
+pub const TURSO_INVENTORY_TRACKED_PATHS_ENV: &str = "FSQLITE_TURSO_INVENTORY_TRACKED_PATHS";
+/// Newline- or semicolon-separated dirty paths for RCH workers without `.git`.
+pub const TURSO_INVENTORY_DIRTY_PATHS_ENV: &str = "FSQLITE_TURSO_INVENTORY_DIRTY_PATHS";
+/// Newline- or semicolon-separated Beads issue IDs for RCH workers without `.beads/`.
+pub const TURSO_INVENTORY_BEAD_IDS_ENV: &str = "FSQLITE_TURSO_INVENTORY_BEAD_IDS";
 
 /// Parsed machine-readable intake and overlap contract.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -224,6 +232,9 @@ impl InventoryDiagnostic {
 pub struct GitSnapshot {
     workspace_root: PathBuf,
     revision: String,
+    source_mode: &'static str,
+    can_read_git_objects: bool,
+    env_bead_ids: Option<BTreeSet<String>>,
     tracked_paths: Vec<String>,
     tracked_path_set: BTreeSet<String>,
     dirty_paths: BTreeSet<String>,
@@ -232,6 +243,16 @@ pub struct GitSnapshot {
 impl GitSnapshot {
     /// Capture the current `HEAD` object set and worktree dirt metadata.
     pub fn capture(workspace_root: &Path) -> Result<Self, String> {
+        match Self::capture_from_git(workspace_root) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(git_error) => match Self::capture_from_env(workspace_root)? {
+                Some(snapshot) => Ok(snapshot),
+                None => Err(git_error),
+            },
+        }
+    }
+
+    fn capture_from_git(workspace_root: &Path) -> Result<Self, String> {
         let revision = git_text(workspace_root, &["rev-parse", "HEAD"])?;
         let tracked = git_bytes(
             workspace_root,
@@ -252,16 +273,82 @@ impl GitSnapshot {
         Ok(Self {
             workspace_root: workspace_root.to_path_buf(),
             revision: revision.trim().to_owned(),
+            source_mode: "tracked_git_head",
+            can_read_git_objects: true,
+            env_bead_ids: None,
             tracked_paths,
             tracked_path_set,
             dirty_paths,
         })
     }
 
+    fn capture_from_env(workspace_root: &Path) -> Result<Option<Self>, String> {
+        let revision = env_snapshot_value(TURSO_INVENTORY_GIT_REVISION_ENV)?;
+        let tracked_paths = env_snapshot_value(TURSO_INVENTORY_TRACKED_PATHS_ENV)?;
+        let dirty_paths = env_snapshot_value(TURSO_INVENTORY_DIRTY_PATHS_ENV)?;
+        let bead_ids = env_snapshot_value(TURSO_INVENTORY_BEAD_IDS_ENV)?;
+
+        let present = [
+            revision.is_some(),
+            tracked_paths.is_some(),
+            dirty_paths.is_some(),
+            bead_ids.is_some(),
+        ];
+        if present.iter().all(|value| !*value) {
+            return Ok(None);
+        }
+        if !present.iter().all(|value| *value) {
+            return Err(format!(
+                "git_env_snapshot_incomplete required={TURSO_INVENTORY_GIT_REVISION_ENV},{TURSO_INVENTORY_TRACKED_PATHS_ENV},{TURSO_INVENTORY_DIRTY_PATHS_ENV},{TURSO_INVENTORY_BEAD_IDS_ENV}"
+            ));
+        }
+
+        let revision = revision.expect("presence checked");
+        if !is_full_git_hash(&revision) {
+            return Err(format!(
+                "git_env_revision_invalid var={TURSO_INVENTORY_GIT_REVISION_ENV}"
+            ));
+        }
+        let tracked_paths = parse_env_path_list(
+            TURSO_INVENTORY_TRACKED_PATHS_ENV,
+            &tracked_paths.expect("presence checked"),
+        )?;
+        let dirty_paths = parse_env_path_list(
+            TURSO_INVENTORY_DIRTY_PATHS_ENV,
+            &dirty_paths.expect("presence checked"),
+        )?
+        .into_iter()
+        .collect();
+        let env_bead_ids = parse_env_bead_id_list(
+            TURSO_INVENTORY_BEAD_IDS_ENV,
+            &bead_ids.expect("presence checked"),
+        )?
+        .into_iter()
+        .collect();
+        let tracked_path_set = tracked_paths.iter().cloned().collect();
+
+        Ok(Some(Self {
+            workspace_root: workspace_root.to_path_buf(),
+            revision,
+            source_mode: "env_tracked_paths_workspace_content",
+            can_read_git_objects: false,
+            env_bead_ids: Some(env_bead_ids),
+            tracked_paths,
+            tracked_path_set,
+            dirty_paths,
+        }))
+    }
+
     /// Commit used for the snapshot.
     #[must_use]
     pub fn revision(&self) -> &str {
         &self.revision
+    }
+
+    /// How the snapshot metadata was captured.
+    #[must_use]
+    pub const fn source_mode(&self) -> &'static str {
+        self.source_mode
     }
 
     /// Sorted tracked paths in the snapshot.
@@ -276,6 +363,10 @@ impl GitSnapshot {
         &self.dirty_paths
     }
 
+    fn env_bead_ids(&self) -> Option<&BTreeSet<String>> {
+        self.env_bead_ids.as_ref()
+    }
+
     fn contains_path_or_tree(&self, path: &str) -> bool {
         self.tracked_path_set.contains(path)
             || self
@@ -288,7 +379,7 @@ impl GitSnapshot {
         if !self.tracked_path_set.contains(path) {
             return Err(format!("snapshot_path_missing path={path}"));
         }
-        if !self.dirty_paths.contains(path) {
+        if !self.dirty_paths.contains(path) || !self.can_read_git_objects {
             return fs::read(self.workspace_root.join(path))
                 .map_err(|error| format!("snapshot_path_read_failed path={path} error={error}"));
         }
@@ -330,6 +421,65 @@ fn git_bytes(workspace_root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 fn git_text(workspace_root: &Path, args: &[&str]) -> Result<String, String> {
     String::from_utf8(git_bytes(workspace_root, args)?)
         .map_err(|error| format!("git_output_non_utf8 args={args:?} error={error}"))
+}
+
+fn env_snapshot_value(name: &str) -> Result<Option<String>, String> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(format!("git_env_non_utf8 var={name}")),
+    }
+}
+
+fn parse_env_path_list(name: &str, raw: &str) -> Result<Vec<String>, String> {
+    let mut paths = Vec::new();
+    let separator = env_list_separator(raw);
+    for (index, path) in raw
+        .split(separator)
+        .filter(|path| !path.is_empty())
+        .enumerate()
+    {
+        if path.contains('\r') {
+            return Err(format!("git_env_path_contains_cr var={name} index={index}"));
+        }
+        if Path::new(path).is_absolute()
+            || path == "."
+            || path == ".."
+            || path.starts_with("../")
+            || path.contains("/../")
+        {
+            return Err(format!(
+                "git_env_path_not_repository_relative var={name} index={index} path={path}"
+            ));
+        }
+        paths.push(path.to_owned());
+    }
+    Ok(paths)
+}
+
+fn parse_env_bead_id_list(name: &str, raw: &str) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    for (index, id) in raw
+        .split(env_list_separator(raw))
+        .filter(|id| !id.is_empty())
+        .enumerate()
+    {
+        if id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+        {
+            ids.push(id.to_owned());
+        } else {
+            return Err(format!(
+                "git_env_bead_id_invalid var={name} index={index} id={id}"
+            ));
+        }
+    }
+    Ok(ids)
+}
+
+fn env_list_separator(raw: &str) -> char {
+    if raw.contains('\n') { '\n' } else { ';' }
 }
 
 fn parse_dirty_paths(status: &[u8]) -> Result<BTreeSet<String>, String> {
@@ -486,6 +636,10 @@ fn load_bead_ids(
     snapshot: &GitSnapshot,
     diagnostics: &mut Vec<InventoryDiagnostic>,
 ) -> BTreeSet<String> {
+    if let Some(bead_ids) = snapshot.env_bead_ids() {
+        return bead_ids.clone();
+    }
+
     let Ok(raw) = snapshot.read_text(".beads/issues.jsonl") else {
         diagnostics.push(InventoryDiagnostic::new(
             "beads_inventory_missing",
@@ -912,13 +1066,17 @@ fn require_equal(
 }
 
 fn require_sha1(diagnostics: &mut Vec<InventoryDiagnostic>, code: &str, path: &str, value: &str) {
-    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_full_git_hash(value) {
         diagnostics.push(InventoryDiagnostic::new(
             code,
             path,
             "expected a full 40-character hexadecimal Git object ID",
         ));
     }
+}
+
+fn is_full_git_hash(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn require_sha256(diagnostics: &mut Vec<InventoryDiagnostic>, code: &str, path: &str, value: &str) {
@@ -1320,7 +1478,7 @@ pub fn build_test_inventory_report(
             tool_schema_version: TEST_INVENTORY_REPORT_SCHEMA_VERSION.to_owned(),
             tool_crate_version: env!("CARGO_PKG_VERSION").to_owned(),
             source_revision: snapshot.revision().to_owned(),
-            source_mode: "tracked_git_head".to_owned(),
+            source_mode: snapshot.source_mode().to_owned(),
             source_dirty: !snapshot.dirty_paths().is_empty(),
             dirty_paths: snapshot.dirty_paths().iter().cloned().collect(),
             upstream_repository: contract.source.repository.clone(),
@@ -1913,7 +2071,9 @@ fn csv_cell(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{csv_cell, parse_dirty_paths};
+    use super::{
+        csv_cell, is_full_git_hash, parse_dirty_paths, parse_env_bead_id_list, parse_env_path_list,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -1938,6 +2098,77 @@ mod tests {
         let error = parse_dirty_paths(b"R  new/name.rs\0")
             .expect_err("rename without its source path must fail closed");
         assert!(error.starts_with("git_status_rename_source_missing"));
+    }
+
+    #[test]
+    fn env_path_list_accepts_newline_separated_repository_paths() {
+        let paths = parse_env_path_list(
+            "TEST_PATHS",
+            "crates/fsqlite-harness/src/test_inventory.rs\ndocs/contracts/supported_surface_matrix.toml\n",
+        )
+        .expect("repository-relative env paths are valid");
+        assert_eq!(
+            paths,
+            vec![
+                "crates/fsqlite-harness/src/test_inventory.rs".to_owned(),
+                "docs/contracts/supported_surface_matrix.toml".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_path_list_accepts_semicolon_separated_repository_paths() {
+        let paths = parse_env_path_list(
+            "TEST_PATHS",
+            "crates/fsqlite-harness/src/test_inventory.rs;docs/contracts/supported_surface_matrix.toml",
+        )
+        .expect("semicolon-separated repository-relative env paths are valid");
+        assert_eq!(
+            paths,
+            vec![
+                "crates/fsqlite-harness/src/test_inventory.rs".to_owned(),
+                "docs/contracts/supported_surface_matrix.toml".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_path_list_rejects_absolute_parent_and_cr_paths() {
+        for raw in ["/tmp/file.rs", "../file.rs", "a/../file.rs", "ok\r.rs"] {
+            let error = parse_env_path_list("TEST_PATHS", raw)
+                .expect_err("invalid env path must fail closed");
+            assert!(error.starts_with("git_env_path_"));
+        }
+    }
+
+    #[test]
+    fn env_bead_id_list_accepts_repository_issue_ids() {
+        let ids =
+            parse_env_bead_id_list("TEST_BEADS", "bd-turso-test-adaptation-zu081.10;bd-2lt76.1")
+                .expect("semicolon-separated bead IDs are valid");
+        assert_eq!(
+            ids,
+            vec![
+                "bd-turso-test-adaptation-zu081.10".to_owned(),
+                "bd-2lt76.1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_bead_id_list_rejects_path_like_values() {
+        let error = parse_env_bead_id_list("TEST_BEADS", "bd-ok;/tmp/file")
+            .expect_err("path-like Beads ID must fail closed");
+        assert!(error.starts_with("git_env_bead_id_invalid"));
+    }
+
+    #[test]
+    fn full_git_hash_requires_exact_forty_hex_characters() {
+        assert!(is_full_git_hash("0123456789abcdef0123456789ABCDEF01234567"));
+        assert!(!is_full_git_hash("0123456789abcdef0123456789abcdef0123456"));
+        assert!(!is_full_git_hash(
+            "0123456789abcdef0123456789abcdef0123456z"
+        ));
     }
 
     #[test]

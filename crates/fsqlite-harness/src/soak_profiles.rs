@@ -918,23 +918,23 @@ fn check_memory_bounded(
     previous: Option<&CheckpointSnapshot>,
     violations: &mut Vec<InvariantViolation>,
 ) {
-    if let Some(prev) = previous {
-        if prev.heap_bytes > 0 {
-            #[allow(clippy::cast_precision_loss)]
-            let growth = current.heap_bytes as f64 / prev.heap_bytes as f64;
-            if growth > HEAP_GROWTH_FACTOR_LIMIT {
-                violations.push(InvariantViolation {
-                    invariant_id: inv.id.clone(),
-                    at_transaction: current.transaction_count,
-                    at_elapsed_secs: current.elapsed_secs,
-                    description: format!(
-                        "heap grew {growth:.2}x between checkpoints ({}->{})",
-                        prev.heap_bytes, current.heap_bytes
-                    ),
-                    observed: Some(format!("{growth:.2}x")),
-                    expected_bound: Some(format!("<= {HEAP_GROWTH_FACTOR_LIMIT}x")),
-                });
-            }
+    if let Some(prev) = previous
+        && prev.heap_bytes > 0
+    {
+        #[allow(clippy::cast_precision_loss)]
+        let growth = current.heap_bytes as f64 / prev.heap_bytes as f64;
+        if growth > HEAP_GROWTH_FACTOR_LIMIT {
+            violations.push(InvariantViolation {
+                invariant_id: inv.id.clone(),
+                at_transaction: current.transaction_count,
+                at_elapsed_secs: current.elapsed_secs,
+                description: format!(
+                    "heap grew {growth:.2}x between checkpoints ({}->{})",
+                    prev.heap_bytes, current.heap_bytes
+                ),
+                observed: Some(format!("{growth:.2}x")),
+                expected_bound: Some(format!("<= {HEAP_GROWTH_FACTOR_LIMIT}x")),
+            });
         }
     }
 }
@@ -945,23 +945,23 @@ fn check_latency_stability(
     previous: Option<&CheckpointSnapshot>,
     violations: &mut Vec<InvariantViolation>,
 ) {
-    if let Some(prev) = previous {
-        if prev.p99_latency_us > 0 {
-            #[allow(clippy::cast_precision_loss)]
-            let degradation = current.p99_latency_us as f64 / prev.p99_latency_us as f64;
-            if degradation > LATENCY_DEGRADATION_LIMIT {
-                violations.push(InvariantViolation {
-                    invariant_id: inv.id.clone(),
-                    at_transaction: current.transaction_count,
-                    at_elapsed_secs: current.elapsed_secs,
-                    description: format!(
-                        "P99 latency degraded {degradation:.1}x ({}us->{}us)",
-                        prev.p99_latency_us, current.p99_latency_us
-                    ),
-                    observed: Some(format!("{degradation:.1}x")),
-                    expected_bound: Some(format!("<= {LATENCY_DEGRADATION_LIMIT}x")),
-                });
-            }
+    if let Some(prev) = previous
+        && prev.p99_latency_us > 0
+    {
+        #[allow(clippy::cast_precision_loss)]
+        let degradation = current.p99_latency_us as f64 / prev.p99_latency_us as f64;
+        if degradation > LATENCY_DEGRADATION_LIMIT {
+            violations.push(InvariantViolation {
+                invariant_id: inv.id.clone(),
+                at_transaction: current.transaction_count,
+                at_elapsed_secs: current.elapsed_secs,
+                description: format!(
+                    "P99 latency degraded {degradation:.1}x ({}us->{}us)",
+                    prev.p99_latency_us, current.p99_latency_us
+                ),
+                observed: Some(format!("{degradation:.1}x")),
+                expected_bound: Some(format!("<= {LATENCY_DEGRADATION_LIMIT}x")),
+            });
         }
     }
 }

@@ -147,7 +147,7 @@ impl SerializabilityReplayArtifact {
         }
         self.expected_report.validate_against(&self.history)?;
         let replayed = check_history(&self.history)?;
-        if replayed != self.expected_report {
+        if !PartialEq::eq(&replayed, &self.expected_report) {
             return Err("serializability replay report mismatch".to_owned());
         }
         match (&self.failure_bundle, self.expected_report.verdict) {
@@ -199,7 +199,7 @@ pub fn replay_serializability_oracle(
 ) -> Result<SerializabilityReport, String> {
     artifact.validate()?;
     let report = check_history(&artifact.history)?;
-    if report == artifact.expected_report {
+    if PartialEq::eq(&report, &artifact.expected_report) {
         Ok(report)
     } else {
         Err("serializability replay produced a different report".to_owned())
@@ -588,10 +588,12 @@ fn validate_typed_promotion_evidence(
         artifact.expected_outcome,
         artifact.expected_outcome,
     );
-    if observed != expected {
+    if !PartialEq::eq(&observed, &expected) {
         return Err("typed corpus promotion requires exact replay verification".to_owned());
     }
-    if artifact.expected_outcome != Outcome::Divergence || artifact.failure_bundle.is_none() {
+    if !PartialEq::eq(&artifact.expected_outcome, &Outcome::Divergence)
+        || artifact.failure_bundle.is_none()
+    {
         return Err("typed corpus promotion requires a bundled divergence".to_owned());
     }
     let reviewed_by = reviewed_by.trim();
@@ -1635,10 +1637,10 @@ impl BisectReplayManifest {
             }
         }
         // Validate failure bundle ref if present.
-        if let Some(bundle_ref) = &self.failure_bundle_ref {
-            if bundle_ref.bundle_id.is_empty() {
-                errors.push("failure_bundle_ref.bundle_id is empty".to_owned());
-            }
+        if let Some(bundle_ref) = &self.failure_bundle_ref
+            && bundle_ref.bundle_id.is_empty()
+        {
+            errors.push("failure_bundle_ref.bundle_id is empty".to_owned());
         }
         // Validate artifact dependencies.
         for (i, dep) in self.artifact_dependencies.iter().enumerate() {

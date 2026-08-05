@@ -552,23 +552,24 @@ fn run_drift_injection_phase(rng: &mut Lcg, config: &AdversarialConfig) -> Vec<C
                 pre_decision: None,
                 post_decision: None,
             });
-        } else if let Some(alarm) = cat_alarm {
-            if alarm.level == AlarmLevel::Info && injection_rate > 0.4 {
-                // Very high injection rate but only Info alarm.
-                results.push(Counterexample {
-                    id: format!("CX-DRIFT-{trial:04}"),
-                    seed: trial_seed,
-                    attack_category: AttackCategory::DriftInjection,
-                    mutations: vec![],
-                    description: format!(
-                        "Only INFO alarm for {} with injection_rate={injection_rate:.3}",
-                        cat.display_name()
-                    ),
-                    severity: CounterexampleSeverity::Low,
-                    pre_decision: None,
-                    post_decision: None,
-                });
-            }
+        } else if let Some(alarm) = cat_alarm
+            && alarm.level == AlarmLevel::Info
+            && injection_rate > 0.4
+        {
+            // Very high injection rate but only Info alarm.
+            results.push(Counterexample {
+                id: format!("CX-DRIFT-{trial:04}"),
+                seed: trial_seed,
+                attack_category: AttackCategory::DriftInjection,
+                mutations: vec![],
+                description: format!(
+                    "Only INFO alarm for {} with injection_rate={injection_rate:.3}",
+                    cat.display_name()
+                ),
+                severity: CounterexampleSeverity::Low,
+                pre_decision: None,
+                post_decision: None,
+            });
         }
     }
 

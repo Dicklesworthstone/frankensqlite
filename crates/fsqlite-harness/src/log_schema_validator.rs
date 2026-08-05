@@ -144,13 +144,13 @@ pub fn classify_field(field_name: &str) -> FieldClassification {
         return c.clone();
     }
     // Wildcard match for context.*
-    if field_name.starts_with("context.") {
-        if let Some(c) = classifications.iter().find(|c| c.field_name == "context.*") {
-            return FieldClassification {
-                field_name: field_name.to_owned(),
-                ..c.clone()
-            };
-        }
+    if field_name.starts_with("context.")
+        && let Some(c) = classifications.iter().find(|c| c.field_name == "context.*")
+    {
+        return FieldClassification {
+            field_name: field_name.to_owned(),
+            ..c.clone()
+        };
     }
     // Default: sensitive with deterministic hash
     FieldClassification {

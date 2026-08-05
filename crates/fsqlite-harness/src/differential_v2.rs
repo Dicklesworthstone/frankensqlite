@@ -653,10 +653,10 @@ impl DifferentialMetadata {
         ) {
             errors.push("normalized_outcome must be pass|divergence|error".to_owned());
         }
-        if let Some(first_failure) = &self.first_failure {
-            if first_failure.sql.trim().is_empty() {
-                errors.push("first_failure.sql must be non-empty".to_owned());
-            }
+        if let Some(first_failure) = &self.first_failure
+            && first_failure.sql.trim().is_empty()
+        {
+            errors.push("first_failure.sql must be non-empty".to_owned());
         }
 
         errors
@@ -1508,10 +1508,10 @@ fn extract_schema_table_names(schema: &[String]) -> Vec<String> {
     let mut tables = Vec::new();
 
     for stmt in schema {
-        if let Some(table) = parse_created_table_name(stmt) {
-            if seen.insert(table.clone()) {
-                tables.push(table);
-            }
+        if let Some(table) = parse_created_table_name(stmt)
+            && seen.insert(table.clone())
+        {
+            tables.push(table);
         }
     }
 

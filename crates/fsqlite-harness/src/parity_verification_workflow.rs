@@ -520,17 +520,17 @@ fn validate_phase_order(report: &WorkflowReport, violations: &mut Vec<WorkflowVi
     }
 
     for (index, step) in report.steps.iter().enumerate() {
-        if let Some(expected_phase) = expected.get(index) {
-            if step.phase != expected_phase.as_str() {
-                violations.push(violation(
-                    "workflow_phase_order_mismatch",
-                    format!(
-                        "phase index {index} expected {} but observed {}",
-                        expected_phase.as_str(),
-                        step.phase
-                    ),
-                ));
-            }
+        if let Some(expected_phase) = expected.get(index)
+            && step.phase != expected_phase.as_str()
+        {
+            violations.push(violation(
+                "workflow_phase_order_mismatch",
+                format!(
+                    "phase index {index} expected {} but observed {}",
+                    expected_phase.as_str(),
+                    step.phase
+                ),
+            ));
         }
     }
 }

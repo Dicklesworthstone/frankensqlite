@@ -224,20 +224,20 @@ pub fn render_text_report(result: &ForensicsQueryResult) -> String {
 }
 
 fn run_matches_filters(run: &RunRecord, filters: &QueryFilters) -> bool {
-    if let Some(issue_id) = &filters.issue_id {
-        if !run.bead_ids.iter().any(|bead| bead == issue_id) {
-            return false;
-        }
+    if let Some(issue_id) = &filters.issue_id
+        && !run.bead_ids.iter().any(|bead| bead == issue_id)
+    {
+        return false;
     }
-    if let Some(commit) = &filters.commit {
-        if run.git_sha != *commit {
-            return false;
-        }
+    if let Some(commit) = &filters.commit
+        && run.git_sha != *commit
+    {
+        return false;
     }
-    if let Some(seed) = filters.seed {
-        if run.seed != seed {
-            return false;
-        }
+    if let Some(seed) = filters.seed
+        && run.seed != seed
+    {
+        return false;
     }
     if let Some(component) = &filters.component {
         let has_component = run.scenarios.iter().any(|scenario| {
@@ -250,10 +250,10 @@ fn run_matches_filters(run: &RunRecord, filters: &QueryFilters) -> bool {
             return false;
         }
     }
-    if let Some(severity_filter) = filters.severity {
-        if classify_severity(run) != severity_filter {
-            return false;
-        }
+    if let Some(severity_filter) = filters.severity
+        && classify_severity(run) != severity_filter
+    {
+        return false;
     }
     true
 }

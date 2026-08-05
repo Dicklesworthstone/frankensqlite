@@ -188,10 +188,10 @@ pub fn validate_benchmark_corpus(corpus: &BenchmarkCorpusManifest) -> Vec<String
         if !ids.insert(entry.id.as_str()) {
             errors.push(format!("duplicate entry id: {}", entry.id));
         }
-        if let Some(previous) = previous_id {
-            if previous > entry.id.as_str() {
-                errors.push("entries must be sorted by id".to_owned());
-            }
+        if let Some(previous) = previous_id
+            && previous > entry.id.as_str()
+        {
+            errors.push("entries must be sorted by id".to_owned());
         }
         previous_id = Some(&entry.id);
         tiers.insert(entry.tier);

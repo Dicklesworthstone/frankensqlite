@@ -383,7 +383,7 @@ fn median(values: &mut [f64]) -> Result<f64, String> {
     }
     values.sort_by(f64::total_cmp);
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         Ok(f64::midpoint(values[mid - 1], values[mid]))
     } else {
         Ok(values[mid])

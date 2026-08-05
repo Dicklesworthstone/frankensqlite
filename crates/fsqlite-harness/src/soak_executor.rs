@@ -531,7 +531,7 @@ impl SoakExecutor {
         if interval == 0 {
             return false;
         }
-        self.state.transaction_index > 0 && self.state.transaction_index % interval == 0
+        self.state.transaction_index > 0 && self.state.transaction_index.is_multiple_of(interval)
     }
 
     /// Probe all configured invariants and record the result.

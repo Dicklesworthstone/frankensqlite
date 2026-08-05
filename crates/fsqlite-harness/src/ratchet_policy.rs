@@ -528,10 +528,10 @@ pub fn evaluate_ratchet(
     }
 
     // Expire waiver if needed.
-    if let Some(waiver) = &state.active_waiver {
-        if waiver.is_expired(evaluation_id) {
-            state.active_waiver = None;
-        }
+    if let Some(waiver) = &state.active_waiver
+        && waiver.is_expired(evaluation_id)
+    {
+        state.active_waiver = None;
     }
 
     RatchetDecision {

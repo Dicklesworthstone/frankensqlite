@@ -1670,13 +1670,14 @@ impl ArtifactManifest {
                 ));
             }
         }
-        if let Some(contract) = &self.verification_contract {
-            if !contract.final_gate_passed && self.gate_passed {
-                errors.push(format!(
-                    "verification_contract.final_gate_passed={} cannot allow gate_passed={}",
-                    contract.final_gate_passed, self.gate_passed
-                ));
-            }
+        if let Some(contract) = &self.verification_contract
+            && !contract.final_gate_passed
+            && self.gate_passed
+        {
+            errors.push(format!(
+                "verification_contract.final_gate_passed={} cannot allow gate_passed={}",
+                contract.final_gate_passed, self.gate_passed
+            ));
         }
         if let Some(gate) = &self.fallback_transparency_gate {
             for error in gate.validate() {
