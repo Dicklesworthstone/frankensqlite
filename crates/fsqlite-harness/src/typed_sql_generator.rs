@@ -2399,6 +2399,83 @@ impl GeneratedCase {
         }
         script
     }
+
+    /// Rebuild a generated case after a test-only structured reduction.
+    ///
+    /// The original generation trace is retained as immutable seed provenance;
+    /// reduction decisions are recorded by the canonical mismatch minimizer.
+    /// Derived SQL, schema, resource counters, and content hashes are recomputed
+    /// from the reduced statement trees so the result can re-enter the public
+    /// typed differential adapter.
+    pub fn rebuild_with_statements(
+        &self,
+        mut statements: Vec<GeneratedStatement>,
+    ) -> Result<Self, GenerationError> {
+        if statements.is_empty() {
+            return Err(GenerationError::invalid_input(
+                "reduction.statements",
+                "a reduced case must retain at least one statement",
+            ));
+        }
+
+        let mut schema = SchemaState::default();
+        let mut transaction_snapshot = None;
+        let mut counters = ResourceCounters::default();
+        let mut subject_seen = false;
+        for statement in &mut statements {
+            match statement.role {
+                StatementRole::Setup if subject_seen => {
+                    return Err(GenerationError::invalid_input(
+                        "reduction.statement_order",
+                        "setup statement appeared after the first subject statement",
+                    ));
+                }
+                StatementRole::Setup => {}
+                StatementRole::Subject => subject_seen = true,
+            }
+            statement.sql = statement.ast.to_sql();
+            apply_statement_to_schema(&mut schema, &mut transaction_snapshot, &statement.ast)?;
+            let (_, value_bytes, _) = statement_resources(&statement.ast);
+            counters.proposals = counters.proposals.saturating_add(1);
+            counters.accepted = counters.accepted.saturating_add(1);
+            counters.rows = schema.total_rows();
+            counters.value_bytes = counters.value_bytes.saturating_add(value_bytes);
+            counters.execution_steps = counters
+                .execution_steps
+                .saturating_add(statement_cost(&statement.ast));
+            counters.maximum_ast_depth = counters.maximum_ast_depth.max(statement.ast.depth());
+        }
+        if !subject_seen {
+            return Err(GenerationError::invalid_input(
+                "reduction.workload",
+                "a reduced case must retain at least one subject statement",
+            ));
+        }
+
+        let sql_script = statements
+            .iter()
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trace_json = canonical_json(&self.trace)?;
+        let schema_json = canonical_json(&schema)?;
+        Ok(Self {
+            schema_version: self.schema_version,
+            generator_version: self.generator_version.clone(),
+            profile_name: self.profile_name.clone(),
+            profile_version: self.profile_version.clone(),
+            canonical_profile_evidence: self.canonical_profile_evidence.clone(),
+            root_seed: self.root_seed,
+            statements,
+            final_schema: schema,
+            trace: self.trace.clone(),
+            counters,
+            sql_hash: sha256_hex(sql_script.as_bytes()),
+            trace_hash: sha256_hex(trace_json.as_bytes()),
+            schema_hash: sha256_hex(schema_json.as_bytes()),
+            terminal_classification: self.terminal_classification,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3166,176 +3243,183 @@ impl GenerationSession {
     }
 
     fn apply_accepted_statement(&mut self, statement: &Statement) -> Result<(), GenerationError> {
-        match statement {
-            Statement::CreateTable { table, columns } => {
-                if self.schema.table(table).is_some() {
-                    return Err(GenerationError::impossible_schema(
-                        "create_table.name",
-                        "accepted table name already exists",
-                    ));
-                }
-                if columns.is_empty() {
-                    return Err(GenerationError::impossible_schema(
-                        "create_table.columns",
-                        "accepted table requires at least one column",
-                    ));
-                }
-                self.schema.tables.push(TableState {
-                    name: table.clone(),
-                    columns: columns.clone(),
-                    estimated_rows: 0,
-                });
-            }
-            Statement::CreateIndex {
-                index,
-                table,
-                columns,
-                unique,
-            } => {
-                if self.schema.indexes.iter().any(|entry| entry.name == *index) {
-                    return Err(GenerationError::impossible_schema(
-                        "create_index.name",
-                        "accepted index name already exists",
-                    ));
-                }
-                let table_state = self.schema.table(table).ok_or_else(|| {
-                    GenerationError::impossible_schema(
-                        "create_index.table",
-                        "accepted index references an unknown table",
-                    )
-                })?;
-                if columns.is_empty()
-                    || columns.iter().any(|name| {
-                        !table_state
-                            .columns
-                            .iter()
-                            .any(|column| column.name == *name)
-                    })
-                {
-                    return Err(GenerationError::impossible_schema(
-                        "create_index.columns",
-                        "accepted index references an unknown or empty column list",
-                    ));
-                }
-                self.schema.indexes.push(IndexState {
-                    name: index.clone(),
-                    table: table.clone(),
-                    columns: columns.clone(),
-                    unique: *unique,
-                });
-            }
-            Statement::Insert {
-                table,
-                columns,
-                rows,
-            } => {
-                let table_state = self
-                    .schema
-                    .tables
-                    .iter_mut()
-                    .find(|entry| entry.name == *table)
-                    .ok_or_else(|| {
-                        GenerationError::impossible_schema(
-                            "insert.table",
-                            "accepted INSERT references an unknown table",
-                        )
-                    })?;
-                if columns.is_empty()
-                    || rows.is_empty()
-                    || rows.iter().any(|row| row.len() != columns.len())
-                {
-                    return Err(GenerationError::impossible_schema(
-                        "insert.rows",
-                        "accepted INSERT has an empty or mismatched row shape",
-                    ));
-                }
-                let mut unique_columns = BTreeSet::new();
-                if columns.iter().any(|name| {
-                    !unique_columns.insert(name)
-                        || !table_state
-                            .columns
-                            .iter()
-                            .any(|column| column.name == *name)
-                }) {
-                    return Err(GenerationError::impossible_schema(
-                        "insert.columns",
-                        "accepted INSERT references an unknown or duplicate column",
-                    ));
-                }
-                table_state.estimated_rows = table_state
-                    .estimated_rows
-                    .saturating_add(u32::try_from(rows.len()).unwrap_or(u32::MAX));
-            }
-            Statement::Delete { table, .. } => {
-                if self.schema.table(table).is_none() {
-                    return Err(GenerationError::impossible_schema(
-                        "delete.table",
-                        "accepted DELETE references an unknown table",
-                    ));
-                }
-                // Predicate cardinality is unknown until the execution adapter
-                // reports it. Retaining the conservative row estimate avoids
-                // manufacturing primary-key reuse after a no-op DELETE.
-            }
-            Statement::Update {
-                table, assignments, ..
-            } => {
-                let table_state = self.schema.table(table).ok_or_else(|| {
-                    GenerationError::impossible_schema(
-                        "update.table",
-                        "accepted UPDATE references an unknown table",
-                    )
-                })?;
-                if assignments.is_empty()
-                    || assignments.iter().any(|(name, _)| {
-                        !table_state
-                            .columns
-                            .iter()
-                            .any(|column| column.name == *name)
-                    })
-                {
-                    return Err(GenerationError::impossible_schema(
-                        "update.assignments",
-                        "accepted UPDATE references an unknown or empty assignment list",
-                    ));
-                }
-            }
-            Statement::Select { .. } => {}
-            Statement::Transaction { statement } => match statement {
-                TransactionStatement::Begin => {
-                    if self.schema.transaction_open {
-                        return Err(GenerationError::impossible_schema(
-                            "transaction.begin",
-                            "a transaction is already open",
-                        ));
-                    }
-                    self.transaction_snapshot = Some(self.schema.clone());
-                    self.schema.transaction_open = true;
-                }
-                TransactionStatement::Commit => {
-                    if !self.schema.transaction_open {
-                        return Err(GenerationError::impossible_schema(
-                            "transaction.commit",
-                            "no transaction is open",
-                        ));
-                    }
-                    self.transaction_snapshot = None;
-                    self.schema.transaction_open = false;
-                }
-                TransactionStatement::Rollback => {
-                    let mut snapshot = self.transaction_snapshot.take().ok_or_else(|| {
-                        GenerationError::impossible_schema(
-                            "transaction.rollback",
-                            "no transaction is open",
-                        )
-                    })?;
-                    snapshot.transaction_open = false;
-                    self.schema = snapshot;
-                }
-            },
-        }
-        Ok(())
+        apply_statement_to_schema(&mut self.schema, &mut self.transaction_snapshot, statement)
     }
+}
+
+fn apply_statement_to_schema(
+    schema: &mut SchemaState,
+    transaction_snapshot: &mut Option<SchemaState>,
+    statement: &Statement,
+) -> Result<(), GenerationError> {
+    match statement {
+        Statement::CreateTable { table, columns } => {
+            if schema.table(table).is_some() {
+                return Err(GenerationError::impossible_schema(
+                    "create_table.name",
+                    "accepted table name already exists",
+                ));
+            }
+            if columns.is_empty() {
+                return Err(GenerationError::impossible_schema(
+                    "create_table.columns",
+                    "accepted table requires at least one column",
+                ));
+            }
+            schema.tables.push(TableState {
+                name: table.clone(),
+                columns: columns.clone(),
+                estimated_rows: 0,
+            });
+        }
+        Statement::CreateIndex {
+            index,
+            table,
+            columns,
+            unique,
+        } => {
+            if schema.indexes.iter().any(|entry| entry.name == *index) {
+                return Err(GenerationError::impossible_schema(
+                    "create_index.name",
+                    "accepted index name already exists",
+                ));
+            }
+            let table_state = schema.table(table).ok_or_else(|| {
+                GenerationError::impossible_schema(
+                    "create_index.table",
+                    "accepted index references an unknown table",
+                )
+            })?;
+            if columns.is_empty()
+                || columns.iter().any(|name| {
+                    !table_state
+                        .columns
+                        .iter()
+                        .any(|column| column.name == *name)
+                })
+            {
+                return Err(GenerationError::impossible_schema(
+                    "create_index.columns",
+                    "accepted index references an unknown or empty column list",
+                ));
+            }
+            schema.indexes.push(IndexState {
+                name: index.clone(),
+                table: table.clone(),
+                columns: columns.clone(),
+                unique: *unique,
+            });
+        }
+        Statement::Insert {
+            table,
+            columns,
+            rows,
+        } => {
+            let table_state = schema
+                .tables
+                .iter_mut()
+                .find(|entry| entry.name == *table)
+                .ok_or_else(|| {
+                    GenerationError::impossible_schema(
+                        "insert.table",
+                        "accepted INSERT references an unknown table",
+                    )
+                })?;
+            if columns.is_empty()
+                || rows.is_empty()
+                || rows.iter().any(|row| row.len() != columns.len())
+            {
+                return Err(GenerationError::impossible_schema(
+                    "insert.rows",
+                    "accepted INSERT has an empty or mismatched row shape",
+                ));
+            }
+            let mut unique_columns = BTreeSet::new();
+            if columns.iter().any(|name| {
+                !unique_columns.insert(name)
+                    || !table_state
+                        .columns
+                        .iter()
+                        .any(|column| column.name == *name)
+            }) {
+                return Err(GenerationError::impossible_schema(
+                    "insert.columns",
+                    "accepted INSERT references an unknown or duplicate column",
+                ));
+            }
+            table_state.estimated_rows = table_state
+                .estimated_rows
+                .saturating_add(u32::try_from(rows.len()).unwrap_or(u32::MAX));
+        }
+        Statement::Delete { table, .. } => {
+            if schema.table(table).is_none() {
+                return Err(GenerationError::impossible_schema(
+                    "delete.table",
+                    "accepted DELETE references an unknown table",
+                ));
+            }
+            // Predicate cardinality is unknown until the execution adapter
+            // reports it. Retaining the conservative row estimate avoids
+            // manufacturing primary-key reuse after a no-op DELETE.
+        }
+        Statement::Update {
+            table, assignments, ..
+        } => {
+            let table_state = schema.table(table).ok_or_else(|| {
+                GenerationError::impossible_schema(
+                    "update.table",
+                    "accepted UPDATE references an unknown table",
+                )
+            })?;
+            if assignments.is_empty()
+                || assignments.iter().any(|(name, _)| {
+                    !table_state
+                        .columns
+                        .iter()
+                        .any(|column| column.name == *name)
+                })
+            {
+                return Err(GenerationError::impossible_schema(
+                    "update.assignments",
+                    "accepted UPDATE references an unknown or empty assignment list",
+                ));
+            }
+        }
+        Statement::Select { .. } => {}
+        Statement::Transaction { statement } => match statement {
+            TransactionStatement::Begin => {
+                if schema.transaction_open {
+                    return Err(GenerationError::impossible_schema(
+                        "transaction.begin",
+                        "a transaction is already open",
+                    ));
+                }
+                *transaction_snapshot = Some(schema.clone());
+                schema.transaction_open = true;
+            }
+            TransactionStatement::Commit => {
+                if !schema.transaction_open {
+                    return Err(GenerationError::impossible_schema(
+                        "transaction.commit",
+                        "no transaction is open",
+                    ));
+                }
+                *transaction_snapshot = None;
+                schema.transaction_open = false;
+            }
+            TransactionStatement::Rollback => {
+                let mut snapshot = transaction_snapshot.take().ok_or_else(|| {
+                    GenerationError::impossible_schema(
+                        "transaction.rollback",
+                        "no transaction is open",
+                    )
+                })?;
+                snapshot.transaction_open = false;
+                *schema = snapshot;
+            }
+        },
+    }
+    Ok(())
 }
 
 /// Generate a deterministic test-local case. Production campaign adapters must

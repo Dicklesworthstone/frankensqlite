@@ -52,8 +52,9 @@ use crate::metamorphic::{
     generate_metamorphic_corpus,
 };
 use crate::mismatch_minimizer::{
-    DeduplicatedFailures, MinimalReproduction, MinimizerConfig, attribute_subsystem, deduplicate,
-    minimize_workload,
+    DeduplicatedFailures, MinimalReproduction, MinimizerConfig, TypedReductionConfig,
+    TypedReductionObservation, TypedReductionResult, attribute_subsystem, deduplicate,
+    minimize_typed_statements, minimize_workload,
 };
 use crate::test_inventory::ExecutionLane;
 use crate::typed_sql_generator::{
@@ -1045,6 +1046,305 @@ where
     Ok(minimal)
 }
 
+/// Replayable result of reducing one typed differential divergence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredTypedMinimization {
+    pub schema_version: String,
+    pub original_case_hash: String,
+    pub minimized_case: TypedDifferentialCase,
+    pub original_result_sha256: String,
+    pub minimized_result_sha256: String,
+    pub mismatch_signature: String,
+    pub reduction: TypedReductionResult,
+    pub repro_command: String,
+    pub content_hash: String,
+}
+
+impl StructuredTypedMinimization {
+    #[must_use]
+    pub fn deterministic_hash(&self) -> String {
+        let mut canonical = self.clone();
+        canonical.content_hash.clear();
+        let bytes = serde_json::to_vec(&canonical)
+            .expect("structured typed minimization serialization must succeed");
+        sha256_hex(&bytes)
+    }
+
+    pub fn validate(&self) -> Result<(), TypedAdapterError> {
+        if self.schema_version != "fsqlite.structured-typed-minimization.v1" {
+            return Err(TypedAdapterError::artifact(
+                "typed_reduction.schema_version",
+                "structured typed minimization schema is unsupported",
+            ));
+        }
+        self.minimized_case.validate()?;
+        self.reduction
+            .validate()
+            .map_err(|error| TypedAdapterError::artifact("typed_reduction.result", error))?;
+        if !is_sha256_hex_64(&self.original_case_hash)
+            || !is_sha256_hex_64(&self.original_result_sha256)
+            || !is_sha256_hex_64(&self.minimized_result_sha256)
+        {
+            return Err(TypedAdapterError::artifact(
+                "typed_reduction.hashes",
+                "case and result identities must be lowercase SHA-256 values",
+            ));
+        }
+        if self.mismatch_signature != self.reduction.observation.mismatch_signature
+            || self.minimized_case.required_lanes != self.reduction.observation.required_lanes
+            || self.minimized_case.generated.statements != self.reduction.minimized_statements
+        {
+            return Err(TypedAdapterError::artifact(
+                "typed_reduction.provenance",
+                "minimized case, mismatch signature, lane, or AST provenance drifted",
+            ));
+        }
+        validate_repro_command(&self.repro_command)?;
+        if self.content_hash != self.deterministic_hash() {
+            return Err(TypedAdapterError::artifact(
+                "typed_reduction.content_hash",
+                "structured typed minimization content hash mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn to_json(&self) -> Result<String, TypedAdapterError> {
+        self.validate()?;
+        serde_json::to_string_pretty(self)
+            .map_err(|error| TypedAdapterError::artifact("typed_reduction.json", error.to_string()))
+    }
+
+    pub fn from_json_strict(json: &str) -> Result<Self, TypedAdapterError> {
+        let package: Self = serde_json::from_str(json).map_err(|error| {
+            TypedAdapterError::artifact("typed_reduction.json", format!("decode failed: {error}"))
+        })?;
+        package.validate()?;
+        Ok(package)
+    }
+}
+
+fn validate_repro_command(repro_command: &str) -> Result<(), TypedAdapterError> {
+    if repro_command.contains('\n')
+        || repro_command.contains('\r')
+        || repro_command.trim().is_empty()
+    {
+        return Err(TypedAdapterError::invalid(
+            "typed_minimizer.repro_command",
+            "reproduction command must be non-empty and single-line",
+        ));
+    }
+    Ok(())
+}
+
+fn mismatch_witness_sha256(result: &DifferentialResult) -> Result<String, TypedAdapterError> {
+    #[derive(Serialize)]
+    struct Witness<'a> {
+        outcome: Outcome,
+        divergences: Vec<(
+            &'a crate::differential_v2::StmtOutcome,
+            &'a crate::differential_v2::StmtOutcome,
+        )>,
+    }
+
+    if result.outcome != Outcome::Divergence || result.divergences.is_empty() {
+        return Err(TypedAdapterError::invalid(
+            "typed_reduction.witness",
+            "structured reduction requires a statement-level divergence",
+        ));
+    }
+    let witness = Witness {
+        outcome: result.outcome,
+        divergences: result
+            .divergences
+            .iter()
+            .map(|divergence| (&divergence.csqlite_outcome, &divergence.fsqlite_outcome))
+            .collect(),
+    };
+    let bytes = serde_json::to_vec(&witness).map_err(|error| {
+        TypedAdapterError::artifact("typed_reduction.witness", error.to_string())
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn rebuild_reduced_typed_case(
+    source: &TypedDifferentialCase,
+    statements: &[GeneratedStatement],
+) -> Result<TypedDifferentialCase, TypedAdapterError> {
+    let generated = source
+        .generated
+        .rebuild_with_statements(statements.to_vec())
+        .map_err(|error| {
+            TypedAdapterError::invalid(
+                "typed_reduction.generated_case",
+                format!("reduced generator AST is invalid: {error:?}"),
+            )
+        })?;
+    let mut reduced =
+        adapt_generated_case(generated, source.run_id.clone(), source.scenario_id.clone())?;
+    reduced
+        .envelope
+        .engines
+        .clone_from(&source.envelope.engines);
+    reduced
+        .envelope
+        .pragmas
+        .clone_from(&source.envelope.pragmas);
+    reduced
+        .envelope
+        .canonicalization
+        .clone_from(&source.envelope.canonicalization);
+    reduced.content_hash = reduced.deterministic_hash();
+    reduced.validate()?;
+    Ok(reduced)
+}
+
+/// Reduce a typed case through fresh public executors for every candidate.
+/// Exact result/error witness and required-lane identity are mandatory.
+pub fn minimize_typed_divergence_structured<F, C, FF, CF, LF>(
+    case: &TypedDifferentialCase,
+    config: &TypedReductionConfig,
+    repro_command: &str,
+    fsqlite_factory: FF,
+    csqlite_factory: CF,
+    lane_evidence_factory: LF,
+) -> Result<(StructuredTypedMinimization, TypedDifferentialRun), TypedAdapterError>
+where
+    F: SqlExecutor,
+    C: SqlExecutor,
+    FF: Fn() -> Result<F, String>,
+    CF: Fn() -> Result<C, String>,
+    LF: Fn(&TypedDifferentialCase) -> Result<Vec<ExecutionLaneEvidence>, TypedAdapterError>,
+{
+    case.validate()?;
+    validate_repro_command(repro_command)?;
+    let run_candidate = |statements: &[GeneratedStatement]| {
+        let candidate = rebuild_reduced_typed_case(case, statements)?;
+        let lane_evidence = lane_evidence_factory(&candidate)?;
+        let fsqlite = fsqlite_factory().map_err(|error| {
+            TypedAdapterError::artifact("typed_reduction.subject_factory", error)
+        })?;
+        let csqlite = csqlite_factory().map_err(|error| {
+            TypedAdapterError::artifact("typed_reduction.reference_factory", error)
+        })?;
+        let run = run_typed_differential_case(&candidate, lane_evidence, &fsqlite, &csqlite)?;
+        let signature = mismatch_witness_sha256(&run.result)?;
+        Ok::<_, TypedAdapterError>((candidate, run, signature))
+    };
+
+    let (_, original_run, original_signature) = run_candidate(&case.generated.statements)?;
+    let test = |statements: &[GeneratedStatement]| {
+        let (candidate, _, mismatch_signature) = run_candidate(statements)
+            .map_err(|error| format!("{}: {}", error.constraint, error.message))?;
+        Ok(TypedReductionObservation {
+            mismatch_signature,
+            required_lanes: candidate.required_lanes,
+        })
+    };
+    let reduction = minimize_typed_statements(&case.generated.statements, config, &test)
+        .map_err(|error| TypedAdapterError::invalid("typed_reduction.minimizer", error))?;
+    if reduction.observation.mismatch_signature != original_signature
+        || reduction.observation.required_lanes != case.required_lanes
+    {
+        return Err(TypedAdapterError::invalid(
+            "typed_reduction.original_witness",
+            "full-case witness changed between required verification passes",
+        ));
+    }
+    let (minimized_case, minimized_run, minimized_signature) =
+        run_candidate(&reduction.minimized_statements)?;
+    if minimized_signature != original_signature {
+        return Err(TypedAdapterError::invalid(
+            "typed_reduction.final_witness",
+            "final minimized witness differs from the original",
+        ));
+    }
+
+    let mut package = StructuredTypedMinimization {
+        schema_version: "fsqlite.structured-typed-minimization.v1".to_owned(),
+        original_case_hash: case.content_hash.clone(),
+        minimized_case,
+        original_result_sha256: original_run.result.artifact_hashes.result_hash,
+        minimized_result_sha256: minimized_run.result.artifact_hashes.result_hash.clone(),
+        mismatch_signature: original_signature,
+        reduction,
+        repro_command: repro_command.to_owned(),
+        content_hash: String::new(),
+    };
+    package.content_hash = package.deterministic_hash();
+    package.validate()?;
+    tracing::info!(
+        bead_id = "bd-turso-test-adaptation-zu081.6",
+        run_id = %case.run_id,
+        trace_id = %case.trace_id,
+        scenario_id = %case.scenario_id,
+        original_statements = package.reduction.stats.original_statements,
+        minimized_statements = package.reduction.stats.minimized_statements,
+        attempts = package.reduction.stats.attempts,
+        accepted = package.reduction.stats.accepted_candidates,
+        mismatch_signature = %package.mismatch_signature,
+        required_lanes = %package.minimized_case.required_lanes.iter().map(|lane| lane.label()).collect::<Vec<_>>().join(","),
+        complete = package.reduction.status.is_complete(),
+        "structured typed differential reduction completed"
+    );
+    Ok((package, minimized_run))
+}
+
+/// Add original/minimized AST and deterministic reduction evidence to the
+/// existing canonical typed failure bundle.
+pub fn build_typed_reduction_failure_bundle(
+    original_case: &TypedDifferentialCase,
+    package: &StructuredTypedMinimization,
+    minimized_run: &TypedDifferentialRun,
+    created_at: &str,
+    environment: EnvironmentInfo,
+    subject: TypedEngineProvenance,
+    reference: TypedEngineProvenance,
+) -> Result<FailureBundle, TypedAdapterError> {
+    original_case.validate()?;
+    package.validate()?;
+    if original_case.content_hash != package.original_case_hash
+        || original_case.generated.statements != package.reduction.original_statements
+    {
+        return Err(TypedAdapterError::artifact(
+            "typed_reduction.original_case",
+            "original case does not match reduction provenance",
+        ));
+    }
+    let mut bundle = build_typed_failure_bundle(
+        &package.minimized_case,
+        minimized_run,
+        created_at,
+        &package.repro_command,
+        environment,
+        subject,
+        reference,
+    )?;
+    let original_json = original_case.to_canonical_json()?;
+    let minimized_json = package.minimized_case.to_canonical_json()?;
+    let reduction_json = package.to_json()?;
+    bundle
+        .state_snapshots
+        .insert("original_typed_case_json".to_owned(), original_json);
+    bundle
+        .state_snapshots
+        .insert("minimized_typed_case_json".to_owned(), minimized_json);
+    bundle
+        .state_snapshots
+        .insert("typed_reduction_json".to_owned(), reduction_json);
+    bundle.scenario.bead_id = "bd-turso-test-adaptation-zu081.6".to_owned();
+    bundle.triage_tags.push("structured-reduction".to_owned());
+    bundle.content_hash = bundle.deterministic_bundle_hash();
+    let errors = bundle.validate();
+    if !errors.is_empty() {
+        return Err(TypedAdapterError::artifact(
+            "typed_reduction.bundle",
+            errors.join("; "),
+        ));
+    }
+    Ok(bundle)
+}
+
 // ===========================================================================
 // Configuration
 // ===========================================================================
@@ -1624,6 +1924,13 @@ fn sha256_hex(data: &[u8]) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+fn is_sha256_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]

@@ -46,6 +46,11 @@ use sha2::{Digest, Sha256};
 
 use crate::differential_v2::StatementDivergence;
 use crate::metamorphic::MismatchClassification;
+use crate::test_inventory::ExecutionLane;
+use crate::typed_sql_generator::{
+    Expr, GeneratedStatement, Identifier, Select, SqlValue, Statement as GeneratedAstStatement,
+    StatementRole, TransactionStatement,
+};
 
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
@@ -53,6 +58,8 @@ const BEAD_ID: &str = "bd-1dp9.2.3";
 
 /// Schema version for the minimizer output format.
 pub const MINIMIZER_SCHEMA_VERSION: u32 = 1;
+/// Schema version for generator-AST reduction evidence.
+pub const TYPED_REDUCTION_SCHEMA_VERSION: &str = "fsqlite.typed-reduction.v1";
 
 // ===========================================================================
 // Subsystem Attribution
@@ -256,6 +263,1027 @@ impl Default for MinimizerConfig {
             max_workload_size: 1000,
         }
     }
+}
+
+/// Deterministic budget and cancellation controls for structured reduction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedReductionConfig {
+    /// Maximum verifier calls after the required full-case verification.
+    pub max_attempts: usize,
+    /// Cancel before this zero-based attempt number.
+    pub cancel_after_attempts: Option<usize>,
+}
+
+impl Default for TypedReductionConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 1_000,
+            cancel_after_attempts: None,
+        }
+    }
+}
+
+/// Stable reducer categories used in traces and aggregate accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedReductionKind {
+    Statement,
+    Transaction,
+    Clause,
+    Join,
+    Projection,
+    Predicate,
+    OrderTerm,
+    Index,
+    Expression,
+    SchemaTable,
+    SchemaColumn,
+    InsertRow,
+    Value,
+}
+
+/// Exact oracle identity that every accepted candidate must preserve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedReductionObservation {
+    pub mismatch_signature: String,
+    pub required_lanes: Vec<ExecutionLane>,
+}
+
+impl TypedReductionObservation {
+    fn validate(&self) -> Result<(), String> {
+        if self.mismatch_signature.trim().is_empty() {
+            return Err("structured reducer mismatch signature is empty".to_owned());
+        }
+        if self.required_lanes.is_empty() {
+            return Err("structured reducer required lane set is empty".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Why structured reduction stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedReductionStatus {
+    Complete,
+    BudgetExhausted,
+    Cancelled,
+}
+
+impl TypedReductionStatus {
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// One deterministic candidate decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedReductionAttempt {
+    pub ordinal: usize,
+    pub kind: TypedReductionKind,
+    pub path: String,
+    pub before_sha256: String,
+    pub after_sha256: String,
+    pub accepted: bool,
+    pub rationale: String,
+}
+
+/// Stable aggregate statistics for one reduction run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedReductionStats {
+    pub original_statements: usize,
+    pub minimized_statements: usize,
+    pub original_bytes: usize,
+    pub minimized_bytes: usize,
+    pub attempts: usize,
+    pub accepted_candidates: usize,
+    pub rejected_candidates: usize,
+}
+
+/// Canonical structured-reduction artifact retained by bundles and replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedReductionResult {
+    pub schema_version: String,
+    pub original_statements: Vec<GeneratedStatement>,
+    pub minimized_statements: Vec<GeneratedStatement>,
+    pub observation: TypedReductionObservation,
+    pub trace: Vec<TypedReductionAttempt>,
+    pub stats: TypedReductionStats,
+    pub status: TypedReductionStatus,
+    pub first_rejected_invariant: Option<String>,
+    pub content_hash: String,
+}
+
+impl TypedReductionResult {
+    #[must_use]
+    pub fn deterministic_hash(&self) -> String {
+        let mut canonical = self.clone();
+        canonical.content_hash.clear();
+        let bytes = serde_json::to_vec(&canonical)
+            .expect("typed reduction artifact serialization must succeed");
+        sha256_hex(&bytes)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != TYPED_REDUCTION_SCHEMA_VERSION {
+            return Err("typed reduction schema version is unsupported".to_owned());
+        }
+        if self.original_statements.is_empty() || self.minimized_statements.is_empty() {
+            return Err("typed reduction statement sets must be non-empty".to_owned());
+        }
+        self.observation.validate()?;
+        if self.stats.original_statements != self.original_statements.len()
+            || self.stats.minimized_statements != self.minimized_statements.len()
+            || self.stats.attempts != self.trace.len()
+            || self.stats.accepted_candidates
+                != self.trace.iter().filter(|attempt| attempt.accepted).count()
+            || self.stats.rejected_candidates
+                != self
+                    .trace
+                    .iter()
+                    .filter(|attempt| !attempt.accepted)
+                    .count()
+        {
+            return Err("typed reduction statistics do not match the payload".to_owned());
+        }
+        if self.content_hash != self.deterministic_hash() {
+            return Err("typed reduction content hash mismatch".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn to_json(&self) -> Result<String, String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self).map_err(|error| error.to_string())
+    }
+
+    pub fn from_json_strict(json: &str) -> Result<Self, String> {
+        let result: Self = serde_json::from_str(json)
+            .map_err(|error| format!("typed reduction decode failed: {error}"))?;
+        result.validate()?;
+        Ok(result)
+    }
+}
+
+/// Candidate verifier used by the structured reducer.
+pub type TypedReproducibilityTest =
+    dyn Fn(&[GeneratedStatement]) -> Result<TypedReductionObservation, String>;
+
+#[derive(Debug, Clone)]
+struct TypedReductionCandidate {
+    kind: TypedReductionKind,
+    path: String,
+    statements: Vec<GeneratedStatement>,
+}
+
+/// Reduce generator-owned statement trees while preserving the exact oracle
+/// signature and required execution lanes returned by `test_fn`.
+pub fn minimize_typed_statements(
+    statements: &[GeneratedStatement],
+    config: &TypedReductionConfig,
+    test_fn: &TypedReproducibilityTest,
+) -> Result<TypedReductionResult, String> {
+    if statements.is_empty() {
+        return Err("structured reduction requires at least one statement".to_owned());
+    }
+    let observation = test_fn(statements)?;
+    observation.validate()?;
+
+    let original = statements.to_vec();
+    let mut current = original.clone();
+    let mut trace = Vec::new();
+    let mut status = TypedReductionStatus::Complete;
+    let mut first_rejected_invariant = None;
+
+    'passes: loop {
+        let candidates = typed_reduction_candidates(&current);
+        let mut accepted_in_pass = false;
+        for candidate in candidates {
+            if config
+                .cancel_after_attempts
+                .is_some_and(|limit| trace.len() >= limit)
+            {
+                status = TypedReductionStatus::Cancelled;
+                break 'passes;
+            }
+            if trace.len() >= config.max_attempts {
+                status = TypedReductionStatus::BudgetExhausted;
+                break 'passes;
+            }
+
+            let before_sha256 = statement_payload_hash(&current);
+            let after_sha256 = statement_payload_hash(&candidate.statements);
+            let (accepted, rationale) = match test_fn(&candidate.statements) {
+                Ok(candidate_observation) if candidate_observation == observation => (
+                    true,
+                    "exact mismatch signature and required lanes preserved".to_owned(),
+                ),
+                Ok(candidate_observation)
+                    if candidate_observation.mismatch_signature
+                        != observation.mismatch_signature =>
+                {
+                    (
+                        false,
+                        "rejected: exact result/error mismatch signature drifted".to_owned(),
+                    )
+                }
+                Ok(_) => (
+                    false,
+                    "rejected: required execution lane identity drifted".to_owned(),
+                ),
+                Err(error) => (false, format!("rejected: candidate invalid: {error}")),
+            };
+            if !accepted && first_rejected_invariant.is_none() {
+                first_rejected_invariant = Some(rationale.clone());
+            }
+            trace.push(TypedReductionAttempt {
+                ordinal: trace.len(),
+                kind: candidate.kind,
+                path: candidate.path,
+                before_sha256,
+                after_sha256,
+                accepted,
+                rationale,
+            });
+            if accepted {
+                current = candidate.statements;
+                accepted_in_pass = true;
+                break;
+            }
+        }
+        if !accepted_in_pass {
+            break;
+        }
+    }
+
+    let original_bytes = statement_payload_bytes(&original);
+    let minimized_bytes = statement_payload_bytes(&current);
+    let accepted_candidates = trace.iter().filter(|attempt| attempt.accepted).count();
+    let mut result = TypedReductionResult {
+        schema_version: TYPED_REDUCTION_SCHEMA_VERSION.to_owned(),
+        original_statements: original,
+        minimized_statements: current,
+        observation,
+        stats: TypedReductionStats {
+            original_statements: statements.len(),
+            minimized_statements: 0,
+            original_bytes,
+            minimized_bytes,
+            attempts: trace.len(),
+            accepted_candidates,
+            rejected_candidates: trace.len().saturating_sub(accepted_candidates),
+        },
+        trace,
+        status,
+        first_rejected_invariant,
+        content_hash: String::new(),
+    };
+    result.stats.minimized_statements = result.minimized_statements.len();
+    result.content_hash = result.deterministic_hash();
+    result.validate()?;
+    Ok(result)
+}
+
+fn typed_reduction_candidates(statements: &[GeneratedStatement]) -> Vec<TypedReductionCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for index in 0..statements.len() {
+        let mut reduced = statements.to_vec();
+        let removed = reduced.remove(index);
+        let kind = if matches!(removed.ast, GeneratedAstStatement::CreateIndex { .. }) {
+            TypedReductionKind::Index
+        } else {
+            TypedReductionKind::Statement
+        };
+        push_typed_candidate(
+            &mut candidates,
+            &mut seen,
+            kind,
+            format!("statements[{index}]"),
+            reduced,
+        );
+    }
+
+    for (begin, end) in transaction_ranges(statements) {
+        let reduced = statements
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != begin && *index != end)
+            .map(|(_, statement)| statement.clone())
+            .collect();
+        push_typed_candidate(
+            &mut candidates,
+            &mut seen,
+            TypedReductionKind::Transaction,
+            format!("transaction[{begin}..={end}].boundaries"),
+            reduced,
+        );
+    }
+
+    for (index, statement) in statements.iter().enumerate() {
+        for (kind, path, ast) in statement_reduction_candidates(&statement.ast) {
+            let mut reduced = statements.to_vec();
+            reduced[index].ast = ast;
+            reduced[index].sql = reduced[index].ast.to_sql();
+            push_typed_candidate(
+                &mut candidates,
+                &mut seen,
+                kind,
+                format!("statements[{index}].{path}"),
+                reduced,
+            );
+        }
+    }
+
+    for (table, column) in schema_column_candidates(statements) {
+        if let Some(reduced) = remove_schema_column(statements, &table, &column) {
+            push_typed_candidate(
+                &mut candidates,
+                &mut seen,
+                TypedReductionKind::SchemaColumn,
+                format!("schema.{}.column.{}", table.as_str(), column.as_str()),
+                reduced,
+            );
+        }
+    }
+    for table in schema_table_candidates(statements) {
+        let reduced = statements
+            .iter()
+            .filter(|statement| !statement_references_table(&statement.ast, &table))
+            .cloned()
+            .collect();
+        push_typed_candidate(
+            &mut candidates,
+            &mut seen,
+            TypedReductionKind::SchemaTable,
+            format!("schema.table.{}", table.as_str()),
+            reduced,
+        );
+    }
+    candidates
+}
+
+fn push_typed_candidate(
+    candidates: &mut Vec<TypedReductionCandidate>,
+    seen: &mut BTreeSet<String>,
+    kind: TypedReductionKind,
+    path: String,
+    statements: Vec<GeneratedStatement>,
+) {
+    if statements.is_empty()
+        || !statements
+            .iter()
+            .any(|statement| statement.role == StatementRole::Subject)
+    {
+        return;
+    }
+    let hash = statement_payload_hash(&statements);
+    if seen.insert(hash) {
+        candidates.push(TypedReductionCandidate {
+            kind,
+            path,
+            statements,
+        });
+    }
+}
+
+fn transaction_ranges(statements: &[GeneratedStatement]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut begin = None;
+    for (index, statement) in statements.iter().enumerate() {
+        match statement.ast {
+            GeneratedAstStatement::Transaction {
+                statement: TransactionStatement::Begin,
+            } => begin = Some(index),
+            GeneratedAstStatement::Transaction {
+                statement: TransactionStatement::Commit | TransactionStatement::Rollback,
+            } => {
+                if let Some(start) = begin.take() {
+                    ranges.push((start, index));
+                }
+            }
+            _ => {}
+        }
+    }
+    ranges
+}
+
+fn statement_reduction_candidates(
+    statement: &GeneratedAstStatement,
+) -> Vec<(TypedReductionKind, String, GeneratedAstStatement)> {
+    let mut candidates = Vec::new();
+    match statement {
+        GeneratedAstStatement::CreateTable { table, columns } => {
+            if columns.len() > 1 {
+                for index in 0..columns.len() {
+                    let mut reduced = columns.clone();
+                    reduced.remove(index);
+                    candidates.push((
+                        TypedReductionKind::SchemaColumn,
+                        format!("create_table.columns[{index}]"),
+                        GeneratedAstStatement::CreateTable {
+                            table: table.clone(),
+                            columns: reduced,
+                        },
+                    ));
+                }
+            }
+        }
+        GeneratedAstStatement::CreateIndex {
+            index,
+            table,
+            columns,
+            unique,
+        } => {
+            if columns.len() > 1 {
+                for position in 0..columns.len() {
+                    let mut reduced = columns.clone();
+                    reduced.remove(position);
+                    candidates.push((
+                        TypedReductionKind::Index,
+                        format!("create_index.columns[{position}]"),
+                        GeneratedAstStatement::CreateIndex {
+                            index: index.clone(),
+                            table: table.clone(),
+                            columns: reduced,
+                            unique: *unique,
+                        },
+                    ));
+                }
+            }
+        }
+        GeneratedAstStatement::Insert {
+            table,
+            columns,
+            rows,
+        } => {
+            if rows.len() > 1 {
+                for row_index in 0..rows.len() {
+                    let mut reduced_rows = rows.clone();
+                    reduced_rows.remove(row_index);
+                    candidates.push((
+                        TypedReductionKind::InsertRow,
+                        format!("insert.rows[{row_index}]"),
+                        GeneratedAstStatement::Insert {
+                            table: table.clone(),
+                            columns: columns.clone(),
+                            rows: reduced_rows,
+                        },
+                    ));
+                }
+            }
+            for (row_index, row) in rows.iter().enumerate() {
+                for (value_index, value) in row.iter().enumerate() {
+                    for reduced_value in reduced_values(value) {
+                        let mut reduced_rows = rows.clone();
+                        reduced_rows[row_index][value_index] = reduced_value;
+                        candidates.push((
+                            TypedReductionKind::Value,
+                            format!("insert.rows[{row_index}].values[{value_index}]"),
+                            GeneratedAstStatement::Insert {
+                                table: table.clone(),
+                                columns: columns.clone(),
+                                rows: reduced_rows,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        GeneratedAstStatement::Update {
+            table,
+            assignments,
+            predicate,
+        } => {
+            if assignments.len() > 1 {
+                for index in 0..assignments.len() {
+                    let mut reduced = assignments.clone();
+                    reduced.remove(index);
+                    candidates.push((
+                        TypedReductionKind::Projection,
+                        format!("update.assignments[{index}]"),
+                        GeneratedAstStatement::Update {
+                            table: table.clone(),
+                            assignments: reduced,
+                            predicate: predicate.clone(),
+                        },
+                    ));
+                }
+            }
+            for (index, (_, expression)) in assignments.iter().enumerate() {
+                for (path, reduced_expression) in expression_reductions(expression) {
+                    let mut reduced = assignments.clone();
+                    reduced[index].1 = reduced_expression;
+                    candidates.push((
+                        TypedReductionKind::Expression,
+                        format!("update.assignments[{index}].{path}"),
+                        GeneratedAstStatement::Update {
+                            table: table.clone(),
+                            assignments: reduced,
+                            predicate: predicate.clone(),
+                        },
+                    ));
+                }
+            }
+            if let Some(expression) = predicate {
+                candidates.push((
+                    TypedReductionKind::Predicate,
+                    "update.predicate".to_owned(),
+                    GeneratedAstStatement::Update {
+                        table: table.clone(),
+                        assignments: assignments.clone(),
+                        predicate: None,
+                    },
+                ));
+                for (path, reduced_expression) in expression_reductions(expression) {
+                    candidates.push((
+                        TypedReductionKind::Expression,
+                        format!("update.predicate.{path}"),
+                        GeneratedAstStatement::Update {
+                            table: table.clone(),
+                            assignments: assignments.clone(),
+                            predicate: Some(reduced_expression),
+                        },
+                    ));
+                }
+            }
+        }
+        GeneratedAstStatement::Delete { table, predicate } => {
+            if let Some(expression) = predicate {
+                candidates.push((
+                    TypedReductionKind::Predicate,
+                    "delete.predicate".to_owned(),
+                    GeneratedAstStatement::Delete {
+                        table: table.clone(),
+                        predicate: None,
+                    },
+                ));
+                for (path, reduced_expression) in expression_reductions(expression) {
+                    candidates.push((
+                        TypedReductionKind::Expression,
+                        format!("delete.predicate.{path}"),
+                        GeneratedAstStatement::Delete {
+                            table: table.clone(),
+                            predicate: Some(reduced_expression),
+                        },
+                    ));
+                }
+            }
+        }
+        GeneratedAstStatement::Select { select } => {
+            for (kind, path, reduced) in select_reduction_candidates(select) {
+                candidates.push((
+                    kind,
+                    path,
+                    GeneratedAstStatement::Select { select: reduced },
+                ));
+            }
+        }
+        GeneratedAstStatement::Transaction { .. } => {}
+    }
+    candidates
+}
+
+fn select_reduction_candidates(select: &Select) -> Vec<(TypedReductionKind, String, Select)> {
+    let mut candidates = Vec::new();
+    if select.distinct {
+        let mut reduced = select.clone();
+        reduced.distinct = false;
+        candidates.push((
+            TypedReductionKind::Clause,
+            "select.distinct".to_owned(),
+            reduced,
+        ));
+    }
+    if select.projection.len() > 1 {
+        for index in 0..select.projection.len() {
+            let mut reduced = select.clone();
+            reduced.projection.remove(index);
+            candidates.push((
+                TypedReductionKind::Projection,
+                format!("select.projection[{index}]"),
+                reduced,
+            ));
+        }
+    }
+    for (index, item) in select.projection.iter().enumerate() {
+        for (path, expression) in expression_reductions(&item.expr) {
+            let mut reduced = select.clone();
+            reduced.projection[index].expr = expression;
+            candidates.push((
+                TypedReductionKind::Expression,
+                format!("select.projection[{index}].{path}"),
+                reduced,
+            ));
+        }
+    }
+    for index in 0..select.joins.len() {
+        let mut reduced = select.clone();
+        reduced.joins.remove(index);
+        candidates.push((
+            TypedReductionKind::Join,
+            format!("select.joins[{index}]"),
+            reduced,
+        ));
+    }
+    if let Some(predicate) = &select.predicate {
+        let mut reduced = select.clone();
+        reduced.predicate = None;
+        candidates.push((
+            TypedReductionKind::Predicate,
+            "select.predicate".to_owned(),
+            reduced,
+        ));
+        for (path, expression) in expression_reductions(predicate) {
+            let mut reduced = select.clone();
+            reduced.predicate = Some(expression);
+            candidates.push((
+                TypedReductionKind::Expression,
+                format!("select.predicate.{path}"),
+                reduced,
+            ));
+        }
+    }
+    for index in 0..select.group_by.len() {
+        let mut reduced = select.clone();
+        reduced.group_by.remove(index);
+        candidates.push((
+            TypedReductionKind::Clause,
+            format!("select.group_by[{index}]"),
+            reduced,
+        ));
+    }
+    if select.having.is_some() {
+        let mut reduced = select.clone();
+        reduced.having = None;
+        candidates.push((
+            TypedReductionKind::Predicate,
+            "select.having".to_owned(),
+            reduced,
+        ));
+    }
+    if select.compound.is_some() {
+        let mut reduced = select.clone();
+        reduced.compound = None;
+        candidates.push((
+            TypedReductionKind::Clause,
+            "select.compound".to_owned(),
+            reduced,
+        ));
+    }
+    for index in 0..select.order_by.len() {
+        let mut reduced = select.clone();
+        reduced.order_by.remove(index);
+        candidates.push((
+            TypedReductionKind::OrderTerm,
+            format!("select.order_by[{index}]"),
+            reduced,
+        ));
+    }
+    if select.limit.is_some() {
+        let mut reduced = select.clone();
+        reduced.limit = None;
+        candidates.push((
+            TypedReductionKind::Clause,
+            "select.limit".to_owned(),
+            reduced,
+        ));
+    }
+    candidates
+}
+
+fn expression_reductions(expression: &Expr) -> Vec<(String, Expr)> {
+    let mut candidates = Vec::new();
+    match expression {
+        Expr::Value { value } => {
+            for reduced in reduced_values(value) {
+                candidates.push(("value".to_owned(), Expr::Value { value: reduced }));
+            }
+        }
+        Expr::Column { .. } => {}
+        Expr::Unary { op, expr } => {
+            candidates.push(("unwrap".to_owned(), expr.as_ref().clone()));
+            for (path, reduced) in expression_reductions(expr) {
+                candidates.push((
+                    format!("unary.{path}"),
+                    Expr::Unary {
+                        op: *op,
+                        expr: Box::new(reduced),
+                    },
+                ));
+            }
+        }
+        Expr::Binary { left, op, right } => {
+            candidates.push(("left".to_owned(), left.as_ref().clone()));
+            candidates.push(("right".to_owned(), right.as_ref().clone()));
+            for (path, reduced) in expression_reductions(left) {
+                candidates.push((
+                    format!("left.{path}"),
+                    Expr::Binary {
+                        left: Box::new(reduced),
+                        op: *op,
+                        right: right.clone(),
+                    },
+                ));
+            }
+            for (path, reduced) in expression_reductions(right) {
+                candidates.push((
+                    format!("right.{path}"),
+                    Expr::Binary {
+                        left: left.clone(),
+                        op: *op,
+                        right: Box::new(reduced),
+                    },
+                ));
+            }
+        }
+        Expr::IsNull { expr, negated } => {
+            candidates.push(("unwrap".to_owned(), expr.as_ref().clone()));
+            for (path, reduced) in expression_reductions(expr) {
+                candidates.push((
+                    format!("is_null.{path}"),
+                    Expr::IsNull {
+                        expr: Box::new(reduced),
+                        negated: *negated,
+                    },
+                ));
+            }
+        }
+        Expr::Aggregate {
+            function,
+            expr,
+            distinct,
+        } => {
+            if let Some(inner) = expr {
+                candidates.push(("aggregate.unwrap".to_owned(), inner.as_ref().clone()));
+                for (path, reduced) in expression_reductions(inner) {
+                    candidates.push((
+                        format!("aggregate.{path}"),
+                        Expr::Aggregate {
+                            function: *function,
+                            expr: Some(Box::new(reduced)),
+                            distinct: *distinct,
+                        },
+                    ));
+                }
+            }
+            if *distinct {
+                candidates.push((
+                    "aggregate.distinct".to_owned(),
+                    Expr::Aggregate {
+                        function: *function,
+                        expr: expr.clone(),
+                        distinct: false,
+                    },
+                ));
+            }
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            candidates.push(("in_subquery.left".to_owned(), expr.as_ref().clone()));
+            for (path, reduced) in expression_reductions(expr) {
+                candidates.push((
+                    format!("in_subquery.{path}"),
+                    Expr::InSubquery {
+                        expr: Box::new(reduced),
+                        subquery: subquery.clone(),
+                        negated: *negated,
+                    },
+                ));
+            }
+        }
+        Expr::ScalarSubquery { .. } => {}
+    }
+    candidates
+}
+
+fn reduced_values(value: &SqlValue) -> Vec<SqlValue> {
+    match value {
+        SqlValue::Null => Vec::new(),
+        SqlValue::Integer(value) if *value == 0 => Vec::new(),
+        SqlValue::Integer(value) => {
+            let mut values = vec![SqlValue::Integer(0)];
+            let halved = *value / 2;
+            if halved != 0 {
+                values.push(SqlValue::Integer(halved));
+            }
+            values
+        }
+        SqlValue::Real(value) if value.as_str() == "0.0" => Vec::new(),
+        SqlValue::Real(_) => crate::typed_sql_generator::RealLiteral::new("0.0")
+            .map(SqlValue::Real)
+            .into_iter()
+            .collect(),
+        SqlValue::Text(value) if value.is_empty() => Vec::new(),
+        SqlValue::Text(value) => {
+            let midpoint = value.len() / 2;
+            let mut values = vec![SqlValue::Text(String::new())];
+            if value.is_char_boundary(midpoint) && midpoint > 0 {
+                values.push(SqlValue::Text(value[..midpoint].to_owned()));
+            }
+            values
+        }
+        SqlValue::Blob(value) if value.is_empty() => Vec::new(),
+        SqlValue::Blob(value) => {
+            let mut values = vec![SqlValue::Blob(Vec::new())];
+            if value.len() > 1 {
+                values.push(SqlValue::Blob(value[..value.len() / 2].to_vec()));
+            }
+            values
+        }
+    }
+}
+
+fn schema_column_candidates(statements: &[GeneratedStatement]) -> Vec<(Identifier, Identifier)> {
+    let mut candidates = Vec::new();
+    for statement in statements {
+        if let GeneratedAstStatement::CreateTable { table, columns } = &statement.ast {
+            for column in columns {
+                if !column.primary_key {
+                    candidates.push((table.clone(), column.name.clone()));
+                }
+            }
+        }
+    }
+    candidates
+}
+
+fn schema_table_candidates(statements: &[GeneratedStatement]) -> Vec<Identifier> {
+    statements
+        .iter()
+        .filter_map(|statement| match &statement.ast {
+            GeneratedAstStatement::CreateTable { table, .. } => Some(table.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn remove_schema_column(
+    statements: &[GeneratedStatement],
+    table: &Identifier,
+    column: &Identifier,
+) -> Option<Vec<GeneratedStatement>> {
+    let mut reduced = Vec::with_capacity(statements.len());
+    let mut changed = false;
+    for statement in statements {
+        let mut statement = statement.clone();
+        match &mut statement.ast {
+            GeneratedAstStatement::CreateTable {
+                table: statement_table,
+                columns,
+            } if statement_table == table => {
+                let original = columns.len();
+                columns.retain(|candidate| candidate.name != *column);
+                changed |= columns.len() != original;
+                if columns.is_empty() {
+                    return None;
+                }
+            }
+            GeneratedAstStatement::CreateIndex {
+                table: statement_table,
+                columns,
+                ..
+            } if statement_table == table => {
+                columns.retain(|candidate| candidate != column);
+                if columns.is_empty() {
+                    changed = true;
+                    continue;
+                }
+            }
+            GeneratedAstStatement::Insert {
+                table: statement_table,
+                columns,
+                rows,
+            } if statement_table == table => {
+                if let Some(position) = columns.iter().position(|candidate| candidate == column) {
+                    columns.remove(position);
+                    for row in rows {
+                        if position >= row.len() {
+                            return None;
+                        }
+                        row.remove(position);
+                    }
+                    changed = true;
+                }
+                if columns.is_empty() {
+                    continue;
+                }
+            }
+            GeneratedAstStatement::Update {
+                table: statement_table,
+                assignments,
+                ..
+            } if statement_table == table => {
+                let original = assignments.len();
+                assignments.retain(|(candidate, _)| candidate != column);
+                changed |= assignments.len() != original;
+                if assignments.is_empty() {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        statement.sql = statement.ast.to_sql();
+        reduced.push(statement);
+    }
+    changed.then_some(reduced)
+}
+
+fn statement_references_table(statement: &GeneratedAstStatement, table: &Identifier) -> bool {
+    match statement {
+        GeneratedAstStatement::CreateTable {
+            table: statement_table,
+            ..
+        }
+        | GeneratedAstStatement::CreateIndex {
+            table: statement_table,
+            ..
+        }
+        | GeneratedAstStatement::Insert {
+            table: statement_table,
+            ..
+        }
+        | GeneratedAstStatement::Update {
+            table: statement_table,
+            ..
+        }
+        | GeneratedAstStatement::Delete {
+            table: statement_table,
+            ..
+        } => statement_table == table,
+        GeneratedAstStatement::Select { select } => select_references_table(select, table),
+        GeneratedAstStatement::Transaction { .. } => false,
+    }
+}
+
+fn select_references_table(select: &Select, table: &Identifier) -> bool {
+    select
+        .from
+        .as_ref()
+        .is_some_and(|from| from.table == *table)
+        || select.joins.iter().any(|join| join.table == *table)
+        || select
+            .projection
+            .iter()
+            .any(|item| expression_references_table(&item.expr, table))
+        || select
+            .predicate
+            .as_ref()
+            .is_some_and(|expression| expression_references_table(expression, table))
+        || select
+            .group_by
+            .iter()
+            .any(|expression| expression_references_table(expression, table))
+        || select
+            .having
+            .as_ref()
+            .is_some_and(|expression| expression_references_table(expression, table))
+        || select
+            .compound
+            .as_ref()
+            .is_some_and(|compound| select_references_table(&compound.right, table))
+}
+
+fn expression_references_table(expression: &Expr, table: &Identifier) -> bool {
+    match expression {
+        Expr::Value { .. } => false,
+        Expr::Column {
+            table: expression_table,
+            ..
+        } => expression_table
+            .as_ref()
+            .is_some_and(|candidate| candidate == table),
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Aggregate {
+            expr: Some(expr), ..
+        } => expression_references_table(expr, table),
+        Expr::Aggregate { expr: None, .. } => false,
+        Expr::Binary { left, right, .. } => {
+            expression_references_table(left, table) || expression_references_table(right, table)
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            expression_references_table(expr, table) || select_references_table(subquery, table)
+        }
+        Expr::ScalarSubquery { subquery } => select_references_table(subquery, table),
+    }
+}
+
+fn statement_payload_bytes(statements: &[GeneratedStatement]) -> usize {
+    serde_json::to_vec(statements)
+        .expect("generated statements must serialize for deterministic reduction")
+        .len()
+}
+
+fn statement_payload_hash(statements: &[GeneratedStatement]) -> String {
+    let bytes = serde_json::to_vec(statements)
+        .expect("generated statements must serialize for deterministic reduction");
+    sha256_hex(&bytes)
 }
 
 // ===========================================================================
@@ -635,6 +1663,15 @@ fn hex_encode_truncated(bytes: &[u8], max_chars: usize) -> String {
     }
     s.truncate(max_chars);
     s
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        write!(output, "{byte:02x}").expect("write to String");
+    }
+    output
 }
 
 // ===========================================================================
