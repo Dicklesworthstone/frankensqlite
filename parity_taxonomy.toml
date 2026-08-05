@@ -1,7 +1,7 @@
 [inert_contract_pointer]
 schema_version = "fsqlite.inert_contract_pointer.v1"
 canonical_path = "docs/contracts/parity_taxonomy.toml"
-canonical_sha256 = "113c29111dbe54e626a190b6ba87634ba8bc7ad9340f131b87a99a97023f47f4"
+canonical_sha256 = "315fde10ca631023bcf972c798d5ba280d8c328c68c3973f5238a6db2aa72981"
 disposition = "historical_payload_inert; docs/contracts path is the sole authority"
 legacy_payload = '''
 # FrankenSQLite Parity Taxonomy v1.0.0

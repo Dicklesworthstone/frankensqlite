@@ -1213,7 +1213,7 @@ fn build_sql_grammar_invariants() -> Vec<ParityInvariant> {
     );
     b.add(
         "F-SQL-033",
-        "VACUUM and VACUUM INTO produce integrity-clean rebuilt database images and preserve documented header metadata; v0.2.0 excludes exact zero-freelist, header-consistent, fixed-point compaction parity (GH #301).",
+        "VACUUM produces queryable rebuilds and VACUUM INTO produces integrity-clean copies while preserving documented header metadata; v0.2.0 excludes exact zero-freelist, header-consistent, fixed-point compaction parity (GH #301).",
         &["WAL journal mode"],
         vec![
             unit_obligation(

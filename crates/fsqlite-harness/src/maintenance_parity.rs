@@ -191,7 +191,7 @@ pub fn assess_maintenance_parity(config: &MaintenanceParityConfig) -> Maintenanc
         check_name: "vacuum_fixed_point_compaction".to_owned(),
         command: "vacuum".to_owned(),
         parity_achieved: false,
-        detail: "VACUUM produces integrity-clean rebuilds, but GH #301 means the rebuilt image can retain freed or trailing pages and page-1 freelist metadata can disagree with the committed freelist; zero-freelist fixed-point compaction is not at parity"
+        detail: "VACUUM produces queryable rebuilds that preserve documented header metadata, but GH #301 means the rebuilt image can retain freed or trailing pages and page-1 freelist metadata can disagree with the committed freelist; zero-freelist fixed-point compaction is not at parity"
             .to_owned(),
     });
     checks.push(MaintenanceCheck {
@@ -237,7 +237,8 @@ pub fn assess_maintenance_parity(config: &MaintenanceParityConfig) -> Maintenanc
         check_name: "integrity_check_disabled_option".to_owned(),
         command: "integrity_check".to_owned(),
         parity_achieved: true,
-        detail: "Integrity check can be disabled, leaving report field None".to_owned(),
+        detail: "The runtime maintenance executor can omit its optional integrity-check result when that check is disabled"
+            .to_owned(),
     });
     commands_at_parity.push("integrity_check".to_owned());
 
@@ -283,8 +284,11 @@ pub fn assess_maintenance_parity(config: &MaintenanceParityConfig) -> Maintenanc
     let parity_score = truncate_score(checks_at_parity as f64 / total_checks as f64);
 
     let cmds_ok = commands_at_parity.len() >= config.min_commands_tested;
-    #[allow(clippy::overly_complex_bool_expr)]
-    let integrity_ok = !config.require_integrity_ok || true;
+    let integrity_check_ok = checks
+        .iter()
+        .filter(|check| check.command == "integrity_check")
+        .all(|check| check.parity_achieved);
+    let integrity_ok = !config.require_integrity_ok || integrity_check_ok;
 
     let verdict = if cmds_ok && integrity_ok && checks_at_parity == total_checks {
         MaintenanceVerdict::Parity
@@ -308,7 +312,7 @@ pub fn assess_maintenance_parity(config: &MaintenanceParityConfig) -> Maintenanc
         verdict,
         commands_tested,
         commands_at_parity,
-        integrity_check_ok: true,
+        integrity_check_ok,
         parity_score,
         total_checks,
         checks_at_parity,
@@ -397,6 +401,14 @@ mod tests {
     fn assess_integrity() {
         let report = assess_maintenance_parity(&MaintenanceParityConfig::default());
         assert!(report.integrity_check_ok);
+        assert_eq!(
+            report.integrity_check_ok,
+            report
+                .checks
+                .iter()
+                .filter(|check| check.command == "integrity_check")
+                .all(|check| check.parity_achieved)
+        );
     }
 
     #[test]

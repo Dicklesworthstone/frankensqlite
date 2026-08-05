@@ -293,13 +293,13 @@ id = "F-SQL.30"
 family = "SQL"
 title = "VACUUM and VACUUM INTO"
 weight = 4
-status = "pass"
+status = "partial"
 observability = [
   "test_vacuum",
-  "test_vacuum_into_copies_main_database_to_new_file",
-  "canonical_sha256_convenience_works",
+  "test_vacuum_rebuilds_file_backed_database_and_preserves_header_metadata",
+  "test_vacuum_into_writes_compacted_copy_with_preserved_page_size_and_pragmas",
 ]
-notes = "Pager-backed VACUUM rebuilds file-backed databases in place, and VACUUM INTO writes compact backup copies while preserving page size and header pragmas"
+notes = "VACUUM produces queryable rebuilds and VACUUM INTO produces integrity-clean copies while preserving documented header metadata. GH #301 excludes exact zero-freelist, header-consistent, fixed-point compact-image parity in v0.2.0."
 
 [[features]]
 id = "F-SQL.31"
