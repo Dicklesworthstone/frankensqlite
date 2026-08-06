@@ -672,6 +672,8 @@ struct WindowsOsLockFiles {
     reserved_file: File,
     pending_file: File,
     held_levels: [bool; 4],
+    #[cfg(test)]
+    fail_next_restore: bool,
 }
 
 impl WindowsOsLockFiles {
@@ -709,6 +711,8 @@ impl WindowsOsLockFiles {
             reserved_file,
             pending_file,
             held_levels: [false; 4],
+            #[cfg(test)]
+            fail_next_restore: false,
         })
     }
 
@@ -834,6 +838,58 @@ impl WindowsOsLockFiles {
             }
         }
         Ok(())
+    }
+
+    fn is_exactly_at(&self, level: LockLevel) -> bool {
+        match level {
+            LockLevel::None => self.held_levels == [false; 4],
+            LockLevel::Shared => self.held_levels == [true, false, false, false],
+            LockLevel::Reserved => self.held_levels == [true, true, false, false],
+            LockLevel::Pending => self.held_levels == [true, true, true, false],
+            // EXCLUSIVE replaces this handle's SHARED lock on the shared
+            // sidecar while retaining the RESERVED and PENDING prefix.
+            LockLevel::Exclusive => self.held_levels == [false, true, true, true],
+        }
+    }
+
+    fn restore_to_exact(&mut self, level: LockLevel) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_restore) {
+            return Err(FrankenError::Io(std::io::Error::other(
+                "injected Windows cooperative ordinary-lock restoration failure",
+            )));
+        }
+
+        self.unlock_to(level)?;
+
+        // A previous partial restoration can leave an upper sidecar held while
+        // a lower prefix member is absent. Rebuild only the missing members,
+        // then verify the complete per-surface state instead of trusting the
+        // file-level aggregate lock value.
+        if level >= LockLevel::Shared
+            && !self.lock_held(LockLevel::Shared)
+            && !self.lock_held(LockLevel::Exclusive)
+        {
+            self.try_lock_level(LockLevel::Shared)?;
+        }
+        if level >= LockLevel::Reserved && !self.lock_held(LockLevel::Reserved) {
+            self.try_lock_level(LockLevel::Reserved)?;
+        }
+        if level >= LockLevel::Pending && !self.lock_held(LockLevel::Pending) {
+            self.try_lock_level(LockLevel::Pending)?;
+        }
+        if level == LockLevel::Exclusive && !self.lock_held(LockLevel::Exclusive) {
+            self.try_lock_level(LockLevel::Exclusive)?;
+        }
+
+        if self.is_exactly_at(level) {
+            Ok(())
+        } else {
+            Err(FrankenError::internal(format!(
+                "Windows cooperative ordinary locks did not restore exactly to {level:?}: held={:?}",
+                self.held_levels
+            )))
+        }
     }
 
     fn highest_held_level(&self) -> LockLevel {
@@ -1012,7 +1068,42 @@ impl WindowsStockMainLocks {
         self.lock_level = self.highest_held_level();
     }
 
-    fn unlock_to(&mut self, level: LockLevel) -> Result<()> {
+    fn is_exactly_at(&self, level: LockLevel) -> bool {
+        match level {
+            LockLevel::None => {
+                !self.pending
+                    && !self.reserved
+                    && !self.shared_range
+                    && !self.shared_range_exclusive
+            }
+            LockLevel::Shared => {
+                !self.pending
+                    && !self.reserved
+                    && self.shared_range
+                    && !self.shared_range_exclusive
+            }
+            LockLevel::Reserved => {
+                !self.pending
+                    && self.reserved
+                    && self.shared_range
+                    && !self.shared_range_exclusive
+            }
+            LockLevel::Pending => {
+                self.pending
+                    && self.reserved
+                    && self.shared_range
+                    && !self.shared_range_exclusive
+            }
+            LockLevel::Exclusive => {
+                self.pending
+                    && self.reserved
+                    && self.shared_range
+                    && self.shared_range_exclusive
+            }
+        }
+    }
+
+    fn restore_to_exact(&mut self, level: LockLevel) -> Result<()> {
         let mut failures = Vec::new();
 
         if self.shared_range_exclusive && level < LockLevel::Exclusive {
@@ -1065,11 +1156,33 @@ impl WindowsStockMainLocks {
         }
 
         self.recompute_lock_level();
-        if failures.is_empty() && self.lock_level != level {
-            failures.push(format!(
-                "requested {level:?} but only a partial/non-prefix stock lock state remained ({:?})",
-                self.lock_level
-            ));
+        if failures.is_empty() {
+            // A prior partial restoration can leave one of the lower stock
+            // ranges absent while an upper range remains held. Reconstruct the
+            // exact requested prefix without treating the derived lock level as
+            // proof that every constituent range is present.
+            if level >= LockLevel::Shared && !self.shared_range {
+                self.try_lock_level(LockLevel::Shared)?;
+            }
+            if level >= LockLevel::Reserved && !self.reserved {
+                self.try_lock_level(LockLevel::Reserved)?;
+            }
+            if level >= LockLevel::Pending && !self.pending {
+                self.try_lock_level(LockLevel::Pending)?;
+            }
+            if level == LockLevel::Exclusive && !self.shared_range_exclusive {
+                self.try_lock_level(LockLevel::Exclusive)?;
+            }
+            self.recompute_lock_level();
+            if !self.is_exactly_at(level) {
+                failures.push(format!(
+                    "requested {level:?} but exact stock lock state was not restored: pending={} reserved={} shared={} exclusive={}",
+                    self.pending,
+                    self.reserved,
+                    self.shared_range,
+                    self.shared_range_exclusive
+                ));
+            }
         }
         if failures.is_empty() {
             Ok(())
@@ -1707,11 +1820,23 @@ impl WindowsFile {
         Ok(())
     }
 
-    fn rollback_ordinary_locks_to(&mut self, level: LockLevel) -> Result<()> {
-        let stock_result = self
+    fn ordinary_locks_are_exactly_at(&self, level: LockLevel) -> Result<bool> {
+        let stock_exact = self
             .stock_main_locks
-            .as_mut()
-            .map_or(Ok(()), |locks| locks.unlock_to(level));
+            .as_ref()
+            .map_or(level == LockLevel::None, |locks| {
+                locks.is_exactly_at(level)
+            });
+        Ok(stock_exact && self.os_locks_ref()?.is_exactly_at(level))
+    }
+
+    fn rollback_ordinary_locks_to(&mut self, level: LockLevel) -> Result<()> {
+        let stock_result = if self.stock_main_locks.is_none() && level == LockLevel::None {
+            Ok(())
+        } else {
+            self.stock_main_locks_mut()
+                .and_then(|locks| locks.restore_to_exact(level))
+        };
         if stock_result.is_err() {
             // A partial UnlockFileEx failure can leave a non-prefix subset of
             // SQLite lock levels (for example RESERVED without SHARED). Drop
@@ -1721,15 +1846,20 @@ impl WindowsFile {
             // structurally incomplete lock ladder.
             drop(self.stock_main_locks.take());
         }
-        let cooperative_result = self.os_locks_mut()?.unlock_to(level);
-        self.lock_level = std::cmp::min(
-            self.stock_main_locks
-                .as_ref()
-                .map_or(LockLevel::None, |locks| locks.lock_level),
-            self.os_locks_ref()?.highest_held_level(),
-        );
+        let cooperative_result = self.os_locks_mut()?.restore_to_exact(level);
         match (stock_result, cooperative_result) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Ok(())) => {
+                if !self.ordinary_locks_are_exactly_at(level)? {
+                    return Err(FrankenError::internal(format!(
+                        "Windows ordinary lock restoration reported success without exact {level:?} ownership on both surfaces"
+                    )));
+                }
+                // The aggregate is publication state, not a recovery oracle.
+                // Advance it only after both independent surfaces prove the
+                // exact recorded target.
+                self.lock_level = level;
+                Ok(())
+            }
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(stock_error), Err(cooperative_error)) => Err(FrankenError::internal(format!(
                 "Windows ordinary lock rollback failed on both lock surfaces: stock={stock_error}; cooperative={cooperative_error}"
@@ -1737,12 +1867,8 @@ impl WindowsFile {
         }
     }
 
-    fn restore_ordinary_lock_level(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
-        if self.lock_level < level {
-            self.lock(cx, level)
-        } else {
-            self.unlock(cx, level)
-        }
+    fn restore_ordinary_lock_level(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
+        self.rollback_ordinary_locks_to(level)
     }
 
     fn acquire_cooperative_wal_maintenance_locks(
@@ -2243,7 +2369,10 @@ impl VfsFile for WindowsFile {
         Ok(self.file_ref()?.metadata()?.len())
     }
 
-    fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
+    fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        if !self.ordinary_locks_are_exactly_at(self.lock_level)? {
+            self.restore_ordinary_lock_level(cx, self.lock_level)?;
+        }
         if level <= self.lock_level {
             return Ok(());
         }
@@ -2280,11 +2409,11 @@ impl VfsFile for WindowsFile {
         Ok(())
     }
 
-    fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if level >= self.lock_level {
+    fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        if level >= self.lock_level && self.ordinary_locks_are_exactly_at(self.lock_level)? {
             return Ok(());
         }
-        self.rollback_ordinary_locks_to(level)
+        self.restore_ordinary_lock_level(cx, level)
     }
 
     fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
