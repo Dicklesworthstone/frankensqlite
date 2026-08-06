@@ -6,13 +6,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use asupersync::lab::{LabConfig, LabRuntime};
 use asupersync::runtime::yield_now;
 use asupersync::types::Budget;
-use fsqlite::{AsyncConnection, Row, SqliteValue};
+use fsqlite::AsyncConnection;
+use fsqlite_core::connection::{Connection, ConnectionEnv, IoPollStrategy, Row, RuntimeConfig};
 use fsqlite_harness::failure_bundle::{ExecutionLaneEvidence, ObservedExecutionLane};
 use fsqlite_harness::serializability_oracle::{
     BeginMode, HistoryEvent, HistoryOperation, HistoryValue, HistoryWorkload, OracleVerdict,
     ScheduleControl, ScheduleProvenance, SerializabilityReport, TransactionHistory, check_history,
 };
 use fsqlite_harness::test_inventory::ExecutionLane;
+use fsqlite_types::SqliteValue;
 use fsqlite_types::cx::Cx as FsqliteCx;
 use sha2::{Digest, Sha256};
 
@@ -135,6 +137,13 @@ fn lock_outcomes(outcomes: &Arc<Mutex<Vec<TxnOutcome>>>) -> MutexGuard<'_, Vec<T
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn runtime_config() -> RuntimeConfig {
+    RuntimeConfig {
+        worker_threads: 1,
+        io_poll_strategy: IoPollStrategy::Blocking,
+    }
+}
+
 fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     fsqlite_harness::bytes_to_lower_hex(Sha256::digest(bytes))
 }
@@ -157,16 +166,25 @@ fn fsqlite_cx(case: LabHistoryCase, decision_id: u64) -> FsqliteCx {
     cx
 }
 
-fn open_lab_connection(
+fn connection_env(cx: &FsqliteCx) -> ConnectionEnv {
+    ConnectionEnv::new_with_root_cx(runtime_config(), cx)
+}
+
+async fn open_lab_connection(
     case: LabHistoryCase,
     decision_id: u64,
     path: &str,
-) -> Result<(AsyncConnection, FsqliteCx), String> {
+) -> Result<(Connection, FsqliteCx), String> {
     let cx = fsqlite_cx(case, decision_id);
     cx.checkpoint()
         .map_err(|error| format!("LabRuntime-rooted Cx pre-open checkpoint: {error}"))?;
-    let conn = AsyncConnection::open_sync(path.to_owned())
-        .map_err(|error| format!("open production async connection: {error}"))?;
+    let conn = Connection::open_with_env(path.to_owned(), connection_env(&cx))
+        .await
+        .map_err(|error| format!("open production bridged connection: {error}"))?;
+    conn.set_strict_mem_fallback_rejection(true);
+    conn.execute("PRAGMA busy_timeout=5000;")
+        .await
+        .map_err(|error| format!("set bounded busy timeout: {error}"))?;
     Ok((conn, cx))
 }
 
@@ -185,9 +203,13 @@ fn sqlite_integer(row: &Row, column: usize) -> Result<i64, String> {
     }
 }
 
-fn concurrent_mode_enabled(conn: &AsyncConnection) -> Result<bool, String> {
+async fn concurrent_mode_enabled(conn: &Connection) -> Result<bool, String> {
+    if !conn.is_concurrent_mode_default() {
+        return Ok(false);
+    }
     let rows = conn
-        .query_sync("PRAGMA concurrent_mode;")
+        .query("PRAGMA concurrent_mode;")
+        .await
         .map_err(|error| format!("query concurrent mode: {error}"))?;
     let row = rows
         .first()
@@ -287,13 +309,17 @@ async fn run_disjoint_writer(
 ) {
     let (mut conn, cx) =
         open_lab_connection(LabHistoryCase::DisjointWriters, plan.decision_id, &path)
+            .await
             .expect("open disjoint lab connection");
     cx.checkpoint()
         .expect("LabRuntime-rooted FrankenSQLite Cx should remain live");
-    let mode_enabled = concurrent_mode_enabled(&conn).expect("query disjoint concurrent mode");
+    let mode_enabled = concurrent_mode_enabled(&conn)
+        .await
+        .expect("query disjoint concurrent mode");
     assert!(mode_enabled, "concurrent mode must start enabled");
 
-    conn.execute_sync("BEGIN;")
+    conn.execute("BEGIN;")
+        .await
         .expect("begin disjoint transaction");
     lock_recorder(&recorder).record(
         plan.connection_id,
@@ -304,10 +330,11 @@ async fn run_disjoint_writer(
     );
     yield_now().await;
 
-    conn.execute_sync(&format!(
+    conn.execute(&format!(
         "INSERT INTO {} VALUES (1, {});",
         plan.table, plan.value
     ))
+    .await
     .expect("insert disjoint value");
     lock_recorder(&recorder).record(
         plan.connection_id,
@@ -320,7 +347,8 @@ async fn run_disjoint_writer(
     );
     yield_now().await;
 
-    conn.execute_sync("COMMIT;")
+    conn.execute("COMMIT;")
+        .await
         .expect("commit disjoint transaction");
     lock_recorder(&recorder).record(
         plan.connection_id,
@@ -333,8 +361,7 @@ async fn run_disjoint_writer(
         transient_conflict: false,
         concurrent_mode_enabled: mode_enabled,
     });
-    conn.close_sync()
-        .expect("disjoint lab connection should close");
+    conn.close_best_effort_in_place().await;
 }
 
 async fn run_same_row_conflict(
@@ -343,8 +370,10 @@ async fn run_same_row_conflict(
     outcomes: Arc<Mutex<Vec<TxnOutcome>>>,
 ) {
     let (mut winner, winner_cx) = open_lab_connection(LabHistoryCase::SameRowConflict, 51, &path)
+        .await
         .expect("open conflict winner");
     let (mut loser, loser_cx) = open_lab_connection(LabHistoryCase::SameRowConflict, 52, &path)
+        .await
         .expect("open conflict loser");
     winner_cx
         .checkpoint()
@@ -352,14 +381,18 @@ async fn run_same_row_conflict(
     loser_cx
         .checkpoint()
         .expect("loser LabRuntime-rooted Cx should remain live");
-    let winner_mode = concurrent_mode_enabled(&winner).expect("query winner concurrent mode");
-    let loser_mode = concurrent_mode_enabled(&loser).expect("query loser concurrent mode");
+    let winner_mode = concurrent_mode_enabled(&winner)
+        .await
+        .expect("query winner concurrent mode");
+    let loser_mode = concurrent_mode_enabled(&loser)
+        .await
+        .expect("query loser concurrent mode");
     assert!(
         winner_mode && loser_mode,
         "both conflict connections need concurrent default"
     );
 
-    winner.execute_sync("BEGIN;").expect("winner begin");
+    winner.execute("BEGIN;").await.expect("winner begin");
     lock_recorder(&recorder).record(
         "conflict-winner",
         Some("txn-winner"),
@@ -367,7 +400,7 @@ async fn run_same_row_conflict(
             mode: BeginMode::Concurrent,
         },
     );
-    loser.execute_sync("BEGIN;").expect("loser begin");
+    loser.execute("BEGIN;").await.expect("loser begin");
     lock_recorder(&recorder).record(
         "conflict-loser",
         Some("txn-loser"),
@@ -378,7 +411,8 @@ async fn run_same_row_conflict(
     yield_now().await;
 
     let winner_read = winner
-        .query_sync("SELECT value FROM conflict_register WHERE id = 1;")
+        .query("SELECT value FROM conflict_register WHERE id = 1;")
+        .await
         .expect("winner read");
     lock_recorder(&recorder).record(
         "conflict-winner",
@@ -394,7 +428,8 @@ async fn run_same_row_conflict(
         },
     );
     let loser_read = loser
-        .query_sync("SELECT value FROM conflict_register WHERE id = 1;")
+        .query("SELECT value FROM conflict_register WHERE id = 1;")
+        .await
         .expect("loser read");
     lock_recorder(&recorder).record(
         "conflict-loser",
@@ -412,7 +447,8 @@ async fn run_same_row_conflict(
     yield_now().await;
 
     winner
-        .execute_sync("UPDATE conflict_register SET value = 100 WHERE id = 1;")
+        .execute("UPDATE conflict_register SET value = 100 WHERE id = 1;")
+        .await
         .expect("winner update");
     lock_recorder(&recorder).record(
         "conflict-winner",
@@ -423,7 +459,28 @@ async fn run_same_row_conflict(
             page_number: None,
         },
     );
-    winner.execute_sync("COMMIT;").expect("winner commit");
+    yield_now().await;
+
+    let update_result = loser
+        .execute("UPDATE conflict_register SET value = 200 WHERE id = 1;")
+        .await;
+    if let Ok(changes) = update_result.as_ref() {
+        assert_eq!(
+            *changes, 1,
+            "loser update should touch the stale row before FCW resolution"
+        );
+        lock_recorder(&recorder).record(
+            "conflict-loser",
+            Some("txn-loser"),
+            HistoryOperation::Write {
+                key: "conflict_register/1".to_owned(),
+                value: HistoryValue::Integer(200),
+                page_number: None,
+            },
+        );
+    }
+
+    winner.execute("COMMIT;").await.expect("winner commit");
     lock_recorder(&recorder).record(
         "conflict-winner",
         Some("txn-winner"),
@@ -437,11 +494,10 @@ async fn run_same_row_conflict(
     });
     yield_now().await;
 
-    let update_result =
-        loser.execute_sync("UPDATE conflict_register SET value = 200 WHERE id = 1;");
     let conflict = match update_result {
         Ok(_) => loser
-            .execute_sync("COMMIT;")
+            .execute("COMMIT;")
+            .await
             .expect_err("loser commit must fail after same-row conflict"),
         Err(error) => error,
     };
@@ -456,7 +512,7 @@ async fn run_same_row_conflict(
             reason: "first_committer_wins_transient".to_owned(),
         },
     );
-    let _ = loser.execute_sync("ROLLBACK;");
+    let _ = loser.execute("ROLLBACK;").await;
     lock_recorder(&recorder).record(
         "conflict-loser",
         Some("txn-loser"),
@@ -471,12 +527,8 @@ async fn run_same_row_conflict(
         concurrent_mode_enabled: loser_mode,
     });
 
-    winner
-        .close_sync()
-        .expect("winner lab connection should close");
-    loser
-        .close_sync()
-        .expect("loser lab connection should close");
+    winner.close_best_effort_in_place().await;
+    loser.close_best_effort_in_place().await;
 }
 
 fn schedule_provenance(
