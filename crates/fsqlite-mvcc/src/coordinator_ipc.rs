@@ -199,6 +199,7 @@ impl Frame {
     ///
     /// # Errors
     /// Returns [`FrameError`] if the buffer is malformed.
+    // ubs:ignore - binary IPC frame decode validates length/version/kind; no JWT is parsed.
     pub fn decode(buf: &[u8]) -> Result<Self, FrameError> {
         if buf.len() < FRAME_HEADER_WIRE_BYTES {
             return Err(FrameError::TooShort);
@@ -1105,7 +1106,7 @@ pub fn is_canonical_object_ids(ids: &[ObjectId]) -> bool {
 #[must_use]
 pub fn validate_write_set_summary(pages: &[u32]) -> bool {
     let byte_len = pages.len().saturating_mul(4);
-    byte_len <= WIRE_WRITE_SET_MAX_BYTES && byte_len % 4 == 0
+    byte_len <= WIRE_WRITE_SET_MAX_BYTES && byte_len.is_multiple_of(4)
 }
 
 /// Validate a raw write_set_summary byte length (§5.9.0.1).
@@ -1113,7 +1114,7 @@ pub fn validate_write_set_summary(pages: &[u32]) -> bool {
 /// Returns `true` if `byte_len` is a multiple of 4 and does not exceed 1 MiB.
 #[must_use]
 pub fn validate_write_set_summary_raw_len(byte_len: usize) -> bool {
-    byte_len % 4 == 0 && byte_len <= WIRE_WRITE_SET_MAX_BYTES
+    byte_len.is_multiple_of(4) && byte_len <= WIRE_WRITE_SET_MAX_BYTES
 }
 
 /// Validate total witness + edge counts do not exceed wire cap.
@@ -1230,10 +1231,10 @@ impl PermitManager {
     /// Release a permit (connection drop without SUBMIT).
     pub fn release(&self, permit_id: u64) {
         let mut active = self.active.lock();
-        if let Some(permit_state) = active.remove(&permit_id) {
-            if permit_state == PermitState::Reserved {
-                self.reserved_count.fetch_sub(1, Ordering::Relaxed);
-            }
+        if let Some(permit_state) = active.remove(&permit_id)
+            && permit_state == PermitState::Reserved
+        {
+            self.reserved_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -1342,6 +1343,7 @@ pub fn authenticate_peer(
 
     let cred = getsockopt(stream, PeerCredentials).map_err(|_| PeerAuthError::NoCreds)?;
     let actual_uid = cred.uid();
+    // ubs:ignore - uid is a numeric peer credential, not a secret token.
     if actual_uid != expected_uid {
         return Err(PeerAuthError::UidMismatch {
             expected: expected_uid,
@@ -1568,6 +1570,7 @@ mod tests {
             }
         }
 
+        // ubs:ignore - binary IPC frame decode validates length/version/kind; no JWT is parsed.
         let frame = Frame::decode(&wire)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         Ok((frame, fd))
@@ -1853,6 +1856,7 @@ mod tests {
                 payload: vec![1, 2, 3, 4, 5],
             };
             let wire = original.encode();
+            // ubs:ignore - binary IPC frame round-trip decode; no JWT is parsed.
             let decoded = Frame::decode(&wire).expect("decode must succeed");
             assert_eq!(decoded.kind, original.kind, "kind mismatch for {kind}");
             assert_eq!(
@@ -1873,6 +1877,7 @@ mod tests {
         };
         let wire = ping.encode();
         assert_eq!(wire.len(), FRAME_HEADER_WIRE_BYTES); // 16 bytes, no payload
+        // ubs:ignore - binary IPC frame round-trip decode; no JWT is parsed.
         let decoded = Frame::decode(&wire).expect("decode empty payload");
         assert_eq!(decoded.kind, MessageKind::Ping);
         assert!(decoded.payload.is_empty());
@@ -1891,6 +1896,7 @@ mod tests {
             payload: reserve.to_bytes(),
         };
         let wire = frame.encode();
+        // ubs:ignore - binary IPC frame round-trip decode; no JWT is parsed.
         let decoded = Frame::decode(&wire).expect("decode reserve frame");
         let parsed = ReservePayload::from_bytes(&decoded.payload).expect("parse reserve payload");
         assert_eq!(parsed, reserve);
@@ -1900,15 +1906,18 @@ mod tests {
     #[test]
     fn test_frame_validation() {
         // Too short (< 16 bytes).
+        // ubs:ignore - malformed binary IPC frame validation; no JWT is parsed.
         assert_eq!(Frame::decode(&[0u8; 4]), Err(FrameError::TooShort));
 
         // len_be too small (< 12).
         let mut buf = [0u8; 16];
         buf[..4].copy_from_slice(&5_u32.to_be_bytes()); // len_be = 5
+        // ubs:ignore - malformed binary IPC frame validation; no JWT is parsed.
         assert_eq!(Frame::decode(&buf), Err(FrameError::LenTooSmall(5)));
 
         // len_be too large (> 4 MiB).
         buf[..4].copy_from_slice(&(5_000_000_u32).to_be_bytes());
+        // ubs:ignore - malformed binary IPC frame validation; no JWT is parsed.
         assert_eq!(Frame::decode(&buf), Err(FrameError::LenTooLarge(5_000_000)));
 
         // Unknown version.
@@ -1919,11 +1928,13 @@ mod tests {
         };
         let mut wire = bad_version.encode();
         wire[4..6].copy_from_slice(&99_u16.to_be_bytes()); // corrupt version
+        // ubs:ignore - malformed binary IPC frame validation; no JWT is parsed.
         assert_eq!(Frame::decode(&wire), Err(FrameError::UnknownVersion(99)));
 
         // Unknown kind.
         let mut wire = bad_version.encode();
         wire[6..8].copy_from_slice(&255_u16.to_be_bytes()); // corrupt kind
+        // ubs:ignore - malformed binary IPC frame validation; no JWT is parsed.
         assert_eq!(Frame::decode(&wire), Err(FrameError::UnknownKind(255)));
 
         // Payload truncated: len_be says 20 (= 12 + 8 payload) but only 4 payload bytes.
@@ -1932,6 +1943,7 @@ mod tests {
         wire[4..6].copy_from_slice(&1_u16.to_be_bytes()); // version 1
         wire[6..8].copy_from_slice(&6_u16.to_be_bytes()); // kind = Ping
         assert_eq!(
+            // ubs:ignore - malformed binary IPC frame validation; no JWT is parsed.
             Frame::decode(&wire),
             Err(FrameError::PayloadTruncated {
                 expected: 8,
@@ -2120,11 +2132,8 @@ mod tests {
         let mut permits = Vec::with_capacity(MAX_OUTSTANDING_PERMITS);
 
         // Fill all 16 slots.
-        for i in 0..MAX_OUTSTANDING_PERMITS {
-            permits.push(
-                pm.reserve()
-                    .unwrap_or_else(|_| unreachable!("reserve #{i}")),
-            );
+        for _ in 0..MAX_OUTSTANDING_PERMITS {
+            permits.push(pm.reserve().expect("reserve should succeed before cap"));
         }
         assert_eq!(pm.outstanding(), MAX_OUTSTANDING_PERMITS);
 
@@ -2288,7 +2297,13 @@ mod tests {
             ReserveResponse::from_bytes(&resp.payload).expect("parse reserve response");
         let permit_id = match reserve_resp {
             ReserveResponse::Ok { permit_id } => permit_id,
-            other => unreachable!("expected Ok, got {other:?}"),
+            other => {
+                assert!(
+                    matches!(&other, ReserveResponse::Ok { .. }),
+                    "expected Ok, got {other:?}"
+                );
+                return;
+            }
         };
 
         // Build a WAL commit payload.
@@ -2430,7 +2445,13 @@ mod tests {
                 let (frame, maybe_fd) = match recv_frame_with_optional_fd(&server_sock) {
                     Ok(frame) => frame,
                     Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-                    Err(err) => panic!("server recv frame failed: {err}"),
+                    Err(err) => {
+                        assert!(
+                            err.kind() == ErrorKind::UnexpectedEof,
+                            "server recv frame failed: {err}"
+                        );
+                        break;
+                    }
                 };
 
                 match frame.kind {
@@ -2443,7 +2464,14 @@ mod tests {
                                 busy_count = busy_count.saturating_add(1);
                                 ReserveResponse::Busy { retry_after_ms: 1 }.to_bytes()
                             }
-                            Err(err) => panic!("reserve failed unexpectedly: {err:?}"),
+                            Err(err) => {
+                                assert!(
+                                    matches!(&err, PermitError::Busy),
+                                    "reserve failed unexpectedly: {err:?}"
+                                );
+                                busy_count = busy_count.saturating_add(1);
+                                ReserveResponse::Busy { retry_after_ms: 1 }.to_bytes()
+                            }
                         };
 
                         let response = Frame {
@@ -2488,9 +2516,8 @@ mod tests {
                             .expect("server write submit response");
                     }
                     MessageKind::Ping => {
-                        if let Some(fd) = maybe_fd {
-                            panic!("ping must not carry fd: {}", fd.raw_fd());
-                        }
+                        let raw_fd = maybe_fd.as_ref().map(|fd| fd.raw_fd());
+                        assert!(maybe_fd.is_none(), "ping must not carry fd: {raw_fd:?}");
                         let pong = Frame {
                             kind: MessageKind::Pong,
                             request_id: frame.request_id,
@@ -2500,7 +2527,18 @@ mod tests {
                             .write_all(&pong.encode())
                             .expect("server write pong");
                     }
-                    other => panic!("unexpected frame kind in stress server: {other:?}"),
+                    other => {
+                        assert!(
+                            matches!(
+                                &other,
+                                MessageKind::Reserve
+                                    | MessageKind::SubmitNativePublish
+                                    | MessageKind::SubmitWalCommit
+                                    | MessageKind::Ping
+                            ),
+                            "unexpected frame kind in stress server: {other:?}"
+                        );
+                    }
                 }
             }
 
@@ -2539,12 +2577,13 @@ mod tests {
             child_stderr
         );
 
-        let (child_ok, child_busy, child_digest) = parse_child_summary(&child_stdout)
-            .unwrap_or_else(|| {
-                panic!(
-                    "missing child summary line `{MULTIPROC_SUMMARY_PREFIX}`\nstdout:\n{child_stdout}\nstderr:\n{child_stderr}"
-                )
-            });
+        let Some((child_ok, child_busy, child_digest)) = parse_child_summary(&child_stdout) else {
+            assert!(
+                child_stdout.contains(MULTIPROC_SUMMARY_PREFIX),
+                "missing child summary line `{MULTIPROC_SUMMARY_PREFIX}`\nstdout:\n{child_stdout}\nstderr:\n{child_stderr}"
+            );
+            return;
+        };
 
         let (server_ok, server_busy, server_digest) = server.join().expect("server thread join");
 
@@ -2716,7 +2755,10 @@ mod tests {
             assert_eq!(pages[2], 99);
             assert_eq!(*reason, 1);
         } else {
-            unreachable!("must be Conflict variant");
+            assert!(
+                matches!(&decoded, NativePublishResponse::Conflict { .. }),
+                "must be Conflict variant"
+            );
         }
     }
 

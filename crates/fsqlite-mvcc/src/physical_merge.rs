@@ -828,14 +828,14 @@ pub fn repack_btree_page(
     page[header_offset + 7] = 0;
 
     // Right-most child for interior pages
-    if let Some(child) = right_most_child {
-        if page_type.is_interior() {
-            let child_bytes = child.get().to_be_bytes();
-            page[header_offset + 8] = child_bytes[0];
-            page[header_offset + 9] = child_bytes[1];
-            page[header_offset + 10] = child_bytes[2];
-            page[header_offset + 11] = child_bytes[3];
-        }
+    if let Some(child) = right_most_child
+        && page_type.is_interior()
+    {
+        let child_bytes = child.get().to_be_bytes();
+        page[header_offset + 8] = child_bytes[0];
+        page[header_offset + 9] = child_bytes[1];
+        page[header_offset + 10] = child_bytes[2];
+        page[header_offset + 11] = child_bytes[3];
     }
 
     // Write cells from end of page, and cell pointers
@@ -951,31 +951,30 @@ pub fn evaluate_merge_ladder(
     }
 
     // Level 2: Deterministic rebase (preferred)
-    if let (Some(log), Some(reader), Some(schema)) = (intent_log, base_row_reader, schema_lookup) {
-        if !log.is_empty() {
-            let eligibility = check_rebase_eligibility(log);
-            if matches!(
-                eligibility,
-                crate::deterministic_rebase::RebaseEligibility::Eligible
-            ) {
-                let snapshot =
-                    Snapshot::new(CommitSeq::new(0), SchemaEpoch::new(snapshot_schema_epoch));
-                let no_unique = crate::index_regen::NoOpUniqueChecker;
-                if let Ok(result) = deterministic_rebase(log, snapshot, reader, schema, &no_unique)
-                {
-                    info!(
-                        ladder_step = "level2",
-                        result = "merge",
-                        reason = "deterministic rebase succeeded",
-                        rebased_op_count = result.rebased_ops.len(),
-                        "merge_ladder: deterministic rebase succeeded"
-                    );
-                    return Ok(MergeLadderResult::RebaseSucceeded {
-                        rebased_ops: result.rebased_ops,
-                    });
-                }
-                // Rebase failed — fall through to Level 3
+    if let (Some(log), Some(reader), Some(schema)) = (intent_log, base_row_reader, schema_lookup)
+        && !log.is_empty()
+    {
+        let eligibility = check_rebase_eligibility(log);
+        if matches!(
+            eligibility,
+            crate::deterministic_rebase::RebaseEligibility::Eligible
+        ) {
+            let snapshot =
+                Snapshot::new(CommitSeq::new(0), SchemaEpoch::new(snapshot_schema_epoch));
+            let no_unique = crate::index_regen::NoOpUniqueChecker;
+            if let Ok(result) = deterministic_rebase(log, snapshot, reader, schema, &no_unique) {
+                info!(
+                    ladder_step = "level2",
+                    result = "merge",
+                    reason = "deterministic rebase succeeded",
+                    rebased_op_count = result.rebased_ops.len(),
+                    "merge_ladder: deterministic rebase succeeded"
+                );
+                return Ok(MergeLadderResult::RebaseSucceeded {
+                    rebased_ops: result.rebased_ops,
+                });
             }
+            // Rebase failed — fall through to Level 3
         }
     }
 
@@ -1529,7 +1528,14 @@ mod tests {
             | MergeLadderResult::StructuredMergeSucceeded { .. } => {
                 // Either path is valid — rebase may succeed or fall through to merge
             }
-            other => panic!("expected rebase or structured merge, got {other:?}"),
+            other => assert!(
+                matches!(
+                    &other,
+                    MergeLadderResult::RebaseSucceeded { .. }
+                        | MergeLadderResult::StructuredMergeSucceeded { .. }
+                ),
+                "expected rebase or structured merge, got {other:?}"
+            ),
         }
     }
 
@@ -1581,7 +1587,10 @@ mod tests {
                 assert!(rowids.contains(&1));
                 assert!(rowids.contains(&2));
             }
-            other => panic!("expected StructuredMergeSucceeded, got {other:?}"),
+            other => assert!(
+                matches!(&other, MergeLadderResult::StructuredMergeSucceeded { .. }),
+                "expected StructuredMergeSucceeded, got {other:?}"
+            ),
         }
     }
 
@@ -1812,7 +1821,16 @@ mod tests {
                 expected: 1,
                 actual: 2,
             }) => {}
-            other => panic!("expected SchemaEpochMismatch, got {other:?}"),
+            other => assert!(
+                matches!(
+                    &other,
+                    Err(MergeError::SchemaEpochMismatch {
+                        expected: 1,
+                        actual: 2
+                    })
+                ),
+                "expected SchemaEpochMismatch, got {other:?}"
+            ),
         }
     }
 
@@ -1886,7 +1904,10 @@ mod tests {
                 assert_eq!(parsed.cells.len(), 1);
                 assert_eq!(parsed.cells[0].rowid, Some(2));
             }
-            other => panic!("expected StructuredMergeSucceeded, got {other:?}"),
+            other => assert!(
+                matches!(&other, MergeLadderResult::StructuredMergeSucceeded { .. }),
+                "expected StructuredMergeSucceeded, got {other:?}"
+            ),
         }
     }
 
@@ -1995,7 +2016,8 @@ mod tests {
                     );
                 }
             }
-            other => panic!(
+            other => assert!(
+                matches!(&other, MergeLadderResult::StructuredMergeSucceeded { .. }),
                 "bead_id=bd-3dv4 case=e2e_commuting expected StructuredMergeSucceeded, got {other:?}"
             ),
         }
@@ -2105,7 +2127,8 @@ mod tests {
                     assert_eq!(mc.cell_bytes, sc.cell_bytes);
                 }
             }
-            other => panic!(
+            other => assert!(
+                matches!(&other, MergeLadderResult::StructuredMergeSucceeded { .. }),
                 "bead_id=bd-3dv4 case=e2e_multi expected StructuredMergeSucceeded, got {other:?}"
             ),
         }

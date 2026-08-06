@@ -79,7 +79,8 @@ const fn rebuild_drain_spin_loops(attempt: u32) -> u32 {
 }
 
 const fn rebuild_drain_should_yield(attempt: u32) -> bool {
-    attempt >= REBUILD_DRAIN_HANDOFF_YIELD_EVERY && attempt % REBUILD_DRAIN_HANDOFF_YIELD_EVERY == 0
+    attempt >= REBUILD_DRAIN_HANDOFF_YIELD_EVERY
+        && attempt.is_multiple_of(REBUILD_DRAIN_HANDOFF_YIELD_EVERY)
 }
 
 fn perform_rebuild_drain_handoff(wait: RebuildDrainWait) {
@@ -109,6 +110,7 @@ fn current_process_birth_token(now_fallback: u64) -> u64 {
         if !std::path::Path::new("/proc").exists() {
             return now_fallback;
         }
+        // ubs:ignore - procfs start ticks distinguish PID reuse; not a security token.
         if let Some(start_ticks) = read_proc_start_time_ticks(std::process::id()) {
             return PID_BIRTH_PROCFS_TAG | (start_ticks & !PID_BIRTH_PROCFS_TAG);
         }
@@ -904,12 +906,11 @@ impl SharedPageLockTable {
         }
 
         // Check draining table.
-        if draining_idx != DRAINING_NONE {
-            if let ProbeResult::FoundOwnedBy(owner) =
+        if draining_idx != DRAINING_NONE
+            && let ProbeResult::FoundOwnedBy(owner) =
                 self.probe_for_existing(&self.tables[draining_idx as usize], page_number)
-            {
-                return Some(owner);
-            }
+        {
+            return Some(owner);
         }
 
         None
@@ -2351,7 +2352,10 @@ mod tests {
                         acquired_count += 1;
                     }
                     other => {
-                        unreachable!("unexpected result for page {page}: {other:?}");
+                        assert!(
+                            matches!(&other, AcquireResult::Busy { .. } | AcquireResult::Acquired),
+                            "unexpected result for page {page}: {other:?}"
+                        );
                     }
                 }
             }

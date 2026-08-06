@@ -172,9 +172,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for VendorCachePadded<T> {
 const _: () = {
     assert!(align_of::<VendorCachePadded<u8>>() == VENDOR_CACHE_LINE_BYTES);
     assert!(size_of::<VendorCachePadded<u8>>() == VENDOR_CACHE_LINE_BYTES);
-    // `%` rather than `is_multiple_of`: the latter is not const-stable at
-    // the crate MSRV (1.85).
-    assert!(size_of::<VendorCachePadded<[u8; 200]>>() % VENDOR_CACHE_LINE_BYTES == 0);
+    assert!(size_of::<VendorCachePadded<[u8; 200]>>().is_multiple_of(VENDOR_CACHE_LINE_BYTES));
 };
 
 // ---------------------------------------------------------------------------
@@ -982,11 +980,11 @@ impl RecentlyCommittedReadersIndex {
         }
 
         // Ring is full — check if oldest entry is evictable.
-        if let Some(oldest) = &self.ring[self.head] {
-            if oldest.commit_seq > min_active_begin_seq {
-                // Oldest entry still required — fail closed.
-                return Err(RcriOverflowError);
-            }
+        if let Some(oldest) = &self.ring[self.head]
+            && oldest.commit_seq > min_active_begin_seq
+        {
+            // Oldest entry still required — fail closed.
+            return Err(RcriOverflowError);
         }
 
         // Evict oldest, write new entry at head, advance head.
@@ -1032,14 +1030,14 @@ impl RecentlyCommittedReadersIndex {
     pub fn gc(&mut self, min_active_begin_seq: u64) -> usize {
         let mut pruned = 0;
         while self.len > 0 {
-            if let Some(oldest) = &self.ring[self.head] {
-                if oldest.commit_seq <= min_active_begin_seq {
-                    self.ring[self.head] = None;
-                    self.head = (self.head + 1) % self.ring.len();
-                    self.len -= 1;
-                    pruned += 1;
-                    continue;
-                }
+            if let Some(oldest) = &self.ring[self.head]
+                && oldest.commit_seq <= min_active_begin_seq
+            {
+                self.ring[self.head] = None;
+                self.head = (self.head + 1) % self.ring.len();
+                self.len -= 1;
+                pruned += 1;
+                continue;
             }
             break;
         }

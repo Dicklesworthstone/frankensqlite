@@ -1780,12 +1780,12 @@ pub fn validate_first_committer_wins(
     let mut max_conflicting_seq = CommitSeq::ZERO;
 
     for page in handle.tracked_write_conflict_pages_iter() {
-        if let Some(committed_seq) = commit_index.latest(page) {
-            if committed_seq > snapshot_seq {
-                conflicting_pages.push(page);
-                if committed_seq > max_conflicting_seq {
-                    max_conflicting_seq = committed_seq;
-                }
+        if let Some(committed_seq) = commit_index.latest(page)
+            && committed_seq > snapshot_seq
+        {
+            conflicting_pages.push(page);
+            if committed_seq > max_conflicting_seq {
+                max_conflicting_seq = committed_seq;
             }
         }
     }

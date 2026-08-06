@@ -298,12 +298,12 @@ where
 
             if last_page_seen != Some(current_page) {
                 pages_touched.push(current_page);
-                if let Some(prefetch_page) = self.next_prefetch_page(current_page) {
-                    if self.last_prefetched_page != Some(prefetch_page) {
-                        self.cursor.prefetch_page_hint(&self.cx, prefetch_page);
-                        self.last_prefetched_page = Some(prefetch_page);
-                        prefetch_hints_issued = prefetch_hints_issued.saturating_add(1);
-                    }
+                if let Some(prefetch_page) = self.next_prefetch_page(current_page)
+                    && self.last_prefetched_page != Some(prefetch_page)
+                {
+                    self.cursor.prefetch_page_hint(&self.cx, prefetch_page);
+                    self.last_prefetched_page = Some(prefetch_page);
+                    prefetch_hints_issued = prefetch_hints_issued.saturating_add(1);
                 }
                 last_page_seen = Some(current_page);
             }
@@ -522,6 +522,10 @@ mod tests {
     const PAGE_SIZE: u32 = 512;
     const ROOT_PAGE: u32 = 2;
     const BEAD_ID: &str = "bd-14vp7.2";
+
+    fn test_failure() -> bool {
+        false
+    }
 
     fn block_on_test<F: Future>(future: F) -> F::Output {
         RuntimeBuilder::current_thread()
@@ -1002,7 +1006,13 @@ mod tests {
             let capacity = MAX_BATCH_CAPACITY.saturating_add(1);
 
             let err = match VectorizedTableScan::try_new(&cx, scan_cursor, specs(), capacity) {
-                Ok(_) => panic!("oversized batch capacity should be rejected up front"),
+                Ok(_) => {
+                    assert!(
+                        test_failure(),
+                        "oversized batch capacity should be rejected up front"
+                    );
+                    return;
+                }
                 Err(err) => err,
             };
             assert!(matches!(

@@ -1144,17 +1144,16 @@ impl CellSlotCache {
         // entry back to the front. Mutate in place when the target is already
         // MRU to keep this path allocation-free and bounded by the SmallVec
         // slot scan.
-        if let Some(front) = self.entries.first_mut() {
-            if front.page_no == page_no && front.mutation_counter == mutation_counter {
-                if let Some((_, existing)) =
-                    front.slots.iter_mut().find(|(idx, _)| *idx == cell_idx)
-                {
-                    *existing = slot;
-                } else {
-                    front.slots.push((cell_idx, slot));
-                }
-                return;
+        if let Some(front) = self.entries.first_mut()
+            && front.page_no == page_no
+            && front.mutation_counter == mutation_counter
+        {
+            if let Some((_, existing)) = front.slots.iter_mut().find(|(idx, _)| *idx == cell_idx) {
+                *existing = slot;
+            } else {
+                front.slots.push((cell_idx, slot));
             }
+            return;
         }
         self.insert_slow(page_no, mutation_counter, cell_idx, slot);
     }
@@ -3406,14 +3405,15 @@ impl<P: PageReader> BtCursor<P> {
         // Alien Optimization: Hot-path Stack Elision.
         // We can only elide the load if the page hasn't been modified
         // in the current transaction (is not dirty).
-        if let Some(existing) = self.stack.last() {
-            if existing.page_no == page_no && !self.pager.is_dirty(page_no) {
-                // In MVCC, unmodified pages for a given snapshot are immutable.
-                let mut cached = existing.clone();
-                cached.cell_idx = 0;
-                self.note_page_visit(page_no);
-                return Ok(cached);
-            }
+        if let Some(existing) = self.stack.last()
+            && existing.page_no == page_no
+            && !self.pager.is_dirty(page_no)
+        {
+            // In MVCC, unmodified pages for a given snapshot are immutable.
+            let mut cached = existing.clone();
+            cached.cell_idx = 0;
+            self.note_page_visit(page_no);
+            return Ok(cached);
         }
 
         self.note_page_visit(page_no);
@@ -7348,65 +7348,57 @@ impl<P: PageWriter> BtCursor<P> {
             if leaf_entry.header.page_type == cell::BtreePageType::LeafTable
                 && insert_idx == leaf_entry.header.cell_count
                 && child_idx == parent_entry.header.cell_count as usize
+                && let Some((_, n)) = read_varint(cell_data)
+                && let Some((rowid, _)) = read_varint(&cell_data[n..])
             {
-                if let Some((_, n)) = read_varint(cell_data) {
-                    if let Some((rowid, _)) = read_varint(&cell_data[n..]) {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let rowid = rowid as i64;
-                        let divider_rowid = self
-                            .rightmost_leaf_cache
-                            .as_ref()
-                            .filter(|cached| cached.page_no == leaf_entry.page_no)
-                            .map(|cached| cached.rowid)
-                            .unwrap_or_else(|| {
-                                Self::table_leaf_rowid_at(
-                                    leaf_entry,
-                                    leaf_entry.header.cell_count.saturating_sub(1),
-                                )
-                                .unwrap_or_else(|_| rowid.saturating_sub(1))
-                            });
-                        let quick_balance_start = instrumentation::profile_start();
-                        match balance::balance_quick_known_divider_rowid(
-                            cx,
-                            &mut self.pager,
-                            parent_page_no,
-                            leaf_entry.page_no,
-                            cell_data,
-                            divider_rowid,
-                            self.usable_size,
-                            self.page_size,
+                #[allow(clippy::cast_possible_wrap)]
+                let rowid = rowid as i64;
+                let divider_rowid = self
+                    .rightmost_leaf_cache
+                    .as_ref()
+                    .filter(|cached| cached.page_no == leaf_entry.page_no)
+                    .map(|cached| cached.rowid)
+                    .unwrap_or_else(|| {
+                        Self::table_leaf_rowid_at(
+                            leaf_entry,
+                            leaf_entry.header.cell_count.saturating_sub(1),
                         )
-                        .await
-                        {
-                            Ok(Some(result)) => {
-                                instrumentation::record_quick_balance_attempt(
-                                    quick_balance_start,
-                                    true,
-                                );
-                                self.note_split_event();
-                                self.stack.clear();
-                                self.at_eof = true;
-                                self.last_known_depth = Some(depth);
-                                self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
-                                    page_no: result.new_pgno,
-                                    rowid,
-                                    tree_depth: depth,
-                                    parent_page: Some(parent_page_no),
-                                    page_data: result.new_page_data,
-                                    header: result.new_header,
-                                    cell_pointers: vec![result.new_cell_ptr],
-                                });
-                                return Ok(());
-                            }
-                            Ok(None) => {
-                                instrumentation::record_quick_balance_attempt(
-                                    quick_balance_start,
-                                    false,
-                                );
-                            }
-                            Err(err) => return Err(err),
-                        }
+                        .unwrap_or_else(|_| rowid.saturating_sub(1))
+                    });
+                let quick_balance_start = instrumentation::profile_start();
+                match balance::balance_quick_known_divider_rowid(
+                    cx,
+                    &mut self.pager,
+                    parent_page_no,
+                    leaf_entry.page_no,
+                    cell_data,
+                    divider_rowid,
+                    self.usable_size,
+                    self.page_size,
+                )
+                .await
+                {
+                    Ok(Some(result)) => {
+                        instrumentation::record_quick_balance_attempt(quick_balance_start, true);
+                        self.note_split_event();
+                        self.stack.clear();
+                        self.at_eof = true;
+                        self.last_known_depth = Some(depth);
+                        self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
+                            page_no: result.new_pgno,
+                            rowid,
+                            tree_depth: depth,
+                            parent_page: Some(parent_page_no),
+                            page_data: result.new_page_data,
+                            header: result.new_header,
+                            cell_pointers: vec![result.new_cell_ptr],
+                        });
+                        return Ok(());
                     }
+                    Ok(None) => {
+                        instrumentation::record_quick_balance_attempt(quick_balance_start, false);
+                    }
+                    Err(err) => return Err(err),
                 }
             }
 
@@ -7830,10 +7822,10 @@ impl<P: PageWriter> BtCursor<P> {
 
         // Now we must insert `new_cell` at `cell_idx`, which will trigger a structural rebalance.
         let balance_result = self.balance_for_insert(cx, &new_cell, cell_idx).await;
-        if balance_result.is_err() {
-            if let Some(first) = new_overflow_head {
-                let _ = self.free_overflow_chain(cx, first).await;
-            }
+        if balance_result.is_err()
+            && let Some(first) = new_overflow_head
+        {
+            let _ = self.free_overflow_chain(cx, first).await;
         }
         balance_result?;
 
@@ -8827,14 +8819,13 @@ impl<P: PageWriter> BtCursor<P> {
         if let Some(reseek) = self
             .ensure_full_mutation_path(cx, MutationPathTarget::TableInsert(rowid))
             .await?
+            && reseek.is_found()
         {
-            if reseek.is_found() {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "rowid {rowid} appeared during rootless-stack rebuild before table insert"
-                    ),
-                });
-            }
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "rowid {rowid} appeared during rootless-stack rebuild before table insert"
+                ),
+            });
         }
 
         let insert_idx = {
@@ -8944,10 +8935,10 @@ impl<P: PageWriter> BtCursor<P> {
                 instrumentation::record_conservative_reload_fallback();
                 let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx).await;
                 self.cell_buf = cell_data;
-                if balance_result.is_err() {
-                    if let Some(first) = overflow_head {
-                        let _ = self.free_overflow_chain(cx, first).await;
-                    }
+                if balance_result.is_err()
+                    && let Some(first) = overflow_head
+                {
+                    let _ = self.free_overflow_chain(cx, first).await;
                 }
                 balance_result
             }
@@ -10751,12 +10742,13 @@ impl<P: PageWriter> BtCursor<P> {
                         enter_record_profile_scope(RecordProfileScope::BtreeCursor);
                     parse_record_prefix(&existing_key, n_unique_cols)
                 };
-                if let Some(existing_fields) = existing_fields {
-                    if existing_fields.len() >= n_unique_cols && new_prefix == existing_fields {
-                        return Err(FrankenError::UniqueViolation {
-                            columns: columns_label.to_owned(),
-                        });
-                    }
+                if let Some(existing_fields) = existing_fields
+                    && existing_fields.len() >= n_unique_cols
+                    && new_prefix == existing_fields
+                {
+                    return Err(FrankenError::UniqueViolation {
+                        columns: columns_label.to_owned(),
+                    });
                 }
             }
 
@@ -10949,10 +10941,10 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                         let balance_result =
                             cursor.balance_for_insert(cx, &cell_data, insert_idx).await;
                         cursor.cell_buf = cell_data;
-                        if balance_result.is_err() {
-                            if let Some(first) = overflow_head {
-                                let _ = cursor.free_overflow_chain(cx, first).await;
-                            }
+                        if balance_result.is_err()
+                            && let Some(first) = overflow_head
+                        {
+                            let _ = cursor.free_overflow_chain(cx, first).await;
                         }
                         balance_result
                     }
@@ -14868,10 +14860,12 @@ mod tests {
                 let payload = cursor.payload(&cx).await.unwrap();
                 let fields = parse_record(&payload).unwrap();
                 let probe = serialize_record(&fields[..1]);
-                match fields[0] {
-                    SqliteValue::Integer(v) => seen.push(v),
-                    SqliteValue::Null => seen.push(i64::MIN),
-                    ref other => panic!("unexpected index key {other:?}"),
+                match &fields[0] {
+                    SqliteValue::Integer(v) => seen.push(*v),
+                    other => {
+                        assert_eq!(other, &SqliteValue::Null, "unexpected index key {other:?}");
+                        seen.push(i64::MIN);
+                    }
                 }
                 cursor.index_move_to_upper_bound(&cx, &probe).await.unwrap();
                 if cursor.eof() {
@@ -14891,10 +14885,12 @@ mod tests {
                 let payload = cursor.payload(&cx).await.unwrap();
                 let fields = parse_record(&payload).unwrap();
                 let first = fields[0].clone();
-                match first {
-                    SqliteValue::Integer(v) => seen_sentinel.push(v),
-                    SqliteValue::Null => seen_sentinel.push(i64::MIN),
-                    ref other => panic!("unexpected index key {other:?}"),
+                match &first {
+                    SqliteValue::Integer(v) => seen_sentinel.push(*v),
+                    other => {
+                        assert_eq!(other, &SqliteValue::Null, "unexpected index key {other:?}");
+                        seen_sentinel.push(i64::MIN);
+                    }
                 }
                 let probe = serialize_record(&[first, SqliteValue::Integer(i64::MAX)]);
                 cursor.index_move_to_upper_bound(&cx, &probe).await.unwrap();
@@ -20100,17 +20096,20 @@ mod tests {
                                 ))
                             })?;
 
-                    let expected_bounds = match (
-                        reference.keys().next().copied(),
-                        reference.keys().next_back().copied(),
-                    ) {
-                        (Some(min_rowid), Some(max_rowid)) => Some(TableSubtreeBounds {
-                            min_rowid,
-                            max_rowid,
-                        }),
-                        (None, None) => None,
-                        _ => unreachable!("BTreeMap first/last should agree on emptiness"),
-                    };
+                    let first_rowid = reference.keys().next().copied();
+                    let last_rowid = reference.keys().next_back().copied();
+                    proptest::prop_assert_eq!(
+                        first_rowid.is_some(),
+                        last_rowid.is_some(),
+                        "BTreeMap first/last should agree on emptiness"
+                    );
+                    let expected_bounds =
+                        first_rowid
+                            .zip(last_rowid)
+                            .map(|(min_rowid, max_rowid)| TableSubtreeBounds {
+                                min_rowid,
+                                max_rowid,
+                            });
                     proptest::prop_assert_eq!(
                         bounds,
                         expected_bounds,
@@ -20183,15 +20182,21 @@ mod tests {
                         ))
                     })?;
 
-                    let expected_bounds = match (expected_keys.first(), expected_keys.last()) {
-                        (Some(min_key), Some(max_key)) => Some(IndexSubtreeBounds {
-                            min_key: min_key.clone(),
-                            max_key: max_key.clone(),
-                            entry_count: expected_keys.len(),
-                        }),
-                        (None, None) => None,
-                        _ => unreachable!("expected key bounds should agree on emptiness"),
-                    };
+                    let first_key = expected_keys.first();
+                    let last_key = expected_keys.last();
+                    proptest::prop_assert_eq!(
+                        first_key.is_some(),
+                        last_key.is_some(),
+                        "expected key bounds should agree on emptiness"
+                    );
+                    let expected_bounds =
+                        first_key
+                            .zip(last_key)
+                            .map(|(min_key, max_key)| IndexSubtreeBounds {
+                                min_key: min_key.clone(),
+                                max_key: max_key.clone(),
+                                entry_count: expected_keys.len(),
+                            });
 
                     proptest::prop_assert_eq!(
                         scanned,

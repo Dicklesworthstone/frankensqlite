@@ -673,7 +673,7 @@ struct WindowsOsLockFiles {
     pending_file: File,
     held_levels: [bool; 4],
     #[cfg(test)]
-    fail_next_restore: bool,
+    fail_next_unlock: bool,
 }
 
 impl WindowsOsLockFiles {
@@ -712,7 +712,7 @@ impl WindowsOsLockFiles {
             pending_file,
             held_levels: [false; 4],
             #[cfg(test)]
-            fail_next_restore: false,
+            fail_next_unlock: false,
         })
     }
 
@@ -819,6 +819,13 @@ impl WindowsOsLockFiles {
     }
 
     fn unlock_to(&mut self, level: LockLevel) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_unlock) {
+            return Err(FrankenError::Io(std::io::Error::other(
+                "injected Windows cooperative ordinary-lock unlock failure",
+            )));
+        }
+
         if self.lock_held(LockLevel::Exclusive) && level < LockLevel::Exclusive {
             Self::unlock_file(&self.shared_file)?;
             self.set_lock_held(LockLevel::Exclusive, false);
@@ -853,13 +860,6 @@ impl WindowsOsLockFiles {
     }
 
     fn restore_to_exact(&mut self, level: LockLevel) -> Result<()> {
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_restore) {
-            return Err(FrankenError::Io(std::io::Error::other(
-                "injected Windows cooperative ordinary-lock restoration failure",
-            )));
-        }
-
         self.unlock_to(level)?;
 
         // A previous partial restoration can leave an upper sidecar held while
@@ -890,18 +890,6 @@ impl WindowsOsLockFiles {
                 self.held_levels
             )))
         }
-    }
-
-    fn highest_held_level(&self) -> LockLevel {
-        [
-            LockLevel::Exclusive,
-            LockLevel::Pending,
-            LockLevel::Reserved,
-            LockLevel::Shared,
-        ]
-        .into_iter()
-        .find(|level| self.lock_held(*level))
-        .unwrap_or(LockLevel::None)
     }
 
     fn reserved_locked_by_other(&self) -> Result<bool> {
@@ -1755,30 +1743,28 @@ impl WindowsFile {
                         )));
                     }
                     state.slots[idx].exclusive_owner = None;
-                } else if owns_shared && !other_shared {
-                    if let Err(unlock_error) =
+                } else if owns_shared
+                    && !other_shared
+                    && let Err(unlock_error) =
                         unlock_stock_sqlite_range_strict(shm_file, lock_byte, 1)
-                    {
-                        let detail = restore_missing_stock_sqlite_range_fence(
-                            shm_file,
-                            lock_byte,
-                            1,
-                            WindowsRangeLockMode::Shared,
-                            "owner-close shared unlock",
-                            &unlock_error,
-                        )
-                        .unwrap_or_else(|| {
-                            format!(
-                                "owner-close shared unlock failed for slot {slot}: {unlock_error}"
-                            )
-                        });
-                        state.poisoned = Some(detail);
-                        let _ = state.owner_refs.remove(&self.owner_id);
-                        owner_detached = true;
-                        return Err(FrankenError::internal(format!(
-                            "Windows SHM owner-close could not release shared slot {slot}: {unlock_error}"
-                        )));
-                    }
+                {
+                    let detail = restore_missing_stock_sqlite_range_fence(
+                        shm_file,
+                        lock_byte,
+                        1,
+                        WindowsRangeLockMode::Shared,
+                        "owner-close shared unlock",
+                        &unlock_error,
+                    )
+                    .unwrap_or_else(|| {
+                        format!("owner-close shared unlock failed for slot {slot}: {unlock_error}")
+                    });
+                    state.poisoned = Some(detail);
+                    let _ = state.owner_refs.remove(&self.owner_id);
+                    owner_detached = true;
+                    return Err(FrankenError::internal(format!(
+                        "Windows SHM owner-close could not release shared slot {slot}: {unlock_error}"
+                    )));
                 }
                 let _ = state.slots[idx].shared_holders.remove(&self.owner_id);
             }
@@ -1990,10 +1976,10 @@ impl WindowsFile {
             .slots
             .get_mut(idx)
             .ok_or_else(|| FrankenError::internal("shm slot index out of bounds"))?;
-        if let Some(exclusive_owner) = slot_state.exclusive_owner {
-            if exclusive_owner != self.owner_id {
-                return Err(FrankenError::Busy);
-            }
+        if let Some(exclusive_owner) = slot_state.exclusive_owner
+            && exclusive_owner != self.owner_id
+        {
+            return Err(FrankenError::Busy);
         }
         let has_shared = slot_state
             .shared_holders
@@ -2252,12 +2238,11 @@ impl VfsFile for WindowsFile {
             first_error = Some(error);
         }
 
-        if !self.is_closed() {
-            if let Err(err) = self.unlock(cx, LockLevel::None) {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
+        if !self.is_closed()
+            && let Err(err) = self.unlock(cx, LockLevel::None)
+            && first_error.is_none()
+        {
+            first_error = Some(err);
         }
 
         let release_result = if self.shm_state.is_some() || self.delete_on_close {
@@ -2396,8 +2381,11 @@ impl VfsFile for WindowsFile {
     }
 
     fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
-        if level >= self.lock_level && self.ordinary_locks_are_exactly_at(self.lock_level)? {
-            return Ok(());
+        if level >= self.lock_level {
+            if self.ordinary_locks_are_exactly_at(self.lock_level)? {
+                return Ok(());
+            }
+            return self.restore_ordinary_lock_level(cx, self.lock_level);
         }
         self.restore_ordinary_lock_level(cx, level)
     }
@@ -2831,6 +2819,7 @@ impl Drop for WindowsFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future as _;
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::process::{Child, ChildStdin, Command, Stdio};
     use std::sync::mpsc;
@@ -3804,6 +3793,97 @@ mod tests {
         assert!(file.external_shared_snapshot_prior_level.is_none());
         assert!(file.external_maintenance_locks.is_none());
         file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_dropped_pending_external_maintenance_retry_releases_cooperative_surface() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("external_dropped_restore_retry.db");
+        let vfs = WindowsVfs::new();
+        let (mut attempted, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open external-maintenance handle");
+
+        attempted
+            .lock_external_maintenance(&cx, false)
+            .expect("acquire external-maintenance fence");
+        attempted
+            .os_locks
+            .as_mut()
+            .expect("open handle has cooperative ordinary locks")
+            .fail_next_unlock = true;
+
+        let mut restoration = Box::pin(async {
+            let error = attempted
+                .restore_external_maintenance_attempt(&cx)
+                .expect_err("first cooperative restoration must fail once");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected Windows cooperative ordinary-lock unlock failure"),
+                "unexpected injected restoration error: {error}"
+            );
+            std::future::pending::<()>().await;
+        });
+        let waker = std::task::Waker::noop();
+        let mut task_cx = std::task::Context::from_waker(waker);
+        assert!(
+            matches!(
+                restoration.as_mut().poll(&mut task_cx),
+                std::task::Poll::Pending
+            ),
+            "the restoration attempt must truly become pending before cancellation"
+        );
+        drop(restoration);
+
+        assert!(
+            attempted.external_maintenance_locks.is_some(),
+            "a failed restoration must retain its retry marker"
+        );
+        assert!(
+            attempted
+                .stock_main_locks
+                .as_ref()
+                .is_some_and(|locks| locks.is_exactly_at(LockLevel::None)),
+            "the first attempt should have restored the stock-visible surface"
+        );
+        assert!(
+            attempted
+                .os_locks
+                .as_ref()
+                .is_some_and(|locks| locks.is_exactly_at(LockLevel::Exclusive)),
+            "the injected failure should leave the cooperative surface outstanding"
+        );
+        assert_eq!(
+            attempted.lock_level,
+            LockLevel::Exclusive,
+            "the aggregate must remain at the last state proven exact on both surfaces"
+        );
+
+        attempted
+            .restore_external_maintenance_attempt(&cx)
+            .expect("retry exact restoration after the dropped future");
+        assert!(attempted.external_maintenance_locks.is_none());
+        assert!(
+            attempted
+                .ordinary_locks_are_exactly_at(LockLevel::None)
+                .expect("inspect exact restored surfaces")
+        );
+        assert_eq!(attempted.lock_level, LockLevel::None);
+
+        let (mut probe, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open independent post-retry probe");
+        probe
+            .lock_external_maintenance(&cx, false)
+            .expect("the retry must leave no cooperative lock stranded");
+        probe
+            .restore_external_maintenance_attempt(&cx)
+            .expect("restore independent probe");
+
+        probe.close(&cx).unwrap();
+        attempted.close(&cx).unwrap();
     }
 
     #[test]

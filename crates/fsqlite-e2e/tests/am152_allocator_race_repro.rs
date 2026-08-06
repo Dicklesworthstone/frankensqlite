@@ -44,6 +44,7 @@
 // every await would change the stress workload this regression test measures.
 #![allow(clippy::future_not_send, clippy::large_futures)]
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
@@ -51,6 +52,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fsqlite::{Connection, FrankenError, Row, SqliteValue};
+use fsqlite_e2e::corruption_fingerprint::classify_sqlite_artifact;
 
 const WRITERS: usize = 14;
 const TABLES_PER_WRITER: usize = 6;
@@ -618,4 +620,300 @@ fn am152_allocator_race_barrier_wal() {
         Ok(()) => eprintln!("[am152 barrier wal] clean"),
         Err(e) => panic!("{e}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// bd-9inpb deterministic discriminator: two writers, one EOF page.
+//
+// The stress scenarios above reproduce the corruption but cannot say WHERE the
+// duplicate page came from. This rendezvous pins it: two file-backed
+// connections start from a byte-identical committed db_size with an empty
+// freelist, so the next allocation for either writer must extend the file at
+// EOF, and both hold that allocation inside an open concurrent transaction
+// before either publishes.
+//
+// Exactly two outcomes are correct, and they answer different questions:
+//   * one commit succeeds and the peer aborts transiently  => the connection
+//     layer's first-committer-wins adjudicated the collision;
+//   * both commit AND the file grew by >= 2 pages          => the pager
+//     allocator handed out distinct pages, so there was nothing to adjudicate.
+// The defect is the third outcome: both commit while the file grew by one
+// page, i.e. one physical page was published by two b-trees.
+// ---------------------------------------------------------------------------
+
+/// Hard wall-clock ceiling for the rendezvous. The test fails closed rather
+/// than hanging if a peer never reports.
+const EOF_RACE_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Wide enough that one row cannot share the seed page and must allocate.
+const EOF_RACE_PAYLOAD_BYTES: usize = 3_000;
+
+#[derive(Debug)]
+struct EofRaceOutcome {
+    writer: usize,
+    page_count_before: i64,
+    concurrent_txn: bool,
+    committed: bool,
+    commit_error: Option<String>,
+    commit_transient: bool,
+}
+
+async fn query_scalar_i64(conn: &Connection, sql: &str) -> Result<i64, String> {
+    let rows: Vec<Row> = with_retry(sql, || async { conn.query(sql).await }).await?;
+    match rows.first().and_then(|row| row.values().first()) {
+        Some(SqliteValue::Integer(n)) => Ok(*n),
+        other => Err(format!("{sql}: unexpected scalar row {other:?}")),
+    }
+}
+
+async fn eof_race_worker(
+    path: &Path,
+    writer: usize,
+    table: &str,
+    begin_barrier: &Barrier,
+    allocated_barrier: &Barrier,
+) -> Result<EofRaceOutcome, String> {
+    // Rendezvous 1: the guard is armed BEFORE any fallible work, so an open or
+    // query failure releases the peer on unwind instead of stranding it.
+    let begin_guard = BarrierArrivalGuard::new(begin_barrier);
+    let conn = open(path, false).await?;
+    let page_count_before = query_scalar_i64(&conn, "PRAGMA page_count;").await?;
+    begin_guard.arrive();
+
+    // Rendezvous 2 is armed before BEGIN so a failed BEGIN or INSERT cannot
+    // strand the peer either.
+    let allocated_guard = BarrierArrivalGuard::new(allocated_barrier);
+
+    // Default concurrent mode must promote this BEGIN; the assertion below is
+    // what keeps this test honest if that default ever regresses.
+    with_retry("begin", || async {
+        conn.execute("BEGIN;").await.map(|_| ())
+    })
+    .await?;
+    let concurrent_txn = conn.is_concurrent_transaction();
+
+    // Distinct per-writer marker: if two b-trees ever share a page, a scan of
+    // one table surfaces the other writer's payload.
+    let marker = if writer == 0 { 'x' } else { 'y' };
+    let payload: String = std::iter::repeat_n(marker, EOF_RACE_PAYLOAD_BYTES).collect();
+    if let Err(err) = conn
+        .execute_with_params(
+            &format!("INSERT INTO {table} (p) VALUES (?1);"),
+            &[SqliteValue::Text(payload.into())],
+        )
+        .await
+    {
+        let _ = conn.execute("ROLLBACK;").await;
+        return Err(format!("writer {writer} insert: {err}"));
+    }
+
+    // Both writers now hold a freshly allocated EOF page inside an open
+    // concurrent transaction. Publication is next.
+    allocated_guard.arrive();
+
+    let (committed, commit_error, commit_transient) = match conn.execute("COMMIT;").await {
+        Ok(_) => (true, None, false),
+        Err(err) => {
+            let transient = is_transient(&err);
+            let _ = conn.execute("ROLLBACK;").await;
+            (false, Some(format!("{err}")), transient)
+        }
+    };
+
+    Ok(EofRaceOutcome {
+        writer,
+        page_count_before,
+        concurrent_txn,
+        committed,
+        commit_error,
+        commit_transient,
+    })
+}
+
+#[test]
+#[ignore = "bd-9inpb discriminator: red until the shared-page allocation race is fixed; run with --ignored"]
+fn two_eof_allocators_never_publish_the_same_page() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("am152_eof_race.db");
+
+    // Seed both tables inside ONE explicit serialized transaction. Default
+    // concurrent DDL can lease pages it never uses and return them to the
+    // freelist, which would give the writers a reusable page and defeat the
+    // "must extend at EOF" premise. The freelist assertion below is what makes
+    // that premise checked rather than assumed.
+    let mut seed: Result<i64, String> = Err("seed skipped".to_owned());
+    asupersync::test_utils::run_test(|| async {
+        seed = async {
+            let conn = open(&db_path, false).await?;
+            with_retry("seed begin", || async {
+                conn.execute("BEGIN IMMEDIATE;").await.map(|_| ())
+            })
+            .await?;
+            for table in ["a", "b"] {
+                with_retry(&format!("seed {table}"), || async {
+                    conn.execute(&format!(
+                        "CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, p TEXT);"
+                    ))
+                    .await
+                    .map(|_| ())
+                })
+                .await?;
+            }
+            with_retry("seed commit", || async {
+                conn.execute("COMMIT;").await.map(|_| ())
+            })
+            .await?;
+            query_scalar_i64(&conn, "PRAGMA freelist_count;").await
+        }
+        .await;
+    });
+    let seed_freelist = seed.expect("seed");
+    assert_eq!(
+        seed_freelist, 0,
+        "seed must leave an empty freelist so the next allocation has to extend at EOF"
+    );
+
+    let begin_barrier = Arc::new(Barrier::new(2));
+    let allocated_barrier = Arc::new(Barrier::new(2));
+    let path = Arc::new(db_path.clone());
+    let (tx, rx) = mpsc::channel();
+
+    let handles: Vec<_> = [(0_usize, "a"), (1_usize, "b")]
+        .into_iter()
+        .map(|(writer, table)| {
+            let path = Arc::clone(&path);
+            let begin_barrier = Arc::clone(&begin_barrier);
+            let allocated_barrier = Arc::clone(&allocated_barrier);
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let mut outcome: Result<EofRaceOutcome, String> =
+                    Err(format!("writer {writer} never reported"));
+                asupersync::test_utils::run_test(|| async {
+                    outcome =
+                        eof_race_worker(&path, writer, table, &begin_barrier, &allocated_barrier)
+                            .await;
+                });
+                let _ = tx.send(outcome);
+            })
+        })
+        .collect();
+    drop(tx);
+
+    let mut outcomes = Vec::new();
+    for _ in 0..2 {
+        match rx.recv_timeout(EOF_RACE_RESULT_TIMEOUT) {
+            Ok(Ok(outcome)) => outcomes.push(outcome),
+            Ok(Err(err)) => panic!("EOF-race worker failed: {err}"),
+            Err(err) => panic!(
+                "EOF-race rendezvous did not report within {EOF_RACE_RESULT_TIMEOUT:?}: {err}"
+            ),
+        }
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    assert_eq!(
+        outcomes[0].page_count_before, outcomes[1].page_count_before,
+        "writers must start from an identical committed db_size: {outcomes:?}"
+    );
+    for outcome in &outcomes {
+        assert!(
+            outcome.concurrent_txn,
+            "writer {} did not run a concurrent transaction; concurrent mode must stay ON: {outcome:?}",
+            outcome.writer
+        );
+    }
+
+    let committed: Vec<&EofRaceOutcome> = outcomes.iter().filter(|o| o.committed).collect();
+    let aborted: Vec<&EofRaceOutcome> = outcomes.iter().filter(|o| !o.committed).collect();
+    assert!(
+        !committed.is_empty(),
+        "both EOF allocators failed to commit; expected at least one winner: {outcomes:?}"
+    );
+    for outcome in &aborted {
+        assert!(
+            outcome.commit_transient,
+            "writer {} aborted with a non-transient error; FCW must reject with a retryable busy/snapshot error: {:?}",
+            outcome.writer, outcome.commit_error
+        );
+    }
+
+    let mut verify: Result<(i64, Vec<String>, i64, i64), String> = Err("verify skipped".to_owned());
+    asupersync::test_utils::run_test(|| async {
+        verify = async {
+            let conn = open(&db_path, false).await?;
+            let page_count_after = query_scalar_i64(&conn, "PRAGMA page_count;").await?;
+            let msgs = integrity_messages(&conn).await?;
+            let rows_a = query_scalar_i64(&conn, "SELECT COUNT(*) FROM a;").await?;
+            let rows_b = query_scalar_i64(&conn, "SELECT COUNT(*) FROM b;").await?;
+            Ok((page_count_after, msgs, rows_a, rows_b))
+        }
+        .await;
+    });
+    let (page_count_after, frank_msgs, rows_a, rows_b) = verify.expect("verify");
+
+    let rusqlite_msg: String = {
+        let c = rusqlite::Connection::open(&db_path).expect("rusqlite open");
+        c.query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+            .expect("rusqlite integrity_check")
+    };
+
+    let pages_grown = page_count_after - outcomes[0].page_count_before;
+    eprintln!(
+        "[am152 eof-race] committed={} aborted={} pages_grown={pages_grown} rows_a={rows_a} rows_b={rows_b} frank={frank_msgs:?} rusqlite={rusqlite_msg:?}",
+        committed.len(),
+        aborted.len()
+    );
+
+    // Direct page-set receipt. Every Franken and rusqlite handle opened above
+    // is closed by this point, so the on-disk image can be classified.
+    // `pages_grown` stays diagnostic only: concurrent page leases can advance
+    // db_size or hand back unused pages, so file growth proves nothing about
+    // ownership in either direction.
+    let classification =
+        classify_sqlite_artifact(&db_path, None).expect("classify sqlite artifact");
+    let owned = |name: &str| -> BTreeSet<u32> {
+        classification
+            .ownership
+            .iter()
+            .filter(|owner| owner.name == name)
+            .flat_map(|owner| {
+                owner
+                    .pages
+                    .iter()
+                    .copied()
+                    .chain(owner.overflow_pages.iter().copied())
+            })
+            .collect()
+    };
+    let owned_a = owned("a");
+    let owned_b = owned("b");
+    let shared: Vec<u32> = owned_a.intersection(&owned_b).copied().collect();
+    assert!(
+        shared.is_empty(),
+        "SHARED PAGE PUBLISHED: tables a and b own overlapping page(s) {shared:?} (a={owned_a:?} b={owned_b:?}); \
+         first-committer-wins did not adjudicate the collision: {outcomes:?}"
+    );
+    assert!(
+        classification.multiply_owned_pages.is_empty(),
+        "multiply-owned pages after the EOF race: {:?} (outcomes: {outcomes:?})",
+        classification.multiply_owned_pages
+    );
+
+    assert_eq!(
+        rows_a + rows_b,
+        committed.len() as i64,
+        "row count must equal the number of committed writers: a={rows_a} b={rows_b} committed={} frank={frank_msgs:?} rusqlite={rusqlite_msg:?}",
+        committed.len()
+    );
+    assert_eq!(
+        frank_msgs,
+        ["ok"],
+        "fsqlite integrity_check must be clean after the EOF race: {frank_msgs:?}"
+    );
+    assert_eq!(
+        rusqlite_msg, "ok",
+        "stock SQLite integrity_check must be clean after the EOF race: {rusqlite_msg:?}"
+    );
 }

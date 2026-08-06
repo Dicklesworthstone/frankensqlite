@@ -154,7 +154,9 @@ impl HybridShmState {
         // by serializing the header and checksumming the first 40 bytes.
         let hdr_bytes = self.legacy_hdr.to_bytes();
         let (mut s1, mut s2) = (0_u32, 0_u32);
-        for chunk in hdr_bytes[..40].chunks_exact(8) {
+        let (chunks, remainder) = hdr_bytes[..40].as_chunks::<8>();
+        debug_assert!(remainder.is_empty());
+        for chunk in chunks {
             let w1 = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let w2 = u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
             s1 = s1.wrapping_add(w1).wrapping_add(s2);
@@ -457,7 +459,7 @@ mod tests {
             let new_mx_frame = commit_num * 3; // 3, 6, 9, 12, 15
             let updated = state
                 .update_legacy_shm(new_mx_frame, 10 + commit_num, [commit_num, 0], [0, 0])
-                .unwrap_or_else(|_| unreachable!("commit {commit_num} should succeed"));
+                .expect("commit should succeed");
 
             assert!(
                 updated.hdr.mx_frame > prev_mx_frame,

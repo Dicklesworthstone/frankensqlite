@@ -300,13 +300,13 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
 
     /// If the root is an interior node with an overflowing buffer, flush it.
     fn flush_if_needed(&mut self) {
-        if let BeNode::Interior { buffer, .. } = &self.root {
-            if buffer.len() > self.config.buffer_capacity {
-                let cap = self.config.buffer_capacity;
-                let leaf_cap = self.config.leaf_capacity;
-                let max_pivots = self.config.max_pivots;
-                flush_node(&mut self.root, cap, leaf_cap, max_pivots, 0);
-            }
+        if let BeNode::Interior { buffer, .. } = &self.root
+            && buffer.len() > self.config.buffer_capacity
+        {
+            let cap = self.config.buffer_capacity;
+            let leaf_cap = self.config.leaf_capacity;
+            let max_pivots = self.config.max_pivots;
+            flush_node(&mut self.root, cap, leaf_cap, max_pivots, 0);
         }
     }
 
@@ -478,15 +478,15 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
                     };
 
                     // Skip children whose range doesn't overlap [lo, hi].
-                    if let Some(child_lo) = child_lo_bound {
-                        if child_lo > hi {
-                            continue;
-                        }
+                    if let Some(child_lo) = child_lo_bound
+                        && child_lo > hi
+                    {
+                        continue;
                     }
-                    if let Some(child_hi) = child_hi_bound {
-                        if child_hi <= lo {
-                            continue;
-                        }
+                    if let Some(child_hi) = child_hi_bound
+                        && child_hi <= lo
+                    {
+                        continue;
                     }
 
                     self.collect_range(child, lo, hi, pending);
@@ -607,10 +607,10 @@ fn flush_node<K: Ord + Clone, V: Clone>(
 
     // Recursively flush any children that now overflow.
     for child in children.iter_mut() {
-        if let BeNode::Interior { buffer: cbuf, .. } = child {
-            if cbuf.len() > buffer_cap {
-                flush_node(child, buffer_cap, leaf_cap, max_pivots, depth + 1);
-            }
+        if let BeNode::Interior { buffer: cbuf, .. } = child
+            && cbuf.len() > buffer_cap
+        {
+            flush_node(child, buffer_cap, leaf_cap, max_pivots, depth + 1);
         }
     }
 

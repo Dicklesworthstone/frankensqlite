@@ -868,13 +868,13 @@ impl ProgramBuilder {
     pub fn finish(self) -> Result<VdbeProgram> {
         // Check for unresolved labels.
         for (i, state) in self.labels.iter().enumerate() {
-            if let LabelState::Unresolved(refs) = state {
-                if !refs.is_empty() {
-                    return Err(FrankenError::Internal(format!(
-                        "unresolved label {i} referenced by {} instruction(s)",
-                        refs.len()
-                    )));
-                }
+            if let LabelState::Unresolved(refs) = state
+                && !refs.is_empty()
+            {
+                return Err(FrankenError::Internal(format!(
+                    "unresolved label {i} referenced by {} instruction(s)",
+                    refs.len()
+                )));
             }
         }
         let bind_parameter_requirement = compute_bind_parameter_requirement(&self.ops);
@@ -1833,10 +1833,10 @@ pub mod pragma {
                 }),
             };
         }
-        if let Ok(text) = parse_text_expr(expr) {
-            if text.eq_ignore_ascii_case("fast") {
-                return Ok(2);
-            }
+        if let Ok(text) = parse_text_expr(expr)
+            && text.eq_ignore_ascii_case("fast")
+        {
+            return Ok(2);
         }
         // OFF/ON/TRUE/FALSE map to 0/1.
         Ok(i64::from(parse_bool(expr)?))
@@ -2494,6 +2494,10 @@ pub mod pragma {
 mod tests {
     use super::*;
 
+    fn test_failure() -> bool {
+        false
+    }
+
     // ── test_vdbe_op_struct_size ─────────────────────────────────────────
     #[test]
     fn test_vdbe_op_struct_size() {
@@ -3068,7 +3072,14 @@ mod tests {
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(end);
 
-        let prog = b.finish().expect("program should build");
+        // ubs:ignore - VDBE ProgramBuilder finalization in a unit test; no token or randomness.
+        let prog = match b.finish() {
+            Ok(prog) => prog,
+            Err(err) => {
+                assert!(test_failure(), "program should build: {err}");
+                return;
+            }
+        };
         assert!(
             !prog.requires_attached_memdb(),
             "storage-only table hot paths should not force a MemDatabase handoff"

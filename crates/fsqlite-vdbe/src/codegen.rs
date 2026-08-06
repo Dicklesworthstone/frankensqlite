@@ -9552,14 +9552,12 @@ fn expr_collation_for_agg(
             .then(|| declared_collation.to_owned());
     }
     // Column reference: inherit from schema.
-    if let Some(idx) = col_idx {
-        if let Some(ci) = table.columns.get(idx) {
-            if let Some(ref coll) = ci.collation {
-                if !coll.eq_ignore_ascii_case("BINARY") {
-                    return Some(coll.clone());
-                }
-            }
-        }
+    if let Some(idx) = col_idx
+        && let Some(ci) = table.columns.get(idx)
+        && let Some(coll) = &ci.collation
+        && !coll.eq_ignore_ascii_case("BINARY")
+    {
+        return Some(coll.clone());
     }
     None
 }
@@ -17329,71 +17327,68 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
         filter,
         ..
     } = expr
+        && is_aggregate_function_call(agg_name, agg_args)
     {
-        if is_aggregate_function_call(agg_name, agg_args) {
-            let canon_name = agg_name.to_ascii_uppercase();
-            let filt = filter.clone();
-            let agg_col = match agg_args {
-                FunctionArgs::Star => AggColumn {
+        let canon_name = agg_name.to_ascii_uppercase();
+        let filt = filter.clone();
+        let agg_col = match agg_args {
+            FunctionArgs::Star => AggColumn {
+                name: canon_name,
+                num_args: 0,
+                arg_col_index: None,
+                arg_is_rowid: false,
+                distinct: *distinct,
+                arg_expr: None,
+                extra_args: Vec::new(),
+                filter: filt,
+                wrapper_expr: None,
+                hidden: false,
+                multi_agg_indices: Vec::new(),
+                bare_expr: None,
+                collation: None,
+            },
+            FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
+                name: canon_name,
+                num_args: 0,
+                arg_col_index: None,
+                arg_is_rowid: false,
+                distinct: *distinct,
+                arg_expr: None,
+                extra_args: Vec::new(),
+                filter: filt,
+                wrapper_expr: None,
+                hidden: false,
+                multi_agg_indices: Vec::new(),
+                bare_expr: None,
+                collation: None,
+            },
+            FunctionArgs::List(exprs) => {
+                let (col_idx, is_rowid, a_expr) = match resolve_column_ref(&exprs[0], table, None) {
+                    Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
+                    Some(SortKeySource::Rowid) => (None, true, None),
+                    _ => (None, false, Some(Box::new(exprs[0].clone()))),
+                };
+                let extra: Vec<Expr> = exprs[1..].to_vec();
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                AggColumn {
                     name: canon_name,
-                    num_args: 0,
-                    arg_col_index: None,
-                    arg_is_rowid: false,
+                    num_args: exprs.len() as i32,
+                    arg_col_index: col_idx,
+                    arg_is_rowid: is_rowid,
                     distinct: *distinct,
-                    arg_expr: None,
-                    extra_args: Vec::new(),
+                    arg_expr: a_expr,
+                    extra_args: extra,
                     filter: filt,
                     wrapper_expr: None,
                     hidden: false,
                     multi_agg_indices: Vec::new(),
                     bare_expr: None,
                     collation: None,
-                },
-                FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
-                    name: canon_name,
-                    num_args: 0,
-                    arg_col_index: None,
-                    arg_is_rowid: false,
-                    distinct: *distinct,
-                    arg_expr: None,
-                    extra_args: Vec::new(),
-                    filter: filt,
-                    wrapper_expr: None,
-                    hidden: false,
-                    multi_agg_indices: Vec::new(),
-                    bare_expr: None,
-                    collation: None,
-                },
-                FunctionArgs::List(exprs) => {
-                    let (col_idx, is_rowid, a_expr) =
-                        match resolve_column_ref(&exprs[0], table, None) {
-                            Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
-                            Some(SortKeySource::Rowid) => (None, true, None),
-                            _ => (None, false, Some(Box::new(exprs[0].clone()))),
-                        };
-                    let extra: Vec<Expr> = exprs[1..].to_vec();
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    AggColumn {
-                        name: canon_name,
-                        num_args: exprs.len() as i32,
-                        arg_col_index: col_idx,
-                        arg_is_rowid: is_rowid,
-                        distinct: *distinct,
-                        arg_expr: a_expr,
-                        extra_args: extra,
-                        filter: filt,
-                        wrapper_expr: None,
-                        hidden: false,
-                        multi_agg_indices: Vec::new(),
-                        bare_expr: None,
-                        collation: None,
-                    }
                 }
-            };
-            let placeholder =
-                Expr::Column(ColumnRef::bare("__agg_result__"), fsqlite_ast::Span::ZERO);
-            return Some((agg_col, placeholder));
-        }
+            }
+        };
+        let placeholder = Expr::Column(ColumnRef::bare("__agg_result__"), fsqlite_ast::Span::ZERO);
+        return Some((agg_col, placeholder));
     }
 
     match expr {
@@ -17476,18 +17471,18 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
             else_expr,
             span,
         } => {
-            if let Some(b) = operand {
-                if let Some((agg_col, new_base)) = extract_inner_aggregate(b, table) {
-                    return Some((
-                        agg_col,
-                        Expr::Case {
-                            operand: Some(Box::new(new_base)),
-                            whens: whens.clone(),
-                            else_expr: else_expr.clone(),
-                            span: *span,
-                        },
-                    ));
-                }
+            if let Some(b) = operand
+                && let Some((agg_col, new_base)) = extract_inner_aggregate(b, table)
+            {
+                return Some((
+                    agg_col,
+                    Expr::Case {
+                        operand: Some(Box::new(new_base)),
+                        whens: whens.clone(),
+                        else_expr: else_expr.clone(),
+                        span: *span,
+                    },
+                ));
             }
             for (i, (cond, val)) in whens.iter().enumerate() {
                 if let Some((agg_col, new_cond)) = extract_inner_aggregate(cond, table) {
@@ -17517,18 +17512,18 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     ));
                 }
             }
-            if let Some(e) = else_expr {
-                if let Some((agg_col, new_else)) = extract_inner_aggregate(e, table) {
-                    return Some((
-                        agg_col,
-                        Expr::Case {
-                            operand: operand.clone(),
-                            whens: whens.clone(),
-                            else_expr: Some(Box::new(new_else)),
-                            span: *span,
-                        },
-                    ));
-                }
+            if let Some(e) = else_expr
+                && let Some((agg_col, new_else)) = extract_inner_aggregate(e, table)
+            {
+                return Some((
+                    agg_col,
+                    Expr::Case {
+                        operand: operand.clone(),
+                        whens: whens.clone(),
+                        else_expr: Some(Box::new(new_else)),
+                        span: *span,
+                    },
+                ));
             }
         }
         Expr::IsNull {
@@ -17612,75 +17607,73 @@ fn rewrite_aggregates_recursive(
         filter,
         ..
     } = expr
+        && is_aggregate_function_call(name, args)
     {
-        if is_aggregate_function_call(name, args) {
-            let idx = agg_cols.len();
-            let canon_name = name.to_ascii_uppercase();
-            let filt = filter.clone();
-            let agg_col = match args {
-                FunctionArgs::Star => AggColumn {
+        let idx = agg_cols.len();
+        let canon_name = name.to_ascii_uppercase();
+        let filt = filter.clone();
+        let agg_col = match args {
+            FunctionArgs::Star => AggColumn {
+                name: canon_name,
+                num_args: 0,
+                arg_col_index: None,
+                arg_is_rowid: false,
+                distinct: *distinct,
+                arg_expr: None,
+                extra_args: Vec::new(),
+                filter: filt,
+                wrapper_expr: None,
+                hidden: true,
+                multi_agg_indices: Vec::new(),
+                bare_expr: None,
+                collation: None,
+            },
+            FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
+                name: canon_name,
+                num_args: 0,
+                arg_col_index: None,
+                arg_is_rowid: false,
+                distinct: *distinct,
+                arg_expr: None,
+                extra_args: Vec::new(),
+                filter: filt,
+                wrapper_expr: None,
+                hidden: true,
+                multi_agg_indices: Vec::new(),
+                bare_expr: None,
+                collation: None,
+            },
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            FunctionArgs::List(exprs) => {
+                let (col_idx, is_rowid, a_expr) = match resolve_column_ref(&exprs[0], table, None) {
+                    Some(SortKeySource::Column(i)) => (Some(i), false, None),
+                    Some(SortKeySource::Rowid) => (None, true, None),
+                    _ => (None, false, Some(Box::new(exprs[0].clone()))),
+                };
+                let extra: Vec<Expr> = exprs[1..].to_vec();
+                AggColumn {
                     name: canon_name,
-                    num_args: 0,
-                    arg_col_index: None,
-                    arg_is_rowid: false,
+                    num_args: exprs.len() as i32,
+                    arg_col_index: col_idx,
+                    arg_is_rowid: is_rowid,
                     distinct: *distinct,
-                    arg_expr: None,
-                    extra_args: Vec::new(),
+                    arg_expr: a_expr,
+                    extra_args: extra,
                     filter: filt,
                     wrapper_expr: None,
                     hidden: true,
                     multi_agg_indices: Vec::new(),
                     bare_expr: None,
                     collation: None,
-                },
-                FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
-                    name: canon_name,
-                    num_args: 0,
-                    arg_col_index: None,
-                    arg_is_rowid: false,
-                    distinct: *distinct,
-                    arg_expr: None,
-                    extra_args: Vec::new(),
-                    filter: filt,
-                    wrapper_expr: None,
-                    hidden: true,
-                    multi_agg_indices: Vec::new(),
-                    bare_expr: None,
-                    collation: None,
-                },
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                FunctionArgs::List(exprs) => {
-                    let (col_idx, is_rowid, a_expr) =
-                        match resolve_column_ref(&exprs[0], table, None) {
-                            Some(SortKeySource::Column(i)) => (Some(i), false, None),
-                            Some(SortKeySource::Rowid) => (None, true, None),
-                            _ => (None, false, Some(Box::new(exprs[0].clone()))),
-                        };
-                    let extra: Vec<Expr> = exprs[1..].to_vec();
-                    AggColumn {
-                        name: canon_name,
-                        num_args: exprs.len() as i32,
-                        arg_col_index: col_idx,
-                        arg_is_rowid: is_rowid,
-                        distinct: *distinct,
-                        arg_expr: a_expr,
-                        extra_args: extra,
-                        filter: filt,
-                        wrapper_expr: None,
-                        hidden: true,
-                        multi_agg_indices: Vec::new(),
-                        bare_expr: None,
-                        collation: None,
-                    }
                 }
-            };
-            agg_cols.push(agg_col);
-            let placeholder_name = format!("__agg_{idx}__");
-            return Expr::Column(
-                ColumnRef::bare(placeholder_name.as_str()),
-                fsqlite_ast::Span::ZERO,
-            );
-        }
+            }
+        };
+        agg_cols.push(agg_col);
+        let placeholder_name = format!("__agg_{idx}__");
+        return Expr::Column(
+            ColumnRef::bare(placeholder_name.as_str()),
+            fsqlite_ast::Span::ZERO,
+        );
     }
 
     // Recurse into child nodes.
@@ -18086,26 +18079,25 @@ fn rewrite_having_select_aliases_inner(
                     expr: select_expr,
                     alias: Some(alias),
                 } = col
+                    && alias.eq_ignore_ascii_case(name)
                 {
-                    if alias.eq_ignore_ascii_case(name) {
-                        if active_aliases
-                            .iter()
-                            .any(|active| active.eq_ignore_ascii_case(alias))
-                        {
-                            return expr.clone();
-                        }
-                        // Substitute the underlying SELECT expression, then keep
-                        // walking it for further nested aliases.
-                        active_aliases.push(alias.clone());
-                        let rewritten = rewrite_having_select_aliases_inner(
-                            select_expr,
-                            columns,
-                            table,
-                            active_aliases,
-                        );
-                        active_aliases.pop();
-                        return rewritten;
+                    if active_aliases
+                        .iter()
+                        .any(|active| active.eq_ignore_ascii_case(alias))
+                    {
+                        return expr.clone();
                     }
+                    // Substitute the underlying SELECT expression, then keep
+                    // walking it for further nested aliases.
+                    active_aliases.push(alias.clone());
+                    let rewritten = rewrite_having_select_aliases_inner(
+                        select_expr,
+                        columns,
+                        table,
+                        active_aliases,
+                    );
+                    active_aliases.pop();
+                    return rewritten;
                 }
             }
             expr.clone()
@@ -18656,10 +18648,10 @@ fn codegen_select_group_by_aggregate(
     // Collect unique table-column indices needed for aggregate arguments.
     let mut agg_arg_table_cols: Vec<usize> = Vec::new();
     for agg in &agg_columns {
-        if let Some(ci) = agg.arg_col_index {
-            if !agg_arg_table_cols.contains(&ci) {
-                agg_arg_table_cols.push(ci);
-            }
+        if let Some(ci) = agg.arg_col_index
+            && !agg_arg_table_cols.contains(&ci)
+        {
+            agg_arg_table_cols.push(ci);
         }
     }
 
@@ -20489,13 +20481,13 @@ fn codegen_insert_select(
     let n_cols = result_column_count(columns, src_table);
     let n_cols_usize = usize::try_from(n_cols).unwrap_or(0);
 
-    if let Some(expected) = expected_cols {
-        if n_cols_usize != expected {
-            return Err(CodegenError::Unsupported(format!(
-                "table {} has {} columns but {} values were supplied",
-                target_table.name, expected, n_cols_usize
-            )));
-        }
+    if let Some(expected) = expected_cols
+        && n_cols_usize != expected
+    {
+        return Err(CodegenError::Unsupported(format!(
+            "table {} has {} columns but {} values were supplied",
+            target_table.name, expected, n_cols_usize
+        )));
     }
 
     // Allocate registers for the scan → insert pipeline.
@@ -20758,13 +20750,13 @@ fn codegen_insert_select_without_from(
     let n_cols = result_column_count_without_from(columns)?;
     let n_cols_usize = usize::try_from(n_cols).unwrap_or(0);
 
-    if let Some(expected) = expected_cols {
-        if n_cols_usize != expected {
-            return Err(CodegenError::Unsupported(format!(
-                "table {} has {} columns but {} values were supplied",
-                target_table.name, expected, n_cols_usize
-            )));
-        }
+    if let Some(expected) = expected_cols
+        && n_cols_usize != expected
+    {
+        return Err(CodegenError::Unsupported(format!(
+            "table {} has {} columns but {} values were supplied",
+            target_table.name, expected, n_cols_usize
+        )));
     }
 
     let rowid_reg = b.alloc_reg();
@@ -25983,10 +25975,10 @@ fn emit_column_reads_selected(
             ResultColumn::Expr { expr, .. } => {
                 if should_emit(output_slot) {
                     if let Expr::Column(col_ref, _) = expr {
-                        if let Some(qualifier) = &col_ref.table {
-                            if !matches_table_or_alias(qualifier, table, table_alias) {
-                                return Err(qualified_column_not_found(qualifier, &col_ref.column));
-                            }
+                        if let Some(qualifier) = &col_ref.table
+                            && !matches_table_or_alias(qualifier, table, table_alias)
+                        {
+                            return Err(qualified_column_not_found(qualifier, &col_ref.column));
                         }
                         if let Some(col_idx) = table.column_index(&col_ref.column) {
                             emit_table_column_read(
@@ -26382,12 +26374,11 @@ fn emit_having_expr(
             {
                 // Find the output column whose group key maps to this table column.
                 for (i, oc) in output_cols.iter().enumerate() {
-                    if let GroupByOutputCol::GroupKey { key_index, .. } = oc {
-                        if matches!(group_by_keys.get(*key_index), Some(GroupByKey::Column(c)) if *c == col_idx)
-                        {
-                            b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
-                            return;
-                        }
+                    if let GroupByOutputCol::GroupKey { key_index, .. } = oc
+                        && matches!(group_by_keys.get(*key_index), Some(GroupByKey::Column(c)) if *c == col_idx)
+                    {
+                        b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
+                        return;
                     }
                 }
             }
@@ -26879,10 +26870,10 @@ fn resolve_sort_key(
     }
 
     if let Expr::Column(col_ref, _) = expr {
-        if let Some(qualifier) = &col_ref.table {
-            if !matches_table_or_alias(qualifier, table, table_alias) {
-                return SortKeySource::Expression(Box::new(expr.clone()));
-            }
+        if let Some(qualifier) = &col_ref.table
+            && !matches_table_or_alias(qualifier, table, table_alias)
+        {
+            return SortKeySource::Expression(Box::new(expr.clone()));
         }
         if let Some(idx) = table.column_index(&col_ref.column) {
             return SortKeySource::Column(idx);
@@ -28594,15 +28585,15 @@ fn extract_column_eq_target<'a>(
         ..
     } = expr
     {
-        if let Some(col_name) = column_name(left, table, table_alias) {
-            if is_simple_constant(right) {
-                return Some((col_name, right));
-            }
+        if let Some(col_name) = column_name(left, table, table_alias)
+            && is_simple_constant(right)
+        {
+            return Some((col_name, right));
         }
-        if let Some(col_name) = column_name(right, table, table_alias) {
-            if is_simple_constant(left) {
-                return Some((col_name, left));
-            }
+        if let Some(col_name) = column_name(right, table, table_alias)
+            && is_simple_constant(left)
+        {
+            return Some((col_name, left));
         }
     }
     None
@@ -31409,10 +31400,10 @@ fn emit_in_probe_expr(
     };
     let Some(probe_source) = resolve_in_probe_source(set, schema) else {
         // Try to handle complex subqueries with ORDER BY/LIMIT.
-        if let fsqlite_ast::InSet::Subquery(subquery) = set {
-            if try_emit_complex_in_subquery(b, operand, subquery, not, reg, scan_ctx) {
-                return;
-            }
+        if let fsqlite_ast::InSet::Subquery(subquery) = set
+            && try_emit_complex_in_subquery(b, operand, subquery, not, reg, scan_ctx)
+        {
+            return;
         }
         emit_in_probe_codegen_failure(b, "unsupported probe source");
         return;
@@ -32080,21 +32071,21 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                 return;
             };
-            if let Some(qualifier) = &col_ref.table {
-                if !matches_table_or_alias(qualifier, sc.table, sc.table_alias) {
-                    // Check secondary table contexts (UPDATE ... FROM, possibly
-                    // multiple FROM sources joined together).
-                    if let Some(sec) = sc
-                        .secondaries
-                        .iter()
-                        .find(|sec| matches_table_or_alias(qualifier, sec.table, sec.table_alias))
-                    {
-                        emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
-                        return;
-                    }
-                    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            if let Some(qualifier) = &col_ref.table
+                && !matches_table_or_alias(qualifier, sc.table, sc.table_alias)
+            {
+                // Check secondary table contexts (UPDATE ... FROM, possibly
+                // multiple FROM sources joined together).
+                if let Some(sec) = sc
+                    .secondaries
+                    .iter()
+                    .find(|sec| matches_table_or_alias(qualifier, sec.table, sec.table_alias))
+                {
+                    emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
                     return;
                 }
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                return;
             }
             // Register-based resolution for generated column expressions
             // during INSERT: copy from the register holding that column's value.
@@ -32163,22 +32154,22 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             emit_expr(b, inner, reg, ctx);
         }
         Expr::Exists { subquery, not, .. } => {
-            if let Some(scan_ctx) = ctx {
-                if let Some(schema) = scan_ctx.schema {
-                    emit_exists_subquery(b, subquery, *not, reg, scan_ctx, schema);
-                    return;
-                }
+            if let Some(scan_ctx) = ctx
+                && let Some(schema) = scan_ctx.schema
+            {
+                emit_exists_subquery(b, subquery, *not, reg, scan_ctx, schema);
+                return;
             }
             // No schema context — emit 0 (false) for EXISTS, 1 for NOT EXISTS.
             let val = i32::from(*not);
             b.emit_op(Opcode::Integer, val, reg, 0, P4::None, 0);
         }
         Expr::Subquery(subquery, _) => {
-            if let Some(scan_ctx) = ctx {
-                if let Some(schema) = scan_ctx.schema {
-                    emit_scalar_subquery(b, subquery, reg, scan_ctx, schema);
-                    return;
-                }
+            if let Some(scan_ctx) = ctx
+                && let Some(schema) = scan_ctx.schema
+            {
+                emit_scalar_subquery(b, subquery, reg, scan_ctx, schema);
+                return;
             }
             // No schema context — emit NULL.
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
@@ -34551,10 +34542,10 @@ fn column_collation<'a>(
             .filter(|collation| !collation.eq_ignore_ascii_case("BINARY"));
     }
     if let Expr::Column(col_ref, _) = inner {
-        if let Some(qualifier) = &col_ref.table {
-            if !matches_table_or_alias(qualifier, table, table_alias) {
-                return None;
-            }
+        if let Some(qualifier) = &col_ref.table
+            && !matches_table_or_alias(qualifier, table, table_alias)
+        {
+            return None;
         }
         if let Some(idx) = table.column_index(&col_ref.column) {
             return table.columns[idx].collation.as_deref();
@@ -35285,10 +35276,10 @@ fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
             if let Some(ctx) = ctx {
                 // Check primary table
                 let check_table = |table: &TableSchema, alias: Option<&str>| -> Option<u8> {
-                    if let Some(qualifier) = &col_ref.table {
-                        if !matches_table_or_alias(qualifier, table, alias) {
-                            return None;
-                        }
+                    if let Some(qualifier) = &col_ref.table
+                        && !matches_table_or_alias(qualifier, table, alias)
+                    {
+                        return None;
                     }
                     if let Some(idx) = table.column_index(&col_ref.column) {
                         return Some(schema_column_expr_affinity(&table.columns[idx]));
@@ -35309,10 +35300,10 @@ fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
                 // Check full schema
                 if let Some(schema) = ctx.schema {
                     for table in schema {
-                        if let Some(qualifier) = &col_ref.table {
-                            if !table.name.eq_ignore_ascii_case(qualifier) {
-                                continue;
-                            }
+                        if let Some(qualifier) = &col_ref.table
+                            && !table.name.eq_ignore_ascii_case(qualifier)
+                        {
+                            continue;
                         }
                         if let Some(idx) = table.column_index(&col_ref.column) {
                             return schema_column_expr_affinity(&table.columns[idx]);
@@ -35463,6 +35454,10 @@ pub fn emit_backfill_key_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_failure() -> bool {
+        false
+    }
     use crate::ProgramBuilder;
     use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
     use asupersync::runtime::RuntimeBuilder;
@@ -36782,26 +36777,30 @@ mod tests {
             };
             prop_assert_eq!(tail, sql.len(), "parser left trailing SQL for generated input: {}", sql);
 
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let mut builder = ProgramBuilder::new();
-                let schema = test_schema();
-                let ctx = CodegenContext::default();
-                match statement {
-                    Statement::Select(stmt) => {
+            let mut builder = ProgramBuilder::new();
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+            let result = match statement {
+                Statement::Select(stmt) => catch_unwind(AssertUnwindSafe(|| {
                         let _ = codegen_select(&mut builder, &stmt, &schema, &ctx);
-                    }
-                    Statement::Insert(stmt) => {
+                })),
+                Statement::Insert(stmt) => catch_unwind(AssertUnwindSafe(|| {
                         let _ = codegen_insert(&mut builder, &stmt, &schema, &ctx);
-                    }
-                    Statement::Update(stmt) => {
+                })),
+                Statement::Update(stmt) => catch_unwind(AssertUnwindSafe(|| {
                         let _ = codegen_update(&mut builder, &stmt, &schema, &ctx);
-                    }
-                    Statement::Delete(stmt) => {
+                })),
+                Statement::Delete(stmt) => catch_unwind(AssertUnwindSafe(|| {
                         let _ = codegen_delete(&mut builder, &stmt, &schema, &ctx);
-                    }
-                    other => panic!("unsupported generated statement variant: {other:?}"),
+                })),
+                other => {
+                    prop_assert!(
+                        false,
+                        "unsupported generated statement variant for sql {sql}: {other:?}"
+                    );
+                    return Ok(());
                 }
-            }));
+            };
 
             prop_assert!(result.is_ok(), "parser->vdbe codegen panicked for sql: {}", sql);
         }
@@ -38039,21 +38038,27 @@ mod tests {
 
         for (name, stmt, schema) in cases {
             let mut b = ProgramBuilder::new();
-            codegen_select(&mut b, &stmt, &schema, &CodegenContext::default())
-                .unwrap_or_else(|err| panic!("{name} SELECT should codegen: {err:?}"));
-            let prog = b
-                .finish()
-                .unwrap_or_else(|err| panic!("{name} program should finish: {err:?}"));
+            if let Err(err) = codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()) {
+                assert!(test_failure(), "{name} SELECT should codegen: {err:?}");
+                continue;
+            }
+            let prog = match b.finish() {
+                Ok(prog) => prog,
+                Err(err) => {
+                    assert!(test_failure(), "{name} program should finish: {err:?}");
+                    continue;
+                }
+            };
             let ops = prog.ops();
 
-            let seek_pos = ops
-                .iter()
-                .position(|op| op.opcode == Opcode::SeekRowid)
-                .unwrap_or_else(|| panic!("{name} lookup must emit SeekRowid"));
-            let column_pos = ops
-                .iter()
-                .position(|op| op.opcode == Opcode::Column)
-                .unwrap_or_else(|| panic!("{name} lookup must read the matched row"));
+            let Some(seek_pos) = ops.iter().position(|op| op.opcode == Opcode::SeekRowid) else {
+                assert!(test_failure(), "{name} lookup must emit SeekRowid");
+                continue;
+            };
+            let Some(column_pos) = ops.iter().position(|op| op.opcode == Opcode::Column) else {
+                assert!(test_failure(), "{name} lookup must read the matched row");
+                continue;
+            };
 
             assert!(
                 seek_pos < column_pos,
@@ -41268,7 +41273,10 @@ mod tests {
                 message.contains("WITH clauses require connection-level CTE lowering"),
                 "unexpected unsupported message: {message}"
             ),
-            other => panic!("expected explicit unsupported WITH boundary, got {other:?}"),
+            other => assert!(
+                false,
+                "expected explicit unsupported WITH boundary, got {other:?}"
+            ),
         }
         assert_eq!(
             b.current_addr(),
@@ -42496,7 +42504,10 @@ mod tests {
                     op.opcode == Opcode::PureFunc
                         && matches!(&op.p4, P4::FuncName(actual) if actual == name)
                 })
-                .unwrap_or_else(|| panic!("expected {name} function opcode"))
+                .unwrap_or_else(|| {
+                    assert!(test_failure(), "expected {name} function opcode");
+                    usize::MAX
+                })
         };
 
         assert!(
@@ -43297,7 +43308,12 @@ mod tests {
             .find(|op| op.opcode == Opcode::SorterOpen)
             .expect("ordered RHS should open sorter");
         let P4::Str(sorter_p4) = &sorter_open.p4 else {
-            panic!("unexpected sorter metadata: {:?}", sorter_open.p4);
+            assert!(
+                test_failure(),
+                "unexpected sorter metadata: {:?}",
+                sorter_open.p4
+            );
+            return;
         };
         assert_eq!(
             sorter_p4, "+|NOCASE",
@@ -44581,7 +44597,10 @@ mod tests {
                     op.opcode == Opcode::PureFunc
                         && matches!(&op.p4, P4::FuncName(actual) if actual == name)
                 })
-                .unwrap_or_else(|| panic!("expected {name} function opcode"))
+                .unwrap_or_else(|| {
+                    assert!(test_failure(), "expected {name} function opcode");
+                    usize::MAX
+                })
         };
         let preflight_index = ops
             .iter()
@@ -44664,29 +44683,40 @@ mod tests {
     #[test]
     fn test_codegen_ordered_distinct_top_n_membership_precedes_admission() {
         let assert_program = |ops: &[VdbeOp], label: &str| {
-            let sorter_open = ops
-                .iter()
-                .find(|op| op.opcode == Opcode::SorterOpen)
-                .unwrap_or_else(|| panic!("[{label}] ordered DISTINCT should open a sorter"));
+            let Some(sorter_open) = ops.iter().find(|op| op.opcode == Opcode::SorterOpen) else {
+                assert!(
+                    test_failure(),
+                    "[{label}] ordered DISTINCT should open a sorter"
+                );
+                return;
+            };
             assert_eq!(
                 sorter_open.p5, SORTER_OPEN_TOP_N_REGISTER,
                 "[{label}] ordered DISTINCT should retain only LIMIT+OFFSET representatives"
             );
 
-            let preflight_index = ops
-                .iter()
-                .position(|op| {
-                    op.opcode == Opcode::SorterCompare && op.p5 == SORTER_COMPARE_TOP_N_PREFLIGHT
-                })
-                .unwrap_or_else(|| panic!("[{label}] ordered DISTINCT should preflight admission"));
-            let found_index = ops
-                .iter()
-                .position(|op| op.opcode == Opcode::Found)
-                .unwrap_or_else(|| panic!("[{label}] DISTINCT should probe membership"));
-            let distinct_insert_index = ops
-                .iter()
-                .position(|op| op.opcode == Opcode::IdxInsert)
-                .unwrap_or_else(|| panic!("[{label}] DISTINCT should record first membership"));
+            let Some(preflight_index) = ops.iter().position(|op| {
+                op.opcode == Opcode::SorterCompare && op.p5 == SORTER_COMPARE_TOP_N_PREFLIGHT
+            }) else {
+                assert!(
+                    test_failure(),
+                    "[{label}] ordered DISTINCT should preflight admission"
+                );
+                return;
+            };
+            let Some(found_index) = ops.iter().position(|op| op.opcode == Opcode::Found) else {
+                assert!(test_failure(), "[{label}] DISTINCT should probe membership");
+                return;
+            };
+            let Some(distinct_insert_index) =
+                ops.iter().position(|op| op.opcode == Opcode::IdxInsert)
+            else {
+                assert!(
+                    test_failure(),
+                    "[{label}] DISTINCT should record first membership"
+                );
+                return;
+            };
             assert!(
                 found_index < distinct_insert_index && distinct_insert_index < preflight_index,
                 "[{label}] every first DISTINCT representative must enter membership before \
@@ -44713,14 +44743,21 @@ mod tests {
                 "[{label}] pass-1 output must be evaluated before DISTINCT membership"
             );
 
-            let offset_index = ops
-                .iter()
-                .position(|op| op.opcode == Opcode::IfPos)
-                .unwrap_or_else(|| panic!("[{label}] OFFSET should skip sorted representatives"));
-            let sorter_data_index = ops
-                .iter()
-                .position(|op| op.opcode == Opcode::SorterData)
-                .unwrap_or_else(|| panic!("[{label}] pass 2 should read retained sorter rows"));
+            let Some(offset_index) = ops.iter().position(|op| op.opcode == Opcode::IfPos) else {
+                assert!(
+                    test_failure(),
+                    "[{label}] OFFSET should skip sorted representatives"
+                );
+                return;
+            };
+            let Some(sorter_data_index) = ops.iter().position(|op| op.opcode == Opcode::SorterData)
+            else {
+                assert!(
+                    test_failure(),
+                    "[{label}] pass 2 should read retained sorter rows"
+                );
+                return;
+            };
             assert!(
                 offset_index < sorter_data_index && sorter_data_index < output_calls[1],
                 "[{label}] OFFSET must skip representatives before source restore and reprojection"
@@ -45048,7 +45085,11 @@ mod tests {
                 ..
             } = stmt.body.select
             else {
-                panic!("partial-index fixture must have a WHERE clause");
+                assert!(
+                    test_failure(),
+                    "partial-index fixture must have a WHERE clause"
+                );
+                return expr_sql("0");
             };
             *where_clause
         }
@@ -49756,7 +49797,8 @@ mod tests {
             columns, group_by, ..
         } = &bucket_stmt.body.select
         else {
-            panic!("bucket fixture must be a SELECT core");
+            assert!(test_failure(), "bucket fixture must be a SELECT core");
+            return;
         };
         assert!(
             simple_group_by_rowid_bucket_sum_plan(columns, &table, None, group_by).is_some(),
@@ -49781,7 +49823,11 @@ mod tests {
             ..
         } = &join_stmt.body.select
         else {
-            panic!("grouped join fixture must have a FROM clause");
+            assert!(
+                test_failure(),
+                "grouped join fixture must have a FROM clause"
+            );
+            return;
         };
         let join_schema = test_schema_with_join_lookup();
         assert!(
@@ -49810,7 +49856,8 @@ mod tests {
         fn aggregate_fixture(sql: &str, table: &TableSchema) -> (SelectStatement, Vec<AggColumn>) {
             let stmt = select_sql(sql);
             let SelectCore::Select { columns, .. } = &stmt.body.select else {
-                panic!("aggregate fixture must be a SELECT core");
+                assert!(test_failure(), "aggregate fixture must be a SELECT core");
+                return (stmt, Vec::new());
             };
             let aggregates =
                 parse_aggregate_columns(columns, table).expect("aggregate fixture should parse");

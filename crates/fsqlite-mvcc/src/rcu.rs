@@ -952,7 +952,7 @@ mod tests {
                         }
                     }
                     reads += 1;
-                    if reads % 200 == 0 {
+                    if reads.is_multiple_of(200) {
                         h.quiescent();
                     }
                 }
@@ -1100,7 +1100,7 @@ mod tests {
                     assert_eq!(a, b, "TORN READ: a={a} b={b}");
                     reads += 1;
                     // Periodically announce quiescent state.
-                    if reads % 1000 == 0 {
+                    if reads.is_multiple_of(1000) {
                         h.quiescent();
                     }
                 }
@@ -1205,7 +1205,7 @@ mod tests {
                     let (a, b) = r_pair.read();
                     assert_eq!(a, b, "TORN READ: a={a} b={b}");
                     reads += 1;
-                    if reads % 500 == 0 {
+                    if reads.is_multiple_of(500) {
                         h.quiescent();
                     }
                 }

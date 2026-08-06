@@ -567,10 +567,10 @@ fn publish_record_visibility_range(
             end_ts: None,
         },
     );
-    if let Some(old_head) = previous_head {
-        if let Some(old_range) = ranges.get_mut(&old_head) {
-            old_range.end_ts = Some(begin_ts);
-        }
+    if let Some(old_head) = previous_head
+        && let Some(old_range) = ranges.get_mut(&old_head)
+    {
+        old_range.end_ts = Some(begin_ts);
     }
 }
 

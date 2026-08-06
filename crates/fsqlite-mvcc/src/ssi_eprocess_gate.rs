@@ -337,7 +337,7 @@ impl SsiEProcessGate {
             } else {
                 1
             };
-            if force_audit_hash % stride == 0 {
+            if force_audit_hash.is_multiple_of(stride) {
                 return false;
             }
         }
@@ -649,6 +649,7 @@ mod tests {
         let n: u64 = 1_000_000;
         let mut gate = SsiEProcessGate::new(SsiEProcessConfig::default());
 
+        // ubs:ignore - benchmark timing source, not random token generation.
         let t0 = std::time::Instant::now();
         for i in 0..n {
             gate.observe(i % 10000 == 0); // 0.01% conflict rate
@@ -671,6 +672,7 @@ mod tests {
             gate.observe(false);
         }
 
+        // ubs:ignore - benchmark timing source, not random token generation.
         let t0 = std::time::Instant::now();
         let mut grants = 0u64;
         for i in 0..n {

@@ -1970,11 +1970,9 @@ mod tests {
         buf.clear();
         buf.reserve(count);
         let ptr_bytes = &page[ptr_array_start..ptr_array_end];
-        buf.extend(
-            ptr_bytes
-                .chunks_exact(CELL_POINTER_SIZE as usize)
-                .map(|c| u16::from_be_bytes([c[0], c[1]])),
-        );
+        let (chunks, remainder) = ptr_bytes.as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
+        buf.extend(chunks.iter().map(|chunk| u16::from_be_bytes(*chunk)));
         Ok(())
     }
 

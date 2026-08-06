@@ -772,17 +772,17 @@ impl InProcessPageLockTable {
         let pgno = page.get() as usize;
 
         // Fast path: pages 1..=65536 use lock-free CAS on the flat array.
-        if pgno <= FAST_LOCK_ARRAY_SIZE {
-            if let Some(slot) = self.fast_lock_slot_if_allocated(pgno) {
-                let txn_raw = txn.get();
-                // CAS: txn_raw (our lock) → 0 (unlocked).
-                if slot
-                    .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    self.notify_waiters_for_page(page);
-                    return true;
-                }
+        if pgno <= FAST_LOCK_ARRAY_SIZE
+            && let Some(slot) = self.fast_lock_slot_if_allocated(pgno)
+        {
+            let txn_raw = txn.get();
+            // CAS: txn_raw (our lock) → 0 (unlocked).
+            if slot
+                .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.notify_waiters_for_page(page);
+                return true;
             }
             // Not held by us — fast-array pages never live in draining.
         }
@@ -1421,15 +1421,13 @@ impl InProcessPageLockTable {
         for chunk in self.fast_locks.iter().filter_map(OnceLock::get) {
             for slot in chunk.iter() {
                 let raw = slot.load(Ordering::Relaxed);
-                if raw != 0 {
-                    if let Some(holder) = TxnId::new(raw) {
-                        if !is_active_txn(holder) {
-                            // Orphaned: CAS to 0.  Failure means another thread
-                            // already released or re-acquired — both are fine.
-                            let _ =
-                                slot.compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Relaxed);
-                        }
-                    }
+                if raw != 0
+                    && let Some(holder) = TxnId::new(raw)
+                    && !is_active_txn(holder)
+                {
+                    // Orphaned: CAS to 0.  Failure means another thread
+                    // already released or re-acquired — both are fine.
+                    let _ = slot.compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Relaxed);
                 }
             }
         }
@@ -2608,32 +2606,32 @@ pub fn raise_gc_horizon_with_reader_clamp(
         .filter_map(|pin| pin.pinned_commit_seq.map(|seq| (pin, seq)))
         .min_by_key(|(_, seq)| *seq);
 
-    if let Some((pin, clamp_seq)) = clamp {
-        if clamp_seq <= result.new_horizon {
-            // Clamp the horizon to clamp_seq - 1 (or old_horizon if that is
-            // larger — monotonicity must be preserved).
-            let clamped = CommitSeq::new(clamp_seq.get().saturating_sub(1));
-            let clamped = if clamped >= old_horizon {
-                clamped
-            } else {
-                old_horizon
-            };
-            if clamped < result.new_horizon {
-                let commit_seq_delta = commit_seq.get().saturating_sub(clamp_seq.get());
-                tracing::warn!(
-                    target: "fsqlite_mvcc::stale_reader_pressure",
-                    guard_id = pin.guard_id,
-                    pinned_for_ms = pin.pinned_for.as_millis() as u64,
-                    commit_seq_delta,
-                    affected_pages,
-                    clamped_horizon = clamped.get(),
-                    proposed_horizon = result.new_horizon.get(),
-                    "commit GC horizon clamped by stale reader pin (bd-wt4uu)"
-                );
-                result.new_horizon = clamped;
-                result.stale_reader_clamps = 1;
-                result.clamped_by_reader_seq = Some(clamp_seq);
-            }
+    if let Some((pin, clamp_seq)) = clamp
+        && clamp_seq <= result.new_horizon
+    {
+        // Clamp the horizon to clamp_seq - 1 (or old_horizon if that is
+        // larger — monotonicity must be preserved).
+        let clamped = CommitSeq::new(clamp_seq.get().saturating_sub(1));
+        let clamped = if clamped >= old_horizon {
+            clamped
+        } else {
+            old_horizon
+        };
+        if clamped < result.new_horizon {
+            let commit_seq_delta = commit_seq.get().saturating_sub(clamp_seq.get());
+            tracing::warn!(
+                target: "fsqlite_mvcc::stale_reader_pressure",
+                guard_id = pin.guard_id,
+                pinned_for_ms = pin.pinned_for.as_millis() as u64,
+                commit_seq_delta,
+                affected_pages,
+                clamped_horizon = clamped.get(),
+                proposed_horizon = result.new_horizon.get(),
+                "commit GC horizon clamped by stale reader pin (bd-wt4uu)"
+            );
+            result.new_horizon = clamped;
+            result.stale_reader_clamps = 1;
+            result.clamped_by_reader_seq = Some(clamp_seq);
         }
     }
 
@@ -4983,8 +4981,9 @@ mod tests {
                      rebuild must complete well within timeout"
                 );
             }
-            DrainResult::TimedOut { remaining, .. } => {
-                unreachable!(
+            other @ DrainResult::TimedOut { remaining, .. } => {
+                assert!(
+                    matches!(&other, DrainResult::Quiescent { .. }),
                     "bead_id={BEAD_22N12} case=bounded_time \
                      rebuild should not time out, remaining={remaining}"
                 );

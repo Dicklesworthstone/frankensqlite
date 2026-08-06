@@ -1024,10 +1024,10 @@ async fn restore_page_best_effort<W: PageWriter>(
     page_no: PageNumber,
     original_page: &PageData,
 ) {
-    if let Ok(current_page) = writer.read_page_data(cx, page_no).await {
-        if current_page.as_bytes() == original_page.as_bytes() {
-            return;
-        }
+    if let Ok(current_page) = writer.read_page_data(cx, page_no).await
+        && current_page.as_bytes() == original_page.as_bytes()
+    {
+        return;
     }
     let _ = writer
         .write_page_data(cx, page_no, original_page.clone())
@@ -1041,10 +1041,10 @@ async fn write_page_if_changed<W: PageWriter>(
     page_data: Vec<u8>,
     original_page: Option<&[u8]>,
 ) -> Result<()> {
-    if let Some(original_page) = original_page {
-        if original_page == page_data.as_slice() {
-            return Ok(());
-        }
+    if let Some(original_page) = original_page
+        && original_page == page_data.as_slice()
+    {
+        return Ok(());
     }
     writer
         .write_page_data(cx, page_no, PageData::from_vec(page_data))
@@ -2079,18 +2079,19 @@ pub(crate) async fn apply_child_replacement<W: PageWriter>(
     // free the child page, reducing tree depth by one.  This is the
     // inverse of balance_deeper and corresponds to SQLite's
     // "balance-shallower" sub-algorithm in the canonical upstream implementation.
-    if parent_is_root && final_cells.is_empty() {
-        if let Some(child_pgno) = right_child {
-            balance_shallower(
-                cx,
-                writer,
-                parent_page_no,
-                child_pgno,
-                usable_size,
-                page_size,
-            )
-            .await?;
-        }
+    if parent_is_root
+        && final_cells.is_empty()
+        && let Some(child_pgno) = right_child
+    {
+        balance_shallower(
+            cx,
+            writer,
+            parent_page_no,
+            child_pgno,
+            usable_size,
+            page_size,
+        )
+        .await?;
     }
 
     Ok(BalanceResult::Done)
@@ -3791,12 +3792,12 @@ mod tests {
                     let policy =
                         leaf_table_split_policy_for_page(Some(hot_page), count, insert_idx);
                     let split = choose_leaf_table_split_index(&cells, 0, 0, USABLE, policy);
-                    let idx = split.unwrap_or_else(|| {
-                        panic!(
-                            "topology split must exist for count={count} payload={payload} \
-                             mode={mode:?} insert_idx={insert_idx}"
-                        )
-                    });
+                    assert!(
+                        split.is_some(),
+                        "topology split must exist for count={count} payload={payload} \
+                         mode={mode:?} insert_idx={insert_idx}"
+                    );
+                    let idx = split.expect("topology split existence was asserted");
                     // Any Some(idx) from choose_leaf_table_split_index is, by the
                     // function's capacity guard, a both-halves-fit split; assert
                     // the index is also a non-empty split point.
