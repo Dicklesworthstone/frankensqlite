@@ -3557,10 +3557,7 @@ mod tests {
             let operation_for_probe = Arc::clone(&operation);
             let receive = recv_async_operation_response(&preflight, &mut rx, operation);
             let probe = async {
-                while !operation_for_probe
-                    .cancel_requested
-                    .load(Ordering::Acquire)
-                {
+                while !operation_for_probe.cancel_requested.load(Ordering::Acquire) {
                     future::yield_now().await;
                 }
 
