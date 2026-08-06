@@ -282,6 +282,31 @@ fn run_scenario(wal: bool) -> Result<(), String> {
         );
     }
 
+    // bd-9inpb release acceptance: a run whose writers failed can neither
+    // prove nor disprove lost writes, so it must not report success on the
+    // strength of a green `integrity_check`. Fail it explicitly as
+    // inconclusive instead.
+    if writer_errors > 0 {
+        return Err(format!(
+            "WRITER FAILURES (wal={wal}): {writer_errors} writer(s) failed; run is inconclusive (frank={frank_msgs:?} rusqlite={rusqlite_msg:?} count_problems={count_problems:?})"
+        ));
+    }
+
+    // bd-9inpb: `integrity_check` only walks reachable structure, so a green
+    // check cannot witness the release symptom ("wrong row counts with zero
+    // writer errors"). Every writer returned Ok above, so each table must hold
+    // exactly ROWS_PER_TABLE rows and any shortfall is a silently lost write.
+    // The explicit-BEGIN barrier scenario already enforces the equivalent
+    // conservation check (`actual_total == total_committed`); this brings the
+    // implicit-autocommit scenario to the same standard.
+    if !count_problems.is_empty() {
+        return Err(format!(
+            "LOST WRITES (wal={wal}): {} table(s) short with zero writer errors: {:?} (frank={frank_msgs:?} rusqlite={rusqlite_msg:?})",
+            count_problems.len(),
+            &count_problems[..count_problems.len().min(10)]
+        ));
+    }
+
     if frank_ok && rusqlite_ok {
         Ok(())
     } else {
