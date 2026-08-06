@@ -372,7 +372,7 @@ where
         "paired minimum iterations must not exceed the maximum"
     );
     assert!(
-        config.max_iters % 2 == 0,
+        config.max_iters.is_multiple_of(2),
         "paired maximum iterations must complete AB/BA order blocks"
     );
 
@@ -383,7 +383,7 @@ where
             config.warmup_iters
         );
         let parameter = adaptive_parameter(iteration, parameter_maximum);
-        if iteration % 2 == 0 {
+        if iteration.is_multiple_of(2) {
             csqlite(parameter);
             fsqlite(parameter);
         } else {
@@ -417,7 +417,7 @@ where
             fsqlite(parameter);
             start.elapsed()
         };
-        let (csqlite_elapsed, fsqlite_elapsed) = if iteration % 2 == 0 {
+        let (csqlite_elapsed, fsqlite_elapsed) = if iteration.is_multiple_of(2) {
             (run_csqlite(&mut csqlite), run_fsqlite(&mut fsqlite))
         } else {
             let fsqlite_elapsed = run_fsqlite(&mut fsqlite);
@@ -3264,16 +3264,17 @@ fn capture_cargo_feature_graph(
 }
 
 fn decode_lower_hex(encoded: &str, field: &str) -> Result<Vec<u8>, String> {
-    if encoded.len() % 2 != 0
+    if !encoded.len().is_multiple_of(2)
         || encoded
             .bytes()
             .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
     {
         return Err(format!("{field} is not even-length lowercase hexadecimal"));
     }
-    let decoded = encoded
-        .as_bytes()
-        .chunks_exact(2)
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty(), "even-length hex has no trailing byte");
+    let decoded = pairs
+        .iter()
         .map(|pair| {
             let digit = |byte: u8| -> u8 {
                 match byte {
@@ -6508,11 +6509,11 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
     }
 
     if options.bridge_experiment {
-        if options.bridge_samples < 48 || options.bridge_samples % 48 != 0 {
+        if options.bridge_samples < 48 || !options.bridge_samples.is_multiple_of(48) {
             return Err("--bridge-samples must be a multiple of 48 and at least 48".to_owned());
         }
         if options.parameter_control_samples < PARAMETER_CONTROL_DEFAULT_SAMPLES_PER_ROLE
-            || options.parameter_control_samples % 4 != 0
+            || !options.parameter_control_samples.is_multiple_of(4)
         {
             return Err(
                 "--parameter-control-samples must be a multiple of 4 and at least 144".to_owned(),
