@@ -164,14 +164,17 @@ pre-enumerated asset plan and an exact-count gate that aborts the upload on any
 mismatch. Under that mode every intended sidecar must be enumerated in the plan
 itself; nothing is discovered from disk.
 
-The current DSR strict contract enumerates only the five primary archives and
-their `.sha256` sidecars. It therefore proves a ten-asset draft and correctly
-rejects the other 33 assets as extras. The v0.2.0 operator must either extend
-that contract before release or use DSR for the ten-asset draft, attach the
-remaining pre-enumerated assets while the release is still a draft, and replace
-DSR's final verifier with an independent exact-43 verifier. After supplements
-are attached, a failing DSR strict verification is expected and must never be
-misreported as end-to-end DSR proof.
+The current DSR strict contract closes the complete 43-name surface. Its five
+primary archives imply five primary `.sha256` sidecars, and
+`exact_additional_assets` enumerates the remaining 33 names. Strict preflight
+can create the five primary sidecars without clobbering an existing file, but
+it does not discover, alias, sign, or generate any additional asset. The
+operator must therefore materialize all 33 additional files in the flat
+artifact directory before invoking release. Preflight then hashes and freezes
+all 43 local paths before creating the draft, and strict verification requires
+the remote asset set to match that same closed plan exactly. Attaching assets
+outside that plan or relying on the non-strict alias/checksum scan is a release
+defect, not a supported supplementation workflow.
 
 SBOM generation is a standalone step, not part of build or release. Generated
 documents are named from a truncated archive basename and carry no license
