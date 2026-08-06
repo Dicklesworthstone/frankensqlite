@@ -69,9 +69,7 @@ fn explicit_root_cx_env_drives_file_backed_production_path() {
         );
         assert!(!fallback.truncated);
 
-        drop(conn);
-
-        let reopened = Connection::open_existing_with_env(&db_path, env)
+        let reopened = Connection::open_existing_with_env(&db_path, env.clone())
             .await
             .expect("reopen should use the same explicit runtime");
         assert!(
@@ -84,6 +82,13 @@ fn explicit_root_cx_env_drives_file_backed_production_path() {
             .await
             .expect("reopened SELECT should stay on the production pager path");
         assert_eq!(reopened_rows[0].values()[0], SqliteValue::Integer(42));
+        reopened
+            .close()
+            .await
+            .expect("reopened connection should close cleanly");
+        conn.close()
+            .await
+            .expect("original connection should close cleanly");
     });
 }
 

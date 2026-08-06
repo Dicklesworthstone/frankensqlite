@@ -2385,6 +2385,16 @@ impl RuntimeContext {
             .clone()
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn attach_io_native_cx_if_missing(&self, cx: &Cx) {
+        if cx.attached_native_cx().is_some() {
+            return;
+        }
+        if let Some(io_cx) = self.io_native_cx() {
+            cx.set_native_cx(io_cx);
+        }
+    }
+
     /// Return the stable runtime identity used to isolate per-database state.
     #[must_use]
     pub const fn runtime_id(&self) -> u64 {
@@ -11679,11 +11689,10 @@ impl Connection {
         ));
         root_cx.set_eprocess_oracle(Arc::clone(&eprocess_oracle));
         // bd-fo6xw: give the io_uring data path a spawner that outlives the
-        // connection. No-op for the process-global default context.
+        // connection when the caller did not already root this connection in
+        // an explicit native Cx. No-op for the process-global default context.
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-        if let Some(io_cx) = env.runtime().io_native_cx() {
-            root_cx.set_native_cx(io_cx);
-        }
+        env.runtime().attach_io_native_cx_if_missing(&root_cx);
 
         let collation_registry = Arc::new(Mutex::new(CollationRegistry::new()));
         let conn = Self {
@@ -12134,11 +12143,10 @@ impl Connection {
         ));
         root_cx.set_eprocess_oracle(Arc::clone(&eprocess_oracle));
         // bd-fo6xw: give the io_uring data path a spawner that outlives the
-        // connection. No-op for the process-global default context.
+        // connection when the caller did not already root this connection in
+        // an explicit native Cx. No-op for the process-global default context.
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-        if let Some(io_cx) = env.runtime().io_native_cx() {
-            root_cx.set_native_cx(io_cx);
-        }
+        env.runtime().attach_io_native_cx_if_missing(&root_cx);
 
         let eager_memdb_rows = pager_is_memory;
         let collation_registry = Arc::new(Mutex::new(CollationRegistry::new()));
