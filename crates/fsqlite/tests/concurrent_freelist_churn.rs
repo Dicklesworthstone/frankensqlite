@@ -406,7 +406,7 @@ impl ExternalReaderChild {
                 .recv_timeout(remaining.min(EXTERNAL_READER_POLL_INTERVAL))
             {
                 Ok(line) => {
-                    let matched = line == expected;
+                    let matched = line.split_whitespace().any(|receipt| receipt == expected);
                     self.transcript.push(line);
                     if matched {
                         return;
