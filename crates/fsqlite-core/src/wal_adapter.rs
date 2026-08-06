@@ -6237,8 +6237,9 @@ mod tests {
     }
 
     #[test]
-    fn test_page_index_incremental_extend() {
-        // Verify that the index extends incrementally when new frames are committed.
+    fn test_page_index_incremental_extend_after_durable_sync() {
+        // Verify that the index extends incrementally once each commit crosses
+        // the durable-sync publication barrier.
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let mut adapter = make_adapter(&vfs, &cx);
@@ -6247,6 +6248,7 @@ mod tests {
         adapter
             .append_frame(&cx, 1, &page1, 1)
             .expect("append commit 1");
+        adapter.sync(&cx).expect("durably publish commit 1");
 
         // First read builds the index.
         assert_eq!(
@@ -6263,6 +6265,7 @@ mod tests {
         adapter
             .append_frame(&cx, 1, &page1_v2, 3)
             .expect("append page 1 v2 (commit)");
+        adapter.sync(&cx).expect("durably publish commit 2");
 
         // Reading should trigger incremental extend, not full rebuild.
         assert_eq!(
