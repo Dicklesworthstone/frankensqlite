@@ -39,8 +39,7 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   `query_row`, and `prepare`, are now `async fn`. Call sites add `.await`.
   The caller's executor polls these futures. Core `Connection` operations
   derive their `Cx` from the connection's `RuntimeContext`; callers that need
-  explicit capability lineage can use `RuntimeContext::new_with_root_cx` in a
-  `ConnectionEnv`.
+  explicit capability lineage can use `ConnectionEnv::new_with_root_cx`.
 - **The sealed storage traits are no longer dyn-compatible.** `MvccPager`,
   `TransactionHandle`, and the neighbouring pager traits return
   `impl Future` (RPITIT) instead of being `async_trait`-boxed, which keeps the
@@ -68,6 +67,32 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   existing index cannot contain an over-long term: writes carrying one failed
   outright in 0.1.x, so an index built by those releases cannot hold one.
 
+### Release blockers
+
+These are not accepted v0.2.0 limitations. Every item below must be fixed and
+covered by terminal candidate-bound evidence before the release tag is cut:
+
+- Ordinary implicit-autocommit stress with 10 or more concurrent writers can
+  corrupt the database and return wrong row counts with zero writer errors in
+  both WAL and rollback-journal modes (`bd-9inpb`).
+- `ROLLBACK TO` after trigger activity involving a JOIN view can expose rows
+  from the aborted savepoint in later queries
+  ([#143](https://github.com/Dicklesworthstone/frankensqlite/issues/143),
+  `bd-dpjhw`).
+- `ALTER TABLE ... ADD COLUMN` on a populated table with a separate unique
+  index can report success while producing a database stock SQLite diagnoses as
+  malformed (`bd-wneoh`).
+- `UPDATE OR REPLACE` on `WITHOUT ROWID` tables can corrupt replacement-victim
+  and secondary-index state (`bd-yuj70`).
+- A commit can become durable yet be reported as an error without publication
+  to live commit/SSI state, and dropping a pending finalization future can
+  strand or overwrite accepted work (`bd-zvxay`, `bd-6xjma`).
+- `VACUUM INTO` can emit a candidate rejected by integrity validation, including
+  a DESC composite-index case (`bd-tutln`,
+  `bd-vacuum-desc-index-self-reject-y2aog`).
+- `PRAGMA integrity_check` can miss a referenced empty non-root leaf that stock
+  SQLite reports as malformed (`bd-y5urj`).
+
 ### Known limitations
 
 - **R-tree write paths are incomplete.** `UPDATE` against an R-tree virtual
@@ -81,9 +106,9 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   column and return false positives. Avoid column-qualified `MATCH`, or verify
   the selected column in application logic
   ([#249](https://github.com/Dicklesworthstone/frankensqlite/issues/249)).
-- **HFDT bounded database-image validation is not shipped in v0.2.0.** Its
-  macOS support is therefore unavailable, and applications must not rely on
-  that downstream capability as a portable `fsqlite::Connection` API
+- **Bounded external-snapshot database-image validation is not shipped in
+  v0.2.0** and is unimplemented on macOS. Applications must not rely on that
+  downstream capability as a portable `fsqlite::Connection` API
   ([#307](https://github.com/Dicklesworthstone/frankensqlite/issues/307)).
 - **v0.2.0 makes no numeric performance claim.** The async storage migration
   invalidated the older benchmark matrices, and the current comprehensive and
@@ -587,9 +612,8 @@ no breaking API changes.
 ### Performance
 
 - Partial-key `SeekGT`/`SeekLE` operations use a logarithmic biased B-tree
-  descent rather than walking equal-prefix runs, avoiding a linear scan across
-  an equal-prefix range. v0.2.0 attaches no numeric performance claim to this
-  change; the post-async-migration benchmark matrix is not yet citable.
+  descent rather than walking equal-prefix runs; the targeted MAX-prefix
+  workload improved by more than 13x.
 - Aggregate rowid equality with parameter, real, or text inputs uses a bounded
   seek with exact-integer coercion instead of a full table scan. Ordinary
   rowid reads use the same semantics.

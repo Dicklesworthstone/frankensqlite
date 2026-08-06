@@ -2,7 +2,8 @@
 
 **Bead / Issue:** [frankensqlite#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
 (closed 2026-05-24; this document is the durable contract that outlived the
-tracking issue).
+tracking issue). Remaining multi-process durability work is carried by the open
+P0 Beads epic `bd-zywqc`.
 
 **Purpose:** state, unambiguously, what concurrency guarantees FrankenSQLite
 claims today — and what it does *not* — so caller projects stop re-filing
@@ -17,8 +18,11 @@ issues whose common cause was never named.
 
 ## TL;DR
 
-- **Single-process, multi-Connection via MVCC WAL**: *supported*. This is
-  the path every in-repo test exercises. Treat it as the default.
+- **Single-process, multi-Connection via MVCC WAL**: *release-blocked on the
+  current candidate*. This is the intended default, but `bd-9inpb` reproduces
+  corruption and wrong row counts with 10 or more ordinary implicit-autocommit
+  writers in both WAL and rollback-journal modes. The v0.2.0 tag must not be cut
+  until the exact gate is green.
 - **Single-process, single-Connection across threads**: *not supported by
   API*. `Connection` is `!Send + !Sync` by construction. Spawn one
   Connection per OS thread against the same file-backed database and
@@ -72,8 +76,9 @@ mechanism (MVCC, DPOR, page-conflict math), see the README's
 
 ### 1. Process count — how many caller processes can safely share one DB file?
 
-- **Single-process**: any number of `Connection` instances, supported
-  unconditionally.
+- **Single-process**: multiple `Connection` instances are the intended default,
+  but the current candidate is release-blocked by `bd-9inpb`; do not claim an
+  unconditional count until its four-scenario writer gate is green.
 - **Multi-process**: target is N ≤ 32 short-lived writers per file
   (matching the swarm harness scale). Today the multi-process surface is
   *partial* — see the closed
@@ -175,9 +180,10 @@ These are intentional or known gaps documented so callers can plan:
 - **Multi-process WAL checkpoint coordination** is currently weaker.
   Stock SQLite's checkpoint protocol has been hardened over decades
   against multi-process opener contention; fsqlite's Silo-style epoch
-  group commit is newer. The #70 hardening series has landed, but
-  multi-process *checkpoint* (not normal commit) remains the weakest surface.
-  Treat this as a measured limitation rather than pending issue work. The
+  group commit is newer. Substantial #70 hardening work has landed, while the
+  remaining program is tracked by `bd-zywqc`; multi-process *checkpoint* (not
+  normal commit) remains the weakest surface. Treat this as a measured
+  limitation rather than evidence that the remaining program is complete. The
   symptoms ("WAL file too small for header during rebuild" on warm
   start; transient `freelist trunk page exceeds db_size`) are cataloged
   in the [#70 history](https://github.com/Dicklesworthstone/frankensqlite/issues/70).
@@ -206,8 +212,9 @@ These are intentional or known gaps documented so callers can plan:
 
 ### 7. Where fsqlite intends stock-SQLite parity
 
-- Wire format on a checkpointed file: byte-for-byte stock-compatible.
-  After successful checkpoint, stock SQLite must open the file and
+- Wire format on a checkpointed file is intended to be byte-for-byte
+  stock-compatible on the documented supported surface. After successful
+  checkpoint, stock SQLite must open the file and
   pass `PRAGMA integrity_check`. This is enforced by
   `crates/fsqlite-e2e/tests/compat_file_format.rs`,
   `crates/fsqlite-e2e/tests/golden_integrity.rs`,
@@ -218,8 +225,10 @@ These are intentional or known gaps documented so callers can plan:
 - Single-writer + multi-reader WAL semantics: full parity, including
   `busy_timeout` honor, `SQLITE_BUSY` error codes, and `PRAGMA
   wal_autocheckpoint` thresholds.
-- `PRAGMA integrity_check` semantics: parity is the contract. fsqlite
-  must pass on a file stock will pass on, and vice versa.
+- `PRAGMA integrity_check` semantics: parity is the target. The current checker
+  can miss a referenced empty non-root leaf that stock SQLite reports as
+  malformed (`bd-y5urj`), so a green FrankenSQLite result is not by itself a
+  complete corruption proof for v0.2.0.
 - Connection lifecycle: `open` / `close` semantics match stock —
   including the hand-off via WAL checkpoint on the last connection
   closing.
@@ -232,7 +241,7 @@ boundary between parity-claimed and parity-aspired.
 
 ## The concurrency contract
 
-### Supported: single-process, multi-Connection via MVCC WAL
+### Release-blocked candidate: single-process, multi-Connection via MVCC WAL
 
 - *N* Connections opened against the same file-backed database within
   a single process, coordinated through the MVCC WAL layer
@@ -242,6 +251,12 @@ boundary between parity-claimed and parity-aspired.
 - Cross-Connection visibility: after a reader's next transaction
   boundary, committed rows from other Connections are visible.
 - `PRAGMA integrity_check = ok` after the workload terminates.
+
+The bullets above are the contract target, not a green statement about the
+current candidate. `bd-9inpb` currently fails ordinary implicit-autocommit
+writer stress in both WAL and rollback-journal modes while the two explicit
+`BEGIN CONCURRENT` barrier controls pass. All four scenarios must pass on the
+candidate before this section can return to **Supported**.
 
 **`journal_mode = 'wal'` means MVCC here, not SQLite's single-writer WAL.**
 For file-format compatibility, `PRAGMA journal_mode` reports `wal` (and
@@ -283,7 +298,8 @@ do not try to share a single `Connection` across OS threads — it is
 This is the path the closed
 [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70) roll-up
 described. Historical symptom families were individually patched, and the
-meta-issue closed after the principled root-cause sweep:
+meta-issue closed once substantial work landed, handing its remaining scope to
+the Beads tree that now carries multi-process durability:
 
 | Family | Example issues | Observable symptom |
 |---|---|---|
@@ -299,10 +315,11 @@ The common shape — "works on stock SQLite, corrupts or mis-reads on
 fsqlite under concurrent load" — was what #70 asked to address at the
 root rather than through another point fix.
 
-**Current status**: the #70 fix series has landed. Multi-process multi-writer
+**Current status**: substantial #70 fixes have landed, but the open P0
+`bd-zywqc` epic still carries the remaining program. Multi-process multi-writer
 remains **partial** until the current candidate's swarm harness is green at
-N ≥ 8 for ≥ 1 hour on the target platform. The bound is the measurement,
-not the state of historical branches or issues.
+N ≥ 8 for ≥ 1 hour on the target platform. The bound is the measurement, not a
+claim that the historical issue closure completed every root-cause gate.
 
 ### Not supported today
 
@@ -360,16 +377,18 @@ that opens `fsqlite` as a dependency):
 
 ### Default assumption
 
-Operate as if you are using **single-process, multi-Connection via
-MVCC WAL**. That is the supported path. If you think you need something
-else, re-check — most "I need multi-process" reports turn out to be
-"I have multiple callers that could run in the same process."
+Design around **single-process, multi-Connection via MVCC WAL**; that is the
+intended default. Do not deploy the current v0.2.0 candidate under concurrent
+write load until `bd-9inpb` is fixed and its four-scenario writer gate is green.
+If you think you need multi-process access, re-check — most reports turn out to
+be multiple callers that could run in the same process.
 
 ### If you really must open from multiple processes
 
 - Treat the swarm as a stress test, not a production load-bearing
-  contract. The #70 fix series has landed; the remaining bound is the largest
-  harness scale and duration you have measured green on your platform.
+  contract. Substantial #70 fixes have landed, but `bd-zywqc` remains open; the
+  practical bound is the largest harness scale and duration you have measured
+  green on your platform.
 - Cap N at whatever your `swarm_multiprocess --workers N --seconds
   3600` run is green on. Publish that number in your caller's own
   README so downstream is not guessing.
@@ -380,11 +399,10 @@ else, re-check — most "I need multi-process" reports turn out to be
   rebuild` or `freelist trunk page exceeds db_size`, do not fail
   closed immediately — it is an fsqlite-known recoverable class. Log,
   clean up the sidecar, and retry once before escalating.
-- If your `PRAGMA integrity_check` is green but in-process verdict
-  state says "corrupt," suspect the verdict classifier before
-  suspecting the database. See
-  [mcp_agent_mail_rust#99](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/99)
-  for a worked example where the verdict was wrong, not the data.
+- A green FrankenSQLite `PRAGMA integrity_check` is not a complete corruption
+  proof while `bd-y5urj` remains open. Preserve the file, close FrankenSQLite,
+  run stock SQLite's checker, and retain the exact reproducer before deciding
+  whether the database or an in-process verdict is wrong.
 
 ### When you hit a new symptom
 
@@ -425,6 +443,7 @@ silently accepting it.
 This is **not implemented yet**. It was sketched out in the closed
 [#70 triage](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
 comment thread as a candidate follow-up and has no live GitHub tracker.
+The broader multi-process durability program remains tracked by `bd-zywqc`.
 Design notes for whoever
 picks it up:
 
@@ -446,9 +465,6 @@ grow a scenario that proves the refusal actually refuses.
 
 ## Change log
 
-- **2026-08-05**: #70, #79, and #80 are closed. Multi-process remains
-  *partial* by measurement rather than by an open investigation;
-  multi-process checkpoint remains the weakest surface.
 - **2026-04-20**: Document created in response to #70. Captures the
   contract as it stands at commit `bd770f2f` (Silo-style epoch group
   commit primitive just landed; multi-process swarm path still under
@@ -462,5 +478,8 @@ grow a scenario that proves the refusal actually refuses.
   [#79](https://github.com/Dicklesworthstone/frankensqlite/issues/79)
   swarm-writer harness at
   `crates/fsqlite-e2e/tests/swarm_writer_harness.rs`
-  (`#[ignore]`-gated; runs via
-  `cargo test --profile release-perf -p fsqlite-e2e --test swarm_writer_harness -- --ignored --nocapture --test-threads=1`).
+   (`#[ignore]`-gated; runs via
+   `cargo test --profile release-perf -p fsqlite-e2e --test swarm_writer_harness -- --ignored --nocapture --test-threads=1`).
+- **2026-08-05**: #70, #79, and #80 are closed. Remaining multi-process work
+  moved to the Beads tree; the contract stays *partial* by measurement, and
+  multi-process checkpoint remains the weakest surface.

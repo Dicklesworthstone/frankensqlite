@@ -59,7 +59,7 @@ signature fails closed rather than silently downgrading authenticity.
 
 | Feature | C SQLite | FrankenSQLite |
 |---------|----------|---------------|
-| Concurrent writers | 1 (file-level lock) | Many (page-level MVCC with SSI) |
+| Concurrent writers | 1 (file-level lock) | Many by design (page-level MVCC with SSI); the v0.2.0 candidate remains blocked on the concurrent-writer correctness gates below |
 | Isolation level | SERIALIZABLE (by serializing) | SERIALIZABLE (SSI for concurrent mode) |
 | Concurrent readers | Many (WAL; 5 read-mark slots by default) | Many (Compat: same 5 read-mark slots; Native: bounded by txn-slot capacity, no WAL-index cap) |
 | Memory safety | Manual (C) | Core engine is safe Rust; `unsafe` is limited to `fsqlite-vfs` (mmap/shm) and the optional `fsqlite-c-api` shim (FFI) |
@@ -69,7 +69,7 @@ signature fails closed rather than silently downgrading authenticity.
 | Page-level encryption | No (commercial SEE extension) | Not available in v0.2.0: the XChaCha20-Poly1305 DEK/KEK implementation exists in `fsqlite-pager`, but no `PRAGMA key`/`rekey` dispatch is wired into `Connection` |
 | SQL dialect | Full | Large and growing subset; parser coverage exceeds full execution parity today |
 | Extensions | FTS3/4/5, R-tree, JSON1, etc. | Extension crates are present; some runtime wiring is still in progress |
-| Cross-process MVCC | No | Yes (shared-memory coordination) |
+| Cross-process MVCC | No | Partial (shared-memory coordination, bounded by the measured harness scale) |
 | Embedded, zero-config | Yes | Yes |
 
 ---
@@ -256,11 +256,13 @@ All threshold PRAGMAs clamp invalid low values to safe minimums.
 > **Using FrankenSQLite from multiple processes or a many-agent swarm?**
 > Read [`docs/concurrency-contract.md`](docs/concurrency-contract.md) before
 > your caller library writes any workaround. It states, unambiguously, which
-> concurrency shapes are supported (`single-process / multi-Connection / MVCC WAL`),
+> concurrency shapes are intended (`single-process / multi-Connection / MVCC WAL`),
 > which are not (`single-Connection shared across threads`), and which are
 > partial at a measured harness scale (`multi-process swarm-write`). The
 > closed [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
-> records the original validation milestone; the harness under
+> records the original validation milestone; the remaining multi-process work
+> is carried by the Beads tracker. The v0.2.0 candidate is also blocked on a
+> reproduced implicit-autocommit writer failure (`bd-9inpb`), so the harness under
 > `crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs` is the canonical source of
 > truth for what currently holds.
 
@@ -1182,9 +1184,10 @@ async fn basic_usage() -> Result<(), FrankenError> {
 }
 ```
 
-`Connection` is asynchronous and does not create a runtime. Run these futures
-inside the caller-owned asupersync runtime; core operations derive their `Cx`
-from the connection's `RuntimeContext`.
+`Connection` methods are asynchronous; the caller supplies the executor that
+polls their futures. `Connection::open` uses a lazily initialized process-global
+`RuntimeContext` by default. To root the connection's `Cx` lineage in a
+caller-supplied `Cx`, open with a `ConnectionEnv::new_with_root_cx` environment.
 
 ### Transaction API
 
@@ -1229,10 +1232,12 @@ async fn write_batch(db_path: &str, writer_id: i64) -> Result<(), FrankenError> 
 }
 ```
 
-Run multiple `write_batch` futures as sibling tasks in a caller-owned
-asupersync scope. Do not share a single `Connection` across threads; production
-callers should add bounded backoff appropriate to their runtime between
-transient retries.
+Run one `write_batch` future per OS thread, with that thread's caller-owned
+executor and its own `Connection`. `Connection` is `!Send + !Sync`, so do not
+move a connection-owning future onto a `Send`-only task lane. To drive several
+connections on one thread, use asupersync's pinned local lane
+(`Cx::spawn_local_in` or `JoinSet::spawn_local`). Production callers should add
+bounded backoff appropriate to their runtime between transient retries.
 
 ---
 
@@ -2743,9 +2748,9 @@ still serves as an authoritative reference.
   write forms in v0.2.0
   ([#208](https://github.com/Dicklesworthstone/frankensqlite/issues/208),
   [#214](https://github.com/Dicklesworthstone/frankensqlite/issues/214)).
-- **HFDT bounded database-image validation is not part of the portable v0.2.0
-  `fsqlite::Connection` API.** Its macOS support is therefore unavailable;
-  downstream applications must not treat that validation surface as shipped
+- **Bounded external-snapshot database-image validation is not part of the
+  portable v0.2.0 `fsqlite::Connection` API,** and is unimplemented on macOS.
+  Downstream applications must not treat that validation surface as shipped
   FrankenSQLite functionality
   ([#307](https://github.com/Dicklesworthstone/frankensqlite/issues/307)).
 - **The runtime-stub release inventory is not exhaustive.** Its line-based
@@ -2876,7 +2881,10 @@ still serves as an authoritative reference.
   lane is focused on a compact in-memory package, feature-gated diagnostics,
   and honest size-budget reporting.
 - **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. Cache eviction and GC mitigate this but introduce background work.
-- **No row-level locking.** Two transactions modifying different rows on the same page can still conflict at the page level. The safe write-merge ladder can resolve commuting conflicts, but non-commuting conflicts still abort/retry. This is a deliberate tradeoff for file format compatibility.
+- **No row-level locking.** Two transactions modifying different rows on the
+  same page can still conflict at the page level. The safe write-merge ladder is
+  dormant in the live commit path, so current conflicts abort/retry. This is a
+  deliberate tradeoff for file format compatibility.
 - **Page encryption is not wired in v0.2.0, and `PRAGMA key`/`PRAGMA rekey` are
   silently ignored.** Both statements parse and return success with no rows and
   no error, but no key is installed and the database is written unencrypted.
@@ -2914,13 +2922,21 @@ SQLite has accumulated 24 years of behavioral nuances that applications depend o
 ## FAQ
 
 **Q: Can I open an existing SQLite database with FrankenSQLite?**
-A: Yes, when the database header declares encoding 1 (UTF-8). FrankenSQLite v0.2.0 recognizes valid UTF-16le/UTF-16be SQLite databases but rejects them as unsupported; convert them to UTF-8 with stock SQLite first. UTF-8 databases use the standard SQLite file and WAL layouts, and a database written by FrankenSQLite opens in C SQLite.
+A: Yes, when the database header declares encoding 1 (UTF-8) and the database
+uses the documented supported surface. FrankenSQLite v0.2.0 recognizes valid
+UTF-16le/UTF-16be SQLite databases but rejects them as unsupported; convert them
+to UTF-8 with stock SQLite first. UTF-8 databases use the standard SQLite file
+and WAL layouts, subject to the extension-specific limitations above.
 
 **Q: How does MVCC interact with WAL mode?**
 A: In the current compatibility runtime, WAL is the durability mechanism while MVCC conflict tracking lives above the pager in shared session state (`ConcurrentRegistry`, commit index, page locks, version store). The more ambitious WAL/native-mode extensions described elsewhere in this README are design/partial-implementation work rather than the entire hot path today.
 
 **Q: What happens when two writers conflict on the same page?**
-A: If the page lock is held, the second writer gets `SQLITE_BUSY` immediately (no waiting, no deadlocks). If both reach commit on the same page, FCW detects base drift; commuting conflicts may be resolved by the safe merge ladder when enabled, otherwise the loser aborts/retries with `SQLITE_BUSY_SNAPSHOT`.
+A: If the page lock is held, the second writer gets `SQLITE_BUSY` immediately
+(no waiting, no deadlocks). If both reach commit on the same page, FCW detects
+base drift and the loser aborts/retries with `SQLITE_BUSY_SNAPSHOT`. The safe
+write-merge ladder exists as dormant implementation and is not wired into the
+live v0.2.0 commit path.
 
 **Q: Why not use `unsafe` for performance-critical paths?**
 A: The engine is intentionally written in safe Rust. The workspace-level lint is `unsafe_code = "forbid"`. Two crates override this locally: `fsqlite-vfs` (mmap and shared-memory regions require raw pointers) and the optional `fsqlite-c-api` shim (FFI boundary code). If you use the Rust API or CLI, you can ignore `fsqlite-c-api` entirely. This keeps the highest-risk surface small while still leaving plenty of room for performance work through data structures, layout, and algorithmic tuning.
