@@ -618,6 +618,51 @@ fn fire_concurrent_commit_window_hook() {
     }
 }
 
+/// Test-only post-durable failure injection at the connection boundary.
+///
+/// The pager has already returned its durable completion before this hook
+/// fires. Keeping this distinct from a pager failure lets the regression prove
+/// that connection-local work cannot turn an acknowledged durable commit back
+/// into an apparent rollback.
+#[cfg(test)]
+static FSQLITE_POST_DURABLE_COMMIT_ERROR_ONCE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+static FSQLITE_POST_DURABLE_COMMIT_ERROR_FIRED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn arm_post_durable_commit_error_once() {
+    FSQLITE_POST_DURABLE_COMMIT_ERROR_FIRED.store(false, AtomicOrdering::Release);
+    FSQLITE_POST_DURABLE_COMMIT_ERROR_ONCE.store(true, AtomicOrdering::Release);
+}
+
+#[cfg(test)]
+fn take_post_durable_commit_error() -> Option<FrankenError> {
+    FSQLITE_POST_DURABLE_COMMIT_ERROR_ONCE
+        .swap(false, AtomicOrdering::AcqRel)
+        .then(|| {
+            FSQLITE_POST_DURABLE_COMMIT_ERROR_FIRED.store(true, AtomicOrdering::Release);
+            FrankenError::Internal("injected connection post-durable commit error".to_owned())
+        })
+}
+
+#[cfg(test)]
+fn take_post_durable_commit_error_fired() -> bool {
+    FSQLITE_POST_DURABLE_COMMIT_ERROR_FIRED.swap(false, AtomicOrdering::AcqRel)
+}
+
+/// The connection's interpretation of the pager terminal result.
+///
+/// A post-durable local error is intentionally separate from a pre-durable
+/// failure: the former must still run the monotonic CommitIndex/SSI/session
+/// publication path and complete the caller's COMMIT as successful work.
+enum PhysicalCommitOutcome {
+    NotCommitted(FrankenError),
+    Durable {
+        post_durable_error: Option<FrankenError>,
+    },
+}
+
 static FSQLITE_PARSE_SINGLE_CALLS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PARSE_MULTI_CALLS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PARSE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -43659,6 +43704,13 @@ impl Connection {
             &FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS,
             finalize_post_publish_start,
         );
+        if let Some(error) = post_durable_commit_error {
+            tracing::warn!(
+                %error,
+                caller_outcome = "committed",
+                "connection completed a durable commit after local post-durable error"
+            );
+        }
         Ok(())
     }
 
@@ -53270,7 +53322,7 @@ impl Connection {
         // Stock SQLite applies the busy handler during COMMIT lock escalation,
         // not just at BEGIN time. We mirror that by retrying on Busy with the
         // same spin-loop backoff used in begin_pager_txn_with_busy_timeout().
-        let committed_write = {
+        let (committed_write, post_durable_commit_error) = {
             // Issue #115: the concurrent-commit publication must be a single
             // critical section spanning FCW/SSI validate → physical pager write
             // → publish into the shared `CommitIndex`. Previously the shared
@@ -53377,6 +53429,21 @@ impl Connection {
                     .record_success(latency);
             }
 
+            let mut commit_outcome = match commit_res {
+                Ok(()) => PhysicalCommitOutcome::Durable {
+                    post_durable_error: None,
+                },
+                Err(error) => PhysicalCommitOutcome::NotCommitted(error),
+            };
+
+            #[cfg(test)]
+            if let PhysicalCommitOutcome::Durable {
+                post_durable_error,
+            } = &mut commit_outcome
+            {
+                *post_durable_error = take_post_durable_commit_error();
+            }
+
             // Issue #115 regression hook: we are now in the precise window
             // AFTER the physical pager write has landed but BEFORE the commit
             // is published into the shared `CommitIndex`. With the #115 fix the
@@ -53388,11 +53455,13 @@ impl Connection {
             // regardless of whether the critical section is held — that lets the
             // same hook reproduce the pre-fix TOCTOU when the guard is released.
             #[cfg(test)]
-            if concurrent_commit_plan.is_some() && matches!(commit_res, Ok(())) {
+            if concurrent_commit_plan.is_some()
+                && matches!(commit_outcome, PhysicalCommitOutcome::Durable { .. })
+            {
                 fire_concurrent_commit_window_hook();
             }
 
-            if matches!(commit_res, Ok(())) {
+            if matches!(commit_outcome, PhysicalCommitOutcome::Durable { .. }) {
                 let commit_finalize_seq_start = hot_path_profile_enabled().then(Instant::now);
                 if let Some(plan) = concurrent_commit_plan {
                     // Bug A (#70): file-backed CONCURRENT writes land in the
@@ -53452,8 +53521,12 @@ impl Connection {
                 );
             }
 
-            commit_res?;
-            txn_has_pending_writes
+            match commit_outcome {
+                PhysicalCommitOutcome::NotCommitted(error) => return Err(error),
+                PhysicalCommitOutcome::Durable {
+                    post_durable_error,
+                } => (txn_has_pending_writes, post_durable_error),
+            }
         };
 
         // Commit succeeded; now consume and drop the handle.
@@ -164568,6 +164641,57 @@ mod tests {
                 "free-only FCW conflict must fail with BusySnapshot, got {conflict:?}"
             );
             conn.execute("ROLLBACK;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_post_durable_connection_error_still_publishes_concurrent_commit() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            super::FSQLITE_POST_DURABLE_COMMIT_ERROR_ONCE.store(false, AtomicOrdering::Release);
+            assert!(
+                !super::take_post_durable_commit_error_fired(),
+                "the one-shot post-durable error hook must start clear"
+            );
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+                .await
+                .unwrap();
+            let root_page = conn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("t"))
+                .map(|table| {
+                    PageNumber::new(u32::try_from(table.root_page).expect("root page fits u32"))
+                        .expect("table root page must be nonzero")
+                })
+                .expect("created table must have a root page");
+
+            conn.execute("BEGIN CONCURRENT;").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'durable');")
+                .await
+                .unwrap();
+            super::arm_post_durable_commit_error_once();
+            conn.execute("COMMIT;").await.expect(
+                "a local error observed after pager durability must complete as committed, not look rollbackable",
+            );
+
+            assert!(
+                super::take_post_durable_commit_error_fired(),
+                "the keeper must exercise its injected post-durable error path"
+            );
+            assert!(
+                !conn.in_transaction(),
+                "a durable commit must finalize the connection rather than retain a rollbackable transaction"
+            );
+            assert!(
+                conn.concurrent_commit_index.latest(root_page).is_some(),
+                "a durable concurrent commit must publish its table root to CommitIndex"
+            );
+            let row = conn.query_row("SELECT v FROM t WHERE id = 1;").await.unwrap();
+            assert_eq!(row.get(0), Some(&SqliteValue::Text("durable".to_owned())));
         });
     }
 
