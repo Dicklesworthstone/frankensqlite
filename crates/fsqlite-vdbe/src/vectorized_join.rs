@@ -1051,7 +1051,7 @@ mod tests {
             TrieRow::new(vec![SqliteValue::Integer(20)], 2),
             TrieRow::new(vec![SqliteValue::Integer(30 + relation_index_i64)], 3),
         ];
-        if relation_index % 2 == 0 {
+        if relation_index.is_multiple_of(2) {
             rows.insert(3, TrieRow::new(vec![SqliteValue::Integer(20)], 4));
         }
         TrieRelation::from_sorted_rows(rows)

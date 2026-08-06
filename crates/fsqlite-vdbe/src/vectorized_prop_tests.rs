@@ -52,20 +52,23 @@ mod tests {
     fn extract_int64(batch: &Batch, col_idx: usize) -> Vec<Option<i64>> {
         let col = &batch.columns()[col_idx];
         let sel = batch.selection().as_slice();
-        if let ColumnData::Int64(v) = &col.data {
-            sel.iter()
-                .map(|&i| {
-                    let idx = usize::from(i);
-                    if col.validity.is_valid(idx) {
-                        Some(v.as_slice()[idx])
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            panic!("expected Int64 column at index {col_idx}")
-        }
+        assert!(
+            matches!(&col.data, ColumnData::Int64(_)),
+            "expected Int64 column at index {col_idx}"
+        );
+        let ColumnData::Int64(v) = &col.data else {
+            return Vec::new();
+        };
+        sel.iter()
+            .map(|&i| {
+                let idx = usize::from(i);
+                if col.validity.is_valid(idx) {
+                    Some(v.as_slice()[idx])
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     // ── Proptest Strategies ───────────────────────────────────────────────
@@ -167,11 +170,14 @@ mod tests {
     }
 
     fn sqlite_key_to_option_i64(value: &SqliteValue) -> Option<i64> {
-        match value {
-            SqliteValue::Integer(v) => Some(*v),
-            SqliteValue::Null => None,
-            other => panic!("expected integer/null join key, got {other:?}"),
+        if let SqliteValue::Integer(value) = value {
+            return Some(*value);
         }
+        assert!(
+            matches!(value, SqliteValue::Null),
+            "expected integer/null join key, got {value:?}"
+        );
+        None
     }
 
     fn leapfrog_join_multiplicity_by_key(
@@ -736,10 +742,10 @@ mod tests {
             let mut naive_groups: std::collections::BTreeMap<i64, i64> =
                 std::collections::BTreeMap::new();
             for (k, v) in &rows {
-                if let (Some(key), Some(val)) = (k, v) {
-                    if *key > threshold {
-                        *naive_groups.entry(*key).or_insert(0) += val;
-                    }
+                if let (Some(key), Some(val)) = (k, v)
+                    && *key > threshold
+                {
+                    *naive_groups.entry(*key).or_insert(0) += val;
                 }
             }
 
@@ -752,10 +758,10 @@ mod tests {
                 .collect();
 
             for (key, sum) in non_null_keys.iter().zip(non_null_sums.iter()) {
-                if let Some(expected) = naive_groups.get(key) {
-                    if let Some(actual) = sum {
-                        prop_assert_eq!(*actual, *expected);
-                    }
+                if let Some(expected) = naive_groups.get(key)
+                    && let Some(actual) = sum
+                {
+                    prop_assert_eq!(*actual, *expected);
                 }
             }
         }
