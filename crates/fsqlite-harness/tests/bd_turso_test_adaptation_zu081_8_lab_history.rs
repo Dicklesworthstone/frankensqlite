@@ -307,6 +307,24 @@ async fn run_disjoint_writer(
     recorder: Arc<Mutex<EventRecorder>>,
     outcomes: Arc<Mutex<Vec<TxnOutcome>>>,
 ) {
+    let native = asupersync::Cx::current().expect("LabRuntime task must install a current Cx");
+    let mut handle = native
+        .spawn_local(move |_child| async move {
+            run_disjoint_writer_local(path, plan, recorder, outcomes).await;
+        })
+        .expect("spawn local production disjoint writer");
+    handle
+        .join(&native)
+        .await
+        .expect("local production disjoint writer should complete");
+}
+
+async fn run_disjoint_writer_local(
+    path: String,
+    plan: DisjointWriterPlan,
+    recorder: Arc<Mutex<EventRecorder>>,
+    outcomes: Arc<Mutex<Vec<TxnOutcome>>>,
+) {
     let (mut conn, cx) =
         open_lab_connection(LabHistoryCase::DisjointWriters, plan.decision_id, &path)
             .await
@@ -365,6 +383,23 @@ async fn run_disjoint_writer(
 }
 
 async fn run_same_row_conflict(
+    path: String,
+    recorder: Arc<Mutex<EventRecorder>>,
+    outcomes: Arc<Mutex<Vec<TxnOutcome>>>,
+) {
+    let native = asupersync::Cx::current().expect("LabRuntime task must install a current Cx");
+    let mut handle = native
+        .spawn_local(move |_child| async move {
+            run_same_row_conflict_local(path, recorder, outcomes).await;
+        })
+        .expect("spawn local production same-row conflict");
+    handle
+        .join(&native)
+        .await
+        .expect("local production same-row conflict should complete");
+}
+
+async fn run_same_row_conflict_local(
     path: String,
     recorder: Arc<Mutex<EventRecorder>>,
     outcomes: Arc<Mutex<Vec<TxnOutcome>>>,
