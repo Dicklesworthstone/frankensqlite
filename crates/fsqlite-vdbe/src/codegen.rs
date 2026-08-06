@@ -23096,6 +23096,202 @@ fn emit_without_rowid_index_deletes(
     }
 }
 
+/// Rewrite one located WITHOUT ROWID row from its OLD image to its NEW image.
+///
+/// bd-yuj70: the previous emission deleted the OLD secondary-index entries and
+/// the OLD table row *before* the NEW primary key was probed, so a NEW-PK
+/// collision with a **different** row reached `IdxInsert` with `OE_REPLACE`
+/// and bypassed the explicit victim-secondary cleanup that
+/// [`emit_without_rowid_row_insert`] performs. That left the victim's
+/// secondary-index entries pointing at a deleted clustered record, and the
+/// ABORT/FAIL/ROLLBACK paths had already destroyed OLD before raising.
+///
+/// The mutation order here is fixed:
+/// 1. the caller computes, validates, and affinitizes NEW before any mutation;
+/// 2. probe the NEW primary key and distinguish a *self* rewrite (NEW PK equals
+///    OLD PK) from an *other* victim;
+/// 3. resolve the conflict action against that other victim first — REPLACE
+///    removes the victim's secondary entries and its clustered row, IGNORE
+///    abandons the row without mutating anything, and the ABORT family raises
+///    the UNIQUE violation while OLD is still intact;
+/// 4. only then delete the OLD secondary entries and the OLD clustered row;
+/// 5. insert NEW under `OE_ABORT` so the write cannot recursively REPLACE.
+///
+/// `new_regs` holds the NEW image (declared column order, already affinitized),
+/// `old_regs` the OLD image used for the OLD secondary-index keys, and
+/// `old_pk_regs` the OLD primary-key values used to re-seek the OLD row after
+/// the probes have moved the cursor.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(clippy::too_many_arguments)]
+fn emit_without_rowid_update_rewrite(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_cursor: i32,
+    new_regs: i32,
+    old_regs: i32,
+    old_pk_regs: i32,
+    pk_indices: &[usize],
+    oe_flag: u16,
+    stmt_level: Option<ConflictAction>,
+    row_done: Label,
+) {
+    let n_cols = table.columns.len();
+    let n_pk = pk_indices.len();
+    let pk_label = without_rowid_pk_label(table, pk_indices);
+    let aff_str = table.affinity_string();
+
+    // Step 2: is the primary key unchanged? Compare collation-aware, per key
+    // column: a single differing column makes this an "other victim" probe.
+    let pk_changed = b.emit_label();
+    let pk_unchanged = b.emit_label();
+    for (j, &pk_col) in pk_indices.iter().enumerate() {
+        let pk_collation = table.columns[pk_col]
+            .collation
+            .as_deref()
+            .filter(|name| !name.eq_ignore_ascii_case("BINARY"))
+            .map_or(P4::None, |name| P4::Collation(name.to_owned()));
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            new_regs + pk_col as i32,
+            old_pk_regs + j as i32,
+            pk_changed,
+            pk_collation,
+            0,
+        );
+    }
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, pk_unchanged, P4::None, 0);
+
+    // Step 3: the primary key moved — resolve any *other* row holding NEW PK
+    // before OLD is touched.
+    b.resolve_label(pk_changed);
+    let new_pk_regs = b.alloc_regs(n_pk as i32);
+    for (j, &pk_col) in pk_indices.iter().enumerate() {
+        b.emit_op(
+            Opcode::Copy,
+            new_regs + pk_col as i32,
+            new_pk_regs + j as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+    let new_pk_rec = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        new_pk_regs,
+        n_pk as i32,
+        new_pk_rec,
+        P4::None,
+        0,
+    );
+    let no_victim = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::NoConflict,
+        table_cursor,
+        new_pk_rec,
+        no_victim,
+        P4::None,
+        0,
+    );
+    if oe_flag == OE_REPLACE {
+        // The cursor is positioned on the victim: drop its secondary-index
+        // entries (keys read from the cursor, not from either image) and then
+        // its clustered row.
+        emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
+        b.emit_op(
+            Opcode::IdxDelete,
+            table_cursor,
+            0,
+            0,
+            P4::Table(table.name.clone()),
+            OPFLAG_REPLACE_VICTIM,
+        );
+    } else if oe_flag == OE_IGNORE {
+        // Abandon the row with OLD still intact.
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
+    } else {
+        // ABORT / FAIL / ROLLBACK: raise the UNIQUE violation now, while OLD is
+        // still present, so the statement cannot lose the OLD row on the way
+        // out. `NoConflict` fell through, so a conflicting row provably exists
+        // and this insert cannot silently succeed.
+        let abort_rec = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            new_regs,
+            n_cols as i32,
+            abort_rec,
+            P4::Affinity(aff_str.clone()),
+            0,
+        );
+        b.emit_op(
+            Opcode::IdxInsert,
+            table_cursor,
+            abort_rec,
+            n_pk as i32,
+            P4::Table(format!("{}.{}", table.name, pk_label)),
+            1u16 | (oe_flag << 1),
+        );
+    }
+    b.resolve_label(no_victim);
+    b.resolve_label(pk_unchanged);
+
+    // Step 4: re-seek OLD (the probes above moved the cursor) and remove its
+    // secondary-index entries and clustered row.
+    let old_seek_regs = b.alloc_regs(n_pk as i32);
+    for j in 0..n_pk {
+        b.emit_op(
+            Opcode::Copy,
+            old_pk_regs + j as i32,
+            old_seek_regs + j as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+    let old_seek_rec = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        old_seek_regs,
+        n_pk as i32,
+        old_seek_rec,
+        P4::None,
+        0,
+    );
+    let old_absent = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::NoConflict,
+        table_cursor,
+        old_seek_rec,
+        old_absent,
+        P4::None,
+        0,
+    );
+    emit_without_rowid_index_deletes(b, table, table_cursor, Some(old_regs), pk_indices);
+    b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 0);
+    b.resolve_label(old_absent);
+
+    // Step 5: insert NEW. Every conflicting row has been resolved above, so
+    // this insert must not itself REPLACE.
+    let rec_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        new_regs,
+        n_cols as i32,
+        rec_reg,
+        P4::Affinity(aff_str),
+        0,
+    );
+    b.emit_op(
+        Opcode::IdxInsert,
+        table_cursor,
+        rec_reg,
+        n_pk as i32,
+        P4::Table(format!("{}.{}", table.name, pk_label)),
+        1u16 | (OE_ABORT << 1),
+    );
+    emit_without_rowid_index_inserts(b, table, table_cursor, new_regs, pk_indices, stmt_level);
+}
+
 /// Emit the per-row insert for a WITHOUT ROWID table.
 ///
 /// `val_regs` holds the full row image in declared column order. Handles
@@ -24275,12 +24471,25 @@ fn codegen_update_without_rowid(
         0,
     );
 
-    // Remove the OLD secondary index entries (keys from the old image) and the
-    // OLD table row (delete at the cursor position located by NoConflict).
-    emit_without_rowid_index_deletes(b, table, table_cursor, Some(col_regs), &pk_indices);
-    b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 0);
+    // bd-yuj70: preserve the OLD image before the assignments overwrite
+    // `col_regs`. The OLD secondary-index keys are derived from it *after* the
+    // NEW primary key has been probed, so no mutation happens before the
+    // conflict action is resolved.
+    let old_regs = b.alloc_regs(n_cols as i32);
+    for i in 0..n_cols {
+        b.emit_op(
+            Opcode::Copy,
+            col_regs + i as i32,
+            old_regs + i as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
 
-    // Compute the NEW image in place, then validate constraints.
+    // Compute the NEW image in place, then validate constraints. Nothing below
+    // this point has mutated the table yet, so OR IGNORE can bail cleanly and
+    // the ABORT family can raise with the OLD row still intact.
     let update_ctx = ScanCtx {
         cursor: table_cursor,
         table,
@@ -24292,47 +24501,36 @@ fn codegen_update_without_rowid(
     emit_update_assignments(b, &stmt.assignments, table, col_regs, &update_ctx)?;
     emit_stored_generated_columns(b, table, col_regs);
     emit_strict_type_check(b, table, col_regs);
-    emit_check_constraints(b, table, col_regs, None);
-    emit_not_null_constraints(b, table, col_regs, stmt.or_conflict, None);
+    let ignore_skip = if oe_flag == OE_IGNORE {
+        Some(row_done)
+    } else {
+        None
+    };
+    emit_check_constraints(b, table, col_regs, ignore_skip);
+    emit_not_null_constraints(b, table, col_regs, stmt.or_conflict, ignore_skip);
 
-    // Insert the rewritten row.
-    let aff_str = table.affinity_string();
+    // Apply column affinities before the primary-key probe so the comparison
+    // and the stored record agree on representation.
     b.emit_op(
         Opcode::Affinity,
         col_regs,
         n_cols as i32,
         0,
-        P4::Affinity(aff_str.clone()),
+        P4::Affinity(table.affinity_string()),
         0,
     );
-    let rec_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        col_regs,
-        n_cols as i32,
-        rec_reg,
-        P4::Affinity(aff_str),
-        0,
-    );
-    b.emit_op(
-        Opcode::IdxInsert,
-        table_cursor,
-        rec_reg,
-        n_pk as i32,
-        P4::Table(format!(
-            "{}.{}",
-            table.name,
-            without_rowid_pk_label(table, &pk_indices)
-        )),
-        1u16 | (oe_flag << 1),
-    );
-    emit_without_rowid_index_inserts(
+
+    emit_without_rowid_update_rewrite(
         b,
         table,
         table_cursor,
         col_regs,
+        old_regs,
+        pk_probe_regs,
         &pk_indices,
+        oe_flag,
         stmt.or_conflict,
+        row_done,
     );
 
     // RETURNING: emit the NEW row image (col_regs now holds the rewritten row).
@@ -24718,48 +24916,29 @@ fn codegen_update_from_without_rowid(
         0,
     );
 
-    // Remove the OLD secondary-index entries + OLD table row.
-    emit_without_rowid_index_deletes(b, table, target_cursor, Some(old_img), &pk_indices);
-    b.emit_op(Opcode::IdxDelete, target_cursor, 0, 0, P4::None, 0);
-
-    // Insert the NEW row + NEW index entries.
-    let aff_str = table.affinity_string();
+    // bd-yuj70: apply affinities before probing, then rewrite through the
+    // shared victim-safe path. UPDATE FROM computed the NEW image during pass 1
+    // while the FROM cursors were live, so only conflict resolution and the
+    // OLD/NEW mutation order are shared with the plain UPDATE emission.
     b.emit_op(
         Opcode::Affinity,
         new_img,
         n_cols as i32,
         0,
-        P4::Affinity(aff_str.clone()),
+        P4::Affinity(table.affinity_string()),
         0,
     );
-    let rec_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        new_img,
-        n_cols as i32,
-        rec_reg,
-        P4::Affinity(aff_str),
-        0,
-    );
-    b.emit_op(
-        Opcode::IdxInsert,
-        target_cursor,
-        rec_reg,
-        n_pk as i32,
-        P4::Table(format!(
-            "{}.{}",
-            table.name,
-            without_rowid_pk_label(table, &pk_indices)
-        )),
-        1u16 | (oe_flag << 1),
-    );
-    emit_without_rowid_index_inserts(
+    emit_without_rowid_update_rewrite(
         b,
         table,
         target_cursor,
         new_img,
+        old_img,
+        pk_probe_regs,
         &pk_indices,
+        oe_flag,
         stmt.or_conflict,
+        row_done,
     );
 
     // RETURNING: the NEW image.
