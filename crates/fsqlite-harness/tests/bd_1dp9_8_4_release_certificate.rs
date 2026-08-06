@@ -33,6 +33,7 @@ fn strict_adapter_rejects_noncanonical_candidate_before_publication() {
         evidence_root: workspace_root,
         evidence_json: PathBuf::from("evidence-that-must-not-be-read.json"),
         candidate_git_sha: "A".repeat(40),
+        tested_candidate_git_sha: "a".repeat(40),
         baseline_metadata_git_sha: "b".repeat(40),
         candidate_rch_project_id: "frankensqlite-candidate".to_owned(),
         baseline_rch_project_id: "frankensqlite-baseline".to_owned(),

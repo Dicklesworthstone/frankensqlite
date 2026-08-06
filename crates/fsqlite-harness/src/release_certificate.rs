@@ -142,8 +142,8 @@ impl Default for CertificateConfig {
 // Strict frozen-candidate adapter contract (bd-2yqp6.7.3)
 // ---------------------------------------------------------------------------
 
-const STRICT_CERTIFICATE_INPUT_SCHEMA: &str = "fsqlite.parity_certificate_input.v4";
-const STRICT_CERTIFICATE_BUNDLE_SCHEMA: &str = "fsqlite.release_certificate_bundle.v2";
+const STRICT_CERTIFICATE_INPUT_SCHEMA: &str = "fsqlite.parity_certificate_input.v5";
+const STRICT_CERTIFICATE_BUNDLE_SCHEMA: &str = "fsqlite.release_certificate_bundle.v3";
 const D4_RUNTIME_PATH_PROOF_SCHEMA: &str = "fsqlite.d4_runtime_path_proof.v1";
 const D4_SCENARIO_ARTIFACT_SCHEMA: &str = "fsqlite.d4_scenario_artifact.v1";
 const STRICT_RESULTS_RECORD_SCHEMA: &str = "fsqlite.release_traceability_result.v1";
@@ -205,7 +205,10 @@ struct StrictLaneManifestRef {
 #[serde(deny_unknown_fields)]
 struct StrictCertificateEvidenceInput {
     schema_version: String,
+    /// Evidence descendant E: the checked-out commit that binds every strict artifact.
     candidate_git_sha: String,
+    /// Tested candidate T: the direct first parent of `candidate_git_sha`.
+    tested_candidate_git_sha: String,
     run_id: String,
     trace_id: String,
     scenario_id: String,
@@ -643,7 +646,10 @@ struct Phase5RchCompletedBuild {
 #[derive(Debug, Serialize)]
 struct StrictCertificateBundleManifest {
     schema_version: String,
+    /// Evidence descendant E that owns the strict artifact manifest.
     candidate_git_sha: String,
+    /// Tested candidate T, required to be the direct first parent of E.
+    tested_candidate_git_sha: String,
     run_id: String,
     trace_id: String,
     scenario_id: String,
@@ -662,17 +668,19 @@ struct LoadedStrictEvidence<T> {
     value: T,
 }
 
-/// Filesystem and candidate parameters for strict release-certificate generation.
+/// Filesystem and T/E provenance parameters for strict release-certificate generation.
 #[derive(Debug, Clone)]
 pub struct StrictCertificateRunConfig {
-    /// Checkout containing the exact frozen candidate commit.
+    /// Checkout containing the exact evidence descendant E.
     pub workspace_root: PathBuf,
     /// Existing sealed root containing every referenced evidence artifact.
     pub evidence_root: PathBuf,
     /// Evidence manifest path, relative to `evidence_root`.
     pub evidence_json: PathBuf,
-    /// Exact lowercase 40-hex frozen candidate commit.
+    /// Exact lowercase 40-hex evidence descendant E checked out in `workspace_root`.
     pub candidate_git_sha: String,
+    /// Exact lowercase 40-hex tested candidate T, the direct first parent of E.
+    pub tested_candidate_git_sha: String,
     /// Exact lowercase 40-hex commit that first committed the baseline metadata.
     pub baseline_metadata_git_sha: String,
     /// Exact RCH project identity required for all candidate-bound receipts.
@@ -1908,6 +1916,50 @@ fn require_ancestor(workspace_root: &Path, ancestor: &str, descendant: &str) -> 
         return Err(format!(
             "commit_not_ancestor ancestor={ancestor} descendant={descendant}"
         ));
+    }
+    Ok(())
+}
+
+/// Require the Phase-5 evidence commit E to be a non-merge direct descendant
+/// of the tested candidate T. This keeps the strict certificate's artifact
+/// binding at E while keeping the measured source tree and manifest at T.
+fn require_direct_phase5_evidence_descendant(
+    workspace_root: &Path,
+    tested_candidate_git_sha: &str,
+    evidence_git_sha: &str,
+) -> Result<(), String> {
+    if tested_candidate_git_sha == evidence_git_sha {
+        return Err("phase5_evidence_commit_must_not_equal_tested_candidate".to_owned());
+    }
+    let parents = String::from_utf8(git_output(
+        workspace_root,
+        &["rev-list", "--parents", "-n", "1", evidence_git_sha],
+        "git_phase5_evidence_parents",
+    )?)
+    .map_err(|error| format!("git_phase5_evidence_parents_not_utf8: {error}"))?;
+    validate_direct_phase5_evidence_parents(tested_candidate_git_sha, evidence_git_sha, &parents)
+}
+
+fn validate_direct_phase5_evidence_parents(
+    tested_candidate_git_sha: &str,
+    evidence_git_sha: &str,
+    parents: &str,
+) -> Result<(), String> {
+    if tested_candidate_git_sha == evidence_git_sha {
+        return Err("phase5_evidence_commit_must_not_equal_tested_candidate".to_owned());
+    }
+    let mut parents = parents.split_whitespace();
+    if parents.next() != Some(evidence_git_sha) {
+        return Err("phase5_evidence_commit_parent_identity_mismatch".to_owned());
+    }
+    let Some(parent) = parents.next() else {
+        return Err("phase5_evidence_commit_must_be_single_parent".to_owned());
+    };
+    if parents.next().is_some() {
+        return Err("phase5_evidence_commit_must_be_single_parent".to_owned());
+    }
+    if parent != tested_candidate_git_sha {
+        return Err("phase5_evidence_commit_parent_mismatch".to_owned());
     }
     Ok(())
 }
@@ -3954,7 +4006,8 @@ fn validate_phase5_live_guard_receipt(
     workspace_root: &Path,
     evidence_root: &Path,
     receipt: &Phase5LiveGuardReceipt,
-    candidate_git_sha: &str,
+    evidence_git_sha: &str,
+    tested_candidate_git_sha: &str,
     baseline_metadata_git_sha: &str,
     phase5_manifest_sha256: &str,
     expected_project_id: &str,
@@ -3962,8 +4015,9 @@ fn validate_phase5_live_guard_receipt(
     manifest_index: &BTreeMap<String, (String, u64)>,
 ) -> Result<(), String> {
     if receipt.schema_version != PHASE5_LIVE_GUARD_RECEIPT_SCHEMA
-        || receipt.source_commit != candidate_git_sha
-        || receipt.tested_tree_blake3 != tested_tree_blake3(workspace_root, candidate_git_sha)?
+        || receipt.source_commit != evidence_git_sha
+        || receipt.tested_tree_blake3
+            != tested_tree_blake3(workspace_root, tested_candidate_git_sha)?
         || receipt.phase5_manifest_sha256 != phase5_manifest_sha256
         || receipt.baseline_metadata_git_sha != baseline_metadata_git_sha
         || receipt.project_id != expected_project_id
@@ -3975,7 +4029,7 @@ fn validate_phase5_live_guard_receipt(
     let binding = Phase5LeafBinding::CandidateManifest(manifest_index);
     let validated = validate_phase5_run(
         evidence_root,
-        candidate_git_sha,
+        tested_candidate_git_sha,
         &receipt.evidence,
         &binding,
         expected_project_id,
@@ -4326,7 +4380,7 @@ fn validate_phase5_manifest(
     workspace_root: &Path,
     evidence_root: &Path,
     manifest: &Phase5Manifest,
-    candidate_git_sha: &str,
+    tested_candidate_git_sha: &str,
     feature_graph_sha256: &str,
     feature_graph_target: &str,
     expected_requirements: &ExpectedPhase5Requirements,
@@ -4334,14 +4388,14 @@ fn validate_phase5_manifest(
     manifest_index: &BTreeMap<String, (String, u64)>,
 ) -> Result<(), String> {
     if manifest.schema_version != PHASE5_SCHEMA_VERSION
-        || manifest.tested_commit != candidate_git_sha
+        || manifest.tested_commit != tested_candidate_git_sha
         || manifest.evidence_pack.is_empty()
     {
         return Err("phase5_manifest_candidate_or_schema_mismatch".to_owned());
     }
     validate_phase5_performance_regression_gate(&manifest.performance_regression_gate)?;
     let expected_minisig_path =
-        format!("{PHASE5_EVIDENCE_PREFIX}/{candidate_git_sha}/signing/manifest.minisig");
+        format!("{PHASE5_EVIDENCE_PREFIX}/{tested_candidate_git_sha}/signing/manifest.minisig");
     let declared_minisig_path = manifest.signature_path.as_str();
     if !PartialEq::eq(declared_minisig_path, expected_minisig_path.as_str())
         || !manifest_index.contains_key(declared_minisig_path)
@@ -4359,7 +4413,7 @@ fn validate_phase5_manifest(
         insert_phase5_leaf(&mut pack, &mut pack_paths, leaf)?;
         drop(load_bound_phase5_leaf(
             evidence_root,
-            candidate_git_sha,
+            tested_candidate_git_sha,
             leaf,
             &Phase5LeafBinding::CandidateManifest(manifest_index),
         )?);
@@ -4408,7 +4462,7 @@ fn validate_phase5_manifest(
     ] {
         drop(load_bound_phase5_leaf(
             evidence_root,
-            candidate_git_sha,
+            tested_candidate_git_sha,
             leaf,
             &binding,
         )?);
@@ -4424,7 +4478,7 @@ fn validate_phase5_manifest(
     }
     let workspace = validate_phase5_run(
         evidence_root,
-        candidate_git_sha,
+        tested_candidate_git_sha,
         &manifest.workspace,
         &binding,
         expected_project_id,
@@ -4434,7 +4488,7 @@ fn validate_phase5_manifest(
     let (_, compiler_leaves) = validate_phase5_compiler_inventory(
         workspace_root,
         evidence_root,
-        candidate_git_sha,
+        tested_candidate_git_sha,
         &manifest.compiler_inventory_attestation,
         &pack,
         expected_project_id,
@@ -4473,7 +4527,7 @@ fn validate_phase5_manifest(
         }
         let run = validate_phase5_run(
             evidence_root,
-            candidate_git_sha,
+            tested_candidate_git_sha,
             &receipt.evidence,
             &binding,
             expected_project_id,
@@ -4486,7 +4540,7 @@ fn validate_phase5_manifest(
             }
             let semantic = validate_t16_transcript(
                 &run.transcript,
-                candidate_git_sha,
+                tested_candidate_git_sha,
                 feature_graph_sha256,
                 feature_graph_target,
                 &expected.argv,
@@ -4823,6 +4877,7 @@ fn publish_strict_certificate_bundle(
     let bundle = StrictCertificateBundleManifest {
         schema_version: STRICT_CERTIFICATE_BUNDLE_SCHEMA.to_owned(),
         candidate_git_sha: input.candidate_git_sha.clone(),
+        tested_candidate_git_sha: input.tested_candidate_git_sha.clone(),
         run_id: input.run_id.clone(),
         trace_id: input.trace_id.clone(),
         scenario_id: input.scenario_id.clone(),
@@ -4877,6 +4932,9 @@ fn build_and_publish_strict_certificate_at(
     if !is_lower_hex(&config.candidate_git_sha, 40) {
         return Err("candidate_git_sha_must_be_lowercase_40_hex".to_owned());
     }
+    if !is_lower_hex(&config.tested_candidate_git_sha, 40) {
+        return Err("tested_candidate_git_sha_must_be_lowercase_40_hex".to_owned());
+    }
     if !is_lower_hex(&config.baseline_metadata_git_sha, 40) {
         return Err("baseline_metadata_git_sha_must_be_lowercase_40_hex".to_owned());
     }
@@ -4906,6 +4964,11 @@ fn build_and_publish_strict_certificate_at(
     if current_head(&config.workspace_root)? != config.candidate_git_sha {
         return Err("candidate_git_sha_does_not_match_checked_out_head".to_owned());
     }
+    require_direct_phase5_evidence_descendant(
+        &config.workspace_root,
+        &config.tested_candidate_git_sha,
+        &config.candidate_git_sha,
+    )?;
     require_exact_clean_checkout(&config.workspace_root)?;
     let input_path = canonical_regular_file(&config.evidence_root, &config.evidence_json)?;
     let input_relative = canonical_relative_path(&config.evidence_root, &input_path)?;
@@ -4921,6 +4984,7 @@ fn build_and_publish_strict_certificate_at(
         .ok_or_else(|| "certification_freshness_budget_overflow".to_owned())?;
     if input.schema_version != STRICT_CERTIFICATE_INPUT_SCHEMA
         || input.candidate_git_sha != config.candidate_git_sha
+        || input.tested_candidate_git_sha != config.tested_candidate_git_sha
         || input.freshness_budget_ms == 0
         || input.freshness_budget_ms > max_freshness_ms
         || input.generated_unix_ms > now_unix_ms
@@ -5067,7 +5131,7 @@ fn build_and_publish_strict_certificate_at(
         &regression.value,
         &regression.bytes,
         &config.baseline_metadata_git_sha,
-        &config.candidate_git_sha,
+        &config.tested_candidate_git_sha,
     )?;
     validate_phase5_baseline_evidence(
         &config.workspace_root,
@@ -5080,7 +5144,7 @@ fn build_and_publish_strict_certificate_at(
         validate_dependency_feature_graph(&config.workspace_root, &feature_graph)?;
     let expected_phase5_path = format!(
         "{PHASE5_EVIDENCE_PREFIX}/{}/manifest.json",
-        config.candidate_git_sha
+        config.tested_candidate_git_sha
     );
     if phase5.relative_path != expected_phase5_path {
         return Err("phase5_manifest_path_not_candidate_canonical".to_owned());
@@ -5089,15 +5153,17 @@ fn build_and_publish_strict_certificate_at(
         &config.workspace_root,
         &config.evidence_root,
         &phase5.value,
-        &config.candidate_git_sha,
+        &config.tested_candidate_git_sha,
         &feature_graph.sha256,
         &feature_graph_target,
         &phase5_requirements,
         &config.candidate_rch_project_id,
         &manifest_index,
     )?;
-    let expected_live_guard_prefix =
-        format!("{PHASE5_EVIDENCE_PREFIX}/{}/", config.candidate_git_sha);
+    let expected_live_guard_prefix = format!(
+        "{PHASE5_EVIDENCE_PREFIX}/{}/",
+        config.tested_candidate_git_sha
+    );
     if !live_guard
         .relative_path
         .starts_with(&expected_live_guard_prefix)
@@ -5110,6 +5176,7 @@ fn build_and_publish_strict_certificate_at(
         &config.evidence_root,
         &live_guard.value,
         &config.candidate_git_sha,
+        &config.tested_candidate_git_sha,
         &config.baseline_metadata_git_sha,
         &phase5.sha256,
         &config.candidate_rch_project_id,
@@ -5143,7 +5210,7 @@ fn build_and_publish_strict_certificate_at(
     for leaf in &phase5.value.evidence_pack {
         drop(load_phase5_leaf(
             &config.evidence_root,
-            &config.candidate_git_sha,
+            &config.tested_candidate_git_sha,
             leaf,
         )?);
     }
@@ -5241,6 +5308,65 @@ mod tests {
         assert_eq!(
             validate_phase5_performance_regression_gate(&performance),
             Err("phase5_performance_regression_gate_contract_invalid".to_owned())
+        );
+    }
+
+    #[test]
+    fn phase5_provenance_accepts_direct_b_m_t_e_evidence_path() {
+        // B -> M -> T is separately enforced by `validate_regression_baseline`.
+        // This boundary test proves the new final link T -> E is exact.
+        let baseline = "1".repeat(40);
+        let metadata = "2".repeat(40);
+        let tested = "3".repeat(40);
+        let evidence = "4".repeat(40);
+        assert_ne!(baseline, metadata);
+        assert_ne!(metadata, tested);
+        assert_eq!(
+            validate_direct_phase5_evidence_parents(
+                &tested,
+                &evidence,
+                &format!("{evidence} {tested}\n"),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn phase5_provenance_rejects_evidence_parent_mismatch() {
+        let tested = "3".repeat(40);
+        let evidence = "4".repeat(40);
+        let wrong_parent = "5".repeat(40);
+        assert_eq!(
+            validate_direct_phase5_evidence_parents(
+                &tested,
+                &evidence,
+                &format!("{evidence} {wrong_parent}\n"),
+            ),
+            Err("phase5_evidence_commit_parent_mismatch".to_owned())
+        );
+    }
+
+    #[test]
+    fn phase5_provenance_rejects_merge_evidence_commit() {
+        let tested = "3".repeat(40);
+        let evidence = "4".repeat(40);
+        let second_parent = "5".repeat(40);
+        assert_eq!(
+            validate_direct_phase5_evidence_parents(
+                &tested,
+                &evidence,
+                &format!("{evidence} {tested} {second_parent}\n"),
+            ),
+            Err("phase5_evidence_commit_must_be_single_parent".to_owned())
+        );
+    }
+
+    #[test]
+    fn phase5_provenance_rejects_self_baselining_evidence_commit() {
+        let tested = "3".repeat(40);
+        assert_eq!(
+            validate_direct_phase5_evidence_parents(&tested, &tested, &format!("{tested}\n")),
+            Err("phase5_evidence_commit_must_not_equal_tested_candidate".to_owned())
         );
     }
 

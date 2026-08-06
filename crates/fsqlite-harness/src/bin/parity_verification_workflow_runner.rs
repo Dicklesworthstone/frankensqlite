@@ -17,6 +17,7 @@ const CERTIFICATE_ONLY_SELECTORS: &[&str] = &[
     "--certificate-evidence-root",
     "--certificate-evidence-json",
     "--candidate-git-sha",
+    "--tested-candidate-git-sha",
     "--baseline-metadata-git-sha",
     "--candidate-rch-project-id",
     "--baseline-rch-project-id",
@@ -53,6 +54,7 @@ impl CertificateCliConfig {
         let mut evidence_root = None;
         let mut evidence_json = None;
         let mut candidate_git_sha = None;
+        let mut tested_candidate_git_sha = None;
         let mut baseline_metadata_git_sha = None;
         let mut candidate_rch_project_id = None;
         let mut baseline_rch_project_id = None;
@@ -85,6 +87,11 @@ impl CertificateCliConfig {
                     index += 1;
                     candidate_git_sha =
                         Some(required_arg(args, index, "--candidate-git-sha")?.to_owned());
+                }
+                "--tested-candidate-git-sha" => {
+                    index += 1;
+                    tested_candidate_git_sha =
+                        Some(required_arg(args, index, "--tested-candidate-git-sha")?.to_owned());
                 }
                 "--baseline-metadata-git-sha" => {
                     index += 1;
@@ -137,6 +144,8 @@ impl CertificateCliConfig {
                     .ok_or_else(|| "--certificate-evidence-json is required".to_owned())?,
                 candidate_git_sha: candidate_git_sha
                     .ok_or_else(|| "--candidate-git-sha is required".to_owned())?,
+                tested_candidate_git_sha: tested_candidate_git_sha
+                    .ok_or_else(|| "--tested-candidate-git-sha is required".to_owned())?,
                 baseline_metadata_git_sha: baseline_metadata_git_sha
                     .ok_or_else(|| "--baseline-metadata-git-sha is required".to_owned())?,
                 candidate_rch_project_id: candidate_rch_project_id
@@ -227,7 +236,9 @@ STRICT CERTIFICATE MODE:
                               Explicit trust root; must resolve to the candidate workspace root
     --certificate-evidence-json <RELATIVE_PATH>
                               Strict candidate evidence manifest below the evidence root
-    --candidate-git-sha <SHA> Exact lowercase 40-hex checked-out candidate
+    --candidate-git-sha <SHA> Exact lowercase 40-hex checked-out evidence descendant E
+    --tested-candidate-git-sha <SHA>
+                              Exact lowercase 40-hex tested candidate T; E must directly descend from T
     --baseline-metadata-git-sha <SHA>
                               Exact commit containing the baseline and its historical receipts
     --candidate-rch-project-id <ID>
@@ -321,8 +332,9 @@ fn run(args: &[String]) -> Result<i32, String> {
         let config = CertificateCliConfig::parse(args)?;
         let certificate = build_and_publish_strict_certificate(&config.run)?;
         println!(
-            "INFO release_certificate_bundle_written candidate_git_sha={} output_dir={} verdict={}",
+            "INFO release_certificate_bundle_written evidence_git_sha={} tested_candidate_git_sha={} output_dir={} verdict={}",
             config.run.candidate_git_sha,
+            config.run.tested_candidate_git_sha,
             config.run.output_dir.display(),
             certificate.verdict,
         );
@@ -457,6 +469,8 @@ mod tests {
             "strict-input.json".to_owned(),
             "--candidate-git-sha".to_owned(),
             "a".repeat(40),
+            "--tested-candidate-git-sha".to_owned(),
+            "c".repeat(40),
             "--baseline-metadata-git-sha".to_owned(),
             "b".repeat(40),
             "--candidate-rch-project-id".to_owned(),
@@ -468,6 +482,7 @@ mod tests {
         ])
         .expect("complete strict invocation");
         assert_eq!(parsed.run.baseline_metadata_git_sha, "b".repeat(40));
+        assert_eq!(parsed.run.tested_candidate_git_sha, "c".repeat(40));
         assert_eq!(parsed.run.candidate_rch_project_id, "candidate-project");
         assert_eq!(parsed.run.baseline_rch_project_id, "baseline-project");
 
@@ -482,6 +497,6 @@ mod tests {
             "certificate".to_owned(),
         ])
         .expect_err("missing chronology proof must fail");
-        assert_eq!(error, "--baseline-metadata-git-sha is required");
+        assert_eq!(error, "--tested-candidate-git-sha is required");
     }
 }
