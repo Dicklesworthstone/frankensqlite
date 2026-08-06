@@ -98,7 +98,7 @@ Compatibility with existing SQLite databases is a core goal of the current runti
 
 ### 5. Serializable Snapshot Isolation (SSI) by Default
 
-`BEGIN CONCURRENT` targets SERIALIZABLE isolation rather than merely Snapshot Isolation. The conservative Cahill/Fekete rule applied at page granularity ("Page-SSI") rejects a transaction that would become a dangerous rw-antidependency pivot. PostgreSQL's SSI results are useful prior art, but they do not establish FrankenSQLite's overhead; that cost remains part of this project's release benchmark matrix. `PRAGMA fsqlite.serializable = OFF` explicitly downgrades to plain SI for benchmarking or applications that tolerate write skew. When two writers touch the same page, FCW detects base drift; commuting conflicts may be resolved by the safe merge ladder, otherwise the loser retries with `SQLITE_BUSY_SNAPSHOT`. Page-lock acquisition does not wait, so it cannot form a page-lock wait-for cycle.
+`BEGIN CONCURRENT` targets SERIALIZABLE isolation rather than merely Snapshot Isolation. The conservative Cahill/Fekete rule applied at page granularity ("Page-SSI") rejects a transaction that would become a dangerous rw-antidependency pivot. PostgreSQL's SSI results are useful prior art, but they do not establish FrankenSQLite's overhead; that cost remains part of this project's release benchmark matrix. `PRAGMA fsqlite.serializable = OFF` explicitly downgrades to plain SI for benchmarking or applications that tolerate write skew. When two writers touch the same page, FCW detects base drift and the current live path makes the loser retry with `SQLITE_BUSY_SNAPSHOT`; the safe merge ladder remains dormant. Page-lock acquisition does not wait, so it cannot form a page-lock wait-for cycle.
 
 This guarantee belongs to the connection pipeline, which records the read/write
 dependencies consumed by Page-SSI. The lower-level
@@ -322,10 +322,9 @@ Transaction C and D both reach COMMIT:
 	  2. Page-Level First-Committer-Wins
 	     │
 	     ├── Both touch leaf page 47 (same B-tree leaf)?
-	     │   ├── Yes → First to lock page 47 wins. Loser hits base drift at commit.
-	     │   │         If PRAGMA fsqlite.write_merge = SAFE, attempt the merge ladder
-	     │   │         (intent replay + structured patches). If merge succeeds → both
-	     │   │         commit; otherwise loser aborts/retries.
+	     │   ├── Yes → First to lock page 47 wins. Loser hits base drift at commit
+	     │   │         and aborts/retries. The intent-replay/structured-patch merge
+	     │   │         ladder is not wired into the live commit path.
 	     │   │         Deadlock impossible (eager locking, no wait-for cycles).
 	     │
 	     └── No (different leaf pages) → Both proceed and commit independently.
@@ -405,16 +404,20 @@ enum IntentOp {
 > "Current Implementation Status" above. Today's live commit path aborts and
 > retries every same-page conflict; the ladder is not yet wired in.
 
-Standard page-level MVCC produces false conflicts when two transactions modify different rows that happen to live on the same B-tree leaf page. The safe write-merge ladder (§5.10 in the spec) reduces aborts from commuting same-page conflicts without introducing row-level MVCC metadata.
+Standard page-level MVCC produces false conflicts when two transactions modify different rows that happen to live on the same B-tree leaf page. The dormant safe write-merge ladder (§5.10 in the spec) is designed to reduce aborts from commuting same-page conflicts without introducing row-level MVCC metadata.
 
-Each writing transaction records a semantic intent log (`Vec<IntentOp>`) describing what it intended to do at the B-tree level. When a transaction reaches commit and discovers a page was modified since its snapshot, a **deterministic rebase** replays the intent log against the current committed state:
+The dormant design would record a semantic intent log (`Vec<IntentOp>`) for
+each writing transaction. If a transaction reached commit after its base page
+changed, a **deterministic rebase** would replay that log against the current
+committed state:
 
 1. **Detect base drift:** the page's latest committed version differs from what the transaction read.
 2. **Attempt rebase:** replay the intent log against the current snapshot.
 3. **Replay succeeds** (B-tree invariants hold, no constraint violations) → commit with rebased deltas.
 4. **Replay fails** (true conflict or constraint violation) → abort/retry.
 
-A strict safety ladder governs merge strategy selection at commit time:
+The proposed strict safety ladder would govern merge-strategy selection at
+commit time:
 
 | Priority | Strategy | When Used |
 |----------|----------|-----------|
@@ -948,7 +951,7 @@ async caller
   ← Result<Rows>
 ```
 
-Write transactions submit commit requests through an MPSC channel to a single write coordinator task. This serializes commit validation (SSI check + first-committer-wins + safe merge ladder) and WAL appends without holding a lock across the entire commit. Each request includes a `oneshot::Sender<Result<()>>` so the caller can `.await` the result.
+Write transactions submit commit requests through an MPSC channel to a single write coordinator task. This serializes commit validation (SSI check plus first-committer-wins) and WAL appends without holding a lock across the entire commit. The safe merge ladder is not invoked by this live path. Each request includes a `oneshot::Sender<Result<()>>` so the caller can `.await` the result.
 
 ---
 
@@ -1919,10 +1922,11 @@ the decoder alone.
 
 ### Safe Write Merge Ladder (Intent + Structured Patches)
 
-When two transactions modify the same physical page, strict page-level FCW would
-abort one. FrankenSQLite can sometimes do better: if the *intent* operations
-commute (e.g., inserts into distinct keys), the loser can be rebased onto the
-latest committed snapshot and still produce a correct state.
+When two transactions modify the same physical page, strict page-level FCW
+aborts one on the current live path. The dormant design could sometimes do
+better: if the *intent* operations commute (for example, inserts into distinct
+keys), the loser could be rebased onto the latest committed snapshot and still
+produce a correct state.
 
 While XOR-deltas compose linearly as byte vectors, **byte-disjointness is not a
 safe merge rule for SQLite structured pages** (B-tree pages, overflow pages,
@@ -1935,7 +1939,7 @@ make two disjoint byte writes semantically dependent, causing lost updates.
 - The byte supports can be disjoint, yet the merged page points at Y (old value)
   and `T2`'s update at X becomes unreachable garbage.
 
-Therefore, merge is only allowed via the SAFE ladder:
+Therefore, the design permits merge only through the SAFE ladder:
 
 | Priority | Strategy | Safety Guarantee |
 |----------|----------|-----------------|
@@ -2148,10 +2152,10 @@ commit_seq C_w and created versions {V_1, ..., V_k}:
 **Theorem 3: First-Committer-Wins**
 
 ```
-Claim: Under strict FCW (no merge), if two transactions both write page P, at
-most one commits successfully. With the SAFE merge ladder enabled, both may
-commit only if the conflict is resolved semantically (intent replay / structured
-patch) producing a state equivalent to some serial ordering.
+Claim: Under the live strict-FCW path, if two transactions both write page P,
+at most one commits successfully. The dormant SAFE-ladder design would permit
+both only if a semantic resolution (intent replay / structured patch) produced
+a state equivalent to some serial ordering.
 
 Proof (two cases):
     Case A — Concurrent lock contention:
@@ -2161,12 +2165,12 @@ Proof (two cases):
     Case B — Sequential (T1 commits and releases before T2 acquires):
         T2 acquires lock on P and writes it.
         At commit validation, T2 discovers T1 committed P after T2's snapshot.
-        If PRAGMA fsqlite.write_merge = SAFE and the merge ladder succeeds,
-        T2 commits with rebased/merged deltas; otherwise T2 aborts/retries.
+        The live path makes T2 abort/retry. A future activation of the SAFE
+        ladder could instead commit rebased/merged deltas after validation.
 
     In all cases, the final committed page version is well-defined: either one
-    writer's changes survive (abort path) or a single merged page incorporates
-    both writers in a serializable way.  QED ∎
+    writer's changes survive. The dormant design additionally requires any
+    future merged page to incorporate both writers in a serializable way. QED ∎
 ```
 
 **Theorem 4: GC Safety (no premature version reclamation)**
