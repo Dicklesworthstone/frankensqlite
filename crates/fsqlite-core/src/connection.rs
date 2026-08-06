@@ -181234,7 +181234,10 @@ fts5(title, body, content=docs, content_rowid=id)'
                     OpenKind::SchemaOnly => Connection::open_schema_only(db_str).await,
                 }
                 .expect_err(rejection);
-                assert!(matches!(err, FrankenError::Unsupported));
+                assert!(
+                    matches!(err, FrankenError::Unsupported),
+                    "{rejection}: expected Unsupported, got {err:?}"
+                );
                 assert_eq!(std::fs::read(&db_path).unwrap(), original);
                 drop(sqlite);
             }
