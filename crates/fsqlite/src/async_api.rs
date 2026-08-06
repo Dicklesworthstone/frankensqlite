@@ -1110,9 +1110,14 @@ async fn recv_async_operation_response<T>(
                 .cancel_reason()
                 .unwrap_or(CancelReason::UserInterrupt);
             control.request_cancel(reason);
-            rx.recv(&completion_cx)
+            match rx
+                .recv(&completion_cx)
                 .await
                 .map_err(|_| worker_dead_err())?
+            {
+                Err(FrankenError::Abort) => Err(FrankenError::Interrupt),
+                result => result,
+            }
         }
     };
     wait_guard.disarm();
