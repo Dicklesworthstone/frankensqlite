@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use asupersync::lab::{LabConfig, LabRuntime};
 use asupersync::runtime::yield_now;
 use asupersync::types::Budget;
-use fsqlite::{AsyncConnection, ConnectionEnv, IoPollStrategy, Row, RuntimeConfig, SqliteValue};
+use fsqlite::{AsyncConnection, Row, SqliteValue};
 use fsqlite_harness::failure_bundle::{ExecutionLaneEvidence, ObservedExecutionLane};
 use fsqlite_harness::serializability_oracle::{
     BeginMode, HistoryEvent, HistoryOperation, HistoryValue, HistoryWorkload, OracleVerdict,
@@ -135,15 +135,6 @@ fn lock_outcomes(outcomes: &Arc<Mutex<Vec<TxnOutcome>>>) -> MutexGuard<'_, Vec<T
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn runtime_config() -> RuntimeConfig {
-    // LabRuntime drives the SQL futures synchronously; use production blocking
-    // file I/O so no ambient io_uring driver task can escape its scheduler.
-    RuntimeConfig {
-        worker_threads: 1,
-        io_poll_strategy: IoPollStrategy::Blocking,
-    }
-}
-
 fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     fsqlite_harness::bytes_to_lower_hex(Sha256::digest(bytes))
 }
@@ -166,18 +157,15 @@ fn fsqlite_cx(case: LabHistoryCase, decision_id: u64) -> FsqliteCx {
     cx
 }
 
-fn connection_env(cx: &FsqliteCx) -> ConnectionEnv {
-    ConnectionEnv::new_with_root_cx(runtime_config(), cx)
-}
-
-async fn open_lab_connection(
+fn open_lab_connection(
     case: LabHistoryCase,
     decision_id: u64,
     path: &str,
 ) -> Result<(AsyncConnection, FsqliteCx), String> {
     let cx = fsqlite_cx(case, decision_id);
-    let conn = AsyncConnection::open_with_env(&cx, path.to_owned(), connection_env(&cx))
-        .await
+    cx.checkpoint()
+        .map_err(|error| format!("LabRuntime-rooted Cx pre-open checkpoint: {error}"))?;
+    let conn = AsyncConnection::open_sync(path.to_owned())
         .map_err(|error| format!("open production async connection: {error}"))?;
     Ok((conn, cx))
 }
@@ -197,10 +185,9 @@ fn sqlite_integer(row: &Row, column: usize) -> Result<i64, String> {
     }
 }
 
-async fn concurrent_mode_enabled(conn: &AsyncConnection, cx: &FsqliteCx) -> Result<bool, String> {
+fn concurrent_mode_enabled(conn: &AsyncConnection) -> Result<bool, String> {
     let rows = conn
-        .query(cx, "PRAGMA concurrent_mode;")
-        .await
+        .query_sync("PRAGMA concurrent_mode;")
         .map_err(|error| format!("query concurrent mode: {error}"))?;
     let row = rows
         .first()
@@ -300,15 +287,13 @@ async fn run_disjoint_writer(
 ) {
     let (mut conn, cx) =
         open_lab_connection(LabHistoryCase::DisjointWriters, plan.decision_id, &path)
-            .await
             .expect("open disjoint lab connection");
-    let mode_enabled = concurrent_mode_enabled(&conn, &cx)
-        .await
-        .expect("query disjoint concurrent mode");
+    cx.checkpoint()
+        .expect("LabRuntime-rooted FrankenSQLite Cx should remain live");
+    let mode_enabled = concurrent_mode_enabled(&conn).expect("query disjoint concurrent mode");
     assert!(mode_enabled, "concurrent mode must start enabled");
 
-    conn.execute(&cx, "BEGIN;")
-        .await
+    conn.execute_sync("BEGIN;")
         .expect("begin disjoint transaction");
     lock_recorder(&recorder).record(
         plan.connection_id,
@@ -319,11 +304,10 @@ async fn run_disjoint_writer(
     );
     yield_now().await;
 
-    conn.execute(
-        &cx,
-        &format!("INSERT INTO {} VALUES (1, {});", plan.table, plan.value),
-    )
-    .await
+    conn.execute_sync(&format!(
+        "INSERT INTO {} VALUES (1, {});",
+        plan.table, plan.value
+    ))
     .expect("insert disjoint value");
     lock_recorder(&recorder).record(
         plan.connection_id,
@@ -336,8 +320,7 @@ async fn run_disjoint_writer(
     );
     yield_now().await;
 
-    conn.execute(&cx, "COMMIT;")
-        .await
+    conn.execute_sync("COMMIT;")
         .expect("commit disjoint transaction");
     lock_recorder(&recorder).record(
         plan.connection_id,
@@ -360,26 +343,23 @@ async fn run_same_row_conflict(
     outcomes: Arc<Mutex<Vec<TxnOutcome>>>,
 ) {
     let (mut winner, winner_cx) = open_lab_connection(LabHistoryCase::SameRowConflict, 51, &path)
-        .await
         .expect("open conflict winner");
     let (mut loser, loser_cx) = open_lab_connection(LabHistoryCase::SameRowConflict, 52, &path)
-        .await
         .expect("open conflict loser");
-    let winner_mode = concurrent_mode_enabled(&winner, &winner_cx)
-        .await
-        .expect("query winner concurrent mode");
-    let loser_mode = concurrent_mode_enabled(&loser, &loser_cx)
-        .await
-        .expect("query loser concurrent mode");
+    winner_cx
+        .checkpoint()
+        .expect("winner LabRuntime-rooted Cx should remain live");
+    loser_cx
+        .checkpoint()
+        .expect("loser LabRuntime-rooted Cx should remain live");
+    let winner_mode = concurrent_mode_enabled(&winner).expect("query winner concurrent mode");
+    let loser_mode = concurrent_mode_enabled(&loser).expect("query loser concurrent mode");
     assert!(
         winner_mode && loser_mode,
         "both conflict connections need concurrent default"
     );
 
-    winner
-        .execute(&winner_cx, "BEGIN;")
-        .await
-        .expect("winner begin");
+    winner.execute_sync("BEGIN;").expect("winner begin");
     lock_recorder(&recorder).record(
         "conflict-winner",
         Some("txn-winner"),
@@ -387,10 +367,7 @@ async fn run_same_row_conflict(
             mode: BeginMode::Concurrent,
         },
     );
-    loser
-        .execute(&loser_cx, "BEGIN;")
-        .await
-        .expect("loser begin");
+    loser.execute_sync("BEGIN;").expect("loser begin");
     lock_recorder(&recorder).record(
         "conflict-loser",
         Some("txn-loser"),
@@ -401,11 +378,7 @@ async fn run_same_row_conflict(
     yield_now().await;
 
     let winner_read = winner
-        .query(
-            &winner_cx,
-            "SELECT value FROM conflict_register WHERE id = 1;",
-        )
-        .await
+        .query_sync("SELECT value FROM conflict_register WHERE id = 1;")
         .expect("winner read");
     lock_recorder(&recorder).record(
         "conflict-winner",
@@ -421,11 +394,7 @@ async fn run_same_row_conflict(
         },
     );
     let loser_read = loser
-        .query(
-            &loser_cx,
-            "SELECT value FROM conflict_register WHERE id = 1;",
-        )
-        .await
+        .query_sync("SELECT value FROM conflict_register WHERE id = 1;")
         .expect("loser read");
     lock_recorder(&recorder).record(
         "conflict-loser",
@@ -443,11 +412,7 @@ async fn run_same_row_conflict(
     yield_now().await;
 
     winner
-        .execute(
-            &winner_cx,
-            "UPDATE conflict_register SET value = 100 WHERE id = 1;",
-        )
-        .await
+        .execute_sync("UPDATE conflict_register SET value = 100 WHERE id = 1;")
         .expect("winner update");
     lock_recorder(&recorder).record(
         "conflict-winner",
@@ -458,10 +423,7 @@ async fn run_same_row_conflict(
             page_number: None,
         },
     );
-    winner
-        .execute(&winner_cx, "COMMIT;")
-        .await
-        .expect("winner commit");
+    winner.execute_sync("COMMIT;").expect("winner commit");
     lock_recorder(&recorder).record(
         "conflict-winner",
         Some("txn-winner"),
@@ -475,16 +437,11 @@ async fn run_same_row_conflict(
     });
     yield_now().await;
 
-    let update_result = loser
-        .execute(
-            &loser_cx,
-            "UPDATE conflict_register SET value = 200 WHERE id = 1;",
-        )
-        .await;
+    let update_result =
+        loser.execute_sync("UPDATE conflict_register SET value = 200 WHERE id = 1;");
     let conflict = match update_result {
         Ok(_) => loser
-            .execute(&loser_cx, "COMMIT;")
-            .await
+            .execute_sync("COMMIT;")
             .expect_err("loser commit must fail after same-row conflict"),
         Err(error) => error,
     };
@@ -499,7 +456,7 @@ async fn run_same_row_conflict(
             reason: "first_committer_wins_transient".to_owned(),
         },
     );
-    let _ = loser.execute(&loser_cx, "ROLLBACK;").await;
+    let _ = loser.execute_sync("ROLLBACK;");
     lock_recorder(&recorder).record(
         "conflict-loser",
         Some("txn-loser"),
@@ -531,7 +488,7 @@ fn schedule_provenance(
         case.seed(),
         report,
         case_test_name(case),
-        "production-async-connection",
+        "production-worker-backed-sync-connection",
     )
 }
 
@@ -600,8 +557,8 @@ fn lane_evidence(case: LabHistoryCase) -> ExecutionLaneEvidence {
         case.scenario_id(),
         "sql-transaction-history",
         "file",
-        "production-async-connection",
-        "fsqlite:async-worker:lab-runtime",
+        "production-worker-backed-sync-connection",
+        "file:production-worker-backed-sync-connection",
         Vec::new(),
         true,
     )
@@ -665,7 +622,7 @@ fn build_cancelled_history(
             "cancelled-sql-history",
             "file",
             "lab-runtime-cancellation",
-            "fsqlite:cx-cancel-observed",
+            "file:lab-runtime-cancellation",
             Vec::new(),
             true,
         )],
@@ -825,76 +782,70 @@ fn run_lab_case(case: LabHistoryCase) -> LabHistoryArtifact {
 
 #[test]
 fn production_lab_history_disjoint_writers_is_deterministic_and_replayable() {
-    asupersync::test_utils::run_test(|| async {
-        let first = run_lab_case(LabHistoryCase::DisjointWriters);
-        let second = run_lab_case(LabHistoryCase::DisjointWriters);
+    let first = run_lab_case(LabHistoryCase::DisjointWriters);
+    let second = run_lab_case(LabHistoryCase::DisjointWriters);
 
-        assert_eq!(first.history_json, second.history_json);
-        assert_eq!(first.report_json, second.report_json);
-        assert_eq!(
-            first.history.schedule.schedule_sha256,
-            second.history.schedule.schedule_sha256
-        );
-        assert_eq!(
-            first.history.final_state_sha256,
-            second.history.final_state_sha256
-        );
-        assert_eq!(
-            first.history.execution_lane_evidence,
-            second.history.execution_lane_evidence
-        );
-        assert!(first.history.schedule.deterministic_replay_claim());
-        assert_eq!(first.report.verdict, OracleVerdict::Serializable);
-        assert_eq!(
-            first.history.final_state.get("writer_a/1"),
-            Some(&HistoryValue::Integer(10))
-        );
-        assert_eq!(
-            first.history.final_state.get("writer_b/1"),
-            Some(&HistoryValue::Integer(20))
-        );
-    });
+    assert_eq!(first.history_json, second.history_json);
+    assert_eq!(first.report_json, second.report_json);
+    assert_eq!(
+        first.history.schedule.schedule_sha256,
+        second.history.schedule.schedule_sha256
+    );
+    assert_eq!(
+        first.history.final_state_sha256,
+        second.history.final_state_sha256
+    );
+    assert_eq!(
+        first.history.execution_lane_evidence,
+        second.history.execution_lane_evidence
+    );
+    assert!(first.history.schedule.deterministic_replay_claim());
+    assert_eq!(first.report.verdict, OracleVerdict::Serializable);
+    assert_eq!(
+        first.history.final_state.get("writer_a/1"),
+        Some(&HistoryValue::Integer(10))
+    );
+    assert_eq!(
+        first.history.final_state.get("writer_b/1"),
+        Some(&HistoryValue::Integer(20))
+    );
 }
 
 #[test]
 fn production_lab_history_same_row_conflict_matches_fcw_abort() {
-    asupersync::test_utils::run_test(|| async {
-        let artifact = run_lab_case(LabHistoryCase::SameRowConflict);
+    let artifact = run_lab_case(LabHistoryCase::SameRowConflict);
 
-        assert!(artifact.history.schedule.deterministic_replay_claim());
-        assert_eq!(artifact.report.verdict, OracleVerdict::Serializable);
-        assert_eq!(
-            artifact.history.final_state.get("conflict_register/1"),
-            Some(&HistoryValue::Integer(100))
-        );
-        assert!(
-            artifact.history.events.iter().any(|event| matches!(
-                event.operation,
-                HistoryOperation::Conflict { ref reason }
-                    if reason == "first_committer_wins_transient"
-            )),
-            "history must record the FCW conflict"
-        );
-    });
+    assert!(artifact.history.schedule.deterministic_replay_claim());
+    assert_eq!(artifact.report.verdict, OracleVerdict::Serializable);
+    assert_eq!(
+        artifact.history.final_state.get("conflict_register/1"),
+        Some(&HistoryValue::Integer(100))
+    );
+    assert!(
+        artifact.history.events.iter().any(|event| matches!(
+            event.operation,
+            HistoryOperation::Conflict { ref reason }
+                if reason == "first_committer_wins_transient"
+        )),
+        "history must record the FCW conflict"
+    );
 }
 
 #[test]
 fn deterministic_history_artifacts_fail_closed_for_corruption_and_observation_only() {
-    asupersync::test_utils::run_test(|| async {
-        let artifact = run_lab_case(LabHistoryCase::SameRowConflict);
-        let midpoint = artifact.history_json.len() / 2;
-        assert!(
-            TransactionHistory::from_json_strict(&artifact.history_json[..midpoint]).is_err(),
-            "truncated history artifacts must fail closed"
-        );
+    let artifact = run_lab_case(LabHistoryCase::SameRowConflict);
+    let midpoint = artifact.history_json.len() / 2;
+    assert!(
+        TransactionHistory::from_json_strict(&artifact.history_json[..midpoint]).is_err(),
+        "truncated history artifacts must fail closed"
+    );
 
-        let mut smuggled = artifact.history.clone();
-        smuggled.schedule.control = ScheduleControl::ObservationOnly;
-        assert!(
-            smuggled.to_json().is_err(),
-            "observation-only histories cannot retain deterministic replay fields"
-        );
-    });
+    let mut smuggled = artifact.history.clone();
+    smuggled.schedule.control = ScheduleControl::ObservationOnly;
+    assert!(
+        smuggled.to_json().is_err(),
+        "observation-only histories cannot retain deterministic replay fields"
+    );
 }
 
 #[test]
