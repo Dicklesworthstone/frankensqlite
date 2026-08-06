@@ -364,6 +364,126 @@ fn alter_sequence_then_index_and_query() {
     });
 }
 
+/// bd-wneoh: ADD COLUMN must preserve an explicit UNIQUE index as an explicit
+/// index. Folding it into the rebuilt table creates an extra implicit
+/// autoindex; if that autoindex is not backfilled, stock SQLite diagnoses the
+/// otherwise-successful migration as a malformed database image.
+#[test]
+fn alter_add_column_preserves_separate_unique_index_for_stock_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bd_wneoh.db");
+        let fconn = Connection::open(path.to_str().unwrap()).await.unwrap();
+
+        for sql in [
+            "CREATE TABLE t (id TEXT PRIMARY KEY, mic TEXT NOT NULL, name TEXT NOT NULL)",
+            "INSERT INTO t(id, mic, name) VALUES \
+                ('XNAS','XNAS','Nasdaq'), \
+                ('XNYS','XNYS','NYSE'), \
+                ('XTKS','XTKS','Tokyo'), \
+                ('XLON','XLON','London'), \
+                ('XETR','XETR','Xetra')",
+            "CREATE UNIQUE INDEX idx_t_mic ON t(mic)",
+            "ALTER TABLE t ADD COLUMN scope TEXT NOT NULL DEFAULT 'x' CHECK(scope = 'x')",
+        ] {
+            fconn.execute(sql).await.unwrap();
+        }
+        fconn.close().await.expect("close FrankenSQLite writer");
+
+        let stock = rusqlite::Connection::open(&path).expect("stock SQLite reopen");
+        let integrity: String = stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("stock SQLite integrity_check");
+        assert_eq!(
+            integrity, "ok",
+            "bd-wneoh: ALTER ADD COLUMN produced an image rejected by stock SQLite"
+        );
+
+        let indexes = {
+            let mut statement = stock
+                .prepare(
+                    "SELECT name, \"unique\", origin \
+                     FROM pragma_index_list('t') \
+                     ORDER BY name",
+                )
+                .expect("prepare stock index inventory");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .expect("query stock index inventory")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect stock index inventory")
+        };
+        assert_eq!(
+            indexes,
+            vec![
+                ("idx_t_mic".to_owned(), 1, "c".to_owned()),
+                ("sqlite_autoindex_t_1".to_owned(), 1, "pk".to_owned()),
+            ],
+            "bd-wneoh: separate UNIQUE index was folded into a table constraint"
+        );
+
+        let index_sql: String = stock
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'idx_t_mic'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read explicit index DDL");
+        assert_eq!(
+            index_sql, "CREATE UNIQUE INDEX idx_t_mic ON t(mic)",
+            "bd-wneoh: explicit index DDL changed across ALTER ADD COLUMN"
+        );
+
+        let backfilled: i64 = stock
+            .query_row("SELECT count(*) FROM t WHERE scope = 'x'", [], |row| {
+                row.get(0)
+            })
+            .expect("read backfilled column through stock SQLite");
+        assert_eq!(backfilled, 5, "all pre-ALTER rows must receive the default");
+
+        let indexed_mics = {
+            let mut statement = stock
+                .prepare("SELECT mic FROM t INDEXED BY idx_t_mic ORDER BY mic")
+                .expect("prepare forced named-index read");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query through preserved named index")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect named-index rows")
+        };
+        assert_eq!(
+            indexed_mics,
+            vec![
+                "XETR".to_owned(),
+                "XLON".to_owned(),
+                "XNAS".to_owned(),
+                "XNYS".to_owned(),
+                "XTKS".to_owned(),
+            ],
+            "preserved named index must contain every pre-ALTER row"
+        );
+
+        let duplicate_error = stock
+            .execute(
+                "INSERT INTO t(id, mic, name, scope) VALUES ('DUP', 'XNAS', 'duplicate', 'x')",
+                [],
+            )
+            .expect_err("preserved named index must still enforce uniqueness");
+        assert!(
+            duplicate_error
+                .to_string()
+                .contains("UNIQUE constraint failed: t.mic"),
+            "expected UNIQUE constraint failure from idx_t_mic, got {duplicate_error}"
+        );
+    });
+}
+
 /// GH #252: ADD COLUMN with a subquery-containing CHECK must be rejected the
 /// way CREATE TABLE already rejects it. Accepting it persists a schema stock
 /// SQLite refuses to parse, making the whole file unreadable ("malformed
