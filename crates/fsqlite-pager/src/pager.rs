@@ -8781,6 +8781,19 @@ async fn conflicting_pages_since_batch_snapshots(
                 &batch.conflict_page_baselines,
             )
             .await?;
+        if tracing::enabled!(
+            target: "fsqlite::wal::conflict_probe",
+            tracing::Level::DEBUG
+        ) {
+            tracing::debug!(
+                target: "fsqlite::wal::conflict_probe",
+                batch_id = batch.context.batch_id,
+                conflict_snapshot = ?snapshot,
+                conflict_pages = ?batch.conflict_pages,
+                detected_conflicts = ?batch_conflicts,
+                "validated a group-commit batch against its pinned WAL snapshot"
+            );
+        }
         conflicts.extend(batch_conflicts);
     }
     conflicts.sort_unstable();
@@ -18132,6 +18145,26 @@ where
             staged_frame_count: 0,
             staging_elapsed_ns: 0,
         });
+        if tracing::enabled!(
+            target: "fsqlite::wal::conflict_probe",
+            tracing::Level::DEBUG
+        ) {
+            let frame_pages = batch
+                .frames
+                .iter()
+                .map(|frame| frame.page_number)
+                .collect::<Vec<_>>();
+            tracing::debug!(
+                target: "fsqlite::wal::conflict_probe",
+                queue_id = queue.queue_id,
+                batch_id,
+                current_db_size,
+                conflict_snapshot = ?batch.conflict_snapshot,
+                conflict_pages = ?batch.conflict_pages,
+                frame_pages = ?frame_pages,
+                "attached conflict metadata to a group-commit batch"
+            );
+        }
 
         let mut lane_prepare_us = 0;
         if staging_fallback_reason.is_none() {
