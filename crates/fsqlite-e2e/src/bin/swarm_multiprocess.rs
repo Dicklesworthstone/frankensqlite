@@ -32,8 +32,8 @@ use fsqlite_harness::mismatch_minimizer::{
     TypedReductionConfig, minimize_history_case,
 };
 use fsqlite_harness::serializability_oracle::{
-    BeginMode, HistoryEvent, HistoryOperation, HistoryValue, HistoryWorkload,
-    ScheduleProvenance, TRANSACTION_HISTORY_SCHEMA_VERSION, TransactionHistory,
+    BeginMode, HistoryEvent, HistoryOperation, HistoryValue, HistoryWorkload, ScheduleProvenance,
+    TRANSACTION_HISTORY_SCHEMA_VERSION, TransactionHistory,
 };
 use fsqlite_harness::test_inventory::ExecutionLane;
 use rand::rngs::StdRng;
@@ -125,7 +125,10 @@ struct RecoveryChildConfig {
 #[derive(Debug, Clone)]
 enum Mode {
     Parent(RunConfig),
-    Child { run: RunConfig, child: ChildConfig },
+    Child {
+        run: RunConfig,
+        child: ChildConfig,
+    },
     RecoveryChild {
         run: RunConfig,
         child: RecoveryChildConfig,
@@ -573,11 +576,7 @@ fn run_recovery_parent(config: RunConfig) -> HarnessResult<bool> {
     .enumerate()
     {
         scenarios.push(run_recovery_scenario(
-            &config,
-            &db_path,
-            &run_dir,
-            worker_id,
-            kill_point,
+            &config, &db_path, &run_dir, worker_id, kill_point,
         )?);
     }
     let success = scenarios.iter().all(|scenario| scenario.success);
@@ -610,7 +609,15 @@ fn run_recovery_scenario(
     kill_point: RecoveryKillPoint,
 ) -> HarnessResult<RecoveryScenarioReport> {
     let marker_path = run_dir.join(format!("recovery_{}.marker.json", kill_point.label()));
-    let exe = env::current_exe().map_err(|error| format!("failed to resolve current exe: {error}"))?;
+    let stderr_path = run_dir.join(format!("recovery_{}.stderr.log", kill_point.label()));
+    let child_stderr = File::create(&stderr_path).map_err(|error| {
+        format!(
+            "failed to create recovery child stderr artifact `{}`: {error}",
+            stderr_path.display()
+        )
+    })?;
+    let exe =
+        env::current_exe().map_err(|error| format!("failed to resolve current exe: {error}"))?;
     // ubs:ignore - current_exe is the trusted harness binary; arguments are not shell-evaluated.
     let mut child = Command::new(exe)
         .arg("--recovery-child")
@@ -631,7 +638,7 @@ fn run_recovery_scenario(
         .arg("--recovery-marker")
         .arg(&marker_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(child_stderr))
         .spawn()
         .map_err(|error| format!("failed to spawn recovery child {worker_id}: {error}"))?;
 
@@ -642,30 +649,31 @@ fn run_recovery_scenario(
     ) {
         Ok(marker) => marker,
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
+            let cleanup = terminate_recovery_child(&mut child, worker_id, kill_point)
+                .err()
+                .map_or_else(String::new, |cleanup_error| {
+                    format!("; cleanup_error={cleanup_error}")
+                });
+            return Err(format!(
+                "{error}; child_stderr={}{}",
+                stderr_path.display(),
+                cleanup
+            ));
         }
     };
     if let Err(error) = validate_recovery_marker(&marker, config, worker_id, kill_point) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+        let cleanup = terminate_recovery_child(&mut child, worker_id, kill_point)
+            .err()
+            .map_or_else(String::new, |cleanup_error| {
+                format!("; cleanup_error={cleanup_error}")
+            });
+        return Err(format!(
+            "{error}; child_stderr={}{}",
+            stderr_path.display(),
+            cleanup
+        ));
     }
-    child.kill().map_err(|error| {
-        format!(
-            "failed to kill recovery child {worker_id} at {}: {error}",
-            kill_point.label()
-        )
-    })?;
-    let status = child
-        .wait()
-        .map_err(|error| format!("failed to wait for recovery child {worker_id}: {error}"))?;
-    let process_exit = RecoveryProcessExit {
-        parent_kill_requested: true,
-        exit_code: status.code(),
-        classification: "terminated_by_parent_at_replayable_kill_point",
-    };
+    let process_exit = terminate_recovery_child(&mut child, worker_id, kill_point)?;
 
     let conn = open_fsqlite(db_path)?;
     configure_fsqlite(&conn, config)?;
@@ -698,6 +706,12 @@ fn run_recovery_scenario(
     if !marker.concurrent_mode_default || !reopen_concurrent_mode_default {
         errors.push("concurrent writer default was not preserved across recovery".to_owned());
     }
+    if !process_exit.parent_kill_requested {
+        errors.push(format!(
+            "recovery child was not terminated by the parent: {}",
+            process_exit.classification
+        ));
+    }
     // ubs:ignore - canonical lane evidence identity, not authentication material.
     if reduction.observation.required_lanes
         != vec![ExecutionLane::MvccRequired, ExecutionLane::RecoveryRequired]
@@ -725,6 +739,50 @@ fn run_recovery_scenario(
     })
 }
 
+fn terminate_recovery_child(
+    child: &mut std::process::Child,
+    worker_id: usize,
+    kill_point: RecoveryKillPoint,
+) -> HarnessResult<RecoveryProcessExit> {
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|error| format!("failed to poll recovery child {worker_id}: {error}"))?
+    {
+        return Ok(RecoveryProcessExit {
+            parent_kill_requested: false,
+            exit_code: status.code(),
+            classification: "exited_before_parent_kill",
+        });
+    }
+    if let Err(kill_error) = child.kill() {
+        if let Some(status) = child.try_wait().map_err(|poll_error| {
+            format!(
+                "failed to kill recovery child {worker_id} at {}: {kill_error}; \
+                 follow-up poll failed: {poll_error}",
+                kill_point.label()
+            )
+        })? {
+            return Ok(RecoveryProcessExit {
+                parent_kill_requested: false,
+                exit_code: status.code(),
+                classification: "exited_during_parent_kill",
+            });
+        }
+        return Err(format!(
+            "failed to kill recovery child {worker_id} at {}: {kill_error}",
+            kill_point.label()
+        ));
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed to wait for recovery child {worker_id}: {error}"))?;
+    Ok(RecoveryProcessExit {
+        parent_kill_requested: true,
+        exit_code: status.code(),
+        classification: "terminated_by_parent_at_replayable_kill_point",
+    })
+}
+
 fn run_recovery_child(config: &RunConfig, child: &RecoveryChildConfig) -> HarnessResult<bool> {
     let db_path = config
         .db_path
@@ -741,19 +799,21 @@ fn run_recovery_child(config: &RunConfig, child: &RecoveryChildConfig) -> Harnes
     let payload = format!("seed-{}-{}", config.seed, child.kill_point.label());
     fsqlite_e2e::block_on(conn.execute("BEGIN CONCURRENT"))
         .map_err(|error| format!("recovery child begin failed: {error}"))?;
-    fsqlite_e2e::block_on(conn.execute_with_params(
-        "INSERT INTO swarm_rows \
+    fsqlite_e2e::block_on(
+        conn.execute_with_params(
+            "INSERT INTO swarm_rows \
          (id, owner, seq, payload, touched_by, generation, deleted) \
          VALUES (?1, ?2, 0, ?3, ?2, 0, 0)",
-        &[
-            SqliteValue::Integer(row_id),
-            SqliteValue::Integer(
-                i64::try_from(child.worker_id)
-                    .map_err(|error| format!("recovery worker id overflow: {error}"))?,
-            ),
-            SqliteValue::Text(payload.into()),
-        ],
-    ))
+            &[
+                SqliteValue::Integer(row_id),
+                SqliteValue::Integer(
+                    i64::try_from(child.worker_id)
+                        .map_err(|error| format!("recovery worker id overflow: {error}"))?,
+                ),
+                SqliteValue::Text(payload.into()),
+            ],
+        ),
+    )
     .map_err(|error| format!("recovery child insert failed: {error}"))?;
     // ubs:ignore - deterministic crash phase, not authentication material.
     if child.kill_point == RecoveryKillPoint::AfterCommitAcknowledged {
@@ -945,12 +1005,7 @@ fn recovery_history(
                 page_number: None,
             },
         ),
-        recovery_event(
-            2,
-            "recovery-child",
-            Some(&marker.transaction_id),
-            terminal,
-        ),
+        recovery_event(2, "recovery-child", Some(&marker.transaction_id), terminal),
         recovery_event(
             3,
             "recovery-parent",
@@ -1015,7 +1070,7 @@ fn recovery_history(
                 "recovery-child-concurrent-transaction",
                 "file",
                 "concurrent_mvcc",
-                "file:swarm-multiprocess",
+                "file:concurrent_mvcc",
                 Vec::new(),
                 true,
             ),
@@ -1032,7 +1087,7 @@ fn recovery_history(
                 "parent-kill-reopen-integrity-check",
                 "file",
                 "reopen_after_process_kill",
-                "file:swarm-multiprocess",
+                "file:reopen_after_process_kill",
                 Vec::new(),
                 true,
             ),
@@ -1084,7 +1139,10 @@ fn reduce_recovery_history(
         "acknowledgement".to_owned(),
         marker.acknowledgement.label().to_owned(),
     );
-    observed_fields.insert("kill_point".to_owned(), marker.kill_point.label().to_owned());
+    observed_fields.insert(
+        "kill_point".to_owned(),
+        marker.kill_point.label().to_owned(),
+    );
     observed_fields.insert("row_count".to_owned(), observed_row_count.to_string());
     observed_fields.insert("irrelevant_probe".to_owned(), "remove-me".to_owned());
     let case = HistoryReductionCase {
@@ -1178,8 +1236,8 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 fn sha256_file(path: &Path) -> HarnessResult<String> {
-    let bytes = fs::read(path)
-        .map_err(|error| format!("failed to hash `{}`: {error}", path.display()))?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("failed to hash `{}`: {error}", path.display()))?;
     Ok(sha256_bytes(&bytes))
 }
 
@@ -2713,11 +2771,7 @@ fn parse_args() -> HarnessResult<Mode> {
             }
             "--recovery-kill-point" => {
                 index = index.saturating_add(1);
-                recovery_kill_point = Some(parse_required(
-                    &args,
-                    index,
-                    "--recovery-kill-point",
-                )?);
+                recovery_kill_point = Some(parse_required(&args, index, "--recovery-kill-point")?);
             }
             "--recovery-marker" => {
                 index = index.saturating_add(1);
@@ -2780,8 +2834,7 @@ fn parse_args() -> HarnessResult<Mode> {
     }
     if recovery_child_mode {
         let child = RecoveryChildConfig {
-            worker_id: worker_id
-                .ok_or_else(|| "recovery child requires --worker-id".to_owned())?,
+            worker_id: worker_id.ok_or_else(|| "recovery child requires --worker-id".to_owned())?,
             kill_point: recovery_kill_point
                 .ok_or_else(|| "recovery child requires --recovery-kill-point".to_owned())?,
             marker_path: recovery_marker
@@ -3279,7 +3332,10 @@ mod tests {
     fn recovery_marker_strict_decode_rejects_schema_and_truncation() {
         let marker = recovery_marker(RecoveryKillPoint::BeforeCommit);
         let json = serde_json::to_string(&marker).expect("encode marker");
-        assert_eq!(decode_recovery_marker(&json).expect("decode marker"), marker);
+        assert_eq!(
+            decode_recovery_marker(&json).expect("decode marker"),
+            marker
+        );
 
         let mut stale = marker.clone();
         stale.schema = "old-schema".to_owned();
@@ -3319,12 +3375,22 @@ mod tests {
             assert_eq!(result.stats.minimized.schedule_events, 1);
             assert_eq!(result.stats.minimized.yield_choices, 1);
             assert_eq!(result.stats.minimized.observed_fields, 3);
-            assert!(result.minimized.history.events.iter().any(|event| {
-                matches!(event.operation, HistoryOperation::Crash { .. })
-            }));
-            assert!(result.minimized.history.events.iter().any(|event| {
-                matches!(event.operation, HistoryOperation::Restart { .. })
-            }));
+            assert!(
+                result
+                    .minimized
+                    .history
+                    .events
+                    .iter()
+                    .any(|event| { matches!(event.operation, HistoryOperation::Crash { .. }) })
+            );
+            assert!(
+                result
+                    .minimized
+                    .history
+                    .events
+                    .iter()
+                    .any(|event| { matches!(event.operation, HistoryOperation::Restart { .. }) })
+            );
         }
     }
 

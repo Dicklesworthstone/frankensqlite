@@ -233,10 +233,7 @@ fn p6_recovery_smoke_classifies_precommit_and_acknowledged_kills() {
     );
     let report: serde_json::Value =
         serde_json::from_str(&stdout).expect("recovery output must be valid JSON");
-    assert_eq!(
-        report["schema"],
-        "fsqlite-e2e.swarm-recovery-report.v1"
-    );
+    assert_eq!(report["schema"], "fsqlite-e2e.swarm-recovery-report.v1");
     assert_eq!(report["success"], true);
     let scenarios = report["scenarios"]
         .as_array()
@@ -252,7 +249,10 @@ fn p6_recovery_smoke_classifies_precommit_and_acknowledged_kills() {
         );
         assert_eq!(scenario["reopen_concurrent_mode_default"], true);
         assert_eq!(scenario["reduction"]["status"], "complete");
-        assert_eq!(scenario["reduction"]["stats"]["minimized"]["checkpoints"], 0);
+        assert_eq!(
+            scenario["reduction"]["stats"]["minimized"]["checkpoints"],
+            0
+        );
         assert_eq!(
             scenario["reduction"]["observation"]["required_lanes"],
             serde_json::json!(["mvcc_required", "recovery_required"])
