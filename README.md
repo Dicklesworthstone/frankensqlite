@@ -65,8 +65,8 @@ signature fails closed rather than silently downgrading authenticity.
 | Memory safety | Manual (C) | Core engine is safe Rust; `unsafe` is limited to `fsqlite-vfs` (mmap/shm) and the optional `fsqlite-c-api` shim (FFI) |
 | Data races | Possible (careful C) | Prevented inside the Rust engine by ownership and type-system checks |
 | File format | SQLite 3.x | SQLite 3.x layout for encoding=1/UTF-8 databases in v0.2.0; UTF-16 support remains a parity target |
-| Self-healing storage | No | Native/ECS design plus partial implementation; not a blanket compatibility-runtime guarantee |
-| Page-level encryption | No (commercial SEE extension) | XChaCha20-Poly1305 (DEK/KEK envelope, Argon2id KEK derivation) |
+| Self-healing storage | No | Native/ECS design plus optional infrastructure; the v0.2.0 compatibility WAL commit/recovery path neither writes nor consults RaptorQ repair symbols |
+| Page-level encryption | No (commercial SEE extension) | Not available in v0.2.0: the XChaCha20-Poly1305 DEK/KEK implementation exists in `fsqlite-pager`, but no `PRAGMA key`/`rekey` dispatch is wired into `Connection` |
 | SQL dialect | Full | Large and growing subset; parser coverage exceeds full execution parity today |
 | Extensions | FTS3/4/5, R-tree, JSON1, etc. | Extension crates are present; some runtime wiring is still in progress |
 | Cross-process MVCC | No | Yes (shared-memory coordination) |
@@ -143,7 +143,7 @@ FrankenSQLite is organized as a 27-member Cargo workspace with strict layered de
 | **Foundation** | `fsqlite-types` | PageNumber, PageSize, TxnId, SqliteValue, 190+ VDBE opcodes, serial types, limits, bitflags |
 | | `fsqlite-error` | 50+ error variants, SQLite error code mapping, recovery hints, transient detection |
 | **Storage** | `fsqlite-vfs` | Virtual filesystem trait (Vfs, VfsFile) abstracting all OS operations |
-| | `fsqlite-pager` | Page cache, rollback journal, ARC eviction, dirty page write-back |
+| | `fsqlite-pager` | Page cache, rollback journal, S3-FIFO default / optional ARC eviction, dirty page write-back |
 | | `fsqlite-wal` | Write-ahead log: frame append, checkpoint, WAL index, crash recovery |
 | | `fsqlite-mvcc` | MVCC page versioning, snapshot management, conflict detection, epoch-based reclamation |
 | | `fsqlite-btree` | B-tree/B+tree: cell parsing, page splitting, overflow chains, cursor navigation |
@@ -430,7 +430,7 @@ Old page versions are reclaimed when no active transaction can see them:
 - **Epoch-based reclamation (EBR)** batches retired version slots behind a global epoch counter and active reader pins
 - Commit-time version maintenance prunes unreachable versions, and retired slots are batch-freed once all pinned readers have advanced past the retire epoch
 - During WAL checkpointing, reclaimable frames are copied back to the main database file
-- ARC ghost entries (B1/B2) for pruned versions are cleaned when the GC horizon advances
+- When the optional ARC eviction policy is selected, its ghost entries (B1/B2) for pruned versions are cleaned as the GC horizon advances
 
 ### Deadlock Freedom (By Construction)
 
@@ -742,18 +742,18 @@ Savepoints are implemented as a stack. ROLLBACK TO undoes changes back to the sa
 
 ### Crash Recovery
 
-The crash model makes six explicit assumptions: (1) process crash at any point, (2) `fsync()` is a durability barrier, (3) writes may be reordered unless constrained by fsync barriers, (4) torn writes at sector granularity (512B or 4KB), (5) bitrot and corruption exist (checksums detect, RaptorQ repairs), (6) file metadata durability may require directory `fsync()`.
+The crash model makes six explicit assumptions: (1) process crash at any point, (2) `fsync()` is a durability barrier, (3) writes may be reordered unless constrained by fsync barriers, (4) torn writes at sector granularity (512B or 4KB), (5) bitrot and corruption exist (checksums detect them; RaptorQ repair is a Native-mode design, not v0.2.0 compatibility-runtime behavior), (6) file metadata durability may require directory `fsync()`.
 
 The WAL provides crash recovery with the following guarantees:
 
 1. **Atomic commit:** A transaction is either fully visible or fully invisible after crash recovery. Partial commits cannot occur. In Native mode, a commit is committed if and only if its `CommitMarker` is durable.
-2. **Durability:** Once `COMMIT` returns, the data survives power loss (assuming `PRAGMA synchronous = FULL`). Durability policy is configurable: `PRAGMA durability = local` (default) requires enough RaptorQ symbols persisted locally for decode success; `PRAGMA durability = quorum(M)` requires symbols across M of N replicas.
-3. **Self-healing:** WAL frames carry RaptorQ repair symbols. Torn writes and bit-flips are detected by xxhash3 checksums and repaired from redundant symbols without requiring a full WAL replay.
+2. **Durability:** Once `COMMIT` returns, the data survives power loss (assuming `PRAGMA synchronous = FULL`). A configurable durability policy (`PRAGMA durability = local`, `PRAGMA durability = quorum(M)`) is a Native-mode design target, **not v0.2.0 behavior**: no such PRAGMA is dispatched, and unrecognised PRAGMAs are silently ignored, so setting it has no effect.
+3. **Self-healing (design / optional infrastructure, not v0.2.0 compatibility-runtime behavior):** RaptorQ WAL repair symbols and the xxhash3-driven repair routines are implemented in `fsqlite-wal`, but the compatibility WAL commit and recovery paths do not write `.wal-fec` sidecars or attempt FEC repair; that machinery is exercised only by the `fsqlite-e2e` recovery demo and harness tests. Ordinary WAL checksum verification still detects mismatches, but it does not invoke the optional FEC machinery.
 4. **Recovery procedure:**
    - On database open, check for a WAL file.
    - Read the WAL header; validate magic number and checksums.
    - Replay all committed frames (those with a nonzero "database size" field in the frame header, indicating a commit boundary).
-   - For frames with checksum failures, attempt RaptorQ repair from available repair symbols.
+   - Validate frame checksums. RaptorQ repair from available repair symbols is the Native-mode design; it is not attempted by the v0.2.0 compatibility recovery path.
    - Discard any frames after the last commit boundary (incomplete transaction).
    - Rebuild the WAL index from the replayed frames.
 
@@ -835,20 +835,24 @@ Journal Page Records (repeated page_count times):
 
 ---
 
-## Buffer Pool: ARC Cache
+## Buffer Pool: S3-FIFO Default (ARC Optional)
 
 LRU can perform poorly on database workloads because a table scan may evict a
-hot working set. FrankenSQLite uses an **Adaptive Replacement Cache (ARC)**
-that adapts between recency and frequency and retains ghost entries to detect
-changes in the workload. The README does not claim a universal competitive
-ratio for this implementation.
+hot working set. The production pager configures **S3-FIFO** eviction by
+default. An ARC policy is also implemented and can be selected through
+`PageCacheEvictionPolicy::Arc`; it adapts between recency and frequency and
+retains ghost entries to detect changes in the workload. The README does not
+claim a universal competitive ratio for either implementation.
 
-### MVCC-Aware Structure
+### MVCC-Aware Structure (Optional ARC Policy)
 
-The buffer pool keys on `(PageNumber, TxnId)` because multiple versions of the same page coexist for MVCC:
+The optional ARC policy (`fsqlite-pager::arc_cache::ArcCache`) keys on
+`(PageNumber, CommitSeq)` because multiple committed versions of the same page
+coexist for MVCC. The following sketch is illustrative; the shipped default
+path uses `ShardedPageCache` with S3-FIFO eviction:
 
 ```rust
-struct ArcBufferPool {
+struct ArcPolicySketch {
     /// Pages accessed exactly once recently (recency-favored).
     t1: LinkedHashMap<CacheKey, CachedPage>,
     /// Pages accessed two or more times (frequency-favored).
@@ -863,7 +867,7 @@ struct ArcBufferPool {
     capacity: usize,
 }
 
-struct CacheKey { pgno: PageNumber, version_id: TxnId }
+struct CacheKey { pgno: PageNumber, commit_seq: CommitSeq }
 ```
 
 ### How ARC Works
@@ -1000,7 +1004,7 @@ A component crash becomes an explainable, bounded event with a deterministic res
 FTS5 provides full-text indexing with BM25 ranking:
 
 - **Tokenizers:** unicode61 (default, Unicode-aware word breaking), ascii, porter (English stemming), trigram (character n-grams for substring search)
-- **Query syntax:** Boolean operators (`AND`, `OR`, `NOT`), phrase matching (`"exact phrase"`), prefix queries (`prefix*`), column filters (`title: search_term`), NEAR queries (`NEAR(a b, 10)`)
+- **Query syntax:** Boolean operators (`AND`, `OR`, `NOT`), phrase matching (`"exact phrase"`), prefix queries (`prefix*`), column filters (`title: search_term`), NEAR queries (`NEAR(a b, 10)`). **Column-qualified `MATCH` returns wrong results in v0.2.0:** the column restriction is ignored, so a query can match terms present only in another column ([#249](https://github.com/Dicklesworthstone/frankensqlite/issues/249)).
 - **Ranking:** BM25 by default, configurable via auxiliary functions
 - **Auxiliary functions:** `highlight()` wraps matches in markup, `snippet()` extracts context around matches
 - **Content modes:** Regular (FTS5 stores a copy), external content (references an existing table), contentless (index-only, no original text stored)
@@ -1412,7 +1416,7 @@ The current user-facing runtime is the compatibility/pager-backed path over stan
 
 ### Compatibility Runtime (Current)
 
-The database file uses the standard SQLite `.db` layout, and WAL frames use the standard SQLite WAL format. In v0.2.0, an existing C SQLite database opens without conversion only when its header declares encoding 1 (UTF-8). Valid encoding 2/3 (UTF-16le/UTF-16be) databases are recognized and rejected as unsupported. A UTF-8 FrankenSQLite database remains readable by C SQLite without conversion. Optional sidecars (`.wal-fec`, `.idx-fec`) store RaptorQ repair symbols alongside the standard files but the core `.db` remains SQLite-compatible when checkpointed. This mode is the default and is used for conformance testing against C SQLite within that supported surface.
+The database file uses the standard SQLite `.db` layout, and WAL frames use the standard SQLite WAL format. In v0.2.0, an existing C SQLite database opens without conversion only when its header declares encoding 1 (UTF-8). Valid encoding 2/3 (UTF-16le/UTF-16be) databases are recognized and rejected as unsupported. A UTF-8 FrankenSQLite database remains readable by C SQLite without conversion. Optional low-level/demo paths can emit a `.wal-fec` sidecar containing RaptorQ repair symbols, but the standard public connection path does not emit or consume it in v0.2.0. The core `.db` remains SQLite-compatible when checkpointed. This mode is the default and is used for conformance testing against C SQLite within that supported surface.
 
 ### Native Mode (Design / Partial Implementation)
 
@@ -1616,22 +1620,33 @@ On systems where shared memory is unavailable or restricted, FrankenSQLite falls
 
 ## Page-Level Encryption
 
-FrankenSQLite provides page-level encryption as a built-in feature, replacing the need for SQLite's commercial Encryption Extension (SEE).
+> **Status: NOT WIRED IN v0.2.0. Do not rely on FrankenSQLite for encryption
+> at rest in this release.** The envelope-encryption implementation
+> (`PageEncryptor`, DEK/KEK, Argon2id) exists in `fsqlite-pager`, but it is not
+> reachable from the public API: `Connection` implements no `PRAGMA key` or
+> `PRAGMA rekey`, and unrecognised PRAGMAs are **silently ignored** for SQLite
+> compatibility. `PRAGMA key = 'passphrase'` therefore parses, returns success
+> with no rows and no error, and the database is written **unencrypted**. The
+> `fsqlite-c-api` shim likewise exposes no `sqlite3_key`/`sqlite3_rekey`.
+> Wiring the key-management PRAGMAs into the connection pipeline is outstanding
+> work. The table below describes the intended design.
 
-| Property | Value |
+The design goal is page-level encryption as a built-in feature, replacing the need for SQLite's commercial Encryption Extension (SEE).
+
+| Property | Design value (not reachable in v0.2.0) |
 |----------|-------|
 | Cipher | XChaCha20-Poly1305 (AEAD) |
 | Data key (DEK) | Random 256-bit key generated at database creation |
 | Key-encryption key (KEK) | Argon2id(passphrase, per-database random salt) |
-| Rekey | O(1): re-wrap DEK (`PRAGMA rekey = 'new_passphrase'`) |
+| Rekey | O(1): re-wrap DEK (planned `PRAGMA rekey = 'new_passphrase'`) |
 | Nonce | 24 bytes, random per page write |
 | Authentication tag | 16 bytes (Poly1305), stored in the page's reserved space |
 | Reserved bytes | `reserved_bytes >= 40` (24B nonce + 16B tag) |
-| Key management API | `PRAGMA key = 'passphrase'` / `PRAGMA rekey = 'new_passphrase'` |
+| Key management API | Planned `PRAGMA key = 'passphrase'` / `PRAGMA rekey = 'new_passphrase'`; **not dispatched in v0.2.0** |
 
-This is envelope encryption: pages are encrypted with the DEK; the DEK is wrapped with the KEK derived from `PRAGMA key`. Random nonces eliminate global counters and remain safe under VM snapshot reverts, crashes, forks, and distributed writers.
+The intended scheme is envelope encryption: pages are encrypted with the DEK; the DEK is wrapped with the KEK derived from the passphrase. Random nonces eliminate global counters and remain safe under VM snapshot reverts, crashes, forks, and distributed writers.
 
-In Native mode, encryption applies before RaptorQ encoding (encrypt-then-code). An attacker who corrupts encrypted ECS symbols cannot forge valid ciphertext; RaptorQ repairs the corruption, then decryption proceeds as normal.
+The Native-mode design applies encryption before RaptorQ encoding (encrypt-then-code). An attacker who corrupts encrypted ECS symbols cannot forge valid ciphertext; after the design is fully wired, RaptorQ repairs the corruption and decryption follows.
 
 ---
 
@@ -2587,15 +2602,15 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | Isolation level | Serializable (by serializing) | SSI (true serializable concurrency) | Snapshot | Snapshot | Snapshot |
 | Memory safety | Manual | Compile-time guaranteed | Manual (C) | Manual (C++) | Compile-time guaranteed |
 | File format | SQLite 3.x | SQLite 3.x encoding=1/UTF-8 subset in v0.2.0 (Compat), or ECS (Native target) | SQLite 3.x (compatible) | Own format | SQLite 3.x (compatible) |
-| Page encryption | Commercial (SEE) | XChaCha20-Poly1305 built-in | No | No | No |
-| Self-healing storage | No | RaptorQ repair symbols | No | No | No |
+| Page encryption | Commercial (SEE) | XChaCha20-Poly1305 implemented in `fsqlite-pager` but unwired in v0.2.0 | No | No | No |
+| Self-healing storage | No | RaptorQ repair symbols (Native-mode design / optional infrastructure; not on the v0.2.0 compatibility WAL path) | No | No | No |
 | Cross-process MVCC | No | Shared-memory coordination | No | Yes | No |
 | Embeddable | Yes | Yes | Yes | Yes | Yes |
 | Extensions | Loadable + built-in | Built-in | Built-in + WASM | Built-in | Limited |
 | WASM target | Via Emscripten | Planned (VFS abstraction) | Yes | Yes | Yes |
 | Async I/O | No | Yes (asupersync + Cx) | Yes | No | Yes (io_uring) |
 
-FrankenSQLite's target combines SQLite file format compatibility, concurrent writers via MVCC with SSI, page-level encryption, self-healing storage, and Rust memory safety. The v0.2.0 compatibility runtime covers SQLite encoding=1/UTF-8 databases; broader encoding parity and parts of the durability design remain active work. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
+FrankenSQLite's target combines SQLite file format compatibility, concurrent writers via MVCC with SSI, page-level encryption, self-healing storage, and Rust memory safety. The v0.2.0 compatibility runtime covers SQLite encoding=1/UTF-8 databases; broader encoding parity and parts of the durability design remain active work, and page encryption plus RaptorQ self-healing are not yet reachable from the v0.2.0 public API. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
 
 ---
 
@@ -2681,7 +2696,7 @@ still serves as an authoritative reference.
 
 **Multiplexor VFS.** C SQLite's multiplexor shards large databases across multiple files to work around filesystem limitations (e.g., FAT32 4GB limit). Modern filesystems do not have these limitations.
 
-**SEE (SQLite Encryption Extension).** The commercial C SQLite encryption extension is not ported. FrankenSQLite provides its own page-level encryption using XChaCha20-Poly1305 with DEK/KEK envelope encryption, Argon2id key derivation, and O(1) instant rekey (only the wrapped key is rewritten, not bulk page data).
+**SEE (SQLite Encryption Extension).** The commercial C SQLite encryption extension is not ported. FrankenSQLite's own page-level encryption design uses XChaCha20-Poly1305 with DEK/KEK envelope encryption, Argon2id key derivation, and O(1) instant rekey (only the wrapped key is rewritten, not bulk page data). That implementation lives in `fsqlite-pager` and is not reachable from the v0.2.0 public API — see the Page-Level Encryption section above.
 
 ---
 
@@ -2747,6 +2762,12 @@ still serves as an authoritative reference.
   2147483648 where stock SQLite reads back 0
   ([#264](https://github.com/Dicklesworthstone/frankensqlite/issues/264)). Use
   non-negative values within signed 32-bit range for these header fields.
+- **Column-qualified FTS5 `MATCH` returns wrong results.** A query written to
+  restrict matching to one indexed column ignores that restriction and can
+  return rows whose match occurs only in a different column. The failure is
+  silent — no error is raised. Avoid column-qualified `MATCH` in v0.2.0, or
+  re-check the intended column in application logic
+  ([#249](https://github.com/Dicklesworthstone/frankensqlite/issues/249)).
 - **FrankenSQLite-created FTS5 databases are not yet integrity-clean when
   reopened by stock SQLite.** Stock SQLite's `integrity_check` reports a
   malformed inverted index on the verified FrankenSQLite-created FTS5 fixture.
@@ -2803,9 +2824,16 @@ still serves as an authoritative reference.
   backends such as OPFS and IndexedDB are still planned work. The current WASM
   lane is focused on a compact in-memory package, feature-gated diagnostics,
   and honest size-budget reporting.
-- **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. ARC eviction and GC mitigate this but introduce background work.
+- **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. Cache eviction and GC mitigate this but introduce background work.
 - **No row-level locking.** Two transactions modifying different rows on the same page can still conflict at the page level. The safe write-merge ladder can resolve commuting conflicts, but non-commuting conflicts still abort/retry. This is a deliberate tradeoff for file format compatibility.
-- **Encryption adds per-page overhead.** The per-page 24-byte nonce and 16-byte tag (40 bytes total) consume reserved space in each page. Databases created with encryption cannot be read without the key, even by C SQLite.
+- **Page encryption is not wired in v0.2.0, and `PRAGMA key`/`PRAGMA rekey` are
+  silently ignored.** Both statements parse and return success with no rows and
+  no error, but no key is installed and the database is written unencrypted.
+  Do not use v0.2.0 where encryption at rest is required, and do not treat a
+  successful `PRAGMA key` as confirmation that a database is encrypted. When
+  the design is wired, encryption will add per-page overhead: the 24-byte nonce
+  and 16-byte tag (40 bytes total) consume reserved space in each page, and
+  encrypted databases will not be readable without the key, even by C SQLite.
 - **Native mode databases are not directly readable by C SQLite.** The ECS commit stream format is FrankenSQLite-specific. Compatibility export (`compat/foo.db`) materializes a standard SQLite file on demand.
 
 ---
@@ -2866,13 +2894,13 @@ A: A reader that holds a snapshot open for a long time pins all page versions ne
 A: Serializable Snapshot Isolation detects write skew -- a class of anomaly where two transactions each read data the other writes, producing a result impossible under serial execution. Plain Snapshot Isolation misses this. FrankenSQLite applies the conservative Cahill/Fekete rule at page granularity: a transaction that would become a dangerous rw-antidependency pivot is aborted. PostgreSQL's SSI work is prior art, but its measured overhead is not evidence for FrankenSQLite; this implementation's cost is covered by the release matrix. You can downgrade to plain SI with `PRAGMA fsqlite.serializable = OFF`.
 
 **Q: What does RaptorQ actually buy me in practice?**
-A: Three things. (1) Self-healing after torn writes: WAL frames carry repair symbols, so partial writes during a crash are recoverable without double-write journaling. (2) Bandwidth-optimal replication: fountain coding means a receiver can reconstruct data from any sufficient subset of encoding symbols, regardless of which symbols arrive. (3) Version chain compression: older page versions are stored as RaptorQ-encoded deltas rather than full copies.
+A: Nothing yet, in v0.2.0 — this is the Native-mode design, plus optional infrastructure that the compatibility runtime does not use. The intended payoffs are three. (1) Self-healing after torn writes: WAL frames carry repair symbols, so partial writes during a crash are recoverable without double-write journaling. (2) Bandwidth-optimal replication: fountain coding means a receiver can reconstruct data from any sufficient subset of encoding symbols, regardless of which symbols arrive. (3) Version chain compression: older page versions are stored as RaptorQ-encoded deltas rather than full copies. In v0.2.0 the compatibility WAL commit and recovery paths write no `.wal-fec` sidecar and attempt no FEC repair, so none of these are live behavior.
 
 **Q: What is the difference between Compatibility and Native mode?**
 A: Today, the stable user-facing runtime is the compatibility/pager-backed path over standard SQLite files whose header declares encoding=1/UTF-8. Native mode refers to the ECS/content-addressed durability design and partial implementation work present in the repo. It is not yet a mature public `PRAGMA fsqlite.mode` toggle on `Connection`.
 
 **Q: How does encryption work?**
-A: `PRAGMA key = 'passphrase'` derives a KEK via Argon2id and unwraps a per-database random DEK. Pages are encrypted with XChaCha20-Poly1305 using a fresh random 24-byte nonce per page write; the nonce and 16-byte tag are stored in each page's reserved bytes. `PRAGMA rekey = 'new_passphrase'` re-wraps the DEK in O(1). In Native mode, encryption happens before RaptorQ encoding (encrypt-then-code).
+A: It does not work in v0.2.0. `PRAGMA key` and `PRAGMA rekey` are not implemented by `Connection`; because unrecognised PRAGMAs are silently ignored, they return success while leaving the database unencrypted. The design — which lives in `fsqlite-pager` but is not wired to the public API — derives a KEK via Argon2id and unwraps a per-database random DEK; pages are encrypted with XChaCha20-Poly1305 using a fresh random 24-byte nonce per page write, with the nonce and 16-byte tag stored in each page's reserved bytes, and `PRAGMA rekey` re-wraps the DEK in O(1). In Native mode, encryption is designed to happen before RaptorQ encoding (encrypt-then-code).
 
 **Q: Does FrankenSQLite support Windows?**
 A: Yes. The `WindowsVfs` implements the same `Vfs` trait as `UnixVfs`, using `LockFileEx`/`UnlockFileEx` for file locking and `CreateFileMapping` for shared memory. Platform-specific code is isolated behind `#[cfg(target_os)]` gates. OS/2, VxWorks, and Windows CE are excluded.
@@ -2895,7 +2923,7 @@ A: Yes. The `fsqlite` crate is the public API. The CLI (`fsqlite-cli`) is a sepa
 | High memory usage with many readers | Long-lived snapshots pin old versions | Close transactions promptly; set connection timeouts |
 | SSI abort (write skew detected) | Two concurrent transactions created rw-antidependency cycle | Retry the aborted transaction; or `PRAGMA fsqlite.serializable = OFF` if write skew is acceptable |
 | Cannot open Native mode database in C SQLite | ECS format is FrankenSQLite-specific | Use `compat/foo.db` export, or switch to Compatibility mode |
-| Encryption: "not an error" / garbled data | Wrong key or unencrypted database opened with key | Verify passphrase; use `PRAGMA key` before any other operation |
+| `PRAGMA key` succeeded but the database is readable without a key | Page encryption is not wired in v0.2.0; unrecognised PRAGMAs are silently ignored | Expected in this release — do not rely on FrankenSQLite for encryption at rest; see Page-Level Encryption above |
 
 ---
 

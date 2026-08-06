@@ -3,9 +3,11 @@
 All notable changes to FrankenSQLite are documented in this file.
 
 FrankenSQLite is an independent ground-up Rust reimplementation of SQLite with
-page-level MVCC concurrent writers, Serializable Snapshot Isolation (SSI), and
-RaptorQ-pervasive durability. The project is organized as a 27-member Cargo
-workspace under `crates/`.
+page-level MVCC concurrent writers and Serializable Snapshot Isolation (SSI).
+RaptorQ erasure coding is durability research: the codecs and WAL repair
+routines exist in the workspace, but the compatibility runtime's WAL commit and
+recovery paths do not write or consult repair symbols. The project is organized
+as a 27-member Cargo workspace under `crates/`.
 
 > The project is pre-release. Crates are published to crates.io as `fsqlite`
 > and the `fsqlite-*` workspace members. The historical entries below
@@ -92,6 +94,13 @@ semantic and crates.io predecessor, but it is not an ancestor of current
   anchors are current; it does not prove that every unsupported runtime path
   has been inventoried
   ([#136](https://github.com/Dicklesworthstone/frankensqlite/issues/136)).
+- **Page encryption is not wired; `PRAGMA key`, `PRAGMA rekey`, and
+  `PRAGMA durability` are silently ignored.** The envelope-encryption
+  implementation lives in `fsqlite-pager`, but `Connection` dispatches none of
+  these PRAGMAs, and unrecognised PRAGMAs return success with no rows and no
+  error. A successful `PRAGMA key` therefore does not encrypt anything: the
+  database is written in plaintext. Do not use v0.2.0 where encryption at rest
+  is required, and do not treat these PRAGMAs as having taken effect.
 - **Read-only opens are not fully mutation-free in v0.2.0.** On Unix, a database
   that FrankenSQLite has opened before joins its existing namespace without
   rewriting the `-fsqlite-ns-gate` or `-fsqlite-ns-use` sidecar. First contact
