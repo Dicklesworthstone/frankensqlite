@@ -1,6 +1,8 @@
 //! bd-turso-test-adaptation-zu081.8: production SQL histories under LabRuntime.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use asupersync::lab::{LabConfig, LabRuntime};
@@ -23,6 +25,21 @@ const TRACE_ID: &str = "turso-lab-history-trace";
 const PROCESS_ID: &str = "lab-process-0";
 const CANCEL_BUDGET_SCENARIO_ID: &str = "bd-zu081-8-cancel-budget";
 const CANCEL_BUDGET_SEED: u64 = 9_001;
+const DIRECT_CONNECTION_SOURCE: &str =
+    "production-root-cx-direct-connection-thread-local-lab-handle";
+static NEXT_LAB_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    // `Connection` is deliberately !Send. Keep it on the test thread and let
+    // LabRuntime tasks carry only deterministic connection ids across yields.
+    static LAB_CONNECTIONS: RefCell<BTreeMap<u64, Connection>> = const { RefCell::new(BTreeMap::new()) };
+    // LabRuntime supplies deterministic schedule points; this current-thread
+    // runtime drives the production `Connection` futures without moving them.
+    static ENGINE_RUNTIME: asupersync::runtime::Runtime =
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build direct production Connection runtime");
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LabHistoryCase {
@@ -108,6 +125,11 @@ struct TxnOutcome {
     concurrent_mode_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LabConnection {
+    id: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DisjointWriterPlan {
     connection_id: &'static str,
@@ -149,43 +171,97 @@ fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
 }
 
 fn engine_git_sha() -> String {
-    option_env!("FSQLITE_TEST_ENGINE_GIT_SHA")
-        .or(option_env!("GITHUB_SHA"))
-        .unwrap_or("rch-source-snapshot-git-metadata-unavailable")
-        .to_owned()
+    std::env::var("FSQLITE_TEST_ENGINE_GIT_SHA")
+        .or_else(|_| std::env::var("GITHUB_SHA"))
+        .ok()
+        .unwrap_or_else(|| "rch-source-snapshot-git-metadata-unavailable".to_owned())
 }
 
 fn engine_dirty() -> bool {
-    option_env!("FSQLITE_TEST_ENGINE_DIRTY").is_some_and(|value| value == "1" || value == "true")
+    std::env::var("FSQLITE_TEST_ENGINE_DIRTY").is_ok_and(|value| value == "1" || value == "true")
 }
 
 fn fsqlite_cx(case: LabHistoryCase, decision_id: u64) -> FsqliteCx {
-    let native = asupersync::Cx::current().expect("LabRuntime task must install a current Cx");
-    let cx = FsqliteCx::new().with_trace_context(case.seed(), decision_id, 0);
-    cx.set_native_cx(native);
-    cx
+    let _native = asupersync::Cx::current().expect("LabRuntime task must install a current Cx");
+    // Production `Connection` futures run on `ENGINE_RUNTIME`; LabRuntime owns
+    // the deterministic history yields. Native cancellation is checked below.
+    FsqliteCx::new().with_trace_context(case.seed(), decision_id, 0)
 }
 
 fn connection_env(cx: &FsqliteCx) -> ConnectionEnv {
     ConnectionEnv::new_with_root_cx(runtime_config(), cx)
 }
 
-async fn open_lab_connection(
+fn block_on_engine<F: std::future::Future>(future: F) -> F::Output {
+    ENGINE_RUNTIME.with(|runtime| runtime.block_on(future))
+}
+
+fn with_lab_connection<T>(conn: LabConnection, operation: impl FnOnce(&mut Connection) -> T) -> T {
+    LAB_CONNECTIONS.with(|connections| {
+        let mut connections = connections.borrow_mut();
+        let conn = connections
+            .get_mut(&conn.id)
+            .expect("LabRuntime connection id must remain open");
+        operation(conn)
+    })
+}
+
+fn open_lab_connection(
     case: LabHistoryCase,
     decision_id: u64,
     path: &str,
-) -> Result<(Connection, FsqliteCx), String> {
+) -> Result<LabConnection, String> {
     let cx = fsqlite_cx(case, decision_id);
     cx.checkpoint()
         .map_err(|error| format!("LabRuntime-rooted Cx pre-open checkpoint: {error}"))?;
-    let conn = Connection::open_with_env(path.to_owned(), connection_env(&cx))
-        .await
-        .map_err(|error| format!("open production bridged connection: {error}"))?;
+    let conn = block_on_engine(Connection::open_with_env(
+        path.to_owned(),
+        connection_env(&cx),
+    ))
+    .map_err(|error| format!("open production root-Cx connection: {error}"))?;
     conn.set_strict_mem_fallback_rejection(true);
-    conn.execute("PRAGMA busy_timeout=5000;")
-        .await
-        .map_err(|error| format!("set bounded busy timeout: {error}"))?;
-    Ok((conn, cx))
+    let handle = LabConnection {
+        id: NEXT_LAB_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+    };
+    LAB_CONNECTIONS.with(|connections| {
+        let replaced = connections.borrow_mut().insert(handle.id, conn);
+        assert!(
+            replaced.is_none(),
+            "LabRuntime connection ids must not be reused"
+        );
+    });
+    if let Err(error) = execute_lab_connection(handle, "PRAGMA busy_timeout=5000;") {
+        close_lab_connection(handle);
+        return Err(format!("set bounded busy timeout: {error}"));
+    }
+    if let Err(error) = cx.checkpoint() {
+        close_lab_connection(handle);
+        return Err(format!(
+            "LabRuntime-rooted Cx post-open checkpoint: {error}"
+        ));
+    }
+    Ok(handle)
+}
+
+fn execute_lab_connection(
+    conn: LabConnection,
+    sql: &str,
+) -> Result<usize, fsqlite_error::FrankenError> {
+    with_lab_connection(conn, |conn| block_on_engine(conn.execute(sql)))
+}
+
+fn query_lab_connection(
+    conn: LabConnection,
+    sql: &str,
+) -> Result<Vec<Row>, fsqlite_error::FrankenError> {
+    with_lab_connection(conn, |conn| block_on_engine(conn.query(sql)))
+}
+
+fn close_lab_connection(conn: LabConnection) {
+    let removed = LAB_CONNECTIONS.with(|connections| connections.borrow_mut().remove(&conn.id));
+    if let Some(mut conn) = removed {
+        block_on_engine(conn.close_best_effort_in_place());
+    }
 }
 
 fn open_sync_connection(_case: LabHistoryCase, _decision_id: u64, path: &str) -> AsyncConnection {
@@ -203,13 +279,8 @@ fn sqlite_integer(row: &Row, column: usize) -> Result<i64, String> {
     }
 }
 
-async fn concurrent_mode_enabled(conn: &Connection) -> Result<bool, String> {
-    if !conn.is_concurrent_mode_default() {
-        return Ok(false);
-    }
-    let rows = conn
-        .query("PRAGMA concurrent_mode;")
-        .await
+fn concurrent_mode_enabled(conn: LabConnection) -> Result<bool, String> {
+    let rows = query_lab_connection(conn, "PRAGMA concurrent_mode;")
         .map_err(|error| format!("query concurrent mode: {error}"))?;
     let row = rows
         .first()
@@ -307,38 +378,12 @@ async fn run_disjoint_writer(
     recorder: Arc<Mutex<EventRecorder>>,
     outcomes: Arc<Mutex<Vec<TxnOutcome>>>,
 ) {
-    let native = asupersync::Cx::current().expect("LabRuntime task must install a current Cx");
-    let mut handle = native
-        .spawn_local(move |_child| async move {
-            run_disjoint_writer_local(path, plan, recorder, outcomes).await;
-        })
-        .expect("spawn local production disjoint writer");
-    handle
-        .join(&native)
-        .await
-        .expect("local production disjoint writer should complete");
-}
-
-async fn run_disjoint_writer_local(
-    path: String,
-    plan: DisjointWriterPlan,
-    recorder: Arc<Mutex<EventRecorder>>,
-    outcomes: Arc<Mutex<Vec<TxnOutcome>>>,
-) {
-    let (mut conn, cx) =
-        open_lab_connection(LabHistoryCase::DisjointWriters, plan.decision_id, &path)
-            .await
-            .expect("open disjoint lab connection");
-    cx.checkpoint()
-        .expect("LabRuntime-rooted FrankenSQLite Cx should remain live");
-    let mode_enabled = concurrent_mode_enabled(&conn)
-        .await
-        .expect("query disjoint concurrent mode");
+    let conn = open_lab_connection(LabHistoryCase::DisjointWriters, plan.decision_id, &path)
+        .expect("open disjoint lab connection");
+    let mode_enabled = concurrent_mode_enabled(conn).expect("query disjoint concurrent mode");
     assert!(mode_enabled, "concurrent mode must start enabled");
 
-    conn.execute("BEGIN;")
-        .await
-        .expect("begin disjoint transaction");
+    execute_lab_connection(conn, "BEGIN;").expect("begin disjoint transaction");
     lock_recorder(&recorder).record(
         plan.connection_id,
         Some(plan.transaction_id),
@@ -348,11 +393,10 @@ async fn run_disjoint_writer_local(
     );
     yield_now().await;
 
-    conn.execute(&format!(
-        "INSERT INTO {} VALUES (1, {});",
-        plan.table, plan.value
-    ))
-    .await
+    execute_lab_connection(
+        conn,
+        &format!("INSERT INTO {} VALUES (1, {});", plan.table, plan.value),
+    )
     .expect("insert disjoint value");
     lock_recorder(&recorder).record(
         plan.connection_id,
@@ -365,9 +409,7 @@ async fn run_disjoint_writer_local(
     );
     yield_now().await;
 
-    conn.execute("COMMIT;")
-        .await
-        .expect("commit disjoint transaction");
+    execute_lab_connection(conn, "COMMIT;").expect("commit disjoint transaction");
     lock_recorder(&recorder).record(
         plan.connection_id,
         Some(plan.transaction_id),
@@ -379,7 +421,7 @@ async fn run_disjoint_writer_local(
         transient_conflict: false,
         concurrent_mode_enabled: mode_enabled,
     });
-    conn.close_best_effort_in_place().await;
+    close_lab_connection(conn);
 }
 
 async fn run_same_row_conflict(
@@ -387,47 +429,18 @@ async fn run_same_row_conflict(
     recorder: Arc<Mutex<EventRecorder>>,
     outcomes: Arc<Mutex<Vec<TxnOutcome>>>,
 ) {
-    let native = asupersync::Cx::current().expect("LabRuntime task must install a current Cx");
-    let mut handle = native
-        .spawn_local(move |_child| async move {
-            run_same_row_conflict_local(path, recorder, outcomes).await;
-        })
-        .expect("spawn local production same-row conflict");
-    handle
-        .join(&native)
-        .await
-        .expect("local production same-row conflict should complete");
-}
-
-async fn run_same_row_conflict_local(
-    path: String,
-    recorder: Arc<Mutex<EventRecorder>>,
-    outcomes: Arc<Mutex<Vec<TxnOutcome>>>,
-) {
-    let (mut winner, winner_cx) = open_lab_connection(LabHistoryCase::SameRowConflict, 51, &path)
-        .await
+    let winner = open_lab_connection(LabHistoryCase::SameRowConflict, 51, &path)
         .expect("open conflict winner");
-    let (mut loser, loser_cx) = open_lab_connection(LabHistoryCase::SameRowConflict, 52, &path)
-        .await
+    let loser = open_lab_connection(LabHistoryCase::SameRowConflict, 52, &path)
         .expect("open conflict loser");
-    winner_cx
-        .checkpoint()
-        .expect("winner LabRuntime-rooted Cx should remain live");
-    loser_cx
-        .checkpoint()
-        .expect("loser LabRuntime-rooted Cx should remain live");
-    let winner_mode = concurrent_mode_enabled(&winner)
-        .await
-        .expect("query winner concurrent mode");
-    let loser_mode = concurrent_mode_enabled(&loser)
-        .await
-        .expect("query loser concurrent mode");
+    let winner_mode = concurrent_mode_enabled(winner).expect("query winner concurrent mode");
+    let loser_mode = concurrent_mode_enabled(loser).expect("query loser concurrent mode");
     assert!(
         winner_mode && loser_mode,
         "both conflict connections need concurrent default"
     );
 
-    winner.execute("BEGIN;").await.expect("winner begin");
+    execute_lab_connection(winner, "BEGIN;").expect("winner begin");
     lock_recorder(&recorder).record(
         "conflict-winner",
         Some("txn-winner"),
@@ -435,7 +448,7 @@ async fn run_same_row_conflict_local(
             mode: BeginMode::Concurrent,
         },
     );
-    loser.execute("BEGIN;").await.expect("loser begin");
+    execute_lab_connection(loser, "BEGIN;").expect("loser begin");
     lock_recorder(&recorder).record(
         "conflict-loser",
         Some("txn-loser"),
@@ -445,10 +458,9 @@ async fn run_same_row_conflict_local(
     );
     yield_now().await;
 
-    let winner_read = winner
-        .query("SELECT value FROM conflict_register WHERE id = 1;")
-        .await
-        .expect("winner read");
+    let winner_read =
+        query_lab_connection(winner, "SELECT value FROM conflict_register WHERE id = 1;")
+            .expect("winner read");
     lock_recorder(&recorder).record(
         "conflict-winner",
         Some("txn-winner"),
@@ -462,10 +474,9 @@ async fn run_same_row_conflict_local(
             source_transaction_id: None,
         },
     );
-    let loser_read = loser
-        .query("SELECT value FROM conflict_register WHERE id = 1;")
-        .await
-        .expect("loser read");
+    let loser_read =
+        query_lab_connection(loser, "SELECT value FROM conflict_register WHERE id = 1;")
+            .expect("loser read");
     lock_recorder(&recorder).record(
         "conflict-loser",
         Some("txn-loser"),
@@ -481,10 +492,11 @@ async fn run_same_row_conflict_local(
     );
     yield_now().await;
 
-    winner
-        .execute("UPDATE conflict_register SET value = 100 WHERE id = 1;")
-        .await
-        .expect("winner update");
+    execute_lab_connection(
+        winner,
+        "UPDATE conflict_register SET value = 100 WHERE id = 1;",
+    )
+    .expect("winner update");
     lock_recorder(&recorder).record(
         "conflict-winner",
         Some("txn-winner"),
@@ -494,11 +506,24 @@ async fn run_same_row_conflict_local(
             page_number: None,
         },
     );
+    execute_lab_connection(winner, "COMMIT;").expect("winner commit");
+    lock_recorder(&recorder).record(
+        "conflict-winner",
+        Some("txn-winner"),
+        HistoryOperation::Commit,
+    );
+    lock_outcomes(&outcomes).push(TxnOutcome {
+        transaction_id: "txn-winner".to_owned(),
+        committed: true,
+        transient_conflict: false,
+        concurrent_mode_enabled: winner_mode,
+    });
     yield_now().await;
 
-    let update_result = loser
-        .execute("UPDATE conflict_register SET value = 200 WHERE id = 1;")
-        .await;
+    let update_result = execute_lab_connection(
+        loser,
+        "UPDATE conflict_register SET value = 200 WHERE id = 1;",
+    );
     if let Ok(changes) = update_result.as_ref() {
         assert_eq!(
             *changes, 1,
@@ -515,24 +540,8 @@ async fn run_same_row_conflict_local(
         );
     }
 
-    winner.execute("COMMIT;").await.expect("winner commit");
-    lock_recorder(&recorder).record(
-        "conflict-winner",
-        Some("txn-winner"),
-        HistoryOperation::Commit,
-    );
-    lock_outcomes(&outcomes).push(TxnOutcome {
-        transaction_id: "txn-winner".to_owned(),
-        committed: true,
-        transient_conflict: false,
-        concurrent_mode_enabled: winner_mode,
-    });
-    yield_now().await;
-
     let conflict = match update_result {
-        Ok(_) => loser
-            .execute("COMMIT;")
-            .await
+        Ok(_) => execute_lab_connection(loser, "COMMIT;")
             .expect_err("loser commit must fail after same-row conflict"),
         Err(error) => error,
     };
@@ -544,10 +553,10 @@ async fn run_same_row_conflict_local(
         "conflict-loser",
         Some("txn-loser"),
         HistoryOperation::Conflict {
-            reason: "first_committer_wins_transient".to_owned(),
+            reason: "first_committer_wins_transient_after_winner_commit".to_owned(),
         },
     );
-    let _ = loser.execute("ROLLBACK;").await;
+    let _ = execute_lab_connection(loser, "ROLLBACK;");
     lock_recorder(&recorder).record(
         "conflict-loser",
         Some("txn-loser"),
@@ -562,8 +571,8 @@ async fn run_same_row_conflict_local(
         concurrent_mode_enabled: loser_mode,
     });
 
-    winner.close_best_effort_in_place().await;
-    loser.close_best_effort_in_place().await;
+    close_lab_connection(winner);
+    close_lab_connection(loser);
 }
 
 fn schedule_provenance(
@@ -575,7 +584,7 @@ fn schedule_provenance(
         case.seed(),
         report,
         case_test_name(case),
-        "production-worker-backed-sync-connection",
+        DIRECT_CONNECTION_SOURCE,
     )
 }
 
@@ -612,7 +621,7 @@ fn deterministic_schedule_provenance(
         schedule_id,
         schedule_sha256,
         format!(
-            "FSQLITE_TEST_ENGINE_GIT_SHA=<sha> RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- cargo test --locked -p fsqlite-harness --test bd_turso_test_adaptation_zu081_8_lab_history {} -- --exact --test-threads=1",
+            "FSQLITE_TEST_ENGINE_GIT_SHA=<sha> FSQLITE_TEST_ENGINE_DIRTY=<0|1> RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- cargo test --locked -p fsqlite-harness --test bd_turso_test_adaptation_zu081_8_lab_history {} -- --exact --test-threads=1",
             test_name
         ),
     )
@@ -644,8 +653,8 @@ fn lane_evidence(case: LabHistoryCase) -> ExecutionLaneEvidence {
         case.scenario_id(),
         "sql-transaction-history",
         "file",
-        "production-worker-backed-sync-connection",
-        "file:production-worker-backed-sync-connection",
+        DIRECT_CONNECTION_SOURCE,
+        format!("file:{DIRECT_CONNECTION_SOURCE}"),
         Vec::new(),
         true,
     )
@@ -912,7 +921,7 @@ fn production_lab_history_same_row_conflict_matches_fcw_abort() {
         artifact.history.events.iter().any(|event| matches!(
             event.operation,
             HistoryOperation::Conflict { ref reason }
-                if reason == "first_committer_wins_transient"
+                if reason == "first_committer_wins_transient_after_winner_commit"
         )),
         "history must record the FCW conflict"
     );
