@@ -389,31 +389,40 @@ async fn bounded_no_retain_writer(
 ) -> Result<(), String> {
     let arrival = BarrierArrivalGuard::new(start_barrier);
     let conn = open(path, false).await?;
-    disable_retained_autocommit(&conn).await?;
-    // Begin the two implicit write streams together so their repeated EOF
-    // allocations contend from the same published baseline. The armed guard
-    // also releases the peer if setup fails before this rendezvous.
-    arrival.arrive();
-    let table = format!("nr_w{writer_id}");
-    for row in 0..NO_RETAIN_ROWS_PER_WRITER {
-        let payload = format!(
-            "nr-w{writer_id}-r{row}-{:0400x}",
-            (writer_id * NO_RETAIN_ROWS_PER_WRITER + row) as u128
-        );
-        with_retry(
-            &format!("bounded no-retain insert {table} r{row}"),
-            || async {
-                conn.query_with_params(
-                    &format!("INSERT INTO {table} (payload) VALUES (?1);"),
-                    &[SqliteValue::Text(payload.clone().into())],
-                )
-                .await
-                .map(|_| ())
-            },
-        )
-        .await?;
+    let work_result = async {
+        disable_retained_autocommit(&conn).await?;
+        // Begin the two implicit write streams together so their repeated EOF
+        // allocations contend from the same published baseline. The armed guard
+        // also releases the peer if setup fails before this rendezvous.
+        arrival.arrive();
+        let table = format!("nr_w{writer_id}");
+        for row in 0..NO_RETAIN_ROWS_PER_WRITER {
+            let payload = format!(
+                "nr-w{writer_id}-r{row}-{:0400x}",
+                (writer_id * NO_RETAIN_ROWS_PER_WRITER + row) as u128
+            );
+            with_retry(
+                &format!("bounded no-retain insert {table} r{row}"),
+                || async {
+                    conn.query_with_params(
+                        &format!("INSERT INTO {table} (payload) VALUES (?1);"),
+                        &[SqliteValue::Text(payload.clone().into())],
+                    )
+                    .await
+                    .map(|_| ())
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    let close_result = conn
+        .close_without_checkpoint()
+        .await
+        .map_err(|error| format!("bounded no-retain writer {writer_id} close: {error}"));
+    work_result?;
+    close_result
 }
 
 fn run_bounded_no_retain_scenario() -> Result<(), String> {
@@ -424,13 +433,25 @@ fn run_bounded_no_retain_scenario() -> Result<(), String> {
     asupersync::test_utils::run_test(|| async {
         seed = async {
             let conn = open(&db_path, false).await?;
-            for writer in 0..NO_RETAIN_WRITERS {
-                conn.execute(&format!(
-                    "CREATE TABLE nr_w{writer} (id INTEGER PRIMARY KEY, payload TEXT);"
-                ))
-                .await?;
+            let work_result = async {
+                for writer in 0..NO_RETAIN_WRITERS {
+                    conn.execute(&format!(
+                        "CREATE TABLE nr_w{writer} (id INTEGER PRIMARY KEY, payload TEXT);"
+                    ))
+                    .await
+                    .map_err(|error| {
+                        format!("bounded no-retain seed create nr_w{writer}: {error}")
+                    })?;
+                }
+                Ok(())
             }
-            Ok(())
+            .await;
+            let close_result = conn
+                .close_without_checkpoint()
+                .await
+                .map_err(|error| format!("bounded no-retain seed close: {error}"));
+            work_result?;
+            close_result
         }
         .await;
     });
@@ -456,8 +477,10 @@ fn run_bounded_no_retain_scenario() -> Result<(), String> {
             })
         })
         .collect();
-    for handle in handles {
-        let _ = handle.join();
+    for (writer, handle) in handles.into_iter().enumerate() {
+        if handle.join().is_err() {
+            return Err(format!("bounded no-retain writer {writer} panicked"));
+        }
     }
     let writer_errors = errors.load(Ordering::Relaxed);
 
@@ -465,14 +488,24 @@ fn run_bounded_no_retain_scenario() -> Result<(), String> {
     asupersync::test_utils::run_test(|| async {
         frank = async {
             let conn = open(&db_path, false).await?;
-            let integrity = integrity_messages(&conn).await?;
-            let mut counts = Vec::with_capacity(NO_RETAIN_WRITERS);
-            for writer in 0..NO_RETAIN_WRITERS {
-                counts.push(
-                    query_scalar_i64(&conn, &format!("SELECT COUNT(*) FROM nr_w{writer};")).await?,
-                );
+            let work_result = async {
+                let integrity = integrity_messages(&conn).await?;
+                let mut counts = Vec::with_capacity(NO_RETAIN_WRITERS);
+                for writer in 0..NO_RETAIN_WRITERS {
+                    counts.push(
+                        query_scalar_i64(&conn, &format!("SELECT COUNT(*) FROM nr_w{writer};"))
+                            .await?,
+                    );
+                }
+                Ok((integrity, counts))
             }
-            Ok((integrity, counts))
+            .await;
+            let close_result = conn
+                .close_without_checkpoint()
+                .await
+                .map_err(|error| format!("bounded no-retain verifier close: {error}"));
+            work_result?;
+            close_result
         }
         .await;
     });
@@ -586,59 +619,68 @@ async fn matrix_writer(
 ) -> Result<(), String> {
     let arrival = BarrierArrivalGuard::new(start_barrier);
     let conn = open(path, false).await?;
-    let table = format!("mx_w{writer}");
-    let sql = format!("INSERT INTO {table} (payload) VALUES (?1);");
-    let prepared = if matches!(surface, MatrixInsertSurface::PreparedExecute) {
-        Some(
-            conn.prepare(&sql)
-                .await
-                .map_err(|error| format!("prepare {table}: {error}"))?,
-        )
-    } else {
-        None
-    };
-    arrival.arrive();
-
-    for row in 0..MATRIX_ROWS_PER_WRITER {
-        let payload = SqliteValue::Text(
-            format!(
-                "mx-{surface:?}-w{writer}-r{row}-{:0400x}",
-                writer * 10_000 + row
+    let work_result = async {
+        let table = format!("mx_w{writer}");
+        let sql = format!("INSERT INTO {table} (payload) VALUES (?1);");
+        let prepared = if matches!(surface, MatrixInsertSurface::PreparedExecute) {
+            Some(
+                conn.prepare(&sql)
+                    .await
+                    .map_err(|error| format!("prepare {table}: {error}"))?,
             )
-            .into(),
-        );
-        let params = [payload];
-        let label = format!("matrix {} writer {writer} row {row}", surface.label());
-        match surface {
-            MatrixInsertSurface::QueryWithParams => {
-                with_retry(&label, || async {
-                    conn.query_with_params(&sql, &params).await.map(|_| ())
-                })
-                .await?;
-            }
-            MatrixInsertSurface::ExecuteWithParams => {
-                with_retry(&label, || async {
-                    conn.execute_with_params(&sql, &params).await.map(|_| ())
-                })
-                .await?;
-            }
-            MatrixInsertSurface::PreparedExecute => {
-                let prepared = prepared.as_ref().ok_or_else(|| {
-                    "prepared matrix arm started without its prepared statement".to_owned()
-                })?;
-                with_retry(&label, || async {
-                    conn.execute_prepared_with_params(prepared, &params)
-                        .await
-                        .map(|_| ())
-                })
-                .await?;
-            }
-            MatrixInsertSurface::ExplicitConcurrent => {
-                explicit_concurrent_insert_with_retry(&conn, &sql, &params, &label).await?;
+        } else {
+            None
+        };
+        arrival.arrive();
+
+        for row in 0..MATRIX_ROWS_PER_WRITER {
+            let payload = SqliteValue::Text(
+                format!(
+                    "mx-{surface:?}-w{writer}-r{row}-{:0400x}",
+                    writer * 10_000 + row
+                )
+                .into(),
+            );
+            let params = [payload];
+            let label = format!("matrix {} writer {writer} row {row}", surface.label());
+            match surface {
+                MatrixInsertSurface::QueryWithParams => {
+                    with_retry(&label, || async {
+                        conn.query_with_params(&sql, &params).await.map(|_| ())
+                    })
+                    .await?;
+                }
+                MatrixInsertSurface::ExecuteWithParams => {
+                    with_retry(&label, || async {
+                        conn.execute_with_params(&sql, &params).await.map(|_| ())
+                    })
+                    .await?;
+                }
+                MatrixInsertSurface::PreparedExecute => {
+                    let prepared = prepared.as_ref().ok_or_else(|| {
+                        "prepared matrix arm started without its prepared statement".to_owned()
+                    })?;
+                    with_retry(&label, || async {
+                        conn.execute_prepared_with_params(prepared, &params)
+                            .await
+                            .map(|_| ())
+                    })
+                    .await?;
+                }
+                MatrixInsertSurface::ExplicitConcurrent => {
+                    explicit_concurrent_insert_with_retry(&conn, &sql, &params, &label).await?;
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
+    .await;
+    let close_result = conn
+        .close_without_checkpoint()
+        .await
+        .map_err(|error| format!("matrix {} writer {writer} close: {error}", surface.label()));
+    work_result?;
+    close_result
 }
 
 fn run_statement_surface_matrix_arm(surface: MatrixInsertSurface) -> Result<(), String> {
@@ -651,13 +693,28 @@ fn run_statement_surface_matrix_arm(surface: MatrixInsertSurface) -> Result<(), 
     asupersync::test_utils::run_test(|| async {
         seed = async {
             let conn = open(&db_path, false).await?;
-            for writer in 0..NO_RETAIN_WRITERS {
-                conn.execute(&format!(
-                    "CREATE TABLE mx_w{writer} (id INTEGER PRIMARY KEY, payload TEXT);"
-                ))
-                .await?;
+            let work_result = async {
+                for writer in 0..NO_RETAIN_WRITERS {
+                    conn.execute(&format!(
+                        "CREATE TABLE mx_w{writer} (id INTEGER PRIMARY KEY, payload TEXT);"
+                    ))
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "matrix {} seed create mx_w{writer}: {error}",
+                            surface.label()
+                        )
+                    })?;
+                }
+                Ok(())
             }
-            Ok(())
+            .await;
+            let close_result = conn
+                .close_without_checkpoint()
+                .await
+                .map_err(|error| format!("matrix {} seed close: {error}", surface.label()));
+            work_result?;
+            close_result
         }
         .await;
     });
@@ -685,8 +742,13 @@ fn run_statement_surface_matrix_arm(surface: MatrixInsertSurface) -> Result<(), 
             })
         })
         .collect();
-    for handle in handles {
-        let _ = handle.join();
+    for (writer, handle) in handles.into_iter().enumerate() {
+        if handle.join().is_err() {
+            return Err(format!(
+                "matrix {} writer {writer} panicked",
+                surface.label()
+            ));
+        }
     }
     let writer_errors = errors.load(Ordering::Relaxed);
 
@@ -694,14 +756,24 @@ fn run_statement_surface_matrix_arm(surface: MatrixInsertSurface) -> Result<(), 
     asupersync::test_utils::run_test(|| async {
         frank = async {
             let conn = open(&db_path, false).await?;
-            let integrity = integrity_messages(&conn).await?;
-            let mut counts = Vec::with_capacity(NO_RETAIN_WRITERS);
-            for writer in 0..NO_RETAIN_WRITERS {
-                counts.push(
-                    query_scalar_i64(&conn, &format!("SELECT COUNT(*) FROM mx_w{writer};")).await?,
-                );
+            let work_result = async {
+                let integrity = integrity_messages(&conn).await?;
+                let mut counts = Vec::with_capacity(NO_RETAIN_WRITERS);
+                for writer in 0..NO_RETAIN_WRITERS {
+                    counts.push(
+                        query_scalar_i64(&conn, &format!("SELECT COUNT(*) FROM mx_w{writer};"))
+                            .await?,
+                    );
+                }
+                Ok((integrity, counts))
             }
-            Ok((integrity, counts))
+            .await;
+            let close_result = conn
+                .close_without_checkpoint()
+                .await
+                .map_err(|error| format!("matrix {} verifier close: {error}", surface.label()));
+            work_result?;
+            close_result
         }
         .await;
     });
