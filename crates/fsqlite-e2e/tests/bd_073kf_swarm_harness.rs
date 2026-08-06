@@ -209,3 +209,69 @@ fn p5_jsonl_lines_contain_required_fields() {
         }
     }
 }
+
+// --- Phase 6: Real-file process kill and recovery ----------------------
+
+#[test]
+fn p6_recovery_smoke_classifies_precommit_and_acknowledged_kills() {
+    let dir = TempDir::new().unwrap();
+    let output = run_swarm(&[
+        "--recovery-smoke",
+        "--workers=2",
+        "--seconds=30",
+        "--busy-timeout-ms=5000",
+        "--seed=1909",
+        &format!("--artifact-root={}", dir.path().display()),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "recovery smoke failed: status={}\nstdout={stdout}\nstderr={stderr}",
+        output.status
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("invalid recovery JSON: {error}\n{stdout}"));
+    assert_eq!(
+        report["schema"],
+        "fsqlite-e2e.swarm-recovery-report.v1"
+    );
+    assert_eq!(report["success"], true);
+    let scenarios = report["scenarios"]
+        .as_array()
+        .expect("recovery scenarios array");
+    assert_eq!(scenarios.len(), 2);
+
+    for scenario in scenarios {
+        assert_eq!(scenario["success"], true, "{scenario:#}");
+        assert_eq!(scenario["process_exit"]["parent_kill_requested"], true);
+        assert_eq!(
+            scenario["process_exit"]["classification"],
+            "terminated_by_parent_at_replayable_kill_point"
+        );
+        assert_eq!(scenario["reopen_concurrent_mode_default"], true);
+        assert_eq!(scenario["reduction"]["status"], "complete");
+        assert_eq!(scenario["reduction"]["stats"]["minimized"]["checkpoints"], 0);
+        assert_eq!(
+            scenario["reduction"]["observation"]["required_lanes"],
+            serde_json::json!(["mvcc_required", "recovery_required"])
+        );
+        assert_eq!(scenario["database_sha256"].as_str().map(str::len), Some(64));
+    }
+
+    let before = scenarios
+        .iter()
+        .find(|scenario| scenario["kill_point"] == "before_commit")
+        .expect("before-commit scenario");
+    assert_eq!(before["marker"]["acknowledgement"], "not_acknowledged");
+    assert_eq!(before["observed_row_count"], 0);
+    assert_eq!(before["expected_row_present"], false);
+
+    let acknowledged = scenarios
+        .iter()
+        .find(|scenario| scenario["kill_point"] == "after_commit_acknowledged")
+        .expect("acknowledged scenario");
+    assert_eq!(acknowledged["marker"]["acknowledgement"], "acknowledged");
+    assert_eq!(acknowledged["observed_row_count"], 1);
+    assert_eq!(acknowledged["expected_row_present"], true);
+}

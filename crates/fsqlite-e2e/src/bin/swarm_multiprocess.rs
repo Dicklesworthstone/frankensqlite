@@ -12,6 +12,7 @@
 #![allow(clippy::large_futures)]
 #![recursion_limit = "512"]
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -24,12 +25,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite::{Connection, FrankenError, SqliteValue};
 use fsqlite_e2e::verify_csqlite::{verify_concurrency_artifact, write_artifact_bundle};
+use fsqlite_harness::failure_bundle::{ExecutionLaneEvidence, ObservedExecutionLane};
+use fsqlite_harness::mismatch_minimizer::{
+    HistoryReductionCase, HistoryReductionObservation, HistoryReductionResult,
+    TypedReductionConfig, minimize_history_case,
+};
+use fsqlite_harness::serializability_oracle::{
+    BeginMode, HistoryEvent, HistoryOperation, HistoryValue, HistoryWorkload,
+    ScheduleProvenance, TRANSACTION_HISTORY_SCHEMA_VERSION, TransactionHistory,
+};
+use fsqlite_harness::test_inventory::ExecutionLane;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const REPORT_SCHEMA_V1: &str = "fsqlite-e2e.swarm-multiprocess-report.v1";
 const WORKER_REPORT_SCHEMA_V1: &str = "fsqlite-e2e.swarm-multiprocess-worker-report.v1";
+const RECOVERY_REPORT_SCHEMA_V1: &str = "fsqlite-e2e.swarm-recovery-report.v1";
+const RECOVERY_MARKER_SCHEMA_V1: &str = "fsqlite-e2e.swarm-recovery-marker.v1";
 const DEFAULT_WORKERS: usize = 8;
 const DEFAULT_SECONDS: u64 = 60;
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -64,6 +78,7 @@ struct RunConfig {
     db_path: Option<PathBuf>,
     artifact_root: PathBuf,
     open_checks: Option<usize>,
+    recovery_smoke: bool,
 }
 
 impl Default for RunConfig {
@@ -77,6 +92,7 @@ impl Default for RunConfig {
             db_path: None,
             artifact_root: PathBuf::from("crates/fsqlite-e2e/artifacts/swarm-multiprocess"),
             open_checks: None,
+            recovery_smoke: false,
         }
     }
 }
@@ -99,9 +115,126 @@ struct ChildConfig {
 }
 
 #[derive(Debug, Clone)]
+struct RecoveryChildConfig {
+    worker_id: usize,
+    kill_point: RecoveryKillPoint,
+    marker_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 enum Mode {
     Parent(RunConfig),
     Child { run: RunConfig, child: ChildConfig },
+    RecoveryChild {
+        run: RunConfig,
+        child: RecoveryChildConfig,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryKillPoint {
+    BeforeCommit,
+    AfterCommitAcknowledged,
+}
+
+impl RecoveryKillPoint {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::BeforeCommit => "before_commit",
+            Self::AfterCommitAcknowledged => "after_commit_acknowledged",
+        }
+    }
+
+    const fn acknowledgement(self) -> AcknowledgementState {
+        match self {
+            Self::BeforeCommit => AcknowledgementState::NotAcknowledged,
+            Self::AfterCommitAcknowledged => AcknowledgementState::Acknowledged,
+        }
+    }
+
+    const fn row_must_survive(self) -> bool {
+        matches!(self, Self::AfterCommitAcknowledged)
+    }
+}
+
+impl std::str::FromStr for RecoveryKillPoint {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "before_commit" => Ok(Self::BeforeCommit),
+            "after_commit_acknowledged" => Ok(Self::AfterCommitAcknowledged),
+            _ => Err(format!("unsupported recovery kill point `{value}`")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AcknowledgementState {
+    NotAcknowledged,
+    Acknowledged,
+}
+
+impl AcknowledgementState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NotAcknowledged => "not_acknowledged",
+            Self::Acknowledged => "acknowledged",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryChildMarker {
+    schema: String,
+    seed: u64,
+    worker_id: usize,
+    pid: u32,
+    kill_point: RecoveryKillPoint,
+    transaction_id: String,
+    row_id: i64,
+    acknowledgement: AcknowledgementState,
+    concurrent_mode_default: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryProcessExit {
+    parent_kill_requested: bool,
+    exit_code: Option<i32>,
+    classification: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryScenarioReport {
+    scenario_id: String,
+    success: bool,
+    kill_point: RecoveryKillPoint,
+    marker: RecoveryChildMarker,
+    process_exit: RecoveryProcessExit,
+    expected_row_present: bool,
+    observed_row_count: i64,
+    reopen_concurrent_mode_default: bool,
+    checkpoint: String,
+    fsqlite_integrity: String,
+    sqlite_integrity: String,
+    database_sha256: String,
+    wal_sha256: Option<String>,
+    history: TransactionHistory,
+    reduction: HistoryReductionResult,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryCampaignReport {
+    schema: &'static str,
+    success: bool,
+    seed: u64,
+    run_dir: String,
+    db_path: String,
+    scenarios: Vec<RecoveryScenarioReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,10 +386,14 @@ fn real_main() -> HarnessResult<bool> {
     match parse_args()? {
         Mode::Parent(config) => run_parent(config),
         Mode::Child { run, child } => run_child_and_write_report(&run, &child),
+        Mode::RecoveryChild { run, child } => run_recovery_child(&run, &child),
     }
 }
 
 fn run_parent(config: RunConfig) -> HarnessResult<bool> {
+    if config.recovery_smoke {
+        return run_recovery_parent(config);
+    }
     validate_parent_config(&config)?;
     let started = Instant::now();
     let run_dir = config.artifact_root.join(timestamp_dir_name("run"));
@@ -395,6 +532,633 @@ fn run_parent(config: RunConfig) -> HarnessResult<bool> {
     write_report_artifact(&run_dir, &report)?;
     print_json(&report)?;
     Ok(success)
+}
+
+fn run_recovery_parent(config: RunConfig) -> HarnessResult<bool> {
+    validate_parent_config(&config)?;
+    let run_dir = config.artifact_root.join(timestamp_dir_name("recovery"));
+    fs::create_dir_all(&run_dir).map_err(|error| {
+        format!(
+            "failed to create recovery artifact directory `{}`: {error}",
+            run_dir.display()
+        )
+    })?;
+    let db_path = config
+        .db_path
+        .clone()
+        .unwrap_or_else(|| run_dir.join("recovery.db"));
+    if db_path.exists() {
+        return Err(format!(
+            "refusing to run recovery harness against existing DB `{}`",
+            db_path.display()
+        ));
+    }
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create recovery DB parent `{}`: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    initialize_database(&db_path, &config)?;
+
+    let mut scenarios = Vec::new();
+    for (worker_id, kill_point) in [
+        RecoveryKillPoint::BeforeCommit,
+        RecoveryKillPoint::AfterCommitAcknowledged,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        scenarios.push(run_recovery_scenario(
+            &config,
+            &db_path,
+            &run_dir,
+            worker_id,
+            kill_point,
+        )?);
+    }
+    let success = scenarios.iter().all(|scenario| scenario.success);
+    let report = RecoveryCampaignReport {
+        schema: RECOVERY_REPORT_SCHEMA_V1,
+        success,
+        seed: config.seed,
+        run_dir: run_dir.to_string_lossy().into_owned(),
+        db_path: db_path.to_string_lossy().into_owned(),
+        scenarios,
+    };
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|error| format!("failed to serialize recovery report: {error}"))?;
+    let report_path = run_dir.join("recovery_report.json");
+    fs::write(&report_path, &json).map_err(|error| {
+        format!(
+            "failed to write recovery report `{}`: {error}",
+            report_path.display()
+        )
+    })?;
+    println!("{json}");
+    Ok(success)
+}
+
+fn run_recovery_scenario(
+    config: &RunConfig,
+    db_path: &Path,
+    run_dir: &Path,
+    worker_id: usize,
+    kill_point: RecoveryKillPoint,
+) -> HarnessResult<RecoveryScenarioReport> {
+    let marker_path = run_dir.join(format!("recovery_{}.marker.json", kill_point.label()));
+    let exe = env::current_exe().map_err(|error| format!("failed to resolve current exe: {error}"))?;
+    let mut child = Command::new(exe)
+        .arg("--recovery-child")
+        .arg("--workers")
+        .arg(config.workers.to_string())
+        .arg("--seconds")
+        .arg(config.seconds.to_string())
+        .arg("--busy-timeout-ms")
+        .arg(config.busy_timeout_ms.to_string())
+        .arg("--seed")
+        .arg(config.seed.to_string())
+        .arg("--db")
+        .arg(db_path)
+        .arg("--worker-id")
+        .arg(worker_id.to_string())
+        .arg("--recovery-kill-point")
+        .arg(kill_point.label())
+        .arg("--recovery-marker")
+        .arg(&marker_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to spawn recovery child {worker_id}: {error}"))?;
+
+    let marker = match wait_for_recovery_marker(
+        &mut child,
+        &marker_path,
+        Duration::from_millis(config.busy_timeout_ms.saturating_add(5_000)),
+    ) {
+        Ok(marker) => marker,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    validate_recovery_marker(&marker, config, worker_id, kill_point)?;
+    child.kill().map_err(|error| {
+        format!(
+            "failed to kill recovery child {worker_id} at {}: {error}",
+            kill_point.label()
+        )
+    })?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed to wait for recovery child {worker_id}: {error}"))?;
+    let process_exit = RecoveryProcessExit {
+        parent_kill_requested: true,
+        exit_code: status.code(),
+        classification: "terminated_by_parent_at_replayable_kill_point",
+    };
+
+    let conn = open_fsqlite(db_path)?;
+    configure_fsqlite(&conn, config)?;
+    let reopen_concurrent_mode_default = conn.is_concurrent_mode_default();
+    let observed_row_count = query_count(
+        &conn,
+        &format!("SELECT COUNT(*) FROM swarm_rows WHERE id = {}", marker.row_id),
+    )?;
+    drop(conn);
+
+    let wal_sha256 = hash_optional_file(&wal_path(db_path))?;
+    let checkpoint = run_fsqlite_checkpoint(db_path, config)?;
+    let fsqlite_integrity = run_fsqlite_integrity_check(db_path, config)?;
+    let sqlite_integrity = run_sqlite_integrity_check(db_path, config)?;
+    let database_sha256 = sha256_file(db_path)?;
+    let history = recovery_history(
+        config,
+        &marker,
+        reopen_concurrent_mode_default,
+        observed_row_count,
+    )?;
+    let reduction = reduce_recovery_history(&history, &marker, observed_row_count)?;
+
+    let mut errors = Vec::new();
+    let expected_count = i64::from(kill_point.row_must_survive());
+    if observed_row_count != expected_count {
+        errors.push(format!(
+            "{} expected row count {expected_count}, observed {observed_row_count}",
+            kill_point.label()
+        ));
+    }
+    if !marker.concurrent_mode_default || !reopen_concurrent_mode_default {
+        errors.push("concurrent writer default was not preserved across recovery".to_owned());
+    }
+    if reduction.observation.required_lanes
+        != vec![ExecutionLane::MvccRequired, ExecutionLane::RecoveryRequired]
+    {
+        errors.push("recovery history did not retain required MVCC and recovery lanes".to_owned());
+    }
+    let success = errors.is_empty();
+    Ok(RecoveryScenarioReport {
+        scenario_id: format!("swarm-recovery-{}", kill_point.label()),
+        success,
+        kill_point,
+        marker,
+        process_exit,
+        expected_row_present: kill_point.row_must_survive(),
+        observed_row_count,
+        reopen_concurrent_mode_default,
+        checkpoint,
+        fsqlite_integrity,
+        sqlite_integrity,
+        database_sha256,
+        wal_sha256,
+        history,
+        reduction,
+        errors,
+    })
+}
+
+fn run_recovery_child(config: &RunConfig, child: &RecoveryChildConfig) -> HarnessResult<bool> {
+    let db_path = config
+        .db_path
+        .as_deref()
+        .ok_or_else(|| "recovery child requires --db".to_owned())?;
+    let conn = open_fsqlite(db_path)?;
+    configure_fsqlite(&conn, config)?;
+    let concurrent_mode_default = conn.is_concurrent_mode_default();
+    if !concurrent_mode_default {
+        return Err("recovery child observed concurrent writer default OFF".to_owned());
+    }
+    let row_id = recovery_row_id(config.seed, child.worker_id)?;
+    let transaction_id = format!("recovery-tx-{}", child.kill_point.label());
+    let payload = format!("seed-{}-{}", config.seed, child.kill_point.label());
+    fsqlite_e2e::block_on(conn.execute("BEGIN CONCURRENT"))
+        .map_err(|error| format!("recovery child begin failed: {error}"))?;
+    fsqlite_e2e::block_on(conn.execute_with_params(
+        "INSERT INTO swarm_rows \
+         (id, owner, seq, payload, touched_by, generation, deleted) \
+         VALUES (?1, ?2, 0, ?3, ?2, 0, 0)",
+        &[
+            SqliteValue::Integer(row_id),
+            SqliteValue::Integer(
+                i64::try_from(child.worker_id)
+                    .map_err(|error| format!("recovery worker id overflow: {error}"))?,
+            ),
+            SqliteValue::Text(payload.into()),
+        ],
+    ))
+    .map_err(|error| format!("recovery child insert failed: {error}"))?;
+    if child.kill_point == RecoveryKillPoint::AfterCommitAcknowledged {
+        fsqlite_e2e::block_on(conn.execute("COMMIT"))
+            .map_err(|error| format!("recovery child commit failed: {error}"))?;
+    }
+    let marker = RecoveryChildMarker {
+        schema: RECOVERY_MARKER_SCHEMA_V1.to_owned(),
+        seed: config.seed,
+        worker_id: child.worker_id,
+        pid: std::process::id(),
+        kill_point: child.kill_point,
+        transaction_id,
+        row_id,
+        acknowledgement: child.kill_point.acknowledgement(),
+        concurrent_mode_default,
+    };
+    write_recovery_marker(&child.marker_path, &marker)?;
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn write_recovery_marker(path: &Path, marker: &RecoveryChildMarker) -> HarnessResult<()> {
+    let bytes = serde_json::to_vec_pretty(marker)
+        .map_err(|error| format!("failed to serialize recovery marker: {error}"))?;
+    let mut file = File::create(path).map_err(|error| {
+        format!(
+            "failed to create recovery marker `{}`: {error}",
+            path.display()
+        )
+    })?;
+    file.write_all(&bytes).map_err(|error| {
+        format!(
+            "failed to write recovery marker `{}`: {error}",
+            path.display()
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        format!(
+            "failed to sync recovery marker `{}`: {error}",
+            path.display()
+        )
+    })
+}
+
+fn wait_for_recovery_marker(
+    child: &mut std::process::Child,
+    path: &Path,
+    timeout: Duration,
+) -> HarnessResult<RecoveryChildMarker> {
+    let started = Instant::now();
+    let mut last_decode_error = None;
+    while started.elapsed() < timeout {
+        if path.exists() {
+            match fs::read_to_string(path) {
+                Ok(json) => match decode_recovery_marker(&json) {
+                    Ok(marker) => return Ok(marker),
+                    Err(error) => last_decode_error = Some(error),
+                },
+                Err(error) => last_decode_error = Some(error.to_string()),
+            }
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("failed to poll recovery child: {error}"))?
+        {
+            return Err(format!(
+                "recovery child exited before marker publication: status={status}; last_decode_error={last_decode_error:?}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(format!(
+        "timed out waiting for recovery marker `{}`; last_decode_error={last_decode_error:?}",
+        path.display()
+    ))
+}
+
+fn decode_recovery_marker(json: &str) -> HarnessResult<RecoveryChildMarker> {
+    let marker: RecoveryChildMarker = serde_json::from_str(json)
+        .map_err(|error| format!("recovery marker decode failed: {error}"))?;
+    if marker.schema != RECOVERY_MARKER_SCHEMA_V1 {
+        return Err(format!(
+            "unsupported recovery marker schema `{}`",
+            marker.schema
+        ));
+    }
+    if marker.transaction_id.trim().is_empty() || marker.pid == 0 {
+        return Err("recovery marker identity is incomplete".to_owned());
+    }
+    Ok(marker)
+}
+
+fn validate_recovery_marker(
+    marker: &RecoveryChildMarker,
+    config: &RunConfig,
+    worker_id: usize,
+    kill_point: RecoveryKillPoint,
+) -> HarnessResult<()> {
+    if marker.seed != config.seed
+        || marker.worker_id != worker_id
+        || marker.kill_point != kill_point
+        || marker.acknowledgement != kill_point.acknowledgement()
+        || marker.row_id != recovery_row_id(config.seed, worker_id)?
+    {
+        return Err(format!(
+            "recovery marker identity mismatch for {}",
+            kill_point.label()
+        ));
+    }
+    Ok(())
+}
+
+fn recovery_row_id(seed: u64, worker_id: usize) -> HarnessResult<i64> {
+    let seed_component = i64::try_from(seed % 100_000)
+        .map_err(|error| format!("recovery seed overflow: {error}"))?;
+    let worker_component = i64::try_from(worker_id)
+        .map_err(|error| format!("recovery worker id overflow: {error}"))?;
+    Ok(10_000_000 + seed_component.saturating_mul(100) + worker_component)
+}
+
+fn recovery_history(
+    config: &RunConfig,
+    marker: &RecoveryChildMarker,
+    reopen_concurrent_mode_default: bool,
+    observed_row_count: i64,
+) -> HarnessResult<TransactionHistory> {
+    let run_id = format!("swarm-recovery-{}", config.seed);
+    let trace_id = format!("{}-{}", run_id, marker.kill_point.label());
+    let scenario_id = format!("TURSO-SWARM-RECOVERY-{}", marker.kill_point.label());
+    let crash_id = format!("process-kill-{}", marker.kill_point.label());
+    let key = format!("swarm_rows/{}", marker.row_id);
+    let payload = format!("seed-{}-{}", config.seed, marker.kill_point.label());
+    let mut initial_state = BTreeMap::new();
+    initial_state.insert(key.clone(), HistoryValue::Null);
+    let mut final_state = BTreeMap::new();
+    final_state.insert(
+        key.clone(),
+        if marker.kill_point.row_must_survive() && observed_row_count == 1 {
+            HistoryValue::Text(payload.clone())
+        } else {
+            HistoryValue::Null
+        },
+    );
+    let terminal = if marker.acknowledgement == AcknowledgementState::Acknowledged {
+        HistoryOperation::Commit
+    } else {
+        HistoryOperation::Rollback {
+            reason: format!(
+                "reopen evidence observed row_count={observed_row_count} after unacknowledged kill"
+            ),
+        }
+    };
+    let events = vec![
+        recovery_event(
+            0,
+            "recovery-child",
+            Some(&marker.transaction_id),
+            HistoryOperation::Begin {
+                mode: BeginMode::Concurrent,
+            },
+        ),
+        recovery_event(
+            1,
+            "recovery-child",
+            Some(&marker.transaction_id),
+            HistoryOperation::Write {
+                key,
+                value: HistoryValue::Text(payload),
+                page_number: None,
+            },
+        ),
+        recovery_event(
+            2,
+            "recovery-child",
+            Some(&marker.transaction_id),
+            terminal,
+        ),
+        recovery_event(
+            3,
+            "recovery-parent",
+            None,
+            HistoryOperation::Crash {
+                crash_id: crash_id.clone(),
+            },
+        ),
+        recovery_event(
+            4,
+            "recovery-parent",
+            None,
+            HistoryOperation::Restart {
+                crash_id: crash_id.clone(),
+            },
+        ),
+        recovery_event(
+            5,
+            "recovery-parent",
+            None,
+            HistoryOperation::Checkpoint {
+                mode: "truncate".to_owned(),
+            },
+        ),
+    ];
+    let schedule_descriptor = format!(
+        "seed={};kill_point={};worker={}",
+        config.seed,
+        marker.kill_point.label(),
+        marker.worker_id
+    );
+    let mut history = TransactionHistory {
+        schema_version: TRANSACTION_HISTORY_SCHEMA_VERSION.to_owned(),
+        run_id: run_id.clone(),
+        trace_id: trace_id.clone(),
+        scenario_id: scenario_id.clone(),
+        seed: config.seed,
+        engine_git_sha: env::var("FSQLITE_TEST_ENGINE_GIT_SHA")
+            .unwrap_or_else(|_| "unavailable-at-runtime".to_owned()),
+        engine_dirty: env::var("FSQLITE_TEST_ENGINE_DIRTY").is_ok_and(|value| value == "1"),
+        workload: HistoryWorkload::Register,
+        schedule: ScheduleProvenance::deterministic(
+            "swarm-multiprocess-parent-kill",
+            format!("recovery-{}", marker.kill_point.label()),
+            sha256_bytes(schedule_descriptor.as_bytes()),
+            format!(
+                "cargo run -p fsqlite-e2e --bin swarm-multiprocess -- --recovery-smoke --seed {}",
+                config.seed
+            ),
+        ),
+        execution_lane_evidence: vec![
+            ExecutionLaneEvidence::from_observations(
+                ExecutionLane::MvccRequired,
+                vec![
+                    ObservedExecutionLane::SqlResult,
+                    ObservedExecutionLane::PagerBacked,
+                    ObservedExecutionLane::Mvcc,
+                ],
+                &trace_id,
+                &run_id,
+                &scenario_id,
+                "recovery-child-concurrent-transaction",
+                "file",
+                "concurrent_mvcc",
+                "file:swarm-multiprocess",
+                Vec::new(),
+                true,
+            ),
+            ExecutionLaneEvidence::from_observations(
+                ExecutionLane::RecoveryRequired,
+                vec![
+                    ObservedExecutionLane::SqlResult,
+                    ObservedExecutionLane::PagerBacked,
+                    ObservedExecutionLane::Recovery,
+                ],
+                &trace_id,
+                &run_id,
+                &scenario_id,
+                "parent-kill-reopen-integrity-check",
+                "file",
+                "reopen_after_process_kill",
+                "file:swarm-multiprocess",
+                Vec::new(),
+                true,
+            ),
+        ],
+        concurrent_mode_enabled: marker.concurrent_mode_default,
+        reopen_concurrent_mode_enabled: Some(reopen_concurrent_mode_default),
+        initial_state,
+        final_state,
+        final_state_sha256: String::new(),
+        events,
+    };
+    history.refresh_final_state_hash();
+    let errors = history.validate();
+    if errors.is_empty() {
+        Ok(history)
+    } else {
+        Err(format!(
+            "recovery transaction history is invalid: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn recovery_event(
+    event_id: u64,
+    process_id: &str,
+    transaction_id: Option<&str>,
+    operation: HistoryOperation,
+) -> HistoryEvent {
+    HistoryEvent {
+        event_id,
+        logical_time: event_id,
+        process_id: process_id.to_owned(),
+        connection_id: transaction_id.unwrap_or("recovery-control").to_owned(),
+        transaction_id: transaction_id.map(str::to_owned),
+        operation,
+    }
+}
+
+fn reduce_recovery_history(
+    history: &TransactionHistory,
+    marker: &RecoveryChildMarker,
+    observed_row_count: i64,
+) -> HarnessResult<HistoryReductionResult> {
+    let required_schedule = format!("kill:{}", marker.kill_point.label());
+    let required_yield = "parent-observed-durable-marker".to_owned();
+    let mut observed_fields = BTreeMap::new();
+    observed_fields.insert(
+        "acknowledgement".to_owned(),
+        marker.acknowledgement.label().to_owned(),
+    );
+    observed_fields.insert("kill_point".to_owned(), marker.kill_point.label().to_owned());
+    observed_fields.insert("row_count".to_owned(), observed_row_count.to_string());
+    observed_fields.insert("irrelevant_probe".to_owned(), "remove-me".to_owned());
+    let case = HistoryReductionCase {
+        history: history.clone(),
+        schedule_events: vec![required_schedule.clone(), "noise:preflight".to_owned()],
+        yield_choices: vec![required_yield.clone(), "noise:poll".to_owned()],
+        observed_fields,
+    };
+    let crash_id = format!("process-kill-{}", marker.kill_point.label());
+    let signature = format!(
+        "process_kill:{}:ack={}:row_count={observed_row_count}",
+        marker.kill_point.label(),
+        marker.acknowledgement.label()
+    );
+    let expected_acknowledgement = marker.acknowledgement.label().to_owned();
+    let expected_kill_point = marker.kill_point.label().to_owned();
+    let verify = |candidate: &HistoryReductionCase| {
+        if !candidate
+            .schedule_events
+            .iter()
+            .any(|event| event == &required_schedule)
+            || !candidate
+                .yield_choices
+                .iter()
+                .any(|choice| choice == &required_yield)
+        {
+            return Err("candidate removed the replayable process kill decision".to_owned());
+        }
+        for (key, expected) in [
+            ("acknowledgement", expected_acknowledgement.as_str()),
+            ("kill_point", expected_kill_point.as_str()),
+        ] {
+            if candidate.observed_fields.get(key).map(String::as_str) != Some(expected) {
+                return Err(format!("candidate removed required recovery field `{key}`"));
+            }
+        }
+        if candidate
+            .observed_fields
+            .get("row_count")
+            .map(String::as_str)
+            != Some(observed_row_count.to_string().as_str())
+        {
+            return Err("candidate removed the observed recovery row count".to_owned());
+        }
+        let has_crash = candidate.history.events.iter().any(|event| {
+            matches!(
+                &event.operation,
+                HistoryOperation::Crash { crash_id: id } if id == &crash_id
+            )
+        });
+        let has_restart = candidate.history.events.iter().any(|event| {
+            matches!(
+                &event.operation,
+                HistoryOperation::Restart { crash_id: id } if id == &crash_id
+            )
+        });
+        let has_terminal = candidate.history.events.iter().any(|event| {
+            event.transaction_id.as_deref() == Some(marker.transaction_id.as_str())
+                && match marker.acknowledgement {
+                    AcknowledgementState::Acknowledged => {
+                        matches!(event.operation, HistoryOperation::Commit)
+                    }
+                    AcknowledgementState::NotAcknowledged => {
+                        matches!(event.operation, HistoryOperation::Rollback { .. })
+                    }
+                }
+        });
+        if !has_crash || !has_restart || !has_terminal {
+            return Err("candidate removed the exact process crash witness".to_owned());
+        }
+        HistoryReductionObservation::from_case(candidate, signature.clone())
+    };
+    minimize_history_case(
+        &case,
+        &TypedReductionConfig {
+            max_attempts: 256,
+            cancel_after_attempts: None,
+        },
+        &verify,
+    )
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_file(path: &Path) -> HarnessResult<String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("failed to hash `{}`: {error}", path.display()))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+fn hash_optional_file(path: &Path) -> HarnessResult<Option<String>> {
+    if path.exists() {
+        sha256_file(path).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn run_child_and_write_report(config: &RunConfig, child: &ChildConfig) -> HarnessResult<bool> {
@@ -1845,16 +2609,21 @@ fn parse_args() -> HarnessResult<Mode> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut config = RunConfig::default();
     let mut child_mode = false;
+    let mut recovery_child_mode = false;
     let mut worker_id = None;
     let mut start_at_ms = None;
     let mut child_report = None;
     let mut jsonl_path = None;
+    let mut recovery_kill_point = None;
+    let mut recovery_marker = None;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         match arg.as_str() {
             "--help" | "-h" => return Err(usage()),
             "--child" => child_mode = true,
+            "--recovery-smoke" => config.recovery_smoke = true,
+            "--recovery-child" => recovery_child_mode = true,
             "--workers" => {
                 index = index.saturating_add(1);
                 config.workers = parse_required(&args, index, "--workers")?;
@@ -1912,6 +2681,22 @@ fn parse_args() -> HarnessResult<Mode> {
                     "--jsonl-path",
                 )?));
             }
+            "--recovery-kill-point" => {
+                index = index.saturating_add(1);
+                recovery_kill_point = Some(parse_required(
+                    &args,
+                    index,
+                    "--recovery-kill-point",
+                )?);
+            }
+            "--recovery-marker" => {
+                index = index.saturating_add(1);
+                recovery_marker = Some(PathBuf::from(parse_required_string(
+                    &args,
+                    index,
+                    "--recovery-marker",
+                )?));
+            }
             _ if arg.starts_with("--workers=") => {
                 config.workers = parse_value(arg, "--workers=")?;
             }
@@ -1948,13 +2733,41 @@ fn parse_args() -> HarnessResult<Mode> {
             _ if arg.starts_with("--jsonl-path=") => {
                 jsonl_path = Some(PathBuf::from(strip_prefix(arg, "--jsonl-path=")?));
             }
+            _ if arg.starts_with("--recovery-kill-point=") => {
+                recovery_kill_point = Some(parse_value(arg, "--recovery-kill-point=")?);
+            }
+            _ if arg.starts_with("--recovery-marker=") => {
+                recovery_marker = Some(PathBuf::from(strip_prefix(arg, "--recovery-marker=")?));
+            }
             _ => return Err(format!("unknown argument `{arg}`\n{}", usage())),
         }
         index = index.saturating_add(1);
     }
 
     validate_parent_config(&config)?;
-    if child_mode {
+    if child_mode && recovery_child_mode {
+        return Err("--child and --recovery-child are mutually exclusive".to_owned());
+    }
+    if recovery_child_mode {
+        let child = RecoveryChildConfig {
+            worker_id: worker_id
+                .ok_or_else(|| "recovery child requires --worker-id".to_owned())?,
+            kill_point: recovery_kill_point
+                .ok_or_else(|| "recovery child requires --recovery-kill-point".to_owned())?,
+            marker_path: recovery_marker
+                .ok_or_else(|| "recovery child requires --recovery-marker".to_owned())?,
+        };
+        if child.worker_id >= config.workers {
+            return Err(format!(
+                "recovery worker_id {} out of range for workers={}",
+                child.worker_id, config.workers
+            ));
+        }
+        if config.db_path.is_none() {
+            return Err("recovery child requires --db".to_owned());
+        }
+        Ok(Mode::RecoveryChild { run: config, child })
+    } else if child_mode {
         let child = ChildConfig {
             worker_id: worker_id.ok_or_else(|| "child mode requires --worker-id".to_owned())?,
             start_at_ms: start_at_ms
@@ -2002,7 +2815,8 @@ fn validate_parent_config(config: &RunConfig) -> HarnessResult<()> {
 
 fn usage() -> String {
     "usage: swarm-multiprocess [--workers=N] [--seconds=N] \
-     [--iters=N] [--busy-timeout-ms=N] [--seed=N] [--db PATH] [--artifact-root PATH]"
+     [--iters=N] [--busy-timeout-ms=N] [--seed=N] [--db PATH] \
+     [--artifact-root PATH] [--recovery-smoke]"
         .to_owned()
 }
 
@@ -2221,6 +3035,24 @@ fn shm_path(db_path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn recovery_marker(kill_point: RecoveryKillPoint) -> RecoveryChildMarker {
+        RecoveryChildMarker {
+            schema: RECOVERY_MARKER_SCHEMA_V1.to_owned(),
+            seed: 42,
+            worker_id: usize::from(kill_point == RecoveryKillPoint::AfterCommitAcknowledged),
+            pid: 1234,
+            kill_point,
+            transaction_id: format!("recovery-tx-{}", kill_point.label()),
+            row_id: recovery_row_id(
+                42,
+                usize::from(kill_point == RecoveryKillPoint::AfterCommitAcknowledged),
+            )
+            .expect("derive row id"),
+            acknowledgement: kill_point.acknowledgement(),
+            concurrent_mode_default: true,
+        }
+    }
+
     fn final_visibility(pass: bool) -> CriterionReport {
         CriterionReport {
             name: "final_cross_process_visibility",
@@ -2410,6 +3242,71 @@ mod tests {
             report.detail.contains("final visibility: final detail"),
             "detail should preserve authoritative final visibility context: {}",
             report.detail
+        );
+    }
+
+    #[test]
+    fn recovery_marker_strict_decode_rejects_schema_and_truncation() {
+        let marker = recovery_marker(RecoveryKillPoint::BeforeCommit);
+        let json = serde_json::to_string(&marker).expect("encode marker");
+        assert_eq!(decode_recovery_marker(&json).expect("decode marker"), marker);
+
+        let mut stale = marker.clone();
+        stale.schema = "old-schema".to_owned();
+        assert!(
+            decode_recovery_marker(&serde_json::to_string(&stale).expect("encode stale")).is_err()
+        );
+        assert!(decode_recovery_marker(&json[..json.len() / 2]).is_err());
+        let with_unknown = json.replacen('{', "{\"unknown\":true,", 1);
+        assert!(decode_recovery_marker(&with_unknown).is_err());
+    }
+
+    #[test]
+    fn recovery_history_reduction_preserves_process_crash_witness() {
+        for kill_point in [
+            RecoveryKillPoint::BeforeCommit,
+            RecoveryKillPoint::AfterCommitAcknowledged,
+        ] {
+            let marker = recovery_marker(kill_point);
+            let observed_row_count = i64::from(kill_point.row_must_survive());
+            let history = recovery_history(
+                &RunConfig {
+                    seed: 42,
+                    ..RunConfig::default()
+                },
+                &marker,
+                true,
+                observed_row_count,
+            )
+            .expect("build recovery history");
+            let result = reduce_recovery_history(&history, &marker, observed_row_count)
+                .expect("reduce recovery history");
+
+            assert!(result.status.is_complete());
+            assert_eq!(result.observation.required_lanes.len(), 2);
+            assert_eq!(result.stats.original.checkpoints, 1);
+            assert_eq!(result.stats.minimized.checkpoints, 0);
+            assert_eq!(result.stats.minimized.schedule_events, 1);
+            assert_eq!(result.stats.minimized.yield_choices, 1);
+            assert_eq!(result.stats.minimized.observed_fields, 3);
+            assert!(result.minimized.history.events.iter().any(|event| {
+                matches!(event.operation, HistoryOperation::Crash { .. })
+            }));
+            assert!(result.minimized.history.events.iter().any(|event| {
+                matches!(event.operation, HistoryOperation::Restart { .. })
+            }));
+        }
+    }
+
+    #[test]
+    fn recovery_history_fails_closed_without_concurrent_mode() {
+        let mut marker = recovery_marker(RecoveryKillPoint::AfterCommitAcknowledged);
+        marker.concurrent_mode_default = false;
+        let result = recovery_history(&RunConfig::default(), &marker, true, 1);
+        assert!(
+            result
+                .expect_err("concurrent mode OFF must fail")
+                .contains("concurrent_mode_enabled must be true")
         );
     }
 }
