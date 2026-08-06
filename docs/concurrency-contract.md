@@ -1,6 +1,9 @@
 # FrankenSQLite Concurrency Contract
 
 **Bead / Issue:** [frankensqlite#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
+(closed 2026-05-24; this document is the durable contract that outlived the
+tracking issue).
+
 **Purpose:** state, unambiguously, what concurrency guarantees FrankenSQLite
 claims today — and what it does *not* — so caller projects stop re-filing
 the same surface-level symptom issues every time the concurrent-write
@@ -20,11 +23,13 @@ issues whose common cause was never named.
   API*. `Connection` is `!Send + !Sync` by construction. Spawn one
   Connection per OS thread against the same file-backed database and
   coordinate below the Connection API.
-- **Multi-process, multi-writer WAL**: *partial / under active hardening*.
+- **Multi-process, multi-writer WAL**: *partial, bounded by measured harness
+  scale*.
   The `swarm_multiprocess` harness exists (`crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs`)
-  precisely because this path has been the source of the
+  because this path was the source of the closed
   [#70 roll-up](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
-  family of bugs. Known failure modes are enumerated below.
+  family of bugs. Known limitations are enumerated below; the harness remains
+  authoritative for the largest process count proven green on each platform.
 - **Failing closed vs silently corrupting**: *goal*. Where a scenario is
   known to be unsafe, the runtime should emit an observable error before
   it scribbles on durable state, not after. Concrete escalation paths are
@@ -71,8 +76,9 @@ mechanism (MVCC, DPOR, page-conflict math), see the README's
   unconditionally.
 - **Multi-process**: target is N ≤ 32 short-lived writers per file
   (matching the swarm harness scale). Today the multi-process surface is
-  *partial* — see [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
-  for the open root-cause sweep. Treat the largest N at which
+  *partial* — see the closed
+  [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
+  roll-up for root-cause history. Treat the largest N at which
   `cargo run -p fsqlite-e2e --bin swarm-multiprocess --workers N --seconds 3600`
   is green on your platform as the conservative upper bound. Mixing
   fsqlite and stock-SQLite *concurrent* opens against the same file is
@@ -151,8 +157,8 @@ family. The contract:
   VFS retries `F_SETLK` with exponential backoff up to `busy_timeout`,
   matching stock SQLite. Historical gap
   ([#45](https://github.com/Dicklesworthstone/frankensqlite/issues/45))
-  was a non-blocking `F_SETLK` that returned immediately — that has been
-  patched; the swarm harness's `busy_timeout` criterion is the
+  was a non-blocking `F_SETLK` that returned immediately. That issue is closed;
+  the swarm harness's `busy_timeout` criterion is the
   regression net.
 - On exhaustion, the failure mode is `FrankenError::Busy` (or
   `BusyRecovery` / `BusySnapshot { .. }` for the snapshot-isolation
@@ -169,8 +175,9 @@ These are intentional or known gaps documented so callers can plan:
 - **Multi-process WAL checkpoint coordination** is currently weaker.
   Stock SQLite's checkpoint protocol has been hardened over decades
   against multi-process opener contention; fsqlite's Silo-style epoch
-  group commit is newer. Until #70's hardening series is fully landed,
-  multi-process *checkpoint* (not normal commit) is the gap. The
+  group commit is newer. The #70 hardening series has landed, but
+  multi-process *checkpoint* (not normal commit) remains the weakest surface.
+  Treat this as a measured limitation rather than pending issue work. The
   symptoms ("WAL file too small for header during rebuild" on warm
   start; transient `freelist trunk page exceeds db_size`) are cataloged
   in the [#70 history](https://github.com/Dicklesworthstone/frankensqlite/issues/70).
@@ -273,10 +280,10 @@ do not try to share a single `Connection` across OS threads — it is
 
 ### Partial: multi-process, multi-writer WAL
 
-This is the path the [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
-roll-up describes. Historical symptom families (all have been individually
-patched as they were found — the meta-issue asks for a principled
-root-cause sweep):
+This is the path the closed
+[#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70) roll-up
+described. Historical symptom families were individually patched, and the
+meta-issue closed after the principled root-cause sweep:
 
 | Family | Example issues | Observable symptom |
 |---|---|---|
@@ -289,17 +296,13 @@ root-cause sweep):
 | Import that survives on stock SQLite | [#69](https://github.com/Dicklesworthstone/frankensqlite/issues/69) | fsqlite corrupts, stock SQLite stays clean on same import |
 
 The common shape — "works on stock SQLite, corrupts or mis-reads on
-fsqlite under concurrent load" — is what #70 asks to be addressed at
-root, not via another point fix.
+fsqlite under concurrent load" — was what #70 asked to address at the
+root rather than through another point fix.
 
-**Status of the fix**: tracked in `feat/*` and `fix/*` branches on
-this repo (as of 2026-04: `flat-combining-page-locks`,
-`fix/freelist-persist-c390`, `feat/ssi-e-process-gate`,
-`fix-pager-compile`, `feat/conformal-retry-budget`,
-`blackcoyote-bugA-fix`, and the MVCC optimization series
-`IMPL-4`/`IMPL-14`/`IMPL-15`/`IMPL-16`/`IMPL-24`). Until those land
-and the swarm harness is green at N ≥ 8 for ≥ 1 hour, treat
-multi-process multi-writer as **partial**.
+**Current status**: the #70 fix series has landed. Multi-process multi-writer
+remains **partial** until the current candidate's swarm harness is green at
+N ≥ 8 for ≥ 1 hour on the target platform. The bound is the measurement,
+not the state of historical branches or issues.
 
 ### Not supported today
 
@@ -365,7 +368,8 @@ else, re-check — most "I need multi-process" reports turn out to be
 ### If you really must open from multiple processes
 
 - Treat the swarm as a stress test, not a production load-bearing
-  contract, until the #70 fix series lands.
+  contract. The #70 fix series has landed; the remaining bound is the largest
+  harness scale and duration you have measured green on your platform.
 - Cap N at whatever your `swarm_multiprocess --workers N --seconds
   3600` run is green on. Publish that number in your caller's own
   README so downstream is not guessing.
@@ -418,9 +422,10 @@ let callers detect a second-process open and refuse with a
 specific `FrankenError::MultiProcessAccessRefused` variant rather than
 silently accepting it.
 
-This is **not implemented yet**. It is sketched out in the
+This is **not implemented yet**. It was sketched out in the closed
 [#70 triage](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
-comment thread as a candidate follow-up. Design notes for whoever
+comment thread as a candidate follow-up and has no live GitHub tracker.
+Design notes for whoever
 picks it up:
 
 - Use an advisory `fcntl(F_SETLK)` exclusive lock on a sidecar file
@@ -441,6 +446,9 @@ grow a scenario that proves the refusal actually refuses.
 
 ## Change log
 
+- **2026-08-05**: #70, #79, and #80 are closed. Multi-process remains
+  *partial* by measurement rather than by an open investigation;
+  multi-process checkpoint remains the weakest surface.
 - **2026-04-20**: Document created in response to #70. Captures the
   contract as it stands at commit `bd770f2f` (Silo-style epoch group
   commit primitive just landed; multi-process swarm path still under

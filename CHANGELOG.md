@@ -70,6 +70,12 @@ semantic and crates.io predecessor, but it is not an ancestor of current
 
 ### Known limitations
 
+- **R-tree write paths are incomplete.** `UPDATE` against an R-tree virtual
+  table does not persist changed bounding boxes
+  ([#208](https://github.com/Dicklesworthstone/frankensqlite/issues/208)),
+  and `INSERT OR REPLACE` is not implemented
+  ([#214](https://github.com/Dicklesworthstone/frankensqlite/issues/214)).
+  Reads and ordinary inserts behave; avoid these two write forms in v0.2.0.
 - **Column-qualified FTS5 `MATCH` is unsound.** A query intended to restrict
   matching to one indexed column can also match terms present only in another
   column and return false positives. Avoid column-qualified `MATCH`, or verify
@@ -581,8 +587,9 @@ no breaking API changes.
 ### Performance
 
 - Partial-key `SeekGT`/`SeekLE` operations use a logarithmic biased B-tree
-  descent rather than walking equal-prefix runs; the targeted MAX-prefix
-  workload improved by more than 13x.
+  descent rather than walking equal-prefix runs, avoiding a linear scan across
+  an equal-prefix range. v0.2.0 attaches no numeric performance claim to this
+  change; the post-async-migration benchmark matrix is not yet citable.
 - Aggregate rowid equality with parameter, real, or text inputs uses a bounded
   seek with exact-integer coercion instead of a full table scan. Ordinary
   rowid reads use the same semantics.

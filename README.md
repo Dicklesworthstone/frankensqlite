@@ -258,10 +258,11 @@ All threshold PRAGMAs clamp invalid low values to safe minimums.
 > your caller library writes any workaround. It states, unambiguously, which
 > concurrency shapes are supported (`single-process / multi-Connection / MVCC WAL`),
 > which are not (`single-Connection shared across threads`), and which are
-> under active hardening (`multi-process swarm-write`, tracked in
-> [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70) — the
-> harness under `crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs` is the
-> canonical source of truth for what currently holds).
+> partial at a measured harness scale (`multi-process swarm-write`). The
+> closed [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
+> records the original validation milestone; the harness under
+> `crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs` is the canonical source of
+> truth for what currently holds.
 
 ### The Write Path
 
@@ -419,7 +420,10 @@ A strict safety ladder governs merge strategy selection at commit time:
 | 2 | Structured page patch merge | Cell-disjoint modifications on same page |
 | 3 | Abort/retry | True conflict; no safe merge possible |
 
-Merge policy is controlled by `PRAGMA fsqlite.write_merge = OFF | SAFE | LAB_UNSAFE`. `SAFE` enables intent replay + structured patches; raw byte-range XOR merge is forbidden for SQLite structured pages.
+The accepted policy values are `PRAGMA fsqlite.write_merge = SAFE | LAB_UNSAFE`;
+`OFF` is rejected. The live commit path still aborts and retries same-page base
+drift as described above; raw byte-range XOR merge is forbidden for SQLite
+structured pages.
 
 ### Garbage Collection
 
@@ -1028,6 +1032,12 @@ The R-tree virtual table indexes N-dimensional bounding boxes for spatial querie
 - **Dimensions:** 1 to 5 dimensions per R-tree (configurable at table creation)
 - **Geopoly extension:** Stores and queries polygons using the GeoJSON-like format, with containment, overlap, and area operations
 
+**v0.2.0 limitations:** R-Tree `UPDATE` does not persist changed bounds
+([#208](https://github.com/Dicklesworthstone/frankensqlite/issues/208)), and
+`INSERT OR REPLACE` is not implemented
+([#214](https://github.com/Dicklesworthstone/frankensqlite/issues/214)). Avoid
+those write forms until the linked issues are resolved.
+
 ### JSON1
 
 Full JSON manipulation within SQL:
@@ -1147,63 +1157,82 @@ Persistent history, full tab completion, and broader sqlite3 dot-command parity 
 ### Basic Usage
 
 ```rust
-use fsqlite::Connection;
+use fsqlite::{Connection, FrankenError, SqliteValue};
 
-let conn = Connection::open("my.db")?;
+async fn basic_usage() -> Result<(), FrankenError> {
+    let conn = Connection::open("my.db").await?;
+    conn.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    ).await?;
+    conn.execute_with_params(
+        "INSERT INTO users (name, age) VALUES (?1, ?2)",
+        &[SqliteValue::from("Alice"), SqliteValue::from(30)],
+    ).await?;
 
-conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])?;
-conn.execute("INSERT INTO users (name, age) VALUES (?1, ?2)", ("Alice", 30))?;
-
-let mut stmt = conn.prepare("SELECT name, age FROM users WHERE age > ?1")?;
-let rows = stmt.query((25,))?;
-
-for row in rows {
-    let name: String = row.get(0)?;
-    let age: i64 = row.get(1)?;
-    println!("{name}: {age}");
+    let stmt = conn.prepare("SELECT name, age FROM users WHERE age > ?1").await?;
+    let rows = stmt.query_with_params(&[SqliteValue::from(25)]).await?;
+    for row in rows {
+        if let (Some(SqliteValue::Text(name)), Some(SqliteValue::Integer(age))) =
+            (row.get(0), row.get(1))
+        {
+            println!("{}: {age}", name.as_str());
+        }
+    }
+    Ok(())
 }
 ```
+
+`Connection` is asynchronous and does not create a runtime. Run these futures
+inside the caller-owned asupersync runtime; core operations derive their `Cx`
+from the connection's `RuntimeContext`.
 
 ### Transaction API
 
 ```rust
-let tx = conn.transaction()?;
+use fsqlite::compat::TransactionExt;
 
-tx.execute("INSERT INTO accounts (id, balance) VALUES (1, 1000)", [])?;
-tx.execute("INSERT INTO accounts (id, balance) VALUES (2, 500)", [])?;
+let mut tx = conn.transaction().await?;
+tx.execute("INSERT INTO accounts (id, balance) VALUES (1, 1000)").await?;
+tx.execute("INSERT INTO accounts (id, balance) VALUES (2, 500)").await?;
 
-tx.commit()?;  // atomic: both inserts visible, or neither
+tx.commit().await?; // atomic: both inserts visible, or neither
 ```
+
+Finalize a transaction by awaiting `commit()` or `rollback()`. Dropping it
+records a mandatory rollback obligation, which the next SQL entry point
+completes before executing the caller's statement.
 
 ### Concurrent Writers
 
 ```rust
-use std::thread;
+use fsqlite::{Connection, FrankenError, SqliteValue};
 
-let db_path = "shared.db";
-
-// Spawn 8 writer threads
-let handles: Vec<_> = (0..8).map(|i| {
-    thread::spawn(move || {
-        let conn = Connection::open(db_path).unwrap();
-        for j in 0..1000 {
-            loop {
-                match conn.execute(
-                    "INSERT INTO events (thread, seq) VALUES (?1, ?2)",
-                    (i, j),
-                ) {
-                    Ok(_) => break,
-                    Err(e) if e.is_transient() => continue,  // SQLITE_BUSY, retry
-                    Err(e) => panic!("{e}"),
+async fn write_batch(db_path: &str, writer_id: i64) -> Result<(), FrankenError> {
+    // Each concurrent task owns a separate connection.
+    let conn = Connection::open(db_path).await?;
+    for sequence in 0_i64..1_000 {
+        let mut retries = 0_u8;
+        loop {
+            match conn.execute_with_params(
+                "INSERT INTO events (writer, sequence) VALUES (?1, ?2)",
+                &[SqliteValue::from(writer_id), SqliteValue::from(sequence)],
+            ).await {
+                Ok(_) => break,
+                Err(error) if error.is_transient() && retries < 8 => {
+                    retries += 1;
                 }
+                Err(error) => return Err(error),
             }
         }
-    })
-}).collect();
-
-for h in handles { h.join().unwrap(); }
-// All 8000 rows present, no data loss, no corruption.
+    }
+    Ok(())
+}
 ```
+
+Run multiple `write_batch` futures as sibling tasks in a caller-owned
+asupersync scope. Do not share a single `Connection` across threads; production
+callers should add bounded backoff appropriate to their runtime between
+transient retries.
 
 ---
 
@@ -1909,9 +1938,10 @@ Therefore, merge is only allowed via the SAFE ladder:
 | 2 | Structured page patch merge | Disjoint by `cell_key_digest`; header ops serialized; invariants checked |
 | 3 | Abort/retry | No safe merge possible |
 
-Merge policy: `PRAGMA fsqlite.write_merge = OFF | SAFE | LAB_UNSAFE`. `SAFE`
-enables only the ladder above; raw byte-range XOR merging is forbidden for
-SQLite structured pages.
+Accepted merge-policy values are `PRAGMA fsqlite.write_merge = SAFE |
+LAB_UNSAFE`; `OFF` is rejected. The ladder above remains dormant in the live
+commit path, and raw byte-range XOR merging is forbidden for SQLite structured
+pages.
 
 ### Three-Tier Checksum Architecture
 
@@ -2708,6 +2738,21 @@ still serves as an authoritative reference.
 
 ## Limitations
 
+- **R-tree write paths are incomplete.** `UPDATE` does not persist changed
+  bounding boxes, and `INSERT OR REPLACE` is not implemented. Avoid those two
+  write forms in v0.2.0
+  ([#208](https://github.com/Dicklesworthstone/frankensqlite/issues/208),
+  [#214](https://github.com/Dicklesworthstone/frankensqlite/issues/214)).
+- **HFDT bounded database-image validation is not part of the portable v0.2.0
+  `fsqlite::Connection` API.** Its macOS support is therefore unavailable;
+  downstream applications must not treat that validation surface as shipped
+  FrankenSQLite functionality
+  ([#307](https://github.com/Dicklesworthstone/frankensqlite/issues/307)).
+- **The runtime-stub release inventory is not exhaustive.** Its line-based
+  scanner stops at the first textual `#[cfg(test)]` marker in each source file,
+  so a green inventory check proves that recorded anchors remain current, not
+  that every unsupported runtime path has been found
+  ([#136](https://github.com/Dicklesworthstone/frankensqlite/issues/136)).
 - **Database text encoding is UTF-8-only in v0.2.0.** FrankenSQLite supports
   SQLite header encoding 1. It recognizes encodings 2 (UTF-16le) and 3
   (UTF-16be) as valid SQLite formats but rejects them before schema/text

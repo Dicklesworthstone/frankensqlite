@@ -1127,13 +1127,16 @@ with the tracker:
 .2  <- .1            .3  <- .1            .18 <- .1
 .4  <- .3, .18       .5  <- .2, .3, .4    .6  <- .5
 .20 <- .6
-.7  <- .1, .2        bd-2lt76.1 <- bd-2jpu6.5
+.7  <- .1, .2
 .8  <- .2, .7, bd-2lt76.1                 .19 <- .7, .8
 .9  <- .19           .10 <- .1, .2, .18   .11 <- .6, .10
 .12 <- .6            .13 <- .1, .2, .18   .14 <- .7, .9
 .15 <- .1, .9        .16 <- .1
 .17 <- .5, .6, .8, .9, .19, .20
 ```
+
+Cross-epic `bd-2lt76.1` has no hard blockers in the tracker; it remains owned
+by `bd-2lt76` and is listed here only where the Turso spine consumes it.
 
 Reading order of the spine: `.1 -> .18 -> .4` is the contract gate; the SQL
 generator/reducer chain is `.3 -> .4 -> .5 -> .6`; the concurrency chain joins
