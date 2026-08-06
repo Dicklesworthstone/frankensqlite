@@ -12131,11 +12131,11 @@ impl Connection {
         shared_mvcc_state.align_commit_clock_floor(initial_visible_commit_seq);
         let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
         pager.bind_shared_connection_count(shared_mvcc_state.shared_open_connection_count());
-        if !pager_is_memory {
-            if let Err(err) = shared_mvcc_state.ensure_write_coordinator_service_started() {
-                let _ = shared_mvcc_state.release_connection(runtime_region, true);
-                return Err(err);
-            }
+        if !pager_is_memory
+            && let Err(err) = shared_mvcc_state.ensure_write_coordinator_service_started()
+        {
+            let _ = shared_mvcc_state.release_connection(runtime_region, true);
+            return Err(err);
         }
         let eprocess_oracle = Arc::new(EProcessOracle::new(
             EPROCESS_DEFAULT_CONFIG,
@@ -15368,23 +15368,23 @@ impl Connection {
         previous_last_insert_rowid: i64,
     ) -> bool {
         let error_state = self.take_table_program_error_state();
-        if preserve_prior_changes_on_constraint_violation && error_is_constraint_violation(error) {
-            if let Some(state) = error_state
+        if preserve_prior_changes_on_constraint_violation
+            && error_is_constraint_violation(error)
+            && let Some(state) = error_state
                 .as_ref()
                 .copied()
                 .filter(|state| !state.force_statement_rollback)
-            {
-                self.restore_change_tracking_state(
-                    state.changes,
-                    previous_total_changes
-                        .saturating_add(state.changes)
-                        .saturating_add(state.rollback_visible_total_changes),
-                    state
-                        .last_insert_rowid
-                        .unwrap_or(previous_last_insert_rowid),
-                );
-                return true;
-            }
+        {
+            self.restore_change_tracking_state(
+                state.changes,
+                previous_total_changes
+                    .saturating_add(state.changes)
+                    .saturating_add(state.rollback_visible_total_changes),
+                state
+                    .last_insert_rowid
+                    .unwrap_or(previous_last_insert_rowid),
+            );
+            return true;
         }
         let rollback_visible_total_changes = error_state
             .as_ref()
@@ -16641,15 +16641,14 @@ impl Connection {
         // re-decodes the database before immediately cloning it into the
         // snapshot ring. Only pay that reload when the connection has marked
         // the mirror as dirty (or when rows are not currently hydrated).
-        if self.memdb_requires_active_txn_reload.get() || !self.memdb_rows_loaded.get() {
-            if let Ok(cx) = self.op_cx() {
-                if let Err(err) = self.reload_memdb_from_pager(&cx).await {
-                    tracing::warn!(
-                        target: "fsqlite.time_travel",
-                        "failed to reload memdb before capturing time-travel snapshot: {err}"
-                    );
-                }
-            }
+        if (self.memdb_requires_active_txn_reload.get() || !self.memdb_rows_loaded.get())
+            && let Ok(cx) = self.op_cx()
+            && let Err(err) = self.reload_memdb_from_pager(&cx).await
+        {
+            tracing::warn!(
+                target: "fsqlite.time_travel",
+                "failed to reload memdb before capturing time-travel snapshot: {err}"
+            );
         }
 
         let observed_timestamp_ns = SystemTime::now()
@@ -17401,15 +17400,15 @@ impl Connection {
             // definitely succeeded. `close_in_place()` promises the caller can
             // inspect or retry on error, so we must not dismantle the live
             // session/transaction handle first and then fail.
-            if *self.concurrent_txn.get_mut() {
-                if let Some(session_id) = *self.concurrent_session_id.get_mut() {
-                    let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                    if let Some(mut handle) = registry.get_mut(session_id) {
-                        concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
-                    }
-                    self.clear_cached_concurrent_handle();
-                    registry.remove_and_recycle(session_id);
+            if *self.concurrent_txn.get_mut()
+                && let Some(session_id) = *self.concurrent_session_id.get_mut()
+            {
+                let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                if let Some(mut handle) = registry.get_mut(session_id) {
+                    concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
                 }
+                self.clear_cached_concurrent_handle();
+                registry.remove_and_recycle(session_id);
             }
             *self.concurrent_session_id.get_mut() = None;
             *self.in_transaction.get_mut() = false;
@@ -21598,8 +21597,9 @@ impl Connection {
         right_sum_rowid_alias_column_index: Option<usize>,
         having_count_filter: Option<&PreparedCountHavingFilter>,
     ) -> Result<Option<Vec<Row>>> {
-        if sum_source.is_none() && left_join_source == PreparedMemValueSource::Rowid {
-            if let Some(rows) = self.prepared_inner_join_grouped_rowid_count_rows(
+        if sum_source.is_none()
+            && left_join_source == PreparedMemValueSource::Rowid
+            && let Some(rows) = self.prepared_inner_join_grouped_rowid_count_rows(
                 left_root_page,
                 left_group_source,
                 left_group_rowid_alias_column_index,
@@ -21607,9 +21607,9 @@ impl Connection {
                 right_join_source,
                 right_join_rowid_alias_column_index,
                 having_count_filter,
-            )? {
-                return Ok(Some(rows));
-            }
+            )?
+        {
+            return Ok(Some(rows));
         }
 
         if let (Some(right_index_root_page), Some(right_join_column_index)) =
@@ -22208,10 +22208,10 @@ impl Connection {
                         return Ok(Some(QueryRowCollectionOutcome::MultipleRows));
                     }
                     let mut row_vec = values.to_vec();
-                    if let Some(ipk_idx) = rowid_alias_column_index {
-                        if let Some(slot) = row_vec.get_mut(ipk_idx) {
-                            *slot = SqliteValue::Integer(rowid);
-                        }
+                    if let Some(ipk_idx) = rowid_alias_column_index
+                        && let Some(slot) = row_vec.get_mut(ipk_idx)
+                    {
+                        *slot = SqliteValue::Integer(rowid);
                     }
                     found_row = Some(row_vec);
                 }
@@ -22953,47 +22953,45 @@ impl Connection {
             && !stmt.may_observe_change_tracking
             && skip_statement_savepoint_in_explicit_txn
             && !rollback_on_constraint_violation
-        {
-            if let Some(direct) = stmt
+            && let Some(direct) = stmt
                 .precompiled_dml()
                 .and_then(|d| d.direct_simple_insert.as_ref())
                 .filter(|d| !Self::direct_simple_insert_prefers_reusable_table_program(d))
-            {
-                self.txn_metrics_note_write();
-                let execute_body_start = hot_path_profile_enabled().then(Instant::now);
-                let result = self
-                    .execute_prepared_direct_simple_insert(execution_cx, table_name, direct, params)
-                    .await;
-                match result {
-                    Ok(Some(rowid)) => {
-                        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
-                        let change_tracking_start = hot_path_profile_enabled().then(Instant::now);
-                        self.set_last_insert_rowid_without_sync(rowid);
-                        self.record_statement_changes_without_sync(1);
-                        record_hot_path_duration(
-                            &FSQLITE_PREPARED_DIRECT_INSERT_CHANGE_TRACKING_TIME_NS,
-                            change_tracking_start,
-                        );
-                        return Ok(1);
-                    }
-                    Ok(None) => {
-                        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
-                        let change_tracking_start = hot_path_profile_enabled().then(Instant::now);
-                        self.record_statement_changes_without_sync(0);
-                        record_hot_path_duration(
-                            &FSQLITE_PREPARED_DIRECT_INSERT_CHANGE_TRACKING_TIME_NS,
-                            change_tracking_start,
-                        );
-                        return Ok(0);
-                    }
-                    Err(FrankenError::NotImplemented(_)) => {
-                        // Fall through to standard path
-                    }
-                    Err(e) => {
-                        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
-                        self.reset_statement_change_count();
-                        return Err(e);
-                    }
+        {
+            self.txn_metrics_note_write();
+            let execute_body_start = hot_path_profile_enabled().then(Instant::now);
+            let result = self
+                .execute_prepared_direct_simple_insert(execution_cx, table_name, direct, params)
+                .await;
+            match result {
+                Ok(Some(rowid)) => {
+                    record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+                    let change_tracking_start = hot_path_profile_enabled().then(Instant::now);
+                    self.set_last_insert_rowid_without_sync(rowid);
+                    self.record_statement_changes_without_sync(1);
+                    record_hot_path_duration(
+                        &FSQLITE_PREPARED_DIRECT_INSERT_CHANGE_TRACKING_TIME_NS,
+                        change_tracking_start,
+                    );
+                    return Ok(1);
+                }
+                Ok(None) => {
+                    record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+                    let change_tracking_start = hot_path_profile_enabled().then(Instant::now);
+                    self.record_statement_changes_without_sync(0);
+                    record_hot_path_duration(
+                        &FSQLITE_PREPARED_DIRECT_INSERT_CHANGE_TRACKING_TIME_NS,
+                        change_tracking_start,
+                    );
+                    return Ok(0);
+                }
+                Err(FrankenError::NotImplemented(_)) => {
+                    // Fall through to standard path
+                }
+                Err(e) => {
+                    record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+                    self.reset_statement_change_count();
+                    return Err(e);
                 }
             }
         }
@@ -43094,33 +43092,34 @@ impl Connection {
         }
 
         let commit_pre_txn_start = hot_path_profile_enabled().then(Instant::now);
-        if ok && !self.live_vtab_transactions.borrow().is_empty() {
-            if let Err(sync_error) = self.live_vtab_sync_all(cx) {
-                if self.concurrent_txn.get() {
-                    self.abort_current_concurrent_session();
-                }
-                self.txn_metrics_note_rollback();
-                let rollback_result = txn.rollback(cx).await;
-                let rollback_succeeded = rollback_result.is_ok();
-                let vtab_rollback_result = self.live_vtab_rollback_all(cx);
-                let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
-                self.concurrent_txn.set(false);
-                *self.concurrent_session_id.borrow_mut() = None;
-                self.txn_metrics_mark_finished();
-                self.clear_prepared_direct_insert_append_hint();
-                if txn_has_pending_writes && rollback_succeeded {
-                    self.reload_memdb_from_pager(cx).await?;
-                }
-                vtab_rollback_result?;
-                registry_rollback_result?;
-                // bd-hjkbr.1: Record pre-txn time on vtab-sync-failure path
-                // so the wall-time ledger stays closed.
-                record_hot_path_duration(&FSQLITE_COMMIT_PRE_TXN_TIME_NS, commit_pre_txn_start);
-                return Err(match rollback_result {
-                    Ok(()) => sync_error,
-                    Err(rollback_error) => rollback_error,
-                });
+        if ok
+            && !self.live_vtab_transactions.borrow().is_empty()
+            && let Err(sync_error) = self.live_vtab_sync_all(cx)
+        {
+            if self.concurrent_txn.get() {
+                self.abort_current_concurrent_session();
             }
+            self.txn_metrics_note_rollback();
+            let rollback_result = txn.rollback(cx).await;
+            let rollback_succeeded = rollback_result.is_ok();
+            let vtab_rollback_result = self.live_vtab_rollback_all(cx);
+            let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
+            self.concurrent_txn.set(false);
+            *self.concurrent_session_id.borrow_mut() = None;
+            self.txn_metrics_mark_finished();
+            self.clear_prepared_direct_insert_append_hint();
+            if txn_has_pending_writes && rollback_succeeded {
+                self.reload_memdb_from_pager(cx).await?;
+            }
+            vtab_rollback_result?;
+            registry_rollback_result?;
+            // bd-hjkbr.1: Record pre-txn time on vtab-sync-failure path
+            // so the wall-time ledger stays closed.
+            record_hot_path_duration(&FSQLITE_COMMIT_PRE_TXN_TIME_NS, commit_pre_txn_start);
+            return Err(match rollback_result {
+                Ok(()) => sync_error,
+                Err(rollback_error) => rollback_error,
+            });
         }
 
         let is_concurrent_txn = self.concurrent_txn.get();
@@ -45456,22 +45455,22 @@ impl Connection {
             // ordering/collation metadata (one entry per PK column, in PK
             // order) so the table cursor compares on the primary-key prefix
             // rather than degrading to whole-record BINARY-ascending order.
-            if table.without_rowid {
-                if let Some(pk_cols) = table.primary_key_constraints.first() {
-                    let desc_flags: Vec<bool> = pk_cols.iter().map(|_| false).collect();
-                    let collations: Vec<Option<String>> = pk_cols
-                        .iter()
-                        .map(|name| {
-                            table
-                                .columns
-                                .iter()
-                                .find(|column| column.name.eq_ignore_ascii_case(name))
-                                .and_then(|column| column.collation.clone())
-                        })
-                        .collect();
-                    index_desc_flags_by_root_page.insert(table.root_page, desc_flags);
-                    index_collations_by_root_page.insert(table.root_page, collations);
-                }
+            if table.without_rowid
+                && let Some(pk_cols) = table.primary_key_constraints.first()
+            {
+                let desc_flags: Vec<bool> = pk_cols.iter().map(|_| false).collect();
+                let collations: Vec<Option<String>> = pk_cols
+                    .iter()
+                    .map(|name| {
+                        table
+                            .columns
+                            .iter()
+                            .find(|column| column.name.eq_ignore_ascii_case(name))
+                            .and_then(|column| column.collation.clone())
+                    })
+                    .collect();
+                index_desc_flags_by_root_page.insert(table.root_page, desc_flags);
+                index_collations_by_root_page.insert(table.root_page, collations);
             }
         }
 
@@ -46663,15 +46662,15 @@ impl Connection {
                     }
                     self.db.borrow_mut().destroy_table(root_page);
                 }
-                if let Some((table_root, columns, collations)) = dropped_temp_unique {
-                    if let Some(table) = self.db.borrow_mut().get_table_mut(table_root) {
-                        table.remove_unique_column_group_with_collations(&columns, &collations);
-                    }
+                if let Some((table_root, columns, collations)) = dropped_temp_unique
+                    && let Some(table) = self.db.borrow_mut().get_table_mut(table_root)
+                {
+                    table.remove_unique_column_group_with_collations(&columns, &collations);
                 }
-                if !dropped_temp {
-                    if let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name).await {
-                        swallow_missing_master(err)?;
-                    }
+                if !dropped_temp
+                    && let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name).await
+                {
+                    swallow_missing_master(err)?;
                 }
                 true
             }
@@ -53116,69 +53115,69 @@ impl Connection {
         let commit_pre_txn_start = hot_path_profile_enabled().then(Instant::now);
         let live_vtab_commit_keys: HashSet<String> =
             self.active_live_vtab_names().into_iter().collect();
-        if !self.live_vtab_transactions.borrow().is_empty() {
-            if let Err(sync_error) = self.live_vtab_sync_all(cx) {
-                let txn_has_pending_writes = self
-                    .active_txn
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|txn| txn.has_pending_writes());
+        if !self.live_vtab_transactions.borrow().is_empty()
+            && let Err(sync_error) = self.live_vtab_sync_all(cx)
+        {
+            let txn_has_pending_writes = self
+                .active_txn
+                .borrow()
+                .as_ref()
+                .is_some_and(|txn| txn.has_pending_writes());
 
-                if self.concurrent_txn.get() {
-                    self.abort_current_concurrent_session();
-                }
-
-                self.txn_metrics_note_rollback();
-                let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
-                    txn.rollback(cx).await
-                } else {
-                    Ok(())
-                };
-                let rollback_succeeded = rollback_result.is_ok();
-                let vtab_rollback_result = self.live_vtab_rollback_all(cx);
-                let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
-                self.clear_pending_memdb_direct_upserts();
-                if rollback_succeeded
-                    && let Some(snapshot) = self.txn_snapshot.borrow().as_ref().cloned()
-                {
-                    self.restore_snapshot_state(&snapshot);
-                }
-                let reload_result = if txn_has_pending_writes && rollback_succeeded {
-                    self.reload_memdb_from_pager(cx).await
-                } else {
-                    Ok(())
-                };
-
-                *self.txn_snapshot.borrow_mut() = None;
-                self.savepoints.borrow_mut().clear();
-                self.in_transaction.set(false);
-                // Issue #110: forced rollback tore down the txn — drop the
-                // transaction-scoped FK parent-validation cache.
-                self.clear_fk_parent_validation_cache();
-                // IMPL-28 / AG-O3: txn torn down — close the IN_TRANSACTION gate.
-                self.set_fast_path_bit(fast_path_gate::IN_TRANSACTION, false);
-                self.implicit_txn.set(false);
-                self.concurrent_txn.set(false);
-                *self.concurrent_session_id.borrow_mut() = None;
-                self.txn_metrics_mark_finished();
-                self.db.borrow_mut().commit_undo();
-                self.reset_transaction_lookaside();
-                // IMPL-9a: forced rollback (vtab sync failure during
-                // commit). Any filter mutated by this transaction is
-                // now out-of-sync with the committed B-tree and MUST
-                // be reseeded on next consultation.
-                self.invalidate_qfs_on_rollback();
-                self.maybe_gc_tick();
-
-                rollback_result?;
-                reload_result?;
-                vtab_rollback_result?;
-                registry_rollback_result?;
-                // bd-hjkbr.1: Record pre-txn time on vtab-sync-failure path
-                // (second commit path) so the wall-time ledger stays closed.
-                record_hot_path_duration(&FSQLITE_COMMIT_PRE_TXN_TIME_NS, commit_pre_txn_start);
-                return Err(sync_error);
+            if self.concurrent_txn.get() {
+                self.abort_current_concurrent_session();
             }
+
+            self.txn_metrics_note_rollback();
+            let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
+                txn.rollback(cx).await
+            } else {
+                Ok(())
+            };
+            let rollback_succeeded = rollback_result.is_ok();
+            let vtab_rollback_result = self.live_vtab_rollback_all(cx);
+            let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
+            self.clear_pending_memdb_direct_upserts();
+            if rollback_succeeded
+                && let Some(snapshot) = self.txn_snapshot.borrow().as_ref().cloned()
+            {
+                self.restore_snapshot_state(&snapshot);
+            }
+            let reload_result = if txn_has_pending_writes && rollback_succeeded {
+                self.reload_memdb_from_pager(cx).await
+            } else {
+                Ok(())
+            };
+
+            *self.txn_snapshot.borrow_mut() = None;
+            self.savepoints.borrow_mut().clear();
+            self.in_transaction.set(false);
+            // Issue #110: forced rollback tore down the txn — drop the
+            // transaction-scoped FK parent-validation cache.
+            self.clear_fk_parent_validation_cache();
+            // IMPL-28 / AG-O3: txn torn down — close the IN_TRANSACTION gate.
+            self.set_fast_path_bit(fast_path_gate::IN_TRANSACTION, false);
+            self.implicit_txn.set(false);
+            self.concurrent_txn.set(false);
+            *self.concurrent_session_id.borrow_mut() = None;
+            self.txn_metrics_mark_finished();
+            self.db.borrow_mut().commit_undo();
+            self.reset_transaction_lookaside();
+            // IMPL-9a: forced rollback (vtab sync failure during
+            // commit). Any filter mutated by this transaction is
+            // now out-of-sync with the committed B-tree and MUST
+            // be reseeded on next consultation.
+            self.invalidate_qfs_on_rollback();
+            self.maybe_gc_tick();
+
+            rollback_result?;
+            reload_result?;
+            vtab_rollback_result?;
+            registry_rollback_result?;
+            // bd-hjkbr.1: Record pre-txn time on vtab-sync-failure path
+            // (second commit path) so the wall-time ledger stays closed.
+            record_hot_path_duration(&FSQLITE_COMMIT_PRE_TXN_TIME_NS, commit_pre_txn_start);
+            return Err(sync_error);
         }
 
         let is_concurrent_txn = self.concurrent_txn.get();
@@ -54709,15 +54708,15 @@ impl Connection {
             });
         }
 
-        if let Some(owners) = owners {
-            if let Some(existing) = owners.insert(page_no, owner.clone()) {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "page {} is referenced multiple times ({existing}; {owner})",
-                        page_no.get()
-                    ),
-                });
-            }
+        if let Some(owners) = owners
+            && let Some(existing) = owners.insert(page_no, owner.clone())
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page {} is referenced multiple times ({existing}; {owner})",
+                    page_no.get()
+                ),
+            });
         }
 
         Ok(())
@@ -55148,16 +55147,15 @@ impl Connection {
             }
         }
 
-        if !auto_vacuum_enabled {
-            if let Some(page_no) =
+        if !auto_vacuum_enabled
+            && let Some(page_no) =
                 Self::first_unowned_database_page(total_pages, page_size, |page_no| {
                     owners.contains_key(&page_no)
                 })
-            {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("page {} is never used", page_no.get()),
-                });
-            }
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("page {} is never used", page_no.get()),
+            });
         }
 
         Ok(())
@@ -55920,20 +55918,19 @@ impl Connection {
             if let fsqlite_vdbe::pragma::PragmaOutput::Text(ref mut mode) = pragma_out {
                 self.normalize_private_memory_journal_mode_output(mode);
             }
-            if let fsqlite_vdbe::pragma::PragmaOutput::Text(ref mode) = pragma_out {
-                if let Err(err) = self.apply_journal_mode_to_pager(mode).await {
-                    self.pragma_state.borrow_mut().journal_mode = prior_journal_mode;
-                    return Err(err);
-                }
+            if let fsqlite_vdbe::pragma::PragmaOutput::Text(ref mode) = pragma_out
+                && let Err(err) = self.apply_journal_mode_to_pager(mode).await
+            {
+                self.pragma_state.borrow_mut().journal_mode = prior_journal_mode;
+                return Err(err);
             }
         }
-        if let Some(prior_synchronous) = maybe_prior_synchronous {
-            if let fsqlite_vdbe::pragma::PragmaOutput::Text(ref synchronous) = pragma_out {
-                if let Err(err) = self.apply_synchronous_to_pager(synchronous) {
-                    self.pragma_state.borrow_mut().synchronous = prior_synchronous;
-                    return Err(err);
-                }
-            }
+        if let Some(prior_synchronous) = maybe_prior_synchronous
+            && let fsqlite_vdbe::pragma::PragmaOutput::Text(ref synchronous) = pragma_out
+            && let Err(err) = self.apply_synchronous_to_pager(synchronous)
+        {
+            self.pragma_state.borrow_mut().synchronous = prior_synchronous;
+            return Err(err);
         }
 
         // Persist header-backed pragmas so values survive reopen.
@@ -58122,43 +58119,43 @@ impl Connection {
             let tokens = Lexer::tokenize(sql);
             let (stmts, _errors) = Parser::new(tokens).parse_all();
             for stmt in &stmts {
-                if let Statement::CreateTable(create) = stmt {
-                    if let CreateTableBody::Columns {
+                if let Statement::CreateTable(create) = stmt
+                    && let CreateTableBody::Columns {
                         constraints,
                         columns,
                         ..
                     } = &create.body
-                    {
-                        // Table-level PRIMARY KEY constraint
-                        for tc in constraints {
-                            if let TableConstraintKind::PrimaryKey {
-                                columns: pk_cols, ..
-                            } = &tc.kind
-                            {
-                                for (pk_pos, pk_col) in pk_cols.iter().enumerate() {
-                                    if let Expr::Column(col_ref, _) = &pk_col.expr {
-                                        if let Some(col_idx) = table.columns.iter().position(|c| {
-                                            c.name.eq_ignore_ascii_case(&col_ref.column)
-                                        }) {
-                                            #[allow(clippy::cast_possible_wrap)]
-                                            {
-                                                positions[col_idx] = (pk_pos as i64) + 1;
-                                            }
-                                        }
+                {
+                    // Table-level PRIMARY KEY constraint
+                    for tc in constraints {
+                        if let TableConstraintKind::PrimaryKey {
+                            columns: pk_cols, ..
+                        } = &tc.kind
+                        {
+                            for (pk_pos, pk_col) in pk_cols.iter().enumerate() {
+                                if let Expr::Column(col_ref, _) = &pk_col.expr
+                                    && let Some(col_idx) = table
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
+                                {
+                                    #[allow(clippy::cast_possible_wrap)]
+                                    {
+                                        positions[col_idx] = (pk_pos as i64) + 1;
                                     }
                                 }
-                                return positions;
                             }
+                            return positions;
                         }
-                        // Column-level PRIMARY KEY (non-IPK, e.g. TEXT PRIMARY KEY)
-                        for (i, col) in columns.iter().enumerate() {
-                            let has_pk = col
-                                .constraints
-                                .iter()
-                                .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
-                            if has_pk && i < n {
-                                positions[i] = 1;
-                            }
+                    }
+                    // Column-level PRIMARY KEY (non-IPK, e.g. TEXT PRIMARY KEY)
+                    for (i, col) in columns.iter().enumerate() {
+                        let has_pk = col
+                            .constraints
+                            .iter()
+                            .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
+                        if has_pk && i < n {
+                            positions[i] = 1;
                         }
                     }
                 }
@@ -59141,13 +59138,12 @@ impl Connection {
         }
         let shadowed = self.shadowed_main_tables.borrow();
         for name_lc in &main_refs {
-            if let Some(main_table) = shadowed.get(name_lc) {
-                if let Some(slot) = schema
+            if let Some(main_table) = shadowed.get(name_lc)
+                && let Some(slot) = schema
                     .iter_mut()
                     .find(|t| t.name.eq_ignore_ascii_case(name_lc))
-                {
-                    *slot = main_table.clone();
-                }
+            {
+                *slot = main_table.clone();
             }
         }
     }
@@ -64298,11 +64294,11 @@ impl Connection {
 
         let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
         for (key, row_values) in keyed_rows {
-            if let Some(last_group) = groups.last_mut() {
-                if group_keys_equal_collated(&last_group.0, &key, &group_collations, &coll_snap) {
-                    last_group.1.push(row_values);
-                    continue;
-                }
+            if let Some(last_group) = groups.last_mut()
+                && group_keys_equal_collated(&last_group.0, &key, &group_collations, &coll_snap)
+            {
+                last_group.1.push(row_values);
+                continue;
             }
             groups.push((key, vec![row_values]));
         }
@@ -78407,12 +78403,12 @@ fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {
     }
     // A nested aggregate anywhere in a result column is a misuse.
     for col in columns {
-        if let ResultColumn::Expr { expr, .. } = col {
-            if expr_has_nested_aggregate(expr) {
-                return Err(FrankenError::FunctionError(
-                    "misuse of aggregate function".to_owned(),
-                ));
-            }
+        if let ResultColumn::Expr { expr, .. } = col
+            && expr_has_nested_aggregate(expr)
+        {
+            return Err(FrankenError::FunctionError(
+                "misuse of aggregate function".to_owned(),
+            ));
         }
     }
     Ok(())
@@ -86798,10 +86794,10 @@ impl SharedMvccState {
                     "could not request database-root region cancellation during drop"
                 );
             }
-            if state.key.path_key != ":memory:" {
-                if let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get() {
-                    lock_unpoisoned(state_map).remove(&state.key);
-                }
+            if state.key.path_key != ":memory:"
+                && let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get()
+            {
+                lock_unpoisoned(state_map).remove(&state.key);
             }
         }
     }
@@ -86877,10 +86873,10 @@ impl SharedMvccState {
                     .unwrap_or(u64::MAX)
             );
 
-            if state.key.path_key != ":memory:" {
-                if let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get() {
-                    lock_unpoisoned(state_map).remove(&state.key);
-                }
+            if state.key.path_key != ":memory:"
+                && let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get()
+            {
+                lock_unpoisoned(state_map).remove(&state.key);
             }
         }
 
@@ -87783,10 +87779,9 @@ fn expr_has_correlated_join_subquery(expr: &Expr) -> bool {
             if let SelectCore::Select {
                 from: Some(from), ..
             } = &sub.body.select
+                && !from.joins.is_empty()
             {
-                if !from.joins.is_empty() {
-                    return true;
-                }
+                return true;
             }
             false
         }
@@ -88203,16 +88198,16 @@ fn subquery_references_table(subquery: &SelectStatement, table_name: &str) -> bo
         from: Some(from), ..
     } = &subquery.body.select
     {
-        if let TableOrSubquery::Table { name, .. } = &from.source {
-            if qualified_relation_matches_name(name, table_name) {
-                return true;
-            }
+        if let TableOrSubquery::Table { name, .. } = &from.source
+            && qualified_relation_matches_name(name, table_name)
+        {
+            return true;
         }
         for join in &from.joins {
-            if let TableOrSubquery::Table { name, .. } = &join.table {
-                if qualified_relation_matches_name(name, table_name) {
-                    return true;
-                }
+            if let TableOrSubquery::Table { name, .. } = &join.table
+                && qualified_relation_matches_name(name, table_name)
+            {
+                return true;
             }
         }
     }
@@ -100322,10 +100317,8 @@ fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
             return None;
         }
         let has_decimal = trimmed.bytes().any(|b| matches!(b, b'.' | b'e' | b'E'));
-        if !has_decimal {
-            if let Ok(v) = trimmed.parse::<i64>() {
-                return Some(SqliteValue::Integer(v));
-            }
+        if !has_decimal && let Ok(v) = trimmed.parse::<i64>() {
+            return Some(SqliteValue::Integer(v));
         }
         if let Ok(v) = trimmed.parse::<f64>() {
             // If it's an exact integer value, store as Integer.
@@ -100449,35 +100442,33 @@ fn should_coerce_for_comparison(
                 if let Some(schema) = schemas
                     .iter()
                     .find(|s| s.name.eq_ignore_ascii_case(table_name))
-                {
-                    if let Some(col_def) = schema
+                    && let Some(col_def) = schema
                         .columns
                         .iter()
                         .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                {
+                    // Check if the column's declared type implies numeric affinity.
+                    let ty = col_def.type_name.as_deref().unwrap_or("").to_uppercase();
+                    // SQLite affinity rules: INT → INTEGER, REAL/FLOA/DOUB → REAL,
+                    // TEXT/CHAR/CLOB → TEXT, BLOB or empty → NONE.
+                    // NUMERIC affinity for anything else.
+                    if ty.is_empty() || ty.contains("BLOB") {
+                        return false; // NONE affinity
+                    }
+                    if ty.contains("INT")
+                        || ty.contains("REAL")
+                        || ty.contains("FLOA")
+                        || ty.contains("DOUB")
+                        || ty.contains("NUMERIC")
+                        || ty.contains("NUM")
                     {
-                        // Check if the column's declared type implies numeric affinity.
-                        let ty = col_def.type_name.as_deref().unwrap_or("").to_uppercase();
-                        // SQLite affinity rules: INT → INTEGER, REAL/FLOA/DOUB → REAL,
-                        // TEXT/CHAR/CLOB → TEXT, BLOB or empty → NONE.
-                        // NUMERIC affinity for anything else.
-                        if ty.is_empty() || ty.contains("BLOB") {
-                            return false; // NONE affinity
-                        }
-                        if ty.contains("INT")
-                            || ty.contains("REAL")
-                            || ty.contains("FLOA")
-                            || ty.contains("DOUB")
-                            || ty.contains("NUMERIC")
-                            || ty.contains("NUM")
-                        {
-                            return true;
-                        }
-                        if ty.contains("TEXT") || ty.contains("CHAR") || ty.contains("CLOB") {
-                            return false; // TEXT affinity
-                        }
-                        // Default: NUMERIC affinity
                         return true;
                     }
+                    if ty.contains("TEXT") || ty.contains("CHAR") || ty.contains("CLOB") {
+                        return false; // TEXT affinity
+                    }
+                    // Default: NUMERIC affinity
+                    return true;
                 }
             }
         }
@@ -100909,15 +100900,14 @@ fn resolve_operand_collation(expr: &Expr, schemas: &[TableSchema]) -> Option<Str
                 .table
                 .as_ref()
                 .is_none_or(|t| t.eq_ignore_ascii_case(&schema.name));
-            if name_matches {
-                if let Some(coll) = schema
+            if name_matches
+                && let Some(coll) = schema
                     .columns
                     .iter()
                     .find(|c| c.name.eq_ignore_ascii_case(&cr.column))
                     .and_then(|c| c.collation.clone())
-                {
-                    return Some(coll);
-                }
+            {
+                return Some(coll);
             }
         }
     }
@@ -100978,20 +100968,19 @@ fn resolve_operand_affinity(expr: &Expr, schemas: &[TableSchema]) -> TypeAffinit
                 .table
                 .as_ref()
                 .is_none_or(|t| t.eq_ignore_ascii_case(&schema.name));
-            if name_matches {
-                if let Some(col) = schema
+            if name_matches
+                && let Some(col) = schema
                     .columns
                     .iter()
                     .find(|c| c.name.eq_ignore_ascii_case(&cr.column))
-                {
-                    return match col.affinity {
-                        'B' | 'b' => TypeAffinity::Text,
-                        'C' | 'c' => TypeAffinity::Numeric,
-                        'D' | 'd' => TypeAffinity::Integer,
-                        'E' | 'e' => TypeAffinity::Real,
-                        _ => TypeAffinity::Blob,
-                    };
-                }
+            {
+                return match col.affinity {
+                    'B' | 'b' => TypeAffinity::Text,
+                    'C' | 'c' => TypeAffinity::Numeric,
+                    'D' | 'd' => TypeAffinity::Integer,
+                    'E' | 'e' => TypeAffinity::Real,
+                    _ => TypeAffinity::Blob,
+                };
             }
         }
     }
@@ -101005,8 +100994,8 @@ fn resolve_named_order_term_idx(
 ) -> Option<usize> {
     // SQLite resolves an unqualified output alias before consulting source
     // column names, even when the alias appears later in the result list.
-    if order_table.is_none() {
-        if let Some(index) = columns.iter().position(|column| {
+    if order_table.is_none()
+        && let Some(index) = columns.iter().position(|column| {
             matches!(
                 column,
                 ResultColumn::Expr {
@@ -101014,9 +101003,9 @@ fn resolve_named_order_term_idx(
                     ..
                 } if alias.eq_ignore_ascii_case(col_name)
             )
-        }) {
-            return Some(index);
-        }
+        })
+    {
+        return Some(index);
     }
 
     columns.iter().position(|column| match column {
@@ -102744,20 +102733,20 @@ async fn execute_table_program_with_db(
         VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size)
     };
     engine.set_retain_storage_cursors_on_close(allow_retained_cursor_reuse);
-    if let Some(params) = params {
-        if let Err(e) = validate_bound_parameters(program, params) {
-            return (
-                (
-                    Err(TableProgramExecError {
-                        error: e,
-                        changes: 0,
-                        last_insert_rowid: None,
-                    }),
-                    txn,
-                ),
-                Some(engine),
-            );
-        }
+    if let Some(params) = params
+        && let Err(e) = validate_bound_parameters(program, params)
+    {
+        return (
+            (
+                Err(TableProgramExecError {
+                    error: e,
+                    changes: 0,
+                    last_insert_rowid: None,
+                }),
+                txn,
+            ),
+            Some(engine),
+        );
     }
 
     let _setup_outcome = engine.apply_reusable_table_execution_state(ReusableTableExecutionState {
@@ -112386,11 +112375,11 @@ fn parse_ssi_decision_query_spec(spec: &str) -> Result<SsiDecisionQuery> {
             continue;
         }
 
-        if query.decision_type.is_none() {
-            if let Ok(decision_type) = SsiDecisionType::from_str(term) {
-                query.decision_type = Some(decision_type);
-                continue;
-            }
+        if query.decision_type.is_none()
+            && let Ok(decision_type) = SsiDecisionType::from_str(term)
+        {
+            query.decision_type = Some(decision_type);
+            continue;
         }
 
         return Err(FrankenError::Internal(format!(
@@ -112504,11 +112493,11 @@ fn parse_raptorq_repair_evidence_query_spec(spec: &str) -> Result<WalFecRepairEv
             continue;
         }
 
-        if query.severity_bucket.is_none() {
-            if let Ok(bucket) = WalFecRepairSeverityBucket::from_str(term) {
-                query.severity_bucket = Some(bucket);
-                continue;
-            }
+        if query.severity_bucket.is_none()
+            && let Ok(bucket) = WalFecRepairSeverityBucket::from_str(term)
+        {
+            query.severity_bucket = Some(bucket);
+            continue;
         }
 
         return Err(FrankenError::Internal(format!(
