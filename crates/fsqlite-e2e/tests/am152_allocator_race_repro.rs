@@ -414,7 +414,7 @@ async fn bounded_no_retain_writer(
             )
             .await?;
         }
-        Ok(())
+        Ok::<(), String>(())
     }
     .await;
     let close_result = conn
@@ -443,7 +443,7 @@ fn run_bounded_no_retain_scenario() -> Result<(), String> {
                         format!("bounded no-retain seed create nr_w{writer}: {error}")
                     })?;
                 }
-                Ok(())
+                Ok::<(), String>(())
             }
             .await;
             let close_result = conn
@@ -497,15 +497,16 @@ fn run_bounded_no_retain_scenario() -> Result<(), String> {
                             .await?,
                     );
                 }
-                Ok((integrity, counts))
+                Ok::<(Vec<String>, Vec<i64>), String>((integrity, counts))
             }
             .await;
             let close_result = conn
                 .close_without_checkpoint()
                 .await
                 .map_err(|error| format!("bounded no-retain verifier close: {error}"));
-            work_result?;
-            close_result
+            let (integrity, counts) = work_result?;
+            close_result?;
+            Ok((integrity, counts))
         }
         .await;
     });
@@ -672,7 +673,7 @@ async fn matrix_writer(
                 }
             }
         }
-        Ok(())
+        Ok::<(), String>(())
     }
     .await;
     let close_result = conn
@@ -706,7 +707,7 @@ fn run_statement_surface_matrix_arm(surface: MatrixInsertSurface) -> Result<(), 
                         )
                     })?;
                 }
-                Ok(())
+                Ok::<(), String>(())
             }
             .await;
             let close_result = conn
@@ -765,15 +766,16 @@ fn run_statement_surface_matrix_arm(surface: MatrixInsertSurface) -> Result<(), 
                             .await?,
                     );
                 }
-                Ok((integrity, counts))
+                Ok::<(Vec<String>, Vec<i64>), String>((integrity, counts))
             }
             .await;
             let close_result = conn
                 .close_without_checkpoint()
                 .await
                 .map_err(|error| format!("matrix {} verifier close: {error}", surface.label()));
-            work_result?;
-            close_result
+            let (integrity, counts) = work_result?;
+            close_result?;
+            Ok((integrity, counts))
         }
         .await;
     });
