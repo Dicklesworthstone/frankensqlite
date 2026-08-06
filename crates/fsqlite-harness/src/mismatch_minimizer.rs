@@ -37,7 +37,7 @@
 //! All operations are deterministic given the same input. Hashes use
 //! SHA-256 truncated to 16 hex characters for readability.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -45,7 +45,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::differential_v2::StatementDivergence;
+use crate::failure_bundle::FailureBundle;
 use crate::metamorphic::MismatchClassification;
+use crate::serializability_oracle::{
+    Anomaly, HistoryOperation, OracleVerdict, SerializabilityReport, TransactionHistory,
+    check_history, validate_serializability_failure_bundle,
+};
 use crate::test_inventory::ExecutionLane;
 use crate::typed_sql_generator::{
     Expr, GeneratedStatement, Identifier, Select, SqlValue, Statement as GeneratedAstStatement,
@@ -60,6 +65,10 @@ const BEAD_ID: &str = "bd-1dp9.2.3";
 pub const MINIMIZER_SCHEMA_VERSION: u32 = 1;
 /// Schema version for generator-AST reduction evidence.
 pub const TYPED_REDUCTION_SCHEMA_VERSION: &str = "fsqlite.typed-reduction.v1";
+/// Schema version for transaction-history reduction evidence.
+pub const HISTORY_REDUCTION_SCHEMA_VERSION: &str = "fsqlite.history-reduction.v1";
+/// Canonical failure-bundle snapshot key for history reduction evidence.
+pub const HISTORY_REDUCTION_SNAPSHOT_KEY: &str = "history_reduction_v1";
 
 // ===========================================================================
 // Subsystem Attribution
@@ -486,6 +495,707 @@ impl TypedReductionResult {
     }
 }
 
+/// History plus scheduler-owned dimensions that are not duplicated in the
+/// transaction-history event schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryReductionCase {
+    pub history: TransactionHistory,
+    pub schedule_events: Vec<String>,
+    pub yield_choices: Vec<String>,
+    pub observed_fields: BTreeMap<String, String>,
+}
+
+impl HistoryReductionCase {
+    /// Validate the canonical history and reducer-owned scheduler dimensions.
+    pub fn validate(&self) -> Result<SerializabilityReport, String> {
+        let report = check_history(&self.history)?;
+        validate_named_values("schedule event", &self.schedule_events)?;
+        validate_named_values("yield choice", &self.yield_choices)?;
+        if self
+            .observed_fields
+            .iter()
+            .any(|(key, value)| key.trim().is_empty() || value.trim().is_empty())
+        {
+            return Err(
+                "history reduction observed fields contain an empty key or value".to_owned(),
+            );
+        }
+        Ok(report)
+    }
+
+    /// Stable identity used by the reduction trace.
+    #[must_use]
+    pub fn deterministic_hash(&self) -> String {
+        let bytes =
+            serde_json::to_vec(self).expect("history reduction case serialization must succeed");
+        sha256_hex(&bytes)
+    }
+}
+
+/// Exact failure identity that every accepted history candidate must retain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryReductionObservation {
+    pub verdict: OracleVerdict,
+    pub minimal_witness: Option<Anomaly>,
+    pub failure_signature: String,
+    pub required_lanes: Vec<ExecutionLane>,
+    pub final_state_sha256: String,
+}
+
+impl HistoryReductionObservation {
+    /// Derive the canonical oracle, lane, and final-state identity for a case.
+    pub fn from_case(
+        case: &HistoryReductionCase,
+        failure_signature: impl Into<String>,
+    ) -> Result<Self, String> {
+        let report = case.validate()?;
+        let mut required_lanes = case
+            .history
+            .execution_lane_evidence
+            .iter()
+            .map(|evidence| evidence.required_lane)
+            .collect::<Vec<_>>();
+        required_lanes.sort_unstable();
+        required_lanes.dedup();
+        let observation = Self {
+            verdict: report.verdict,
+            minimal_witness: report.minimal_witness,
+            failure_signature: failure_signature.into(),
+            required_lanes,
+            final_state_sha256: case.history.final_state_sha256.clone(),
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.failure_signature.trim().is_empty() {
+            return Err("history reduction failure signature is empty".to_owned());
+        }
+        if self.required_lanes.is_empty() {
+            return Err("history reduction required lane set is empty".to_owned());
+        }
+        if self
+            .required_lanes
+            .windows(2)
+            .any(|lanes| lanes[0] >= lanes[1])
+        {
+            return Err("history reduction required lanes are not canonical".to_owned());
+        }
+        if !is_sha256_hex_64(&self.final_state_sha256) {
+            return Err("history reduction final-state hash is malformed".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Stable history reducer categories used by traces and dimensional accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryReductionKind {
+    Transaction,
+    Worker,
+    Operation,
+    Checkpoint,
+    CrashPoint,
+    ScheduleEvent,
+    YieldChoice,
+    ObservedField,
+}
+
+/// One deterministic history candidate decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryReductionAttempt {
+    pub ordinal: usize,
+    pub kind: HistoryReductionKind,
+    pub path: String,
+    pub before_sha256: String,
+    pub after_sha256: String,
+    pub accepted: bool,
+    pub rationale: String,
+}
+
+/// Dimensional history size retained for original and minimized artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryReductionSize {
+    pub transactions: usize,
+    pub operations: usize,
+    pub workers: usize,
+    pub schedule_events: usize,
+    pub yield_choices: usize,
+    pub checkpoints: usize,
+    pub crash_points: usize,
+    pub observed_fields: usize,
+}
+
+impl HistoryReductionSize {
+    fn for_case(case: &HistoryReductionCase) -> Self {
+        let transactions = case
+            .history
+            .events
+            .iter()
+            .filter_map(|event| event.transaction_id.as_deref())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let workers = case
+            .history
+            .events
+            .iter()
+            .map(|event| event.process_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let checkpoints = case
+            .history
+            .events
+            .iter()
+            .filter(|event| matches!(event.operation, HistoryOperation::Checkpoint { .. }))
+            .count();
+        let crash_points = case
+            .history
+            .events
+            .iter()
+            .filter_map(|event| match &event.operation {
+                HistoryOperation::Crash { crash_id } => Some(crash_id.as_str()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
+        Self {
+            transactions,
+            operations: case.history.events.len(),
+            workers,
+            schedule_events: case.schedule_events.len(),
+            yield_choices: case.yield_choices.len(),
+            checkpoints,
+            crash_points,
+            observed_fields: case.observed_fields.len(),
+        }
+    }
+
+    const fn componentwise_le(self, other: Self) -> bool {
+        self.transactions <= other.transactions
+            && self.operations <= other.operations
+            && self.workers <= other.workers
+            && self.schedule_events <= other.schedule_events
+            && self.yield_choices <= other.yield_choices
+            && self.checkpoints <= other.checkpoints
+            && self.crash_points <= other.crash_points
+            && self.observed_fields <= other.observed_fields
+    }
+}
+
+/// Aggregate statistics for one history reduction run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryReductionStats {
+    pub original: HistoryReductionSize,
+    pub minimized: HistoryReductionSize,
+    pub attempts: usize,
+    pub accepted_candidates: usize,
+    pub rejected_candidates: usize,
+}
+
+/// Canonical history reduction artifact retained by replay bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryReductionResult {
+    pub schema_version: String,
+    pub config: TypedReductionConfig,
+    pub original: HistoryReductionCase,
+    pub minimized: HistoryReductionCase,
+    pub observation: HistoryReductionObservation,
+    pub trace: Vec<HistoryReductionAttempt>,
+    pub stats: HistoryReductionStats,
+    pub status: TypedReductionStatus,
+    pub first_rejected_invariant: Option<String>,
+    pub content_hash: String,
+}
+
+impl HistoryReductionResult {
+    /// Hash replay-relevant content while excluding the hash field itself.
+    #[must_use]
+    pub fn deterministic_hash(&self) -> String {
+        let mut canonical = self.clone();
+        canonical.content_hash.clear();
+        let bytes = serde_json::to_vec(&canonical)
+            .expect("history reduction artifact serialization must succeed");
+        sha256_hex(&bytes)
+    }
+
+    /// Validate schemas, dimensions, trace continuity, and exact oracle identity.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != HISTORY_REDUCTION_SCHEMA_VERSION {
+            return Err("history reduction schema version is unsupported".to_owned());
+        }
+        self.original.validate()?;
+        self.minimized.validate()?;
+        self.observation.validate()?;
+        let minimized_observation = HistoryReductionObservation::from_case(
+            &self.minimized,
+            self.observation.failure_signature.clone(),
+        )?;
+        // ubs:ignore - deterministic reducer evidence identity, not authentication material.
+        if minimized_observation != self.observation {
+            return Err(
+                "history reduction minimized witness, lane, or state identity drifted".to_owned(),
+            );
+        }
+        let expected_stats = HistoryReductionStats {
+            original: HistoryReductionSize::for_case(&self.original),
+            minimized: HistoryReductionSize::for_case(&self.minimized),
+            attempts: self.trace.len(),
+            accepted_candidates: self.trace.iter().filter(|attempt| attempt.accepted).count(),
+            rejected_candidates: self
+                .trace
+                .iter()
+                .filter(|attempt| !attempt.accepted)
+                .count(),
+        };
+        if self.stats != expected_stats
+            || !self.stats.minimized.componentwise_le(self.stats.original)
+        {
+            return Err(
+                "history reduction statistics do not match monotonic payload dimensions".to_owned(),
+            );
+        }
+        validate_reduction_status(self.status, &self.config, self.trace.len())?;
+        let mut current_hash = self.original.deterministic_hash();
+        for (ordinal, attempt) in self.trace.iter().enumerate() {
+            if attempt.ordinal != ordinal
+                || attempt.path.trim().is_empty()
+                || attempt.rationale.trim().is_empty()
+                || !is_sha256_hex_64(&attempt.before_sha256)
+                || !is_sha256_hex_64(&attempt.after_sha256)
+                || attempt.before_sha256 != current_hash
+                || attempt.before_sha256 == attempt.after_sha256
+            {
+                return Err("history reduction trace is malformed or discontinuous".to_owned());
+            }
+            if attempt.accepted {
+                current_hash.clone_from(&attempt.after_sha256);
+            }
+        }
+        if current_hash != self.minimized.deterministic_hash() {
+            return Err("history reduction trace does not produce the minimized case".to_owned());
+        }
+        let first_rejected = self
+            .trace
+            .iter()
+            .find(|attempt| !attempt.accepted)
+            .map(|attempt| attempt.rationale.as_str());
+        if first_rejected != self.first_rejected_invariant.as_deref() {
+            return Err("history reduction first rejected invariant drifted".to_owned());
+        }
+        if self.content_hash != self.deterministic_hash() {
+            return Err("history reduction content hash mismatch".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Serialize a validated history reduction artifact.
+    pub fn to_json(&self) -> Result<String, String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self).map_err(|error| error.to_string())
+    }
+
+    /// Strictly decode and validate a history reduction artifact.
+    pub fn from_json_strict(json: &str) -> Result<Self, String> {
+        let result: Self = serde_json::from_str(json)
+            .map_err(|error| format!("history reduction decode failed: {error}"))?;
+        result.validate()?;
+        Ok(result)
+    }
+
+    /// Attach reduction evidence to the existing canonical serializability bundle.
+    pub fn attach_to_failure_bundle(&self, bundle: &mut FailureBundle) -> Result<(), String> {
+        self.validate()?;
+        let (history, report) = validate_serializability_failure_bundle(bundle)?;
+        // ubs:ignore - typed history payload identity, not authentication material.
+        if history != self.minimized.history {
+            return Err(
+                "history reduction bundle does not contain the minimized history".to_owned(),
+            );
+        }
+        // ubs:ignore - deterministic oracle witness identity, not authentication material.
+        if report.verdict != self.observation.verdict
+            // ubs:ignore - deterministic oracle witness identity, not authentication material.
+            || report.minimal_witness != self.observation.minimal_witness
+        {
+            return Err("history reduction bundle witness identity drifted".to_owned());
+        }
+        let mut attached = bundle.clone();
+        attached
+            .state_snapshots
+            .insert(HISTORY_REDUCTION_SNAPSHOT_KEY.to_owned(), self.to_json()?);
+        if !attached
+            .triage_tags
+            .iter()
+            .any(|tag| tag == "history-reduced")
+        {
+            attached.triage_tags.push("history-reduced".to_owned());
+        }
+        attached.content_hash = attached.deterministic_bundle_hash();
+        let errors = attached.validate();
+        if errors.is_empty() {
+            *bundle = attached;
+            Ok(())
+        } else {
+            Err(format!(
+                "history reduction produced an invalid failure bundle: {}",
+                errors.join("; ")
+            ))
+        }
+    }
+}
+
+/// Candidate verifier used by the history-domain reducer.
+pub type HistoryReproducibilityTest<'a> =
+    dyn Fn(&HistoryReductionCase) -> Result<HistoryReductionObservation, String> + 'a;
+
+#[derive(Debug, Clone)]
+struct HistoryReductionCandidate {
+    kind: HistoryReductionKind,
+    path: String,
+    case: HistoryReductionCase,
+}
+
+/// Reduce a typed history while preserving exact witness, lane, and final-state identity.
+pub fn minimize_history_case(
+    case: &HistoryReductionCase,
+    config: &TypedReductionConfig,
+    test_fn: &HistoryReproducibilityTest<'_>,
+) -> Result<HistoryReductionResult, String> {
+    case.validate()?;
+    let observation = test_fn(case)?;
+    observation.validate()?;
+    if HistoryReductionObservation::from_case(case, observation.failure_signature.clone())?
+        != observation
+    {
+        return Err("history reduction verifier returned inconsistent initial evidence".to_owned());
+    }
+
+    let original = case.clone();
+    let mut current = original.clone();
+    let mut trace = Vec::new();
+    let mut status = TypedReductionStatus::Complete;
+    let mut first_rejected_invariant = None;
+
+    'passes: loop {
+        let candidates = history_reduction_candidates(&current);
+        let mut accepted_in_pass = false;
+        for candidate in candidates {
+            if config
+                .cancel_after_attempts
+                .is_some_and(|limit| trace.len() >= limit)
+            {
+                status = TypedReductionStatus::Cancelled;
+                break 'passes;
+            }
+            if trace.len() >= config.max_attempts {
+                status = TypedReductionStatus::BudgetExhausted;
+                break 'passes;
+            }
+
+            let before_sha256 = current.deterministic_hash();
+            let after_sha256 = candidate.case.deterministic_hash();
+            let (accepted, rationale) = match candidate.case.validate() {
+                Err(error) => (
+                    false,
+                    format!("rejected: lifecycle or causal invariant: {error}"),
+                ),
+                Ok(_) => match test_fn(&candidate.case) {
+                    // ubs:ignore - deterministic reducer evidence identity, not authentication material.
+                    Ok(candidate_observation) if candidate_observation == observation => (
+                        true,
+                        "exact history witness, required lanes, and final state preserved"
+                            .to_owned(),
+                    ),
+                    Ok(candidate_observation)
+                        // ubs:ignore - deterministic failure signature, not authentication material.
+                        if candidate_observation.failure_signature
+                            != observation.failure_signature
+                            // ubs:ignore - deterministic oracle verdict, not authentication material.
+                            || candidate_observation.verdict != observation.verdict
+                            // ubs:ignore - deterministic oracle witness, not authentication material.
+                            || candidate_observation.minimal_witness
+                                != observation.minimal_witness =>
+                    {
+                        (
+                            false,
+                            "rejected: exact history or crash witness drifted".to_owned(),
+                        )
+                    }
+                    Ok(candidate_observation)
+                        // ubs:ignore - deterministic lane identity, not authentication material.
+                        if candidate_observation.required_lanes != observation.required_lanes =>
+                    {
+                        (
+                            false,
+                            "rejected: required execution lane identity drifted".to_owned(),
+                        )
+                    }
+                    Ok(_) => (false, "rejected: final-state identity drifted".to_owned()),
+                    Err(error) => (false, format!("rejected: candidate replay failed: {error}")),
+                },
+            };
+            if !accepted && first_rejected_invariant.is_none() {
+                first_rejected_invariant = Some(rationale.clone());
+            }
+            trace.push(HistoryReductionAttempt {
+                ordinal: trace.len(),
+                kind: candidate.kind,
+                path: candidate.path,
+                before_sha256,
+                after_sha256,
+                accepted,
+                rationale,
+            });
+            if accepted {
+                current = candidate.case;
+                accepted_in_pass = true;
+                break;
+            }
+        }
+        if !accepted_in_pass {
+            break;
+        }
+    }
+
+    let stats = HistoryReductionStats {
+        original: HistoryReductionSize::for_case(&original),
+        minimized: HistoryReductionSize::for_case(&current),
+        attempts: trace.len(),
+        accepted_candidates: trace.iter().filter(|attempt| attempt.accepted).count(),
+        rejected_candidates: trace.iter().filter(|attempt| !attempt.accepted).count(),
+    };
+    tracing::info!(
+        target: "fsqlite.history_reduction",
+        original_transactions = stats.original.transactions,
+        minimized_transactions = stats.minimized.transactions,
+        original_operations = stats.original.operations,
+        minimized_operations = stats.minimized.operations,
+        witness = %observation.failure_signature,
+        attempts = stats.attempts,
+        complete = status.is_complete(),
+        "history reduction completed"
+    );
+    let mut result = HistoryReductionResult {
+        schema_version: HISTORY_REDUCTION_SCHEMA_VERSION.to_owned(),
+        config: config.clone(),
+        original,
+        minimized: current,
+        observation,
+        trace,
+        stats,
+        status,
+        first_rejected_invariant,
+        content_hash: String::new(),
+    };
+    result.content_hash = result.deterministic_hash();
+    result.validate()?;
+    Ok(result)
+}
+
+fn validate_named_values(kind: &str, values: &[String]) -> Result<(), String> {
+    if values.iter().any(|value| value.trim().is_empty()) {
+        return Err(format!("history reduction {kind} is empty"));
+    }
+    if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
+        return Err(format!(
+            "history reduction {kind} values contain duplicates"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reduction_status(
+    status: TypedReductionStatus,
+    config: &TypedReductionConfig,
+    attempts: usize,
+) -> Result<(), String> {
+    if attempts > config.max_attempts {
+        return Err("history reduction trace exceeds its attempt budget".to_owned());
+    }
+    match status {
+        TypedReductionStatus::Complete => Ok(()),
+        TypedReductionStatus::BudgetExhausted if attempts == config.max_attempts => Ok(()),
+        TypedReductionStatus::Cancelled
+            if config
+                .cancel_after_attempts
+                .is_some_and(|limit| attempts == limit) =>
+        {
+            Ok(())
+        }
+        TypedReductionStatus::BudgetExhausted | TypedReductionStatus::Cancelled => {
+            Err("history reduction status contradicts its budget controls".to_owned())
+        }
+    }
+}
+
+fn history_reduction_candidates(case: &HistoryReductionCase) -> Vec<HistoryReductionCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    let worker_ids = case
+        .history
+        .events
+        .iter()
+        .map(|event| event.process_id.clone())
+        .collect::<BTreeSet<_>>();
+    for worker_id in worker_ids {
+        let mut candidate = case.clone();
+        candidate
+            .history
+            .events
+            .retain(|event| event.process_id != worker_id);
+        push_history_candidate(
+            &mut candidates,
+            &mut seen,
+            HistoryReductionKind::Worker,
+            format!("worker:{worker_id}"),
+            candidate,
+        );
+    }
+
+    let transaction_ids = case
+        .history
+        .events
+        .iter()
+        .filter_map(|event| event.transaction_id.clone())
+        .collect::<BTreeSet<_>>();
+    for transaction_id in transaction_ids {
+        let mut candidate = case.clone();
+        candidate
+            .history
+            .events
+            .retain(|event| event.transaction_id.as_deref() != Some(transaction_id.as_str()));
+        push_history_candidate(
+            &mut candidates,
+            &mut seen,
+            HistoryReductionKind::Transaction,
+            format!("transaction:{transaction_id}"),
+            candidate,
+        );
+    }
+
+    for (index, event) in case.history.events.iter().enumerate() {
+        if matches!(
+            event.operation,
+            HistoryOperation::Crash { .. }
+                | HistoryOperation::Restart { .. }
+                | HistoryOperation::Checkpoint { .. }
+        ) {
+            continue;
+        }
+        let mut candidate = case.clone();
+        candidate.history.events.remove(index);
+        push_history_candidate(
+            &mut candidates,
+            &mut seen,
+            HistoryReductionKind::Operation,
+            format!("operation:event-{}", event.event_id),
+            candidate,
+        );
+    }
+
+    for (index, event) in case.history.events.iter().enumerate() {
+        if !matches!(event.operation, HistoryOperation::Checkpoint { .. }) {
+            continue;
+        }
+        let mut candidate = case.clone();
+        candidate.history.events.remove(index);
+        push_history_candidate(
+            &mut candidates,
+            &mut seen,
+            HistoryReductionKind::Checkpoint,
+            format!("checkpoint:event-{}", event.event_id),
+            candidate,
+        );
+    }
+
+    let crash_ids = case
+        .history
+        .events
+        .iter()
+        .filter_map(|event| match &event.operation {
+            HistoryOperation::Crash { crash_id } => Some(crash_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for crash_id in crash_ids {
+        let mut candidate = case.clone();
+        candidate.history.events.retain(|event| {
+            !matches!(
+                &event.operation,
+                HistoryOperation::Crash { crash_id: id }
+                    | HistoryOperation::Restart { crash_id: id }
+                    if id == &crash_id
+            )
+        });
+        push_history_candidate(
+            &mut candidates,
+            &mut seen,
+            HistoryReductionKind::CrashPoint,
+            format!("crash:{crash_id}"),
+            candidate,
+        );
+    }
+
+    for index in 0..case.schedule_events.len() {
+        let mut candidate = case.clone();
+        candidate.schedule_events.remove(index);
+        push_history_candidate(
+            &mut candidates,
+            &mut seen,
+            HistoryReductionKind::ScheduleEvent,
+            format!("schedule_event:{index}"),
+            candidate,
+        );
+    }
+    for index in 0..case.yield_choices.len() {
+        let mut candidate = case.clone();
+        candidate.yield_choices.remove(index);
+        push_history_candidate(
+            &mut candidates,
+            &mut seen,
+            HistoryReductionKind::YieldChoice,
+            format!("yield_choice:{index}"),
+            candidate,
+        );
+    }
+    for key in case.observed_fields.keys() {
+        let mut candidate = case.clone();
+        candidate.observed_fields.remove(key);
+        push_history_candidate(
+            &mut candidates,
+            &mut seen,
+            HistoryReductionKind::ObservedField,
+            format!("observed_field:{key}"),
+            candidate,
+        );
+    }
+    candidates
+}
+
+fn push_history_candidate(
+    candidates: &mut Vec<HistoryReductionCandidate>,
+    seen: &mut BTreeSet<String>,
+    kind: HistoryReductionKind,
+    path: String,
+    mut case: HistoryReductionCase,
+) {
+    for (event_id, event) in case.history.events.iter_mut().enumerate() {
+        event.event_id = u64::try_from(event_id).expect("history event count must fit u64");
+    }
+    let hash = case.deterministic_hash();
+    if seen.insert(hash) {
+        candidates.push(HistoryReductionCandidate { kind, path, case });
+    }
+}
+
 /// Candidate verifier used by the structured reducer.
 pub type TypedReproducibilityTest<'a> =
     dyn Fn(&[GeneratedStatement]) -> Result<TypedReductionObservation, String> + 'a;
@@ -535,6 +1245,7 @@ pub fn minimize_typed_statements(
             let before_sha256 = statement_payload_hash(&current);
             let after_sha256 = statement_payload_hash(&candidate.statements);
             let (accepted, rationale) = match test_fn(&candidate.statements) {
+                // ubs:ignore - deterministic reducer evidence identity, not authentication material.
                 Ok(candidate_observation) if candidate_observation == observation => (
                     true,
                     "exact mismatch signature and required lanes preserved".to_owned(),
