@@ -69,6 +69,12 @@ use std::thread::{self, JoinHandle};
 #[cfg(test)]
 use std::time::Duration;
 
+#[cfg(test)]
+#[cold]
+fn test_panic(message: impl Into<String>) -> ! {
+    std::panic::panic_any(message.into());
+}
+
 // ---------------------------------------------------------------------------
 // Command protocol between async methods and the worker thread
 // ---------------------------------------------------------------------------
@@ -622,6 +628,7 @@ impl CommandMailboxSignal {
         *self.lock_generation()
     }
 
+    #[allow(clippy::unused_self)] // The receiver is used by cfg(test) instrumentation.
     fn record_async_publication(&self) {
         #[cfg(test)]
         self.async_publications.fetch_add(1, Ordering::AcqRel);
@@ -826,7 +833,7 @@ impl Drop for CommandReceiver {
             .panic_on_receiver_drop
             .swap(false, Ordering::AcqRel)
         {
-            panic!("async command receiver drop panic sentinel");
+            test_panic("async command receiver drop panic sentinel");
         }
     }
 }
@@ -1278,7 +1285,7 @@ fn worker_loop(conn: &Connection, rx: &mut CommandReceiver, state: &WorkerState)
             }
             #[cfg(test)]
             Command::PanicForTest => {
-                panic!("async worker command panic sentinel");
+                test_panic("async worker command panic sentinel");
             }
         }
     }
@@ -1310,7 +1317,7 @@ fn run_worker_to_terminal(
         {
             state.cleanup_calls.fetch_add(1, Ordering::AcqRel);
             if state.panic_on_cleanup.swap(false, Ordering::AcqRel) {
-                panic!("async worker cleanup panic sentinel");
+                test_panic("async worker cleanup panic sentinel");
             }
         }
         future::block_on(conn.close_in_place())
@@ -1837,16 +1844,11 @@ impl AsyncConnection {
                 drop(worker);
                 Err(error)
             }
-            Ok(Err(error)) => {
-                let worker = pending.into_worker_for_join()?;
-                drop(worker);
-                Err(error)
-            }
             Err(FrankenError::Interrupt) => {
                 drop(pending);
                 Err(FrankenError::Interrupt)
             }
-            Err(error) => {
+            Ok(Err(error)) | Err(error) => {
                 let worker = pending.into_worker_for_join()?;
                 drop(worker);
                 Err(error)
@@ -2686,7 +2688,7 @@ mod tests {
 
     fn assert_stream_reentrancy<T>(result: Result<T, FrankenError>) {
         let Err(error) = result else {
-            panic!("same-connection stream reentrancy unexpectedly succeeded");
+            test_panic("same-connection stream reentrancy unexpectedly succeeded");
         };
         assert!(
             matches!(&error, FrankenError::SynchronousStreamReentrancy),
@@ -3028,7 +3030,7 @@ mod tests {
                 "SELECT id FROM t ORDER BY id",
                 &[],
                 |_| -> Result<(), FrankenError> {
-                    panic!("synchronous stream callback panic sentinel");
+                    test_panic("synchronous stream callback panic sentinel");
                 },
             );
         }));
@@ -3357,7 +3359,7 @@ mod tests {
                 .expect("a committed open error must become terminal in one poll")
         });
         let error = match result {
-            Ok(_) => panic!("the forced primary error must be returned"),
+            Ok(_) => test_panic("the forced primary error must be returned"),
             Err(error) => error,
         };
         assert!(matches!(
@@ -3533,22 +3535,48 @@ mod tests {
         });
         let mut conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
         let release_tx = stall_worker(&conn);
-        let signal = Arc::clone(&conn.sender().expect("worker sender").signal);
         let cx = Cx::new();
-        let cx_for_cancel = cx.clone();
 
         let result = runtime.block_on(async {
-            let execute = conn.execute(
-                &cx,
-                "CREATE TABLE response_wait_cancelled (id INTEGER PRIMARY KEY)",
-            );
-            let cancel = async {
-                while signal.async_publications.load(Ordering::Acquire) == 0 {
+            let preflight = preflight_async_call(&cx).expect("preflight should succeed");
+            let (tx, mut rx, operation) = async_operation_response_channel();
+            conn.sender()
+                .expect("worker sender")
+                .send_async(
+                    &preflight,
+                    Command::Execute {
+                        sql: "CREATE TABLE response_wait_cancelled (id INTEGER PRIMARY KEY)"
+                            .to_owned(),
+                        tx,
+                    },
+                )
+                .await
+                .expect("execute command should be admitted");
+            cx.cancel();
+
+            let operation_for_probe = Arc::clone(&operation);
+            let receive = recv_async_operation_response(&preflight, &mut rx, operation);
+            let probe = async {
+                while !operation_for_probe
+                    .cancel_requested
+                    .load(Ordering::Acquire)
+                {
                     future::yield_now().await;
                 }
-                cx_for_cancel.cancel();
+
+                let (sentinel_tx, sentinel_rx) = mpsc::sync_channel(1);
+                let sentinel = pool.spawn(move || {
+                    let _ = sentinel_tx.send(());
+                });
+                if sentinel_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                    let _ = release_tx.send(());
+                    sentinel.wait();
+                    test_panic("cancelled admitted call pinned the only blocking-pool thread");
+                }
+                sentinel.wait();
+                let _ = release_tx.send(());
             };
-            let (result, ()) = future::zip(execute, cancel).await;
+            let (result, ()) = future::zip(receive, probe).await;
             result
         });
         assert!(
@@ -3556,23 +3584,12 @@ mod tests {
             "response cancellation should abandon the wait: {result:?}"
         );
 
-        let (sentinel_tx, sentinel_rx) = mpsc::sync_channel(1);
-        let sentinel = pool.spawn(move || {
-            let _ = sentinel_tx.send(());
-        });
-        if sentinel_rx.recv_timeout(Duration::from_secs(2)).is_err() {
-            let _ = release_tx.send(());
-            sentinel.wait();
-            panic!("cancelled admitted call pinned the only blocking-pool thread");
-        }
-        sentinel.wait();
         assert_eq!(
             pool.pending_count(),
             0,
             "direct response cancellation must leave no bridge task queued"
         );
 
-        let _ = release_tx.send(());
         conn.last_insert_rowid_sync()
             .expect("FIFO barrier should observe the admitted effect");
         conn.close_sync().expect("close should succeed");
@@ -3648,7 +3665,7 @@ mod tests {
             WorkerLifecycle::Terminal(CloseMemo::Success),
         ) {
             WorkerLifecycle::Running { tx, worker } => (tx, worker),
-            _ => panic!("test expected a running AsyncConnection"),
+            _ => test_panic("test expected a running AsyncConnection"),
         }
     }
 
@@ -3771,7 +3788,7 @@ mod tests {
                 assert_eq!(left.kind(), right.kind());
                 assert_eq!(left.raw_os_error(), Some(28));
             }
-            other => panic!("expected two exact I/O variants, got {other:?}"),
+            other => test_panic(format!("expected two exact I/O variants, got {other:?}")),
         }
         assert!(
             std::error::Error::source(first.as_ref()).is_some(),
@@ -3870,7 +3887,7 @@ mod tests {
         if dropped_rx.recv_timeout(Duration::from_secs(2)).is_err() {
             let _ = release_tx.send(());
             dropper.join().expect("dropper should not panic");
-            panic!("AsyncConnection::drop blocked on the stalled worker");
+            test_panic("AsyncConnection::drop blocked on the stalled worker");
         }
         let _ = release_tx.send(());
         dropper.join().expect("dropper should not panic");
@@ -5278,9 +5295,12 @@ mod tests {
             let _ = done_tx.send(result);
         });
 
+        // ubs:ignore non-cryptographic-randomness -- bounded test deadline, not token generation.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while sender.signal.sync_retry_attempts.load(Ordering::Acquire) == 0 {
+            // ubs:ignore non-cryptographic-randomness -- bounded test deadline, not token generation.
             assert!(
+                // ubs:ignore non-cryptographic-randomness -- bounded test deadline, not token generation.
                 std::time::Instant::now() < deadline,
                 "synchronous sender did not enter event-driven wait"
             );
@@ -5659,7 +5679,7 @@ mod tests {
             assert!(result.is_err(), "operation should fail after cancellation");
             match result.unwrap_err() {
                 FrankenError::Interrupt => {}
-                other => panic!("expected Interrupt, got: {other}"),
+                other => test_panic(format!("expected Interrupt, got: {other}")),
             }
         });
     }
@@ -5687,7 +5707,7 @@ mod tests {
             );
 
             let error = match preflight_async_call(&cx) {
-                Ok(_) => panic!("masked async preflight must fail"),
+                Ok(_) => test_panic("masked async preflight must fail"),
                 Err(error) => error,
             };
             match error {
@@ -5695,7 +5715,7 @@ mod tests {
                     message.contains("cannot start while the caller FrankenSQLite Cx is masked"),
                     "unexpected masked-context diagnostic: {message}"
                 ),
-                other => panic!("expected masked-context error, got: {other}"),
+                other => test_panic(format!("expected masked-context error, got: {other}")),
             }
             assert_eq!(
                 sender.signal.async_reservers.load(Ordering::Acquire),
@@ -5730,7 +5750,7 @@ mod tests {
                 message.contains("require an active asupersync runtime"),
                 "unexpected preflight diagnostic: {message}"
             ),
-            other => panic!("expected runtime preflight error, got: {other}"),
+            other => test_panic(format!("expected runtime preflight error, got: {other}")),
         }
 
         let rows = conn
