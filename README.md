@@ -863,7 +863,9 @@ struct ArcPolicySketch {
     b2: LinkedHashSet<CacheKey>,
     /// Adaptive parameter: target size for T1 (range [0, capacity]).
     p: usize,
-    /// Max pages in T1 + T2. Default: 2000 (~8MB at 4KB pages).
+    /// Max pages in T1 + T2. Derived from `PRAGMA cache_size`: a positive
+    /// value is a page count; a negative value is a KiB budget (the
+    /// conventional -2000 gives ~2 MB, i.e. 500 pages at 4 KiB).
     capacity: usize,
 }
 
@@ -884,7 +886,11 @@ On page request (O(1) amortized):
 
 Ghost entries (B1/B2) store only the cache key, not page data. They let ARC learn access patterns without consuming page-sized memory.
 
-### Eviction Constraints
+### Eviction Constraints (Optional ARC Policy)
+
+These constraints describe the ARC policy. The shipped default
+(`ShardedPageCache` with S3-FIFO) has no byte-based trigger and does not consult
+`PRAGMA cache_size` for a byte budget:
 
 1. Never evict a pinned page (`ref_count > 0`).
 2. Never evict a dirty page (must flush to WAL first).
@@ -1007,7 +1013,7 @@ FTS5 provides full-text indexing with BM25 ranking:
 - **Query syntax:** Boolean operators (`AND`, `OR`, `NOT`), phrase matching (`"exact phrase"`), prefix queries (`prefix*`), column filters (`title: search_term`), NEAR queries (`NEAR(a b, 10)`). **Column-qualified `MATCH` returns wrong results in v0.2.0:** the column restriction is ignored, so a query can match terms present only in another column ([#249](https://github.com/Dicklesworthstone/frankensqlite/issues/249)).
 - **Ranking:** BM25 by default, configurable via auxiliary functions
 - **Auxiliary functions:** `highlight()` wraps matches in markup, `snippet()` extracts context around matches
-- **Content modes:** Regular (FTS5 stores a copy), external content (references an existing table), contentless (index-only, no original text stored)
+- **Content modes:** Regular (FTS5 stores a copy), external content (references an existing table), contentless (index-only, no original text stored). The contentless `delete-all` control command is not supported in v0.2.0 ([#253](https://github.com/Dicklesworthstone/frankensqlite/issues/253)).
 - **Index structure:** A B-tree of terms mapping to document/position lists, with incremental merge for write performance
 
 Upgrading from 0.1.x with a `porter`-tokenized table requires an FTS rebuild;
