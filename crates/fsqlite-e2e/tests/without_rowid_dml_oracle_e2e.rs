@@ -698,3 +698,128 @@ fn without_rowid_update_secondary_unique_stays_stock_integrity_clean() {
         );
     });
 }
+
+/// bd-yuj70 — mixed per-index conflict actions must not produce a partial
+/// mutation: a REPLACE decision on one index followed by IGNORE on another
+/// leaves the database completely untouched.
+///
+/// A statement-level `OR <algo>` overrides every constraint action, so mixing
+/// requires a bare `UPDATE` plus constraint-level `ON CONFLICT` clauses. Index
+/// order is declaration order, so `UNIQUE(a)` is decided before `UNIQUE(b)`:
+/// the `a` victim is captured first, then `b` says IGNORE. Under a
+/// delete-as-you-go design the `a` victim would already be gone; here nothing
+/// may change.
+#[test]
+fn without_rowid_update_mixed_actions_replace_then_ignore_is_a_no_op() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, \
+                 UNIQUE(a) ON CONFLICT REPLACE, UNIQUE(b) ON CONFLICT IGNORE) WITHOUT ROWID",
+                "INSERT INTO wr VALUES ('r1',1,10),('r2',2,20),('r3',3,30)",
+                // Collides on `a` with r2 (REPLACE) and on `b` with r3
+                // (IGNORE). The IGNORE wins the row, so r2 must survive.
+                "UPDATE wr SET a = 2, b = 30 WHERE k = 'r1'",
+            ],
+            &[
+                "SELECT k, a, b FROM wr ORDER BY k",
+                "SELECT a, k FROM wr ORDER BY a",
+                "SELECT b, k FROM wr ORDER BY b",
+                "SELECT k FROM wr WHERE a = 2",
+                "SELECT k FROM wr WHERE b = 30",
+                "SELECT count(*) FROM wr",
+            ],
+            "without_rowid_update_mixed_replace_then_ignore",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — the same shape with ABORT second: the raise must happen before
+/// the captured REPLACE victim is deleted, so the statement is atomic.
+#[test]
+fn without_rowid_update_mixed_actions_replace_then_abort_preserves_victim() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, \
+                 UNIQUE(a) ON CONFLICT REPLACE, UNIQUE(b) ON CONFLICT ABORT) WITHOUT ROWID",
+                "INSERT INTO wr VALUES ('r1',1,10),('r2',2,20),('r3',3,30)",
+                // `a` captures r2 as a REPLACE victim, then `b` aborts on r3.
+                // Both r2 and r3 must be intact afterwards.
+                "UPDATE wr SET a = 2, b = 30 WHERE k = 'r1'",
+            ],
+            &[
+                "SELECT k, a, b FROM wr ORDER BY k",
+                "SELECT a, k FROM wr ORDER BY a",
+                "SELECT b, k FROM wr ORDER BY b",
+                "SELECT k FROM wr WHERE a = 2",
+                "SELECT count(*) FROM wr",
+            ],
+            "without_rowid_update_mixed_replace_then_abort",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — one row reached as a victim through two different UNIQUE
+/// indexes. Both decisions capture the *same* primary key, so phase B must
+/// delete it once and skip the second seek rather than double-deleting.
+#[test]
+fn without_rowid_update_same_victim_through_two_unique_indexes() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, \
+                 lab TEXT NOT NULL) WITHOUT ROWID",
+                "CREATE UNIQUE INDEX wr_a ON wr(a)",
+                "CREATE UNIQUE INDEX wr_b ON wr(b)",
+                "CREATE INDEX wr_lab ON wr(lab)",
+                "INSERT INTO wr VALUES ('r1',1,10,'x'),('r2',2,20,'y'),('r3',3,30,'z')",
+                // r2 holds BOTH a = 2 and b = 20: one victim, two indexes.
+                "UPDATE OR REPLACE wr SET a = 2, b = 20, lab = 'merged' WHERE k = 'r1'",
+            ],
+            &[
+                "SELECT k, a, b, lab FROM wr ORDER BY k",
+                "SELECT a, k FROM wr ORDER BY a",
+                "SELECT b, k FROM wr ORDER BY b",
+                "SELECT lab, k FROM wr ORDER BY lab, k",
+                "SELECT k FROM wr WHERE a = 2",
+                "SELECT k FROM wr WHERE b = 20",
+                "SELECT count(*) FROM wr",
+            ],
+            "without_rowid_update_same_victim_two_indexes",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — the primary-key victim and a secondary victim are the same row,
+/// so the PK capture and the secondary capture name one primary key. Phase B
+/// must still delete exactly once.
+#[test]
+fn without_rowid_update_pk_and_secondary_victim_are_same_row() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, a INTEGER NOT NULL, lab TEXT NOT NULL) \
+                 WITHOUT ROWID",
+                "CREATE UNIQUE INDEX wr_a ON wr(a)",
+                "CREATE INDEX wr_lab ON wr(lab)",
+                "INSERT INTO wr VALUES ('r1',1,'x'),('r2',2,'y'),('r3',3,'z')",
+                // Re-key r1 onto r2 AND take r2's unique `a`: r2 is both the
+                // primary-key victim and the wr_a victim.
+                "UPDATE OR REPLACE wr SET k = 'r2', a = 2, lab = 'merged' WHERE k = 'r1'",
+            ],
+            &[
+                "SELECT k, a, lab FROM wr ORDER BY k",
+                "SELECT a, k FROM wr ORDER BY a",
+                "SELECT lab, k FROM wr ORDER BY lab, k",
+                "SELECT k FROM wr WHERE a = 2",
+                "SELECT count(*) FROM wr",
+            ],
+            "without_rowid_update_pk_and_secondary_same_victim",
+        )
+        .await;
+    });
+}

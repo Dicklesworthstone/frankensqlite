@@ -23148,7 +23148,30 @@ fn emit_without_rowid_update_rewrite(
     let pk_label = without_rowid_pk_label(table, pk_indices);
     let aff_str = table.affinity_string();
 
-    // Step 2: is the primary key unchanged? Compare collation-aware, per key
+    // PHASE A — decide every conflict before mutating anything.
+    //
+    // Ordering follows `emit_without_rowid_row_insert` (and SQLite's
+    // `sqlite3GenerateConstraintChecks`): the primary key is resolved first,
+    // then each index in `table.indexes` schema order. Nothing in phase A
+    // deletes: a REPLACE decision only *captures* the victim's primary key, so
+    // a later IGNORE or ABORT on a different index still leaves the database
+    // exactly as it was. Phase B then applies the captured deletions.
+    let pk_victim_flag = b.alloc_reg();
+    b.emit_op(Opcode::Integer, 0, pk_victim_flag, 0, P4::None, 0);
+    let unique_index_slots: Vec<(usize, i32, i32)> = table
+        .indexes
+        .iter()
+        .enumerate()
+        .filter(|(_, index)| index.is_unique && index.key_term_count() > 0)
+        .map(|(idx_offset, _)| {
+            let flag = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, flag, 0, P4::None, 0);
+            let victim_pk = b.alloc_regs(n_pk as i32);
+            (idx_offset, flag, victim_pk)
+        })
+        .collect();
+
+    // A1: is the primary key unchanged? Compare collation-aware, per key
     // column: a single differing column makes this an "other victim" probe.
     let pk_changed = b.emit_label();
     let pk_unchanged = b.emit_label();
@@ -23169,8 +23192,7 @@ fn emit_without_rowid_update_rewrite(
     }
     b.emit_jump_to_label(Opcode::Goto, 0, 0, pk_unchanged, P4::None, 0);
 
-    // Step 3: the primary key moved — resolve any *other* row holding NEW PK
-    // before OLD is touched.
+    // A2: the primary key moved — decide against any *other* row holding NEW PK.
     b.resolve_label(pk_changed);
     let new_pk_regs = b.alloc_regs(n_pk as i32);
     for (j, &pk_col) in pk_indices.iter().enumerate() {
@@ -23202,18 +23224,10 @@ fn emit_without_rowid_update_rewrite(
         0,
     );
     if oe_flag == OE_REPLACE {
-        // The cursor is positioned on the victim: drop its secondary-index
-        // entries (keys read from the cursor, not from either image) and then
-        // its clustered row.
-        emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
-        b.emit_op(
-            Opcode::IdxDelete,
-            table_cursor,
-            0,
-            0,
-            P4::Table(table.name.clone()),
-            OPFLAG_REPLACE_VICTIM,
-        );
+        // Record the decision only. The victim's primary key *is* the NEW
+        // primary key, so no separate capture registers are needed; phase B
+        // re-seeks it. Deleting here would be visible to a later IGNORE.
+        b.emit_op(Opcode::Integer, 1, pk_victim_flag, 0, P4::None, 0);
     } else if oe_flag == OE_IGNORE {
         // Abandon the row with OLD still intact.
         b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
@@ -23243,8 +23257,7 @@ fn emit_without_rowid_update_rewrite(
     b.resolve_label(no_victim);
     b.resolve_label(pk_unchanged);
 
-    // Step 3b: resolve every UNIQUE secondary-index conflict while OLD is still
-    // intact.
+    // A3: decide every UNIQUE secondary-index conflict, still without mutating.
     //
     // The engine's `IdxInsert` OE_REPLACE branch resolves its victim as a
     // *rowid* (`find_conflicting_rowid_in_index` -> `Option<i64>`, then
@@ -23252,18 +23265,13 @@ fn emit_without_rowid_update_rewrite(
     // ROWID secondary entry ends with the PRIMARY KEY, not an integer rowid, so
     // that path cannot address the victim and instead reports the healthy
     // database as malformed. Every unique conflict is therefore resolved here,
-    // in clustered terms, and step 5 hands the engine a non-REPLACE action so
+    // in clustered terms, and phase C hands the engine a non-REPLACE action so
     // the rowid-suffix path is never entered.
-    for (idx_offset, index) in table.indexes.iter().enumerate() {
-        if !index.is_unique {
-            continue;
-        }
+    for &(idx_offset, victim_flag, victim_pk_regs) in &unique_index_slots {
+        let index = &table.indexes[idx_offset];
         let idx_oe = effective_oe(stmt_level, index.conflict_action);
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
-        if n_idx_cols == 0 {
-            continue;
-        }
         let idx_done = b.emit_label();
 
         // A partial index only constrains rows its predicate admits: when NEW
@@ -23323,7 +23331,6 @@ fn emit_without_rowid_update_rewrite(
 
         // A conflicting entry exists and `idx_cursor` is positioned on it. Its
         // trailing terms are the victim's PRIMARY KEY.
-        let victim_pk_regs = b.alloc_regs(n_pk as i32);
         for j in 0..n_pk {
             b.emit_op(
                 Opcode::Column,
@@ -23336,7 +23343,7 @@ fn emit_without_rowid_update_rewrite(
         }
 
         // Self-conflict: the entry belongs to the row being rewritten, so the
-        // OLD delete in step 4 already removes it. Comparing against OLD PK
+        // OLD delete in phase B already removes it. Comparing against OLD PK
         // (not NEW) is what makes a pure secondary-key rewrite a no-op here.
         let victim_is_other = b.emit_label();
         for (j, &pk_col) in pk_indices.iter().enumerate() {
@@ -23361,42 +23368,17 @@ fn emit_without_rowid_update_rewrite(
             // Abandon the whole row with OLD intact.
             b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
         } else if idx_oe == OE_REPLACE {
-            // Seek the clustered row by the victim's PRIMARY KEY, then reuse
-            // the same victim teardown the PK arm uses: all of the victim's
-            // secondary entries (keys read from the positioned table cursor),
-            // then its clustered row.
-            let victim_seek_rec = b.alloc_reg();
-            b.emit_op(
-                Opcode::MakeRecord,
-                victim_pk_regs,
-                n_pk as i32,
-                victim_seek_rec,
-                P4::None,
-                0,
-            );
-            b.emit_jump_to_label(
-                Opcode::NoConflict,
-                table_cursor,
-                victim_seek_rec,
-                idx_done,
-                P4::None,
-                0,
-            );
-            emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
-            b.emit_op(
-                Opcode::IdxDelete,
-                table_cursor,
-                0,
-                0,
-                P4::Table(table.name.clone()),
-                OPFLAG_REPLACE_VICTIM,
-            );
+            // Record the decision only: `victim_pk_regs` already holds the
+            // victim's primary key. Phase B re-seeks and deletes it, so a
+            // later IGNORE or ABORT on another index still sees an unmutated
+            // database.
+            b.emit_op(Opcode::Integer, 1, victim_flag, 0, P4::None, 0);
         } else {
             // ABORT / FAIL / ROLLBACK: raise the UNIQUE violation now, while
-            // OLD is still present. The full [key || pk] record is what the
-            // engine's unique check expects; `NoConflict` fell through, so a
-            // conflicting entry provably exists and this cannot silently
-            // succeed.
+            // OLD and every captured victim are still present. The full
+            // [key || pk] record is what the engine's unique check expects;
+            // `NoConflict` fell through, so a conflicting entry provably exists
+            // and this cannot silently succeed.
             let raise_regs = b.alloc_regs((n_idx_cols + n_pk) as i32);
             for key_pos in 0..n_idx_cols {
                 b.emit_op(
@@ -23439,7 +23421,54 @@ fn emit_without_rowid_update_rewrite(
         b.resolve_label(idx_done);
     }
 
-    // Step 4: re-seek OLD (the probes above moved the cursor) and remove its
+    // PHASE B — apply the captured REPLACE deletions.
+    //
+    // Every decision is now final: no IGNORE or ABORT can still fire, so these
+    // deletions cannot become an unintended partial mutation. Each victim is
+    // re-seeked by primary key and skipped when already absent, which is what
+    // makes duplicate victims safe — the same row reached through two indexes,
+    // or a secondary victim that is also the primary-key victim, is deleted
+    // once and the later seeks find nothing.
+    let emit_captured_victim_delete = |b: &mut ProgramBuilder, flag: i32, pk_regs: i32| {
+        let victim_done = b.emit_label();
+        b.emit_jump_to_label(Opcode::IfNot, flag, 1, victim_done, P4::None, 0);
+        let victim_seek_rec = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            pk_regs,
+            n_pk as i32,
+            victim_seek_rec,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::NoConflict,
+            table_cursor,
+            victim_seek_rec,
+            victim_done,
+            P4::None,
+            0,
+        );
+        emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
+        b.emit_op(
+            Opcode::IdxDelete,
+            table_cursor,
+            0,
+            0,
+            P4::Table(table.name.clone()),
+            OPFLAG_REPLACE_VICTIM,
+        );
+        b.resolve_label(victim_done);
+    };
+
+    // B1: the primary-key victim, whose primary key is the NEW primary key.
+    emit_captured_victim_delete(b, pk_victim_flag, new_pk_regs);
+    // B2: each captured secondary victim, in the same index order as phase A.
+    for &(_, victim_flag, victim_pk_regs) in &unique_index_slots {
+        emit_captured_victim_delete(b, victim_flag, victim_pk_regs);
+    }
+
+    // B3: re-seek OLD (the probes above moved the cursor) and remove its
     // secondary-index entries and clustered row.
     let old_seek_regs = b.alloc_regs(n_pk as i32);
     for j in 0..n_pk {
@@ -23474,7 +23503,7 @@ fn emit_without_rowid_update_rewrite(
     b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 0);
     b.resolve_label(old_absent);
 
-    // Step 5: insert NEW. Every conflicting row has been resolved above, so
+    // PHASE C: insert NEW. Every conflicting row has been resolved above, so
     // this insert must not itself REPLACE.
     let rec_reg = b.alloc_reg();
     b.emit_op(
