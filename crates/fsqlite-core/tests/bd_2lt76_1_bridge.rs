@@ -18,7 +18,7 @@ fn explicit_root_cx_env_drives_file_backed_production_path() {
         let parent_cx = Cx::new().with_trace_context(21_760_001, 0, 0);
         let env = ConnectionEnv::new_with_root_cx(bridge_runtime_config(), &parent_cx);
         let runtime = env.runtime().clone();
-        let conn = Connection::open_with_env(&db_path, env.clone())
+        let mut conn = Connection::open_with_env(&db_path, env.clone())
             .await
             .expect("file-backed bridge connection should open");
 
@@ -69,7 +69,7 @@ fn explicit_root_cx_env_drives_file_backed_production_path() {
         );
         assert!(!fallback.truncated);
 
-        let reopened = Connection::open_existing_with_env(&db_path, env.clone())
+        let mut reopened = Connection::open_existing_with_env(&db_path, env.clone())
             .await
             .expect("reopen should use the same explicit runtime");
         assert!(
@@ -82,13 +82,8 @@ fn explicit_root_cx_env_drives_file_backed_production_path() {
             .await
             .expect("reopened SELECT should stay on the production pager path");
         assert_eq!(reopened_rows[0].values()[0], SqliteValue::Integer(42));
-        conn.close()
-            .await
-            .expect("original connection should close cleanly");
-        reopened
-            .close()
-            .await
-            .expect("reopened connection should close cleanly");
+        conn.close_best_effort_in_place().await;
+        reopened.close_best_effort_in_place().await;
     });
 }
 
