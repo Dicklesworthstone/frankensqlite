@@ -7310,82 +7310,100 @@ fn profile_fsqlite_insert_with_strategy(
     label: &str,
     strategy: InsertProfileStrategy,
 ) {
-    let conn = open_fsqlite_memory_connection_for_benchmark();
-    apply_pragmas_fsqlite(&conn);
-
     let previous_hot_path_profile_enabled = hot_path_profile_enabled();
     set_hot_path_profile_enabled(true);
-    reset_hot_path_profile();
+    // Keep the diagnostic profiler's measured statement loop identical to the
+    // scored sections: one outer runtime entry, then ordinary awaited prepared
+    // executions. In particular, do not charge a `block_on` bridge crossing to
+    // every row before attributing the resulting profile counters to the engine.
+    let (setup_us, begin_us, prepare_us, insert_us, commit_us, wal_before, wal_after, profile) =
+        fsqlite_e2e::block_on(async {
+            let setup_start = Instant::now();
+            let conn = open_fsqlite_memory_connection_for_benchmark_async().await;
+            apply_pragmas_fsqlite_async(&conn).await;
+            fs_execute_async(&conn, record_size.create_table_sql()).await;
+            let setup_us = setup_start.elapsed().as_secs_f64() * 1_000_000.0;
 
-    let setup_start = Instant::now();
-    fs_execute(&conn, record_size.create_table_sql());
-    let setup_us = setup_start.elapsed().as_secs_f64() * 1_000_000.0;
+            reset_hot_path_profile();
+            let wal_before = fsqlite_wal::wal_telemetry_snapshot();
 
-    reset_hot_path_profile();
-    let wal_before = fsqlite_wal::wal_telemetry_snapshot();
-
-    let mut begin_us = if matches!(strategy, InsertProfileStrategy::SingleTxn) {
-        let begin_start = Instant::now();
-        fs_execute(&conn, "BEGIN");
-        begin_start.elapsed().as_secs_f64() * 1_000_000.0
-    } else {
-        0.0
-    };
-
-    let prepare_start = Instant::now();
-    let statement = fs_prepare(&conn, record_size.insert_sql_csqlite());
-    let prepare_us = prepare_start.elapsed().as_secs_f64() * 1_000_000.0;
-
-    let mut insert_us = 0.0;
-    let mut commit_us = 0.0;
-    #[allow(clippy::cast_possible_wrap)]
-    match strategy {
-        InsertProfileStrategy::Autocommit | InsertProfileStrategy::SingleTxn => {
-            let insert_start = Instant::now();
-            for i in 0..count as i64 {
-                fs_stmt_execute_with_params(&statement, &[fsqlite::SqliteValue::Integer(i)]);
-            }
-            insert_us = insert_start.elapsed().as_secs_f64() * 1_000_000.0;
-        }
-        InsertProfileStrategy::Batched { batch_size } => {
-            let batch_size = batch_size.max(1);
-            let num_batches = count.div_ceil(batch_size);
-            for batch in 0..num_batches {
+            let mut begin_us = if matches!(strategy, InsertProfileStrategy::SingleTxn) {
                 let begin_start = Instant::now();
-                fs_execute(&conn, "BEGIN");
-                begin_us = begin_start
-                    .elapsed()
-                    .as_secs_f64()
-                    .mul_add(1_000_000.0, begin_us);
+                fs_execute_async(&conn, "BEGIN").await;
+                begin_start.elapsed().as_secs_f64() * 1_000_000.0
+            } else {
+                0.0
+            };
 
-                let start = (batch * batch_size) as i64;
-                let end = ((batch + 1) * batch_size).min(count) as i64;
-                let insert_start = Instant::now();
-                for i in start..end {
-                    fs_stmt_execute_with_params(&statement, &[fsqlite::SqliteValue::Integer(i)]);
+            let prepare_start = Instant::now();
+            let statement = fs_prepare_async(&conn, record_size.insert_sql_csqlite()).await;
+            let prepare_us = prepare_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+            let mut insert_us = 0.0;
+            let mut commit_us = 0.0;
+            #[allow(clippy::cast_possible_wrap)]
+            match strategy {
+                InsertProfileStrategy::Autocommit | InsertProfileStrategy::SingleTxn => {
+                    let insert_start = Instant::now();
+                    for i in 0..count as i64 {
+                        fs_stmt_execute_with_params_async(
+                            &statement,
+                            &[fsqlite::SqliteValue::Integer(i)],
+                        )
+                        .await;
+                    }
+                    insert_us = insert_start.elapsed().as_secs_f64() * 1_000_000.0;
                 }
-                insert_us = insert_start
-                    .elapsed()
-                    .as_secs_f64()
-                    .mul_add(1_000_000.0, insert_us);
+                InsertProfileStrategy::Batched { batch_size } => {
+                    let batch_size = batch_size.max(1);
+                    let num_batches = count.div_ceil(batch_size);
+                    for batch in 0..num_batches {
+                        let begin_start = Instant::now();
+                        fs_execute_async(&conn, "BEGIN").await;
+                        begin_us = begin_start
+                            .elapsed()
+                            .as_secs_f64()
+                            .mul_add(1_000_000.0, begin_us);
 
-                let commit_start = Instant::now();
-                fs_execute(&conn, "COMMIT");
-                commit_us = commit_start
-                    .elapsed()
-                    .as_secs_f64()
-                    .mul_add(1_000_000.0, commit_us);
+                        let start = (batch * batch_size) as i64;
+                        let end = ((batch + 1) * batch_size).min(count) as i64;
+                        let insert_start = Instant::now();
+                        for i in start..end {
+                            fs_stmt_execute_with_params_async(
+                                &statement,
+                                &[fsqlite::SqliteValue::Integer(i)],
+                            )
+                            .await;
+                        }
+                        insert_us = insert_start
+                            .elapsed()
+                            .as_secs_f64()
+                            .mul_add(1_000_000.0, insert_us);
+
+                        let commit_start = Instant::now();
+                        fs_execute_async(&conn, "COMMIT").await;
+                        commit_us = commit_start
+                            .elapsed()
+                            .as_secs_f64()
+                            .mul_add(1_000_000.0, commit_us);
+                    }
+                }
             }
-        }
-    }
 
-    if matches!(strategy, InsertProfileStrategy::SingleTxn) {
-        let commit_start = Instant::now();
-        fs_execute(&conn, "COMMIT");
-        commit_us = commit_start.elapsed().as_secs_f64() * 1_000_000.0;
-    }
+            if matches!(strategy, InsertProfileStrategy::SingleTxn) {
+                let commit_start = Instant::now();
+                fs_execute_async(&conn, "COMMIT").await;
+                commit_us = commit_start.elapsed().as_secs_f64() * 1_000_000.0;
+            }
 
-    let wal_after = fsqlite_wal::wal_telemetry_snapshot();
+            let wal_after = fsqlite_wal::wal_telemetry_snapshot();
+            let profile = hot_path_profile_snapshot();
+            (
+                setup_us, begin_us, prepare_us, insert_us, commit_us, wal_before, wal_after,
+                profile,
+            )
+        });
+    set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
     let wal_frames = metric_delta(
         wal_after.wal.frames_written_total,
         wal_before.wal.frames_written_total,
@@ -7498,9 +7516,6 @@ fn profile_fsqlite_insert_with_strategy(
         .saturating_add(commit_wal_backend_lock_wait_us)
         .saturating_add(commit_exclusive_lock_us);
     let commit_wal_service_us = commit_wal_append_us.saturating_add(commit_wal_sync_us);
-
-    let profile = hot_path_profile_snapshot();
-    set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
 
     eprintln!(
         "    [fs_insert_{}_{}_{count}] insert_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} insert_us={insert_us:.1} commit_us={commit_us:.1} rows={count} direct_insert={} fast={} slow={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} direct_flush_calls={} direct_flush_ns={} page_run_flushes={} page_run_records={} page_run_bytes={} page_run_owned={} page_run_arena={} page_run_repeated={} page_run_empty_root={} page_run_depth2={} page_run_fallbacks={} page_run_fallback_rows={} commit_pre_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_journal_ns={} pager_c_metadata_ns={} pager_file_size_ns={} pager_unlock_ns={} pager_publish_ns={} pager_cache_finish_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} finalize_post_ns={} parser_multi_calls={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} parser_rewrite_ns={} bg_checks={} bg_ns={} op_cx_bg_gates={} dispatch_bg_gates={} pager_pub_refreshes={} commit_refreshes={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} row_build_ns={} preserialize_ns={} preserialize_cell_ns={} preserialize_eval_ns={} preserialize_affinity_ns={} preserialize_layout_ns={} preserialize_encode_ns={} row_value_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} memdb_apply_ns={} schema_validation_ns={} autocommit_begin_ns={} autocommit_resolve_ns={} autocommit_executions={} change_tracking_ns={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} btree_leaf_payload_appends={} btree_leaf_payload_mutate_ns={} btree_leaf_payload_stage_ns={} btree_leaf_full_cell_appends={} btree_leaf_full_cell_mutate_ns={} btree_leaf_full_cell_stage_ns={} btree_quick_balance_attempts={} btree_quick_balance_hits={} btree_quick_balance_ns={} btree_local_split_attempts={} btree_local_split_hits={} btree_local_split_ns={} btree_nonroot_balance_calls={} btree_nonroot_balance_ns={} btree_bulk_group={}/{} btree_bulk_leaf_build={}/{} btree_bulk_leaf_write={}/{} btree_bulk_interior_build={}/{} btree_bulk_interior_write={}/{} btree_no_split_reuse_hits={} btree_conservative_reloads={} btree_page_header_rebuilds={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={} wal_frames={} wal_bytes={} wal_group_commits={} wal_group_commit_size_sum={} wal_group_commit_latency_us={} commit_prepare_us={} commit_batch_build_us={} commit_conflict_snapshot_us={} commit_lane_prepare_us={} commit_consolidator_lock_wait_us={} commit_consolidator_flushing_wait_us={} commit_flusher_arrival_wait_us={} commit_wal_backend_lock_wait_us={} commit_exclusive_lock_us={} commit_wal_append_us={} commit_flush_frame_prep_us={} commit_append_conflict_check_us={} commit_append_frames_us={} commit_wal_sync_us={} commit_waiter_epoch_wait_us={} commit_flusher_commits={} commit_waiter_commits={} commit_phase_a_us={} commit_phase_b_us={} commit_phase_c1_us={} commit_phase_c2_us={} commit_phase_count={} commit_flusher_lock_wait_us={} commit_wal_service_us={}",
@@ -9124,6 +9139,251 @@ mod tests {
                 .eq_ignore_ascii_case("PRAGMA fsqlite_capture_time_travel_snapshots=false;")),
             "comprehensive-bench should profile benchmark workloads, not optional time-travel snapshot cloning"
         );
+    }
+
+    #[test]
+    fn unpolled_execute_variants_do_not_mutate_benchmark_fixture() {
+        fsqlite_e2e::block_on(async {
+            let conn = fsqlite::Connection::open(":memory:")
+                .await
+                .expect("open benchmark fixture");
+            conn.execute(
+                "CREATE TABLE lazy_execute (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)",
+            )
+            .await
+            .expect("create benchmark fixture");
+
+            let unpolled_execute = conn.execute("INSERT INTO lazy_execute VALUES (1, 10)");
+            drop(unpolled_execute);
+
+            let statement = conn
+                .prepare("INSERT INTO lazy_execute VALUES (?1, ?2)")
+                .await
+                .expect("prepare parameterized benchmark insert");
+            let parameters = [
+                fsqlite::SqliteValue::Integer(2),
+                fsqlite::SqliteValue::Integer(20),
+            ];
+            let unpolled_parameterized = statement.execute_with_params(&parameters);
+            drop(unpolled_parameterized);
+
+            let rows = conn
+                .query("SELECT id, value FROM lazy_execute ORDER BY id")
+                .await
+                .expect("query after dropped futures");
+            assert!(
+                rows.is_empty(),
+                "constructing then dropping execute futures must not mutate before their first poll"
+            );
+        });
+    }
+
+    #[test]
+    fn dropped_parameterized_execute_preserves_transaction_ownership() {
+        fsqlite_e2e::block_on(async {
+            let conn = fsqlite::Connection::open(":memory:")
+                .await
+                .expect("open benchmark fixture");
+            conn.execute(
+                "CREATE TABLE dropped_execute (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)",
+            )
+            .await
+            .expect("create benchmark fixture");
+            let statement = conn
+                .prepare("INSERT INTO dropped_execute VALUES (?1, ?2)")
+                .await
+                .expect("prepare parameterized benchmark insert");
+
+            conn.execute("BEGIN")
+                .await
+                .expect("begin explicit transaction");
+            let dropped_parameters = [
+                fsqlite::SqliteValue::Integer(1),
+                fsqlite::SqliteValue::Integer(10),
+            ];
+            let dropped_execute = statement.execute_with_params(&dropped_parameters);
+            drop(dropped_execute);
+
+            let rollback_parameters = [
+                fsqlite::SqliteValue::Integer(2),
+                fsqlite::SqliteValue::Integer(20),
+            ];
+            assert_eq!(
+                statement
+                    .execute_with_params(&rollback_parameters)
+                    .await
+                    .expect("transaction remains usable after dropped execute"),
+                1
+            );
+            conn.execute("ROLLBACK")
+                .await
+                .expect("rollback remains owned by the explicit transaction");
+
+            let rolled_back = conn
+                .query("SELECT id, value FROM dropped_execute ORDER BY id")
+                .await
+                .expect("query after rollback");
+            assert!(
+                rolled_back.is_empty(),
+                "dropped execute must neither mutate nor strand transaction ownership"
+            );
+
+            conn.execute("BEGIN")
+                .await
+                .expect("begin replacement transaction");
+            let committed_parameters = [
+                fsqlite::SqliteValue::Integer(3),
+                fsqlite::SqliteValue::Integer(30),
+            ];
+            assert_eq!(
+                statement
+                    .execute_with_params(&committed_parameters)
+                    .await
+                    .expect("parameterized insert after rollback"),
+                1
+            );
+            conn.execute("COMMIT")
+                .await
+                .expect("commit replacement transaction");
+            let committed = conn
+                .query("SELECT id, value FROM dropped_execute ORDER BY id")
+                .await
+                .expect("query after replacement transaction");
+            assert_eq!(committed.len(), 1);
+            assert_eq!(
+                committed[0].values(),
+                &[
+                    fsqlite::SqliteValue::Integer(3),
+                    fsqlite::SqliteValue::Integer(30)
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn narrow_parameterized_insert_returns_exact_rows() {
+        fsqlite_e2e::block_on(async {
+            let conn = fsqlite::Connection::open(":memory:")
+                .await
+                .expect("open benchmark fixture");
+            conn.execute(
+                "CREATE TABLE narrow_insert (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+            )
+            .await
+            .expect("create benchmark fixture");
+            let statement = conn
+                .prepare("INSERT INTO narrow_insert VALUES (?1, ?2)")
+                .await
+                .expect("prepare narrow parameterized insert");
+
+            for (id, value) in [(1_i64, "alpha"), (2, "beta"), (3, "gamma")] {
+                let parameters = [
+                    fsqlite::SqliteValue::Integer(id),
+                    fsqlite::SqliteValue::Text(value.into()),
+                ];
+                assert_eq!(
+                    statement
+                        .execute_with_params(&parameters)
+                        .await
+                        .expect("narrow parameterized insert"),
+                    1
+                );
+            }
+
+            let rows = conn
+                .query("SELECT id, value FROM narrow_insert ORDER BY id")
+                .await
+                .expect("query narrow parameterized inserts");
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                rows[0].values(),
+                &[
+                    fsqlite::SqliteValue::Integer(1),
+                    fsqlite::SqliteValue::Text("alpha".into())
+                ]
+            );
+            assert_eq!(
+                rows[1].values(),
+                &[
+                    fsqlite::SqliteValue::Integer(2),
+                    fsqlite::SqliteValue::Text("beta".into())
+                ]
+            );
+            assert_eq!(
+                rows[2].values(),
+                &[
+                    fsqlite::SqliteValue::Integer(3),
+                    fsqlite::SqliteValue::Text("gamma".into())
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn large_benchmark_insert_keeps_results_and_direct_fast_lane_counters() {
+        fsqlite_e2e::block_on(async {
+            const ROWS: i64 = 32;
+
+            let conn = fsqlite::Connection::open(":memory:")
+                .await
+                .expect("open wide benchmark fixture");
+            conn.execute(RecordSize::Large.create_table_sql())
+                .await
+                .expect("create wide benchmark fixture");
+            let statement = conn
+                .prepare(RecordSize::Large.insert_sql_csqlite())
+                .await
+                .expect("prepare wide benchmark insert");
+
+            let previous_profile_enabled = hot_path_profile_enabled();
+            set_hot_path_profile_enabled(true);
+            reset_hot_path_profile();
+            conn.execute("BEGIN")
+                .await
+                .expect("begin wide benchmark transaction");
+            for id in 0..ROWS {
+                assert_eq!(
+                    statement
+                        .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                        .await
+                        .expect("wide parameterized insert"),
+                    1
+                );
+            }
+            conn.execute("COMMIT")
+                .await
+                .expect("commit wide benchmark transaction");
+            let profile = hot_path_profile_snapshot();
+            set_hot_path_profile_enabled(previous_profile_enabled);
+
+            assert_eq!(
+                profile.prepared_insert_fast_lane_hits, ROWS as u64,
+                "wide benchmark inserts must retain the prepared fast lane: {profile:?}"
+            );
+            assert_eq!(
+                profile.prepared_insert_instrumented_lane_hits, 0,
+                "wide benchmark inserts must avoid the instrumented lane: {profile:?}"
+            );
+            assert_eq!(
+                profile.prepared_direct_insert_executions, ROWS as u64,
+                "wide benchmark inserts must retain direct insert execution: {profile:?}"
+            );
+
+            let rows = conn
+                .query("SELECT id, score FROM bench ORDER BY id")
+                .await
+                .expect("query wide benchmark rows");
+            assert_eq!(rows.len(), ROWS as usize);
+            for (id, row) in (0..ROWS).zip(rows) {
+                assert_eq!(
+                    row.values(),
+                    &[
+                        fsqlite::SqliteValue::Integer(id),
+                        fsqlite::SqliteValue::Integer(id * 13)
+                    ]
+                );
+            }
+        });
     }
 
     #[test]
