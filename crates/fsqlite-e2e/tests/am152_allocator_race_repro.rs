@@ -295,13 +295,15 @@ fn run_scenario(wal: bool) -> Result<(), String> {
     // bd-9inpb: `integrity_check` only walks reachable structure, so a green
     // check cannot witness the release symptom ("wrong row counts with zero
     // writer errors"). Every writer returned Ok above, so each table must hold
-    // exactly ROWS_PER_TABLE rows and any shortfall is a silently lost write.
+    // exactly ROWS_PER_TABLE rows; any deviation is silent write corruption.
+    // Both directions matter: page aliasing makes a scan of one table observe
+    // another table's rows, so over-counts are as diagnostic as shortfalls.
     // The explicit-BEGIN barrier scenario already enforces the equivalent
     // conservation check (`actual_total == total_committed`); this brings the
     // implicit-autocommit scenario to the same standard.
     if !count_problems.is_empty() {
         return Err(format!(
-            "LOST WRITES (wal={wal}): {} table(s) short with zero writer errors: {:?} (frank={frank_msgs:?} rusqlite={rusqlite_msg:?})",
+            "ROW-COUNT MISMATCH (wal={wal}): {} table(s) with wrong row counts and zero writer errors (over- or under-count): {:?} (frank={frank_msgs:?} rusqlite={rusqlite_msg:?})",
             count_problems.len(),
             &count_problems[..count_problems.len().min(10)]
         ));
