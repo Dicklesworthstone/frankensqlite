@@ -54864,6 +54864,7 @@ impl Connection {
             Btree {
                 page_no: PageNumber,
                 owner: String,
+                is_root: bool,
             },
             Overflow {
                 first_overflow: PageNumber,
@@ -54876,10 +54877,15 @@ impl Connection {
         let mut pending = vec![WalkTask::Btree {
             page_no,
             owner: owner.to_owned(),
+            is_root: true,
         }];
         while let Some(task) = pending.pop() {
-            let (page_no, owner) = match task {
-                WalkTask::Btree { page_no, owner } => (page_no, owner),
+            let (page_no, owner, is_root) = match task {
+                WalkTask::Btree {
+                    page_no,
+                    owner,
+                    is_root,
+                } => (page_no, owner, is_root),
                 WalkTask::Overflow {
                     first_overflow,
                     payload_size,
@@ -54922,6 +54928,14 @@ impl Connection {
             .map_err(|err| FrankenError::DatabaseCorrupt {
                 detail: format!("{owner}: page {} header invalid: {err}", page_no.get()),
             })?;
+            if !is_root && header.cell_count == 0 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "{owner}: page {} is an empty non-root B-tree page",
+                        page_no.get()
+                    ),
+                });
+            }
             let cell_pointers = header
                 .parse_cell_pointers(page_bytes, page_size, reserved_per_page)
                 .map_err(|err| FrankenError::DatabaseCorrupt {
@@ -54966,6 +54980,7 @@ impl Connection {
                     next_tasks.push(WalkTask::Btree {
                         page_no: left_child,
                         owner: format!("{owner} -> child[{cell_idx}]"),
+                        is_root: false,
                     });
                 }
                 if let Some(first_overflow) = cell.overflow_page {
@@ -54981,6 +54996,7 @@ impl Connection {
                 next_tasks.push(WalkTask::Btree {
                     page_no: right_child,
                     owner: format!("{owner} -> right_child"),
+                    is_root: false,
                 });
             }
             pending.extend(next_tasks.into_iter().rev());
@@ -216367,6 +216383,133 @@ mod pager_routing_tests {
                     || message.contains("corrupt"),
                 "unexpected integrity_check diagnostic: {message}"
             );
+        });
+    }
+
+    #[test]
+    fn test_integrity_checks_reject_empty_non_root_btree_pages_but_accept_empty_roots() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open_with_page_size(":memory:", 1024)
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT); \
+                 CREATE INDEX idx_t_id ON t(id);",
+            )
+            .await
+            .unwrap();
+
+            // A zero-cell table root and a zero-cell index root are both valid.
+            // Root-ness must come from the catalog walk entry, not page shape.
+            for pragma in ["quick_check", "integrity_check"] {
+                let rows = conn.query(&format!("PRAGMA {pragma};")).await.unwrap();
+                assert_eq!(rows.len(), 1, "{pragma} should return one result row");
+                assert_eq!(
+                    rows[0].values()[0],
+                    SqliteValue::Text("ok".into()),
+                    "{pragma} must accept valid empty B-tree roots"
+                );
+            }
+
+            let table_root_page = conn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("t"))
+                .map(|table| PageNumber::new(u32::try_from(table.root_page).unwrap()).unwrap())
+                .expect("test table root page");
+            let payload = "z".repeat(900);
+            for rowid in 1..=64 {
+                conn.execute(&format!("INSERT INTO t VALUES ({rowid}, '{payload}');"))
+                    .await
+                    .unwrap();
+
+                let cx = Cx::new();
+                if conn.retained_autocommit_txn.borrow().is_some() {
+                    conn.flush_retained_autocommit_txn(&cx).await.unwrap();
+                }
+                conn.invalidate_cached_write_txn(&cx).await;
+                conn.invalidate_cached_read_snapshot(&cx).await;
+                let mut txn = conn
+                    .pager
+                    .begin(&cx, TransactionMode::ReadOnly)
+                    .await
+                    .unwrap();
+                let root_page = txn.get_page(&cx, table_root_page).await.unwrap();
+                let header_offset = fsqlite_btree::header_offset_for_page(table_root_page);
+                let root_header =
+                    fsqlite_btree::BtreePageHeader::parse(root_page.as_ref(), header_offset)
+                        .unwrap();
+                let root_is_interior =
+                    root_header.page_type == fsqlite_btree::BtreePageType::InteriorTable;
+                txn.rollback(&cx).await.unwrap();
+                if root_is_interior {
+                    break;
+                }
+                assert!(
+                    rowid < 64,
+                    "table root did not split under sustained inserts"
+                );
+            }
+
+            let cx = Cx::new();
+            if conn.retained_autocommit_txn.borrow().is_some() {
+                conn.flush_retained_autocommit_txn(&cx).await.unwrap();
+            }
+            conn.invalidate_cached_write_txn(&cx).await;
+            conn.invalidate_cached_read_snapshot(&cx).await;
+            let mut txn = conn
+                .pager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .unwrap();
+            let root_page = txn.get_page(&cx, table_root_page).await.unwrap().into_vec();
+            let header_offset = fsqlite_btree::header_offset_for_page(table_root_page);
+            let root_header =
+                fsqlite_btree::BtreePageHeader::parse(&root_page, header_offset).unwrap();
+            assert_eq!(
+                root_header.page_type,
+                fsqlite_btree::BtreePageType::InteriorTable,
+                "test setup requires an interior table root"
+            );
+            let child_page_no = root_header
+                .right_child
+                .expect("interior table root must reference a right-most child");
+            let mut child_page = txn.get_page(&cx, child_page_no).await.unwrap().into_vec();
+            let child_header = fsqlite_btree::BtreePageHeader::parse(&child_page, 0).unwrap();
+            assert_eq!(
+                child_header.page_type,
+                fsqlite_btree::BtreePageType::LeafTable,
+                "freshly split table root should reference leaf children"
+            );
+            assert!(
+                child_header.cell_count > 0,
+                "selected child must be non-empty before corruption"
+            );
+
+            let (usable_size, _) = Connection::current_btree_cursor_sizes_in_txn(&cx, &txn)
+                .await
+                .unwrap();
+            child_page.fill(0);
+            fsqlite_types::BTreePageHeader::write_empty_leaf_table(&mut child_page, 0, usable_size);
+            txn.write_page(&cx, child_page_no, &child_page)
+                .await
+                .unwrap();
+            txn.commit(&cx).await.unwrap();
+
+            conn.invalidate_cached_write_txn(&cx).await;
+            conn.invalidate_cached_read_snapshot(&cx).await;
+            for pragma in ["quick_check", "integrity_check"] {
+                let rows = conn.query(&format!("PRAGMA {pragma};")).await.unwrap();
+                assert_eq!(rows.len(), 1, "{pragma} should return one result row");
+                let SqliteValue::Text(message) = &rows[0].values()[0] else {
+                    panic!("{pragma} should return a text diagnostic row");
+                };
+                assert!(
+                    message.contains("empty non-root B-tree page"),
+                    "unexpected {pragma} diagnostic: {message}"
+                );
+            }
         });
     }
 
