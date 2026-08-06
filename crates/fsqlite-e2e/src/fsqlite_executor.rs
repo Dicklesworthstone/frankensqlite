@@ -2773,10 +2773,10 @@ fn parse_value(s: &str) -> SqliteValue {
     if let Ok(i) = s.parse::<i64>() {
         return SqliteValue::Integer(i);
     }
-    if let Ok(f) = s.parse::<f64>() {
-        if f.is_finite() {
-            return SqliteValue::Float(f);
-        }
+    if let Ok(f) = s.parse::<f64>()
+        && f.is_finite()
+    {
+        return SqliteValue::Float(f);
     }
     SqliteValue::Text(s.into())
 }

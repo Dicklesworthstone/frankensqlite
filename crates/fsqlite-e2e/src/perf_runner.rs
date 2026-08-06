@@ -4141,13 +4141,13 @@ fn build_hot_path_causal_classification(
     }
     if let Some(runner_up) = &runner_up {
         push_mapped_beads(&mut mixed_beads, &runner_up.mapped_beads);
-        if let Some(evidence) = runner_up.evidence.first() {
-            if !mixed_evidence.iter().any(|existing| {
+        if let Some(evidence) = runner_up.evidence.first()
+            && !mixed_evidence.iter().any(|existing| {
                 existing.artifact == evidence.artifact
                     && existing.metric_path == evidence.metric_path
-            }) {
-                mixed_evidence.push(evidence.clone());
-            }
+            })
+        {
+            mixed_evidence.push(evidence.clone());
         }
     }
     let mixed_time_ns = if mixed_or_ambiguous {

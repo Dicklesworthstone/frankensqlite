@@ -246,15 +246,14 @@ pub fn verify_sqlite_result(
                     result.scenario_name
                 ));
             }
-            if let Some(min_rows) = min_surviving_rows {
-                if let Some(recovered) = result.rows_recovered {
-                    if recovered < *min_rows {
-                        return Err(format!(
-                            "{}: expected at least {min_rows} surviving rows, got {recovered}",
-                            result.scenario_name
-                        ));
-                    }
-                }
+            if let Some(min_rows) = min_surviving_rows
+                && let Some(recovered) = result.rows_recovered
+                && recovered < *min_rows
+            {
+                return Err(format!(
+                    "{}: expected at least {min_rows} surviving rows, got {recovered}",
+                    result.scenario_name
+                ));
             }
         }
         ExpectedSqliteBehavior::DataLoss { max_recovered_rows } => {
@@ -271,13 +270,13 @@ pub fn verify_sqlite_result(
                         result.scenario_name
                     ));
                 }
-                if let Some(max) = max_recovered_rows {
-                    if recovered > *max {
-                        return Err(format!(
-                            "{}: expected at most {max} recovered rows, got {recovered}",
-                            result.scenario_name
-                        ));
-                    }
+                if let Some(max) = max_recovered_rows
+                    && recovered > *max
+                {
+                    return Err(format!(
+                        "{}: expected at most {max} recovered rows, got {recovered}",
+                        result.scenario_name
+                    ));
                 }
             }
         }

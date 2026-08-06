@@ -238,23 +238,23 @@ pub fn run_scenario(scenario: &CorruptionScenario) -> FsqliteRecoveryReport {
     };
 
     // Step 3: Optionally build WAL-FEC sidecar.
-    if scenario.setup_wal_fec {
-        if let Err(e) = build_wal_fec_sidecar(
+    if scenario.setup_wal_fec
+        && let Err(e) = build_wal_fec_sidecar(
             &wal_path,
             &info,
             &original_pages,
             scenario.setup_repair_symbols,
-        ) {
-            return FsqliteRecoveryReport {
-                scenario_name: scenario.name,
-                passed: false,
-                verdict: format!("sidecar build failed: {e}"),
-                corruption_report: None,
-                recovery_log: None,
-                recovery_succeeded: false,
-                pages_recovered: 0,
-            };
-        }
+        )
+    {
+        return FsqliteRecoveryReport {
+            scenario_name: scenario.name,
+            passed: false,
+            verdict: format!("sidecar build failed: {e}"),
+            corruption_report: None,
+            recovery_log: None,
+            recovery_succeeded: false,
+            pages_recovered: 0,
+        };
     }
 
     // Step 4: Inject corruption.
@@ -349,10 +349,10 @@ fn inject_scenario_corruption(
     // DB corruption scenarios must operate on real database pages.  When WAL
     // mode is active, recent writes can live only in the WAL until checkpoint.
     // Checkpoint before corrupting the DB file so page 2+ exists as expected.
-    if scenario.target == CorruptionTarget::Database {
-        if let Ok(conn) = rusqlite::Connection::open(db_path) {
-            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        }
+    if scenario.target == CorruptionTarget::Database
+        && let Ok(conn) = rusqlite::Connection::open(db_path)
+    {
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
     let target_path = match scenario.target {

@@ -262,13 +262,13 @@ fn detect_os() -> String {
     // Try to get kernel version on Linux.
     #[cfg(target_os = "linux")]
     {
-        if let Ok(uname) = std::fs::read_to_string("/proc/version") {
-            if let Some(first_line) = uname.lines().next() {
-                // Extract "Linux X.Y.Z-..." from the proc version string.
-                let parts: Vec<&str> = first_line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    return format!("{} {}", parts[0], parts[2]);
-                }
+        if let Ok(uname) = std::fs::read_to_string("/proc/version")
+            && let Some(first_line) = uname.lines().next()
+        {
+            // Extract "Linux X.Y.Z-..." from the proc version string.
+            let parts: Vec<&str> = first_line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                return format!("{} {}", parts[0], parts[2]);
             }
         }
     }
@@ -280,10 +280,10 @@ fn detect_cpu_model() -> Option<String> {
     {
         if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
             for line in cpuinfo.lines() {
-                if line.starts_with("model name") {
-                    if let Some((_key, val)) = line.split_once(':') {
-                        return Some(val.trim().to_owned());
-                    }
+                if line.starts_with("model name")
+                    && let Some((_key, val)) = line.split_once(':')
+                {
+                    return Some(val.trim().to_owned());
                 }
             }
         }
@@ -299,10 +299,10 @@ fn detect_ram_bytes() -> Option<u64> {
                 if line.starts_with("MemTotal:") {
                     // Format: "MemTotal:       32717852 kB"
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        if let Ok(kb) = parts[1].parse::<u64>() {
-                            return Some(kb * 1024);
-                        }
+                    if parts.len() >= 2
+                        && let Ok(kb) = parts[1].parse::<u64>()
+                    {
+                        return Some(kb * 1024);
                     }
                 }
             }

@@ -460,10 +460,10 @@ pub fn parse_recording_args(args: &[String]) -> Option<RecordingConfig> {
         RecordingConfig::default()
     };
 
-    if let Some(seed_str) = find_flag_value(args, "--record-seed") {
-        if let Ok(s) = seed_str.parse::<u64>() {
-            config.seed = s;
-        }
+    if let Some(seed_str) = find_flag_value(args, "--record-seed")
+        && let Ok(s) = seed_str.parse::<u64>()
+    {
+        config.seed = s;
     }
 
     if let Some(dir) = find_flag_value(args, "--record-output") {

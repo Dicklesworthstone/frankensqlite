@@ -615,10 +615,10 @@ fn discover_fixture_ids(golden_dir: &Path) -> E2eResult<Vec<String>> {
     for entry in std::fs::read_dir(golden_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("db") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                ids.push(stem.to_owned());
-            }
+        if path.extension().and_then(|e| e.to_str()) == Some("db")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            ids.push(stem.to_owned());
         }
     }
     ids.sort();

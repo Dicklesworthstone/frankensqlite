@@ -449,16 +449,15 @@ fn evaluate_benchmark_recovery_probe(
         }
     }
 
-    if let Some(hard_fail_wall_time_micros) = threshold.hard_fail_wall_time_micros {
-        if let Some(value) = measurement.wall_time_micros {
-            if value > hard_fail_wall_time_micros {
-                status = BenchmarkRecoveryStatus::HardFail;
-                findings.push(format!(
-                    "wall {}us breaches the {}us hard-fail ceiling",
-                    value, hard_fail_wall_time_micros
-                ));
-            }
-        }
+    if let Some(hard_fail_wall_time_micros) = threshold.hard_fail_wall_time_micros
+        && let Some(value) = measurement.wall_time_micros
+        && value > hard_fail_wall_time_micros
+    {
+        status = BenchmarkRecoveryStatus::HardFail;
+        findings.push(format!(
+            "wall {}us breaches the {}us hard-fail ceiling",
+            value, hard_fail_wall_time_micros
+        ));
     }
 
     BenchmarkRecoveryAssessment {

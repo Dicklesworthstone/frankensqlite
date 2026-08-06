@@ -692,7 +692,7 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
     const DAYS_IN_MONTH: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
     fn is_leap_year(year: u64) -> bool {
-        (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
     }
 
     fn days_in_year(year: u64) -> u64 {

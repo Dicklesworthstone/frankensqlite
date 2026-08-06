@@ -265,19 +265,19 @@ fn run_wal_corruption_recovery(scenario: &CorruptionScenario, dir: &Path) -> Rec
     };
 
     // Step 3: Optionally build WAL-FEC sidecar.
-    if scenario.setup_wal_fec {
-        if let Err(e) = build_wal_fec_sidecar(
+    if scenario.setup_wal_fec
+        && let Err(e) = build_wal_fec_sidecar(
             &wal_path,
             &info,
             &original_pages,
             scenario.setup_repair_symbols,
-        ) {
-            return make_error_report(
-                scenario.name,
-                &format!("sidecar build failed: {e}"),
-                &scenario.expected_fsqlite,
-            );
-        }
+        )
+    {
+        return make_error_report(
+            scenario.name,
+            &format!("sidecar build failed: {e}"),
+            &scenario.expected_fsqlite,
+        );
     }
 
     // Step 4: Inject corruption.

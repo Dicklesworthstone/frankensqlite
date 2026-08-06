@@ -802,27 +802,27 @@ impl CorruptionInjector {
                 let mut page_min: Option<u32> = None;
                 let mut page_max: Option<u32> = None;
 
-                if let Some(last_full_frame) = end_frame_inclusive {
-                    if start_frame <= last_full_frame {
-                        for frame_idx in start_frame..=last_full_frame {
-                            let frame_start = WAL_HEADER_SIZE + u64::from(frame_idx) * frame_size;
-                            let hdr_start = usize::try_from(frame_start).map_err(|_| {
-                                E2eError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    "frame offset overflow",
-                                ))
-                            })?;
-                            if hdr_start + 4 <= original_len {
-                                let pgno = u32::from_be_bytes(
-                                    data[hdr_start..hdr_start + 4]
-                                        .try_into()
-                                        .unwrap_or([0_u8; 4]),
-                                );
-                                if pgno != 0 {
-                                    affected_pages.push(pgno);
-                                    page_min = Some(page_min.map_or(pgno, |p| p.min(pgno)));
-                                    page_max = Some(page_max.map_or(pgno, |p| p.max(pgno)));
-                                }
+                if let Some(last_full_frame) = end_frame_inclusive
+                    && start_frame <= last_full_frame
+                {
+                    for frame_idx in start_frame..=last_full_frame {
+                        let frame_start = WAL_HEADER_SIZE + u64::from(frame_idx) * frame_size;
+                        let hdr_start = usize::try_from(frame_start).map_err(|_| {
+                            E2eError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "frame offset overflow",
+                            ))
+                        })?;
+                        if hdr_start + 4 <= original_len {
+                            let pgno = u32::from_be_bytes(
+                                data[hdr_start..hdr_start + 4]
+                                    .try_into()
+                                    .unwrap_or([0_u8; 4]),
+                            );
+                            if pgno != 0 {
+                                affected_pages.push(pgno);
+                                page_min = Some(page_min.map_or(pgno, |p| p.min(pgno)));
+                                page_max = Some(page_max.map_or(pgno, |p| p.max(pgno)));
                             }
                         }
                     }

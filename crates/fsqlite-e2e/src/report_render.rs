@@ -1076,20 +1076,21 @@ fn render_scaling_analysis(out: &mut String, cells: &[CellOutcome]) {
         }
 
         // Compute scaling efficiency vs single-threaded baseline.
-        if let Some(&(base_c, base_ops, _)) = sorted.first() {
-            if base_ops > 0.0 && base_c == 1 {
-                let _ = writeln!(out, "\n_Scaling efficiency (vs c=1):_\n");
-                for &(c, ops, _) in &sorted {
-                    if c > 1 {
-                        #[allow(clippy::cast_precision_loss)]
-                        let ideal = base_ops * f64::from(c);
-                        let efficiency = ops / ideal * 100.0;
-                        let _ = writeln!(
-                            out,
-                            "- c={c}: {:.0} ops/s ({:.0}% of linear scaling)",
-                            ops, efficiency
-                        );
-                    }
+        if let Some(&(base_c, base_ops, _)) = sorted.first()
+            && base_ops > 0.0
+            && base_c == 1
+        {
+            let _ = writeln!(out, "\n_Scaling efficiency (vs c=1):_\n");
+            for &(c, ops, _) in &sorted {
+                if c > 1 {
+                    #[allow(clippy::cast_precision_loss)]
+                    let ideal = base_ops * f64::from(c);
+                    let efficiency = ops / ideal * 100.0;
+                    let _ = writeln!(
+                        out,
+                        "- c={c}: {:.0} ops/s ({:.0}% of linear scaling)",
+                        ops, efficiency
+                    );
                 }
             }
         }

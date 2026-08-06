@@ -810,10 +810,10 @@ fn pointer_map_pages(page_size: u32, usable_size: u32, page_count: u32) -> BTree
         if page == pending_byte_page {
             page = page.saturating_add(1);
         }
-        if page <= u64::from(page_count) {
-            if let Ok(page) = u32::try_from(page) {
-                pages.insert(page);
-            }
+        if page <= u64::from(page_count)
+            && let Ok(page) = u32::try_from(page)
+        {
+            pages.insert(page);
         }
         page = page.saturating_add(u64::from(stride));
     }

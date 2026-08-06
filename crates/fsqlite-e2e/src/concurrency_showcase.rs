@@ -481,22 +481,23 @@ fn render_scaling_efficiency(out: &mut String, rows: &[ScalingRow]) {
         let engine_rows: Vec<_> = rows.iter().filter(|r| r.engine == *engine).collect();
         let baseline = engine_rows.iter().find(|r| r.concurrency == 1);
 
-        if let Some(base) = baseline {
-            if base.ops_per_sec > 0.0 && engine_rows.len() > 1 {
-                let _ = writeln!(out, "_Scaling efficiency for {engine} (vs c=1):_\n");
-                for row in &engine_rows {
-                    if row.concurrency > 1 {
-                        let ideal = base.ops_per_sec * f64::from(row.concurrency);
-                        let efficiency = row.ops_per_sec / ideal * 100.0;
-                        let _ = writeln!(
-                            out,
-                            "- c={}: {:.0} ops/s ({:.0}% of linear scaling)",
-                            row.concurrency, row.ops_per_sec, efficiency
-                        );
-                    }
+        if let Some(base) = baseline
+            && base.ops_per_sec > 0.0
+            && engine_rows.len() > 1
+        {
+            let _ = writeln!(out, "_Scaling efficiency for {engine} (vs c=1):_\n");
+            for row in &engine_rows {
+                if row.concurrency > 1 {
+                    let ideal = base.ops_per_sec * f64::from(row.concurrency);
+                    let efficiency = row.ops_per_sec / ideal * 100.0;
+                    let _ = writeln!(
+                        out,
+                        "- c={}: {:.0} ops/s ({:.0}% of linear scaling)",
+                        row.concurrency, row.ops_per_sec, efficiency
+                    );
                 }
-                let _ = writeln!(out);
             }
+            let _ = writeln!(out);
         }
     }
 }

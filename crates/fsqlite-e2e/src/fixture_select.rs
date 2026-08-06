@@ -1971,15 +1971,15 @@ fn passes_secondary_filters(entry: &ManifestEntry, filter: &FixtureFilter) -> bo
     }
 
     // Size range.
-    if let Some(min) = filter.min_size_bytes {
-        if entry.size_bytes < min {
-            return false;
-        }
+    if let Some(min) = filter.min_size_bytes
+        && entry.size_bytes < min
+    {
+        return false;
     }
-    if let Some(max) = filter.max_size_bytes {
-        if entry.size_bytes > max {
-            return false;
-        }
+    if let Some(max) = filter.max_size_bytes
+        && entry.size_bytes > max
+    {
+        return false;
     }
 
     // WAL requirement.
@@ -2230,18 +2230,17 @@ pub fn sync_tags_from_metadata(
     let mut updated = 0;
     for entry in &mut manifest.entries {
         let meta_path = meta_dir.join(format!("{}.json", entry.db_id));
-        if let Ok(content) = std::fs::read_to_string(&meta_path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(tags) = meta.get("tags").and_then(|v| v.as_array()) {
-                    let new_tags: Vec<String> = tags
-                        .iter()
-                        .filter_map(|t| t.as_str().map(str::to_owned))
-                        .collect();
-                    if entry.tags != new_tags {
-                        entry.tags = new_tags;
-                        updated += 1;
-                    }
-                }
+        if let Ok(content) = std::fs::read_to_string(&meta_path)
+            && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(tags) = meta.get("tags").and_then(|v| v.as_array())
+        {
+            let new_tags: Vec<String> = tags
+                .iter()
+                .filter_map(|t| t.as_str().map(str::to_owned))
+                .collect();
+            if entry.tags != new_tags {
+                entry.tags = new_tags;
+                updated += 1;
             }
         }
     }

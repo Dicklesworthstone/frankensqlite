@@ -107,15 +107,14 @@ pub fn verify_rusqlite_pragmas(conn: &rusqlite::Connection) -> E2eResult<()> {
     // Cache size is a special case: the sign and exact value matter, but the
     // PRAGMA returns pages (positive) or KiB (negative), depending on input.
     // We check that the effective cache is at least 64 MB (negative form).
-    if let Ok(Some(cache_str)) = query_pragma_rusqlite(conn, "cache_size") {
-        if let Ok(cache_val) = cache_str.parse::<i64>() {
-            // Negative means KiB: -64000 ≈ 64 MB.
-            if cache_val > 0 || cache_val.unsigned_abs() < 60_000 {
-                mismatches.push(format!(
-                    "PRAGMA cache_size: expected <= -60000 (>= 60 MB), got {cache_val}"
-                ));
-            }
-        }
+    if let Ok(Some(cache_str)) = query_pragma_rusqlite(conn, "cache_size")
+        && let Ok(cache_val) = cache_str.parse::<i64>()
+        // Negative means KiB: -64000 ≈ 64 MB.
+        && (cache_val > 0 || cache_val.unsigned_abs() < 60_000)
+    {
+        mismatches.push(format!(
+            "PRAGMA cache_size: expected <= -60000 (>= 60 MB), got {cache_val}"
+        ));
     }
 
     if mismatches.is_empty() {

@@ -904,28 +904,25 @@ fn collect_triage_hints(path_a: &Path, path_b: &Path) -> Vec<String> {
         if let (Ok(ps_a), Ok(ps_b)) = (
             ca.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0)),
             cb.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0)),
-        ) {
-            if ps_a != ps_b {
-                hints.push(format!("page_size mismatch: {ps_a} vs {ps_b}"));
-            }
+        ) && ps_a != ps_b
+        {
+            hints.push(format!("page_size mismatch: {ps_a} vs {ps_b}"));
         }
         // auto_vacuum mismatch.
         if let (Ok(av_a), Ok(av_b)) = (
             ca.query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0)),
             cb.query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0)),
-        ) {
-            if av_a != av_b {
-                hints.push(format!("auto_vacuum mismatch: {av_a} vs {av_b}"));
-            }
+        ) && av_a != av_b
+        {
+            hints.push(format!("auto_vacuum mismatch: {av_a} vs {av_b}"));
         }
         // journal_mode mismatch.
         if let (Ok(jm_a), Ok(jm_b)) = (
             ca.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)),
             cb.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)),
-        ) {
-            if jm_a != jm_b {
-                hints.push(format!("journal_mode mismatch: {jm_a} vs {jm_b}"));
-            }
+        ) && jm_a != jm_b
+        {
+            hints.push(format!("journal_mode mismatch: {jm_a} vs {jm_b}"));
         }
     }
 

@@ -601,12 +601,12 @@ fn execute_sql_stmt(
                         "expected error, but query succeeded: `{trimmed}`"
                     )));
                 }
-                if let Some(ExpectedResult::RowCount(n)) = expected {
-                    if rc != *n {
-                        return Err(OpError::Fatal(format!(
-                            "rowcount mismatch: expected {n}, got {rc} for `{trimmed}`"
-                        )));
-                    }
+                if let Some(ExpectedResult::RowCount(n)) = expected
+                    && rc != *n
+                {
+                    return Err(OpError::Fatal(format!(
+                        "rowcount mismatch: expected {n}, got {rc} for `{trimmed}`"
+                    )));
                 }
                 Ok(())
             }
@@ -626,12 +626,12 @@ fn execute_sql_stmt(
                         "expected error, but statement succeeded: `{trimmed}`"
                     )));
                 }
-                if let Some(ExpectedResult::AffectedRows(n)) = expected {
-                    if affected != *n {
-                        return Err(OpError::Fatal(format!(
-                            "affected mismatch: expected {n}, got {affected} for `{trimmed}`"
-                        )));
-                    }
+                if let Some(ExpectedResult::AffectedRows(n)) = expected
+                    && affected != *n
+                {
+                    return Err(OpError::Fatal(format!(
+                        "affected mismatch: expected {n}, got {affected} for `{trimmed}`"
+                    )));
                 }
                 Ok(())
             }
@@ -679,12 +679,12 @@ fn execute_structured_insert(
                     "expected error, but statement succeeded: `{sql}`"
                 )));
             }
-            if let Some(ExpectedResult::AffectedRows(n)) = expected {
-                if affected != *n {
-                    return Err(OpError::Fatal(format!(
-                        "affected mismatch: expected {n}, got {affected} for `{sql}`"
-                    )));
-                }
+            if let Some(ExpectedResult::AffectedRows(n)) = expected
+                && affected != *n
+            {
+                return Err(OpError::Fatal(format!(
+                    "affected mismatch: expected {n}, got {affected} for `{sql}`"
+                )));
             }
             Ok(())
         }
@@ -731,12 +731,12 @@ fn execute_structured_update(
                     "expected error, but statement succeeded: `{sql}`"
                 )));
             }
-            if let Some(ExpectedResult::AffectedRows(n)) = expected {
-                if affected != *n {
-                    return Err(OpError::Fatal(format!(
-                        "affected mismatch: expected {n}, got {affected} for `{sql}`"
-                    )));
-                }
+            if let Some(ExpectedResult::AffectedRows(n)) = expected
+                && affected != *n
+            {
+                return Err(OpError::Fatal(format!(
+                    "affected mismatch: expected {n}, got {affected} for `{sql}`"
+                )));
             }
             Ok(())
         }
@@ -773,10 +773,10 @@ fn parse_sql_value(s: &str) -> Value {
     if let Ok(i) = s.parse::<i64>() {
         return Value::Integer(i);
     }
-    if let Ok(f) = s.parse::<f64>() {
-        if f.is_finite() {
-            return Value::Real(f);
-        }
+    if let Ok(f) = s.parse::<f64>()
+        && f.is_finite()
+    {
+        return Value::Real(f);
     }
 
     Value::Text(s.to_owned())
