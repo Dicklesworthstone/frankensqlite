@@ -53456,12 +53456,12 @@ impl Connection {
             // same hook reproduce the pre-fix TOCTOU when the guard is released.
             #[cfg(test)]
             if concurrent_commit_plan.is_some()
-                && matches!(commit_outcome, PhysicalCommitOutcome::Durable { .. })
+                && matches!(&commit_outcome, PhysicalCommitOutcome::Durable { .. })
             {
                 fire_concurrent_commit_window_hook();
             }
 
-            if matches!(commit_outcome, PhysicalCommitOutcome::Durable { .. }) {
+            if matches!(&commit_outcome, PhysicalCommitOutcome::Durable { .. }) {
                 let commit_finalize_seq_start = hot_path_profile_enabled().then(Instant::now);
                 if let Some(plan) = concurrent_commit_plan {
                     // Bug A (#70): file-backed CONCURRENT writes land in the
