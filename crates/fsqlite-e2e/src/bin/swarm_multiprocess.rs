@@ -1031,12 +1031,6 @@ fn recovery_history(
             },
         ),
     ];
-    let schedule_descriptor = format!(
-        "seed={};kill_point={};worker={}",
-        config.seed,
-        marker.kill_point.label(),
-        marker.worker_id
-    );
     let mut history = TransactionHistory {
         schema_version: TRANSACTION_HISTORY_SCHEMA_VERSION.to_owned(),
         run_id: run_id.clone(),
@@ -1047,14 +1041,8 @@ fn recovery_history(
             .unwrap_or_else(|_| "unavailable-at-runtime".to_owned()),
         engine_dirty: env::var("FSQLITE_TEST_ENGINE_DIRTY").is_ok_and(|value| value == "1"),
         workload: HistoryWorkload::Register,
-        schedule: ScheduleProvenance::deterministic(
-            "swarm-multiprocess-parent-kill",
-            format!("recovery-{}", marker.kill_point.label()),
-            sha256_bytes(schedule_descriptor.as_bytes()),
-            format!(
-                "cargo run -p fsqlite-e2e --bin swarm-multiprocess -- --recovery-smoke --seed {}",
-                config.seed
-            ),
+        schedule: ScheduleProvenance::observation_only(
+            "swarm-multiprocess-parent-observed-kill-point",
         ),
         execution_lane_evidence: vec![
             ExecutionLaneEvidence::from_observations(
