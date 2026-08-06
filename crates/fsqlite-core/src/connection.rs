@@ -149483,6 +149483,119 @@ mod tests {
         });
     }
 
+    /// ASCII-only UTF-16 databases are the discriminating fail-closed case.
+    ///
+    /// `test_utf16_database_admission_fails_closed_and_preserves_main_image`
+    /// builds its fixtures from a non-ASCII schema, whose UTF-16 encoding is
+    /// invalid UTF-8. The `parse_record`/`decode_value` TEXT paths would
+    /// therefore reject those fixtures even if the header encoding gate were
+    /// removed, so that keeper cannot tell the gate apart from downstream
+    /// UTF-8 validation. An ASCII-only `sqlite_master` encodes to byte-valid
+    /// UTF-8 with embedded NULs (`t\0a\0b\0l\0e\0`), so nothing after the
+    /// header gate can reject it on decode. This keeper fails the moment
+    /// admission stops consulting the header encoding.
+    #[test]
+    fn test_utf16_ascii_only_schema_admission_fails_closed_across_all_modes() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            for encoding in ["UTF-16le", "UTF-16be"] {
+                let db_path = dir.path().join(format!("ascii_only_{encoding}.db"));
+                let db_str = db_path.to_string_lossy().into_owned();
+                {
+                    let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                    sqlite
+                        .execute_batch(&format!(
+                            "PRAGMA encoding = '{encoding}';
+                             CREATE TABLE ascii_only_t(id INTEGER PRIMARY KEY, value TEXT);
+                             INSERT INTO ascii_only_t VALUES (1, 'plain');"
+                        ))
+                        .unwrap();
+                }
+                let original = std::fs::read(&db_path).unwrap();
+                let header_encoding =
+                    u32::from_be_bytes(original[56..60].try_into().expect("encoding bytes"));
+                let expected_encoding = if encoding == "UTF-16le" { 2 } else { 3 };
+                assert_eq!(header_encoding, expected_encoding);
+
+                // Prove the fixture actually exercises the fail-open shape:
+                // the ASCII table name is stored as UTF-16 in `sqlite_master`
+                // and those bytes are byte-valid UTF-8, so no decode-side
+                // validation can stand in for the header encoding gate.
+                let needle: Vec<u8> = "ascii_only_t"
+                    .chars()
+                    .flat_map(|ch| {
+                        let unit = u16::try_from(u32::from(ch)).expect("ASCII fits one code unit");
+                        if encoding == "UTF-16le" {
+                            unit.to_le_bytes()
+                        } else {
+                            unit.to_be_bytes()
+                        }
+                    })
+                    .collect();
+                assert!(
+                    std::str::from_utf8(&needle).is_ok(),
+                    "ASCII-only UTF-16 schema text must be byte-valid UTF-8 for this keeper to discriminate"
+                );
+                assert!(
+                    original
+                        .windows(needle.len())
+                        .any(|window| window == needle.as_slice()),
+                    "fixture must store the ASCII table name as UTF-16 in sqlite_master"
+                );
+
+                let err = Connection::open(&db_str)
+                    .await
+                    .expect_err("ordinary open must reject ASCII-only UTF-16");
+                assert!(matches!(err, FrankenError::Unsupported));
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+
+                let err = Connection::open_existing(&db_str)
+                    .await
+                    .expect_err("existing-only open must reject ASCII-only UTF-16");
+                assert!(matches!(err, FrankenError::Unsupported));
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+
+                let err = Connection::open_schema_only(&db_str)
+                    .await
+                    .expect_err("schema-only open must reject ASCII-only UTF-16");
+                assert!(matches!(err, FrankenError::Unsupported));
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+
+                let err = Connection::import_bytes(&original)
+                    .await
+                    .expect_err("in-memory import must reject ASCII-only UTF-16");
+                assert!(matches!(err, FrankenError::Unsupported));
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+
+                let parent = Connection::open(":memory:").await.unwrap();
+                let attach_path = db_str.replace('\'', "''");
+                let attach_err = parent
+                    .execute(&format!(
+                        "ATTACH DATABASE '{attach_path}' AS ascii_only_utf16;"
+                    ))
+                    .await
+                    .expect_err("ATTACH must reject an ASCII-only UTF-16 database");
+                assert!(matches!(attach_err, FrankenError::Unsupported));
+                assert!(
+                    parent
+                        .attached_schemas
+                        .borrow()
+                        .find("ascii_only_utf16")
+                        .is_none(),
+                    "failed ASCII-only UTF-16 ATTACH must not publish the schema name"
+                );
+                assert!(
+                    !parent
+                        .attached_connections
+                        .borrow()
+                        .contains_key(&attached_schema_key("ascii_only_utf16")),
+                    "failed ASCII-only UTF-16 ATTACH must not retain the child connection"
+                );
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+            }
+        });
+    }
+
     #[test]
     fn test_import_bytes_rejects_empty_database_image() {
         asupersync::test_utils::run_test(|| async {

@@ -912,13 +912,27 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
         if shm.exists() {
             expected_names.insert(shm.file_name().expect("SHM file name").to_owned());
         }
+        #[cfg(windows)]
+        {
+            for artifact in [&path, &wal, &wal_certificate] {
+                for suffix in ["-lock-shared", "-lock-reserved", "-lock-pending"] {
+                    let lock_sidecar = suffixed_path(artifact, suffix);
+                    expected_names.insert(
+                        lock_sidecar
+                            .file_name()
+                            .expect("Windows lock sidecar file name")
+                            .to_owned(),
+                    );
+                }
+            }
+        }
         assert_eq!(
             before
                 .keys()
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>(),
             expected_names,
-            "GH #294 steady-state fixture must contain exactly main, WAL, WAL-certificate, namespace, and any native filesystem-backed SHM artifacts before the read-only open"
+            "GH #294 steady-state fixture must contain exactly main, WAL, WAL-certificate, namespace, and native platform lock/SHM artifacts before the read-only open"
         );
 
         let readonly = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
