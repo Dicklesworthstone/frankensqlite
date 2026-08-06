@@ -5283,12 +5283,14 @@ mod tests {
     #[test]
     fn phase5_missing_policy_gate_is_typed_and_non_authorizing() {
         let mut performance = blocked_missing_authoritative_policy();
-        assert!(validate_phase5_performance_regression_gate(
-            Path::new("."),
-            "a".repeat(40).as_str(),
-            &performance,
-        )
-        .is_ok());
+        assert!(
+            validate_phase5_performance_regression_gate(
+                Path::new("."),
+                "a".repeat(40).as_str(),
+                &performance,
+            )
+            .is_ok()
+        );
         performance.release_authorized = true;
         assert_eq!(
             validate_phase5_performance_regression_gate(

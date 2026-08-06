@@ -168,7 +168,9 @@ pub fn validate_pack(
     validate_commit(&pack.baseline.source_commit, "baseline source commit")?;
     validate_commit(&pack.tested.source_commit, "tested source commit")?;
     if pack.tested.source_commit != expected_tested_commit {
-        return Err("admission pack tested source commit does not match frozen candidate".to_owned());
+        return Err(
+            "admission pack tested source commit does not match frozen candidate".to_owned(),
+        );
     }
     if pack.baseline.source_commit == pack.tested.source_commit {
         return Err("baseline and tested source commits must be distinct".to_owned());
@@ -190,17 +192,23 @@ pub fn validate_pack(
         let baseline = profile_by_name(&pack.baseline, profile)?;
         let tested = profile_by_name(&pack.tested, profile)?;
         if baseline.feature_graph_sha256 != tested.feature_graph_sha256 {
-            return Err(format!("{profile} feature graph hashes must match across B/T"));
+            return Err(format!(
+                "{profile} feature graph hashes must match across B/T"
+            ));
         }
         if baseline.binary_nonce == tested.binary_nonce {
-            return Err(format!("{profile} baseline/tested binary nonces must differ"));
+            return Err(format!(
+                "{profile} baseline/tested binary nonces must differ"
+            ));
         }
     }
     let mut nonces = BTreeSet::new();
     for candidate in [&pack.baseline, &pack.tested] {
         for profile in &candidate.profiles {
             if !nonces.insert(profile.binary_nonce.as_str()) {
-                return Err("binary nonce reuse is forbidden across the B/T admission pack".to_owned());
+                return Err(
+                    "binary nonce reuse is forbidden across the B/T admission pack".to_owned(),
+                );
             }
         }
     }
@@ -213,8 +221,16 @@ pub fn validate_pack(
     }
     for candidate in [&pack.baseline, &pack.tested] {
         for profile in &candidate.profiles {
-            validate_artifact(workspace_root, &profile.raw_report, "raw measurement report")?;
-            validate_artifact(workspace_root, &profile.raw_manifest, "raw measurement manifest")?;
+            validate_artifact(
+                workspace_root,
+                &profile.raw_report,
+                "raw measurement report",
+            )?;
+            validate_artifact(
+                workspace_root,
+                &profile.raw_manifest,
+                "raw measurement manifest",
+            )?;
         }
     }
     Ok(())
@@ -235,7 +251,9 @@ fn validate_candidate(candidate: &CandidateProvenance, label: &str) -> Result<()
         .map(|profile| profile.profile.as_str())
         .collect::<Vec<_>>();
     if profiles != ["release", "release-perf"] {
-        return Err(format!("{label} profiles must be exactly release then release-perf"));
+        return Err(format!(
+            "{label} profiles must be exactly release then release-perf"
+        ));
     }
     for profile in &candidate.profiles {
         if profile.report_schema == LEGACY_REPORT_SCHEMA_V9 {
@@ -262,7 +280,11 @@ fn profile_by_name<'a>(
         .ok_or_else(|| format!("missing required profile `{expected}`"))
 }
 
-fn validate_artifact(workspace_root: &Path, artifact: &ArtifactDigest, label: &str) -> Result<(), String> {
+fn validate_artifact(
+    workspace_root: &Path,
+    artifact: &ArtifactDigest,
+    label: &str,
+) -> Result<(), String> {
     if artifact.digest_algorithm != SHA256_ALGORITHM || !is_lower_hex(&artifact.sha256, 64) {
         return Err(format!("{label} must carry a lowercase sha2-256 digest"));
     }
@@ -279,7 +301,10 @@ fn checked_path(workspace_root: &Path, raw: &str, label: &str) -> Result<PathBuf
     if raw.trim().is_empty()
         || relative.is_absolute()
         || relative.components().any(|component| {
-            matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
         })
     {
         return Err(format!("{label} path must be a non-empty relative path"));
@@ -319,7 +344,10 @@ fn require_ancestor(root: &Path, baseline: &str, tested: &str) -> Result<(), Str
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -340,13 +368,15 @@ mod tests {
     };
 
     fn git(root: &Path, arguments: &[&str]) {
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(arguments)
-            .status()
-            .expect("run git")
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(arguments)
+                .status()
+                .expect("run git")
+                .success()
+        );
     }
 
     fn receipt(root: &Path, path: &str, bytes: &[u8]) -> ArtifactDigest {
@@ -364,8 +394,16 @@ mod tests {
         ProfileEvidence {
             profile: profile.to_owned(),
             report_schema: "fsqlite.performance_admission_measurement.v1".to_owned(),
-            raw_report: receipt(root, &format!("evidence/{side}/{profile}/report.json"), b"report"),
-            raw_manifest: receipt(root, &format!("evidence/{side}/{profile}/manifest.json"), b"manifest"),
+            raw_report: receipt(
+                root,
+                &format!("evidence/{side}/{profile}/report.json"),
+                b"report",
+            ),
+            raw_manifest: receipt(
+                root,
+                &format!("evidence/{side}/{profile}/manifest.json"),
+                b"manifest",
+            ),
             feature_graph_sha256: "e".repeat(64),
             binary_nonce: nonce.to_string().repeat(64),
         }
@@ -378,18 +416,44 @@ mod tests {
                 source_commit: baseline,
                 host_fingerprint_sha256: "a".repeat(64),
                 toolchain_sha256: "b".repeat(64),
-                profiles: vec![profile(root, "baseline", "release", '1'), profile(root, "baseline", "release-perf", '2')],
+                profiles: vec![
+                    profile(root, "baseline", "release", '1'),
+                    profile(root, "baseline", "release-perf", '2'),
+                ],
             },
             tested: CandidateProvenance {
                 source_commit: tested,
                 host_fingerprint_sha256: "a".repeat(64),
                 toolchain_sha256: "b".repeat(64),
-                profiles: vec![profile(root, "tested", "release", '3'), profile(root, "tested", "release-perf", '4')],
+                profiles: vec![
+                    profile(root, "tested", "release", '3'),
+                    profile(root, "tested", "release-perf", '4'),
+                ],
             },
-            policy: receipt(root, "evidence/policy.json", b"test policy; no production acceptance claim"),
-            calibration_receipt: receipt(root, "evidence/calibration.json", b"synthetic calibration receipt"),
-            sensitivity_receipt: receipt(root, "evidence/sensitivity.json", b"synthetic sensitivity receipt"),
-            predicates: AdmissionPredicates { source_provenance: true, strict_ancestry: true, policy_hash: true, raw_evidence_hashes: true, environment_binding: true, calibration_receipt: true, sensitivity_receipt: true },
+            policy: receipt(
+                root,
+                "evidence/policy.json",
+                b"test policy; no production acceptance claim",
+            ),
+            calibration_receipt: receipt(
+                root,
+                "evidence/calibration.json",
+                b"synthetic calibration receipt",
+            ),
+            sensitivity_receipt: receipt(
+                root,
+                "evidence/sensitivity.json",
+                b"synthetic sensitivity receipt",
+            ),
+            predicates: AdmissionPredicates {
+                source_provenance: true,
+                strict_ancestry: true,
+                policy_hash: true,
+                raw_evidence_hashes: true,
+                environment_binding: true,
+                calibration_receipt: true,
+                sensitivity_receipt: true,
+            },
             synthetic_fixture: true,
         }
     }
@@ -399,17 +463,43 @@ mod tests {
         let repo = tempfile::tempdir().expect("repo");
         git(repo.path(), &["init", "--initial-branch=main"]);
         git(repo.path(), &["config", "user.name", "Keeper"]);
-        git(repo.path(), &["config", "user.email", "keeper@example.invalid"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "keeper@example.invalid"],
+        );
         fs::write(repo.path().join("b"), "b").expect("write baseline");
         git(repo.path(), &["add", "b"]);
         git(repo.path(), &["commit", "-m", "baseline"]);
-        let baseline = String::from_utf8(std::process::Command::new("git").arg("-C").arg(repo.path()).args(["rev-parse", "HEAD"]).output().expect("baseline rev").stdout).expect("utf8").trim().to_owned();
+        let baseline = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("baseline rev")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_owned();
         fs::write(repo.path().join("t"), "t").expect("write tested");
         git(repo.path(), &["add", "t"]);
         git(repo.path(), &["commit", "-m", "tested"]);
-        let tested = String::from_utf8(std::process::Command::new("git").arg("-C").arg(repo.path()).args(["rev-parse", "HEAD"]).output().expect("tested rev").stdout).expect("utf8").trim().to_owned();
+        let tested = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("tested rev")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_owned();
         let pack = keeper(repo.path(), baseline, tested.clone());
-        validate_pack(repo.path(), &tested, &pack, true).expect("synthetic keeper should validate only in test mode");
+        validate_pack(repo.path(), &tested, &pack, true)
+            .expect("synthetic keeper should validate only in test mode");
         assert!(validate_pack(repo.path(), &tested, &pack, false).is_err());
     }
 
@@ -420,22 +510,86 @@ mod tests {
         assert!(!gate.release_authorized);
         let mut pack = PerformanceAdmissionPack {
             schema_version: ADMISSION_PACK_SCHEMA_V2.to_owned(),
-            baseline: CandidateProvenance { source_commit: "a".repeat(40), host_fingerprint_sha256: "a".repeat(64), toolchain_sha256: "b".repeat(64), profiles: Vec::new() },
-            tested: CandidateProvenance { source_commit: "b".repeat(40), host_fingerprint_sha256: "a".repeat(64), toolchain_sha256: "b".repeat(64), profiles: Vec::new() },
-            policy: ArtifactDigest { path: "policy".to_owned(), digest_algorithm: "sha2-256".to_owned(), sha256: "c".repeat(64) },
-            calibration_receipt: ArtifactDigest { path: "calibration".to_owned(), digest_algorithm: "sha2-256".to_owned(), sha256: "d".repeat(64) },
-            sensitivity_receipt: ArtifactDigest { path: "sensitivity".to_owned(), digest_algorithm: "sha2-256".to_owned(), sha256: "e".repeat(64) },
-            predicates: AdmissionPredicates { source_provenance: false, strict_ancestry: true, policy_hash: true, raw_evidence_hashes: true, environment_binding: true, calibration_receipt: true, sensitivity_receipt: true },
+            baseline: CandidateProvenance {
+                source_commit: "a".repeat(40),
+                host_fingerprint_sha256: "a".repeat(64),
+                toolchain_sha256: "b".repeat(64),
+                profiles: Vec::new(),
+            },
+            tested: CandidateProvenance {
+                source_commit: "b".repeat(40),
+                host_fingerprint_sha256: "a".repeat(64),
+                toolchain_sha256: "b".repeat(64),
+                profiles: Vec::new(),
+            },
+            policy: ArtifactDigest {
+                path: "policy".to_owned(),
+                digest_algorithm: "sha2-256".to_owned(),
+                sha256: "c".repeat(64),
+            },
+            calibration_receipt: ArtifactDigest {
+                path: "calibration".to_owned(),
+                digest_algorithm: "sha2-256".to_owned(),
+                sha256: "d".repeat(64),
+            },
+            sensitivity_receipt: ArtifactDigest {
+                path: "sensitivity".to_owned(),
+                digest_algorithm: "sha2-256".to_owned(),
+                sha256: "e".repeat(64),
+            },
+            predicates: AdmissionPredicates {
+                source_provenance: false,
+                strict_ancestry: true,
+                policy_hash: true,
+                raw_evidence_hashes: true,
+                environment_binding: true,
+                calibration_receipt: true,
+                sensitivity_receipt: true,
+            },
             synthetic_fixture: false,
         };
         assert!(validate_pack(Path::new("."), &pack.tested.source_commit, &pack, false).is_err());
         pack.predicates.source_provenance = true;
-        pack.baseline.profiles = vec![ProfileEvidence { profile: "release".to_owned(), report_schema: "fsqlite-e2e.mt_mvcc_bench_report.v9".to_owned(), raw_report: pack.policy.clone(), raw_manifest: pack.policy.clone(), feature_graph_sha256: "f".repeat(64), binary_nonce: "1".repeat(64) }, ProfileEvidence { profile: "release-perf".to_owned(), report_schema: "x".to_owned(), raw_report: pack.policy.clone(), raw_manifest: pack.policy.clone(), feature_graph_sha256: "f".repeat(64), binary_nonce: "2".repeat(64) }];
+        pack.baseline.profiles = vec![
+            ProfileEvidence {
+                profile: "release".to_owned(),
+                report_schema: "fsqlite-e2e.mt_mvcc_bench_report.v9".to_owned(),
+                raw_report: pack.policy.clone(),
+                raw_manifest: pack.policy.clone(),
+                feature_graph_sha256: "f".repeat(64),
+                binary_nonce: "1".repeat(64),
+            },
+            ProfileEvidence {
+                profile: "release-perf".to_owned(),
+                report_schema: "x".to_owned(),
+                raw_report: pack.policy.clone(),
+                raw_manifest: pack.policy.clone(),
+                feature_graph_sha256: "f".repeat(64),
+                binary_nonce: "2".repeat(64),
+            },
+        ];
         pack.tested.profiles = pack.baseline.profiles.clone();
         pack.tested.profiles[0].binary_nonce = "3".repeat(64);
         pack.tested.profiles[1].binary_nonce = "4".repeat(64);
         assert!(validate_pack(Path::new("."), &pack.tested.source_commit, &pack, false).is_err());
-        let malformed_authorization = PerformanceAdmissionGate { schema_version: ADMISSION_GATE_SCHEMA_V2.to_owned(), status: "authorized".to_owned(), release_authorized: true, blockers: Vec::new(), rationale: "test".to_owned(), admission_pack: Some(AdmissionPackReference { path: "missing.json".to_owned(), sha256: "0".repeat(64) }) };
-        assert!(validate_gate(Path::new("."), &pack.tested.source_commit, &malformed_authorization).is_err());
+        let malformed_authorization = PerformanceAdmissionGate {
+            schema_version: ADMISSION_GATE_SCHEMA_V2.to_owned(),
+            status: "authorized".to_owned(),
+            release_authorized: true,
+            blockers: Vec::new(),
+            rationale: "test".to_owned(),
+            admission_pack: Some(AdmissionPackReference {
+                path: "missing.json".to_owned(),
+                sha256: "0".repeat(64),
+            }),
+        };
+        assert!(
+            validate_gate(
+                Path::new("."),
+                &pack.tested.source_commit,
+                &malformed_authorization
+            )
+            .is_err()
+        );
     }
 }

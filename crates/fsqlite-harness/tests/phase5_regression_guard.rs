@@ -3,16 +3,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use fsqlite_harness::performance_release_admission::{
+    PerformanceAdmissionGate as PerformanceRegressionGate, blocked_missing_authoritative_policy,
+    validate_gate as validate_performance_admission_gate,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use syn::parse::{ParseStream, Parser};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{Attribute, Expr, Item, Lit, Meta, Token};
-use fsqlite_harness::performance_release_admission::{
-    PerformanceAdmissionGate as PerformanceRegressionGate, blocked_missing_authoritative_policy,
-    validate_gate as validate_performance_admission_gate,
-};
 
 const BEAD_ID: &str = "bd-16e7";
 const LOG_PREFIX: &str = "[REGR_GUARD]";
@@ -3197,7 +3197,11 @@ fn validate_release_evidence_manifest(
         &manifest.tested_commit,
         "persistent/release-perf",
     )?;
-    validate_performance_regression_gate(root, &manifest.tested_commit, &manifest.performance_regression_gate)?;
+    validate_performance_regression_gate(
+        root,
+        &manifest.tested_commit,
+        &manifest.performance_regression_gate,
+    )?;
     validate_command_evidence_shape(&manifest.workspace.execution, "workspace")?;
     validate_command_evidence_commit_paths(
         &manifest.workspace.execution,
@@ -8146,9 +8150,15 @@ fn test_regression_guard_pre_capture_untracked_census_fails_closed() {
 #[test]
 fn test_regression_guard_requires_typed_v2_policy_blocker_when_no_policy_exists() {
     let mut gate = blocked_missing_authoritative_policy();
-    assert!(validate_performance_regression_gate(Path::new("."), "a".repeat(40).as_str(), &gate).is_ok());
+    assert!(
+        validate_performance_regression_gate(Path::new("."), "a".repeat(40).as_str(), &gate)
+            .is_ok()
+    );
     gate.release_authorized = true;
-    assert!(validate_performance_regression_gate(Path::new("."), "a".repeat(40).as_str(), &gate).is_err());
+    assert!(
+        validate_performance_regression_gate(Path::new("."), "a".repeat(40).as_str(), &gate)
+            .is_err()
+    );
 }
 
 #[test]

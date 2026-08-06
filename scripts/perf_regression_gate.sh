@@ -21,7 +21,11 @@ set -euo pipefail
 #
 # The underlying v9 benchmark report is explicitly non-citable. A green result
 # here is useful as a same-environment development guard, but it is not by
-# itself sufficient release evidence.
+# itself sufficient release evidence. The result now carries a typed v2
+# performance-admission blocker so downstream Phase-5 evidence cannot mistake
+# a diagnostic report for authorization. v9 is permanently rejected from v2
+# authorization; an immutable B/T pack, policy hash, raw evidence hashes,
+# calibration receipt, and sensitivity receipt are separate requirements.
 # The 16-writer and scaling margins are required caller inputs because no
 # acceptance-owner values exist yet. Supplying them makes the diagnostic rule
 # explicit; it does not authorize those values or promote the result to release
@@ -261,7 +265,7 @@ if [[ -z "$COMMIT_HASH" || "$COMMIT_HASH" == "unknown" ]]; then
 fi
 MEASUREMENT_MODE="measured"
 
-echo "[$BEAD_ID] Diagnostic-only v9 performance regression guard"
+echo "[$BEAD_ID] Diagnostic-only v9 performance regression guard (v2 authorization rejected)"
 echo "[$BEAD_ID] Commit: $COMMIT_HASH"
 echo "[$BEAD_ID] Rows/thread: $ROWS_PER_THREAD"
 echo "[$BEAD_ID] Iterations: $ITERATIONS"
@@ -2044,6 +2048,16 @@ def v8_run():
         "verdict": "diagnostic_only" if guard_status == "passed" else "failed",
         "release_evidence": False,
         "release_eligible": False,
+        "performance_admission": {
+            "schema_version": "fsqlite.performance_release_admission.v2",
+            "status": "blocked_legacy_v9_report_and_missing_authoritative_policy",
+            "release_authorized": False,
+            "blockers": [
+                "legacy_v9_report_not_authorizing",
+                "missing_authoritative_performance_policy",
+            ],
+            "rationale": "The v9 analyzer is diagnostic-only. It cannot provide the immutable provenance-bound B/T admission pack required by the v2 release contract, and no authoritative acceptance policy artifact is currently supplied.",
+        },
         "absolute_comparisons": comparisons,
         "scaling_comparisons": scaling_comparisons,
     }

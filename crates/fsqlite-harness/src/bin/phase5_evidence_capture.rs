@@ -15,12 +15,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha2::{Digest, Sha256};
 use fsqlite_harness::performance_release_admission::{
     PerformanceAdmissionGate, blocked_missing_authoritative_policy,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const SCHEMA_VERSION: u32 = 3;
 const DIGEST_ALGORITHM: &str = "blake3-256";

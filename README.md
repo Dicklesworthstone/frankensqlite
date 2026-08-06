@@ -2343,16 +2343,16 @@ Coverage guarantee:
     or any other pathological distribution real databases produce.
 ```
 
-This is a proposed calibration design, not the gate implemented on current
-`main`. The repository's current analyzer,
-`scripts/perf_regression_gate.sh`, reports bootstrap confidence intervals and
-explicitly marks its output as not provenance-bound, not release evidence, and
-not release-eligible. No tracked current-main baseline exists from which either
-that analyzer or a conformal test could make a release decision. `bd-zywqc.2`
-tracks the missing baseline, runner, calibration, synthetic-regression, and
-retention evidence; `bd-dqdoe` tracks same-source performance re-verification.
-Until those gates are implemented and satisfied, the project makes no current
-"no performance regression" claim.
+This is a proposed calibration design, not a local acceptance margin. The
+Phase-5 v2 admission mechanics require an immutable B/T pack with full source
+SHAs and strict ancestry, hash-bound policy, reports/manifests, profile/host/
+toolchain/feature-graph/binary provenance, and calibration and sensitivity
+receipts. Legacy v9 diagnostic reports cannot authorize release. No
+authoritative performance-policy artifact is currently tracked, so this is a
+typed fail-closed blocker rather than a release decision. `bd-zywqc.2` tracks
+the remaining baseline and runner work; `bd-dqdoe` tracks same-source
+performance re-verification. The project therefore makes no current "no
+performance regression" claim.
 
 ### Varint Encoding: Huffman-Optimal Integer Compression
 
