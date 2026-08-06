@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 asupersync.workspace = true
 blake3.workspace = true
-fsqlite = { workspace = true }
+fsqlite = { workspace = true, features = ["async-api"] }
 fsqlite-ast = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-parser = { workspace = true }
