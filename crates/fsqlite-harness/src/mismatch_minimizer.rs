@@ -510,6 +510,12 @@ impl HistoryReductionCase {
     /// Validate the canonical history and reducer-owned scheduler dimensions.
     pub fn validate(&self) -> Result<SerializabilityReport, String> {
         let report = check_history(&self.history)?;
+        if self.history.schedule.deterministic_replay_claim() {
+            return Err(
+                "history reduction deterministic schedules require an execution-backed replay adapter"
+                    .to_owned(),
+            );
+        }
         validate_named_values("schedule event", &self.schedule_events)?;
         validate_named_values("yield choice", &self.yield_choices)?;
         if self
@@ -828,9 +834,22 @@ impl HistoryReductionResult {
             return Err("history reduction bundle witness identity drifted".to_owned());
         }
         let mut attached = bundle.clone();
-        attached
+        let reduction_json = self.to_json()?;
+        if let Some(existing) = attached
             .state_snapshots
-            .insert(HISTORY_REDUCTION_SNAPSHOT_KEY.to_owned(), self.to_json()?);
+            .get(HISTORY_REDUCTION_SNAPSHOT_KEY)
+        {
+            if existing != &reduction_json {
+                return Err(
+                    "history reduction bundle already contains different canonical evidence"
+                        .to_owned(),
+                );
+            }
+        } else {
+            attached
+                .state_snapshots
+                .insert(HISTORY_REDUCTION_SNAPSHOT_KEY.to_owned(), reduction_json);
+        }
         if !attached
             .triage_tags
             .iter()
