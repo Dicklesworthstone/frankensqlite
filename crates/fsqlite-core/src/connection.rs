@@ -29477,20 +29477,20 @@ impl Connection {
                 // them per-row during the scan, seeing partially-deleted
                 // state from earlier rows (e.g., DELETE FROM t WHERE val >
                 // (SELECT AVG(val) FROM t) cascades incorrectly).
-                if let Some(wh) = effective_delete.where_clause.as_ref() {
-                    if expr_has_self_referencing_scalar_subquery(
+                if let Some(wh) = effective_delete.where_clause.as_ref()
+                    && expr_has_self_referencing_scalar_subquery(
                         wh,
                         &effective_delete.table.name.name,
                         &self.schema.borrow(),
-                    ) {
-                        let mut rewritten = wh.clone();
-                        self.inline_self_referencing_scalar_subqueries(
-                            &mut rewritten,
-                            &effective_delete.table.name.name,
-                        )
-                        .await?;
-                        effective_delete.where_clause = Some(rewritten);
-                    }
+                    )
+                {
+                    let mut rewritten = wh.clone();
+                    self.inline_self_referencing_scalar_subqueries(
+                        &mut rewritten,
+                        &effective_delete.table.name.name,
+                    )
+                    .await?;
+                    effective_delete.where_clause = Some(rewritten);
                 }
                 if effective_delete.where_clause.as_ref().is_some_and(|wh| {
                     expr_has_self_referencing_correlated_exists(
@@ -31567,21 +31567,20 @@ impl Connection {
                                 if Some(mem_row.0) == explicit_rowid {
                                     continue; // Replacing this rowid.
                                 }
-                                if let Some(existing_val) = mem_row.1.get(i) {
-                                    if cmp_sqlite_values_collated_snapshot(
+                                if let Some(existing_val) = mem_row.1.get(i)
+                                    && cmp_sqlite_values_collated_snapshot(
                                         existing_val,
                                         new_val,
                                         col_info.collation.as_deref(),
                                         &coll_snapshot,
                                     ) == std::cmp::Ordering::Equal
-                                    {
-                                        if *conflict == ConflictAction::Replace {
-                                            conflicting_rowids.insert(mem_row.0);
-                                        } else {
-                                            unique_violation_col = Some(col_info.name.clone());
-                                        }
-                                        break;
+                                {
+                                    if *conflict == ConflictAction::Replace {
+                                        conflicting_rowids.insert(mem_row.0);
+                                    } else {
+                                        unique_violation_col = Some(col_info.name.clone());
                                     }
+                                    break;
                                 }
                             }
                         }
@@ -36226,12 +36225,12 @@ impl Connection {
                 // signed integer ordinals cannot disagree with later ORDER BY
                 // or GROUP BY handling. Arithmetic expressions such as `1+1`
                 // intentionally remain ordinary expressions.
-                if let Some(n) = connection_order_by_integer_ordinal(expr) {
-                    if n < 1 || n > ncol_i {
-                        return Err(FrankenError::FunctionError(format!(
-                            "{kind} term out of range - should be between 1 and {ncol_i}"
-                        )));
-                    }
+                if let Some(n) = connection_order_by_integer_ordinal(expr)
+                    && (n < 1 || n > ncol_i)
+                {
+                    return Err(FrankenError::FunctionError(format!(
+                        "{kind} term out of range - should be between 1 and {ncol_i}"
+                    )));
                 }
                 Ok(())
             };
@@ -46770,13 +46769,12 @@ impl Connection {
                 if let Some(idx) = trigger_idx {
                     let trigger = triggers.remove(idx);
                     drop(triggers);
-                    if !trigger.temporary {
-                        if let Err(err) = self
+                    if !trigger.temporary
+                        && let Err(err) = self
                             .delete_sqlite_master_typed_row("trigger", obj_name)
                             .await
-                        {
-                            swallow_missing_master(err)?;
-                        }
+                    {
+                        swallow_missing_master(err)?;
                     }
                     true
                 } else {
@@ -59956,12 +59954,11 @@ impl Connection {
             });
 
             for (key, row_values) in keyed_rows {
-                if let Some(last_group) = groups.last_mut() {
-                    if group_keys_equal_collated(&last_group.0, &key, &group_collations, &coll_snap)
-                    {
-                        last_group.1.push(row_values);
-                        continue;
-                    }
+                if let Some(last_group) = groups.last_mut()
+                    && group_keys_equal_collated(&last_group.0, &key, &group_collations, &coll_snap)
+                {
+                    last_group.1.push(row_values);
+                    continue;
                 }
                 groups.push((key, vec![row_values]));
             }
@@ -62646,29 +62643,28 @@ impl Connection {
                     left, op, right, ..
                 } => {
                     // IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE
-                    if matches!(op, BinaryOp::Is | BinaryOp::IsNot) {
-                        if let Expr::Literal(lit, _) = right.as_ref() {
-                            if matches!(lit, Literal::True | Literal::False) {
-                                let lv = self
-                                    .eval_expr_with_subqueries(left, row, col_map, params)
-                                    .await?;
-                                let truthy = if lv.is_null() {
-                                    None
-                                } else {
-                                    Some(is_sqlite_truthy(&lv))
-                                };
-                                let is_true_test = matches!(lit, Literal::True);
-                                let is_not = matches!(op, BinaryOp::IsNot);
-                                let result = match truthy {
-                                    Some(t) => {
-                                        let keep = is_true_test != is_not;
-                                        i64::from(if keep { t } else { !t })
-                                    }
-                                    None => i64::from(is_not),
-                                };
-                                return Ok(SqliteValue::Integer(result));
+                    if matches!(op, BinaryOp::Is | BinaryOp::IsNot)
+                        && let Expr::Literal(lit, _) = right.as_ref()
+                        && matches!(lit, Literal::True | Literal::False)
+                    {
+                        let lv = self
+                            .eval_expr_with_subqueries(left, row, col_map, params)
+                            .await?;
+                        let truthy = if lv.is_null() {
+                            None
+                        } else {
+                            Some(is_sqlite_truthy(&lv))
+                        };
+                        let is_true_test = matches!(lit, Literal::True);
+                        let is_not = matches!(op, BinaryOp::IsNot);
+                        let result = match truthy {
+                            Some(t) => {
+                                let keep = is_true_test != is_not;
+                                i64::from(if keep { t } else { !t })
                             }
-                        }
+                            None => i64::from(is_not),
+                        };
+                        return Ok(SqliteValue::Integer(result));
                     }
                     // AND/OR are associative under SQLite three-valued logic.
                     // Nested `Box::pin(async { eval(left).await; eval(right).await })`
@@ -71748,17 +71744,16 @@ impl Connection {
                 }
             }
             fsqlite_ast::InsertSource::Select(sel) => {
-                if let SelectCore::Values(rows) = &sel.body.select {
-                    if rows.iter().any(|r| r.iter().any(expr_has_any_subquery)) {
-                        let mut new_insert = insert.clone();
-                        let mut new_sel = sel.as_ref().clone();
-                        let mut new_values = rows.clone();
-                        new_values
-                            .replace_rows_preserving_representation(resolve_rows(rows).await?);
-                        new_sel.body.select = SelectCore::Values(new_values);
-                        new_insert.source = fsqlite_ast::InsertSource::Select(Box::new(new_sel));
-                        return Ok(Cow::Owned(new_insert));
-                    }
+                if let SelectCore::Values(rows) = &sel.body.select
+                    && rows.iter().any(|r| r.iter().any(expr_has_any_subquery))
+                {
+                    let mut new_insert = insert.clone();
+                    let mut new_sel = sel.as_ref().clone();
+                    let mut new_values = rows.clone();
+                    new_values.replace_rows_preserving_representation(resolve_rows(rows).await?);
+                    new_sel.body.select = SelectCore::Values(new_values);
+                    new_insert.source = fsqlite_ast::InsertSource::Select(Box::new(new_sel));
+                    return Ok(Cow::Owned(new_insert));
                 }
                 Ok(Cow::Borrowed(insert))
             }
@@ -72255,13 +72250,11 @@ impl Connection {
             Ok((rows, changes, last_insert_rowid)) => {
                 *self.last_replace_victims.borrow_mut() = replace_victims;
                 self.clear_table_program_error_state();
-                if track_last_insert_rowid {
-                    if let Some(last_insert_rowid) = last_insert_rowid {
-                        // Defer the thread-local sync until the caller records
-                        // statement changes so successful INSERTs only pay one
-                        // change-tracking update on the hot path.
-                        self.set_last_insert_rowid_without_sync(last_insert_rowid);
-                    }
+                if track_last_insert_rowid && let Some(last_insert_rowid) = last_insert_rowid {
+                    // Defer the thread-local sync until the caller records
+                    // statement changes so successful INSERTs only pay one
+                    // change-tracking update on the hot path.
+                    self.set_last_insert_rowid_without_sync(last_insert_rowid);
                 }
                 if invalidate_memdb_count_shortcuts_on_success {
                     self.memdb_storage_count_shortcuts_safe
@@ -74081,78 +74074,78 @@ impl Connection {
                 // Parse FK definitions and UNIQUE column groups from the CREATE TABLE AST.
                 let mut fk_defs = Vec::new();
                 let mut primary_key_constraints = Vec::new();
-                if let Some(create_stmt) = parsed_create_table.as_ref() {
-                    if let CreateTableBody::Columns {
+                if let Some(create_stmt) = parsed_create_table.as_ref()
+                    && let CreateTableBody::Columns {
                         columns: col_defs,
                         constraints,
                     } = &create_stmt.body
-                    {
-                        primary_key_constraints =
-                            collect_primary_key_constraints(col_defs, constraints);
-                        // Column-level FK constraints.
-                        for (i, col) in col_defs.iter().enumerate() {
-                            for c in &col.constraints {
-                                if let ColumnConstraintKind::ForeignKey(fk_clause) = &c.kind {
-                                    fk_defs.push(fk_clause_to_def(
-                                        &[i],
-                                        Some(col.name.clone()),
-                                        fk_clause,
-                                    ));
-                                }
+                {
+                    primary_key_constraints =
+                        collect_primary_key_constraints(col_defs, constraints);
+                    // Column-level FK constraints.
+                    for (i, col) in col_defs.iter().enumerate() {
+                        for c in &col.constraints {
+                            if let ColumnConstraintKind::ForeignKey(fk_clause) = &c.kind {
+                                fk_defs.push(fk_clause_to_def(
+                                    &[i],
+                                    Some(col.name.clone()),
+                                    fk_clause,
+                                ));
                             }
                         }
-                        // Table-level FK constraints.
-                        for tc in constraints {
-                            if let TableConstraintKind::ForeignKey {
-                                columns: fk_cols,
-                                clause,
-                            } = &tc.kind
-                            {
-                                let child_indices: Vec<usize> = fk_cols
-                                    .iter()
-                                    .filter_map(|fk_name| {
-                                        columns
-                                            .iter()
-                                            .position(|c| c.name.eq_ignore_ascii_case(fk_name))
-                                    })
-                                    .collect();
-                                if !child_indices.is_empty() {
-                                    fk_defs.push(fk_clause_to_def(&child_indices, None, clause));
-                                }
+                    }
+                    // Table-level FK constraints.
+                    for tc in constraints {
+                        if let TableConstraintKind::ForeignKey {
+                            columns: fk_cols,
+                            clause,
+                        } = &tc.kind
+                        {
+                            let child_indices: Vec<usize> = fk_cols
+                                .iter()
+                                .filter_map(|fk_name| {
+                                    columns
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(fk_name))
+                                })
+                                .collect();
+                            if !child_indices.is_empty() {
+                                fk_defs.push(fk_clause_to_def(&child_indices, None, clause));
                             }
                         }
+                    }
 
-                        // Use the same canonical, deduplicated slot vector as
-                        // direct CREATE and implicit-index reload. Re-deriving
-                        // groups from raw constraints would revive duplicate
-                        // slots and apply a discarded WR INTEGER-PK term
-                        // collation instead of the column's effective collation.
-                        if let Some(mem_table) = new_db.get_table_mut(real_root_page) {
-                            for slot in bound_table_autoindexes.into_iter().flat_map(
-                                crate::compat_persist::BoundTableAutoindexes::implicit_slots,
-                            ) {
-                                let Some(column_indices) = slot
-                                    .columns()
-                                    .iter()
-                                    .map(|column_name| {
-                                        columns.iter().position(|column| {
-                                            column.name.eq_ignore_ascii_case(column_name)
-                                        })
+                    // Use the same canonical, deduplicated slot vector as
+                    // direct CREATE and implicit-index reload. Re-deriving
+                    // groups from raw constraints would revive duplicate
+                    // slots and apply a discarded WR INTEGER-PK term
+                    // collation instead of the column's effective collation.
+                    if let Some(mem_table) = new_db.get_table_mut(real_root_page) {
+                        for slot in bound_table_autoindexes
+                            .into_iter()
+                            .flat_map(crate::compat_persist::BoundTableAutoindexes::implicit_slots)
+                        {
+                            let Some(column_indices) = slot
+                                .columns()
+                                .iter()
+                                .map(|column_name| {
+                                    columns.iter().position(|column| {
+                                        column.name.eq_ignore_ascii_case(column_name)
                                     })
-                                    .collect::<Option<Vec<_>>>()
-                                else {
-                                    return Err(FrankenError::DatabaseCorrupt {
-                                        detail: format!(
-                                            "canonical autoindex layout for `{name}` references a missing column"
-                                        ),
-                                    });
-                                };
-                                if !column_indices.is_empty() {
-                                    mem_table.add_unique_column_group_with_collations(
-                                        column_indices,
-                                        slot.key_collations().to_vec(),
-                                    );
-                                }
+                                })
+                                .collect::<Option<Vec<_>>>()
+                            else {
+                                return Err(FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "canonical autoindex layout for `{name}` references a missing column"
+                                    ),
+                                });
+                            };
+                            if !column_indices.is_empty() {
+                                mem_table.add_unique_column_group_with_collations(
+                                    column_indices,
+                                    slot.key_collations().to_vec(),
+                                );
                             }
                         }
                     }
@@ -77331,17 +77324,15 @@ fn validate_aggregate_window_misuse(select: &SelectStatement) -> Result<()> {
     validate_function_call_modifiers_in_select(select)?;
 
     // Recursive-CTE: an aggregate in the recursive term is unsupported.
-    if let Some(with) = &select.with {
-        if with.recursive {
-            for cte in &with.ctes {
-                for (_, core) in &cte.query.body.compounds {
-                    if select_core_references_table(core, &cte.name)
-                        && select_core_is_aggregate(core)
-                    {
-                        return Err(FrankenError::FunctionError(
-                            "recursive aggregate queries not supported".to_owned(),
-                        ));
-                    }
+    if let Some(with) = &select.with
+        && with.recursive
+    {
+        for cte in &with.ctes {
+            for (_, core) in &cte.query.body.compounds {
+                if select_core_references_table(core, &cte.name) && select_core_is_aggregate(core) {
+                    return Err(FrankenError::FunctionError(
+                        "recursive aggregate queries not supported".to_owned(),
+                    ));
                 }
             }
         }
@@ -78753,10 +78744,10 @@ fn extract_inner_window_function(expr: &Expr) -> Option<ExtractedWindowFunction>
             else_expr,
             ..
         } => {
-            if let Some(op) = operand {
-                if let Some(r) = extract_inner_window_function(op) {
-                    return Some(r);
-                }
+            if let Some(op) = operand
+                && let Some(r) = extract_inner_window_function(op)
+            {
+                return Some(r);
             }
             for (w, t) in whens {
                 if let Some(r) = extract_inner_window_function(w) {
@@ -88226,16 +88217,16 @@ fn select_has_correlated_join_subquery(select: &SelectStatement) -> bool {
         return false;
     };
     for col in columns {
-        if let ResultColumn::Expr { expr, .. } = col {
-            if expr_has_correlated_join_subquery(expr) {
-                return true;
-            }
-        }
-    }
-    if let Some(wh) = where_clause {
-        if expr_has_correlated_join_subquery(wh) {
+        if let ResultColumn::Expr { expr, .. } = col
+            && expr_has_correlated_join_subquery(expr)
+        {
             return true;
         }
+    }
+    if let Some(wh) = where_clause
+        && expr_has_correlated_join_subquery(wh)
+    {
+        return true;
     }
     for term in &select.order_by {
         if expr_has_correlated_join_subquery(&term.expr) {
@@ -89399,12 +89390,12 @@ fn rewrite_row_value_comparisons(expr: &Expr) -> Expr {
         } => {
             let l = rewrite_row_value_comparisons(left);
             let r = rewrite_row_value_comparisons(right);
-            if let (Expr::RowValue(la, _), Expr::RowValue(ra, _)) = (&l, &r) {
-                if !la.is_empty() && la.len() == ra.len() {
-                    if let Some(expanded) = expand_row_value_comparison(la, ra, *op, *span) {
-                        return expanded;
-                    }
-                }
+            if let (Expr::RowValue(la, _), Expr::RowValue(ra, _)) = (&l, &r)
+                && !la.is_empty()
+                && la.len() == ra.len()
+                && let Some(expanded) = expand_row_value_comparison(la, ra, *op, *span)
+            {
+                return expanded;
             }
             Expr::BinaryOp {
                 left: Box::new(l),
@@ -89437,24 +89428,25 @@ fn rewrite_row_value_comparisons(expr: &Expr) -> Expr {
             // lexicographically via the row-value comparison expansion. (GH #171)
             if let (Expr::RowValue(ea, _), Expr::RowValue(la, _), Expr::RowValue(ha, _)) =
                 (&e2, &low2, &high2)
+                && !ea.is_empty()
+                && ea.len() == la.len()
+                && ea.len() == ha.len()
             {
-                if !ea.is_empty() && ea.len() == la.len() && ea.len() == ha.len() {
-                    let (lo_op, hi_op, combine) = if *not {
-                        (BinaryOp::Lt, BinaryOp::Gt, BinaryOp::Or)
-                    } else {
-                        (BinaryOp::Ge, BinaryOp::Le, BinaryOp::And)
+                let (lo_op, hi_op, combine) = if *not {
+                    (BinaryOp::Lt, BinaryOp::Gt, BinaryOp::Or)
+                } else {
+                    (BinaryOp::Ge, BinaryOp::Le, BinaryOp::And)
+                };
+                if let (Some(lo_cmp), Some(hi_cmp)) = (
+                    expand_row_value_comparison(ea, la, lo_op, *span),
+                    expand_row_value_comparison(ea, ha, hi_op, *span),
+                ) {
+                    return Expr::BinaryOp {
+                        left: Box::new(lo_cmp),
+                        op: combine,
+                        right: Box::new(hi_cmp),
+                        span: *span,
                     };
-                    if let (Some(lo_cmp), Some(hi_cmp)) = (
-                        expand_row_value_comparison(ea, la, lo_op, *span),
-                        expand_row_value_comparison(ea, ha, hi_op, *span),
-                    ) {
-                        return Expr::BinaryOp {
-                            left: Box::new(lo_cmp),
-                            op: combine,
-                            right: Box::new(hi_cmp),
-                            span: *span,
-                        };
-                    }
                 }
             }
             Expr::Between {
@@ -99671,10 +99663,9 @@ fn evaluate_having_value(
             #[cfg(feature = "ext-fts5")]
             if current_application_function_kind(name, aggregate_args_len_for_lookup(args))
                 .is_none()
+                && let Some(value) = eval_fts5_scalar_fallback(name, &arg_values)?
             {
-                if let Some(value) = eval_fts5_scalar_fallback(name, &arg_values)? {
-                    return Ok(value);
-                }
+                return Ok(value);
             }
             let collation = function_argument_collation(args, col_map);
             if let Some(result) =
@@ -114729,10 +114720,10 @@ fn bind_trigger_columns_in_statement(statement: &mut Statement, frame: &TriggerF
                 fsqlite_ast::InsertSource::DefaultValues => {}
             }
             for upsert in &mut insert.upsert {
-                if let Some(target) = &mut upsert.target {
-                    if let Some(where_clause) = &mut target.where_clause {
-                        bind_trigger_prefixed_only_in_expr(where_clause, frame);
-                    }
+                if let Some(target) = &mut upsert.target
+                    && let Some(where_clause) = &mut target.where_clause
+                {
+                    bind_trigger_prefixed_only_in_expr(where_clause, frame);
                 }
                 if let fsqlite_ast::UpsertAction::Update {
                     assignments,
@@ -115234,10 +115225,10 @@ fn bind_trigger_columns_in_expr_inner(
                 return;
             }
             let column_name = col_ref.column.clone();
-            if frame.references_pseudo_column(table_prefix, &column_name) {
-                if let Some(value) = frame.lookup_value(table_prefix, &column_name) {
-                    *expr = value_to_literal_expr(value);
-                }
+            if frame.references_pseudo_column(table_prefix, &column_name)
+                && let Some(value) = frame.lookup_value(table_prefix, &column_name)
+            {
+                *expr = value_to_literal_expr(value);
             }
         }
         Expr::BinaryOp { left, right, .. } => {
@@ -116504,29 +116495,27 @@ struct HashableJoinKey(smallvec::SmallVec<[SqliteValue; 2]>);
 /// Normalize a `SqliteValue` for hash-join comparison: coerce TEXT that
 /// is a valid number to its numeric form (matching `cmp_values` behavior).
 fn normalize_join_key_value(val: &SqliteValue) -> std::borrow::Cow<'_, SqliteValue> {
-    if let SqliteValue::Text(s) = val {
+    if let SqliteValue::Text(s) = val
+        && !s.trim().is_empty()
+    {
         let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            // Try integer first (no decimal point / exponent).
-            let has_decimal = trimmed.bytes().any(|b| matches!(b, b'.' | b'e' | b'E'));
+        // Try integer first (no decimal point / exponent).
+        let has_decimal = trimmed.bytes().any(|b| matches!(b, b'.' | b'e' | b'E'));
+        if !has_decimal && let Ok(v) = trimmed.parse::<i64>() {
+            return std::borrow::Cow::Owned(SqliteValue::Integer(v));
+        }
+        if let Ok(v) = trimmed.parse::<f64>()
+            && v.is_finite()
+        {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
             if !has_decimal {
-                if let Ok(v) = trimmed.parse::<i64>() {
-                    return std::borrow::Cow::Owned(SqliteValue::Integer(v));
+                let truncated = v as i64;
+                #[allow(clippy::float_cmp)]
+                if truncated as f64 == v {
+                    return std::borrow::Cow::Owned(SqliteValue::Integer(truncated));
                 }
             }
-            if let Ok(v) = trimmed.parse::<f64>() {
-                if v.is_finite() {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-                    if !has_decimal {
-                        let truncated = v as i64;
-                        #[allow(clippy::float_cmp)]
-                        if truncated as f64 == v {
-                            return std::borrow::Cow::Owned(SqliteValue::Integer(truncated));
-                        }
-                    }
-                    return std::borrow::Cow::Owned(SqliteValue::Float(v));
-                }
-            }
+            return std::borrow::Cow::Owned(SqliteValue::Float(v));
         }
     }
     std::borrow::Cow::Borrowed(val)
@@ -116784,33 +116773,33 @@ fn execute_hash_join(
     let mut result = Vec::with_capacity(left.len());
     for left_row in left {
         let mut matched = false;
-        if let Some(probe_key) = build_canonical_hash_join_key(left_row, hash_pairs, false) {
-            if let Some(matching_indices) = right_index.get(&probe_key) {
-                for &ri in matching_indices {
-                    let right_row = &right[ri];
-                    let mut combined = Vec::with_capacity(combined_width);
-                    combined.extend_from_slice(left_row);
-                    combined.extend_from_slice(&right_row[..right_width]);
+        if let Some(probe_key) = build_canonical_hash_join_key(left_row, hash_pairs, false)
+            && let Some(matching_indices) = right_index.get(&probe_key)
+        {
+            for &ri in matching_indices {
+                let right_row = &right[ri];
+                let mut combined = Vec::with_capacity(combined_width);
+                combined.extend_from_slice(left_row);
+                combined.extend_from_slice(&right_row[..right_width]);
 
-                    if let Some(residual) = residual {
-                        #[cfg(test)]
-                        FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS
-                            .with(|counter| counter.set(counter.get().wrapping_add(1)));
-                        if !eval_join_predicate(residual, &combined, col_map)? {
-                            continue;
-                        }
-                    }
-                    if using_recheck
-                        .is_some_and(|indices| !eval_using_constraint_indices(indices, &combined))
-                    {
+                if let Some(residual) = residual {
+                    #[cfg(test)]
+                    FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS
+                        .with(|counter| counter.set(counter.get().wrapping_add(1)));
+                    if !eval_join_predicate(residual, &combined, col_map)? {
                         continue;
                     }
+                }
+                if using_recheck
+                    .is_some_and(|indices| !eval_using_constraint_indices(indices, &combined))
+                {
+                    continue;
+                }
 
-                    result.push(combined);
-                    matched = true;
-                    if track_right {
-                        right_matched[ri] = true;
-                    }
+                result.push(combined);
+                matched = true;
+                if track_right {
+                    right_matched[ri] = true;
                 }
             }
         }
@@ -117132,32 +117121,30 @@ fn execute_single_join(
     };
 
     // ── Hash-join fast path for equi-joins (O(n+m) vs O(n*m)) ──
-    if let Some(JoinConstraint::On(expr)) = constraint {
-        if let Some(plan) = plan_hash_join_predicate(expr, col_map, left_width) {
-            if let Some(hash_pairs) = hash_join_pairs_with_modes(&plan.equi_pairs, left_width) {
-                let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
-                #[cfg(test)]
-                FSQLITE_JOIN_HASH_FAST_PATH_HITS
-                    .with(|counter| counter.set(counter.get().wrapping_add(1)));
-                #[cfg(test)]
-                if plan.residual.is_some() {
-                    FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS
-                        .with(|counter| counter.set(counter.get().wrapping_add(1)));
-                }
-                return execute_hash_join(
-                    left,
-                    right,
-                    right_width,
-                    left_width,
-                    kind,
-                    &hash_pairs,
-                    track_right,
-                    plan.residual.as_ref(),
-                    None,
-                    col_map,
-                );
-            }
+    if let Some(JoinConstraint::On(expr)) = constraint
+        && let Some(plan) = plan_hash_join_predicate(expr, col_map, left_width)
+        && let Some(hash_pairs) = hash_join_pairs_with_modes(&plan.equi_pairs, left_width)
+    {
+        let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+        #[cfg(test)]
+        FSQLITE_JOIN_HASH_FAST_PATH_HITS.with(|counter| counter.set(counter.get().wrapping_add(1)));
+        #[cfg(test)]
+        if plan.residual.is_some() {
+            FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS
+                .with(|counter| counter.set(counter.get().wrapping_add(1)));
         }
+        return execute_hash_join(
+            left,
+            right,
+            right_width,
+            left_width,
+            kind,
+            &hash_pairs,
+            track_right,
+            plan.residual.as_ref(),
+            None,
+            col_map,
+        );
     }
     if let Some(JoinConstraint::Using(cols)) = constraint {
         let mut equi_pairs = Vec::with_capacity(cols.len());
@@ -118404,27 +118391,26 @@ fn eval_recursive_cte_direct_expr_sync(
         Expr::BinaryOp {
             left, op, right, ..
         } => {
-            if matches!(op, BinaryOp::Is | BinaryOp::IsNot) {
-                if let Expr::Literal(lit, _) = right.as_ref() {
-                    if matches!(lit, Literal::True | Literal::False) {
-                        let lv = eval_recursive_cte_direct_expr_sync(left, row, col_map, params)?;
-                        let truthy = if lv.is_null() {
-                            None
-                        } else {
-                            Some(is_sqlite_truthy(&lv))
-                        };
-                        let is_true_test = matches!(lit, Literal::True);
-                        let is_not = matches!(op, BinaryOp::IsNot);
-                        let result = match truthy {
-                            Some(t) => {
-                                let keep = is_true_test != is_not;
-                                i64::from(if keep { t } else { !t })
-                            }
-                            None => i64::from(is_not),
-                        };
-                        return Ok(SqliteValue::Integer(result));
+            if matches!(op, BinaryOp::Is | BinaryOp::IsNot)
+                && let Expr::Literal(lit, _) = right.as_ref()
+                && matches!(lit, Literal::True | Literal::False)
+            {
+                let lv = eval_recursive_cte_direct_expr_sync(left, row, col_map, params)?;
+                let truthy = if lv.is_null() {
+                    None
+                } else {
+                    Some(is_sqlite_truthy(&lv))
+                };
+                let is_true_test = matches!(lit, Literal::True);
+                let is_not = matches!(op, BinaryOp::IsNot);
+                let result = match truthy {
+                    Some(t) => {
+                        let keep = is_true_test != is_not;
+                        i64::from(if keep { t } else { !t })
                     }
-                }
+                    None => i64::from(is_not),
+                };
+                return Ok(SqliteValue::Integer(result));
             }
             let l = eval_recursive_cte_direct_expr_sync(left, row, col_map, params)?;
             let r = eval_recursive_cte_direct_expr_sync(right, row, col_map, params)?;
@@ -118720,29 +118706,28 @@ pub(crate) fn eval_join_expr(
             left, op, right, ..
         } => {
             // IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE
-            if matches!(op, BinaryOp::Is | BinaryOp::IsNot) {
-                if let Expr::Literal(lit, _) = right.as_ref() {
-                    if matches!(lit, Literal::True | Literal::False) {
-                        let lv = eval_join_expr(left, row, col_map)?;
-                        let truthy = if lv.is_null() {
-                            None
-                        } else {
-                            Some(is_sqlite_truthy(&lv))
-                        };
-                        let is_true_test = matches!(lit, Literal::True);
-                        let is_not = matches!(op, BinaryOp::IsNot);
-                        let result = match truthy {
-                            Some(t) => {
-                                // IS TRUE / IS NOT FALSE → keep truthiness
-                                // IS FALSE / IS NOT TRUE → invert truthiness
-                                let keep = is_true_test != is_not;
-                                i64::from(if keep { t } else { !t })
-                            }
-                            None => i64::from(is_not),
-                        };
-                        return Ok(SqliteValue::Integer(result));
+            if matches!(op, BinaryOp::Is | BinaryOp::IsNot)
+                && let Expr::Literal(lit, _) = right.as_ref()
+                && matches!(lit, Literal::True | Literal::False)
+            {
+                let lv = eval_join_expr(left, row, col_map)?;
+                let truthy = if lv.is_null() {
+                    None
+                } else {
+                    Some(is_sqlite_truthy(&lv))
+                };
+                let is_true_test = matches!(lit, Literal::True);
+                let is_not = matches!(op, BinaryOp::IsNot);
+                let result = match truthy {
+                    Some(t) => {
+                        // IS TRUE / IS NOT FALSE → keep truthiness
+                        // IS FALSE / IS NOT TRUE → invert truthiness
+                        let keep = is_true_test != is_not;
+                        i64::from(if keep { t } else { !t })
                     }
-                }
+                    None => i64::from(is_not),
+                };
+                return Ok(SqliteValue::Integer(result));
             }
             let lv = eval_join_expr(left, row, col_map)?;
             let rv = eval_join_expr(right, row, col_map)?;
@@ -119319,10 +119304,11 @@ fn resolve_group_by_aliases(
         // Numeric index: GROUP BY 1 → group by the first result column.
         if let Expr::Literal(Literal::Integer(n), _) = expr {
             let idx = usize::try_from(*n).unwrap_or(0);
-            if idx >= 1 && idx <= columns.len() {
-                if let ResultColumn::Expr { expr: col_expr, .. } = &columns[idx - 1] {
-                    *expr = col_expr.clone();
-                }
+            if idx >= 1
+                && idx <= columns.len()
+                && let ResultColumn::Expr { expr: col_expr, .. } = &columns[idx - 1]
+            {
+                *expr = col_expr.clone();
             }
             continue;
         }
@@ -119341,11 +119327,10 @@ fn resolve_group_by_aliases(
                     alias: Some(alias),
                     expr: aliased_expr,
                 } = col
+                    && alias.eq_ignore_ascii_case(name)
                 {
-                    if alias.eq_ignore_ascii_case(name) {
-                        *expr = aliased_expr.clone();
-                        break;
-                    }
+                    *expr = aliased_expr.clone();
+                    break;
                 }
             }
         }
@@ -121097,23 +121082,23 @@ fn extract_temporal_clause(select: &SelectStatement) -> Option<TimeTravelTarget>
 /// MemDatabase snapshot without the VDBE seeing time-travel directives.
 #[allow(clippy::collapsible_match)]
 fn strip_temporal_clauses(select: &mut SelectStatement) {
-    if let SelectCore::Select { ref mut from, .. } = select.body.select {
-        if let Some(from) = from {
+    if let SelectCore::Select { ref mut from, .. } = select.body.select
+        && let Some(from) = from
+    {
+        if let TableOrSubquery::Table {
+            ref mut time_travel,
+            ..
+        } = from.source
+        {
+            *time_travel = None;
+        }
+        for join in &mut from.joins {
             if let TableOrSubquery::Table {
                 ref mut time_travel,
                 ..
-            } = from.source
+            } = join.table
             {
                 *time_travel = None;
-            }
-            for join in &mut from.joins {
-                if let TableOrSubquery::Table {
-                    ref mut time_travel,
-                    ..
-                } = join.table
-                {
-                    *time_travel = None;
-                }
             }
         }
     }
