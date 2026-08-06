@@ -835,10 +835,7 @@ impl HistoryReductionResult {
         }
         let mut attached = bundle.clone();
         let reduction_json = self.to_json()?;
-        if let Some(existing) = attached
-            .state_snapshots
-            .get(HISTORY_REDUCTION_SNAPSHOT_KEY)
-        {
+        if let Some(existing) = attached.state_snapshots.get(HISTORY_REDUCTION_SNAPSHOT_KEY) {
             if existing != &reduction_json {
                 return Err(
                     "history reduction bundle already contains different canonical evidence"

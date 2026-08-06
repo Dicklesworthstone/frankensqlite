@@ -16,6 +16,7 @@ fn swarm_binary() -> PathBuf {
 }
 
 fn run_swarm(args: &[&str]) -> std::process::Output {
+    // ubs:ignore - CARGO_BIN_EXE resolves the trusted test target; argv is not shell-evaluated.
     Command::new(swarm_binary())
         .args(args)
         .output()
@@ -36,8 +37,8 @@ fn p1_swarm_runs_with_minimal_config() {
         &format!("--artifact-root={}", artifact_root.display()),
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{stdout}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("swarm output must be valid JSON");
     assert!(
         parsed.get("schema").is_some(),
         "report must have schema field"
@@ -197,8 +198,8 @@ fn p5_jsonl_lines_contain_required_fields() {
                 "outcome",
             ];
             for line in content.lines().filter(|l| !l.trim().is_empty()) {
-                let parsed: serde_json::Value = serde_json::from_str(line)
-                    .unwrap_or_else(|e| panic!("invalid JSONL: {e}\nline: {line}"));
+                let parsed: serde_json::Value =
+                    serde_json::from_str(line).expect("worker line must be valid JSONL");
                 for field in &required {
                     assert!(
                         parsed.get(*field).is_some(),
@@ -230,8 +231,8 @@ fn p6_recovery_smoke_classifies_precommit_and_acknowledged_kills() {
         "recovery smoke failed: status={}\nstdout={stdout}\nstderr={stderr}",
         output.status
     );
-    let report: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|error| panic!("invalid recovery JSON: {error}\n{stdout}"));
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("recovery output must be valid JSON");
     assert_eq!(
         report["schema"],
         "fsqlite-e2e.swarm-recovery-report.v1"

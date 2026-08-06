@@ -610,6 +610,7 @@ fn run_recovery_scenario(
 ) -> HarnessResult<RecoveryScenarioReport> {
     let marker_path = run_dir.join(format!("recovery_{}.marker.json", kill_point.label()));
     let exe = env::current_exe().map_err(|error| format!("failed to resolve current exe: {error}"))?;
+    // ubs:ignore - current_exe is the trusted harness binary; arguments are not shell-evaluated.
     let mut child = Command::new(exe)
         .arg("--recovery-child")
         .arg("--workers")
@@ -645,7 +646,11 @@ fn run_recovery_scenario(
             return Err(error);
         }
     };
-    validate_recovery_marker(&marker, config, worker_id, kill_point)?;
+    if let Err(error) = validate_recovery_marker(&marker, config, worker_id, kill_point) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     child.kill().map_err(|error| {
         format!(
             "failed to kill recovery child {worker_id} at {}: {error}",
@@ -664,10 +669,7 @@ fn run_recovery_scenario(
     let conn = open_fsqlite(db_path)?;
     configure_fsqlite(&conn, config)?;
     let reopen_concurrent_mode_default = conn.is_concurrent_mode_default();
-    let observed_row_count = query_count(
-        &conn,
-        &format!("SELECT COUNT(*) FROM swarm_rows WHERE id = {}", marker.row_id),
-    )?;
+    let observed_row_count = count_recovery_row(&conn, marker.row_id)?;
     drop(conn);
 
     let wal_sha256 = hash_optional_file(&wal_path(db_path))?;
@@ -685,6 +687,7 @@ fn run_recovery_scenario(
 
     let mut errors = Vec::new();
     let expected_count = i64::from(kill_point.row_must_survive());
+    // ubs:ignore - deterministic row-count evidence, not authentication material.
     if observed_row_count != expected_count {
         errors.push(format!(
             "{} expected row count {expected_count}, observed {observed_row_count}",
@@ -694,6 +697,7 @@ fn run_recovery_scenario(
     if !marker.concurrent_mode_default || !reopen_concurrent_mode_default {
         errors.push("concurrent writer default was not preserved across recovery".to_owned());
     }
+    // ubs:ignore - canonical lane evidence identity, not authentication material.
     if reduction.observation.required_lanes
         != vec![ExecutionLane::MvccRequired, ExecutionLane::RecoveryRequired]
     {
@@ -750,15 +754,17 @@ fn run_recovery_child(config: &RunConfig, child: &RecoveryChildConfig) -> Harnes
         ],
     ))
     .map_err(|error| format!("recovery child insert failed: {error}"))?;
+    // ubs:ignore - deterministic crash phase, not authentication material.
     if child.kill_point == RecoveryKillPoint::AfterCommitAcknowledged {
         fsqlite_e2e::block_on(conn.execute("COMMIT"))
             .map_err(|error| format!("recovery child commit failed: {error}"))?;
     }
+    let pid = std::process::id();
     let marker = RecoveryChildMarker {
         schema: RECOVERY_MARKER_SCHEMA_V1.to_owned(),
         seed: config.seed,
         worker_id: child.worker_id,
-        pid: std::process::id(),
+        pid,
         kill_point: child.kill_point,
         transaction_id,
         row_id,
@@ -830,6 +836,7 @@ fn wait_for_recovery_marker(
 fn decode_recovery_marker(json: &str) -> HarnessResult<RecoveryChildMarker> {
     let marker: RecoveryChildMarker = serde_json::from_str(json)
         .map_err(|error| format!("recovery marker decode failed: {error}"))?;
+    // ubs:ignore - versioned artifact schema, not authentication material.
     if marker.schema != RECOVERY_MARKER_SCHEMA_V1 {
         return Err(format!(
             "unsupported recovery marker schema `{}`",
@@ -848,6 +855,7 @@ fn validate_recovery_marker(
     worker_id: usize,
     kill_point: RecoveryKillPoint,
 ) -> HarnessResult<()> {
+    // ubs:ignore - deterministic replay identity, not authentication material.
     if marker.seed != config.seed
         || marker.worker_id != worker_id
         || marker.kill_point != kill_point
@@ -868,6 +876,21 @@ fn recovery_row_id(seed: u64, worker_id: usize) -> HarnessResult<i64> {
     let worker_component = i64::try_from(worker_id)
         .map_err(|error| format!("recovery worker id overflow: {error}"))?;
     Ok(10_000_000 + seed_component.saturating_mul(100) + worker_component)
+}
+
+fn count_recovery_row(conn: &Connection, row_id: i64) -> HarnessResult<i64> {
+    let rows = fsqlite_e2e::block_on(conn.query_with_params(
+        "SELECT COUNT(*) FROM swarm_rows WHERE id = ?1",
+        &[SqliteValue::Integer(row_id)],
+    ))
+    .map_err(|error| format!("recovery row count failed: {error}"))?;
+    if rows.len() != 1 {
+        return Err(format!(
+            "recovery row count returned {} rows instead of one",
+            rows.len()
+        ));
+    }
+    value_i64(&rows[0], 0)
 }
 
 fn recovery_history(
@@ -1070,13 +1093,14 @@ fn reduce_recovery_history(
         observed_fields,
     };
     let crash_id = format!("process-kill-{}", marker.kill_point.label());
-    let signature = format!(
+    let witness_label = format!(
         "process_kill:{}:ack={}:row_count={observed_row_count}",
         marker.kill_point.label(),
         marker.acknowledgement.label()
     );
     let expected_acknowledgement = marker.acknowledgement.label().to_owned();
     let expected_kill_point = marker.kill_point.label().to_owned();
+    let expected_row_count = observed_row_count.to_string();
     let verify = |candidate: &HistoryReductionCase| {
         if !candidate
             .schedule_events
@@ -1101,7 +1125,7 @@ fn reduce_recovery_history(
             .observed_fields
             .get("row_count")
             .map(String::as_str)
-            != Some(observed_row_count.to_string().as_str())
+            != Some(expected_row_count.as_str())
         {
             return Err("candidate removed the observed recovery row count".to_owned());
         }
@@ -1131,7 +1155,7 @@ fn reduce_recovery_history(
         if !has_crash || !has_restart || !has_terminal {
             return Err("candidate removed the exact process crash witness".to_owned());
         }
-        HistoryReductionObservation::from_case(candidate, signature.clone())
+        HistoryReductionObservation::from_case(candidate, witness_label.clone())
     };
     minimize_history_case(
         &case,
