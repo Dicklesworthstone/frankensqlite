@@ -121306,7 +121306,7 @@ mod tests {
         module_factory_from,
     };
     use fsqlite_pager::{PageCacheQueueKind, TransactionHandle, TransactionMode};
-    use fsqlite_types::cx::Cx;
+    use fsqlite_types::cx::{CancelReason, Cx};
     use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::{SqlLikeFastPathKind, SqlLikeFastPathMatcher, SqliteValue};
