@@ -113,8 +113,29 @@ async fn open(path: &Path, wal: bool) -> Result<Connection, String> {
     Ok(conn)
 }
 
-async fn writer_body(path: &Path, writer_id: usize, wal: bool) -> Result<(), String> {
+async fn disable_retained_autocommit(conn: &Connection) -> Result<(), String> {
+    with_retry("disable retained autocommit", || async {
+        conn.execute("PRAGMA fsqlite.autocommit_retain=OFF;")
+            .await
+            .map(|_| ())
+    })
+    .await?;
+    if query_scalar_i64(conn, "PRAGMA fsqlite.autocommit_retain;").await? != 0 {
+        return Err("retained autocommit must be disabled for this discriminator".to_owned());
+    }
+    Ok(())
+}
+
+async fn writer_body(
+    path: &Path,
+    writer_id: usize,
+    wal: bool,
+    retain_autocommit: bool,
+) -> Result<(), String> {
     let conn = open(path, wal).await?;
+    if !retain_autocommit {
+        disable_retained_autocommit(&conn).await?;
+    }
     for t in 0..TABLES_PER_WRITER {
         // Tables are pre-created in the seed phase so the DDL schema-visibility
         // window does not short-circuit this writer before it builds enough
@@ -158,7 +179,7 @@ async fn integrity_messages(conn: &Connection) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn run_scenario(wal: bool) -> Result<(), String> {
+fn run_scenario(wal: bool, retain_autocommit: bool) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let db_path = dir.path().join("am152.db");
 
@@ -205,7 +226,7 @@ fn run_scenario(wal: bool) -> Result<(), String> {
             let errors = Arc::clone(&errors);
             thread::spawn(move || {
                 asupersync::test_utils::run_test(|| async {
-                    if let Err(e) = writer_body(&path, w, wal).await {
+                    if let Err(e) = writer_body(&path, w, wal, retain_autocommit).await {
                         eprintln!("[writer {w}] FAILED: {e}");
                         errors.fetch_add(1, Ordering::Relaxed);
                     }
@@ -325,7 +346,7 @@ fn run_scenario(wal: bool) -> Result<(), String> {
 fn am152_allocator_race_rollback_journal() {
     // The suspected-vulnerable path: concurrent_mode ON + DELETE journal,
     // where commit-time cross-process conflict detection is empty.
-    match run_scenario(false) {
+    match run_scenario(false, true) {
         Ok(()) => eprintln!("[am152 rollback] clean"),
         Err(e) => panic!("{e}"),
     }
@@ -335,10 +356,422 @@ fn am152_allocator_race_rollback_journal() {
 #[ignore = "am#152 / bd-9inpb stress harness: reproduced+fixed; run on demand with --ignored to validate the page-alias fix"]
 fn am152_allocator_race_wal() {
     // Control: WAL mode has the first-committer-wins page conflict check.
-    match run_scenario(true) {
+    match run_scenario(true, true) {
         Ok(()) => eprintln!("[am152 wal] clean"),
         Err(e) => panic!("{e}"),
     }
+}
+
+/// Negative control for bd-9inpb: this keeps concurrent mode and the same
+/// DELETE-journal contention while explicitly disabling retained autocommit.
+/// Concurrent autocommit normally does not park retained batches, so a firing
+/// difference would expose an unexpected lifecycle divergence rather than by
+/// itself proving retained-autocommit causality.
+#[test]
+#[ignore = "bd-9inpb discriminator: compare implicit DELETE writers with retained autocommit disabled; run with --ignored"]
+fn am152_allocator_race_rollback_journal_without_retained_autocommit() {
+    match run_scenario(false, false) {
+        Ok(()) => eprintln!("[am152 rollback no-retain] clean"),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+// Bounded bd-9inpb discriminator: 128 separate implicit file-backed commits
+// are enough to force repeated EOF growth contention without turning the
+// no-retain control into the full 67,200-commit stress workload.
+const NO_RETAIN_WRITERS: usize = 2;
+const NO_RETAIN_ROWS_PER_WRITER: usize = 64;
+
+async fn bounded_no_retain_writer(
+    path: &Path,
+    writer_id: usize,
+    start_barrier: &Barrier,
+) -> Result<(), String> {
+    let arrival = BarrierArrivalGuard::new(start_barrier);
+    let conn = open(path, false).await?;
+    disable_retained_autocommit(&conn).await?;
+    // Begin the two implicit write streams together so their repeated EOF
+    // allocations contend from the same published baseline. The armed guard
+    // also releases the peer if setup fails before this rendezvous.
+    arrival.arrive();
+    let table = format!("nr_w{writer_id}");
+    for row in 0..NO_RETAIN_ROWS_PER_WRITER {
+        let payload = format!(
+            "nr-w{writer_id}-r{row}-{:0400x}",
+            (writer_id * NO_RETAIN_ROWS_PER_WRITER + row) as u128
+        );
+        with_retry(
+            &format!("bounded no-retain insert {table} r{row}"),
+            || async {
+                conn.query_with_params(
+                    &format!("INSERT INTO {table} (payload) VALUES (?1);"),
+                    &[SqliteValue::Text(payload.clone().into())],
+                )
+                .await
+                .map(|_| ())
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn run_bounded_no_retain_scenario() -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+    let db_path = dir.path().join("am152_no_retain.db");
+
+    let mut seed: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        seed = async {
+            let conn = open(&db_path, false).await?;
+            for writer in 0..NO_RETAIN_WRITERS {
+                conn.execute(&format!(
+                    "CREATE TABLE nr_w{writer} (id INTEGER PRIMARY KEY, payload TEXT);"
+                ))
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+    });
+    seed?;
+
+    let errors = Arc::new(AtomicUsize::new(0));
+    let path = Arc::new(db_path.clone());
+    let start_barrier = Arc::new(Barrier::new(NO_RETAIN_WRITERS));
+    let handles: Vec<_> = (0..NO_RETAIN_WRITERS)
+        .map(|writer| {
+            let errors = Arc::clone(&errors);
+            let path = Arc::clone(&path);
+            let start_barrier = Arc::clone(&start_barrier);
+            thread::spawn(move || {
+                asupersync::test_utils::run_test(|| async {
+                    if let Err(error) =
+                        bounded_no_retain_writer(&path, writer, &start_barrier).await
+                    {
+                        eprintln!("[bounded no-retain writer {writer}] FAILED: {error}");
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            })
+        })
+        .collect();
+    for handle in handles {
+        let _ = handle.join();
+    }
+    let writer_errors = errors.load(Ordering::Relaxed);
+
+    let mut frank: Result<(Vec<String>, Vec<i64>), String> = Err("verify skipped".to_owned());
+    asupersync::test_utils::run_test(|| async {
+        frank = async {
+            let conn = open(&db_path, false).await?;
+            let integrity = integrity_messages(&conn).await?;
+            let mut counts = Vec::with_capacity(NO_RETAIN_WRITERS);
+            for writer in 0..NO_RETAIN_WRITERS {
+                counts.push(
+                    query_scalar_i64(&conn, &format!("SELECT COUNT(*) FROM nr_w{writer};")).await?,
+                );
+            }
+            Ok((integrity, counts))
+        }
+        .await;
+    });
+    let (frank_integrity, frank_counts) = frank?;
+
+    let canonical =
+        rusqlite::Connection::open(&db_path).map_err(|error| format!("rusqlite open: {error}"))?;
+    let rusqlite_integrity: String = canonical
+        .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+        .map_err(|error| format!("rusqlite integrity_check: {error}"))?;
+    let mut canonical_counts = Vec::with_capacity(NO_RETAIN_WRITERS);
+    for writer in 0..NO_RETAIN_WRITERS {
+        canonical_counts.push(
+            canonical
+                .query_row(&format!("SELECT COUNT(*) FROM nr_w{writer};"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|error| format!("rusqlite count nr_w{writer}: {error}"))?,
+        );
+    }
+
+    eprintln!(
+        "[am152 bounded no-retain] writer_errors={writer_errors} frank={frank_integrity:?} canonical={rusqlite_integrity:?} frank_counts={frank_counts:?} canonical_counts={canonical_counts:?}"
+    );
+    let expected = vec![NO_RETAIN_ROWS_PER_WRITER as i64; NO_RETAIN_WRITERS];
+    if writer_errors == 0
+        && frank_integrity == ["ok"]
+        && rusqlite_integrity == "ok"
+        && frank_counts == expected
+        && canonical_counts == expected
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "bounded no-retain discriminator failed: writer_errors={writer_errors} frank={frank_integrity:?} canonical={rusqlite_integrity:?} frank_counts={frank_counts:?} canonical_counts={canonical_counts:?}"
+        ))
+    }
+}
+
+#[test]
+#[ignore = "bd-9inpb discriminator: bounded implicit DELETE writers without retained autocommit; run with --ignored"]
+fn am152_bounded_rollback_journal_without_retained_autocommit() {
+    match run_bounded_no_retain_scenario() {
+        Ok(()) => eprintln!("[am152 bounded no-retain] clean"),
+        Err(error) => panic!("{error}"),
+    }
+}
+
+// Small statement-surface matrix for bd-9inpb.  Each arm uses the same two
+// writers, wide payload, retry budget, and verification; only the route from
+// SQL text to an insert (or the explicit transaction boundary) changes.
+const MATRIX_ROWS_PER_WRITER: usize = 96;
+
+#[derive(Clone, Copy, Debug)]
+enum MatrixInsertSurface {
+    QueryWithParams,
+    ExecuteWithParams,
+    PreparedExecute,
+    ExplicitConcurrent,
+}
+
+impl MatrixInsertSurface {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::QueryWithParams => "query_with_params",
+            Self::ExecuteWithParams => "execute_with_params",
+            Self::PreparedExecute => "prepared_execute",
+            Self::ExplicitConcurrent => "explicit_begin_concurrent",
+        }
+    }
+}
+
+async fn explicit_concurrent_insert_with_retry(
+    conn: &Connection,
+    sql: &str,
+    params: &[SqliteValue],
+    label: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + RETRY_BUDGET;
+    let mut attempt = 0_u32;
+    loop {
+        let result = match conn.execute("BEGIN CONCURRENT;").await {
+            Ok(_) => match conn.execute_with_params(sql, params).await {
+                Ok(_) => conn.execute("COMMIT;").await.map(|_| ()),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if is_transient(&error) && Instant::now() < deadline => {
+                // A failed INSERT or COMMIT can leave the explicit transaction
+                // open.  Roll it back before retrying from a fresh snapshot.
+                let _ = conn.execute("ROLLBACK;").await;
+                attempt = attempt.saturating_add(1);
+                thread::sleep(backoff(attempt));
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK;").await;
+                return Err(format!("{label}: {error}"));
+            }
+        }
+    }
+}
+
+async fn matrix_writer(
+    path: &Path,
+    writer: usize,
+    surface: MatrixInsertSurface,
+    start_barrier: &Barrier,
+) -> Result<(), String> {
+    let arrival = BarrierArrivalGuard::new(start_barrier);
+    let conn = open(path, false).await?;
+    let table = format!("mx_w{writer}");
+    let sql = format!("INSERT INTO {table} (payload) VALUES (?1);");
+    let prepared = if matches!(surface, MatrixInsertSurface::PreparedExecute) {
+        Some(
+            conn.prepare(&sql)
+                .await
+                .map_err(|error| format!("prepare {table}: {error}"))?,
+        )
+    } else {
+        None
+    };
+    arrival.arrive();
+
+    for row in 0..MATRIX_ROWS_PER_WRITER {
+        let payload = SqliteValue::Text(
+            format!(
+                "mx-{surface:?}-w{writer}-r{row}-{:0400x}",
+                writer * 10_000 + row
+            )
+            .into(),
+        );
+        let params = [payload];
+        let label = format!("matrix {} writer {writer} row {row}", surface.label());
+        match surface {
+            MatrixInsertSurface::QueryWithParams => {
+                with_retry(&label, || async {
+                    conn.query_with_params(&sql, &params).await.map(|_| ())
+                })
+                .await?;
+            }
+            MatrixInsertSurface::ExecuteWithParams => {
+                with_retry(&label, || async {
+                    conn.execute_with_params(&sql, &params).await.map(|_| ())
+                })
+                .await?;
+            }
+            MatrixInsertSurface::PreparedExecute => {
+                let prepared = prepared.as_ref().ok_or_else(|| {
+                    "prepared matrix arm started without its prepared statement".to_owned()
+                })?;
+                with_retry(&label, || async {
+                    conn.execute_prepared_with_params(prepared, &params)
+                        .await
+                        .map(|_| ())
+                })
+                .await?;
+            }
+            MatrixInsertSurface::ExplicitConcurrent => {
+                explicit_concurrent_insert_with_retry(&conn, &sql, &params, &label).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_statement_surface_matrix_arm(surface: MatrixInsertSurface) -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|error| format!("tempdir: {error}"))?;
+    let db_path = dir
+        .path()
+        .join(format!("am152_matrix_{}.db", surface.label()));
+
+    let mut seed: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        seed = async {
+            let conn = open(&db_path, false).await?;
+            for writer in 0..NO_RETAIN_WRITERS {
+                conn.execute(&format!(
+                    "CREATE TABLE mx_w{writer} (id INTEGER PRIMARY KEY, payload TEXT);"
+                ))
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+    });
+    seed?;
+
+    let errors = Arc::new(AtomicUsize::new(0));
+    let path = Arc::new(db_path.clone());
+    let start_barrier = Arc::new(Barrier::new(NO_RETAIN_WRITERS));
+    let handles: Vec<_> = (0..NO_RETAIN_WRITERS)
+        .map(|writer| {
+            let errors = Arc::clone(&errors);
+            let path = Arc::clone(&path);
+            let start_barrier = Arc::clone(&start_barrier);
+            thread::spawn(move || {
+                asupersync::test_utils::run_test(|| async {
+                    if let Err(error) = matrix_writer(&path, writer, surface, &start_barrier).await
+                    {
+                        eprintln!(
+                            "[matrix {} writer {writer}] FAILED: {error}",
+                            surface.label()
+                        );
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            })
+        })
+        .collect();
+    for handle in handles {
+        let _ = handle.join();
+    }
+    let writer_errors = errors.load(Ordering::Relaxed);
+
+    let mut frank: Result<(Vec<String>, Vec<i64>), String> = Err("verify skipped".to_owned());
+    asupersync::test_utils::run_test(|| async {
+        frank = async {
+            let conn = open(&db_path, false).await?;
+            let integrity = integrity_messages(&conn).await?;
+            let mut counts = Vec::with_capacity(NO_RETAIN_WRITERS);
+            for writer in 0..NO_RETAIN_WRITERS {
+                counts.push(
+                    query_scalar_i64(&conn, &format!("SELECT COUNT(*) FROM mx_w{writer};")).await?,
+                );
+            }
+            Ok((integrity, counts))
+        }
+        .await;
+    });
+    let (frank_integrity, frank_counts) = frank?;
+
+    let canonical =
+        rusqlite::Connection::open(&db_path).map_err(|error| format!("rusqlite open: {error}"))?;
+    let canonical_integrity: String = canonical
+        .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+        .map_err(|error| format!("rusqlite integrity_check: {error}"))?;
+    let mut canonical_counts = Vec::with_capacity(NO_RETAIN_WRITERS);
+    for writer in 0..NO_RETAIN_WRITERS {
+        canonical_counts.push(
+            canonical
+                .query_row(&format!("SELECT COUNT(*) FROM mx_w{writer};"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|error| format!("rusqlite count mx_w{writer}: {error}"))?,
+        );
+    }
+
+    eprintln!(
+        "[am152 matrix {}] writer_errors={writer_errors} frank={frank_integrity:?} canonical={canonical_integrity:?} frank_counts={frank_counts:?} canonical_counts={canonical_counts:?}",
+        surface.label()
+    );
+    let expected = vec![MATRIX_ROWS_PER_WRITER as i64; NO_RETAIN_WRITERS];
+    if writer_errors == 0
+        && frank_integrity == ["ok"]
+        && canonical_integrity == "ok"
+        && frank_counts == expected
+        && canonical_counts == expected
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "statement-surface matrix {} failed: writer_errors={writer_errors} frank={frank_integrity:?} canonical={canonical_integrity:?} frank_counts={frank_counts:?} canonical_counts={canonical_counts:?}",
+            surface.label()
+        ))
+    }
+}
+
+#[test]
+#[ignore = "bd-9inpb discriminator: bounded statement-surface matrix; run with --ignored"]
+fn am152_statement_surface_query_with_params() {
+    run_statement_surface_matrix_arm(MatrixInsertSurface::QueryWithParams).unwrap_or_else(
+        |error| {
+            panic!("{error}");
+        },
+    );
+}
+
+#[test]
+#[ignore = "bd-9inpb discriminator: bounded statement-surface matrix; run with --ignored"]
+fn am152_statement_surface_execute_with_params() {
+    run_statement_surface_matrix_arm(MatrixInsertSurface::ExecuteWithParams)
+        .unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+#[ignore = "bd-9inpb discriminator: bounded statement-surface matrix; run with --ignored"]
+fn am152_statement_surface_prepared_execute() {
+    run_statement_surface_matrix_arm(MatrixInsertSurface::PreparedExecute)
+        .unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+#[ignore = "bd-9inpb discriminator: bounded statement-surface matrix; run with --ignored"]
+fn am152_statement_surface_explicit_begin_concurrent() {
+    run_statement_surface_matrix_arm(MatrixInsertSurface::ExplicitConcurrent)
+        .unwrap_or_else(|error| panic!("{error}"));
 }
 
 // ===========================================================================
