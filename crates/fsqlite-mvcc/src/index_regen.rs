@@ -767,15 +767,14 @@ pub fn regenerate_index_ops(
                     let has_null = parse_record(&new_key)
                         .map(|fields| fields.iter().any(|v| matches!(v, SqliteValue::Null)))
                         .unwrap_or(false);
-                    if !has_null {
-                        if let Some(conflicting) =
+                    if !has_null
+                        && let Some(conflicting) =
                             unique_checker.check_unique(index_def.index_id, &new_key, rowid)
-                        {
-                            return Err(IndexRegenError::UniqueConstraintViolation {
-                                index_id: index_def.index_id,
-                                conflicting_rowid: conflicting,
-                            });
-                        }
+                    {
+                        return Err(IndexRegenError::UniqueConstraintViolation {
+                            index_id: index_def.index_id,
+                            conflicting_rowid: conflicting,
+                        });
                     }
                 }
 
@@ -803,15 +802,14 @@ pub fn regenerate_index_ops(
                         let has_null = parse_record(&new_key)
                             .map(|fields| fields.iter().any(|v| matches!(v, SqliteValue::Null)))
                             .unwrap_or(false);
-                        if !has_null {
-                            if let Some(conflicting) =
+                        if !has_null
+                            && let Some(conflicting) =
                                 unique_checker.check_unique(index_def.index_id, &new_key, rowid)
-                            {
-                                return Err(IndexRegenError::UniqueConstraintViolation {
-                                    index_id: index_def.index_id,
-                                    conflicting_rowid: conflicting,
-                                });
-                            }
+                        {
+                            return Err(IndexRegenError::UniqueConstraintViolation {
+                                index_id: index_def.index_id,
+                                conflicting_rowid: conflicting,
+                            });
                         }
                     }
 
@@ -1028,19 +1026,25 @@ mod tests {
             regenerate_index_ops(&base, &updates, &indexes, RowId::new(1), &ConflictChecker);
 
         assert!(result.is_err(), "bead_id={BEAD_ID} unique_violation");
-        if let Err(IndexRegenError::UniqueConstraintViolation {
-            index_id,
-            conflicting_rowid,
-        }) = result
-        {
-            assert_eq!(index_id.get(), 40, "bead_id={BEAD_ID} correct_index");
-            assert_eq!(
-                conflicting_rowid.get(),
-                99,
-                "bead_id={BEAD_ID} correct_rowid"
-            );
-        } else {
-            panic!("bead_id={BEAD_ID} wrong error type");
+        match result {
+            Err(IndexRegenError::UniqueConstraintViolation {
+                index_id,
+                conflicting_rowid,
+            }) => {
+                assert_eq!(index_id.get(), 40, "bead_id={BEAD_ID} correct_index");
+                assert_eq!(
+                    conflicting_rowid.get(),
+                    99,
+                    "bead_id={BEAD_ID} correct_rowid"
+                );
+            }
+            other => assert!(
+                matches!(
+                    &other,
+                    Err(IndexRegenError::UniqueConstraintViolation { .. })
+                ),
+                "bead_id={BEAD_ID} wrong error type"
+            ),
         }
     }
 
@@ -1082,26 +1086,34 @@ mod tests {
         assert_eq!(result.ops.len(), 2, "bead_id={BEAD_ID} expr_index");
 
         // Verify the key bytes encode the lowered value.
-        if let IntentOpKind::IndexDelete { key, .. } = &result.ops[0] {
-            let parsed = parse_record(key).unwrap();
-            assert_eq!(
-                parsed,
-                vec![SqliteValue::Text("hello".into())],
-                "bead_id={BEAD_ID} old_key_lower"
-            );
-        } else {
-            panic!("bead_id={BEAD_ID} expected delete");
+        match &result.ops[0] {
+            IntentOpKind::IndexDelete { key, .. } => {
+                let parsed = parse_record(key).unwrap();
+                assert_eq!(
+                    parsed,
+                    vec![SqliteValue::Text("hello".into())],
+                    "bead_id={BEAD_ID} old_key_lower"
+                );
+            }
+            other => assert!(
+                matches!(other, IntentOpKind::IndexDelete { .. }),
+                "bead_id={BEAD_ID} expected delete"
+            ),
         }
 
-        if let IntentOpKind::IndexInsert { key, .. } = &result.ops[1] {
-            let parsed = parse_record(key).unwrap();
-            assert_eq!(
-                parsed,
-                vec![SqliteValue::Text("world".into())],
-                "bead_id={BEAD_ID} new_key_lower"
-            );
-        } else {
-            panic!("bead_id={BEAD_ID} expected insert");
+        match &result.ops[1] {
+            IntentOpKind::IndexInsert { key, .. } => {
+                let parsed = parse_record(key).unwrap();
+                assert_eq!(
+                    parsed,
+                    vec![SqliteValue::Text("world".into())],
+                    "bead_id={BEAD_ID} new_key_lower"
+                );
+            }
+            other => assert!(
+                matches!(other, IntentOpKind::IndexInsert { .. }),
+                "bead_id={BEAD_ID} expected insert"
+            ),
         }
     }
 
@@ -1549,13 +1561,17 @@ mod tests {
         // Key changes because col2 is part of the composite key.
         assert_eq!(result.ops.len(), 2, "bead_id={BEAD_ID} composite_key");
 
-        if let IntentOpKind::IndexInsert { key, .. } = &result.ops[1] {
-            let parsed = parse_record(key).unwrap();
-            assert_eq!(parsed.len(), 2, "bead_id={BEAD_ID} composite_2_cols");
-            assert_eq!(parsed[0], SqliteValue::Text("alice".into()));
-            assert_eq!(parsed[1], SqliteValue::Integer(40));
-        } else {
-            panic!("bead_id={BEAD_ID} expected insert");
+        match &result.ops[1] {
+            IntentOpKind::IndexInsert { key, .. } => {
+                let parsed = parse_record(key).unwrap();
+                assert_eq!(parsed.len(), 2, "bead_id={BEAD_ID} composite_2_cols");
+                assert_eq!(parsed[0], SqliteValue::Text("alice".into()));
+                assert_eq!(parsed[1], SqliteValue::Integer(40));
+            }
+            other => assert!(
+                matches!(other, IntentOpKind::IndexInsert { .. }),
+                "bead_id={BEAD_ID} expected insert"
+            ),
         }
     }
 

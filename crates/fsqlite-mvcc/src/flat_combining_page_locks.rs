@@ -158,7 +158,7 @@ const fn fc_handoff_spin_loops(attempt: u32) -> u32 {
 }
 
 const fn fc_handoff_should_park(attempt: u32) -> bool {
-    attempt >= FC_HANDOFF_PARK_EVERY && attempt % FC_HANDOFF_PARK_EVERY == 0
+    attempt >= FC_HANDOFF_PARK_EVERY && attempt.is_multiple_of(FC_HANDOFF_PARK_EVERY)
 }
 
 const fn fc_handoff_wait(attempt: u32) -> FcHandoffWait {
@@ -367,7 +367,13 @@ impl FcPageLockShard {
         match self.submit(FcOp::TryAcquire { page, txn }) {
             FcOutcome::Acquired => Ok(()),
             FcOutcome::Held(h) => Err(h),
-            other => unreachable!("try_acquire expected Acquired|Held, got {other:?}"),
+            other => {
+                assert!(
+                    matches!(&other, FcOutcome::Acquired | FcOutcome::Held(_)),
+                    "try_acquire expected Acquired|Held, got {other:?}"
+                );
+                Err(txn)
+            }
         }
     }
 
@@ -378,7 +384,13 @@ impl FcPageLockShard {
         match self.submit(FcOp::Release { page, txn }) {
             FcOutcome::Released => true,
             FcOutcome::NotHeld => false,
-            other => unreachable!("release expected Released|NotHeld, got {other:?}"),
+            other => {
+                assert!(
+                    matches!(&other, FcOutcome::Released | FcOutcome::NotHeld),
+                    "release expected Released|NotHeld, got {other:?}"
+                );
+                false
+            }
         }
     }
 
@@ -388,7 +400,13 @@ impl FcPageLockShard {
         match self.submit(FcOp::Holder { page }) {
             FcOutcome::Unlocked => None,
             FcOutcome::HolderIs(h) => Some(h),
-            other => unreachable!("holder expected Unlocked|HolderIs, got {other:?}"),
+            other => {
+                assert!(
+                    matches!(&other, FcOutcome::Unlocked | FcOutcome::HolderIs(_)),
+                    "holder expected Unlocked|HolderIs, got {other:?}"
+                );
+                None
+            }
         }
     }
 

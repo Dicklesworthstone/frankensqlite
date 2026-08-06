@@ -392,20 +392,20 @@ impl WriteCoordinator {
     /// Release the coordinator lease.
     pub fn release_lease(&self, pid: u64) -> bool {
         let mut lease = self.lease.write();
-        if let Some(existing) = &*lease {
-            if existing.holder_pid == pid {
-                let released_lease = *existing;
-                *lease = None;
-                drop(lease);
-                info!(
-                    bead_id = "bd-389e",
-                    pid,
-                    acquired_at = released_lease.acquired_at,
-                    expires_at = released_lease.expires_at,
-                    "coordinator lease released"
-                );
-                return true;
-            }
+        if let Some(existing) = &*lease
+            && existing.holder_pid == pid
+        {
+            let released_lease = *existing;
+            *lease = None;
+            drop(lease);
+            info!(
+                bead_id = "bd-389e",
+                pid,
+                acquired_at = released_lease.acquired_at,
+                expires_at = released_lease.expires_at,
+                "coordinator lease released"
+            );
+            return true;
         }
         false
     }
@@ -464,14 +464,14 @@ impl WriteCoordinator {
             let mut conflict_seq = CommitSeq::new(0);
 
             for &pgno in &req.write_set_summary {
-                if let Some(&committed_seq) = index.get(&pgno) {
-                    if committed_seq.get() > req.begin_seq.get() {
-                        if let Some(pn) = PageNumber::new(pgno) {
-                            conflict_pages.push(pn);
-                        }
-                        if committed_seq.get() > conflict_seq.get() {
-                            conflict_seq = committed_seq;
-                        }
+                if let Some(&committed_seq) = index.get(&pgno)
+                    && committed_seq.get() > req.begin_seq.get()
+                {
+                    if let Some(pn) = PageNumber::new(pgno) {
+                        conflict_pages.push(pn);
+                    }
+                    if committed_seq.get() > conflict_seq.get() {
+                        conflict_seq = committed_seq;
                     }
                 }
             }
@@ -565,14 +565,14 @@ impl WriteCoordinator {
             let mut conflict_seq = CommitSeq::new(0);
 
             for &pgno in &page_set {
-                if let Some(&committed_seq) = index.get(&pgno) {
-                    if committed_seq.get() > req.snapshot.high.get() {
-                        if let Some(pn) = PageNumber::new(pgno) {
-                            conflict_pages.push(pn);
-                        }
-                        if committed_seq.get() > conflict_seq.get() {
-                            conflict_seq = committed_seq;
-                        }
+                if let Some(&committed_seq) = index.get(&pgno)
+                    && committed_seq.get() > req.snapshot.high.get()
+                {
+                    if let Some(pn) = PageNumber::new(pgno) {
+                        conflict_pages.push(pn);
+                    }
+                    if committed_seq.get() > conflict_seq.get() {
+                        conflict_seq = committed_seq;
                     }
                 }
             }
@@ -696,14 +696,14 @@ impl WriteCoordinator {
             let mut conflict_seq = CommitSeq::new(0);
 
             for &pgno in &page_set {
-                if let Some(&committed_seq) = index.get(&pgno) {
-                    if committed_seq.get() > req.snapshot.high.get() {
-                        if let Some(pn) = PageNumber::new(pgno) {
-                            conflict_pages.push(pn);
-                        }
-                        if committed_seq.get() > conflict_seq.get() {
-                            conflict_seq = committed_seq;
-                        }
+                if let Some(&committed_seq) = index.get(&pgno)
+                    && committed_seq.get() > req.snapshot.high.get()
+                {
+                    if let Some(pn) = PageNumber::new(pgno) {
+                        conflict_pages.push(pn);
+                    }
+                    if committed_seq.get() > conflict_seq.get() {
+                        conflict_seq = committed_seq;
                     }
                 }
             }
@@ -969,7 +969,10 @@ mod tests {
                     "marker must be non-zero"
                 );
             }
-            other => panic!("expected Ok, got {other:?}"),
+            other => assert!(
+                matches!(&other, NativePublishResponse::Ok { .. }),
+                "expected Ok, got {other:?}"
+            ),
         }
 
         // The request has no PageData field — the coordinator physically
@@ -1012,7 +1015,10 @@ mod tests {
                 CompatCommitResponse::Ok { commit_seq, .. } => {
                     commit_seqs.push(commit_seq.get());
                 }
-                other => panic!("expected Ok, got {other:?}"),
+                other => assert!(
+                    matches!(&other, CompatCommitResponse::Ok { .. }),
+                    "expected Ok, got {other:?}"
+                ),
             }
         }
 
@@ -1067,7 +1073,10 @@ mod tests {
             CompatCommitResponse::Ok { commit_seq, .. } => {
                 assert!(commit_seq.get() > 0);
             }
-            other => panic!("expected Ok, got {other:?}"),
+            other => assert!(
+                matches!(&other, CompatCommitResponse::Ok { .. }),
+                "expected Ok, got {other:?}"
+            ),
         }
     }
 
@@ -1125,7 +1134,10 @@ mod tests {
                     "missing lease should return explicit lease error"
                 );
             }
-            other => panic!("expected IoError, got {other:?}"),
+            other => assert!(
+                matches!(&other, NativePublishResponse::IoError { .. }),
+                "expected IoError, got {other:?}"
+            ),
         }
     }
 
@@ -1141,7 +1153,10 @@ mod tests {
                     "missing lease should return explicit lease error"
                 );
             }
-            other => panic!("expected IoError, got {other:?}"),
+            other => assert!(
+                matches!(&other, CompatCommitResponse::IoError { .. }),
+                "expected IoError, got {other:?}"
+            ),
         }
     }
 
@@ -1154,7 +1169,13 @@ mod tests {
         let first_resp = coord.compat_commit(&first);
         let first_commit_seq = match first_resp {
             CompatCommitResponse::Ok { commit_seq, .. } => commit_seq,
-            other => panic!("expected first compat commit ok, got {other:?}"),
+            other => {
+                assert!(
+                    matches!(&other, CompatCommitResponse::Ok { .. }),
+                    "expected first compat commit ok, got {other:?}"
+                );
+                return;
+            }
         };
 
         let second = compat_request(2, &[42]);
@@ -1271,7 +1292,10 @@ mod tests {
                     "WAL offset advances by frame_header + page_size per page"
                 );
             }
-            other => panic!("expected Ok, got {other:?}"),
+            other => assert!(
+                matches!(&other, CompatCommitResponse::Ok { .. }),
+                "expected Ok, got {other:?}"
+            ),
         }
 
         // Second commit should start where the first ended.
@@ -1296,7 +1320,10 @@ mod tests {
                     "second commit starts after first"
                 );
             }
-            other => panic!("expected Ok, got {other:?}"),
+            other => assert!(
+                matches!(&other, CompatCommitResponse::Ok { .. }),
+                "expected Ok, got {other:?}"
+            ),
         }
     }
 
@@ -1336,7 +1363,13 @@ mod tests {
 
         let first_commit_seq = match &responses[0] {
             CompatCommitResponse::Ok { commit_seq, .. } => *commit_seq,
-            other => panic!("expected first response Ok, got {other:?}"),
+            other => {
+                assert!(
+                    matches!(other, CompatCommitResponse::Ok { .. }),
+                    "expected first response Ok, got {other:?}"
+                );
+                return;
+            }
         };
 
         match &responses[1] {
@@ -1347,7 +1380,10 @@ mod tests {
                 assert_eq!(conflicting_pages, &vec![PageNumber::new(42).unwrap()]);
                 assert_eq!(*conflicting_commit_seq, first_commit_seq);
             }
-            other => panic!("expected second response Conflict, got {other:?}"),
+            other => assert!(
+                matches!(other, CompatCommitResponse::Conflict { .. }),
+                "expected second response Conflict, got {other:?}"
+            ),
         }
     }
 
@@ -1377,7 +1413,10 @@ mod tests {
                 assert_eq!(wal_offset, 12_345);
                 assert_eq!(commit_seq, CommitSeq::new(11));
             }
-            other => panic!("expected Ok, got {other:?}"),
+            other => assert!(
+                matches!(&other, CompatCommitResponse::Ok { .. }),
+                "expected Ok, got {other:?}"
+            ),
         }
     }
 }

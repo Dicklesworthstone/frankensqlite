@@ -597,16 +597,16 @@ impl DroVolatilityTracker {
                 window_samples = self.windows.len(),
                 trigger,
             );
-            if let Some(previous_certificate) = previous_certificate {
-                if current_certificate.base_radius > previous_certificate.base_radius {
-                    warn!(
-                        target: "fsqlite::ssi::dro",
-                        event = "regime_shift",
-                        old_radius = previous_certificate.base_radius,
-                        new_radius = current_certificate.base_radius,
-                        volatility = current_certificate.base_radius,
-                    );
-                }
+            if let Some(previous_certificate) = previous_certificate
+                && current_certificate.base_radius > previous_certificate.base_radius
+            {
+                warn!(
+                    target: "fsqlite::ssi::dro",
+                    event = "regime_shift",
+                    old_radius = previous_certificate.base_radius,
+                    new_radius = current_certificate.base_radius,
+                    volatility = current_certificate.base_radius,
+                );
             }
         }
         Ok(())

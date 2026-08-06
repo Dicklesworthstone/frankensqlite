@@ -523,11 +523,12 @@ fn check_update_expression_pair(a: &IntentOpKind, b: &IntentOpKind) -> Option<bo
 /// - `MAX(Literal(Integer(c)), ColumnRef(col_idx))`
 #[must_use]
 pub fn is_join_max_int_update(col_idx: ColumnIdx, expr: &RebaseExpr) -> bool {
-    if let RebaseExpr::FunctionCall { name, args } = expr {
-        if name.eq_ignore_ascii_case("MAX") && args.len() == 2 {
-            return is_column_ref_and_int_literal(col_idx, &args[0], &args[1])
-                || is_column_ref_and_int_literal(col_idx, &args[1], &args[0]);
-        }
+    if let RebaseExpr::FunctionCall { name, args } = expr
+        && name.eq_ignore_ascii_case("MAX")
+        && args.len() == 2
+    {
+        return is_column_ref_and_int_literal(col_idx, &args[0], &args[1])
+            || is_column_ref_and_int_literal(col_idx, &args[1], &args[0]);
     }
     false
 }
@@ -547,11 +548,12 @@ fn is_column_ref_and_int_literal(
 /// Returns `None` if the expression is not a valid join-max form.
 #[must_use]
 pub fn extract_join_max_constant(col_idx: ColumnIdx, expr: &RebaseExpr) -> Option<i64> {
-    if let RebaseExpr::FunctionCall { name, args } = expr {
-        if name.eq_ignore_ascii_case("MAX") && args.len() == 2 {
-            return extract_int_constant_pair(col_idx, &args[0], &args[1])
-                .or_else(|| extract_int_constant_pair(col_idx, &args[1], &args[0]));
-        }
+    if let RebaseExpr::FunctionCall { name, args } = expr
+        && name.eq_ignore_ascii_case("MAX")
+        && args.len() == 2
+    {
+        return extract_int_constant_pair(col_idx, &args[0], &args[1])
+            .or_else(|| extract_int_constant_pair(col_idx, &args[1], &args[0]));
     }
     None
 }
@@ -561,10 +563,10 @@ fn extract_int_constant_pair(
     maybe_col: &RebaseExpr,
     maybe_lit: &RebaseExpr,
 ) -> Option<i64> {
-    if matches!(maybe_col, RebaseExpr::ColumnRef(c) if *c == col_idx) {
-        if let RebaseExpr::Literal(SqliteValue::Integer(c)) = maybe_lit {
-            return Some(*c);
-        }
+    if matches!(maybe_col, RebaseExpr::ColumnRef(c) if *c == col_idx)
+        && let RebaseExpr::Literal(SqliteValue::Integer(c)) = maybe_lit
+    {
+        return Some(*c);
     }
     None
 }

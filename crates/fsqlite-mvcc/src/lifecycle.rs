@@ -110,7 +110,7 @@ const fn serialized_drain_spin_loops(attempt: u32) -> u32 {
 
 const fn serialized_drain_should_park(attempt: u32) -> bool {
     attempt >= SERIALIZED_DRAIN_HANDOFF_PARK_EVERY
-        && attempt % SERIALIZED_DRAIN_HANDOFF_PARK_EVERY == 0
+        && attempt.is_multiple_of(SERIALIZED_DRAIN_HANDOFF_PARK_EVERY)
 }
 
 fn perform_serialized_drain_handoff(
@@ -1555,11 +1555,11 @@ impl TransactionManager {
         // FCW freshness validation: check that no pending write page has been
         // committed since our snapshot.
         for &pgno in &pages {
-            if let Some(latest) = self.commit_index.latest(pgno) {
-                if latest > txn.snapshot.high {
-                    self.abort(txn);
-                    return Err(MvccError::BusySnapshot);
-                }
+            if let Some(latest) = self.commit_index.latest(pgno)
+                && latest > txn.snapshot.high
+            {
+                self.abort(txn);
+                return Err(MvccError::BusySnapshot);
             }
         }
 
@@ -1618,10 +1618,10 @@ impl TransactionManager {
         // SmallVec avoids heap allocation for typical transactions (≤8 conflicts).
         let mut conflicts = smallvec::SmallVec::<[PageNumber; 8]>::new();
         for &pgno in &pages {
-            if let Some(latest) = self.commit_index.latest(pgno) {
-                if latest > txn.snapshot.high {
-                    conflicts.push(pgno);
-                }
+            if let Some(latest) = self.commit_index.latest(pgno)
+                && latest > txn.snapshot.high
+            {
+                conflicts.push(pgno);
             }
         }
 

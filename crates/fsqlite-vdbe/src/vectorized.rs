@@ -154,7 +154,7 @@ impl<T> AlignedValues<T> {
         if self.values.is_empty() {
             return true;
         }
-        alignment != 0 && self.address() % alignment == 0
+        alignment != 0 && self.address().is_multiple_of(alignment)
     }
 
     /// Declared alignment contract for this buffer.
@@ -398,7 +398,7 @@ impl ColumnData {
             Self::Float32(values) => values.is_aligned_to(alignment),
             Self::Float64(values) => values.is_aligned_to(alignment),
             Self::Binary { offsets, .. } | Self::Text { offsets, .. } => {
-                alignment != 0 && (offsets.as_ptr() as usize) % alignment == 0
+                alignment != 0 && (offsets.as_ptr() as usize).is_multiple_of(alignment)
             }
         }
     }

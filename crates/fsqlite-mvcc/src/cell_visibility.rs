@@ -916,18 +916,18 @@ impl CellVisibilityLog {
         let current_bytes = arena.cell_data_bytes();
         drop(arena);
 
-        if current_bytes > self.budget_bytes {
-            if let Some(ref cb) = self.materialization_cb {
-                // Find pages with highest delta counts for materialization
-                let pages_to_materialize = self.find_high_delta_pages(10);
-                for (pgno, cell_keys) in pages_to_materialize {
-                    debug!(
-                        pgno = pgno.get(),
-                        cell_count = cell_keys.len(),
-                        "cell_budget_exceeded_materializing"
-                    );
-                    cb(pgno, &cell_keys);
-                }
+        if current_bytes > self.budget_bytes
+            && let Some(ref cb) = self.materialization_cb
+        {
+            // Find pages with highest delta counts for materialization
+            let pages_to_materialize = self.find_high_delta_pages(10);
+            for (pgno, cell_keys) in pages_to_materialize {
+                debug!(
+                    pgno = pgno.get(),
+                    cell_count = cell_keys.len(),
+                    "cell_budget_exceeded_materializing"
+                );
+                cb(pgno, &cell_keys);
             }
         }
     }
@@ -980,12 +980,10 @@ impl CellVisibilityLog {
             .chunks
             .get_mut(idx.chunk as usize)
             .and_then(|c| c.get_mut(idx.offset as usize))
+            && slot.generation.eq(&idx.generation)
+            && let Some(delta) = slot.delta.as_mut()
         {
-            if slot.generation.eq(&idx.generation) {
-                if let Some(ref mut delta) = slot.delta {
-                    delta.commit_seq = commit_seq;
-                }
-            }
+            delta.commit_seq = commit_seq;
         }
     }
 
@@ -1207,13 +1205,11 @@ impl CellVisibilityLog {
                 .chunks
                 .get_mut(idx.chunk as usize)
                 .and_then(|c| c.get_mut(idx.offset as usize))
+                && slot.generation.eq(&idx.generation)
+                && let Some(delta) = slot.delta.as_mut()
             {
-                if slot.generation.eq(&idx.generation) {
-                    if let Some(ref mut delta) = slot.delta {
-                        delta.commit_seq = commit_seq;
-                        committed_count += 1;
-                    }
-                }
+                delta.commit_seq = commit_seq;
+                committed_count += 1;
             }
         }
 
@@ -1405,18 +1401,18 @@ impl CellVisibilityLog {
         }
 
         for idx in their_deltas {
-            if let Some(delta) = arena.get(*idx) {
-                if our_cells.contains(&(delta.page_number, delta.cell_key.key_digest)) {
-                    debug!(
-                        txn_id = txn.id.get(),
-                        other_txn_id = other_txn.id.get(),
-                        pgno = delta.page_number.get(),
-                        "cell_conflict_detected"
-                    );
-                    return CellConflict::Conflict {
-                        with_txn: other_txn,
-                    };
-                }
+            if let Some(delta) = arena.get(*idx)
+                && our_cells.contains(&(delta.page_number, delta.cell_key.key_digest))
+            {
+                debug!(
+                    txn_id = txn.id.get(),
+                    other_txn_id = other_txn.id.get(),
+                    pgno = delta.page_number.get(),
+                    "cell_conflict_detected"
+                );
+                return CellConflict::Conflict {
+                    with_txn: other_txn,
+                };
             }
         }
 
