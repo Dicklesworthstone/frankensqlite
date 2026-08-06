@@ -2479,6 +2479,17 @@ impl ConnectionEnv {
         }
     }
 
+    /// Create a connection environment rooted in a caller-supplied `Cx`.
+    ///
+    /// This is the narrow bridge used by deterministic harnesses: callers own
+    /// the parent capability context, while FrankenSQLite derives its
+    /// connection/runtime regions from that lineage instead of minting a
+    /// detached process-global root.
+    #[must_use]
+    pub fn new_with_root_cx(config: RuntimeConfig, root_cx: &Cx) -> Self {
+        Self::new(Arc::new(RuntimeContext::new_with_root_cx(config, root_cx)))
+    }
+
     /// Enable strict multi-process mode for this connection env. With
     /// strict mode on, the connection refuses to silently proceed past
     /// concurrency contract violations (F_SETLK timeout, freelist
@@ -123057,6 +123068,106 @@ mod tests {
     }
 
     #[test]
+    fn test_open_with_root_cx_env_file_backed_bridge_preserves_runtime_and_lane() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bd-2lt76-1-bridge.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+            let parent_cx = Cx::new().with_trace_context(21_760_001, 0, 0);
+            let env = ConnectionEnv::new_with_root_cx(
+                RuntimeConfig {
+                    worker_threads: 1,
+                    io_poll_strategy: IoPollStrategy::Auto,
+                },
+                &parent_cx,
+            );
+            let runtime = Arc::clone(env.runtime());
+            let conn = Connection::open_with_env(&db_path, env.clone())
+                .await
+                .expect("file-backed bridge connection should open");
+
+            assert!(Arc::ptr_eq(&conn._shared_mvcc_state._runtime, &runtime));
+            assert_ne!(
+                conn.pager_backend_label(),
+                "memory",
+                "bd-2lt76.1 bridge must exercise a production file-backed pager"
+            );
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "bridge must preserve concurrent-writer default"
+            );
+
+            {
+                let state = lock_unpoisoned(&conn._shared_mvcc_state.runtime_state);
+                assert_eq!(
+                    state.regions.parent(conn.runtime_region),
+                    Some(Some(state.db_root_region)),
+                    "connection region should be a child of the explicit-runtime database root"
+                );
+            }
+
+            let root_cx = conn.root_cx().clone();
+            let op_cx = conn.op_cx().expect("operation Cx should derive");
+            assert_ne!(root_cx.trace_id(), 0);
+            assert_eq!(
+                op_cx.trace_id(),
+                root_cx.trace_id(),
+                "operation Cx should inherit the connection trace"
+            );
+            assert_ne!(
+                op_cx.decision_id(),
+                0,
+                "operation Cx should allocate a stable decision id"
+            );
+
+            conn.set_strict_mem_fallback_rejection(true);
+            conn.execute("CREATE TABLE bridge_probe(id INTEGER PRIMARY KEY, v INTEGER);")
+                .await
+                .expect("DDL should use the production execution path");
+            conn.execute("BEGIN;")
+                .await
+                .expect("plain BEGIN should promote under concurrent default");
+            assert!(conn.is_concurrent_transaction());
+            conn.execute("INSERT INTO bridge_probe VALUES (1, 42);")
+                .await
+                .expect("INSERT should traverse the production pager path");
+            conn.execute("COMMIT;")
+                .await
+                .expect("commit should publish through MVCC/WAL");
+            assert!(conn.is_concurrent_mode_default());
+
+            conn.reset_fallback_decision_evidence();
+            let rows = conn
+                .query("SELECT v FROM bridge_probe WHERE id = 1;")
+                .await
+                .expect("SELECT should traverse the production pager path");
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+            let fallback = conn.fallback_decision_snapshot();
+            assert!(
+                fallback.decisions.is_empty(),
+                "bridge proof must fail closed on compatibility fallback: {fallback:?}"
+            );
+            assert!(!fallback.truncated);
+
+            drop(conn);
+
+            let reopened = Connection::open_existing_with_env(&db_path, env)
+                .await
+                .expect("reopen should use the same explicit runtime");
+            assert!(
+                reopened.is_concurrent_mode_default(),
+                "concurrent default must survive reopen"
+            );
+            reopened.set_strict_mem_fallback_rejection(true);
+            let reopened_rows = reopened
+                .query("SELECT v FROM bridge_probe WHERE id = 1;")
+                .await
+                .expect("reopened SELECT should stay on the production pager path");
+            assert_eq!(reopened_rows[0].values()[0], SqliteValue::Integer(42));
+        });
+    }
+
+    #[test]
     fn test_private_memory_open_starts_from_certified_empty_memdb() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:")
@@ -123207,6 +123318,48 @@ mod tests {
             assert!(
                 conn.root_cx.checkpoint().is_err(),
                 "seeded native cancellation should reach connection root"
+            );
+        });
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_open_with_root_cx_env_propagates_cancellation_to_operation_cx() {
+        use asupersync::Cx as NativeCx;
+        use asupersync::types::CancelReason as NativeCancelReason;
+
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bd-2lt76-1-cancel.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+            let parent_cx = Cx::new().with_trace_context(21_760_002, 0, 0);
+            let native = NativeCx::for_testing();
+            parent_cx.set_native_cx(native.clone());
+            let env = ConnectionEnv::new_with_root_cx(
+                RuntimeConfig {
+                    worker_threads: 1,
+                    io_poll_strategy: IoPollStrategy::Auto,
+                },
+                &parent_cx,
+            );
+            let runtime = Arc::clone(env.runtime());
+            let conn = Connection::open_with_env(&db_path, env)
+                .await
+                .expect("file-backed bridge connection should open");
+            let op_cx = conn.op_cx().expect("operation Cx should derive");
+
+            assert!(runtime.root_cx.attached_native_cx().is_some());
+            assert!(conn.root_cx.attached_native_cx().is_some());
+            assert!(op_cx.attached_native_cx().is_some());
+
+            native.set_cancel_reason(NativeCancelReason::timeout());
+            assert!(
+                conn.root_cx.checkpoint().is_err(),
+                "explicit-root cancellation should reach connection root"
+            );
+            assert!(
+                op_cx.checkpoint().is_err(),
+                "explicit-root cancellation should reach operation Cx"
             );
         });
     }
