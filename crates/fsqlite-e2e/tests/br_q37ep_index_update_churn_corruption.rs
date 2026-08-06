@@ -531,6 +531,11 @@ async fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
             quick_check(&conn).await.unwrap_or_else(|error| {
                 panic!("GH#132 seed={SEED:#x} cycle={cycle}: fsqlite quick_check failed: {error}")
             });
+            conn.close().await.unwrap_or_else(|error| {
+                panic!(
+                    "GH#132 seed={SEED:#x} cycle={cycle}: awaited close before stock reopen failed: {error}"
+                )
+            });
         }
 
         let stock = rusqlite::Connection::open(&path).unwrap_or_else(|error| {
@@ -578,6 +583,21 @@ async fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
         integrity, "ok",
         "GH#132 seed={SEED:#x}: stock integrity_check detected committed damage"
     );
+    for object in ["conversations", "sqlite_autoindex_conversations_1"] {
+        let internal_pages: i64 = stock
+            .query_row(
+                "SELECT count(*) FROM dbstat WHERE name = ?1 AND pagetype = 'internal'",
+                [object],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|error| {
+                panic!("GH#132 seed={SEED:#x}: inspect {object} split geometry: {error}")
+            });
+        assert!(
+            internal_pages > 0,
+            "GH#132 seed={SEED:#x}: {object} must contain an internal page so the keeper proves split-tree behavior"
+        );
+    }
 
     let via_table = collect_gh132_rows(&stock, "conversations NOT INDEXED");
     let via_index = collect_gh132_rows(
