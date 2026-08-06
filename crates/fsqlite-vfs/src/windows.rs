@@ -1077,28 +1077,16 @@ impl WindowsStockMainLocks {
                     && !self.shared_range_exclusive
             }
             LockLevel::Shared => {
-                !self.pending
-                    && !self.reserved
-                    && self.shared_range
-                    && !self.shared_range_exclusive
+                !self.pending && !self.reserved && self.shared_range && !self.shared_range_exclusive
             }
             LockLevel::Reserved => {
-                !self.pending
-                    && self.reserved
-                    && self.shared_range
-                    && !self.shared_range_exclusive
+                !self.pending && self.reserved && self.shared_range && !self.shared_range_exclusive
             }
             LockLevel::Pending => {
-                self.pending
-                    && self.reserved
-                    && self.shared_range
-                    && !self.shared_range_exclusive
+                self.pending && self.reserved && self.shared_range && !self.shared_range_exclusive
             }
             LockLevel::Exclusive => {
-                self.pending
-                    && self.reserved
-                    && self.shared_range
-                    && self.shared_range_exclusive
+                self.pending && self.reserved && self.shared_range && self.shared_range_exclusive
             }
         }
     }
@@ -1824,9 +1812,7 @@ impl WindowsFile {
         let stock_exact = self
             .stock_main_locks
             .as_ref()
-            .map_or(level == LockLevel::None, |locks| {
-                locks.is_exactly_at(level)
-            });
+            .map_or(level == LockLevel::None, |locks| locks.is_exactly_at(level));
         Ok(stock_exact && self.os_locks_ref()?.is_exactly_at(level))
     }
 
