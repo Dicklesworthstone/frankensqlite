@@ -136,9 +136,11 @@ fn lock_outcomes(outcomes: &Arc<Mutex<Vec<TxnOutcome>>>) -> MutexGuard<'_, Vec<T
 }
 
 fn runtime_config() -> RuntimeConfig {
+    // LabRuntime drives the SQL futures synchronously; use production blocking
+    // file I/O so no ambient io_uring driver task can escape its scheduler.
     RuntimeConfig {
         worker_threads: 1,
-        io_poll_strategy: IoPollStrategy::Auto,
+        io_poll_strategy: IoPollStrategy::Blocking,
     }
 }
 
@@ -823,70 +825,76 @@ fn run_lab_case(case: LabHistoryCase) -> LabHistoryArtifact {
 
 #[test]
 fn production_lab_history_disjoint_writers_is_deterministic_and_replayable() {
-    let first = run_lab_case(LabHistoryCase::DisjointWriters);
-    let second = run_lab_case(LabHistoryCase::DisjointWriters);
+    asupersync::test_utils::run_test(|| async {
+        let first = run_lab_case(LabHistoryCase::DisjointWriters);
+        let second = run_lab_case(LabHistoryCase::DisjointWriters);
 
-    assert_eq!(first.history_json, second.history_json);
-    assert_eq!(first.report_json, second.report_json);
-    assert_eq!(
-        first.history.schedule.schedule_sha256,
-        second.history.schedule.schedule_sha256
-    );
-    assert_eq!(
-        first.history.final_state_sha256,
-        second.history.final_state_sha256
-    );
-    assert_eq!(
-        first.history.execution_lane_evidence,
-        second.history.execution_lane_evidence
-    );
-    assert!(first.history.schedule.deterministic_replay_claim());
-    assert_eq!(first.report.verdict, OracleVerdict::Serializable);
-    assert_eq!(
-        first.history.final_state.get("writer_a/1"),
-        Some(&HistoryValue::Integer(10))
-    );
-    assert_eq!(
-        first.history.final_state.get("writer_b/1"),
-        Some(&HistoryValue::Integer(20))
-    );
+        assert_eq!(first.history_json, second.history_json);
+        assert_eq!(first.report_json, second.report_json);
+        assert_eq!(
+            first.history.schedule.schedule_sha256,
+            second.history.schedule.schedule_sha256
+        );
+        assert_eq!(
+            first.history.final_state_sha256,
+            second.history.final_state_sha256
+        );
+        assert_eq!(
+            first.history.execution_lane_evidence,
+            second.history.execution_lane_evidence
+        );
+        assert!(first.history.schedule.deterministic_replay_claim());
+        assert_eq!(first.report.verdict, OracleVerdict::Serializable);
+        assert_eq!(
+            first.history.final_state.get("writer_a/1"),
+            Some(&HistoryValue::Integer(10))
+        );
+        assert_eq!(
+            first.history.final_state.get("writer_b/1"),
+            Some(&HistoryValue::Integer(20))
+        );
+    });
 }
 
 #[test]
 fn production_lab_history_same_row_conflict_matches_fcw_abort() {
-    let artifact = run_lab_case(LabHistoryCase::SameRowConflict);
+    asupersync::test_utils::run_test(|| async {
+        let artifact = run_lab_case(LabHistoryCase::SameRowConflict);
 
-    assert!(artifact.history.schedule.deterministic_replay_claim());
-    assert_eq!(artifact.report.verdict, OracleVerdict::Serializable);
-    assert_eq!(
-        artifact.history.final_state.get("conflict_register/1"),
-        Some(&HistoryValue::Integer(100))
-    );
-    assert!(
-        artifact.history.events.iter().any(|event| matches!(
-            event.operation,
-            HistoryOperation::Conflict { ref reason }
-                if reason == "first_committer_wins_transient"
-        )),
-        "history must record the FCW conflict"
-    );
+        assert!(artifact.history.schedule.deterministic_replay_claim());
+        assert_eq!(artifact.report.verdict, OracleVerdict::Serializable);
+        assert_eq!(
+            artifact.history.final_state.get("conflict_register/1"),
+            Some(&HistoryValue::Integer(100))
+        );
+        assert!(
+            artifact.history.events.iter().any(|event| matches!(
+                event.operation,
+                HistoryOperation::Conflict { ref reason }
+                    if reason == "first_committer_wins_transient"
+            )),
+            "history must record the FCW conflict"
+        );
+    });
 }
 
 #[test]
 fn deterministic_history_artifacts_fail_closed_for_corruption_and_observation_only() {
-    let artifact = run_lab_case(LabHistoryCase::SameRowConflict);
-    let midpoint = artifact.history_json.len() / 2;
-    assert!(
-        TransactionHistory::from_json_strict(&artifact.history_json[..midpoint]).is_err(),
-        "truncated history artifacts must fail closed"
-    );
+    asupersync::test_utils::run_test(|| async {
+        let artifact = run_lab_case(LabHistoryCase::SameRowConflict);
+        let midpoint = artifact.history_json.len() / 2;
+        assert!(
+            TransactionHistory::from_json_strict(&artifact.history_json[..midpoint]).is_err(),
+            "truncated history artifacts must fail closed"
+        );
 
-    let mut smuggled = artifact.history.clone();
-    smuggled.schedule.control = ScheduleControl::ObservationOnly;
-    assert!(
-        smuggled.to_json().is_err(),
-        "observation-only histories cannot retain deterministic replay fields"
-    );
+        let mut smuggled = artifact.history.clone();
+        smuggled.schedule.control = ScheduleControl::ObservationOnly;
+        assert!(
+            smuggled.to_json().is_err(),
+            "observation-only histories cannot retain deterministic replay fields"
+        );
+    });
 }
 
 #[test]
