@@ -51,12 +51,7 @@ fn reduction_case(auxiliary_count: usize) -> HistoryReductionCase {
         engine_git_sha: "0123456789abcdef".to_owned(),
         engine_dirty: false,
         workload: HistoryWorkload::WriteSkew { minimum_sum: 1 },
-        schedule: ScheduleProvenance::deterministic(
-            "asupersync-lab-runtime",
-            "schedule-history-reduction",
-            "a".repeat(64),
-            "cargo test -p fsqlite-harness --test bd_turso_test_adaptation_zu081_19_history_reduction",
-        ),
+        schedule: ScheduleProvenance::observation_only("synthetic-history-reducer-fixture"),
         execution_lane_evidence: vec![ExecutionLaneEvidence::semantic_only(
             TRACE_ID,
             RUN_ID,
@@ -266,7 +261,7 @@ fn verify_exact_failure(
 }
 
 #[test]
-fn deterministic_history_reduction_preserves_public_witness_and_bundle_replay() {
+fn semantic_history_reduction_preserves_public_witness_and_oracle_replay() {
     let case = reduction_case(2);
     let config = TypedReductionConfig {
         max_attempts: 256,
@@ -342,9 +337,29 @@ fn deterministic_history_reduction_preserves_public_witness_and_bundle_replay() 
         },
     )
     .expect("build canonical serializability bundle");
+    let mut conflicting_bundle = bundle.clone();
+    conflicting_bundle.state_snapshots.insert(
+        HISTORY_REDUCTION_SNAPSHOT_KEY.to_owned(),
+        "different canonical evidence".to_owned(),
+    );
+    conflicting_bundle.content_hash = conflicting_bundle.deterministic_bundle_hash();
+    assert_eq!(
+        first.attach_to_failure_bundle(&mut conflicting_bundle),
+        Err("history reduction bundle already contains different canonical evidence".to_owned())
+    );
+    assert_eq!(
+        conflicting_bundle
+            .state_snapshots
+            .get(HISTORY_REDUCTION_SNAPSHOT_KEY)
+            .map(String::as_str),
+        Some("different canonical evidence")
+    );
     first
         .attach_to_failure_bundle(&mut bundle)
         .expect("attach reduction to canonical bundle");
+    first
+        .attach_to_failure_bundle(&mut bundle)
+        .expect("reattaching identical canonical evidence is idempotent");
     assert!(
         bundle
             .state_snapshots
@@ -415,6 +430,28 @@ fn cancellation_and_budget_exhaustion_return_valid_partial_reductions() {
             &verify_exact_failure
         )
         .is_err()
+    );
+}
+
+#[test]
+fn deterministic_schedule_claim_requires_execution_backed_replay_adapter() {
+    let mut case = reduction_case(0);
+    case.history.schedule = ScheduleProvenance::deterministic(
+        "synthetic-history-reducer-fixture",
+        "unexecuted-schedule",
+        "a".repeat(64),
+        "cargo test -p fsqlite-harness --test bd_turso_test_adaptation_zu081_19_history_reduction",
+    );
+    assert_eq!(
+        minimize_history_case(
+            &case,
+            &TypedReductionConfig::default(),
+            &verify_exact_failure,
+        ),
+        Err(
+            "history reduction deterministic schedules require an execution-backed replay adapter"
+                .to_owned()
+        )
     );
 }
 
