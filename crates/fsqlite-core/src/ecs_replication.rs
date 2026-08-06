@@ -263,19 +263,18 @@ impl AntiEntropySession {
         self.decoded_objects.insert(object_id);
 
         // Check if all needed objects are decoded.
-        if let Some(missing) = &self.missing {
-            if missing
+        if let Some(missing) = &self.missing
+            && missing
                 .needed
                 .iter()
                 .all(|id| self.decoded_objects.contains(id))
-            {
-                debug!(
-                    bead_id = BEAD_ID,
-                    decoded_count = self.decoded_objects.len(),
-                    "all missing objects decoded"
-                );
-                self.phase = AntiEntropyPhase::PersistAndUpdate;
-            }
+        {
+            debug!(
+                bead_id = BEAD_ID,
+                decoded_count = self.decoded_objects.len(),
+                "all missing objects decoded"
+            );
+            self.phase = AntiEntropyPhase::PersistAndUpdate;
         }
         Ok(())
     }

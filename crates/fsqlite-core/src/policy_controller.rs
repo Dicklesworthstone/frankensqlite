@@ -891,10 +891,10 @@ impl PolicyController {
         {
             return Some("guardrail_symbol_loss_budget".to_owned());
         }
-        if let Some(cap) = hard_cap {
-            if candidate.value > cap {
-                return Some(format!("hard_cap_override({cap})"));
-            }
+        if let Some(cap) = hard_cap
+            && candidate.value > cap
+        {
+            return Some(format!("hard_cap_override({cap})"));
         }
         None
     }

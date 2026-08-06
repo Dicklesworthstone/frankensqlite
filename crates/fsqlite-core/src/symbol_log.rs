@@ -282,10 +282,10 @@ pub fn symbol_segment_path(symbols_dir: &Path, segment_id: u64) -> PathBuf {
 
 /// Ensure a segment exists with the given header.
 pub fn ensure_symbol_segment(segment_path: &Path, header: SymbolSegmentHeader) -> Result<()> {
-    if let Some(parent) = segment_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = segment_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     match fs::OpenOptions::new()

@@ -750,49 +750,50 @@ impl SnapshotReceiver {
         }
 
         // Check if ready to decode this block.
-        if decoder.ready_to_decode() && !decoder.decoded {
-            if let Some(padded) = decoder.try_decode() {
-                match parse_decoded_snapshot_block(&padded, self.page_size) {
-                    Ok(pages) => {
-                        let block_id = u32::try_from(block_idx).unwrap_or(u32::MAX);
-                        decoder.decoded = true;
-                        if block_idx < self.resume.blocks.len() {
-                            self.resume.blocks[block_idx].decoded = true;
-                        }
-                        let n_pages = pages.len();
-                        self.decoded_blocks.push(DecodedBlock {
-                            block_index: block_id,
-                            pages,
-                        });
+        if decoder.ready_to_decode()
+            && !decoder.decoded
+            && let Some(padded) = decoder.try_decode()
+        {
+            match parse_decoded_snapshot_block(&padded, self.page_size) {
+                Ok(pages) => {
+                    let block_id = u32::try_from(block_idx).unwrap_or(u32::MAX);
+                    decoder.decoded = true;
+                    if block_idx < self.resume.blocks.len() {
+                        self.resume.blocks[block_idx].decoded = true;
+                    }
+                    let n_pages = pages.len();
+                    self.decoded_blocks.push(DecodedBlock {
+                        block_index: block_id,
+                        pages,
+                    });
+                    info!(
+                        bead_id = BEAD_ID,
+                        block_index = block_idx,
+                        n_pages,
+                        decoded_so_far = self.decoded_blocks.len(),
+                        total_blocks = self.num_blocks,
+                        "source block decoded (progressive)"
+                    );
+
+                    // Check if all blocks are done.
+                    if self.block_decoders.iter().all(|d| d.decoded) {
+                        self.state = SnapshotReceiverState::Complete;
                         info!(
                             bead_id = BEAD_ID,
-                            block_index = block_idx,
-                            n_pages,
-                            decoded_so_far = self.decoded_blocks.len(),
                             total_blocks = self.num_blocks,
-                            "source block decoded (progressive)"
+                            "snapshot fully received"
                         );
-
-                        // Check if all blocks are done.
-                        if self.block_decoders.iter().all(|d| d.decoded) {
-                            self.state = SnapshotReceiverState::Complete;
-                            info!(
-                                bead_id = BEAD_ID,
-                                total_blocks = self.num_blocks,
-                                "snapshot fully received"
-                            );
-                        }
-                        return Ok(SnapshotPacketResult::BlockDecoded(block_id));
                     }
-                    Err(e) => {
-                        error!(
-                            bead_id = BEAD_ID,
-                            block_index = block_idx,
-                            error = %e,
-                            "snapshot block validation failed"
-                        );
-                        return Err(e);
-                    }
+                    return Ok(SnapshotPacketResult::BlockDecoded(block_id));
+                }
+                Err(e) => {
+                    error!(
+                        bead_id = BEAD_ID,
+                        block_index = block_idx,
+                        error = %e,
+                        "snapshot block validation failed"
+                    );
+                    return Err(e);
                 }
             }
         }

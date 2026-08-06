@@ -529,29 +529,29 @@ impl ReplicationReceiver {
         }
 
         // Enforce global buffered-symbol bound before accepting a new symbol.
-        if let Some(decoder) = self.decoders.get(&changeset_id) {
-            if !decoder.has_symbol(packet.esi) {
-                let next_total = self
-                    .buffered_symbol_bytes
-                    .saturating_add(packet.symbol_data.len());
-                if next_total > self.config.max_buffered_symbol_bytes {
-                    warn!(
-                        bead_id = BEAD_ID,
-                        buffered_symbol_bytes = self.buffered_symbol_bytes,
-                        incoming_symbol_bytes = packet.symbol_data.len(),
-                        max_buffered_symbol_bytes = self.config.max_buffered_symbol_bytes,
-                        "buffered symbol budget exceeded"
-                    );
-                    if created_decoder {
-                        self.remove_decoder(changeset_id);
-                        self.state = if self.decoders.is_empty() {
-                            ReceiverState::Listening
-                        } else {
-                            ReceiverState::Collecting
-                        };
-                    }
-                    return Err(FrankenError::TooBig);
+        if let Some(decoder) = self.decoders.get(&changeset_id)
+            && !decoder.has_symbol(packet.esi)
+        {
+            let next_total = self
+                .buffered_symbol_bytes
+                .saturating_add(packet.symbol_data.len());
+            if next_total > self.config.max_buffered_symbol_bytes {
+                warn!(
+                    bead_id = BEAD_ID,
+                    buffered_symbol_bytes = self.buffered_symbol_bytes,
+                    incoming_symbol_bytes = packet.symbol_data.len(),
+                    max_buffered_symbol_bytes = self.config.max_buffered_symbol_bytes,
+                    "buffered symbol budget exceeded"
+                );
+                if created_decoder {
+                    self.remove_decoder(changeset_id);
+                    self.state = if self.decoders.is_empty() {
+                        ReceiverState::Listening
+                    } else {
+                        ReceiverState::Collecting
+                    };
                 }
+                return Err(FrankenError::TooBig);
             }
         }
 

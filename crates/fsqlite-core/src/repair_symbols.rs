@@ -806,8 +806,10 @@ impl FailureRateMonitor {
             wilson_upper_bound(state.total_failures, state.total_attempts, self.wilson_z);
 
         let mut events = Vec::new();
-        let should_emit_debug =
-            !attempt.success || state.total_attempts % self.debug_every_attempts == 0;
+        let should_emit_debug = !attempt.success
+            || state
+                .total_attempts
+                .is_multiple_of(self.debug_every_attempts);
         if should_emit_debug {
             debug!(
                 k_range = %bucket.k_range,

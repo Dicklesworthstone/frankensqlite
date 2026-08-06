@@ -1346,14 +1346,13 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 if let Some(mem_table) = db.get_table(table.root_page) {
                     for (rowid, values) in mem_table.iter_rows() {
                         // For partial indexes, skip rows that don't match
-                        // the WHERE predicate.
-                        if let Some(ref predicate) = partial_predicate {
-                            if let Ok(result) = eval_join_expr(predicate, values, &col_map) {
-                                if !is_sqlite_truthy(&result) {
-                                    continue;
-                                }
-                            }
-                            // If evaluation fails, include the row (safe default).
+                        // the WHERE predicate. If evaluation fails, include
+                        // the row (safe default).
+                        if let Some(ref predicate) = partial_predicate
+                            && let Ok(result) = eval_join_expr(predicate, values, &col_map)
+                            && !is_sqlite_truthy(&result)
+                        {
+                            continue;
                         }
 
                         // Build index key: (indexed_terms..., rowid).
