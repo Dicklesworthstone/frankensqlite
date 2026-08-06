@@ -22975,10 +22975,18 @@ fn emit_without_rowid_index_inserts(
     col_regs: i32,
     pk_indices: &[usize],
     stmt_conflict: Option<ConflictAction>,
+    unique_conflicts_preflighted: bool,
 ) {
     let n_pk = pk_indices.len();
     for (idx_offset, index) in table.indexes.iter().enumerate() {
-        let oe_flag = effective_oe(stmt_conflict, index.conflict_action);
+        // When the caller has already resolved every UNIQUE victim in clustered
+        // terms, hand the engine ABORT: its OE_REPLACE branch resolves victims
+        // by rowid and cannot address a WITHOUT ROWID clustered row.
+        let oe_flag = if unique_conflicts_preflighted && index.is_unique {
+            OE_ABORT
+        } else {
+            effective_oe(stmt_conflict, index.conflict_action)
+        };
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
         let skip_label = b.emit_label();
@@ -23122,7 +23130,7 @@ fn emit_without_rowid_index_deletes(
 /// `old_pk_regs` the OLD primary-key values used to re-seek the OLD row after
 /// the probes have moved the cursor.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn emit_without_rowid_update_rewrite(
     b: &mut ProgramBuilder,
     table: &TableSchema,
@@ -23235,6 +23243,202 @@ fn emit_without_rowid_update_rewrite(
     b.resolve_label(no_victim);
     b.resolve_label(pk_unchanged);
 
+    // Step 3b: resolve every UNIQUE secondary-index conflict while OLD is still
+    // intact.
+    //
+    // The engine's `IdxInsert` OE_REPLACE branch resolves its victim as a
+    // *rowid* (`find_conflicting_rowid_in_index` -> `Option<i64>`, then
+    // `native_replace_row`, which seeks the table B-tree by rowid). A WITHOUT
+    // ROWID secondary entry ends with the PRIMARY KEY, not an integer rowid, so
+    // that path cannot address the victim and instead reports the healthy
+    // database as malformed. Every unique conflict is therefore resolved here,
+    // in clustered terms, and step 5 hands the engine a non-REPLACE action so
+    // the rowid-suffix path is never entered.
+    for (idx_offset, index) in table.indexes.iter().enumerate() {
+        if !index.is_unique {
+            continue;
+        }
+        let idx_oe = effective_oe(stmt_level, index.conflict_action);
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        let n_idx_cols = index.key_term_count();
+        if n_idx_cols == 0 {
+            continue;
+        }
+        let idx_done = b.emit_label();
+
+        // A partial index only constrains rows its predicate admits: when NEW
+        // is outside the predicate it cannot conflict on this index at all.
+        let new_scan_ctx = ScanCtx {
+            cursor: table_cursor,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: Some(new_regs),
+            secondaries: &[],
+        };
+        emit_index_predicate_guard(b, index, &new_scan_ctx, idx_done);
+
+        // Probe the unique prefix only (the PK suffix is what distinguishes
+        // rows, so it must not participate in the conflict test).
+        let probe_regs = b.alloc_regs(n_idx_cols as i32);
+        for key_pos in 0..n_idx_cols {
+            emit_index_key_term(
+                b,
+                index,
+                key_pos,
+                probe_regs + key_pos as i32,
+                &new_scan_ctx,
+            );
+        }
+        // SQL UNIQUE never constrains NULL keys: a NULL in any key term means
+        // this row cannot collide, matching `IdxInsert`'s own NoConflict
+        // semantics.
+        for key_pos in 0..n_idx_cols {
+            b.emit_jump_to_label(
+                Opcode::IsNull,
+                probe_regs + key_pos as i32,
+                0,
+                idx_done,
+                P4::None,
+                0,
+            );
+        }
+        let probe_rec = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            probe_regs,
+            n_idx_cols as i32,
+            probe_rec,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::NoConflict,
+            idx_cursor,
+            probe_rec,
+            idx_done,
+            P4::None,
+            0,
+        );
+
+        // A conflicting entry exists and `idx_cursor` is positioned on it. Its
+        // trailing terms are the victim's PRIMARY KEY.
+        let victim_pk_regs = b.alloc_regs(n_pk as i32);
+        for j in 0..n_pk {
+            b.emit_op(
+                Opcode::Column,
+                idx_cursor,
+                (n_idx_cols + j) as i32,
+                victim_pk_regs + j as i32,
+                P4::None,
+                0,
+            );
+        }
+
+        // Self-conflict: the entry belongs to the row being rewritten, so the
+        // OLD delete in step 4 already removes it. Comparing against OLD PK
+        // (not NEW) is what makes a pure secondary-key rewrite a no-op here.
+        let victim_is_other = b.emit_label();
+        for (j, &pk_col) in pk_indices.iter().enumerate() {
+            let pk_collation = table.columns[pk_col]
+                .collation
+                .as_deref()
+                .filter(|name| !name.eq_ignore_ascii_case("BINARY"))
+                .map_or(P4::None, |name| P4::Collation(name.to_owned()));
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                victim_pk_regs + j as i32,
+                old_pk_regs + j as i32,
+                victim_is_other,
+                pk_collation,
+                0,
+            );
+        }
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, idx_done, P4::None, 0);
+        b.resolve_label(victim_is_other);
+
+        if idx_oe == OE_IGNORE {
+            // Abandon the whole row with OLD intact.
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
+        } else if idx_oe == OE_REPLACE {
+            // Seek the clustered row by the victim's PRIMARY KEY, then reuse
+            // the same victim teardown the PK arm uses: all of the victim's
+            // secondary entries (keys read from the positioned table cursor),
+            // then its clustered row.
+            let victim_seek_rec = b.alloc_reg();
+            b.emit_op(
+                Opcode::MakeRecord,
+                victim_pk_regs,
+                n_pk as i32,
+                victim_seek_rec,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::NoConflict,
+                table_cursor,
+                victim_seek_rec,
+                idx_done,
+                P4::None,
+                0,
+            );
+            emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
+            b.emit_op(
+                Opcode::IdxDelete,
+                table_cursor,
+                0,
+                0,
+                P4::Table(table.name.clone()),
+                OPFLAG_REPLACE_VICTIM,
+            );
+        } else {
+            // ABORT / FAIL / ROLLBACK: raise the UNIQUE violation now, while
+            // OLD is still present. The full [key || pk] record is what the
+            // engine's unique check expects; `NoConflict` fell through, so a
+            // conflicting entry provably exists and this cannot silently
+            // succeed.
+            let raise_regs = b.alloc_regs((n_idx_cols + n_pk) as i32);
+            for key_pos in 0..n_idx_cols {
+                b.emit_op(
+                    Opcode::Copy,
+                    probe_regs + key_pos as i32,
+                    raise_regs + key_pos as i32,
+                    0,
+                    P4::None,
+                    0,
+                );
+            }
+            for (j, &pk_col) in pk_indices.iter().enumerate() {
+                b.emit_op(
+                    Opcode::Copy,
+                    new_regs + pk_col as i32,
+                    raise_regs + (n_idx_cols + j) as i32,
+                    0,
+                    P4::None,
+                    0,
+                );
+            }
+            let raise_rec = b.alloc_reg();
+            b.emit_op(
+                Opcode::MakeRecord,
+                raise_regs,
+                (n_idx_cols + n_pk) as i32,
+                raise_rec,
+                P4::None,
+                0,
+            );
+            b.emit_op(
+                Opcode::IdxInsert,
+                idx_cursor,
+                raise_rec,
+                n_idx_cols as i32,
+                P4::Table(format!("{}.{}", table.name, index.key_label())),
+                1u16 | (idx_oe << 1),
+            );
+        }
+        b.resolve_label(idx_done);
+    }
+
     // Step 4: re-seek OLD (the probes above moved the cursor) and remove its
     // secondary-index entries and clustered row.
     let old_seek_regs = b.alloc_regs(n_pk as i32);
@@ -23289,7 +23493,15 @@ fn emit_without_rowid_update_rewrite(
         P4::Table(format!("{}.{}", table.name, pk_label)),
         1u16 | (OE_ABORT << 1),
     );
-    emit_without_rowid_index_inserts(b, table, table_cursor, new_regs, pk_indices, stmt_level);
+    emit_without_rowid_index_inserts(
+        b,
+        table,
+        table_cursor,
+        new_regs,
+        pk_indices,
+        stmt_level,
+        true,
+    );
 }
 
 /// Emit the per-row insert for a WITHOUT ROWID table.
@@ -23460,7 +23672,15 @@ fn emit_without_rowid_row_insert(
 
     // Secondary-index maintenance (skipped by the IGNORE conflict path, which
     // jumps straight to `row_done`).
-    emit_without_rowid_index_inserts(b, table, table_cursor, val_regs, pk_indices, stmt_level);
+    emit_without_rowid_index_inserts(
+        b,
+        table,
+        table_cursor,
+        val_regs,
+        pk_indices,
+        stmt_level,
+        false,
+    );
 
     // RETURNING: emit the inserted row image. Placed on the insert path so an
     // IGNORE conflict (which jumps to `row_done`) produces no RETURNING row,
@@ -23649,6 +23869,7 @@ fn emit_without_rowid_upsert_row(
         existing_regs,
         pk_indices,
         stmt_level,
+        false,
     );
 
     if !returning.is_empty() {

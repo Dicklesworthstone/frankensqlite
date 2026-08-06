@@ -239,6 +239,16 @@ fn without_rowid_update_or_replace_self_and_abort_arms() {
                 "UPDATE OR REPLACE wr SET k = 'z' WHERE k = 'c'",
                 // OR IGNORE onto an occupied PK: must be a no-op, OLD intact.
                 "UPDATE OR IGNORE wr SET k = 'b' WHERE k = 'z'",
+                // The ABORT family must actually raise, with OLD still intact.
+                // `scenario` asserts frank and rusqlite agree on Ok/Err per
+                // statement, so these are real assertions on the raise itself
+                // rather than on a swallowed error.
+                "UPDATE OR ABORT wr SET k = 'b' WHERE k = 'z'",
+                "UPDATE OR ROLLBACK wr SET k = 'b' WHERE k = 'z'",
+                "UPDATE OR FAIL wr SET k = 'b' WHERE k = 'z'",
+                // Bare UPDATE (statement-level default is ABORT) onto an
+                // occupied PK must raise identically.
+                "UPDATE wr SET k = 'b' WHERE k = 'z'",
             ],
             &[
                 "SELECT k, tag, n FROM wr ORDER BY k",
@@ -282,6 +292,10 @@ fn without_rowid_update_or_replace_stays_stock_integrity_clean() {
             ] {
                 conn.execute(stmt).await.expect("frank statement");
             }
+            // Await the close explicitly: relying on Drop cancels region tasks
+            // without rolling back open transactions or running a checkpoint,
+            // so the bytes stock SQLite then reads would not be a settled image.
+            conn.close().await.expect("await frank close");
         }
 
         let stock = rusqlite::Connection::open(&db_path).expect("stock reopen");
@@ -334,6 +348,353 @@ fn without_rowid_update_or_replace_stays_stock_integrity_clean() {
             survivors,
             vec!["b/moved/20".to_owned(), "d/moved2/30".to_owned()],
             "bd-yuj70: unexpected surviving rows after victim replacement"
+        );
+    });
+}
+
+/// bd-yuj70 — `UPDATE OR REPLACE` whose NEW row conflicts on a **secondary
+/// UNIQUE index** rather than on the primary key.
+///
+/// `emit_without_rowid_update_rewrite` preflights only the PK victim; the
+/// secondary-unique conflict is left to the engine's `IdxInsert` with the
+/// statement conflict action. SQLite semantics require REPLACE to delete the
+/// conflicting *row* (and all of its index entries), not merely to overwrite
+/// the index slot. This scenario is the probe for that: the NEW primary key
+/// `'z'` is free, so the PK preflight does nothing and only the secondary-index
+/// path is exercised.
+#[test]
+fn without_rowid_update_or_replace_secondary_unique_victim() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, tag TEXT NOT NULL, n INTEGER NOT NULL) \
+                 WITHOUT ROWID",
+                "CREATE INDEX wr_tag ON wr(tag)",
+                "CREATE UNIQUE INDEX wr_n ON wr(n)",
+                "INSERT INTO wr VALUES ('a','alpha',1),('b','beta',2),('c','gamma',3)",
+                // PK 'z' is free; n = 2 collides with row 'b' on wr_n.
+                "UPDATE OR REPLACE wr SET k = 'z', n = 2 WHERE k = 'a'",
+            ],
+            &[
+                "SELECT k, tag, n FROM wr ORDER BY k",
+                "SELECT n, k FROM wr ORDER BY n",
+                "SELECT tag, k FROM wr ORDER BY tag",
+                "SELECT k FROM wr WHERE n = 2",
+                "SELECT count(*) FROM wr",
+            ],
+            "without_rowid_update_or_replace_secondary_unique_victim",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — the same victim-safe rewrite driven through `UPDATE ... FROM`.
+///
+/// `codegen_update_from_without_rowid` shares
+/// `emit_without_rowid_update_rewrite` but computes the NEW image during its
+/// pass-1 join, so the OLD/NEW register plumbing is distinct and needs its own
+/// oracle. Row-count parity alone would not discriminate — a stale victim
+/// entry keeps the clustered row count correct — so the queries below read
+/// through the secondary keys.
+#[test]
+fn without_rowid_update_from_or_replace_pk_victim_and_secondary_indexes() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, tag TEXT NOT NULL, n INTEGER NOT NULL) \
+                 WITHOUT ROWID",
+                "CREATE INDEX wr_tag ON wr(tag)",
+                "CREATE UNIQUE INDEX wr_n ON wr(n)",
+                "INSERT INTO wr VALUES ('a','alpha',1),('b','beta',2),('c','gamma',3),\
+                 ('d','delta',4)",
+                "CREATE TABLE moves (from_k TEXT PRIMARY KEY, to_k TEXT NOT NULL, \
+                 new_tag TEXT NOT NULL, new_n INTEGER NOT NULL)",
+                // 'a' -> 'b' re-keys onto a live victim; 'c' -> 'y' is a free
+                // slot, so both the victim and no-victim arms run in one join.
+                "INSERT INTO moves VALUES ('a','b','moved',20),('c','y','shifted',30)",
+                "UPDATE OR REPLACE wr SET k = moves.to_k, tag = moves.new_tag, n = moves.new_n \
+                 FROM moves WHERE wr.k = moves.from_k",
+            ],
+            &[
+                "SELECT k, tag, n FROM wr ORDER BY k",
+                "SELECT tag, k FROM wr ORDER BY tag",
+                "SELECT n, k FROM wr ORDER BY n",
+                "SELECT k FROM wr WHERE tag = 'beta'",
+                "SELECT k FROM wr WHERE n = 2",
+                "SELECT count(*) FROM wr",
+            ],
+            "without_rowid_update_from_or_replace_pk_victim",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — `UPDATE ... FROM` self-rewrite and `OR IGNORE`/ABORT arms.
+#[test]
+fn without_rowid_update_from_self_and_conflict_arms() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, tag TEXT NOT NULL, n INTEGER NOT NULL) \
+                 WITHOUT ROWID",
+                "CREATE INDEX wr_tag ON wr(tag)",
+                "CREATE UNIQUE INDEX wr_n ON wr(n)",
+                "INSERT INTO wr VALUES ('a','alpha',1),('b','beta',2),('c','gamma',3)",
+                "CREATE TABLE moves (from_k TEXT PRIMARY KEY, to_k TEXT NOT NULL, \
+                 new_tag TEXT NOT NULL, new_n INTEGER NOT NULL)",
+                "INSERT INTO moves VALUES ('a','a','ALPHA',11)",
+                // PK unchanged through the join: the self-rewrite arm.
+                "UPDATE OR REPLACE wr SET k = moves.to_k, tag = moves.new_tag, n = moves.new_n \
+                 FROM moves WHERE wr.k = moves.from_k",
+                "DELETE FROM moves",
+                "INSERT INTO moves VALUES ('c','b','clash',77)",
+                // OR IGNORE onto an occupied PK through the join: no-op.
+                "UPDATE OR IGNORE wr SET k = moves.to_k, tag = moves.new_tag \
+                 FROM moves WHERE wr.k = moves.from_k",
+                // The ABORT family must raise with OLD intact.
+                "UPDATE OR ABORT wr SET k = moves.to_k FROM moves WHERE wr.k = moves.from_k",
+                "UPDATE wr SET k = moves.to_k FROM moves WHERE wr.k = moves.from_k",
+            ],
+            &[
+                "SELECT k, tag, n FROM wr ORDER BY k",
+                "SELECT tag, k FROM wr ORDER BY tag",
+                "SELECT n, k FROM wr ORDER BY n",
+                "SELECT k FROM wr WHERE n = 1",
+                "SELECT count(*) FROM wr",
+            ],
+            "without_rowid_update_from_self_and_conflict",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — stock-SQLite structural verification of the `UPDATE ... FROM`
+/// rewrite.
+///
+/// This is the arm that *forces* index discrimination. The in-memory scenarios
+/// above read through secondary keys, but whether FrankenSQLite's planner
+/// actually serves them from the index is not a contract this suite can pin —
+/// `INDEXED BY` is documented as not a hard contract for stock WITHOUT ROWID
+/// indexes (frankensqlite#137), so it is deliberately not used here. Stock
+/// SQLite's `integrity_check` on a WITHOUT ROWID table validates index-vs-table
+/// consistency independently of any query plan, which is the property that
+/// makes an orphaned victim entry unmissable.
+#[test]
+fn without_rowid_update_from_or_replace_stays_stock_integrity_clean() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("wr_from_replace_victim.db");
+        let path_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(path_str).await.expect("open frank");
+            for stmt in [
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, tag TEXT NOT NULL, n INTEGER NOT NULL) \
+                 WITHOUT ROWID",
+                "CREATE INDEX wr_tag ON wr(tag)",
+                "CREATE UNIQUE INDEX wr_n ON wr(n)",
+                "INSERT INTO wr VALUES ('a','alpha',1),('b','beta',2),('c','gamma',3),\
+                 ('d','delta',4)",
+                "CREATE TABLE moves (from_k TEXT PRIMARY KEY, to_k TEXT NOT NULL, \
+                 new_tag TEXT NOT NULL, new_n INTEGER NOT NULL)",
+                "INSERT INTO moves VALUES ('a','b','moved',20),('c','d','moved2',30)",
+                "UPDATE OR REPLACE wr SET k = moves.to_k, tag = moves.new_tag, n = moves.new_n \
+                 FROM moves WHERE wr.k = moves.from_k",
+            ] {
+                conn.execute(stmt).await.expect("frank statement");
+            }
+            conn.close().await.expect("await frank close");
+        }
+
+        let stock = rusqlite::Connection::open(&db_path).expect("stock reopen");
+        let integrity: String = stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("integrity_check");
+        assert_eq!(
+            integrity, "ok",
+            "bd-yuj70: UPDATE ... FROM victim handling left a malformed image"
+        );
+
+        let table_rows: i64 = stock
+            .query_row("SELECT count(*) FROM wr", [], |row| row.get(0))
+            .expect("table count");
+        assert_eq!(
+            table_rows, 2,
+            "bd-yuj70: both UPDATE ... FROM victims must be replaced"
+        );
+
+        let survivors: Vec<String> = stock
+            .prepare("SELECT k || '/' || tag || '/' || n FROM wr ORDER BY k")
+            .expect("prepare survivors")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query survivors")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect survivors");
+        assert_eq!(
+            survivors,
+            vec!["b/moved/20".to_owned(), "d/moved2/30".to_owned()],
+            "bd-yuj70: unexpected surviving rows after UPDATE ... FROM replacement"
+        );
+    });
+}
+
+/// bd-yuj70 — the non-REPLACE conflict actions on a secondary UNIQUE index.
+///
+/// The preflight must skip the row for `OR IGNORE` and raise for the ABORT
+/// family, in both cases leaving OLD exactly as it was. `scenario` asserts
+/// frank and rusqlite agree on Ok/Err per statement, so the raises are real
+/// assertions rather than swallowed errors.
+#[test]
+fn without_rowid_update_secondary_unique_ignore_and_abort_arms() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, tag TEXT NOT NULL, n INTEGER NOT NULL) \
+                 WITHOUT ROWID",
+                "CREATE UNIQUE INDEX wr_n ON wr(n)",
+                "INSERT INTO wr VALUES ('a','alpha',1),('b','beta',2),('c','gamma',3)",
+                // OR IGNORE: n = 2 is held by 'b', so the row is skipped whole.
+                "UPDATE OR IGNORE wr SET tag = 'skipped', n = 2 WHERE k = 'a'",
+                // The ABORT family must raise, leaving 'a' untouched.
+                "UPDATE OR ABORT wr SET n = 2 WHERE k = 'a'",
+                "UPDATE OR FAIL wr SET n = 2 WHERE k = 'a'",
+                "UPDATE OR ROLLBACK wr SET n = 2 WHERE k = 'a'",
+                // Bare UPDATE defaults to ABORT.
+                "UPDATE wr SET n = 2 WHERE k = 'a'",
+                // A self-conflict on the unique key must NOT be treated as a
+                // victim: rewriting 'a' to its own current n is a no-op probe.
+                "UPDATE OR ABORT wr SET tag = 'self', n = 1 WHERE k = 'a'",
+            ],
+            &[
+                "SELECT k, tag, n FROM wr ORDER BY k",
+                "SELECT n, k FROM wr ORDER BY n",
+                "SELECT k FROM wr WHERE n = 2",
+                "SELECT count(*) FROM wr",
+            ],
+            "without_rowid_update_secondary_unique_ignore_and_abort",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — two distinct UNIQUE indexes, each contributing a *different*
+/// victim in one statement, plus a partial UNIQUE index whose predicate
+/// excludes the NEW row.
+///
+/// This is the multi-victim shape: the preflight must clear both victims (and
+/// every one of their secondary entries) before OLD is deleted, and must not
+/// treat the partial index as constraining a row its predicate does not admit.
+#[test]
+fn without_rowid_update_replace_multiple_unique_victims() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, \
+                 lab TEXT NOT NULL) WITHOUT ROWID",
+                "CREATE UNIQUE INDEX wr_a ON wr(a)",
+                "CREATE UNIQUE INDEX wr_b ON wr(b)",
+                "CREATE INDEX wr_lab ON wr(lab)",
+                // Partial UNIQUE index that only admits lab = 'p'.
+                "CREATE UNIQUE INDEX wr_part ON wr(a) WHERE lab = 'p'",
+                "INSERT INTO wr VALUES ('r1',1,10,'x'),('r2',2,20,'y'),('r3',3,30,'z'),\
+                 ('r4',4,40,'w')",
+                // r1 takes r2's `a` and r3's `b`: two victims, two indexes, one
+                // statement. NEW lab = 'q' keeps it outside wr_part.
+                "UPDATE OR REPLACE wr SET a = 2, b = 30, lab = 'q' WHERE k = 'r1'",
+            ],
+            &[
+                "SELECT k, a, b, lab FROM wr ORDER BY k",
+                "SELECT a, k FROM wr ORDER BY a",
+                "SELECT b, k FROM wr ORDER BY b",
+                "SELECT lab, k FROM wr ORDER BY lab, k",
+                "SELECT k FROM wr WHERE a = 2",
+                "SELECT k FROM wr WHERE b = 30",
+                "SELECT count(*) FROM wr",
+            ],
+            "without_rowid_update_replace_multiple_unique_victims",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — NULL keys never collide on a UNIQUE index, and a NOCASE
+/// collation must decide the conflict, not raw bytes.
+#[test]
+fn without_rowid_update_secondary_unique_null_and_collation() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, u TEXT, c TEXT COLLATE NOCASE) \
+                 WITHOUT ROWID",
+                "CREATE UNIQUE INDEX wr_u ON wr(u)",
+                "CREATE UNIQUE INDEX wr_c ON wr(c)",
+                "INSERT INTO wr VALUES ('a',NULL,'Alpha'),('b',NULL,'Beta'),('c','cc','Gamma')",
+                // Multiple NULLs coexist on a UNIQUE index: this must not be
+                // read as a conflict and must not delete a victim.
+                "UPDATE OR REPLACE wr SET u = NULL WHERE k = 'c'",
+                // NOCASE: 'BETA' collides with 'Beta' on wr_c, so REPLACE must
+                // remove row 'b' even though the bytes differ.
+                "UPDATE OR REPLACE wr SET c = 'BETA' WHERE k = 'a'",
+            ],
+            &[
+                "SELECT k, u, c FROM wr ORDER BY k",
+                "SELECT c, k FROM wr ORDER BY c, k",
+                "SELECT k FROM wr WHERE c = 'beta'",
+                "SELECT count(*) FROM wr",
+                "SELECT count(*) FROM wr WHERE u IS NULL",
+            ],
+            "without_rowid_update_secondary_unique_null_and_collation",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — stock-SQLite structural proof for the secondary-UNIQUE victim
+/// path, mirroring the PK-victim integrity arm.
+#[test]
+fn without_rowid_update_secondary_unique_stays_stock_integrity_clean() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("wr_secondary_unique_victim.db");
+        let path_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(path_str).await.expect("open frank");
+            for stmt in [
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, \
+                 lab TEXT NOT NULL) WITHOUT ROWID",
+                "CREATE UNIQUE INDEX wr_a ON wr(a)",
+                "CREATE UNIQUE INDEX wr_b ON wr(b)",
+                "CREATE INDEX wr_lab ON wr(lab)",
+                "INSERT INTO wr VALUES ('r1',1,10,'x'),('r2',2,20,'y'),('r3',3,30,'z'),\
+                 ('r4',4,40,'w')",
+                "UPDATE OR REPLACE wr SET a = 2, b = 30, lab = 'q' WHERE k = 'r1'",
+            ] {
+                conn.execute(stmt).await.expect("frank statement");
+            }
+            conn.close().await.expect("await frank close");
+        }
+
+        let stock = rusqlite::Connection::open(&db_path).expect("stock reopen");
+        let integrity: String = stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("integrity_check");
+        assert_eq!(
+            integrity, "ok",
+            "bd-yuj70: secondary-UNIQUE victim handling left a malformed image"
+        );
+
+        let survivors: Vec<String> = stock
+            .prepare("SELECT k || '/' || a || '/' || b || '/' || lab FROM wr ORDER BY k")
+            .expect("prepare survivors")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query survivors")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect survivors");
+        assert_eq!(
+            survivors,
+            vec!["r1/2/30/q".to_owned(), "r4/4/40/w".to_owned()],
+            "bd-yuj70: both secondary-UNIQUE victims must be replaced"
         );
     });
 }
