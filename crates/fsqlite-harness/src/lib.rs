@@ -90,6 +90,7 @@ pub mod parity_taxonomy;
 pub mod parity_verification_workflow;
 pub mod perf_loop;
 pub mod performance_regression_detector;
+pub mod performance_release_admission;
 pub mod planner_vdbe_closure;
 pub mod ratchet_policy;
 pub mod realdb_e2e_logging;

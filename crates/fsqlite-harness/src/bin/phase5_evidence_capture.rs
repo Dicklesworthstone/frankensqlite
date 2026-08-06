@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use fsqlite_harness::performance_release_admission::{
+    PerformanceAdmissionGate, blocked_missing_authoritative_policy,
+};
 
 const SCHEMA_VERSION: u32 = 3;
 const DIGEST_ALGORITHM: &str = "blake3-256";
@@ -68,17 +71,8 @@ struct Manifest {
     workspace: RunEvidence,
     run_receipts: Vec<RunReceipt>,
     auxiliary_scorecards: Scorecards,
-    performance_regression_gate: PerformanceRegressionGate,
+    performance_regression_gate: PerformanceAdmissionGate,
     evidence_pack: Vec<EvidenceLeaf>,
-}
-
-#[derive(Debug, Serialize)]
-struct PerformanceRegressionGate {
-    schema_version: &'static str,
-    status: &'static str,
-    release_authorized: bool,
-    blockers: [&'static str; 4],
-    rationale: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -533,13 +527,7 @@ fn run() -> Result<(), String> {
                 },
             },
         },
-        performance_regression_gate: PerformanceRegressionGate {
-            schema_version: "fsqlite.performance_release_admission.v1",
-            status: "blocked_no_immutable_historical_baseline",
-            release_authorized: false,
-            blockers: ["bd-dqdoe", "bd-uh1fv", "bd-zywqc.2", "bd-1dp9.6.4"],
-            rationale: "Dual-profile persistent receipts prove only profile-bound capture integrity. The existing perf_regression_gate is diagnostic-only and has no immutable historical paired baseline, calibration, synthetic-regression sensitivity proof, or authoritative regression policy; it cannot authorize release.",
-        },
+        performance_regression_gate: blocked_missing_authoritative_policy(),
         evidence_pack: Vec::new(),
     };
     let manifest_path = format!("{namespace}/{MANIFEST_NAME}");

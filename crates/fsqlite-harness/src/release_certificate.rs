@@ -56,6 +56,10 @@ use crate::parity_verification_workflow::{
     BEAD_ID as WORKFLOW_BEAD_ID, SCHEMA_VERSION as WORKFLOW_SCHEMA_VERSION, WorkflowOutcome,
     WorkflowPhase, WorkflowReport, validate_workflow_report,
 };
+use crate::performance_release_admission::{
+    PerformanceAdmissionGate, blocked_missing_authoritative_policy,
+    validate_gate as validate_performance_admission_gate,
+};
 use crate::score_engine::BayesianScorecard;
 
 #[allow(dead_code)]
@@ -434,15 +438,7 @@ struct Phase5Manifest {
     evidence_pack: Vec<Phase5EvidenceLeaf>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct Phase5PerformanceRegressionGate {
-    schema_version: String,
-    status: String,
-    release_authorized: bool,
-    blockers: Vec<String>,
-    rationale: String,
-}
+type Phase5PerformanceRegressionGate = PerformanceAdmissionGate;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -4358,21 +4354,12 @@ fn validate_t16_binary_manifest_binding(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn validate_phase5_performance_regression_gate(
+    workspace_root: &Path,
+    tested_commit: &str,
     performance: &Phase5PerformanceRegressionGate,
 ) -> Result<(), String> {
-    const SCHEMA: &str = "fsqlite.performance_release_admission.v1";
-    const STATUS: &str = "blocked_no_immutable_historical_baseline";
-    const BLOCKERS: [&str; 4] = ["bd-dqdoe", "bd-uh1fv", "bd-zywqc.2", "bd-1dp9.6.4"];
-    const RATIONALE: &str = "Dual-profile persistent receipts prove only profile-bound capture integrity. The existing perf_regression_gate is diagnostic-only and has no immutable historical paired baseline, calibration, synthetic-regression sensitivity proof, or authoritative regression policy; it cannot authorize release.";
-    if performance.schema_version != SCHEMA
-        || performance.status != STATUS
-        || performance.release_authorized
-        || !performance.blockers.iter().map(String::as_str).eq(BLOCKERS)
-        || performance.rationale != RATIONALE
-    {
-        return Err("phase5_performance_regression_gate_contract_invalid".to_owned());
-    }
-    Ok(())
+    validate_performance_admission_gate(workspace_root, tested_commit, performance)
+        .map_err(|error| format!("phase5_performance_regression_gate_contract_invalid: {error}"))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -4393,7 +4380,11 @@ fn validate_phase5_manifest(
     {
         return Err("phase5_manifest_candidate_or_schema_mismatch".to_owned());
     }
-    validate_phase5_performance_regression_gate(&manifest.performance_regression_gate)?;
+    validate_phase5_performance_regression_gate(
+        workspace_root,
+        tested_candidate_git_sha,
+        &manifest.performance_regression_gate,
+    )?;
     let expected_minisig_path =
         format!("{PHASE5_EVIDENCE_PREFIX}/{tested_candidate_git_sha}/signing/manifest.minisig");
     let declared_minisig_path = manifest.signature_path.as_str();
@@ -5290,24 +5281,22 @@ mod tests {
     }
 
     #[test]
-    fn phase5_diagnostic_performance_gate_remains_non_authorizing() {
-        let mut performance = Phase5PerformanceRegressionGate {
-            schema_version: "fsqlite.performance_release_admission.v1".to_owned(),
-            status: "blocked_no_immutable_historical_baseline".to_owned(),
-            release_authorized: false,
-            blockers: vec![
-                "bd-dqdoe".to_owned(),
-                "bd-uh1fv".to_owned(),
-                "bd-zywqc.2".to_owned(),
-                "bd-1dp9.6.4".to_owned(),
-            ],
-            rationale: "Dual-profile persistent receipts prove only profile-bound capture integrity. The existing perf_regression_gate is diagnostic-only and has no immutable historical paired baseline, calibration, synthetic-regression sensitivity proof, or authoritative regression policy; it cannot authorize release.".to_owned(),
-        };
-        assert!(validate_phase5_performance_regression_gate(&performance).is_ok());
+    fn phase5_missing_policy_gate_is_typed_and_non_authorizing() {
+        let mut performance = blocked_missing_authoritative_policy();
+        assert!(validate_phase5_performance_regression_gate(
+            Path::new("."),
+            "a".repeat(40).as_str(),
+            &performance,
+        )
+        .is_ok());
         performance.release_authorized = true;
         assert_eq!(
-            validate_phase5_performance_regression_gate(&performance),
-            Err("phase5_performance_regression_gate_contract_invalid".to_owned())
+            validate_phase5_performance_regression_gate(
+                Path::new("."),
+                "a".repeat(40).as_str(),
+                &performance,
+            ),
+            Err("phase5_performance_regression_gate_contract_invalid: performance admission gate authorization shape is invalid".to_owned())
         );
     }
 

@@ -9,6 +9,10 @@ use syn::parse::{ParseStream, Parser};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{Attribute, Expr, Item, Lit, Meta, Token};
+use fsqlite_harness::performance_release_admission::{
+    PerformanceAdmissionGate as PerformanceRegressionGate, blocked_missing_authoritative_policy,
+    validate_gate as validate_performance_admission_gate,
+};
 
 const BEAD_ID: &str = "bd-16e7";
 const LOG_PREFIX: &str = "[REGR_GUARD]";
@@ -2097,16 +2101,6 @@ struct ReleaseEvidenceManifest {
     evidence_pack: Vec<EvidenceLeaf>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct PerformanceRegressionGate {
-    schema_version: String,
-    status: String,
-    release_authorized: bool,
-    blockers: Vec<String>,
-    rationale: String,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ValidatedCurrentRunReceipts {
     locators: HashSet<String>,
@@ -2779,23 +2773,12 @@ fn validate_persistent_profile_pairing(
     Ok(())
 }
 
-fn validate_performance_regression_gate(gate: &PerformanceRegressionGate) -> Result<(), String> {
-    const SCHEMA: &str = "fsqlite.performance_release_admission.v1";
-    const STATUS: &str = "blocked_no_immutable_historical_baseline";
-    const RATIONALE: &str = "Dual-profile persistent receipts prove only profile-bound capture integrity. The existing perf_regression_gate is diagnostic-only and has no immutable historical paired baseline, calibration, synthetic-regression sensitivity proof, or authoritative regression policy; it cannot authorize release.";
-    const BLOCKERS: [&str; 4] = ["bd-dqdoe", "bd-uh1fv", "bd-zywqc.2", "bd-1dp9.6.4"];
-    if gate.schema_version != SCHEMA
-        || gate.status != STATUS
-        || gate.release_authorized
-        || !gate.blockers.iter().map(String::as_str).eq(BLOCKERS)
-        || gate.rationale != RATIONALE
-    {
-        return Err(
-            "performance regression admission must remain explicitly blocked until an immutable historical baseline and authoritative policy are implemented"
-                .to_owned(),
-        );
-    }
-    Ok(())
+fn validate_performance_regression_gate(
+    root: &Path,
+    tested_commit: &str,
+    gate: &PerformanceRegressionGate,
+) -> Result<(), String> {
+    validate_performance_admission_gate(root, tested_commit, gate)
 }
 
 fn expected_test_target(source_path: &str) -> Result<CargoTestTarget, String> {
@@ -3214,7 +3197,7 @@ fn validate_release_evidence_manifest(
         &manifest.tested_commit,
         "persistent/release-perf",
     )?;
-    validate_performance_regression_gate(&manifest.performance_regression_gate)?;
+    validate_performance_regression_gate(root, &manifest.tested_commit, &manifest.performance_regression_gate)?;
     validate_command_evidence_shape(&manifest.workspace.execution, "workspace")?;
     validate_command_evidence_commit_paths(
         &manifest.workspace.execution,
@@ -5980,18 +5963,7 @@ fn sample_release_evidence() -> (RegressionBaseline, ReleaseEvidenceManifest) {
                 },
             },
         },
-        performance_regression_gate: PerformanceRegressionGate {
-            schema_version: "fsqlite.performance_release_admission.v1".to_owned(),
-            status: "blocked_no_immutable_historical_baseline".to_owned(),
-            release_authorized: false,
-            blockers: vec![
-                "bd-dqdoe".to_owned(),
-                "bd-uh1fv".to_owned(),
-                "bd-zywqc.2".to_owned(),
-                "bd-1dp9.6.4".to_owned(),
-            ],
-            rationale: "Dual-profile persistent receipts prove only profile-bound capture integrity. The existing perf_regression_gate is diagnostic-only and has no immutable historical paired baseline, calibration, synthetic-regression sensitivity proof, or authoritative regression policy; it cannot authorize release.".to_owned(),
-        },
+        performance_regression_gate: blocked_missing_authoritative_policy(),
         evidence_pack: Vec::new(),
     };
     manifest.evidence_pack = vec![
@@ -8172,22 +8144,11 @@ fn test_regression_guard_pre_capture_untracked_census_fails_closed() {
 }
 
 #[test]
-fn test_regression_guard_marks_diagnostic_performance_gate_non_authorizing() {
-    let mut gate = PerformanceRegressionGate {
-        schema_version: "fsqlite.performance_release_admission.v1".to_owned(),
-        status: "blocked_no_immutable_historical_baseline".to_owned(),
-        release_authorized: false,
-        blockers: vec![
-            "bd-dqdoe".to_owned(),
-            "bd-uh1fv".to_owned(),
-            "bd-zywqc.2".to_owned(),
-            "bd-1dp9.6.4".to_owned(),
-        ],
-        rationale: "Dual-profile persistent receipts prove only profile-bound capture integrity. The existing perf_regression_gate is diagnostic-only and has no immutable historical paired baseline, calibration, synthetic-regression sensitivity proof, or authoritative regression policy; it cannot authorize release.".to_owned(),
-    };
-    assert!(validate_performance_regression_gate(&gate).is_ok());
+fn test_regression_guard_requires_typed_v2_policy_blocker_when_no_policy_exists() {
+    let mut gate = blocked_missing_authoritative_policy();
+    assert!(validate_performance_regression_gate(Path::new("."), "a".repeat(40).as_str(), &gate).is_ok());
     gate.release_authorized = true;
-    assert!(validate_performance_regression_gate(&gate).is_err());
+    assert!(validate_performance_regression_gate(Path::new("."), "a".repeat(40).as_str(), &gate).is_err());
 }
 
 #[test]
