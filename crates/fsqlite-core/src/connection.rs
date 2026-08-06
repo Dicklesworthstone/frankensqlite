@@ -9916,6 +9916,21 @@ impl FallbackDecisionCapture {
     }
 }
 
+/// Restores the prior operation context when an actor-dispatched call ends.
+///
+/// The guard is deliberately lexical: cancellation authority cannot leak into
+/// the next command when a future returns early or unwinds.
+pub struct OperationCxGuard<'a> {
+    slot: &'a RefCell<Option<Cx>>,
+    previous: Option<Cx>,
+}
+
+impl Drop for OperationCxGuard<'_> {
+    fn drop(&mut self) {
+        self.slot.replace(self.previous.take());
+    }
+}
+
 pub struct Connection {
     path: String,
     /// In-memory execution image shared with the VDBE engine.
@@ -10533,6 +10548,10 @@ pub struct Connection {
     /// Root capability context for this connection. All per-operation contexts
     /// are derived from this via `op_cx()`, inheriting the connection's trace ID.
     root_cx: Cx,
+    /// Lexically scoped context supplied by the dedicated async actor for one
+    /// admitted operation. The actor is the sole owner of its `Connection`, so
+    /// a single-slot override is sufficient and cannot cross worker threads.
+    operation_cx_override: RefCell<Option<Cx>>,
     /// Connection-scoped e-process oracle for adaptive cancellation decisions.
     eprocess_oracle: Arc<EProcessOracle>,
     /// Counter for throttling e-process oracle refresh (every 64 statements).
@@ -11838,6 +11857,7 @@ impl Connection {
             #[cfg(test)]
             fail_alter_drop_after_storage_once: Cell::new(false),
             root_cx,
+            operation_cx_override: RefCell::new(None),
             eprocess_oracle,
             statement_count_since_oracle_refresh: Cell::new(0),
             version_store: OnceCell::new(),
@@ -12296,6 +12316,7 @@ impl Connection {
             fail_alter_drop_after_storage_once: Cell::new(false),
             // Cx capability context (bd-2g5.6)
             root_cx,
+            operation_cx_override: RefCell::new(None),
             eprocess_oracle,
             statement_count_since_oracle_refresh: Cell::new(0),
             // MVCC version-chain reclamation (bd-3wop3.5)
@@ -16348,6 +16369,27 @@ impl Connection {
         &self.root_cx
     }
 
+    /// Bind a worker-owned context to subsequent operation-context derivations.
+    ///
+    /// This is the cancellation bridge for actor facades. The supplied context
+    /// must be derived from this connection's root so it retains the worker's
+    /// capabilities and native I/O attachment. Dropping the returned guard
+    /// restores the previous binding, including during unwinding.
+    #[must_use = "the operation context binding lasts only while the guard is held"]
+    pub fn bind_operation_cx(&self, cx: &Cx) -> OperationCxGuard<'_> {
+        let previous = self.operation_cx_override.replace(Some(cx.clone()));
+        OperationCxGuard {
+            slot: &self.operation_cx_override,
+            previous,
+        }
+    }
+
+    /// Run one actor-dispatched operation under a worker-root-derived context.
+    pub fn with_operation_cx<T>(&self, cx: &Cx, operation: impl FnOnce() -> T) -> T {
+        let _binding = self.bind_operation_cx(cx);
+        operation()
+    }
+
     /// Derive a per-operation capability context from this connection's root.
     ///
     /// Each call allocates a new `decision_id` so that per-operation tracing
@@ -16377,7 +16419,13 @@ impl Connection {
         // Hot-path SQL operations do not need independent cancellation trees
         // per statement; cloning the connection root preserves lineage while
         // avoiding child-context allocation and parent-child bookkeeping.
-        let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
+        let op_cx = self
+            .operation_cx_override
+            .borrow()
+            .as_ref()
+            .unwrap_or(&self.root_cx)
+            .clone()
+            .with_decision_id(next_decision_id());
         if tracing::enabled!(target: "fsqlite::cx", tracing::Level::DEBUG) {
             tracing::debug!(
                 target: "fsqlite::cx",
@@ -124004,6 +124052,28 @@ mod tests {
                 op_cx.decision_id(),
                 0,
                 "operation contexts should allocate a fresh decision id"
+            );
+        });
+    }
+
+    #[test]
+    fn operation_cx_binding_is_lexical_and_cancel_scoped() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let (operation, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+
+            {
+                let _binding = conn.bind_operation_cx(&operation);
+                assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                assert!(
+                    conn.op_cx().unwrap().checkpoint().is_err(),
+                    "the bound operation must observe actor-relayed cancellation"
+                );
+            }
+
+            assert!(
+                conn.op_cx().unwrap().checkpoint().is_ok(),
+                "dropping the binding must restore the connection root context"
             );
         });
     }

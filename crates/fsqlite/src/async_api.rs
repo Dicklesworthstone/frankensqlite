@@ -22,9 +22,10 @@
 //! not currently expose that depth, so native masking retains its ordinary
 //! deferred-cancellation semantics.
 //!
-//! Once a command has been admitted, the current worker protocol runs it to
-//! completion even if the caller later abandons the response. Mid-flight
-//! cancellation requires a separate worker-side cancellation protocol.
+//! Once a command has been admitted, caller cancellation is relayed into a
+//! worker-root-derived per-operation context. The caller then waits for the
+//! worker's authoritative terminal effect result: an aborted operation returns
+//! `Interrupt`, while a publication that already won returns its actual result.
 //!
 //! # Feature gate
 //!
@@ -57,7 +58,7 @@ use asupersync::channel::{mpsc as async_mpsc, oneshot};
 use asupersync::cx::{Cx as NativeCx, cap as native_cap};
 use asupersync::runtime::Runtime;
 use asupersync::runtime::blocking_pool::{BlockingPoolHandle, BlockingTaskHandle};
-use fsqlite_types::cx::Cx;
+use fsqlite_types::cx::{CancelReason, Cx, LocalCancelRelay};
 use futures_lite::future;
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -72,10 +73,100 @@ use std::time::Duration;
 // Command protocol between async methods and the worker thread
 // ---------------------------------------------------------------------------
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationPhase {
+    Queued,
+    Running,
+    Completed,
+}
+
+#[derive(Debug)]
+struct OperationControl {
+    cancel_requested: AtomicBool,
+    phase: AtomicU8,
+    relay: Mutex<Option<LocalCancelRelay>>,
+}
+
+impl OperationControl {
+    fn new() -> Self {
+        Self {
+            cancel_requested: AtomicBool::new(false),
+            phase: AtomicU8::new(OperationPhase::Queued as u8),
+            relay: Mutex::new(None),
+        }
+    }
+
+    fn request_cancel(&self, reason: CancelReason) {
+        if self.phase.load(Ordering::Acquire) == OperationPhase::Completed as u8 {
+            return;
+        }
+        self.cancel_requested.store(true, Ordering::Release);
+        let relay = self
+            .relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(relay) = relay.as_ref() {
+            let _ = relay.cancel_local(reason);
+        }
+    }
+
+    /// Mark an abandoned response future without locking or invoking runtime
+    /// code from `Drop`. A queued worker rechecks this bit before SQL starts.
+    fn abandon(&self) {
+        self.cancel_requested.store(true, Ordering::Release);
+    }
+
+    fn run<T>(
+        &self,
+        conn: &Connection,
+        operation: impl FnOnce() -> Result<T, FrankenError>,
+    ) -> Result<T, FrankenError> {
+        let (operation_cx, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+        {
+            let mut slot = self
+                .relay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Some(relay);
+            self.phase
+                .store(OperationPhase::Running as u8, Ordering::Release);
+            if self.cancel_requested.load(Ordering::Acquire)
+                && let Some(relay) = slot.as_ref()
+            {
+                let _ = relay.cancel_local(CancelReason::UserInterrupt);
+            }
+        }
+        let _completion = OperationCompletionGuard { control: self };
+        conn.with_operation_cx(&operation_cx, operation)
+    }
+}
+
+struct OperationCompletionGuard<'a> {
+    control: &'a OperationControl,
+}
+
+impl Drop for OperationCompletionGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .control
+            .relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.control
+            .phase
+            .store(OperationPhase::Completed as u8, Ordering::Release);
+    }
+}
+
 #[derive(Debug)]
 enum Responder<T> {
     Sync(mpsc::SyncSender<Result<T, FrankenError>>),
-    Async(oneshot::Sender<Result<T, FrankenError>>),
+    Async {
+        tx: oneshot::Sender<Result<T, FrankenError>>,
+        operation: Option<Arc<OperationControl>>,
+    },
 }
 
 impl<T> Responder<T> {
@@ -84,11 +175,18 @@ impl<T> Responder<T> {
             Self::Sync(tx) => {
                 let _ = tx.send(result);
             }
-            Self::Async(tx) => {
+            Self::Async { tx, .. } => {
                 // `send_blocking` is an immediate, context-free publication;
                 // it does not park this dedicated engine thread.
                 let _ = tx.send_blocking(result);
             }
+        }
+    }
+
+    fn operation_control(&self) -> Option<Arc<OperationControl>> {
+        match self {
+            Self::Sync(_) => None,
+            Self::Async { operation, .. } => operation.as_ref().map(Arc::clone),
         }
     }
 }
@@ -100,7 +198,30 @@ fn sync_response_channel<T>() -> (Responder<T>, mpsc::Receiver<Result<T, Franken
 
 fn async_response_channel<T>() -> (Responder<T>, oneshot::Receiver<Result<T, FrankenError>>) {
     let (tx, rx) = oneshot::channel();
-    (Responder::Async(tx), rx)
+    (
+        Responder::Async {
+            tx,
+            operation: None,
+        },
+        rx,
+    )
+}
+
+fn async_operation_response_channel<T>() -> (
+    Responder<T>,
+    oneshot::Receiver<Result<T, FrankenError>>,
+    Arc<OperationControl>,
+) {
+    let (tx, rx) = oneshot::channel();
+    let operation = Arc::new(OperationControl::new());
+    (
+        Responder::Async {
+            tx,
+            operation: Some(Arc::clone(&operation)),
+        },
+        rx,
+        operation,
+    )
 }
 
 const COMMAND_MAILBOX_CAPACITY: usize = 32;
@@ -133,6 +254,10 @@ struct WorkerState {
     #[cfg(test)]
     open_response_committed: AtomicBool,
     #[cfg(test)]
+    hold_before_command_response: AtomicBool,
+    #[cfg(test)]
+    command_response_waiting: AtomicBool,
+    #[cfg(test)]
     unobserved_errors: Mutex<Vec<String>>,
     #[cfg(test)]
     forced_open_error: Mutex<Option<FrankenError>>,
@@ -152,6 +277,10 @@ impl WorkerState {
             open_response_waiting: AtomicBool::new(false),
             #[cfg(test)]
             open_response_committed: AtomicBool::new(false),
+            #[cfg(test)]
+            hold_before_command_response: AtomicBool::new(false),
+            #[cfg(test)]
+            command_response_waiting: AtomicBool::new(false),
             #[cfg(test)]
             unobserved_errors: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -190,6 +319,17 @@ impl WorkerState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+
+    #[cfg(test)]
+    fn pause_before_command_response(&self) {
+        if !self.hold_before_command_response.load(Ordering::Acquire) {
+            return;
+        }
+        self.command_response_waiting.store(true, Ordering::Release);
+        while self.hold_before_command_response.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
     }
 
     #[cfg(test)]
@@ -883,6 +1023,95 @@ async fn recv_async_response<T>(
     }
 }
 
+struct OperationWaitGuard {
+    control: Arc<OperationControl>,
+    armed: bool,
+}
+
+impl OperationWaitGuard {
+    fn new(control: Arc<OperationControl>) -> Self {
+        Self {
+            control,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OperationWaitGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Future Drop must stay nonblocking. The worker checks this atomic
+            // before starting a queued effect; explicit cancellation uses the
+            // relay path below and then arbitrates the terminal result.
+            self.control.abandon();
+        }
+    }
+}
+
+enum OperationReceive<T> {
+    Completed(T),
+    Cancelled,
+}
+
+async fn recv_async_operation_response<T>(
+    preflight: &AsyncCallPreflight,
+    rx: &mut oneshot::Receiver<Result<T, FrankenError>>,
+    control: Arc<OperationControl>,
+) -> Result<T, FrankenError> {
+    let mut wait_guard = OperationWaitGuard::new(Arc::clone(&control));
+    let completion_cx = NativeCx::<native_cap::None>::detached_cancel_context();
+    let (native_cancel_tx, mut native_cancel_rx) = oneshot::channel::<()>();
+    let outcome = {
+        let response = async {
+            match rx.recv(&completion_cx).await {
+                Ok(result) => OperationReceive::Completed(Ok(result)),
+                Err(
+                    oneshot::RecvError::Cancelled
+                    | oneshot::RecvError::Closed
+                    | oneshot::RecvError::PolledAfterCompletion,
+                ) => OperationReceive::Completed(Err(worker_dead_err())),
+            }
+        };
+        let native_cancelled = async {
+            let result = native_cancel_rx.recv(&preflight.native_cx).await;
+            debug_assert!(matches!(result, Err(oneshot::RecvError::Cancelled)));
+            OperationReceive::Cancelled
+        };
+        let locally_cancelled = async {
+            preflight.control_cx.wait_for_local_cancel_request().await;
+            OperationReceive::Cancelled
+        };
+
+        // A worker result wins a same-poll race. Otherwise cancellation is
+        // relayed to the worker-owned operation context and this caller waits
+        // on an uncancelled completion context for the authoritative effect
+        // outcome. Thus a completed publication returns success, never a late
+        // caller-side Interrupt.
+        future::or(response, future::or(native_cancelled, locally_cancelled)).await
+    };
+    drop(native_cancel_tx);
+
+    let result = match outcome {
+        OperationReceive::Completed(result) => result?,
+        OperationReceive::Cancelled => {
+            let reason = preflight
+                .control_cx
+                .cancel_reason()
+                .unwrap_or(CancelReason::UserInterrupt);
+            control.request_cancel(reason);
+            rx.recv(&completion_cx)
+                .await
+                .map_err(|_| worker_dead_err())?
+        }
+    };
+    wait_guard.disarm();
+    result
+}
+
 fn recv_worker_response<T>(rx: mpsc::Receiver<Result<T, FrankenError>>) -> Result<T, FrankenError> {
     rx.recv().map_err(|_| worker_dead_err())?
 }
@@ -907,7 +1136,22 @@ fn publish_and_respond<T>(
     // result visible. This also covers transaction control expressed as SQL
     // text and rollback-on-error paths, not just the convenience methods.
     state.publish_connection_state(conn);
+    #[cfg(test)]
+    state.pause_before_command_response();
     tx.respond(result);
+}
+
+fn run_operation_and_respond<T>(
+    conn: &Connection,
+    state: &WorkerState,
+    tx: Responder<T>,
+    operation: impl FnOnce() -> Result<T, FrankenError>,
+) {
+    let result = match tx.operation_control() {
+        Some(control) => control.run(conn, operation),
+        None => operation(),
+    };
+    publish_and_respond(conn, state, tx, result);
 }
 
 fn worker_loop(conn: &Connection, rx: &mut CommandReceiver, state: &WorkerState) -> WorkerStop {
@@ -926,16 +1170,17 @@ fn worker_loop(conn: &Connection, rx: &mut CommandReceiver, state: &WorkerState)
 
         match cmd {
             Command::Prepare { sql, tx } => {
-                let result = future::block_on(conn.prepare(&sql)).map(drop);
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || {
+                    future::block_on(conn.prepare(&sql)).map(drop)
+                });
             }
             Command::Query { sql, tx } => {
-                let result = future::block_on(conn.query(&sql));
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || future::block_on(conn.query(&sql)));
             }
             Command::QueryWithParams { sql, params, tx } => {
-                let result = future::block_on(conn.query_with_params(&sql, &params));
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || {
+                    future::block_on(conn.query_with_params(&sql, &params))
+                });
             }
             Command::QueryWithParamsStream { sql, params, tx } => {
                 let mut published_before_first_row = false;
@@ -963,53 +1208,59 @@ fn worker_loop(conn: &Connection, rx: &mut CommandReceiver, state: &WorkerState)
                 }
             }
             Command::QueryRow { sql, tx } => {
-                let result = future::block_on(conn.query_row(&sql));
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || {
+                    future::block_on(conn.query_row(&sql))
+                });
             }
             Command::QueryRowWithParams { sql, params, tx } => {
-                let result = future::block_on(conn.query_row_with_params(&sql, &params));
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || {
+                    future::block_on(conn.query_row_with_params(&sql, &params))
+                });
             }
             Command::Execute { sql, tx } => {
-                let result = future::block_on(conn.execute(&sql));
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || future::block_on(conn.execute(&sql)));
             }
             Command::ExecuteWithParams { sql, params, tx } => {
-                let result = future::block_on(conn.execute_with_params(&sql, &params));
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || {
+                    future::block_on(conn.execute_with_params(&sql, &params))
+                });
             }
             Command::ExecuteManyWithParamsInTransaction {
                 sql,
                 parameter_sets,
                 tx,
             } => {
-                let result = future::block_on(
-                    conn.execute_many_with_params_skip_statement_savepoint_in_explicit_txn(
-                        &sql,
-                        &parameter_sets,
-                    ),
-                );
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || {
+                    future::block_on(
+                        conn.execute_many_with_params_skip_statement_savepoint_in_explicit_txn(
+                            &sql,
+                            &parameter_sets,
+                        ),
+                    )
+                });
             }
             Command::ExecuteBatch { sql, tx } => {
-                let result = future::block_on(conn.execute_batch(&sql));
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || {
+                    future::block_on(conn.execute_batch(&sql))
+                });
             }
             Command::BeginTransaction { tx } => {
-                let result = future::block_on(conn.begin_transaction());
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || {
+                    future::block_on(conn.begin_transaction())
+                });
             }
             Command::CommitTransaction { tx } => {
-                let result = future::block_on(conn.commit_transaction());
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || {
+                    future::block_on(conn.commit_transaction())
+                });
             }
             Command::RollbackTransaction { tx } => {
-                let result = future::block_on(conn.rollback_transaction());
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || {
+                    future::block_on(conn.rollback_transaction())
+                });
             }
             Command::LastInsertRowid { tx } => {
-                let result = Ok(conn.last_insert_rowid());
-                publish_and_respond(conn, state, tx, result);
+                run_operation_and_respond(conn, state, tx, || Ok(conn.last_insert_rowid()));
             }
             Command::Close => {
                 return WorkerStop::ExplicitClose;
@@ -1453,8 +1704,9 @@ fn async_admission_err<T>(error: async_mpsc::SendError<T>) -> FrankenError {
 /// usable native cancellation context before dispatching. Only async close
 /// needs the runtime's blocking pool in order to observe the OS-thread join.
 /// A failed preflight returns without touching the underlying connection.
-/// Commands that pass preflight currently run to completion once admitted to
-/// the worker.
+/// Commands that pass preflight carry a cancellation-only relay into a
+/// worker-root-derived operation context. Cancellation after admission waits
+/// for the worker's authoritative terminal effect result.
 ///
 /// A caller context with a nonzero cancellation-mask depth is rejected when
 /// the call starts. A mask acquired through another alias after that start-time
@@ -1864,7 +2116,7 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(
                 &preflight,
@@ -1874,7 +2126,7 @@ impl AsyncConnection {
                 },
             )
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Execute a SQL query and return all result rows.
@@ -1884,7 +2136,7 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(
                 &preflight,
@@ -1894,7 +2146,7 @@ impl AsyncConnection {
                 },
             )
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Execute a query with bound parameters and return all result rows.
@@ -1909,7 +2161,7 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(
                 &preflight,
@@ -1920,7 +2172,7 @@ impl AsyncConnection {
                 },
             )
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Execute a query and return exactly one row.
@@ -1930,7 +2182,7 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(
                 &preflight,
@@ -1940,7 +2192,7 @@ impl AsyncConnection {
                 },
             )
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Execute a query with parameters and return exactly one row.
@@ -1955,7 +2207,7 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(
                 &preflight,
@@ -1966,7 +2218,7 @@ impl AsyncConnection {
                 },
             )
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Execute SQL and return the number of affected/output rows.
@@ -1976,7 +2228,7 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(
                 &preflight,
@@ -1986,7 +2238,7 @@ impl AsyncConnection {
                 },
             )
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Execute SQL with bound parameters and return the number of affected/output rows.
@@ -2001,7 +2253,7 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(
                 &preflight,
@@ -2012,7 +2264,7 @@ impl AsyncConnection {
                 },
             )
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Execute zero or more SQL statements separated by semicolons.
@@ -2022,7 +2274,7 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(
                 &preflight,
@@ -2032,7 +2284,7 @@ impl AsyncConnection {
                 },
             )
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Begin a transaction.
@@ -2042,11 +2294,11 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(&preflight, Command::BeginTransaction { tx })
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Commit the active transaction.
@@ -2056,11 +2308,11 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(&preflight, Command::CommitTransaction { tx })
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Roll back the active transaction.
@@ -2070,11 +2322,11 @@ impl AsyncConnection {
         fsqlite_types::cx::cap::None: fsqlite_types::cx::cap::SubsetOf<Caps>,
     {
         let preflight = preflight_async_call(cx)?;
-        let (tx, mut rx) = async_response_channel();
+        let (tx, mut rx, operation) = async_operation_response_channel();
         self.sender()?
             .send_async(&preflight, Command::RollbackTransaction { tx })
             .await?;
-        recv_async_response(&preflight, &mut rx).await?
+        recv_async_operation_response(&preflight, &mut rx, operation).await
     }
 
     /// Returns `true` if an explicit transaction is currently active.
@@ -4432,7 +4684,7 @@ mod tests {
     }
 
     #[test]
-    fn local_cancellation_after_publication_abandons_only_the_response_wait() {
+    fn local_cancellation_after_publication_stops_queued_write_and_waits_for_worker() {
         let mut conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -4450,133 +4702,126 @@ mod tests {
         let signal = Arc::clone(&conn.sender().expect("worker sender").signal);
         let root = Cx::new();
         let (operation, relay) = root.create_child_with_local_cancel_relay();
-        let watchdog_timed_out = Arc::new(AtomicBool::new(false));
-        let watchdog_timed_out_in_thread = Arc::clone(&watchdog_timed_out);
-        let release_from_watchdog = release_tx.clone();
-        let (watchdog_cancel_tx, watchdog_cancel_rx) = mpsc::sync_channel(1);
-        let watchdog = thread::spawn(move || {
-            if watchdog_cancel_rx
-                .recv_timeout(Duration::from_secs(5))
-                .is_err()
-            {
-                watchdog_timed_out_in_thread.store(true, Ordering::Release);
-                let _ = release_from_watchdog.send(());
-            }
-        });
-
         let runtime = test_runtime();
         let result = runtime.block_on(async {
-            let execute = conn.execute(
+            let mut execute = Box::pin(conn.execute(
                 &operation,
                 "CREATE TABLE locally_cancelled_after_publication (id INTEGER PRIMARY KEY)",
-            );
-            let cancel = async {
-                while signal.async_publications.load(Ordering::Acquire) == 0 {
-                    future::yield_now().await;
-                }
+            ));
+            while signal.async_publications.load(Ordering::Acquire) == 0 {
                 assert!(
-                    relay.cancel_local(fsqlite_types::cx::CancelReason::UserInterrupt),
-                    "live operation should accept relayed cancellation"
+                    future::poll_once(&mut execute).await.is_none(),
+                    "queued command must not complete while the worker gate is held"
                 );
-            };
-            let (result, ()) = future::zip(execute, cancel).await;
-            result
+                future::yield_now().await;
+            }
+            assert!(relay.cancel_local(CancelReason::UserInterrupt));
+            assert!(
+                future::poll_once(&mut execute).await.is_none(),
+                "caller cancellation must await the worker's effect outcome"
+            );
+            let _ = release_tx.send(());
+            execute.await
         });
-        let _ = watchdog_cancel_tx.send(());
         assert!(
             matches!(result, Err(FrankenError::Interrupt)),
-            "published response wait should observe local cancellation: {result:?}"
-        );
-        assert!(
-            !watchdog_timed_out.load(Ordering::Acquire),
-            "local cancellation did not release the response waiter promptly"
+            "worker-confirmed cancellation should surface as Interrupt: {result:?}"
         );
         assert!(
             root.checkpoint().is_ok(),
             "operation-local cancellation must not affect its parent"
         );
-
-        let _ = release_tx.send(());
-        watchdog.join().expect("watchdog should not panic");
         let rows = conn
             .query_sync(
                 "SELECT name FROM sqlite_master \
                  WHERE type = 'table' AND name = 'locally_cancelled_after_publication'",
             )
             .expect("schema query should succeed after releasing the worker");
-        assert_eq!(
-            rows.len(),
-            1,
-            "publication transfers effect ownership to the worker; response cancellation \
-             must not silently retract an admitted command"
+        assert!(
+            rows.is_empty(),
+            "final Interrupt must have no late SQL effect"
         );
         conn.close_sync().expect("close should succeed");
         drop(runtime);
     }
 
     #[test]
-    fn native_cancellation_after_publication_abandons_only_the_response_wait() {
+    fn dropping_admitted_write_future_cancels_before_effect_and_connection_reuses() {
         let mut conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
-        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::sync_channel(1);
-        conn.sender()
-            .expect("worker sender")
-            .send(Command::BlockForTest {
-                entered_tx,
-                release_rx,
-            })
-            .expect("blocking test command should be admitted");
-        entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("worker should enter deterministic gate");
-
+        conn.execute_sync("CREATE TABLE dropped_write (value INTEGER)")
+            .expect("setup should succeed");
+        let release_tx = stall_worker(&conn);
         let signal = Arc::clone(&conn.sender().expect("worker sender").signal);
+        let runtime = test_runtime();
+
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let mut write = Box::pin(conn.execute(&cx, "INSERT INTO dropped_write VALUES (1)"));
+            while signal.async_publications.load(Ordering::Acquire) == 0 {
+                assert!(
+                    future::poll_once(&mut write).await.is_none(),
+                    "admitted write must wait behind the worker gate"
+                );
+                future::yield_now().await;
+            }
+            drop(write);
+        });
+
+        let _ = release_tx.send(());
+        let rows = conn
+            .query_sync("SELECT value FROM dropped_write")
+            .expect("connection should remain reusable after abandoned write cleanup");
+        assert!(
+            rows.is_empty(),
+            "dropped admitted write must leave no effect"
+        );
+        assert!(
+            !conn.in_transaction(),
+            "abandoned write must leave a known idle state"
+        );
+        conn.close_sync()
+            .expect("explicit close should join the worker");
+        drop(runtime);
+    }
+
+    #[test]
+    fn publication_wins_native_cancellation_and_returns_committed_result() {
+        let mut conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
+        conn.state
+            .hold_before_command_response
+            .store(true, Ordering::Release);
         let operation = Cx::new();
         let native = NativeCx::for_testing();
         operation.set_native_cx(native.clone());
-        let watchdog_timed_out = Arc::new(AtomicBool::new(false));
-        let watchdog_timed_out_in_thread = Arc::clone(&watchdog_timed_out);
-        let release_from_watchdog = release_tx.clone();
-        let (watchdog_cancel_tx, watchdog_cancel_rx) = mpsc::sync_channel(1);
-        let watchdog = thread::spawn(move || {
-            if watchdog_cancel_rx
-                .recv_timeout(Duration::from_secs(5))
-                .is_err()
-            {
-                watchdog_timed_out_in_thread.store(true, Ordering::Release);
-                let _ = release_from_watchdog.send(());
-            }
-        });
-
         let runtime = test_runtime();
         let result = runtime.block_on(async {
-            let execute = conn.execute(
+            let mut execute = Box::pin(conn.execute(
                 &operation,
                 "CREATE TABLE native_cancelled_after_publication (id INTEGER PRIMARY KEY)",
+            ));
+            while !conn.state.command_response_waiting.load(Ordering::Acquire) {
+                assert!(
+                    future::poll_once(&mut execute).await.is_none(),
+                    "response must remain held at the publication gate"
+                );
+                future::yield_now().await;
+            }
+            native.set_cancel_reason(asupersync::types::CancelReason::user(
+                "native publication arbitration test",
+            ));
+            assert!(
+                future::poll_once(&mut execute).await.is_none(),
+                "publication winner must remain pending until its response is released"
             );
-            let cancel = async {
-                while signal.async_publications.load(Ordering::Acquire) == 0 {
-                    future::yield_now().await;
-                }
-                native.set_cancel_reason(asupersync::types::CancelReason::user(
-                    "native response cancellation test",
-                ));
-            };
-            let (result, ()) = future::zip(execute, cancel).await;
-            result
+            conn.state
+                .hold_before_command_response
+                .store(false, Ordering::Release);
+            execute.await
         });
-        let _ = watchdog_cancel_tx.send(());
         assert!(
-            matches!(result, Err(FrankenError::Interrupt)),
-            "published response wait should observe native cancellation: {result:?}"
+            matches!(result, Ok(0)),
+            "completed publication must return its committed result: {result:?}"
         );
-        assert!(
-            !watchdog_timed_out.load(Ordering::Acquire),
-            "native cancellation did not release the response waiter promptly"
-        );
-
-        let _ = release_tx.send(());
-        watchdog.join().expect("watchdog should not panic");
         let rows = conn
             .query_sync(
                 "SELECT name FROM sqlite_master \
@@ -4586,7 +4831,7 @@ mod tests {
         assert_eq!(
             rows.len(),
             1,
-            "native response cancellation must not silently retract an admitted command"
+            "publication winner must remain durably visible"
         );
         conn.close_sync().expect("close should succeed");
         drop(runtime);
