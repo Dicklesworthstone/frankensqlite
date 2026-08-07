@@ -2964,11 +2964,13 @@ mod tests {
         )
         .expect("write pack");
         let namespace = "tests/artifacts/release-evidence/keeper";
-        assert!(
-            super::stage_performance_admission(root.path(), input.path(), namespace, &tested)
-                .expect_err("unvalidated pack must fail")
-                .contains("profiles must be exactly")
-        );
+        let error =
+            match super::stage_performance_admission(root.path(), input.path(), namespace, &tested)
+            {
+                Ok(_) => panic!("unvalidated pack must fail"),
+                Err(error) => error,
+            };
+        assert!(error.contains("profiles must be exactly"));
         assert!(
             !root
                 .path()
