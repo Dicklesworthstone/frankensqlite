@@ -92,7 +92,7 @@ fn run_stack_gate_child(scenario: &str, deadline: Duration) {
     });
 
     let started = Instant::now();
-    let (status, timed_out) = loop {
+    let (status, timed_out) = 'wait_for_child: loop {
         if let Some(status) = child
             .try_wait()
             .unwrap_or_else(|error| panic!("poll stack-gate scenario {scenario}: {error}"))
@@ -109,7 +109,7 @@ fn run_stack_gate_child(scenario: &str, deadline: Duration) {
                     .try_wait()
                     .unwrap_or_else(|error| panic!("reap timed-out scenario {scenario}: {error}"))
                 {
-                    break (status, true);
+                    break 'wait_for_child (status, true);
                 }
                 assert!(
                     reap_started.elapsed() < CHILD_REAP_DEADLINE,
