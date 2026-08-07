@@ -16967,15 +16967,13 @@ impl Connection {
             .await?;
         }
 
-        let opened_snapshot_high = self
-            .concurrent_commit_index
-            .latest_seq()
-            .map_or(bound_visible_commit_seq, |latest| {
-                bound_visible_commit_seq.max(latest)
-            });
-        if opened_snapshot_high > snapshot.high {
+        // The pager transaction's bound visibility is the only safe upper
+        // bound for its MVCC snapshot. The process-wide commit index may have
+        // advanced after this pager transaction opened; claiming those newer
+        // commits here would let stale page images evade FCW validation.
+        if snapshot.high != bound_visible_commit_seq {
             *snapshot = Snapshot::new(
-                opened_snapshot_high,
+                bound_visible_commit_seq,
                 SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
             );
         }
@@ -121419,10 +121417,11 @@ mod tests {
         join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
         memdb_row_matches_like_fast_path, parse_single_statement,
         qualify_persistent_view_relations, resolve_used_window_spec,
-        select_contains_any_placeholder, set_trigger_depth_limit_override,
-        statement_contains_rewritable_subquery, substitute_outer_refs_in_select,
-        take_trigger_stack_probe, validate_named_window_definitions, visit_select_qualified_names,
-        wal_file_present_with_vfs, wal_path_for_db_path,
+        retry_busy_connection_bootstrap, select_contains_any_placeholder,
+        set_trigger_depth_limit_override, statement_contains_rewritable_subquery,
+        substitute_outer_refs_in_select, take_trigger_stack_probe,
+        validate_named_window_definitions, visit_select_qualified_names, wal_file_present_with_vfs,
+        wal_path_for_db_path,
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{
@@ -164186,7 +164185,7 @@ mod tests {
             let path = dir.path().join("begin_opened_pager_visibility_rebase.db");
             let path_str = path.to_str().unwrap();
 
-            let conn_a = Connection::open(path_str).await.unwrap();
+            let mut conn_a = Connection::open(path_str).await.unwrap();
             conn_a
                 .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
                 .await
@@ -164196,7 +164195,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let conn_b = Connection::open(path_str).await.unwrap();
+            let mut conn_b = Connection::open(path_str).await.unwrap();
             assert_eq!(
                 conn_b
                     .query_row("SELECT v FROM t WHERE id = 1;")
@@ -164230,8 +164229,21 @@ mod tests {
                 "test precondition: conn_b execution image should be stale before rebase"
             );
 
+            conn_a
+                .execute("UPDATE t SET v = 2 WHERE id = 1;")
+                .await
+                .unwrap();
+            let latest_indexed_commit_seq = conn_b
+                .concurrent_commit_index
+                .latest_seq()
+                .expect("conn_a's later commit should advance the shared commit index");
+            assert!(
+                latest_indexed_commit_seq > opened_visible_commit_seq,
+                "test precondition: the commit index should advance past conn_b's opened pager view"
+            );
+
             let mut stale_snapshot = Snapshot::new(
-                CommitSeq::ZERO,
+                latest_indexed_commit_seq,
                 SchemaEpoch::new((*conn_b.schema_cookie.borrow()).into()),
             );
             conn_b
@@ -164241,7 +164253,7 @@ mod tests {
 
             assert_eq!(
                 stale_snapshot.high, opened_visible_commit_seq,
-                "concurrent BEGIN should rebase the MVCC snapshot to the opened pager view"
+                "concurrent BEGIN must not rebase the MVCC snapshot past the opened pager view"
             );
             assert_eq!(
                 *conn_b.memdb_visible_commit_seq.borrow(),
@@ -164250,6 +164262,8 @@ mod tests {
             );
 
             txn.rollback(&cx).await.unwrap();
+            conn_b.close_without_checkpoint_in_place().await.unwrap();
+            conn_a.close_without_checkpoint_in_place().await.unwrap();
         });
     }
 
@@ -165411,7 +165425,7 @@ mod tests {
             let db = db_path.to_string_lossy().to_string();
 
             {
-                let conn = Connection::open(&db).await.unwrap();
+                let mut conn = Connection::open(&db).await.unwrap();
                 conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
                 conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
                     .await
@@ -165428,6 +165442,7 @@ mod tests {
                     .await
                     .unwrap();
                 }
+                conn.close_in_place().await.unwrap();
             }
 
             let start_barrier = Arc::new(std::sync::Barrier::new(WORKERS));
@@ -165438,7 +165453,9 @@ mod tests {
                 handles.push(std::thread::spawn(move || -> (Vec<i64>, u64) {
                 let mut worker_out: (Vec<i64>, u64) = (Vec::new(), 0);
                 asupersync::test_utils::run_test(|| async {
-                let conn = Connection::open(&db).await.unwrap();
+                let mut conn = retry_busy_connection_bootstrap(|| Connection::open(&db))
+                    .await
+                    .unwrap();
                 conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
                 conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await.unwrap();
 
@@ -165508,6 +165525,7 @@ mod tests {
                     }
                 }
 
+                conn.close_without_checkpoint_in_place().await.unwrap();
                 worker_out = (per_account_delta, transient_retries);
                 });
                 worker_out
@@ -165526,7 +165544,7 @@ mod tests {
                 total_retries += retries;
             }
 
-            let verifier = Connection::open(&db).await.unwrap();
+            let mut verifier = Connection::open(&db).await.unwrap();
             let sum_row = verifier
                 .query_row("SELECT SUM(balance) FROM accounts;")
                 .await
@@ -165588,6 +165606,7 @@ mod tests {
                 mismatches.len(),
                 mismatch_preview
             );
+            verifier.close_without_checkpoint_in_place().await.unwrap();
         });
     }
 

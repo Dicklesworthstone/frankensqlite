@@ -70,12 +70,20 @@ enum TxnKind {
     BalanceCheck,
 }
 
+#[derive(Clone, Copy)]
+enum TxnOperation {
+    Transfer { from: i64, to: i64, amount: i64 },
+    Deposit { account: i64, amount: i64 },
+    BalanceCheck,
+}
+
 #[derive(Debug, Clone)]
 struct CommittedTxn {
     start_order: u64,
     commit_order: u64,
     read_set: BTreeSet<i64>,
     write_set: BTreeSet<i64>,
+    balance_deltas: BTreeMap<i64, i64>,
 }
 
 #[derive(Debug, Default)]
@@ -468,13 +476,32 @@ async fn run_ssi_workload(
         hard_failures.join(" | ")
     );
 
-    let (final_sum, min_balance) = read_account_invariants(&db_path).await;
+    let (final_sum, min_balance, final_balances) = read_account_invariants(&db_path).await;
     let initial_sum = account_count * INITIAL_BALANCE;
     let expected_sum = initial_sum + sum_delta;
 
+    let mut expected_balances = BTreeMap::new();
+    for txn in &committed_txns {
+        for (&account, &delta) in &txn.balance_deltas {
+            *expected_balances.entry(account).or_insert(INITIAL_BALANCE) += delta;
+        }
+    }
+    let balance_mismatches = expected_balances
+        .iter()
+        .filter_map(|(&account, &expected)| {
+            let actual = final_balances.get(&account).copied();
+            (actual != Some(expected)).then_some((account, expected, actual))
+        })
+        .take(10)
+        .collect::<Vec<_>>();
+
     assert_eq!(
         final_sum, expected_sum,
-        "sum invariant violated in {label}: final_sum={final_sum} expected_sum={expected_sum} initial_sum={initial_sum} sum_delta={sum_delta}"
+        "sum invariant violated in {label}: final_sum={final_sum} expected_sum={expected_sum} initial_sum={initial_sum} sum_delta={sum_delta} balance_mismatches={balance_mismatches:?}"
+    );
+    assert!(
+        balance_mismatches.is_empty(),
+        "per-account invariant violated in {label}: {balance_mismatches:?}"
     );
     assert!(
         min_balance >= 0,
@@ -571,28 +598,28 @@ async fn run_worker(
         let worker_token = u64::try_from(worker_id).expect("worker id should fit in u64");
         let txn_token = u64::try_from(txn_index).expect("txn index should fit in u64");
         let logical_txn_id = (worker_token << 32) | txn_token;
+        let operation = plan_txn_operation(&mut rng, account_count);
 
         let mut retries = 0_usize;
         let mut last_wait_ms = None;
         loop {
-            let kind = choose_txn_kind(&mut rng);
-
             let execute_result: Result<_, FrankenError> =
-                execute_single_txn(&conn, &mut rng, kind, account_count).await;
+                execute_single_txn(&conn, operation).await;
             match execute_result {
-                Ok((start_order, commit_order, read_set, write_set, delta_sum)) => {
+                Ok((start_order, commit_order, read_set, write_set, balance_deltas)) => {
                     if let Some(wait_ms) = last_wait_ms.take() {
                         retry_controller.observe(wait_ms, true);
                     }
                     retry_controller.clear_conflict(logical_txn_id);
 
                     result.committed += 1;
-                    result.sum_delta += delta_sum;
+                    result.sum_delta += balance_deltas.values().sum::<i64>();
                     result.txns.push(CommittedTxn {
                         start_order,
                         commit_order,
                         read_set,
                         write_set,
+                        balance_deltas,
                     });
                     break;
                 }
@@ -691,10 +718,8 @@ async fn run_worker(
 #[allow(clippy::type_complexity)]
 async fn execute_single_txn(
     conn: &fsqlite::Connection,
-    rng: &mut StdRng,
-    kind: TxnKind,
-    account_count: i64,
-) -> Result<(u64, u64, BTreeSet<i64>, BTreeSet<i64>, i64), FrankenError> {
+    operation: TxnOperation,
+) -> Result<(u64, u64, BTreeSet<i64>, BTreeSet<i64>, BTreeMap<i64, i64>), FrankenError> {
     conn.execute("BEGIN CONCURRENT;").await?;
     let start_order = conn.current_concurrent_snapshot_seq().ok_or_else(|| {
         FrankenError::Internal(
@@ -704,47 +729,51 @@ async fn execute_single_txn(
 
     let mut read_set = BTreeSet::new();
     let mut write_set = BTreeSet::new();
-    let mut delta_sum = 0_i64;
+    let mut balance_deltas = BTreeMap::new();
 
-    match kind {
-        TxnKind::Transfer => {
-            let from = random_account(rng, account_count);
-            let mut to = random_account(rng, account_count);
-            if to == from {
-                to = if to == account_count { 1 } else { to + 1 };
-            }
-            let amount = i64::from(rng.random_range(1_u8..=5_u8));
-
+    match operation {
+        TxnOperation::Transfer { from, to, amount } => {
             let from_balance = read_balance(conn, from).await?;
             read_set.insert(from);
 
             if from_balance >= amount {
-                conn.execute(&format!(
-                    "UPDATE accounts \
+                let affected = conn
+                    .execute(&format!(
+                        "UPDATE accounts \
                      SET balance = CASE \
                          WHEN id = {from} THEN balance - {amount} \
                          WHEN id = {to} THEN balance + {amount} \
                          ELSE balance \
                      END \
                      WHERE id IN ({from}, {to});"
-                ))
-                .await?;
+                    ))
+                    .await?;
+                if affected != 2 {
+                    return Err(FrankenError::Internal(format!(
+                        "transfer from={from} to={to} amount={amount} affected {affected} rows, expected 2"
+                    )));
+                }
                 write_set.insert(from);
                 write_set.insert(to);
+                balance_deltas.insert(from, -amount);
+                balance_deltas.insert(to, amount);
             }
         }
-        TxnKind::Deposit => {
-            let account = random_account(rng, account_count);
-            let amount = i64::from(rng.random_range(1_u8..=3_u8));
-
-            conn.execute(&format!(
-                "UPDATE accounts SET balance = balance + {amount} WHERE id = {account};"
-            ))
-            .await?;
+        TxnOperation::Deposit { account, amount } => {
+            let affected = conn
+                .execute(&format!(
+                    "UPDATE accounts SET balance = balance + {amount} WHERE id = {account};"
+                ))
+                .await?;
+            if affected != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "deposit account={account} amount={amount} affected {affected} rows, expected 1"
+                )));
+            }
             write_set.insert(account);
-            delta_sum += amount;
+            balance_deltas.insert(account, amount);
         }
-        TxnKind::BalanceCheck => {
+        TxnOperation::BalanceCheck => {
             let _ = read_sum(conn).await?;
         }
     }
@@ -753,7 +782,33 @@ async fn execute_single_txn(
     let commit_order = conn.last_local_commit_seq().ok_or_else(|| {
         FrankenError::Internal("missing commit sequence after successful COMMIT".to_owned())
     })?;
-    Ok((start_order, commit_order, read_set, write_set, delta_sum))
+    Ok((
+        start_order,
+        commit_order,
+        read_set,
+        write_set,
+        balance_deltas,
+    ))
+}
+
+fn plan_txn_operation(rng: &mut StdRng, account_count: i64) -> TxnOperation {
+    match choose_txn_kind(rng) {
+        TxnKind::Transfer => {
+            let from = random_account(rng, account_count);
+            let mut to = random_account(rng, account_count);
+            if to == from {
+                to = if to == account_count { 1 } else { to + 1 };
+            }
+            let amount = i64::from(rng.random_range(1_u8..=5_u8));
+            TxnOperation::Transfer { from, to, amount }
+        }
+        TxnKind::Deposit => {
+            let account = random_account(rng, account_count);
+            let amount = i64::from(rng.random_range(1_u8..=3_u8));
+            TxnOperation::Deposit { account, amount }
+        }
+        TxnKind::BalanceCheck => TxnOperation::BalanceCheck,
+    }
 }
 
 fn choose_txn_kind(rng: &mut StdRng) -> TxnKind {
@@ -860,7 +915,7 @@ fn extract_int(row: &fsqlite::Row, index: usize) -> Result<i64, FrankenError> {
     }
 }
 
-async fn read_account_invariants(path: &Path) -> (i64, i64) {
+async fn read_account_invariants(path: &Path) -> (i64, i64, BTreeMap<i64, i64>) {
     let mut conn = fsqlite::Connection::open(path.to_string_lossy().as_ref())
         .await
         .expect("open verifier connection");
@@ -876,11 +931,24 @@ async fn read_account_invariants(path: &Path) -> (i64, i64) {
         .await
         .expect("query min balance");
     let min_balance = extract_int(&min_row, 0).expect("extract min balance");
+    let balance_rows = conn
+        .query("SELECT id, balance FROM accounts ORDER BY id;")
+        .await
+        .expect("query account balances");
+    let final_balances = balance_rows
+        .iter()
+        .map(|row| {
+            (
+                extract_int(row, 0).expect("extract account id"),
+                extract_int(row, 1).expect("extract account balance"),
+            )
+        })
+        .collect();
     conn.close_without_checkpoint_in_place()
         .await
         .expect("close verifier connection");
 
-    (final_sum, min_balance)
+    (final_sum, min_balance, final_balances)
 }
 
 fn detect_cycle(txns: &[CommittedTxn]) -> Option<Vec<usize>> {
@@ -1041,12 +1109,14 @@ fn detect_cycle_returns_none_for_acyclic_graph() {
             commit_order: 2,
             read_set: BTreeSet::new(),
             write_set: BTreeSet::from([1]),
+            balance_deltas: BTreeMap::new(),
         },
         CommittedTxn {
             start_order: 3,
             commit_order: 4,
             read_set: BTreeSet::new(),
             write_set: BTreeSet::from([2]),
+            balance_deltas: BTreeMap::new(),
         },
     ];
 
@@ -1064,18 +1134,21 @@ fn detect_cycle_finds_three_node_cycle() {
             commit_order: 10,
             read_set: BTreeSet::from([3]),
             write_set: BTreeSet::from([1]),
+            balance_deltas: BTreeMap::new(),
         },
         CommittedTxn {
             start_order: 2,
             commit_order: 11,
             read_set: BTreeSet::from([1]),
             write_set: BTreeSet::from([2]),
+            balance_deltas: BTreeMap::new(),
         },
         CommittedTxn {
             start_order: 3,
             commit_order: 12,
             read_set: BTreeSet::from([2]),
             write_set: BTreeSet::from([3]),
+            balance_deltas: BTreeMap::new(),
         },
     ];
 
