@@ -49,6 +49,7 @@ const MAX_RETRIES_PER_TXN: usize = 16;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const RETRY_SLEEP_JITTER_MS: u64 = 2;
 const RETRY_CONTROLLER_FALLBACK_SLEEP_MS: u64 = 20;
+const RECOVERY_RETRY_SLEEP_MS: u64 = 10;
 const MIX_TRANSFER_PCT: u8 = 70;
 const MIX_DEPOSIT_PCT: u8 = 20;
 const MIX_BALANCE_CHECK_PCT: u8 = 10;
@@ -749,18 +750,48 @@ fn random_account(rng: &mut StdRng, account_count: i64) -> i64 {
 }
 
 async fn open_worker_connection(db_path: &Path) -> Result<fsqlite::Connection, FrankenError> {
-    let conn = fsqlite::Connection::open(db_path.to_string_lossy().as_ref()).await?;
-    conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
-        .await?;
-    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await?;
-    Ok(conn)
+    let started = Instant::now();
+    loop {
+        let result = async {
+            let conn = fsqlite::Connection::open(db_path.to_string_lossy().as_ref()).await?;
+            conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
+                .await?;
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await?;
+            Ok(conn)
+        }
+        .await;
+
+        match result {
+            Ok(conn) => return Ok(conn),
+            Err(err)
+                if err.is_transient()
+                    && started.elapsed() < Duration::from_millis(BUSY_TIMEOUT_MS) =>
+            {
+                thread::sleep(Duration::from_millis(RECOVERY_RETRY_SLEEP_MS));
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 async fn rollback_required(conn: &fsqlite::Connection) -> Result<(), FrankenError> {
-    if !conn.in_transaction() {
-        return Ok(());
+    let started = Instant::now();
+    loop {
+        if !conn.in_transaction() {
+            return Ok(());
+        }
+        match conn.execute("ROLLBACK;").await {
+            Ok(_) => return Ok(()),
+            Err(err) if err.is_transient() && !conn.in_transaction() => return Ok(()),
+            Err(err)
+                if err.is_transient()
+                    && started.elapsed() < Duration::from_millis(BUSY_TIMEOUT_MS) =>
+            {
+                thread::sleep(Duration::from_millis(RECOVERY_RETRY_SLEEP_MS));
+            }
+            Err(err) => return Err(err),
+        }
     }
-    conn.execute("ROLLBACK;").await.map(|_| ())
 }
 
 async fn read_balance(conn: &fsqlite::Connection, account_id: i64) -> Result<i64, FrankenError> {

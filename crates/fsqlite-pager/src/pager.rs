@@ -14391,7 +14391,7 @@ where
         {
             return Err(FrankenError::BusyRecovery);
         }
-        let recovered_orphan = if let Some(claim) = orphaned_recovery_claim.as_mut() {
+        if let Some(claim) = orphaned_recovery_claim.as_mut() {
             let recovery_owner = claim.recovery().owner;
             let _recovery_guard = recovery_fence.acquire_for_recovery()?;
             let prior_kind = maintenance_open_lease.upgrade_to_exclusive(Some(recovery_owner))?;
@@ -14450,10 +14450,7 @@ where
                 }
             };
             debug_assert_eq!(completed.owner, recovery_owner);
-            true
-        } else {
-            false
-        };
+        }
         if disposition == ReadWriteOpenDisposition::ExistingOnly
             && with_main_shared_lock(
                 cx,
@@ -14839,11 +14836,7 @@ where
         };
 
         let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
-        let initial_journal_mode = if recovered_orphan {
-            Self::journal_mode_from_database_header(&header)?
-        } else {
-            JournalMode::Delete
-        };
+        let initial_journal_mode = Self::journal_mode_from_database_header(&header)?;
         let freelist_count = freelist.len();
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
@@ -31913,6 +31906,33 @@ mod tests {
                 pager.journal_mode(),
                 JournalMode::Wal,
                 "bead_id={BEAD_ID} case=wal_mode_persisted"
+            );
+        });
+    }
+
+    #[test]
+    fn test_wal_journal_mode_persists_across_reopen() {
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/wal_journal_mode_reopen.db");
+            let cx = Cx::new();
+
+            {
+                let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                    .await
+                    .unwrap();
+                let (backend, _frames, _, _) = MockWalBackend::new();
+                pager.set_wal_backend(Box::new(backend)).unwrap();
+                pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            }
+
+            let reopened = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.journal_mode(),
+                JournalMode::Wal,
+                "bead_id={BEAD_ID} case=wal_mode_reopen"
             );
         });
     }
