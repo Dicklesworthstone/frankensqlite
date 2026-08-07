@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn every_certificate_only_selector_activates_strict_mode() {
-        for selector in CERTIFICATE_ONLY_SELECTORS.iter().copied() {
+        for &selector in CERTIFICATE_ONLY_SELECTORS {
             assert!(certificate_mode_requested(&[selector.to_owned()]));
         }
         assert!(!certificate_mode_requested(&["--input-json".to_owned()]));

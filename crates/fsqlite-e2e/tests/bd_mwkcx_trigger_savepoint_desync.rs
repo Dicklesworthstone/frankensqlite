@@ -256,7 +256,7 @@ fn t3_concurrent_trigger_contention() {
                                         .is_ok()
                                     {
                                         // Randomly rollback 1/4 of the time
-                                        if seq % 4 == 0 {
+                                        if seq.is_multiple_of(4) {
                                             conn.execute("ROLLBACK TO sp").await.ok();
                                         }
                                     }

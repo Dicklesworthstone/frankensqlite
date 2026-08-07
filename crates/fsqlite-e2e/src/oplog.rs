@@ -3013,14 +3013,14 @@ mod tests {
 
         // Each insert payload should be exactly `payload` bytes.
         for rec in &log.records {
-            if let OpKind::Insert { values, .. } = &rec.kind {
-                if let Some((_, p)) = values.iter().find(|(k, _)| k == "payload") {
-                    assert_eq!(
-                        p.len(),
-                        payload as usize,
-                        "payload must be exactly {payload} bytes"
-                    );
-                }
+            if let OpKind::Insert { values, .. } = &rec.kind
+                && let Some((_, p)) = values.iter().find(|(k, _)| k == "payload")
+            {
+                assert_eq!(
+                    p.len(),
+                    payload as usize,
+                    "payload must be exactly {payload} bytes"
+                );
             }
         }
 

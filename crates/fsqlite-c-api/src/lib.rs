@@ -1023,10 +1023,10 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
             Ok(Ok(Some(rows))) => {
                 db.clear_error();
                 db.refresh_last_changes();
-                if s.column_count == 0 {
-                    if let Some(first) = rows.first() {
-                        s.column_count = first.values().len() as c_int;
-                    }
+                if s.column_count == 0
+                    && let Some(first) = rows.first()
+                {
+                    s.column_count = first.values().len() as c_int;
                 }
                 s.rows = Some(rows);
                 s.cursor = 0;

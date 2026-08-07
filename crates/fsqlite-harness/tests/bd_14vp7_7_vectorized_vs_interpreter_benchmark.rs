@@ -572,10 +572,10 @@ fn test_hash_join_benchmark() {
             }
         }
         for row in &probe_rows {
-            if let SqliteValue::Integer(fk) = row[0] {
-                if let Some(matches) = ht_interp.get(&fk) {
-                    result_count += matches.len();
-                }
+            if let SqliteValue::Integer(fk) = row[0]
+                && let Some(matches) = ht_interp.get(&fk)
+            {
+                result_count += matches.len();
             }
         }
         std::hint::black_box(result_count);

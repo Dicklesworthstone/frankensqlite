@@ -916,18 +916,18 @@ fn test_vdbe_opcode_coverage_matrix() {
                     };
 
                 // Check expected opcodes in explain output if this is a single SELECT
-                if !t.expected_opcodes.is_empty() {
-                    if let Ok(stmt) = conn.prepare(t.sql).await {
-                        let explain = stmt.explain();
-                        for opcode in &t.expected_opcodes {
-                            assert!(
-                                explain.contains(opcode),
-                                "test '{}': expected opcode '{}' not found in explain:\n{}",
-                                t.name,
-                                opcode,
-                                explain
-                            );
-                        }
+                if !t.expected_opcodes.is_empty()
+                    && let Ok(stmt) = conn.prepare(t.sql).await
+                {
+                    let explain = stmt.explain();
+                    for opcode in &t.expected_opcodes {
+                        assert!(
+                            explain.contains(opcode),
+                            "test '{}': expected opcode '{}' not found in explain:\n{}",
+                            t.name,
+                            opcode,
+                            explain
+                        );
                     }
                 }
 

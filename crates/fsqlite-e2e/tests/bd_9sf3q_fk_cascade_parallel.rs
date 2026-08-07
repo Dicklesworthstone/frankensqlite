@@ -338,7 +338,7 @@ fn f3_cascade_same_parent_contention() {
                             }
 
                             // Occasionally delete the parent (cascade) then re-add
-                            if local_ops % 50 == 0 && conn.execute("BEGIN").await.is_ok() {
+                            if local_ops.is_multiple_of(50) && conn.execute("BEGIN").await.is_ok() {
                                 conn.execute("DELETE FROM parents WHERE id = 1").await.ok();
                                 conn.execute(
                                     "INSERT OR IGNORE INTO parents VALUES (1, 'hot_parent')",
@@ -532,7 +532,7 @@ fn f5_rapid_parent_delete_reinsert() {
                     }
 
                     // Every 10th op, delete a parent (cascade children)
-                    if ops % 10 == 0 && conn.execute("BEGIN").await.is_ok() {
+                    if ops.is_multiple_of(10) && conn.execute("BEGIN").await.is_ok() {
                         conn.execute(&format!("DELETE FROM parents WHERE id = {pid}"))
                             .await
                             .ok();

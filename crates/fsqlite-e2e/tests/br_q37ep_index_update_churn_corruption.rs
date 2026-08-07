@@ -97,12 +97,10 @@ async fn churn_indexed_state(rows: i64, rounds: i64, stripe: i64) {
         conn.execute(&sql)
             .await
             .unwrap_or_else(|e| panic!("update round {round} failed: {e}"));
-        if round % 8 == 0 || round == rounds - 1 {
-            if let Err(msg) = quick_check(&conn).await {
-                panic!(
-                    "INDEX CORRUPTION after round {round} (rows={rows}, stripe={stripe}): {msg}"
-                );
-            }
+        if (round % 8 == 0 || round == rounds - 1)
+            && let Err(msg) = quick_check(&conn).await
+        {
+            panic!("INDEX CORRUPTION after round {round} (rows={rows}, stripe={stripe}): {msg}");
         }
     }
 }
@@ -948,13 +946,13 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
                         panic!("GH#289 committed corruption after txn {transaction}: {error}")
                     });
                 }
-                if transaction % 10 == 9 {
-                    if let Err(error) = conn.query("PRAGMA wal_checkpoint(PASSIVE)").await {
-                        assert!(
-                            error.to_string().contains("database is busy"),
-                            "GH#289 checkpoint after txn {transaction}: {error}"
-                        );
-                    }
+                if transaction % 10 == 9
+                    && let Err(error) = conn.query("PRAGMA wal_checkpoint(PASSIVE)").await
+                {
+                    assert!(
+                        error.to_string().contains("database is busy"),
+                        "GH#289 checkpoint after txn {transaction}: {error}"
+                    );
                 }
             }
         });
@@ -1063,10 +1061,10 @@ fn index_churn_tiny_pages_deep_tree_stays_intact() {
                 ))
                 .await
                 .unwrap_or_else(|e| panic!("update round {round}: {e}"));
-                if round % 8 == 0 || round == rounds - 1 {
-                    if let Err(msg) = quick_check(&conn).await {
-                        panic!("INDEX CORRUPTION (tiny pages) after round {round}: {msg}");
-                    }
+                if (round % 8 == 0 || round == rounds - 1)
+                    && let Err(msg) = quick_check(&conn).await
+                {
+                    panic!("INDEX CORRUPTION (tiny pages) after round {round}: {msg}");
                 }
             }
         }

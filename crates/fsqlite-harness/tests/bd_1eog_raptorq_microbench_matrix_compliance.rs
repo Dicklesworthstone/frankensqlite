@@ -104,19 +104,19 @@ fn test_bd_1eog_bead_exists_and_in_progress() {
     let content = std::fs::read_to_string(&issues_path).expect("issues.jsonl should be readable");
     let mut found = false;
     for line in content.lines() {
-        if let Ok(issue) = serde_json::from_str::<Value>(line) {
-            if issue.get("id").and_then(Value::as_str) == Some(BEAD_ID) {
-                found = true;
-                let status = issue
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                assert!(
-                    status == "in_progress" || status == "closed",
-                    "bead_id={BEAD_ID} expected in_progress or closed, got {status}"
-                );
-                break;
-            }
+        if let Ok(issue) = serde_json::from_str::<Value>(line)
+            && issue.get("id").and_then(Value::as_str) == Some(BEAD_ID)
+        {
+            found = true;
+            let status = issue
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            assert!(
+                status == "in_progress" || status == "closed",
+                "bead_id={BEAD_ID} expected in_progress or closed, got {status}"
+            );
+            break;
         }
     }
     assert!(found, "bead_id={BEAD_ID} not found in {ISSUES_JSONL}");

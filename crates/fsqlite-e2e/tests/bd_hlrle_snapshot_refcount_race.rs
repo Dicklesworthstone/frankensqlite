@@ -63,7 +63,7 @@ fn s1_rapid_txn_churn_no_panic() {
                                 .await
                                 .ok();
                                 // Alternate commit/rollback → unregister snapshot
-                                if local_ops % 2 == 0 {
+                                if local_ops.is_multiple_of(2) {
                                     conn.execute("COMMIT").await.ok();
                                 } else {
                                     conn.execute("ROLLBACK").await.ok();
@@ -245,11 +245,12 @@ fn s3_concurrent_readers_consistent_snapshots() {
                             if rconn.execute("BEGIN").await.is_ok() {
                                 let r1 = rconn.query("SELECT val FROM counter WHERE id = 1").await;
                                 let r2 = rconn.query("SELECT val FROM counter WHERE id = 1").await;
-                                if let (Ok(v1), Ok(v2)) = (r1, r2) {
-                                    if v1.len() == 1 && v2.len() == 1 {
-                                        // Within same txn, both reads should see same value
-                                        reads += 1;
-                                    }
+                                if let (Ok(v1), Ok(v2)) = (r1, r2)
+                                    && v1.len() == 1
+                                    && v2.len() == 1
+                                {
+                                    // Within same txn, both reads should see same value
+                                    reads += 1;
                                 }
                                 rconn.execute("COMMIT").await.ok();
                             }
@@ -322,7 +323,7 @@ fn s4_file_backed_txn_register_unregister_storm() {
                                     ))
                                     .await
                                     .is_ok();
-                                if ok && seq % 3 != 0 {
+                                if ok && !seq.is_multiple_of(3) {
                                     // Commit 2/3 of the time
                                     if conn.execute("COMMIT").await.is_ok() {
                                         committed += 1;
@@ -408,13 +409,13 @@ fn s5_savepoint_register_unregister_churn() {
                                     .ok();
 
                                     // Alternate between release and rollback
-                                    if local_ops % 2 != 0 {
+                                    if !local_ops.is_multiple_of(2) {
                                         conn.execute("ROLLBACK TO sp1").await.ok();
                                     }
                                     conn.execute("RELEASE sp1").await.ok();
                                 }
 
-                                if local_ops % 3 == 0 {
+                                if local_ops.is_multiple_of(3) {
                                     conn.execute("ROLLBACK").await.ok();
                                 } else {
                                     conn.execute("COMMIT").await.ok();

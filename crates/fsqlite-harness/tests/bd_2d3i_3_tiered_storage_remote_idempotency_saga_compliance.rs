@@ -916,15 +916,15 @@ fn e2e_epoch_transition_under_load() -> Result<(), String> {
     }
 
     for commit in commits {
-        if let Some(committed_epoch) = commit.committed_epoch {
-            if committed_epoch != old_epoch {
-                return Err(format!(
-                    "commit_straddled_epoch_boundary begin={} committed={} new={}",
-                    commit.begin_epoch.get(),
-                    committed_epoch.get(),
-                    new_epoch.get()
-                ));
-            }
+        if let Some(committed_epoch) = commit.committed_epoch
+            && committed_epoch != old_epoch
+        {
+            return Err(format!(
+                "commit_straddled_epoch_boundary begin={} committed={} new={}",
+                commit.begin_epoch.get(),
+                committed_epoch.get(),
+                new_epoch.get()
+            ));
         }
     }
 

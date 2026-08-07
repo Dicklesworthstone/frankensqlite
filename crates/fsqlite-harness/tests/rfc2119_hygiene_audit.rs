@@ -215,14 +215,15 @@ fn collect_must_statements(spec_text: &str) -> Vec<MustStatement> {
             current_section = Some(section);
         }
 
-        if let Some(section) = current_section {
-            if section <= 2 && has_word_exact_case(raw_line, "MUST") {
-                out.push(MustStatement {
-                    section,
-                    line: index + 1,
-                    text: raw_line.trim().to_string(),
-                });
-            }
+        if let Some(section) = current_section
+            && section <= 2
+            && has_word_exact_case(raw_line, "MUST")
+        {
+            out.push(MustStatement {
+                section,
+                line: index + 1,
+                text: raw_line.trim().to_string(),
+            });
         }
     }
 

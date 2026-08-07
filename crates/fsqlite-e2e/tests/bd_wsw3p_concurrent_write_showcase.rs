@@ -764,7 +764,7 @@ fn median(values: &mut [f64]) -> f64 {
     assert!(!values.is_empty(), "median requires at least one sample");
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         f64::midpoint(values[middle - 1], values[middle])
     } else {
         values[middle]
@@ -928,7 +928,7 @@ fn require_resolved_provenance(name: &str, value: &str) {
 /// genuinely unset at build time.
 fn require_hex_provenance(name: &str, value: &str) {
     assert!(
-        value.len() % 2 == 0 && value.chars().all(|c| c.is_ascii_hexdigit()),
+        value.len().is_multiple_of(2) && value.chars().all(|c| c.is_ascii_hexdigit()),
         "build provenance {name} must be even-length hexadecimal, found `{value}`"
     );
 }

@@ -86,22 +86,22 @@ async fn dump_diagnostics(conn: &fsqlite::Connection, path: &str) {
     eprintln!("[DIAG] Database path: {path}");
 
     // Query various PRAGMA values for diagnostics
-    if let Ok(rows) = conn.query("PRAGMA page_size").await {
-        if let Some(row) = rows.first() {
-            eprintln!("[DIAG] Page size: {:?}", row.get(0));
-        }
+    if let Ok(rows) = conn.query("PRAGMA page_size").await
+        && let Some(row) = rows.first()
+    {
+        eprintln!("[DIAG] Page size: {:?}", row.get(0));
     }
 
-    if let Ok(rows) = conn.query("PRAGMA page_count").await {
-        if let Some(row) = rows.first() {
-            eprintln!("[DIAG] Page count: {:?}", row.get(0));
-        }
+    if let Ok(rows) = conn.query("PRAGMA page_count").await
+        && let Some(row) = rows.first()
+    {
+        eprintln!("[DIAG] Page count: {:?}", row.get(0));
     }
 
-    if let Ok(rows) = conn.query("PRAGMA journal_mode").await {
-        if let Some(row) = rows.first() {
-            eprintln!("[DIAG] Journal mode: {:?}", row.get(0));
-        }
+    if let Ok(rows) = conn.query("PRAGMA journal_mode").await
+        && let Some(row) = rows.first()
+    {
+        eprintln!("[DIAG] Journal mode: {:?}", row.get(0));
     }
 
     // Dump sqlite_master
@@ -784,26 +784,26 @@ async fn stage_5_persist(path: &str) -> StageReport {
     // Verify data persisted
     match conn.query("SELECT COUNT(*) FROM users").await {
         Ok(rows) => {
-            if let Some(row) = rows.first() {
-                if let Some(SqliteValue::Integer(count_after)) = row.get(0) {
-                    e2e_log_kv!(
-                        stage,
-                        "verify",
-                        "Persistence verification",
-                        expected = count_before,
-                        actual = count_after
-                    );
+            if let Some(row) = rows.first()
+                && let Some(SqliteValue::Integer(count_after)) = row.get(0)
+            {
+                e2e_log_kv!(
+                    stage,
+                    "verify",
+                    "Persistence verification",
+                    expected = count_before,
+                    actual = count_after
+                );
 
-                    if *count_after != count_before {
-                        return StageReport::failure(
-                            stage,
-                            start.elapsed().as_millis(),
-                            format!(
-                                "Data loss! Expected {} rows, got {}",
-                                count_before, count_after
-                            ),
-                        );
-                    }
+                if *count_after != count_before {
+                    return StageReport::failure(
+                        stage,
+                        start.elapsed().as_millis(),
+                        format!(
+                            "Data loss! Expected {} rows, got {}",
+                            count_before, count_after
+                        ),
+                    );
                 }
             }
         }

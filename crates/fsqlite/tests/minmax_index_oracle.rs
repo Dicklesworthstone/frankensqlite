@@ -68,10 +68,10 @@ async fn uses_index_seek(conn: &Connection, sql: &str) -> bool {
             // OpenRead on an index is marked by a P4 index name (col 6 in EXPLAIN is p4/comment).
             if op == "OpenRead" {
                 // p3 (col 4) is 0 for the index-only open; distinguish via the P4 comment.
-                if let Some(SqliteValue::Text(p4)) = vals.get(5) {
-                    if p4.to_string().to_lowercase().contains("idx") {
-                        opened_index = true;
-                    }
+                if let Some(SqliteValue::Text(p4)) = vals.get(5)
+                    && p4.to_string().to_lowercase().contains("idx")
+                {
+                    opened_index = true;
                 }
             }
             if op == "Rowid" {

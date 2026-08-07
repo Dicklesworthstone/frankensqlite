@@ -874,13 +874,13 @@ fn test_symbol_loss_generator_deterministic() {
     let pattern1: Vec<usize> = (0..n)
         .filter(|i| {
             let hash = seed.wrapping_mul((*i as u32).wrapping_add(1));
-            hash % 5 == 0 // Drop ~20% of symbols
+            hash.is_multiple_of(5) // Drop ~20% of symbols
         })
         .collect();
     let pattern2: Vec<usize> = (0..n)
         .filter(|i| {
             let hash = seed.wrapping_mul((*i as u32).wrapping_add(1));
-            hash % 5 == 0
+            hash.is_multiple_of(5)
         })
         .collect();
     assert_eq!(

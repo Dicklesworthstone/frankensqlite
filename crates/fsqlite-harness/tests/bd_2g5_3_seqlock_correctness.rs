@@ -357,7 +357,7 @@ fn test_conformance_summary() {
             sl.write(i);
         }
         let seq = sl.sequence();
-        let pass = seq == 20 && seq % 2 == 0;
+        let pass = seq == 20 && seq.is_multiple_of(2);
         results.push(TestResult {
             name: "sequence_parity",
             pass,
@@ -408,10 +408,10 @@ fn test_conformance_summary() {
         let reader = thread::spawn(move || {
             rb.wait();
             while !rst.load(Ordering::Relaxed) {
-                if let Some((a, b)) = rs.read("c6") {
-                    if a != b {
-                        rt.store(true, Ordering::Relaxed);
-                    }
+                if let Some((a, b)) = rs.read("c6")
+                    && a != b
+                {
+                    rt.store(true, Ordering::Relaxed);
                 }
             }
         });

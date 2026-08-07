@@ -249,7 +249,7 @@ fn test_stress_no_torn_reads() {
                 let (a, b) = r_pair.read();
                 assert_eq!(a, b, "TORN READ: a={a} b={b}");
                 local_reads += 1;
-                if local_reads % 1000 == 0 {
+                if local_reads.is_multiple_of(1000) {
                     h.quiescent();
                 }
             }
@@ -412,7 +412,7 @@ fn test_conformance_summary() {
                     rt.store(true, Ordering::Relaxed);
                 }
                 reads += 1;
-                if reads % 1000 == 0 {
+                if reads.is_multiple_of(1000) {
                     h.quiescent();
                 }
             }

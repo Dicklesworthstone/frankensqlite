@@ -460,10 +460,10 @@ fn checksums_sha256_no_duplicate_filenames() {
         if line.is_empty() {
             continue;
         }
-        if let Some((_, filename)) = line.split_once("  ") {
-            if !seen.insert(filename.to_owned()) {
-                duplicates.push(filename.to_owned());
-            }
+        if let Some((_, filename)) = line.split_once("  ")
+            && !seen.insert(filename.to_owned())
+        {
+            duplicates.push(filename.to_owned());
         }
     }
 

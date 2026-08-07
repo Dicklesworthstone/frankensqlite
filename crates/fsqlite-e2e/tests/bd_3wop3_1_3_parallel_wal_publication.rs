@@ -133,7 +133,7 @@ fn median(samples: &[u64]) -> u64 {
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     let middle = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         sorted[middle - 1]
             .saturating_add(sorted[middle])
             .div_ceil(2)

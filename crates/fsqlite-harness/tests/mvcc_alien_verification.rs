@@ -200,7 +200,7 @@ impl HotBucket {
         for (word_idx, w) in readers.iter().enumerate() {
             let mut bits = w.load(Ordering::Acquire);
             while bits != 0 {
-                let lsb = bits & bits.wrapping_neg();
+                let lsb = bits.isolate_lowest_one();
                 let bit = lsb.trailing_zeros();
                 let Ok(word) = u64::try_from(word_idx) else {
                     continue;
@@ -322,7 +322,7 @@ impl HotBucket {
         for (word_idx, w) in readers.iter().enumerate() {
             let mut bits = w.load(Ordering::Acquire);
             while bits != 0 {
-                let lsb = bits & bits.wrapping_neg();
+                let lsb = bits.isolate_lowest_one();
                 let bit = lsb.trailing_zeros();
                 let Ok(word) = u32::try_from(word_idx) else {
                     continue;
@@ -705,13 +705,13 @@ fn dpor_outgoing_edges_cover_committed_and_freed_writers() {
 
                 // If a writer committed after our begin and touched page 1 before we committed,
                 // out_edges must be non-empty (no false negatives).
-                if let Some(w_commit_seq) = w_commit_seq_at_check {
-                    if w_commit_seq > begin_seq {
-                        assert!(
-                            out_edges.contains(&w_commit_seq),
-                            "missing outgoing edge to committed writer"
-                        );
-                    }
+                if let Some(w_commit_seq) = w_commit_seq_at_check
+                    && w_commit_seq > begin_seq
+                {
+                    assert!(
+                        out_edges.contains(&w_commit_seq),
+                        "missing outgoing edge to committed writer"
+                    );
                 }
             })
             .expect("spawn T");
@@ -936,10 +936,10 @@ fn discover_outgoing_edges(
     // Outgoing edge T -rw-> W exists if W committed after T's snapshot and wrote a page T read.
     let mut out = Vec::new();
     for &p in read_pages {
-        if let Some(&latest) = commit_index.get(&p) {
-            if latest > begin_seq {
-                out.push(latest);
-            }
+        if let Some(&latest) = commit_index.get(&p)
+            && latest > begin_seq
+        {
+            out.push(latest);
         }
     }
     out.sort_unstable();

@@ -81,7 +81,7 @@ fn test_grace_period_latency() {
             while !r_stop.load(Ordering::Relaxed) {
                 h.quiescent();
                 qs += 1;
-                if qs % 100 == 0 {
+                if qs.is_multiple_of(100) {
                     thread::yield_now();
                 }
             }
@@ -155,7 +155,7 @@ fn test_rcu_cell_concurrent_reads() {
                     max_val = v;
                 }
                 reads += 1;
-                if reads % 1000 == 0 {
+                if reads.is_multiple_of(1000) {
                     h.quiescent();
                 }
             }
@@ -229,7 +229,7 @@ fn test_rcu_pair_no_torn_reads() {
                     r_torn.fetch_add(1, Ordering::Relaxed);
                 }
                 reads += 1;
-                if reads % 500 == 0 {
+                if reads.is_multiple_of(500) {
                     h.quiescent();
                 }
             }
@@ -303,7 +303,7 @@ fn test_rcu_triple_no_torn_reads() {
                     r_torn.fetch_add(1, Ordering::Relaxed);
                 }
                 reads += 1;
-                if reads % 500 == 0 {
+                if reads.is_multiple_of(500) {
                     h.quiescent();
                 }
             }
@@ -418,7 +418,7 @@ fn test_read_dominated_schema_cache() {
                 assert!(schema_ver > 0, "schema version should be > 0");
                 let _ = commit_seq; // read but don't assert (can be 0)
                 local_reads += 1;
-                if local_reads % 1000 == 0 {
+                if local_reads.is_multiple_of(1000) {
                     h.quiescent();
                 }
             }

@@ -747,19 +747,19 @@ fn assert_wal_shape_clean(db_path: &Path) -> CriterionReport {
     // Read the magic; must be 0x377f0682 or 0x377f0683.
     let mut header = [0u8; 32];
     use std::io::Read as _;
-    if let Ok(mut f) = File::open(&path) {
-        if f.read_exact(&mut header).is_ok() {
-            let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-            if magic != 0x377f_0682 && magic != 0x377f_0683 {
-                return CriterionReport {
-                    name: "wal_shape",
-                    pass: false,
-                    detail: format!(
-                        "WAL header magic {magic:#x} not a SQLite WAL marker \
-                         (assertion #2)"
-                    ),
-                };
-            }
+    if let Ok(mut f) = File::open(&path)
+        && f.read_exact(&mut header).is_ok()
+    {
+        let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        if magic != 0x377f_0682 && magic != 0x377f_0683 {
+            return CriterionReport {
+                name: "wal_shape",
+                pass: false,
+                detail: format!(
+                    "WAL header magic {magic:#x} not a SQLite WAL marker \
+                     (assertion #2)"
+                ),
+            };
         }
     }
     CriterionReport {

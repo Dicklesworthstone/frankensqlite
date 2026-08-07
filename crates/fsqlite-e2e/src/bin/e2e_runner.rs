@@ -759,10 +759,10 @@ fn emit_results(config: &RunnerConfig, tests: &[TestResult], elapsed: std::time:
 
     // Write results.json.
     let results_path = config.output_dir.join("results.json");
-    if let Ok(json) = serde_json::to_string_pretty(&results) {
-        if let Err(e) = fs::write(&results_path, &json) {
-            eprintln!("warning: could not write results.json: {e}");
-        }
+    if let Ok(json) = serde_json::to_string_pretty(&results)
+        && let Err(e) = fs::write(&results_path, &json)
+    {
+        eprintln!("warning: could not write results.json: {e}");
     }
 
     // Write report.md.

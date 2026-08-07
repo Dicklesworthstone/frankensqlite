@@ -84,8 +84,8 @@ fn d1_concurrent_txns_no_deadlock_during_gc() {
                                     ))
                                     .await
                                     .ok();
-                                    let should_rollback =
-                                        local_ops % 3 == 0 || conn.execute("COMMIT").await.is_err();
+                                    let should_rollback = local_ops.is_multiple_of(3)
+                                        || conn.execute("COMMIT").await.is_err();
                                     if should_rollback {
                                         conn.execute("ROLLBACK").await.ok();
                                     }

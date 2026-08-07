@@ -916,14 +916,14 @@ fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
         }
     }
 
-    let mut chunks = encoded.as_bytes().chunks_exact(2);
+    let (chunks, remainder) = encoded.as_bytes().as_chunks::<2>();
     let mut decoded = Vec::with_capacity(encoded.len() / 2);
-    for chunk in &mut chunks {
+    for chunk in chunks {
         let high = nibble(chunk[0]).ok_or_else(|| format!("non-hex byte 0x{:02x}", chunk[0]))?;
         let low = nibble(chunk[1]).ok_or_else(|| format!("non-hex byte 0x{:02x}", chunk[1]))?;
         decoded.push((high << 4) | low);
     }
-    if chunks.remainder().is_empty() {
+    if remainder.is_empty() {
         Ok(decoded)
     } else {
         Err("hex value has odd length".to_owned())
@@ -2023,7 +2023,7 @@ struct RoundOrderReceipt {
 }
 
 fn round_order_receipt(round_index: usize) -> RoundOrderReceipt {
-    let order = if round_index % 2 == 0 {
+    let order = if round_index.is_multiple_of(2) {
         [
             "csqlite_null_a",
             "csqlite_null_b",
@@ -2379,7 +2379,7 @@ fn median(values: &mut [f64]) -> f64 {
     assert!(!values.is_empty(), "median requires at least one sample");
     values.sort_by(f64::total_cmp);
     let upper = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         f64::midpoint(values[upper - 1], values[upper])
     } else {
         values[upper]

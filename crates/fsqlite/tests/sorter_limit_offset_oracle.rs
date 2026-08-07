@@ -59,13 +59,13 @@ async fn sorter_top_n(conn: &Connection, sql: &str) -> Option<i64> {
     let rows = conn.query(&format!("EXPLAIN {sql}")).await.unwrap();
     for row in &rows {
         let vals = row.values();
-        if let Some(SqliteValue::Text(op)) = vals.get(1) {
-            if op.to_string() == "SorterOpen" {
-                return match vals.get(4) {
-                    Some(SqliteValue::Integer(p3)) => Some(*p3),
-                    _ => Some(0),
-                };
-            }
+        if let Some(SqliteValue::Text(op)) = vals.get(1)
+            && op.to_string() == "SorterOpen"
+        {
+            return match vals.get(4) {
+                Some(SqliteValue::Integer(p3)) => Some(*p3),
+                _ => Some(0),
+            };
         }
     }
     None

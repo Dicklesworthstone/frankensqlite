@@ -724,12 +724,12 @@ fn test_cx_deadline_respected() -> Result<(), String> {
         }
     }
 
-    if let RetryAction::RetryAfter { wait_ms } = entry.chosen_action {
-        if wait_ms > effective_budget {
-            return Err(format!(
-                "bead_id={BEAD_ID} case=cx_deadline_action_violated wait={wait_ms}ms > budget={effective_budget}ms"
-            ));
-        }
+    if let RetryAction::RetryAfter { wait_ms } = entry.chosen_action
+        && wait_ms > effective_budget
+    {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=cx_deadline_action_violated wait={wait_ms}ms > budget={effective_budget}ms"
+        ));
     }
 
     eprintln!(

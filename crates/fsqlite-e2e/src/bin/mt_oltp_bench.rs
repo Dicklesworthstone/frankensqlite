@@ -379,7 +379,7 @@ fn validate_options(opts: &Options) -> Result<(), String> {
     if opts.iters == 0 {
         return Err("--iters must be greater than zero".to_owned());
     }
-    if opts.iters % 8 != 0 {
+    if !opts.iters.is_multiple_of(8) {
         return Err(
             "--iters must be a multiple of 8 for complete alternating ABBA/BAAB order blocks"
                 .to_owned(),
@@ -2619,7 +2619,7 @@ fn ratio(numerator: f64, denominator: f64, metric: &str) -> Result<f64, String> 
 
 const fn fsqlite_runs_first(sample_index: usize) -> bool {
     let within_block = sample_index % 4;
-    let abba_block = (sample_index / 4) % 2 == 0;
+    let abba_block = (sample_index / 4).is_multiple_of(2);
     if abba_block {
         matches!(within_block, 0 | 3)
     } else {
@@ -2637,7 +2637,7 @@ fn paired_iteration_ratio(
     Ok(PairedIterationRatio {
         sample_index,
         order_block_index: zero_based / 4,
-        order_block_pattern: if (zero_based / 4) % 2 == 0 {
+        order_block_pattern: if (zero_based / 4).is_multiple_of(2) {
             "ABBA".to_owned()
         } else {
             "BAAB".to_owned()

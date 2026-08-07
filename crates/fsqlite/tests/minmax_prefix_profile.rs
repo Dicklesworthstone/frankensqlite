@@ -233,7 +233,7 @@ fn median(values: &mut [f64]) -> f64 {
     assert!(!values.is_empty(), "median requires samples");
     values.sort_by(f64::total_cmp);
     let upper = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         f64::midpoint(values[upper - 1], values[upper])
     } else {
         values[upper]

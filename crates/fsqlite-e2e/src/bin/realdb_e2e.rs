@@ -2254,12 +2254,11 @@ fn resolve_hot_path_workspace_root(
     golden_dir: &Path,
     working_base: &Path,
 ) -> Option<PathBuf> {
-    if let Some(workspace_root) = hot_path_override_env(HOT_PATH_WORKSPACE_ROOT_ENV) {
-        if let Some(workspace_root) =
+    if let Some(workspace_root) = hot_path_override_env(HOT_PATH_WORKSPACE_ROOT_ENV)
+        && let Some(workspace_root) =
             resolve_hot_path_workspace_root_candidate(Path::new(&workspace_root))
-        {
-            return Some(workspace_root);
-        }
+    {
+        return Some(workspace_root);
     }
     let mut candidates = Vec::new();
     if let Ok(current_dir) = std::env::current_dir() {
@@ -2756,16 +2755,12 @@ fn resolve_bench_matrix_selection(
         None
     };
 
-    if !golden_dir_overridden {
-        if let Some(defaults) = &canonical_defaults {
-            golden_dir.clone_from(&defaults.golden_dir);
-        }
+    if !golden_dir_overridden && let Some(defaults) = &canonical_defaults {
+        golden_dir.clone_from(&defaults.golden_dir);
     }
 
-    if !concurrency_overridden {
-        if let Some(defaults) = &canonical_defaults {
-            concurrency.clone_from(&defaults.concurrency);
-        }
+    if !concurrency_overridden && let Some(defaults) = &canonical_defaults {
+        concurrency.clone_from(&defaults.concurrency);
     }
 
     if presets.is_empty() || presets.iter().any(|preset| preset == "all") {
@@ -2775,10 +2770,8 @@ fn resolve_bench_matrix_selection(
     }
 
     if fixture_ids.is_empty() {
-        if !golden_dir_overridden {
-            if let Some(defaults) = &canonical_defaults {
-                fixture_ids.clone_from(&defaults.fixture_ids);
-            }
+        if !golden_dir_overridden && let Some(defaults) = &canonical_defaults {
+            fixture_ids.clone_from(&defaults.fixture_ids);
         }
         if fixture_ids.is_empty() {
             fixture_ids = discover_golden_fixture_ids(&golden_dir)?;
@@ -2812,15 +2805,15 @@ fn resolve_bench_matrix_selection(
 }
 
 fn prepare_output_path(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|error| {
-                format!(
-                    "failed to create output directory {}: {error}",
-                    parent.display()
-                )
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create output directory {}: {error}",
+                parent.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -4013,15 +4006,15 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
         }
     };
 
-    if let Some(tag) = tag.as_deref() {
-        if !fsqlite_harness::fixture_discovery::is_stable_corpus_tag(tag) {
-            eprintln!("error: unknown --tag `{tag}`");
-            eprintln!(
-                "help: allowed tags: {}",
-                fsqlite_harness::fixture_discovery::STABLE_CORPUS_TAGS.join(", ")
-            );
-            return 2;
-        }
+    if let Some(tag) = tag.as_deref()
+        && !fsqlite_harness::fixture_discovery::is_stable_corpus_tag(tag)
+    {
+        eprintln!("error: unknown --tag `{tag}`");
+        eprintln!(
+            "help: allowed tags: {}",
+            fsqlite_harness::fixture_discovery::STABLE_CORPUS_TAGS.join(", ")
+        );
+        return 2;
     }
 
     // Resolve source DB path. Prefer literal paths; otherwise do a bounded discovery scan.
@@ -5093,11 +5086,11 @@ fn run_sqlite3_engine(
                 }
             };
 
-            if let Some(path) = output_jsonl {
-                if let Err(e) = append_jsonl_line(path, &text) {
-                    eprintln!("error: failed to append JSONL output: {e}");
-                    return 1;
-                }
+            if let Some(path) = output_jsonl
+                && let Err(e) = append_jsonl_line(path, &text)
+            {
+                eprintln!("error: failed to append JSONL output: {e}");
+                return 1;
             }
             println!("{text}");
         }
@@ -5238,11 +5231,11 @@ fn run_fsqlite_engine(args: FsqliteRunArgs<'_>) -> i32 {
                 }
             };
 
-            if let Some(path) = output_jsonl {
-                if let Err(e) = append_jsonl_line(path, &text) {
-                    eprintln!("error: failed to append JSONL output: {e}");
-                    return 1;
-                }
+            if let Some(path) = output_jsonl
+                && let Err(e) = append_jsonl_line(path, &text)
+            {
+                eprintln!("error: failed to append JSONL output: {e}");
+                return 1;
             }
             println!("{text}");
         }
@@ -5257,10 +5250,10 @@ fn run_fsqlite_engine(args: FsqliteRunArgs<'_>) -> i32 {
 }
 
 fn append_jsonl_line(path: &Path, line: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -5639,11 +5632,11 @@ fn cmd_bench(argv: &[String]) -> i32 {
         .workspace_root
         .as_deref()
         .and_then(|workspace_root| build_canonical_bench_context(workspace_root, argv));
-    if let Some(ref path) = output_jsonl {
-        if let Err(error) = truncate_output_file(path) {
-            eprintln!("error: {error}");
-            return 1;
-        }
+    if let Some(ref path) = output_jsonl
+        && let Err(error) = truncate_output_file(path)
+    {
+        eprintln!("error: {error}");
+        return 1;
     }
     let execution = match execute_benchmark_matrix(&BenchMatrixRequest {
         selection: &selection,
@@ -7669,12 +7662,11 @@ fn discover_golden_fixture_ids(golden_dir: &Path) -> Result<Vec<String>, String>
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("db") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if !stem.is_empty() {
-                    ids.push(stem.to_owned());
-                }
-            }
+        if path.extension().and_then(|e| e.to_str()) == Some("db")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && !stem.is_empty()
+        {
+            ids.push(stem.to_owned());
         }
     }
     ids.sort();

@@ -776,10 +776,10 @@ fn macro_attribute_at_cursor_finding(input: ParseStream<'_>) -> syn::Result<Opti
     let content;
     syn::bracketed!(content in fork);
     let meta_input = content.fork();
-    if let Ok(meta) = meta_input.parse::<Meta>() {
-        if meta_input.is_empty() {
-            return Ok(meta_macro_finding(&meta));
-        }
+    if let Ok(meta) = meta_input.parse::<Meta>()
+        && meta_input.is_empty()
+    {
+        return Ok(meta_macro_finding(&meta));
     }
 
     if scan_tokens_for_dollar(&content.fork())? {
@@ -2546,6 +2546,10 @@ struct PersistentCitationIdentity {
     workload: PersistentWorkload,
 }
 
+#[expect(
+    clippy::literal_string_with_formatting_args,
+    reason = "the braces are literal placeholders in the artifact path contract"
+)]
 fn validate_persistent_citation_receipt_bytes(
     bytes: &[u8],
     tested_commit: &str,
@@ -2634,9 +2638,13 @@ fn validate_persistent_citation_receipt_bytes(
     }
     if provenance.build.profile != expected_profile.receipt_name()
         || provenance.build.expected_opt_level != expected_profile.expected_opt_level()
-        || provenance.build.rustflags.RUSTFLAGS != ""
-        || provenance.build.rustflags.CARGO_ENCODED_RUSTFLAGS != ""
-        || provenance.build.rustflags.CARGO_BUILD_RUSTFLAGS != ""
+        || !provenance.build.rustflags.RUSTFLAGS.is_empty()
+        || !provenance
+            .build
+            .rustflags
+            .CARGO_ENCODED_RUSTFLAGS
+            .is_empty()
+        || !provenance.build.rustflags.CARGO_BUILD_RUSTFLAGS.is_empty()
         || provenance.build.rustflags.policy != RUSTFLAGS_POLICY
         || provenance.build.nonce.len() != 64
         || !is_lowercase_hex(&provenance.build.nonce)
@@ -2653,7 +2661,7 @@ fn validate_persistent_citation_receipt_bytes(
     if provenance.workload.benchmark != "persistent_concurrent_write_{1,8,16}t"
         || provenance.workload.rows_per_thread != 1000
         || provenance.workload.synchronous != "NORMAL"
-        || provenance.workload.threads.as_slice() != &[1, 8, 16]
+        || provenance.workload.threads.as_slice() != [1, 8, 16]
         || provenance.workload.criterion.sample_size == 0
         || provenance.workload.criterion.warmup_secs == 0
         || provenance.workload.criterion.measurement_secs == 0
@@ -2971,8 +2979,8 @@ fn validate_cargo_manifest_test_target_contract(
                     "run_for_release library target requires Cargo auto-discovery".to_owned(),
                 );
             }
-            if let Some(library) = manifest.get("lib").and_then(toml::Value::as_table) {
-                if library
+            if let Some(library) = manifest.get("lib").and_then(toml::Value::as_table)
+                && (library
                     .get("path")
                     .and_then(toml::Value::as_str)
                     .is_some_and(|path| path != "src/lib.rs")
@@ -2984,13 +2992,11 @@ fn validate_cargo_manifest_test_target_contract(
                         .get("harness")
                         .and_then(toml::Value::as_bool)
                         .is_some_and(|enabled| !enabled)
-                    || library.contains_key("required-features")
-                {
-                    return Err(
-                        "run_for_release library target has a noncanonical Cargo override"
-                            .to_owned(),
-                    );
-                }
+                    || library.contains_key("required-features"))
+            {
+                return Err(
+                    "run_for_release library target has a noncanonical Cargo override".to_owned(),
+                );
             }
         }
         CargoTestTarget::Integration(target) => {
@@ -5273,20 +5279,20 @@ fn parse_summary_line(line: &str) -> Option<RegressionCounts> {
     let mut ignored = None;
 
     for segment in line.split(';') {
-        if let Some(count) = parse_count_segment(segment, "passed") {
-            if passed.replace(count).is_some() {
-                return None;
-            }
+        if let Some(count) = parse_count_segment(segment, "passed")
+            && passed.replace(count).is_some()
+        {
+            return None;
         }
-        if let Some(count) = parse_count_segment(segment, "failed") {
-            if failed.replace(count).is_some() {
-                return None;
-            }
+        if let Some(count) = parse_count_segment(segment, "failed")
+            && failed.replace(count).is_some()
+        {
+            return None;
         }
-        if let Some(count) = parse_count_segment(segment, "ignored") {
-            if ignored.replace(count).is_some() {
-                return None;
-            }
+        if let Some(count) = parse_count_segment(segment, "ignored")
+            && ignored.replace(count).is_some()
+        {
+            return None;
         }
     }
 
@@ -5307,10 +5313,12 @@ fn parse_summary_line(line: &str) -> Option<RegressionCounts> {
 }
 
 fn cargo_target_section(line: &str) -> Option<&str> {
-    if let Some(section) = line.strip_prefix("     Running ") {
-        if !section.is_empty() && section.contains(" (") && section.ends_with(')') {
-            return Some(section);
-        }
+    if let Some(section) = line.strip_prefix("     Running ")
+        && !section.is_empty()
+        && section.contains(" (")
+        && section.ends_with(')')
+    {
+        return Some(section);
     }
 
     let section = line.strip_prefix("   Doc-tests ")?;

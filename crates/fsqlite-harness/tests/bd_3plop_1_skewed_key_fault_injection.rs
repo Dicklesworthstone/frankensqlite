@@ -312,10 +312,10 @@ async fn btree_order_check(conn: &Connection) -> Result<bool, String> {
         let Some(SqliteValue::Integer(value)) = row.get(0) else {
             return Err("unexpected_order_column_type".to_owned());
         };
-        if let Some(prev) = previous {
-            if *value < prev {
-                return Ok(false);
-            }
+        if let Some(prev) = previous
+            && *value < prev
+        {
+            return Ok(false);
         }
         previous = Some(*value);
     }

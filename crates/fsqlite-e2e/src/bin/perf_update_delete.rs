@@ -946,7 +946,7 @@ fn run_fsqlite_exact_gate_benchmark(
     rows_i64: i64,
     delete_count: usize,
 ) -> Result<TimingTotals, RunError> {
-    if delete_count == 0 || args.rows % 20 != 0 {
+    if delete_count == 0 || !args.rows.is_multiple_of(20) {
         return Err(RunError::Usage(
             "exact-gate rows must be a positive multiple of 20".to_string(),
         ));
@@ -1080,7 +1080,7 @@ fn run_sqlite_exact_gate_benchmark(
     rows_i64: i64,
     delete_count: usize,
 ) -> Result<TimingTotals, RunError> {
-    if delete_count == 0 || args.rows % 20 != 0 {
+    if delete_count == 0 || !args.rows.is_multiple_of(20) {
         return Err(RunError::Usage(
             "exact-gate rows must be a positive multiple of 20".to_string(),
         ));

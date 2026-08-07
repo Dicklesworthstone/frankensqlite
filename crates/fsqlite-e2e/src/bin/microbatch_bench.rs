@@ -96,12 +96,12 @@ fn measure(cfg: Config, rows: usize) -> (Vec<u64>, u64) {
 fn core_microbatch_hits(conn: &fsqlite::Connection) -> u64 {
     let rows = fsqlite_e2e::block_on(conn.query("PRAGMA fsqlite.stmt_microbatch_stats;"))
         .unwrap_or_default();
-    if let Some(row) = rows.first() {
-        if let Some(fsqlite::SqliteValue::Text(text)) = row.values().first() {
-            for field in text.split_whitespace() {
-                if let Some(val) = field.strip_prefix("hits=") {
-                    return val.parse().unwrap_or(0);
-                }
+    if let Some(row) = rows.first()
+        && let Some(fsqlite::SqliteValue::Text(text)) = row.values().first()
+    {
+        for field in text.split_whitespace() {
+            if let Some(val) = field.strip_prefix("hits=") {
+                return val.parse().unwrap_or(0);
             }
         }
     }

@@ -126,7 +126,7 @@ fn s2_len_sampling_during_write_storm() {
             let _len = sampler_table.lock_count();
             let _empty = sampler_table.lock_count() == 0;
             samples += 1;
-            if samples % 10_000 == 0 && start.elapsed() > STRESS_DURATION {
+            if samples.is_multiple_of(10_000) && start.elapsed() > STRESS_DURATION {
                 break;
             }
         }
