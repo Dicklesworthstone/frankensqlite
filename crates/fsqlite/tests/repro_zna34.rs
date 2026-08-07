@@ -5,9 +5,9 @@
 //! pattern to reproduce the EBADF.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const ROWS_PER_THREAD: i64 = 200;
 const MAX_RETRIES: u32 = 100;
@@ -47,28 +47,69 @@ fn run_one_iteration(n_threads: usize) -> Vec<String> {
         }
     });
 
-    let barrier = Arc::new(Barrier::new(n_threads));
     let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let conflict_count = Arc::new(AtomicU64::new(0));
+    let (startup_tx, startup_rx) = mpsc::channel::<(usize, Result<(), String>)>();
+    let mut start_senders = Vec::with_capacity(n_threads);
+    let mut handles = Vec::with_capacity(n_threads);
 
-    let handles: Vec<_> = (0..n_threads)
-        .map(|tid| {
-            let p = path.clone();
-            let bar = barrier.clone();
-            let errs = errors.clone();
-            let conflicts = conflict_count.clone();
-            thread::spawn(move || {
-                asupersync::test_utils::run_test(|| async {
-                let conn = fsqlite::Connection::open(&p).await.unwrap();
-                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
-                conn.execute("PRAGMA synchronous = NORMAL;").await.unwrap();
-                conn.execute("PRAGMA cache_size = -64000;").await.unwrap();
-                conn.execute("PRAGMA fsqlite.concurrent_mode = ON;").await.unwrap();
+    for tid in 0..n_threads {
+        let p = path.clone();
+        let errs = errors.clone();
+        let conflicts = conflict_count.clone();
+        let startup_tx = startup_tx.clone();
+        let (start_tx, start_rx) = mpsc::sync_channel(1);
+        start_senders.push(start_tx);
+        handles.push(thread::spawn(move || {
+            asupersync::test_utils::run_test(|| async {
+                let mut open_attempts = 0_u32;
+                let conn = loop {
+                    open_attempts += 1;
+                    match fsqlite::Connection::open(&p).await {
+                        Ok(conn) => break conn,
+                        Err(error) if is_retryable(&error) && open_attempts < MAX_RETRIES => {
+                            thread::sleep(Duration::from_micros(
+                                100 * u64::from(open_attempts),
+                            ));
+                        }
+                        Err(error) => {
+                            let message = format!(
+                                "[t{tid}] startup open failed after {open_attempts} attempts: {error:?}"
+                            );
+                            errs.lock().unwrap().push(message.clone());
+                            let _ = startup_tx.send((tid, Err(message)));
+                            return;
+                        }
+                    }
+                };
+                for pragma in [
+                    "PRAGMA journal_mode = WAL;",
+                    "PRAGMA synchronous = NORMAL;",
+                    "PRAGMA cache_size = -64000;",
+                    "PRAGMA fsqlite.concurrent_mode = ON;",
+                ] {
+                    if let Err(error) = conn.execute(pragma).await {
+                        let message = format!("[t{tid}] startup {pragma} failed: {error:?}");
+                        errs.lock().unwrap().push(message.clone());
+                        let _ = startup_tx.send((tid, Err(message)));
+                        return;
+                    }
+                }
                 let insert_sql = format!(
                     "INSERT INTO bench_{tid} VALUES (?1, ('t' || ?1), (?1 * 7));"
                 );
-                let stmt = conn.prepare(&insert_sql).await.unwrap();
-                bar.wait();
+                let stmt = match conn.prepare(&insert_sql).await {
+                    Ok(stmt) => stmt,
+                    Err(error) => {
+                        let message = format!("[t{tid}] startup prepare failed: {error:?}");
+                        errs.lock().unwrap().push(message.clone());
+                        let _ = startup_tx.send((tid, Err(message)));
+                        return;
+                    }
+                };
+                if startup_tx.send((tid, Ok(()))).is_err() || start_rx.recv() != Ok(true) {
+                    return;
+                }
 
                 for i in 0..ROWS_PER_THREAD {
                     let mut retries = 0u32;
@@ -159,10 +200,48 @@ fn run_one_iteration(n_threads: usize) -> Vec<String> {
                         }
                     }
                 }
-                });
-            })
-        })
-        .collect();
+            });
+        }));
+    }
+    drop(startup_tx);
+
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = vec![false; n_threads];
+    let mut ready_count = 0_usize;
+    let mut startup_failed = false;
+    while ready_count < n_threads && !startup_failed {
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            errors.lock().unwrap().push(format!(
+                "startup timed out with {ready_count}/{n_threads} workers ready"
+            ));
+            startup_failed = true;
+            break;
+        }
+        match startup_rx.recv_timeout(remaining) {
+            Ok((tid, Ok(()))) if tid < n_threads && !ready[tid] => {
+                ready[tid] = true;
+                ready_count += 1;
+            }
+            Ok((_tid, Err(_message))) => startup_failed = true,
+            Ok((tid, Ok(()))) => {
+                errors.lock().unwrap().push(format!(
+                    "invalid or duplicate startup receipt from worker {tid}"
+                ));
+                startup_failed = true;
+            }
+            Err(error) => {
+                errors.lock().unwrap().push(format!(
+                    "startup channel failed with {ready_count}/{n_threads} workers ready: {error}"
+                ));
+                startup_failed = true;
+            }
+        }
+    }
+    let run = !startup_failed && ready_count == n_threads;
+    for sender in start_senders {
+        let _ = sender.send(run);
+    }
 
     for h in handles {
         h.join().unwrap();

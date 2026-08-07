@@ -7212,23 +7212,28 @@ mod tests {
                                 last_transient_error = None;
                             }
                             Err(error) => {
-                                if let Err(rollback_error) = conn.execute("ROLLBACK;").await {
-                                    outcome.failure = Some(format!(
-                                        "rollback after commit error {error:?} failed: {rollback_error:?}"
-                                    ));
-                                    break;
+                                let transient_error = format!("commit: {error:?}");
+                                match concurrent_stress_rollback_precommit_transient(
+                                    &conn,
+                                    &mut outcome,
+                                    "commit",
+                                    &error,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        last_transient_error = Some(transient_error);
+                                        concurrent_stress_backoff(
+                                            attempts_for_commit,
+                                            u64::try_from(worker_id).expect("worker id fits u64"),
+                                        );
+                                        continue;
+                                    }
+                                    Err(recovery_error) => {
+                                        outcome.failure = Some(recovery_error);
+                                        break;
+                                    }
                                 }
-                                if outcome.retries.record(&error) {
-                                    last_transient_error = Some(format!("commit: {error:?}"));
-                                    concurrent_stress_backoff(
-                                        attempts_for_commit,
-                                        u64::try_from(worker_id).expect("worker id fits u64"),
-                                    );
-                                    continue;
-                                }
-                                outcome.failure =
-                                    Some(format!("unexpected commit error: {error:?}"));
-                                break;
                             }
                         }
                     }
