@@ -121338,8 +121338,8 @@ pub(crate) fn fsqlite_core_test_serializer() -> std::sync::MutexGuard<'static, (
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundPagerPublication, CanonicalHashJoinKey, CommitSeq, Connection, ConnectionEnv,
-        DifferentialEvent, FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS,
+        BoundPagerPublication, CanonicalHashJoinKey, CommitSeq, ConcurrentRegistry, Connection,
+        ConnectionEnv, DifferentialEvent, FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS,
         FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS, FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS,
         FSQLITE_JOIN_EXPR_BINDING_HITS, FSQLITE_JOIN_EXPR_FALLBACK_SCANS,
         FSQLITE_JOIN_HASH_FAST_PATH_HITS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
