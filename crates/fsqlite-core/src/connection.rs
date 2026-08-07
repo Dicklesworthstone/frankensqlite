@@ -16653,6 +16653,12 @@ impl Connection {
     #[inline]
     fn sync_filebacked_post_commit_visibility_floor(&self) -> CommitSeq {
         self.clear_pending_local_live_vtab_preservation();
+        // The pager sequence is the commit identity for file-backed writes.
+        // A peer can refresh or open after our physical commit and raise the
+        // shared logical clock floor before this connection reaches MVCC
+        // finalization. Allocating from next_commit_seq at that point would
+        // publish a CommitIndex entry one step ahead of the durable pager
+        // image, leaving every later BEGIN permanently stale for that page.
         let committed_seq = self.pager.published_snapshot().visible_commit_seq;
         self.align_commit_clock_floor(committed_seq);
         // Use max to avoid decreasing last_local_commit_seq — a lower pager
@@ -41389,8 +41395,13 @@ impl Connection {
             if !self.pager.is_memory() && self.pager.journal_mode() == JournalMode::Wal {
                 self.pager.checkpoint(cx, CheckpointMode::Passive).await?;
             }
-            let committed_seq = self.advance_commit_clock_without_memdb_visibility();
-            self.finish_commit_clock(committed_seq);
+            let committed_seq = if self.pager.is_memory() {
+                let committed_seq = self.advance_commit_clock_without_memdb_visibility();
+                self.finish_commit_clock(committed_seq);
+                committed_seq
+            } else {
+                self.sync_filebacked_post_commit_visibility_floor()
+            };
             self.memdb_storage_count_shortcuts_safe.set(false);
             self.memdb_rows_loaded.set(false);
             self.emit_differential_commit_invalidations(committed_seq);
@@ -43452,7 +43463,11 @@ impl Connection {
                             *self.memdb_visible_commit_seq.borrow_mut() = committed_seq;
                             self.sync_memory_autocommit_commit_seq(committed_seq);
                         } else if let Some(plan) = concurrent_plan {
-                            let committed_seq = self.advance_commit_clock();
+                            let committed_seq = if self.pager.is_memory() {
+                                self.advance_commit_clock()
+                            } else {
+                                self.sync_filebacked_post_commit_visibility_floor()
+                            };
                             // Issue #115: publish through the SAME held guard.
                             // `concurrent_plan.is_some()` here implies the guard
                             // was acquired (both gate on
@@ -43472,7 +43487,9 @@ impl Connection {
                             if let Some(card) = commit_card {
                                 self.ssi_evidence_ledger.record_async(card);
                             }
-                            self.finish_commit_clock(committed_seq);
+                            if self.pager.is_memory() {
+                                self.finish_commit_clock(committed_seq);
+                            }
                         }
                         record_hot_path_duration(
                             &FSQLITE_COMMIT_FINALIZE_SEQ_TIME_NS,
@@ -43694,8 +43711,16 @@ impl Connection {
                 if result.is_ok() {
                     match txn.commit(&cx).await {
                         Ok(()) => {
-                            let committed_seq = self.advance_commit_clock();
-                            self.finish_commit_clock(committed_seq);
+                            let committed_seq = if self.pager.is_memory() {
+                                let committed_seq = self.advance_commit_clock();
+                                self.finish_commit_clock(committed_seq);
+                                committed_seq
+                            } else {
+                                let committed_seq =
+                                    self.sync_filebacked_post_commit_visibility_floor();
+                                *self.memdb_visible_commit_seq.borrow_mut() = committed_seq;
+                                committed_seq
+                            };
                             self.emit_differential_commit_invalidations(committed_seq);
                             auto_commit_succeeded = true;
                             None
@@ -53395,7 +53420,7 @@ impl Connection {
                     let committed_seq = if self.pager.is_memory() {
                         self.advance_commit_clock()
                     } else {
-                        self.advance_commit_clock_without_memdb_visibility()
+                        self.sync_filebacked_post_commit_visibility_floor()
                     };
                     // Issue #115: publish through the SAME held registry guard
                     // (do not re-acquire / release-and-reacquire the lock). The
@@ -53417,15 +53442,21 @@ impl Connection {
                     if let Some(card) = commit_card {
                         self.ssi_evidence_ledger.record_async(card);
                     }
-                    self.finish_commit_clock(committed_seq);
+                    if self.pager.is_memory() {
+                        self.finish_commit_clock(committed_seq);
+                    }
                 } else if is_concurrent_txn {
                     self.finalize_read_only_concurrent_commit();
                 } else if txn_has_pending_writes {
                     // File-backed explicit commits publish through the pager
                     // first; do not advertise local memdb visibility until the
                     // post-commit refresh path can observe that publication.
-                    let committed_seq = self.advance_commit_clock_without_memdb_visibility();
-                    self.finish_commit_clock(committed_seq);
+                    if self.pager.is_memory() {
+                        let committed_seq = self.advance_commit_clock_without_memdb_visibility();
+                        self.finish_commit_clock(committed_seq);
+                    } else {
+                        self.sync_filebacked_post_commit_visibility_floor();
+                    }
                 }
                 record_hot_path_duration(
                     &FSQLITE_COMMIT_FINALIZE_SEQ_TIME_NS,
@@ -165428,6 +165459,286 @@ mod tests {
                 "bd-rjc per-account drift detected ({} mismatches): {}",
                 mismatches.len(),
                 mismatch_preview
+            );
+            verifier.close_without_checkpoint_in_place().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_filebacked_concurrent_commit_uses_pager_sequence_after_clock_floor_race() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("filebacked_commit_clock_floor_race.db");
+            let db = db_path.to_string_lossy().to_string();
+            let mut conn = Connection::open(&db).await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 0);").await.unwrap();
+            let table_root_pgno = PageNumber::new(
+                u32::try_from(
+                    conn.schema
+                        .borrow()
+                        .iter()
+                        .find(|table| table.name.eq_ignore_ascii_case("t"))
+                        .map(|table| table.root_page)
+                        .expect("table t should exist after setup"),
+                )
+                .expect("root page should fit in u32"),
+            )
+            .expect("root page should be valid");
+
+            let next_commit_seq = Arc::clone(&conn.next_commit_seq);
+            let hook_calls = Arc::new(AtomicUsize::new(0));
+            let hook_calls_for_callback = Arc::clone(&hook_calls);
+            super::set_concurrent_commit_window_hook(Some(Arc::new(move || {
+                hook_calls_for_callback.fetch_add(1, AtomicOrdering::SeqCst);
+                let planned_seq = next_commit_seq.load(AtomicOrdering::Acquire);
+                next_commit_seq.fetch_max(planned_seq.saturating_add(1), AtomicOrdering::AcqRel);
+            })));
+            struct CommitWindowHookGuard;
+            impl Drop for CommitWindowHookGuard {
+                fn drop(&mut self) {
+                    super::set_concurrent_commit_window_hook(None);
+                }
+            }
+            let hook_guard = CommitWindowHookGuard;
+
+            conn.execute("BEGIN;").await.unwrap();
+            assert_eq!(
+                conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+                    .await
+                    .unwrap(),
+                1
+            );
+            conn.execute("COMMIT;").await.unwrap();
+            drop(hook_guard);
+
+            assert_eq!(
+                hook_calls.load(AtomicOrdering::SeqCst),
+                1,
+                "the deterministic post-durable/pre-MVCC-publish race hook must fire once"
+            );
+            let pager_visible = conn.pager.published_snapshot().visible_commit_seq;
+            assert_eq!(
+                conn.concurrent_commit_index.latest(table_root_pgno),
+                Some(pager_visible),
+                "CommitIndex must publish the pager's durable commit identity even when a peer \
+                 raises the shared logical clock floor before MVCC finalization"
+            );
+            assert_eq!(
+                conn.current_global_commit_seq(),
+                pager_visible,
+                "the finalized logical clock must remain aligned with the durable pager sequence"
+            );
+            conn.close_without_checkpoint_in_place().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_bounded_hot_page_writers_refresh_snapshot_after_conflict() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            const WORKERS: usize = 8;
+            const COMMITS_PER_WORKER: u64 = 4;
+            const MAX_ATTEMPTS_PER_WORKER: u64 = 256;
+
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bounded_hot_page_snapshot_refresh.db");
+            let db = db_path.to_string_lossy().to_string();
+            let table_root_page = {
+                let mut conn = Connection::open(&db).await.unwrap();
+                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                    .await
+                    .unwrap();
+                conn.execute("INSERT INTO t VALUES (1, 0);").await.unwrap();
+                let root_page = conn
+                    .schema
+                    .borrow()
+                    .iter()
+                    .find(|table| table.name.eq_ignore_ascii_case("t"))
+                    .map(|table| table.root_page)
+                    .expect("table t should exist after setup");
+                conn.close_without_checkpoint_in_place().await.unwrap();
+                root_page
+            };
+            let table_root_pgno = PageNumber::new(
+                u32::try_from(table_root_page).expect("root page should fit in u32"),
+            )
+            .expect("root page should be valid");
+
+            let start_barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+            let mut handles = Vec::with_capacity(WORKERS);
+            for worker_id in 0..WORKERS {
+                let db = db.clone();
+                let barrier = Arc::clone(&start_barrier);
+                handles.push(std::thread::spawn(move || -> Result<u64> {
+                    let mut worker_result = Err(FrankenError::internal(
+                        "bounded hot-page worker exited without a result",
+                    ));
+                    asupersync::test_utils::run_test(|| async {
+                        worker_result = async {
+                        let mut conn = Connection::open(&db).await?;
+                        assert!(
+                            conn.is_concurrent_mode_default(),
+                            "worker {worker_id} lost the concurrent-writer default"
+                        );
+                        barrier.wait();
+
+                        let clock_diagnostic = || {
+                            let active_commit_seqs =
+                                lock_unpoisoned(&conn.active_commit_seqs).clone();
+                            format!(
+                                "worker={worker_id} snapshot={:?} latest_root={:?} \
+                                 pager_visible={} stable={} next={} memdb_visible={} \
+                                 last_local={:?} active_commit_seqs={active_commit_seqs:?}",
+                                conn.current_concurrent_snapshot_seq(),
+                                conn.concurrent_commit_index.latest(table_root_pgno),
+                                conn.pager.published_snapshot().visible_commit_seq.get(),
+                                conn.current_global_commit_seq().get(),
+                                conn.next_commit_seq.load(AtomicOrdering::Acquire),
+                                conn.memdb_visible_commit_seq.borrow().get(),
+                                conn.last_local_commit_seq(),
+                            )
+                        };
+
+                        let mut commits = 0_u64;
+                        let mut attempts = 0_u64;
+                        while commits < COMMITS_PER_WORKER {
+                            attempts += 1;
+                            if attempts > MAX_ATTEMPTS_PER_WORKER {
+                                return Err(FrankenError::internal(format!(
+                                    "bounded hot-page worker exhausted its attempt budget: {}",
+                                    clock_diagnostic()
+                                )));
+                            }
+
+                            let latest_before_begin = conn
+                                .concurrent_commit_index
+                                .latest(table_root_pgno)
+                                .unwrap_or(CommitSeq::ZERO);
+                            match conn.execute("BEGIN;").await {
+                                Ok(_) => {}
+                                Err(error) if error.is_transient() => {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+
+                            let snapshot_high = CommitSeq::new(
+                                conn.current_concurrent_snapshot_seq()
+                                    .expect("BEGIN should bind a concurrent snapshot"),
+                            );
+                            if snapshot_high < latest_before_begin {
+                                let diagnostic = clock_diagnostic();
+                                let _ = conn.execute("ROLLBACK;").await;
+                                return Err(FrankenError::internal(format!(
+                                    "BEGIN bound a snapshot behind the already-published hot page: \
+                                     latest_before_begin={latest_before_begin:?}; {diagnostic}"
+                                )));
+                            }
+
+                            match conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;").await {
+                                Ok(1) => {}
+                                Ok(changes) => {
+                                    return Err(FrankenError::internal(format!(
+                                        "hot-page UPDATE affected {changes} rows; {}",
+                                        clock_diagnostic()
+                                    )));
+                                }
+                                Err(error) if error.is_transient() => {
+                                    let rollback_result = conn.execute("ROLLBACK;").await;
+                                    if rollback_result.is_err() && conn.in_transaction.get() {
+                                        return Err(FrankenError::internal(format!(
+                                            "transient UPDATE left an active transaction after \
+                                             rollback {rollback_result:?}: {}",
+                                            clock_diagnostic()
+                                        )));
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+
+                            match conn.execute("COMMIT;").await {
+                                Ok(_) => {
+                                    commits += 1;
+                                    let latest_root_commit = conn
+                                        .concurrent_commit_index
+                                        .latest(table_root_pgno)
+                                        .expect("successful hot-page commit should be indexed");
+                                    let committed_seq = CommitSeq::new(
+                                        conn.last_local_commit_seq().expect(
+                                            "successful commit should record its local identity",
+                                        ),
+                                    );
+                                    let pager_visible =
+                                        conn.pager.published_snapshot().visible_commit_seq;
+                                    if committed_seq > pager_visible {
+                                        return Err(FrankenError::internal(format!(
+                                            "successful hot-page commit reported a local identity \
+                                             ahead of its durable pager publication: {}",
+                                            clock_diagnostic()
+                                        )));
+                                    }
+                                    if latest_root_commit < committed_seq {
+                                        return Err(FrankenError::internal(format!(
+                                            "successful hot-page commit was not present in the \
+                                             shared CommitIndex: {}",
+                                            clock_diagnostic()
+                                        )));
+                                    }
+                                }
+                                Err(error) if error.is_transient() => {
+                                    let rollback_result = conn.execute("ROLLBACK;").await;
+                                    if rollback_result.is_err() && conn.in_transaction.get() {
+                                        return Err(FrankenError::internal(format!(
+                                            "transient COMMIT left an active transaction after \
+                                             rollback {rollback_result:?}: {}",
+                                            clock_diagnostic()
+                                        )));
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+
+                        conn.close_without_checkpoint_in_place().await?;
+                        Ok(commits)
+                        }
+                        .await;
+                    });
+                    worker_result
+                }));
+            }
+
+            for (worker_id, handle) in handles.into_iter().enumerate() {
+                assert_eq!(
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| panic!("hot-page worker {worker_id} panicked"))
+                        .unwrap_or_else(|error| {
+                            panic!("hot-page worker {worker_id} failed: {error}")
+                        }),
+                    COMMITS_PER_WORKER,
+                    "hot-page worker {worker_id} committed the wrong number of updates"
+                );
+            }
+
+            let mut verifier = Connection::open(&db).await.unwrap();
+            assert_eq!(
+                verifier
+                    .query_row("SELECT v FROM t WHERE id = 1;")
+                    .await
+                    .unwrap()
+                    .values()[0],
+                SqliteValue::Integer(
+                    i64::try_from(WORKERS).unwrap() * i64::try_from(COMMITS_PER_WORKER).unwrap()
+                )
             );
             verifier.close_without_checkpoint_in_place().await.unwrap();
         });

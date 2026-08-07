@@ -333,6 +333,16 @@ mod tests {
         // before the next BEGIN binds a fresh publication snapshot.
         if let Err(rollback_error) = conn.execute("ROLLBACK;").await {
             let _ = outcome.retries.record(&rollback_error);
+            // Full rollback clears the explicit-transaction state before it
+            // reloads the newly committed pager image. A peer may hold the
+            // recovery fence during that reload, yielding BusyRecovery even
+            // though rollback already released this worker's page locks and
+            // ended its transaction. In that exact state the next bounded
+            // BEGIN is the recovery retry; every other rollback error remains
+            // a hard failure.
+            if matches!(rollback_error, FrankenError::BusyRecovery) && !conn.in_transaction() {
+                return Ok(());
+            }
             return Err(format!(
                 "ROLLBACK after retryable {phase} error {primary_error:?} failed: \
                  {rollback_error:?}"
