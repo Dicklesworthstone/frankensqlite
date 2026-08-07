@@ -36165,8 +36165,17 @@ impl Connection {
                 if column_reference_preflight {
                     self.validate_select_column_references(select)?;
                 }
-                SelectStructureResolver::new(self)
-                    .validate_select_without_relation_preflight(select, column_reference_preflight)
+                SelectStructureResolver::new(self).validate_select_without_relation_preflight(
+                    select,
+                    column_reference_preflight,
+                )?;
+                let collation_registry = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                validate_select_collation_consumers(
+                    self,
+                    select,
+                    SubqueryCollationUse::Scalar,
+                    &collation_registry,
+                )
             }
             Statement::Insert(insert) => {
                 if let InsertSource::Select(select) = &insert.source {
@@ -36178,6 +36187,14 @@ impl Connection {
                     SelectStructureResolver::new(self).validate_select_without_relation_preflight(
                         select,
                         column_reference_preflight,
+                    )?;
+                    let collation_registry =
+                        lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                    validate_select_collation_consumers(
+                        self,
+                        select,
+                        SubqueryCollationUse::Scalar,
+                        &collation_registry,
                     )?;
                 }
                 Ok(())
@@ -36192,6 +36209,14 @@ impl Connection {
                     SelectStructureResolver::new(self).validate_select_without_relation_preflight(
                         select,
                         column_reference_preflight,
+                    )?;
+                    let collation_registry =
+                        lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                    validate_select_collation_consumers(
+                        self,
+                        select,
+                        SubqueryCollationUse::Scalar,
+                        &collation_registry,
                     )?;
                 }
                 Ok(())
@@ -118761,7 +118786,10 @@ fn invoke_current_registered_pattern_operator(
             pattern_operator_argument_collation(pattern_expr, source_expr, escape_expr, col_map)
                 .map(|collation_name| {
                     with_current_join_eval_collation_context(|context| {
-                        context.and_then(|context| context.registry.find(&collation_name))
+                        context.map_or_else(
+                            || CollationRegistry::new().find(&collation_name),
+                            |context| context.registry.find(&collation_name),
+                        )
                     })
                     .ok_or_else(|| {
                         FrankenError::function_error(format!(
