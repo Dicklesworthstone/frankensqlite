@@ -63985,6 +63985,20 @@ impl Connection {
                     .map(|column_name| (effective_label.to_owned(), column_name, true)),
             )
             .collect();
+        let column_collations = self.build_join_col_collations(select);
+        let column_affinities = self.build_join_col_affinities(select);
+        let using_column_projections = self.build_join_using_column_projections(
+            select,
+            &column_collations,
+            &column_affinities,
+        );
+        let _join_eval_collation_guard =
+            JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                column_collations,
+                column_affinities,
+                using_column_projections,
+                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+            });
 
         // Resolve the INTEGER PRIMARY KEY column name so that rowid/_rowid_/oid
         // aliases in GROUP BY and result columns can be rewritten to the real name.
