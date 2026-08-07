@@ -120083,11 +120083,16 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
             SqliteValue::Null => SqliteValue::Null,
         }
     } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
-        SqliteValue::Text(val.to_text().into())
+        match val {
+            SqliteValue::Blob(bytes) => {
+                SqliteValue::Text(fsqlite_types::SmallText::from_arc_bytes(bytes))
+            }
+            other => SqliteValue::Text(other.to_text().into()),
+        }
     } else if upper.contains("BLOB") || upper.is_empty() {
         match val {
             SqliteValue::Blob(_) => val,
-            SqliteValue::Text(s) => SqliteValue::Blob(s.as_bytes().to_vec().into()),
+            SqliteValue::Text(s) => SqliteValue::Blob(s.as_bytes_direct().to_vec().into()),
             SqliteValue::Integer(_) | SqliteValue::Float(_) => {
                 SqliteValue::Blob(val.to_text().into_bytes().into())
             }
@@ -165675,6 +165680,8 @@ mod tests {
                 !handle.holds_page_lock(page),
                 "the rejected pending page must release its newly acquired lock"
             );
+            drop(handle);
+            conn.close().await.unwrap();
         });
     }
 

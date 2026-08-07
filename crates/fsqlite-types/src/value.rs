@@ -198,12 +198,13 @@ pub fn small_text_direct_trait_hits_for_bench() -> u64 {
     SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A small-string-optimized text value.
+/// A small-string-optimized SQLite TEXT value.
 ///
 /// Stores strings ≤ 23 bytes inline without heap allocation. Longer strings
 /// stay owned until the first clone, then lazily promote to `Arc<str>` for
-/// shared O(1) cloning. This eliminates both malloc and refcount traffic for
-/// the common single-owner path.
+/// shared O(1) cloning. SQLite also permits TEXT values whose byte payload is
+/// not valid UTF-8; those use a byte-preserving raw representation plus a
+/// cached lossy view for Rust APIs that require `&str`.
 pub struct SmallText {
     /// Representation: either inline bytes or a lazily shared heap string.
     repr: SmallTextRepr,
@@ -226,6 +227,11 @@ enum SmallTextRepr {
     },
     /// Heap storage after the text has been shared.
     HeapShared(Arc<str>),
+    /// Byte-preserving storage for SQLite TEXT that is not valid UTF-8.
+    ///
+    /// `lossy` exists only to satisfy Rust-facing string APIs. Storage,
+    /// equality, ordering, hashing, and CAST-to-BLOB use `bytes`.
+    Raw { bytes: Arc<[u8]>, lossy: Arc<str> },
 }
 
 impl Clone for SmallText {
@@ -248,6 +254,10 @@ impl Clone for SmallTextRepr {
                 Self::HeapShared(shared)
             }
             Self::HeapShared(text) => Self::HeapShared(Arc::clone(text)),
+            Self::Raw { bytes, lossy } => Self::Raw {
+                bytes: Arc::clone(bytes),
+                lossy: Arc::clone(lossy),
+            },
         }
     }
 }
@@ -305,6 +315,37 @@ impl SmallText {
         }
     }
 
+    /// Create SQLite TEXT from its exact byte payload.
+    ///
+    /// Valid UTF-8 retains the usual inline/owned fast paths. Invalid UTF-8 is
+    /// kept byte-for-byte and exposed through [`Self::as_bytes_direct`].
+    #[inline]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        match simdutf8::basic::from_utf8(bytes) {
+            Ok(text) => Self::new(text),
+            Err(_) => Self::from_raw_bytes(Arc::from(bytes)),
+        }
+    }
+
+    /// Create SQLite TEXT from shared exact bytes, retaining the allocation
+    /// when the payload is not valid UTF-8.
+    #[inline]
+    pub fn from_arc_bytes(bytes: Arc<[u8]>) -> Self {
+        match simdutf8::basic::from_utf8(&bytes) {
+            Ok(text) => Self::new(text),
+            Err(_) => Self::from_raw_bytes(bytes),
+        }
+    }
+
+    #[inline]
+    fn from_raw_bytes(bytes: Arc<[u8]>) -> Self {
+        debug_assert!(simdutf8::basic::from_utf8(&bytes).is_err());
+        let lossy: Arc<str> = Arc::from(String::from_utf8_lossy(&bytes).into_owned());
+        Self {
+            repr: SmallTextRepr::Raw { bytes, lossy },
+        }
+    }
+
     /// Overwrite this string, reusing the existing heap allocation when the
     /// value is still single-owner.
     #[inline]
@@ -336,6 +377,15 @@ impl SmallText {
         }
     }
 
+    /// Overwrite this value from an exact SQLite TEXT byte payload.
+    #[inline]
+    pub fn overwrite_bytes(&mut self, bytes: &[u8]) {
+        match simdutf8::basic::from_utf8(bytes) {
+            Ok(text) => self.overwrite(text),
+            Err(_) => *self = Self::from_raw_bytes(Arc::from(bytes)),
+        }
+    }
+
     /// Get the string as a slice.
     ///
     /// OPT-UTF8: the inline buffer is always valid UTF-8 by construction (see
@@ -352,16 +402,33 @@ impl SmallText {
                 .expect("SmallText inline representation must always contain valid UTF-8"),
             SmallTextRepr::HeapOwned { text, .. } => text.as_str(),
             SmallTextRepr::HeapShared(text) => text,
+            SmallTextRepr::Raw { lossy, .. } => lossy,
         }
+    }
+
+    /// Return a borrowed string only when the exact TEXT payload is UTF-8.
+    #[inline]
+    #[must_use]
+    pub fn as_str_checked(&self) -> Option<&str> {
+        match &self.repr {
+            SmallTextRepr::Raw { .. } => None,
+            _ => Some(self.as_str()),
+        }
+    }
+
+    /// Whether the exact TEXT payload is valid UTF-8.
+    #[inline]
+    #[must_use]
+    pub fn is_valid_utf8(&self) -> bool {
+        !matches!(&self.repr, SmallTextRepr::Raw { .. })
     }
 
     /// Get the raw bytes of this text value without going through `&str`.
     ///
-    /// Unlike [`Self::as_str`] (which revalidates the inline buffer via
-    /// `from_utf8`), this directly returns the stored bytes. The returned
-    /// slice is guaranteed to be valid UTF-8 by construction: every code path
-    /// that writes to a `SmallText` (`new`, `from_string`, `from_arc`,
-    /// `overwrite`) sources its bytes from a `&str` or `Arc<str>`.
+    /// Unlike [`Self::as_str`] (which returns a cached lossy view for a raw
+    /// payload), this directly returns the exact stored bytes. The slice can
+    /// therefore be invalid UTF-8 when the value came from SQLite record bytes
+    /// or a BLOB-to-TEXT cast.
     ///
     /// This is useful on hot paths where a byte-wise equality check is the
     /// only operation performed — for example, the record-decode fast path
@@ -375,6 +442,7 @@ impl SmallText {
             SmallTextRepr::Inline { len, buf } => &buf[..*len as usize],
             SmallTextRepr::HeapOwned { text, .. } => text.as_bytes(),
             SmallTextRepr::HeapShared(text) => text.as_bytes(),
+            SmallTextRepr::Raw { bytes, .. } => bytes,
         }
     }
 
@@ -385,6 +453,7 @@ impl SmallText {
             SmallTextRepr::Inline { len, .. } => *len as usize,
             SmallTextRepr::HeapOwned { text, .. } => text.len(),
             SmallTextRepr::HeapShared(text) => text.len(),
+            SmallTextRepr::Raw { bytes, .. } => bytes.len(),
         }
     }
 
@@ -414,6 +483,7 @@ impl SmallText {
                 .into_inner()
                 .unwrap_or_else(|| Arc::<str>::from(text)),
             SmallTextRepr::HeapShared(text) => text,
+            SmallTextRepr::Raw { lossy, .. } => lossy,
         }
     }
 }
@@ -446,7 +516,10 @@ impl PartialEq for SmallText {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return self.as_bytes_direct() == other.as_bytes_direct();
         }
-        self.as_str() == other.as_str()
+        match (self.as_str_checked(), other.as_str_checked()) {
+            (Some(left), Some(right)) => left == right,
+            _ => self.as_bytes_direct() == other.as_bytes_direct(),
+        }
     }
 }
 
@@ -468,7 +541,10 @@ impl Ord for SmallText {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return self.as_bytes_direct().cmp(other.as_bytes_direct());
         }
-        self.as_str().cmp(other.as_str())
+        match (self.as_str_checked(), other.as_str_checked()) {
+            (Some(left), Some(right)) => left.cmp(right),
+            _ => self.as_bytes_direct().cmp(other.as_bytes_direct()),
+        }
     }
 }
 
@@ -483,7 +559,12 @@ impl Hash for SmallText {
             state.write_u8(0xff);
             return;
         }
-        self.as_str().hash(state);
+        if let Some(text) = self.as_str_checked() {
+            text.hash(state);
+        } else {
+            state.write(self.as_bytes_direct());
+            state.write_u8(0xff);
+        }
     }
 }
 
@@ -537,7 +618,12 @@ impl serde::Serialize for SmallText {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(self.as_str())
+        let Some(text) = self.as_str_checked() else {
+            return Err(serde::ser::Error::custom(
+                "SQLite TEXT containing invalid UTF-8 cannot be serialized as a Rust string",
+            ));
+        };
+        serializer.serialize_str(text)
     }
 }
 
@@ -706,11 +792,11 @@ pub enum SqliteValue {
     Integer(i64),
     /// A 64-bit IEEE floating point number.
     Float(f64),
-    /// A UTF-8 text string.
+    /// A SQLite TEXT value.
     ///
     /// Uses `SmallText` for small-string optimization: strings ≤ 23 bytes
-    /// are stored inline without heap allocation. Longer strings use
-    /// `Arc<str>` internally for O(1) cloning.
+    /// are stored inline without heap allocation. Longer valid UTF-8 strings
+    /// use shared string storage; invalid UTF-8 remains exact raw bytes.
     Text(SmallText),
     /// A binary large object.
     ///
@@ -969,11 +1055,12 @@ impl SqliteValue {
         }
     }
 
-    /// Convert to text following SQLite's CAST(x AS TEXT) coercion rules.
+    /// Convert to a Rust `String` representation of this value.
     ///
-    /// For blobs, this interprets the raw bytes as UTF-8 (with lossy
-    /// replacement for invalid sequences), matching C SQLite behavior.
-    /// For the SQL-literal hex format (`X'...'`), use the `Display` impl.
+    /// This boundary is necessarily lossy for invalid UTF-8 BLOB/TEXT bytes.
+    /// SQL CAST paths use `SmallText::from_arc_bytes` instead so SQLite TEXT
+    /// remains byte-preserving. For a SQL-literal hex format (`X'...'`), use
+    /// the `Display` impl.
     pub fn to_text(&self) -> String {
         match self {
             Self::Null => String::new(),
@@ -2676,6 +2763,33 @@ mod tests {
             "cloned text should use the shared Arc representation"
         );
         assert_eq!(text.as_str(), cloned.as_str());
+    }
+
+    #[test]
+    fn test_small_text_invalid_utf8_clone_compare_and_serde_fail_closed() {
+        let bytes: &[u8] = &[0x80, 0xC0, 0xAF];
+        let text = SmallText::from_bytes(bytes);
+        assert!(!text.is_valid_utf8());
+        assert_eq!(text.as_str_checked(), None);
+        assert_eq!(text.as_bytes_direct(), bytes);
+        assert_eq!(text.len(), bytes.len());
+        assert!(!text.is_inline());
+
+        let cloned = text.clone();
+        assert_eq!(cloned, text);
+        assert_eq!(cloned.as_bytes_direct(), bytes);
+        assert_ne!(
+            text,
+            SmallText::new("\u{FFFD}\u{FFFD}\u{FFFD}"),
+            "lossy display text must not define SQLite TEXT equality"
+        );
+
+        let error = serde_json::to_string(&text)
+            .expect_err("raw TEXT must not be silently substituted during string serialization");
+        assert!(
+            error.to_string().contains("invalid UTF-8"),
+            "serialization failure must explain the unsupported Rust-string boundary: {error}"
+        );
     }
 
     #[test]

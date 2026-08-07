@@ -29,7 +29,7 @@ use crate::serial_type::{
     varint_len, write_varint,
 };
 use crate::sync_primitives::Instant;
-use crate::value::{SqliteValue, pool_acquire, pool_return_reusable};
+use crate::value::{SmallText, SqliteValue, pool_acquire, pool_return_reusable};
 
 static FSQLITE_RECORD_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 static FSQLITE_RECORD_PARSE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -2580,25 +2580,19 @@ fn decode_value_into(
                     }
                     return Some(());
                 }
-                // Bytes differ: validate the incoming bytes as UTF-8 once,
-                // then overwrite the slot reusing its heap allocation when
-                // possible.
-                //
-                // OPT-UTF8: simdutf8::basic::from_utf8 is a SIMD-accelerated
-                // drop-in for std::str::from_utf8, typically 3-10x faster on
-                // ASCII/majority-ASCII payloads which dominate TEXT columns
-                // in real workloads.
-                let text = simdutf8::basic::from_utf8(bytes).ok()?;
-                existing.overwrite(text);
+                // Bytes differ: preserve the exact SQLite TEXT payload.
+                // Valid UTF-8 reuses the normal SmallText fast paths; invalid
+                // UTF-8 uses its byte-preserving raw representation.
+                existing.overwrite_bytes(bytes);
                 if profile_enabled {
                     note_decoded_value(slot);
                 }
                 return Some(());
             }
-            // Slot did not hold a TEXT value — validate once and construct
-            // a fresh `SqliteValue::Text`.
-            let text = simdutf8::basic::from_utf8(bytes).ok()?;
-            replace_decoded_slot(slot, SqliteValue::Text(text.into()));
+            // Slot did not hold a TEXT value. SQLite's TEXT storage class can
+            // contain arbitrary bytes, so construction must not reject or
+            // substitute an invalid UTF-8 sequence.
+            replace_decoded_slot(slot, SqliteValue::Text(SmallText::from_bytes(bytes)));
         }
         SerialTypeClass::Blob => {
             if let SqliteValue::Blob(existing) = slot {
@@ -3103,26 +3097,39 @@ mod tests {
     }
 
     #[test]
-    fn decode_text_rejects_invalid_utf8_when_slot_differs() {
-        // Regression guard: even when the fast-path equality check fails,
-        // the subsequent `from_utf8` validation must still reject malformed
-        // bytes. This covers the non-fast-path write into an existing Text
-        // slot.
+    fn decode_text_preserves_invalid_utf8_when_slot_differs() {
+        // SQLite TEXT is byte-preserving even when its payload is not UTF-8.
+        // Cover the non-fast-path overwrite of an existing Text slot.
         let mut slot = SqliteValue::Text(SmallText::new("previous value"));
         let invalid: &[u8] = &[0xFF, 0xFE, 0xFD]; // not valid UTF-8
         let result = decode_value_into(serial_type_for_text(3), invalid, &mut slot, false);
-        assert!(result.is_none(), "invalid UTF-8 must be rejected");
+        result.expect("raw SQLite TEXT must decode without substitution");
+        let SqliteValue::Text(text) = slot else {
+            panic!("decoded value must retain the TEXT storage class");
+        };
+        assert_eq!(text.as_bytes_direct(), invalid);
+        assert!(!text.is_valid_utf8());
     }
 
     #[test]
-    fn decode_text_rejects_invalid_utf8_when_slot_non_text() {
-        // Regression guard: the `replace_decoded_slot` arm (slot held a
-        // non-Text value) must also run `from_utf8` validation before
-        // constructing a new `SqliteValue::Text`.
+    fn decode_text_preserves_invalid_utf8_when_slot_non_text() {
+        // Cover the replace-decoded-slot arm and the full record encode/decode
+        // round-trip for a raw TEXT payload.
         let mut slot = SqliteValue::Integer(7);
         let invalid: &[u8] = &[0xFF, 0xFE, 0xFD];
         let result = decode_value_into(serial_type_for_text(3), invalid, &mut slot, false);
-        assert!(result.is_none(), "invalid UTF-8 must be rejected");
+        result.expect("raw SQLite TEXT must decode without substitution");
+        let SqliteValue::Text(text) = &slot else {
+            panic!("decoded value must retain the TEXT storage class");
+        };
+        assert_eq!(text.as_bytes_direct(), invalid);
+
+        let record = serialize_record(&[slot]);
+        let values = parse_record(&record).expect("raw TEXT record must round-trip");
+        let SqliteValue::Text(round_tripped) = &values[0] else {
+            panic!("round-tripped value must retain the TEXT storage class");
+        };
+        assert_eq!(round_tripped.as_bytes_direct(), invalid);
     }
 
     #[test]
@@ -3601,9 +3608,13 @@ mod tests {
     }
 
     #[test]
-    fn malformed_record_invalid_utf8_text() {
+    fn record_invalid_utf8_text_is_preserved() {
         let data = [0x02, 0x0F, 0xFF];
-        assert!(parse_record(&data).is_none());
+        let parsed = parse_record(&data).expect("SQLite TEXT may contain arbitrary bytes");
+        let SqliteValue::Text(text) = &parsed[0] else {
+            panic!("serial type 15 must decode as TEXT");
+        };
+        assert_eq!(text.as_bytes_direct(), [0xFF]);
     }
 
     #[test]

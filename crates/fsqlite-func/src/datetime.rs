@@ -1327,7 +1327,7 @@ fn is_implicit_now_time_value(value: &SqliteValue) -> bool {
 /// whitespace. Numeric values cannot equal any keyword checked here.
 fn sqlite_value_is_keyword(value: &SqliteValue, keyword: &str) -> bool {
     let bytes = match value {
-        SqliteValue::Text(text) => sqlite_c_string_bytes(text.as_bytes()),
+        SqliteValue::Text(text) => sqlite_c_string_bytes(text.as_bytes_direct()),
         SqliteValue::Blob(bytes) => sqlite_c_string_bytes(bytes),
         SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Float(_) => return false,
     };
@@ -1962,11 +1962,13 @@ mod tests {
             ));
             assert!(matches!(
                 TimeFunc.invoke(&[text(alias)]).unwrap(),
-                SqliteValue::Text(value) if value.len() == 12 && value.as_bytes()[8] == b'.'
+                SqliteValue::Text(value)
+                    if value.len() == 12 && value.as_bytes_direct()[8] == b'.'
             ));
             assert!(matches!(
                 DateTimeFunc.invoke(&[text(alias)]).unwrap(),
-                SqliteValue::Text(value) if value.len() == 23 && value.as_bytes()[19] == b'.'
+                SqliteValue::Text(value)
+                    if value.len() == 23 && value.as_bytes_direct()[19] == b'.'
             ));
             assert!(matches!(
                 JuliandayFunc.invoke(&[text(alias)]).unwrap(),

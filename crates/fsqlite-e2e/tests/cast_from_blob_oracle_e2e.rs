@@ -5,7 +5,9 @@
 //! `CAST(blob AS INTEGER/REAL)` first treats the bytes as text and then applies
 //! the usual text->number prefix parse (so `X'3132'` = "12" -> 12, `X'6162'` =
 //! "ab" -> 0). NUMERIC and NULL/typeof variants are included. Compared against
-//! rusqlite; only printable-ASCII byte sequences are used so rendering is stable.
+//! rusqlite. Invalid UTF-8 cases project through `hex(CAST(... AS BLOB))` so
+//! the oracle comparison observes the exact bytes without asking Rust strings
+//! to represent them.
 #![recursion_limit = "512"]
 
 use fsqlite::Connection;
@@ -76,6 +78,7 @@ async fn assert_scalar(queries: &[&str], label: &str) {
             (Err(_), Err(_)) => {}
         }
     }
+    f.close().await.expect("close frank oracle database");
     assert!(
         mismatches.is_empty(),
         "{label}: {} mismatch(es)\n{}",
@@ -98,6 +101,53 @@ fn cast_blob_to_text() {
             "cast_blob_to_text",
         )
         .await;
+    });
+}
+
+#[test]
+fn cast_blob_to_text_preserves_invalid_utf8_bytes() {
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT hex(CAST(CAST(X'80' AS TEXT) AS BLOB))",
+                "SELECT hex(CAST(CAST(X'C0AF' AS TEXT) AS BLOB))",
+                "SELECT hex(CAST(CAST(X'EDA080' AS TEXT) AS BLOB))",
+                "SELECT hex(CAST(CAST(X'F08080AF' AS TEXT) AS BLOB))",
+                "SELECT typeof(CAST(X'80' AS TEXT))",
+            ],
+            "cast_blob_to_text_preserves_invalid_utf8_bytes",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn invalid_utf8_text_record_round_trips_without_substitution() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.expect("open frank");
+        let sqlite = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+        let setup = "CREATE TABLE raw_text(x TEXT);
+                     INSERT INTO raw_text VALUES
+                         (CAST(X'80' AS TEXT)),
+                         (CAST(X'C0AF' AS TEXT)),
+                         (CAST(X'EDA080' AS TEXT)),
+                         (CAST(X'F08080AF' AS TEXT));";
+        frank
+            .execute_batch(setup)
+            .await
+            .expect("insert frank raw TEXT");
+        sqlite.execute_batch(setup).expect("insert sqlite raw TEXT");
+
+        let query = "SELECT typeof(x), hex(CAST(x AS BLOB)) FROM raw_text ORDER BY rowid";
+        let frank_rows = frank_rows(&frank, query)
+            .await
+            .expect("query frank raw TEXT");
+        let sqlite_rows = sqlite_rows(&sqlite, query).expect("query sqlite raw TEXT");
+        assert_eq!(
+            frank_rows, sqlite_rows,
+            "stored SQLite TEXT must retain its exact invalid UTF-8 payload"
+        );
+        frank.close().await.expect("close frank raw TEXT database");
     });
 }
 

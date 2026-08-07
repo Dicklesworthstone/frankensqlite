@@ -532,7 +532,7 @@ fn sqlite_value_to_text_bytes(value: &SqliteValue) -> Vec<u8> {
         SqliteValue::Null => Vec::new(),
         SqliteValue::Integer(number) => number.to_string().into_bytes(),
         value @ SqliteValue::Float(_) => value.to_text().into_bytes(),
-        SqliteValue::Text(text) => text.as_bytes().to_vec(),
+        SqliteValue::Text(text) => text.as_bytes_direct().to_vec(),
         SqliteValue::Blob(bytes) => bytes.to_vec(),
     }
 }

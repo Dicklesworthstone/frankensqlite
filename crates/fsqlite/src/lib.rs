@@ -7227,7 +7227,6 @@ mod tests {
                                             attempts_for_commit,
                                             u64::try_from(worker_id).expect("worker id fits u64"),
                                         );
-                                        continue;
                                     }
                                     Err(recovery_error) => {
                                         outcome.failure = Some(recovery_error);

@@ -607,20 +607,20 @@ fn append_unique_constraint_key_component(
         }
         SqliteValue::Text(text) => {
             key.push(3);
+            let text_bytes = text.as_bytes_direct();
             if is_nocase {
-                let folded = text.to_ascii_lowercase();
                 #[allow(clippy::cast_possible_truncation)]
-                key.extend_from_slice(&(folded.len() as u64).to_le_bytes());
-                key.extend_from_slice(folded.as_bytes());
+                key.extend_from_slice(&(text_bytes.len() as u64).to_le_bytes());
+                key.extend(text_bytes.iter().map(u8::to_ascii_lowercase));
             } else if is_rtrim {
-                let trimmed = trim_rtrim_collation_text(text.as_bytes());
+                let trimmed = trim_rtrim_collation_text(text_bytes);
                 #[allow(clippy::cast_possible_truncation)]
                 key.extend_from_slice(&(trimmed.len() as u64).to_le_bytes());
                 key.extend_from_slice(trimmed);
             } else {
                 #[allow(clippy::cast_possible_truncation)]
-                key.extend_from_slice(&(text.len() as u64).to_le_bytes());
-                key.extend_from_slice(text.as_bytes());
+                key.extend_from_slice(&(text_bytes.len() as u64).to_le_bytes());
+                key.extend_from_slice(text_bytes);
             }
         }
         SqliteValue::Blob(bytes) => {
@@ -1306,7 +1306,7 @@ fn bloom_hash(val: &SqliteValue) -> u64 {
             }
             return h;
         }
-        SqliteValue::Text(s) => s.as_bytes(),
+        SqliteValue::Text(s) => s.as_bytes_direct(),
         SqliteValue::Blob(b) => b,
     };
     for &b in bytes {
@@ -6415,20 +6415,20 @@ fn distinct_key_collated(args: &[SqliteValue], collation: Option<&str>) -> Disti
             }
             SqliteValue::Text(s) => {
                 key.push(3);
+                let text_bytes = s.as_bytes_direct();
                 if is_nocase {
-                    let folded = s.to_ascii_lowercase();
                     #[allow(clippy::cast_possible_truncation)]
-                    key.extend_from_slice(&(folded.len() as u64).to_le_bytes());
-                    key.extend_from_slice(folded.as_bytes());
+                    key.extend_from_slice(&(text_bytes.len() as u64).to_le_bytes());
+                    key.extend(text_bytes.iter().map(u8::to_ascii_lowercase));
                 } else if is_rtrim {
-                    let trimmed = trim_rtrim_collation_text(s.as_bytes());
+                    let trimmed = trim_rtrim_collation_text(text_bytes);
                     #[allow(clippy::cast_possible_truncation)]
                     key.extend_from_slice(&(trimmed.len() as u64).to_le_bytes());
                     key.extend_from_slice(trimmed);
                 } else {
                     #[allow(clippy::cast_possible_truncation)]
-                    key.extend_from_slice(&(s.len() as u64).to_le_bytes());
-                    key.extend_from_slice(s.as_bytes());
+                    key.extend_from_slice(&(text_bytes.len() as u64).to_le_bytes());
+                    key.extend_from_slice(text_bytes);
                 }
             }
             SqliteValue::Blob(b) => {
@@ -16710,8 +16710,8 @@ fn collate_compare(
 ) -> Option<std::cmp::Ordering> {
     match (lhs, rhs) {
         (SqliteValue::Text(l), SqliteValue::Text(r)) => Some(compare_text_with_collation(
-            l.as_bytes(),
-            r.as_bytes(),
+            l.as_bytes_direct(),
+            r.as_bytes_direct(),
             coll_name,
             collation_registry,
         )),
@@ -16731,21 +16731,21 @@ fn compare_text_with_collation(
         .unwrap_or_else(|| left.cmp(right))
 }
 
-fn builtin_collation_compare_text(left: &str, right: &str, coll_name: &str) -> Option<Ordering> {
+fn builtin_collation_compare_text(
+    left: &SmallText,
+    right: &SmallText,
+    coll_name: &str,
+) -> Option<Ordering> {
+    let left = left.as_bytes_direct();
+    let right = right.as_bytes_direct();
     if coll_name.eq_ignore_ascii_case("BINARY") {
-        return Some(left.as_bytes().cmp(right.as_bytes()));
+        return Some(left.cmp(right));
     }
     if coll_name.eq_ignore_ascii_case("NOCASE") {
-        return Some(compare_ascii_nocase_bytes(
-            left.as_bytes(),
-            right.as_bytes(),
-        ));
+        return Some(compare_ascii_nocase_bytes(left, right));
     }
     if coll_name.eq_ignore_ascii_case("RTRIM") {
-        return Some(
-            trim_rtrim_collation_text(left.as_bytes())
-                .cmp(trim_rtrim_collation_text(right.as_bytes())),
-        );
+        return Some(trim_rtrim_collation_text(left).cmp(trim_rtrim_collation_text(right)));
     }
     None
 }
@@ -16753,7 +16753,7 @@ fn builtin_collation_compare_text(left: &str, right: &str, coll_name: &str) -> O
 fn cmp_sqlite_values_collated(a: &SqliteValue, b: &SqliteValue, coll: &str) -> Ordering {
     match (a, b) {
         (SqliteValue::Text(l), SqliteValue::Text(r)) => builtin_collation_compare_text(l, r, coll)
-            .unwrap_or_else(|| l.as_bytes().cmp(r.as_bytes())),
+            .unwrap_or_else(|| l.as_bytes_direct().cmp(r.as_bytes_direct())),
         _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
     }
 }
@@ -16807,7 +16807,7 @@ fn fast_compare_same_storage_class(
         }
         (SqliteValue::Text(a), SqliteValue::Text(b)) if affinity < SQLITE_AFF_NUMERIC => match p4 {
             P4::Collation(coll_name) => builtin_collation_compare_text(a, b, coll_name).map(Some),
-            _ => Some(Some(a.as_bytes().cmp(b.as_bytes()))),
+            _ => Some(Some(a.as_bytes_direct().cmp(b.as_bytes_direct()))),
         },
         (SqliteValue::Blob(a), SqliteValue::Blob(b)) if !matches!(p4, P4::Collation(_)) => {
             Some(Some(a.as_ref().cmp(b.as_ref())))
@@ -18306,7 +18306,12 @@ fn cmp_values_collated(
     collation_registry: &CollationRegistry,
 ) -> Ordering {
     if let (Some(coll), SqliteValue::Text(lt), SqliteValue::Text(rt)) = (collation, lhs, rhs) {
-        return compare_text_with_collation(lt.as_bytes(), rt.as_bytes(), coll, collation_registry);
+        return compare_text_with_collation(
+            lt.as_bytes_direct(),
+            rt.as_bytes_direct(),
+            coll,
+            collation_registry,
+        );
     }
     lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
 }
@@ -18635,23 +18640,22 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
     // C SQLite interprets blob bytes as UTF-8 text before numeric casts.
     let val = match (val, target_byte) {
         (SqliteValue::Blob(b), b'C' | b'c' | b'D' | b'd' | b'E' | b'e') => {
-            SqliteValue::Text(String::from_utf8_lossy(&b).into_owned().into())
+            SqliteValue::Text(SmallText::from_arc_bytes(b))
         }
         (other, _) => other,
     };
     match target_byte {
         b'A' | b'a' => SqliteValue::Blob(match val {
             SqliteValue::Blob(b) => b,
-            SqliteValue::Text(s) => Arc::from(s.as_bytes()),
+            SqliteValue::Text(s) => Arc::from(s.as_bytes_direct()),
             other => Arc::from(other.to_text().into_bytes()),
         }),
         b'B' | b'b' => {
-            // C SQLite: CAST(blob AS TEXT) decodes bytes as UTF-8,
-            // not as hex literal.
+            // C SQLite changes the storage-class tag without validating or
+            // replacing the BLOB payload. SmallText retains invalid UTF-8 in
+            // its byte-preserving raw representation.
             match val {
-                SqliteValue::Blob(b) => {
-                    SqliteValue::Text(String::from_utf8_lossy(&b).into_owned().into())
-                }
+                SqliteValue::Blob(b) => SqliteValue::Text(SmallText::from_arc_bytes(b)),
                 other => SqliteValue::Text(other.to_text().into()),
             }
         }
@@ -20334,7 +20338,7 @@ mod tests {
                 }
                 buf.copy_from_slice(&float.to_bits().to_be_bytes());
             }
-            SqliteValue::Text(text) => buf.copy_from_slice(text.as_bytes()),
+            SqliteValue::Text(text) => buf.copy_from_slice(text.as_bytes_direct()),
             SqliteValue::Blob(blob) => buf.copy_from_slice(blob),
         }
     }
