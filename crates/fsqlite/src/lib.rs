@@ -6867,24 +6867,49 @@ mod tests {
                 conn.is_concurrent_mode_default(),
                 "setup connection must preserve the concurrent-writer default"
             );
-            conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER);")
-                .await
-                .expect("create accounts table");
+            conn.execute(
+                "CREATE TABLE accounts (
+                    id INTEGER PRIMARY KEY,
+                    balance INTEGER,
+                    payload TEXT NOT NULL
+                );",
+            )
+            .await
+            .expect("create accounts table");
+            let payload = "x".repeat(512);
             for account_id in 0..NUM_ACCOUNTS {
-                conn.execute(&format!(
-                    "INSERT INTO accounts VALUES ({account_id}, {INITIAL_BALANCE});"
-                ))
+                conn.execute_with_params(
+                    "INSERT INTO accounts VALUES (?1, ?2, ?3);",
+                    &[
+                        SqliteValue::Integer(account_id),
+                        SqliteValue::Integer(INITIAL_BALANCE),
+                        SqliteValue::Text(payload.clone().into()),
+                    ],
+                )
                 .await
                 .expect("insert initial account");
             }
             let rows = conn
-                .query("SELECT COUNT(*), SUM(balance) FROM accounts;")
+                .query(
+                    "SELECT COUNT(*), SUM(balance), MIN(length(payload)), MAX(length(payload))
+                     FROM accounts;",
+                )
                 .await
                 .expect("query initial account invariants");
             assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(NUM_ACCOUNTS));
             assert_eq!(
                 row_values(&rows[0])[1],
                 SqliteValue::Integer(EXPECTED_TOTAL)
+            );
+            assert_eq!(row_values(&rows[0])[2], SqliteValue::Integer(512));
+            assert_eq!(row_values(&rows[0])[3], SqliteValue::Integer(512));
+            let page_count = conn
+                .query_row("PRAGMA page_count;")
+                .await
+                .expect("query multi-page setup size");
+            assert!(
+                matches!(row_values(&page_count).as_slice(), [SqliteValue::Integer(count)] if *count > 2),
+                "fixed-width account payloads must span multiple database pages: {page_count:?}"
             );
             conn.close()
                 .await
@@ -7376,7 +7401,8 @@ mod tests {
             let rows = conn
                 .query(
                     "SELECT COUNT(*), SUM(balance),\
-                     SUM(CASE WHEN balance < 0 THEN 1 ELSE 0 END) FROM accounts;",
+                     SUM(CASE WHEN balance < 0 THEN 1 ELSE 0 END),\
+                     MIN(length(payload)), MAX(length(payload)) FROM accounts;",
                 )
                 .await
                 .expect("query final account invariants");
@@ -7396,8 +7422,10 @@ mod tests {
                 SqliteValue::Integer(NUM_ACCOUNTS),
                 SqliteValue::Integer(EXPECTED_TOTAL),
                 SqliteValue::Integer(0),
+                SqliteValue::Integer(512),
+                SqliteValue::Integer(512),
             ]]),
-            "final aggregate invariants must have exact INTEGER storage classes"
+            "final multi-page aggregate invariants must have exact INTEGER storage classes"
         );
         assert_eq!(
             final_integrity,
