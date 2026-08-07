@@ -61,6 +61,7 @@ const MAX_CI_ELAPSED_SECS_RELEASE: f64 = 300.0;
 const MAX_SINGLE_WRITER_ELAPSED_SECS_DEBUG: f64 = 120.0;
 const MAX_SINGLE_WRITER_ELAPSED_SECS_RELEASE: f64 = 180.0;
 const TEST_SEED: u64 = 0xBDBD_3010_05AA_55EE;
+const CI_TEST_SEEDS: [u64; 3] = [TEST_SEED, 0xBDBD_3010_05AA_55EF, 0xBDBD_3010_05AA_55F0];
 
 #[derive(Clone, Copy)]
 enum TxnKind {
@@ -90,60 +91,66 @@ struct WorkerResult {
 #[test]
 fn ssi_serialization_correctness_ci_scale() {
     asupersync::test_utils::run_test(|| async {
-        let summary = run_ssi_workload(
-            configured_ci_writers(),
-            configured_ci_txns_per_writer(),
-            TEST_SEED,
-            "ci-scale",
-        )
-        .await;
+        for seed in CI_TEST_SEEDS {
+            let label = format!("ci-scale-{seed:016x}");
+            let summary = run_ssi_workload(
+                configured_ci_writers(),
+                configured_ci_txns_per_writer(),
+                seed,
+                &label,
+            )
+            .await;
 
-        let attempted = summary.committed + summary.aborted;
-        assert!(attempted > 0, "expected at least one attempted transaction");
+            let attempted = summary.committed + summary.aborted;
+            assert!(
+                attempted > 0,
+                "seed={seed:#018x}: expected at least one attempted transaction"
+            );
 
-        #[allow(clippy::cast_precision_loss)]
-        let abort_rate = summary.aborted as f64 / attempted as f64;
-        #[allow(clippy::cast_precision_loss)]
-        let throughput = summary.committed as f64 / summary.elapsed_seconds;
-        let min_ci_throughput = configured_ci_min_throughput();
-        let max_ci_elapsed = configured_ci_max_elapsed_seconds();
+            #[allow(clippy::cast_precision_loss)]
+            let abort_rate = summary.aborted as f64 / attempted as f64;
+            #[allow(clippy::cast_precision_loss)]
+            let throughput = summary.committed as f64 / summary.elapsed_seconds;
+            let min_ci_throughput = configured_ci_min_throughput();
+            let max_ci_elapsed = configured_ci_max_elapsed_seconds();
 
-        assert!(
-            abort_rate < MAX_ABORT_RATE,
-            "abort rate too high: {:.3} (max {:.3}); committed={} aborted={} retry_conflicts={}",
-            abort_rate,
-            MAX_ABORT_RATE,
-            summary.committed,
-            summary.aborted,
-            summary.retry_conflicts
-        );
-        assert!(
-            throughput > min_ci_throughput,
-            "throughput too low: {:.1} txn/s (min {:.1} txn/s); committed={} elapsed={:.3}s",
-            throughput,
-            min_ci_throughput,
-            summary.committed,
-            summary.elapsed_seconds
-        );
-        assert!(
-            summary.elapsed_seconds <= max_ci_elapsed,
-            "ci-scale workload exceeded elapsed-time budget: elapsed={:.3}s max={:.3}s",
-            summary.elapsed_seconds,
-            max_ci_elapsed
-        );
+            assert!(
+                abort_rate < MAX_ABORT_RATE,
+                "seed={seed:#018x}: abort rate too high: {:.3} (max {:.3}); committed={} aborted={} retry_conflicts={}",
+                abort_rate,
+                MAX_ABORT_RATE,
+                summary.committed,
+                summary.aborted,
+                summary.retry_conflicts
+            );
+            assert!(
+                throughput > min_ci_throughput,
+                "seed={seed:#018x}: throughput too low: {:.1} txn/s (min {:.1} txn/s); committed={} elapsed={:.3}s",
+                throughput,
+                min_ci_throughput,
+                summary.committed,
+                summary.elapsed_seconds
+            );
+            assert!(
+                summary.elapsed_seconds <= max_ci_elapsed,
+                "seed={seed:#018x}: ci-scale workload exceeded elapsed-time budget: elapsed={:.3}s max={:.3}s",
+                summary.elapsed_seconds,
+                max_ci_elapsed
+            );
 
-        emit_scenario_outcome(
-            "ci-scale",
-            TEST_SEED,
-            &summary,
-            json!({
-                "abort_rate": abort_rate,
-                "throughput_txn_per_sec": throughput,
-                "max_abort_rate": MAX_ABORT_RATE,
-                "min_throughput_txn_per_sec": min_ci_throughput,
-                "max_elapsed_seconds": max_ci_elapsed,
-            }),
-        );
+            emit_scenario_outcome(
+                "ci-scale",
+                seed,
+                &summary,
+                json!({
+                    "abort_rate": abort_rate,
+                    "throughput_txn_per_sec": throughput,
+                    "max_abort_rate": MAX_ABORT_RATE,
+                    "min_throughput_txn_per_sec": min_ci_throughput,
+                    "max_elapsed_seconds": max_ci_elapsed,
+                }),
+            );
+        }
     });
 }
 
@@ -192,7 +199,7 @@ fn ssi_serialization_correctness_single_writer_smoke() {
 #[test]
 fn rollback_required_ignores_failed_begin_state() {
     asupersync::test_utils::run_test(|| async {
-        let conn = fsqlite::Connection::open(":memory:")
+        let mut conn = fsqlite::Connection::open(":memory:")
             .await
             .expect("open rollback-state fixture");
 
@@ -207,6 +214,9 @@ fn rollback_required_ignores_failed_begin_state() {
             .await
             .expect("an active transaction must roll back");
         assert!(!conn.in_transaction());
+        conn.close_without_checkpoint_in_place()
+            .await
+            .expect("close rollback-state fixture");
     });
 }
 
@@ -502,7 +512,7 @@ async fn run_ssi_workload(
 }
 
 async fn initialize_db(path: &Path, account_count: i64) {
-    let conn = fsqlite::Connection::open(path.to_string_lossy().as_ref())
+    let mut conn = fsqlite::Connection::open(path.to_string_lossy().as_ref())
         .await
         .expect("open db for initialization");
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -530,6 +540,9 @@ async fn initialize_db(path: &Path, account_count: i64) {
         .await
         .expect("seed account row");
     }
+    conn.close_in_place()
+        .await
+        .expect("close initialization connection");
 }
 
 async fn run_worker(
@@ -627,6 +640,14 @@ async fn run_worker(
                         }
                     };
                     thread::sleep(Duration::from_millis(retry_sleep_ms));
+                    if let Err(close_err) = conn.close_without_checkpoint_in_place().await {
+                        retry_controller.clear_conflict(logical_txn_id);
+                        result.aborted += 1;
+                        result.hard_failures.push(format!(
+                            "worker={worker_id} txn_index={txn_index} close failed before reopen after transient error ({err}): {close_err}"
+                        ));
+                        return result;
+                    }
                     conn = match open_worker_connection(db_path).await {
                         Ok(conn) => conn,
                         Err(open_err) => {
@@ -635,7 +656,7 @@ async fn run_worker(
                             result.hard_failures.push(format!(
                                 "worker={worker_id} txn_index={txn_index} reopen failed after transient error ({err}): {open_err}"
                             ));
-                            break;
+                            return result;
                         }
                     };
                 }
@@ -659,6 +680,11 @@ async fn run_worker(
         }
     }
 
+    if let Err(err) = conn.close_without_checkpoint_in_place().await {
+        result
+            .hard_failures
+            .push(format!("worker={worker_id} final close failed: {err}"));
+    }
     result
 }
 
@@ -752,24 +778,38 @@ fn random_account(rng: &mut StdRng, account_count: i64) -> i64 {
 async fn open_worker_connection(db_path: &Path) -> Result<fsqlite::Connection, FrankenError> {
     let started = Instant::now();
     loop {
-        let result = async {
-            let conn = fsqlite::Connection::open(db_path.to_string_lossy().as_ref()).await?;
-            conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
-                .await?;
-            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await?;
-            Ok(conn)
-        }
-        .await;
-
-        match result {
-            Ok(conn) => return Ok(conn),
+        let mut conn = match fsqlite::Connection::open(db_path.to_string_lossy().as_ref()).await {
+            Ok(conn) => conn,
             Err(err)
                 if err.is_transient()
                     && started.elapsed() < Duration::from_millis(BUSY_TIMEOUT_MS) =>
             {
                 thread::sleep(Duration::from_millis(RECOVERY_RETRY_SLEEP_MS));
+                continue;
             }
             Err(err) => return Err(err),
+        };
+        let configure_result: Result<(), FrankenError> = async {
+            conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
+                .await?;
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await?;
+            Ok(())
+        }
+        .await;
+
+        match configure_result {
+            Ok(()) => return Ok(conn),
+            Err(err)
+                if err.is_transient()
+                    && started.elapsed() < Duration::from_millis(BUSY_TIMEOUT_MS) =>
+            {
+                conn.close_without_checkpoint_in_place().await?;
+                thread::sleep(Duration::from_millis(RECOVERY_RETRY_SLEEP_MS));
+            }
+            Err(err) => {
+                conn.close_without_checkpoint_in_place().await?;
+                return Err(err);
+            }
         }
     }
 }
@@ -821,7 +861,7 @@ fn extract_int(row: &fsqlite::Row, index: usize) -> Result<i64, FrankenError> {
 }
 
 async fn read_account_invariants(path: &Path) -> (i64, i64) {
-    let conn = fsqlite::Connection::open(path.to_string_lossy().as_ref())
+    let mut conn = fsqlite::Connection::open(path.to_string_lossy().as_ref())
         .await
         .expect("open verifier connection");
 
@@ -836,6 +876,9 @@ async fn read_account_invariants(path: &Path) -> (i64, i64) {
         .await
         .expect("query min balance");
     let min_balance = extract_int(&min_row, 0).expect("extract min balance");
+    conn.close_without_checkpoint_in_place()
+        .await
+        .expect("close verifier connection");
 
     (final_sum, min_balance)
 }

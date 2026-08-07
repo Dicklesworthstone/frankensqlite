@@ -11759,7 +11759,7 @@ impl Connection {
         env.runtime().attach_io_native_cx_if_missing(&root_cx);
 
         let collation_registry = Arc::new(Mutex::new(CollationRegistry::new()));
-        let conn = Self {
+        let mut conn = Self {
             path,
             db: Rc::new(RefCell::new(MemDatabase::new())),
             pager,
@@ -11965,30 +11965,38 @@ impl Connection {
             // the invariant.
             fast_path_gate: AtomicU32::new(0),
         };
-        let op_cx = conn.op_cx()?;
-        {
-            let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
-            conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
+        let bootstrap_result: Result<()> = async {
+            let op_cx = conn.op_cx()?;
+            {
+                let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+                conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
+            }
+            conn.register_cache_pages_module();
+            conn.bootstrap_journal_mode_from_storage(false).await?;
+            conn.bootstrap_pragma_state_from_storage();
+            if writable {
+                conn.apply_current_journal_mode_to_pager().await?;
+            } else {
+                conn.apply_current_journal_mode_to_pager_readonly().await?;
+            }
+            conn.apply_current_synchronous_to_pager()?;
+            // Explicitly load schema only — never hydrate row data.
+            conn.reload_memdb_from_pager_with_mode(&op_cx, false)
+                .await?;
+            conn.align_commit_clock_floor(*conn.memdb_visible_commit_seq.borrow());
+            conn.sync_change_tracking_context();
+            conn.attach_connection_pool_metrics();
+            // The native namespace gate remains exclusive throughout every
+            // journal/WAL/schema/MemDB bootstrap step above. Publish the completed
+            // connection generation only at the final success boundary.
+            conn.pager.finish_namespace_bootstrap()?;
+            Ok(())
         }
-        conn.register_cache_pages_module();
-        conn.bootstrap_journal_mode_from_storage(false).await?;
-        conn.bootstrap_pragma_state_from_storage();
-        if writable {
-            conn.apply_current_journal_mode_to_pager().await?;
-        } else {
-            conn.apply_current_journal_mode_to_pager_readonly().await?;
+        .await;
+        if let Err(err) = bootstrap_result {
+            conn.close_best_effort_in_place().await;
+            return Err(err);
         }
-        conn.apply_current_synchronous_to_pager()?;
-        // Explicitly load schema only — never hydrate row data.
-        conn.reload_memdb_from_pager_with_mode(&op_cx, false)
-            .await?;
-        conn.align_commit_clock_floor(*conn.memdb_visible_commit_seq.borrow());
-        conn.sync_change_tracking_context();
-        conn.attach_connection_pool_metrics();
-        // The native namespace gate remains exclusive throughout every
-        // journal/WAL/schema/MemDB bootstrap step above. Publish the completed
-        // connection generation only at the final success boundary.
-        conn.pager.finish_namespace_bootstrap()?;
         Ok(conn)
     }
 
@@ -12215,7 +12223,7 @@ impl Connection {
 
         let eager_memdb_rows = pager_is_memory;
         let collation_registry = Arc::new(Mutex::new(CollationRegistry::new()));
-        let conn = Self {
+        let mut conn = Self {
             path,
             db: Rc::new(RefCell::new(MemDatabase::new())),
             pager,
@@ -12434,32 +12442,40 @@ impl Connection {
             // the invariant.
             fast_path_gate: AtomicU32::new(0),
         };
-        let op_cx = conn.op_cx()?;
-        {
-            let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
-            conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
+        let bootstrap_result: Result<()> = async {
+            let op_cx = conn.op_cx()?;
+            {
+                let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+                conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
+            }
+            conn.register_cache_pages_module();
+            conn.bootstrap_journal_mode_from_storage(storage_was_empty)
+                .await?;
+            conn.bootstrap_pragma_state_from_storage();
+            conn.apply_current_journal_mode_to_pager().await?;
+            conn.apply_current_synchronous_to_pager()?;
+            // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
+            // Fresh private `:memory:` opens start from the same empty MemDatabase
+            // state that an empty page-1 reload would produce, so avoid the pager
+            // read transaction on the benchmark-critical setup path. Imported
+            // memory images pass `storage_was_empty = false` and still hydrate.
+            if !pager_is_memory || !storage_was_empty {
+                conn.reload_memdb_from_pager(&op_cx).await?;
+            }
+            conn.align_commit_clock_floor(*conn.memdb_visible_commit_seq.borrow());
+            conn.sync_change_tracking_context();
+            conn.attach_connection_pool_metrics();
+            // Retain the native namespace bootstrap lease through journal/WAL,
+            // schema, and MemDB initialization. Publish the generation only at
+            // this final successful Connection boundary.
+            conn.pager.finish_namespace_bootstrap()?;
+            Ok(())
         }
-        conn.register_cache_pages_module();
-        conn.bootstrap_journal_mode_from_storage(storage_was_empty)
-            .await?;
-        conn.bootstrap_pragma_state_from_storage();
-        conn.apply_current_journal_mode_to_pager().await?;
-        conn.apply_current_synchronous_to_pager()?;
-        // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
-        // Fresh private `:memory:` opens start from the same empty MemDatabase
-        // state that an empty page-1 reload would produce, so avoid the pager
-        // read transaction on the benchmark-critical setup path. Imported
-        // memory images pass `storage_was_empty = false` and still hydrate.
-        if !pager_is_memory || !storage_was_empty {
-            conn.reload_memdb_from_pager(&op_cx).await?;
+        .await;
+        if let Err(err) = bootstrap_result {
+            conn.close_best_effort_in_place().await;
+            return Err(err);
         }
-        conn.align_commit_clock_floor(*conn.memdb_visible_commit_seq.borrow());
-        conn.sync_change_tracking_context();
-        conn.attach_connection_pool_metrics();
-        // Retain the native namespace bootstrap lease through journal/WAL,
-        // schema, and MemDB initialization. Publish the generation only at
-        // this final successful Connection boundary.
-        conn.pager.finish_namespace_bootstrap()?;
         Ok(conn)
     }
 
