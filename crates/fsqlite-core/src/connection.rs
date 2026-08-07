@@ -43704,13 +43704,6 @@ impl Connection {
             &FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS,
             finalize_post_publish_start,
         );
-        if let Some(error) = post_durable_commit_error {
-            tracing::warn!(
-                %error,
-                caller_outcome = "committed",
-                "connection completed a durable commit after local post-durable error"
-            );
-        }
         Ok(())
     }
 
@@ -53429,7 +53422,7 @@ impl Connection {
                     .record_success(latency);
             }
 
-            let mut commit_outcome = match commit_res {
+            let commit_outcome = match commit_res {
                 Ok(()) => PhysicalCommitOutcome::Durable {
                     post_durable_error: None,
                 },
@@ -53437,12 +53430,13 @@ impl Connection {
             };
 
             #[cfg(test)]
-            if let PhysicalCommitOutcome::Durable {
-                post_durable_error,
-            } = &mut commit_outcome
-            {
-                *post_durable_error = take_post_durable_commit_error();
-            }
+            let commit_outcome = {
+                let mut commit_outcome = commit_outcome;
+                if let PhysicalCommitOutcome::Durable { post_durable_error } = &mut commit_outcome {
+                    *post_durable_error = take_post_durable_commit_error();
+                }
+                commit_outcome
+            };
 
             // Issue #115 regression hook: we are now in the precise window
             // AFTER the physical pager write has landed but BEFORE the commit
@@ -53523,9 +53517,9 @@ impl Connection {
 
             match commit_outcome {
                 PhysicalCommitOutcome::NotCommitted(error) => return Err(error),
-                PhysicalCommitOutcome::Durable {
-                    post_durable_error,
-                } => (txn_has_pending_writes, post_durable_error),
+                PhysicalCommitOutcome::Durable { post_durable_error } => {
+                    (txn_has_pending_writes, post_durable_error)
+                }
             }
         };
 
@@ -53653,6 +53647,13 @@ impl Connection {
             &FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS,
             finalize_post_publish_start,
         );
+        if let Some(error) = post_durable_commit_error {
+            tracing::warn!(
+                %error,
+                caller_outcome = "committed",
+                "connection completed a durable commit after local post-durable error"
+            );
+        }
         Ok(())
     }
 
@@ -164690,8 +164691,11 @@ mod tests {
                 conn.concurrent_commit_index.latest(root_page).is_some(),
                 "a durable concurrent commit must publish its table root to CommitIndex"
             );
-            let row = conn.query_row("SELECT v FROM t WHERE id = 1;").await.unwrap();
-            assert_eq!(row.get(0), Some(&SqliteValue::Text("durable".to_owned())));
+            let row = conn
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .await
+                .unwrap();
+            assert_eq!(row.get(0), Some(&SqliteValue::Text("durable".into())));
         });
     }
 
