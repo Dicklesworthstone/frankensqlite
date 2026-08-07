@@ -203,11 +203,12 @@ use fsqlite_mvcc::{
     InProcessPageLockTable, MvccError, PreparedConcurrentCommit, SharedConcurrentHandle,
     SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEProcessConfig,
     SsiEProcessGate, SsiEProcessSnapshot, SsiEvidenceLedger, VersionStore, concurrent_abort,
-    concurrent_commit_read_only, concurrent_rollback_to_savepoint, concurrent_savepoint,
-    concurrent_track_write_conflict_page, finalize_prepared_concurrent_commit_with_ssi,
-    flat_combining_metrics, morsel_parallel_insert::MorselScheduler,
-    prepare_concurrent_commit_fcw_only, prepare_concurrent_commit_with_ssi,
-    record_registry_commit_lock_hold, record_registry_commit_lock_wait, ssi_metrics_snapshot,
+    concurrent_clear_page_state, concurrent_commit_read_only, concurrent_rollback_to_savepoint,
+    concurrent_savepoint, concurrent_track_write_conflict_page,
+    finalize_prepared_concurrent_commit_with_ssi, flat_combining_metrics,
+    morsel_parallel_insert::MorselScheduler, prepare_concurrent_commit_fcw_only,
+    prepare_concurrent_commit_with_ssi, record_registry_commit_lock_hold,
+    record_registry_commit_lock_wait, ssi_metrics_snapshot,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 #[cfg(feature = "diagnostic-pragmas")]
@@ -611,6 +612,35 @@ fn fire_concurrent_commit_window_hook() {
         FSQLITE_CONCURRENT_COMMIT_WINDOW_HOOK
             .lock()
             .expect("commit-window hook mutex poisoned")
+            .clone()
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Test-only hook fired after the pending-page commit-index precheck and
+/// before page-lock acquisition. A deterministic regression installs a
+/// callback here to publish an intervening commit in the exact FCW window.
+#[cfg(test)]
+static FSQLITE_PENDING_CONFLICT_LOCK_WINDOW_HOOK: Mutex<
+    Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_pending_conflict_lock_window_hook(hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>) {
+    *FSQLITE_PENDING_CONFLICT_LOCK_WINDOW_HOOK
+        .lock()
+        .expect("pending-conflict lock-window hook mutex poisoned") = hook;
+}
+
+#[cfg(test)]
+#[inline]
+fn fire_pending_conflict_lock_window_hook() {
+    let hook = {
+        FSQLITE_PENDING_CONFLICT_LOCK_WINDOW_HOOK
+            .lock()
+            .expect("pending-conflict lock-window hook mutex poisoned")
             .clone()
     };
     if let Some(hook) = hook {
@@ -16667,6 +16697,22 @@ impl Connection {
         let mut last = self.last_local_commit_seq.borrow_mut();
         *last = Some(last.map_or(committed_seq, |existing| existing.max(committed_seq)));
         committed_seq
+    }
+
+    #[inline]
+    fn planned_concurrent_commit_seq(&self) -> CommitSeq {
+        if self.pager.is_memory() {
+            CommitSeq::new(self.next_commit_seq.load(AtomicOrdering::Acquire))
+        } else {
+            // File-backed CommitIndex entries are finalized with the pager/WAL
+            // publication sequence, so planning must use the next value from
+            // that same clock. The shared logical floor can be ahead when a
+            // peer publishes or refreshes first; using it here can make the
+            // prepared frontier greater than the later durable pager identity.
+            // A peer commit that lands after this snapshot only raises the
+            // final pager sequence, which the MVCC finalizer already permits.
+            self.pager.published_snapshot().visible_commit_seq.next()
+        }
     }
 
     #[inline]
@@ -52708,6 +52754,9 @@ impl Connection {
                 });
             }
 
+            #[cfg(test)]
+            fire_pending_conflict_lock_window_hook();
+
             let mut handle = registry.get_mut(session_id).ok_or_else(|| {
                 FrankenError::Internal(
                     "concurrent transaction missing session during pending commit tracking"
@@ -52734,6 +52783,41 @@ impl Connection {
                     page.get()
                 )),
             })?;
+            drop(handle);
+
+            // The initial index check and page-lock acquisition are separate
+            // operations. A peer can publish this page in between them and
+            // release its lock before our try_acquire, so FCW must revalidate
+            // after the lock is ours. Otherwise both transactions can pass
+            // validation against different points in time and the stale writer
+            // can silently overwrite the newer page image.
+            if self
+                .concurrent_commit_index
+                .latest(page)
+                .is_some_and(|seq| seq > snapshot_high)
+            {
+                let mut handle = registry.get_mut(session_id).ok_or_else(|| {
+                    FrankenError::Internal(
+                        "concurrent transaction missing session during stale page-lock cleanup"
+                            .to_owned(),
+                    )
+                })?;
+                concurrent_clear_page_state(
+                    &mut handle,
+                    &self.concurrent_lock_table,
+                    session_id,
+                    page,
+                )
+                .map_err(|error| {
+                    FrankenError::Internal(format!(
+                        "failed to release stale pending commit page {}: {error}",
+                        page.get()
+                    ))
+                })?;
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: page.get().to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -52757,7 +52841,7 @@ impl Connection {
         };
 
         let mut abort_card: Option<SsiDecisionCardDraft> = None;
-        let planned_commit_seq = CommitSeq::new(self.next_commit_seq.load(AtomicOrdering::Acquire));
+        let planned_commit_seq = self.planned_concurrent_commit_seq();
         record_hot_path_count(&FSQLITE_CONCURRENT_COMMIT_PLAN_ATTEMPTS, 1);
         record_hot_path_count(
             &FSQLITE_CONCURRENT_COMMIT_PLAN_PENDING_PAGES,
@@ -165490,6 +165574,16 @@ mod tests {
             .expect("root page should be valid");
 
             let next_commit_seq = Arc::clone(&conn.next_commit_seq);
+            let pager_visible_before_commit = conn.pager.published_snapshot().visible_commit_seq;
+            next_commit_seq.fetch_max(
+                pager_visible_before_commit.get().saturating_add(8),
+                AtomicOrdering::AcqRel,
+            );
+            assert_eq!(
+                conn.planned_concurrent_commit_seq(),
+                pager_visible_before_commit.next(),
+                "file-backed planning must ignore an ahead logical floor and predict from the pager clock"
+            );
             let hook_calls = Arc::new(AtomicUsize::new(0));
             let hook_calls_for_callback = Arc::clone(&hook_calls);
             super::set_concurrent_commit_window_hook(Some(Arc::new(move || {
@@ -165533,6 +165627,54 @@ mod tests {
                 "the finalized logical clock must remain aligned with the durable pager sequence"
             );
             conn.close_without_checkpoint_in_place().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_pending_conflict_page_revalidates_fcw_after_lock_acquisition() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            let page = PageNumber::new(42).unwrap();
+            let mut registry = ConcurrentRegistry::new();
+            let session_id = registry
+                .begin_concurrent(Snapshot::new(CommitSeq::new(5), SchemaEpoch::new(0)))
+                .unwrap();
+
+            let commit_index = Arc::clone(&conn.concurrent_commit_index);
+            super::set_pending_conflict_lock_window_hook(Some(Arc::new(move || {
+                commit_index.update(page, CommitSeq::new(6));
+            })));
+            struct PendingConflictLockWindowHookGuard;
+            impl Drop for PendingConflictLockWindowHookGuard {
+                fn drop(&mut self) {
+                    super::set_pending_conflict_lock_window_hook(None);
+                }
+            }
+            let hook_guard = PendingConflictLockWindowHookGuard;
+
+            let error = conn
+                .track_pending_conflict_pages_with_registry(&registry, session_id, &[page])
+                .unwrap_err();
+            drop(hook_guard);
+
+            assert!(
+                matches!(
+                    error,
+                    FrankenError::BusySnapshot { ref conflicting_pages }
+                        if conflicting_pages == "42"
+                ),
+                "the stale writer must fail FCW after acquiring the page lock: {error}"
+            );
+            let handle = registry.get(session_id).unwrap();
+            assert!(
+                !handle.tracks_write_conflict_page(page),
+                "the rejected pending page must not remain in the write-conflict surface"
+            );
+            assert!(
+                !handle.holds_page_lock(page),
+                "the rejected pending page must release its newly acquired lock"
+            );
         });
     }
 
