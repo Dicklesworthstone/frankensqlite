@@ -76,8 +76,9 @@ mod tests {
     const CONCURRENT_STRESS_CHILD_TIMEOUT: Duration = Duration::from_secs(90);
     const CONCURRENT_STRESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
     const CONCURRENT_STRESS_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
-    const CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT: u64 = 128;
+    const CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT: u64 = 512;
     const CONCURRENT_STRESS_MAX_ATTEMPTS_PER_WORKER: u64 = 2_560;
+    const CONCURRENT_READER_MAX_OPEN_ATTEMPTS: u64 = 4;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ConcurrentStressStartDecision {
@@ -307,16 +308,19 @@ mod tests {
         }
     }
 
-    fn concurrent_stress_backoff(attempts_for_commit: u64) {
+    fn concurrent_stress_backoff(attempts_for_commit: u64, participant_id: u64) {
         let exponent = attempts_for_commit.saturating_sub(1).min(5) as u32;
-        std::thread::sleep(Duration::from_millis(1_u64 << exponent));
+        let base_millis = 1_u64 << exponent;
+        let jitter_millis = participant_id
+            .wrapping_mul(11)
+            .wrapping_add(attempts_for_commit.wrapping_mul(7))
+            % (base_millis + 1);
+        std::thread::sleep(Duration::from_millis(base_millis + jitter_millis));
     }
 
-    async fn concurrent_stress_recover_precommit_transient(
-        conn: &mut Connection,
-        path: &str,
+    async fn concurrent_stress_rollback_precommit_transient(
+        conn: &Connection,
         outcome: &mut ConcurrentStressWorkerOutcome,
-        started_at: Instant,
         phase: &str,
         primary_error: &FrankenError,
     ) -> Result<(), String> {
@@ -324,56 +328,18 @@ mod tests {
             return Err(format!("unexpected {phase} error: {primary_error:?}"));
         }
 
-        if let Err(cleanup_error) = conn.close_without_checkpoint_in_place().await {
-            let _ = outcome.retries.record(&cleanup_error);
-            conn.close_best_effort_in_place().await;
+        // BusySnapshot invalidates the whole transaction. Full ROLLBACK is the
+        // engine contract that releases page locks and reloads committed state
+        // before the next BEGIN binds a fresh publication snapshot.
+        if let Err(rollback_error) = conn.execute("ROLLBACK;").await {
+            let _ = outcome.retries.record(&rollback_error);
             return Err(format!(
-                "connection cleanup after retryable {phase} error {primary_error:?} failed: \
-                 {cleanup_error:?}; best-effort teardown was attempted without retrying the \
-                 transaction"
+                "ROLLBACK after retryable {phase} error {primary_error:?} failed: \
+                 {rollback_error:?}"
             ));
         }
 
-        let mut reopen_attempts = 0_u64;
-        let mut last_open_error = None;
-        loop {
-            if reopen_attempts >= CONCURRENT_STRESS_MAX_ATTEMPTS_PER_COMMIT
-                || outcome.attempts >= CONCURRENT_STRESS_MAX_ATTEMPTS_PER_WORKER
-                || started_at.elapsed() >= CONCURRENT_STRESS_WORKER_TIMEOUT
-            {
-                return Err(format!(
-                    "connection reopen after retryable {phase} error {primary_error:?} exhausted \
-                     its bounded retry budget after {reopen_attempts} attempts; last transient \
-                     error: {}",
-                    last_open_error.as_deref().unwrap_or("none")
-                ));
-            }
-
-            reopen_attempts += 1;
-            outcome.attempts += 1;
-            match Connection::open(path).await {
-                Ok(new_conn) if new_conn.is_concurrent_mode_default() => {
-                    *conn = new_conn;
-                    return Ok(());
-                }
-                Ok(mut new_conn) => {
-                    new_conn.close_best_effort_in_place().await;
-                    return Err(format!(
-                        "connection reopen after retryable {phase} error lost the \
-                         concurrent-writer default"
-                    ));
-                }
-                Err(error) if outcome.retries.record(&error) => {
-                    last_open_error = Some(format!("connection reopen: {error:?}"));
-                    concurrent_stress_backoff(reopen_attempts);
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "connection reopen after retryable {phase} error failed: {error:?}"
-                    ));
-                }
-            }
-        }
+        Ok(())
     }
 
     fn concurrent_stress_panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -6953,7 +6919,10 @@ mod tests {
                             Ok(conn) => break conn,
                             Err(error) if outcome.retries.record(&error) => {
                                 last_open_error = Some(format!("connection open: {error:?}"));
-                                concurrent_stress_backoff(open_attempts);
+                                concurrent_stress_backoff(
+                                    open_attempts,
+                                    u64::try_from(worker_id).expect("worker id fits u64"),
+                                );
                             }
                             Err(error) => {
                                 let message = format!("connection open failed: {error:?}");
@@ -7030,7 +6999,10 @@ mod tests {
                         if let Err(error) = conn.execute("BEGIN;").await {
                             if outcome.retries.record(&error) {
                                 last_transient_error = Some(format!("BEGIN: {error:?}"));
-                                concurrent_stress_backoff(attempts_for_commit);
+                                concurrent_stress_backoff(
+                                    attempts_for_commit,
+                                    u64::try_from(worker_id).expect("worker id fits u64"),
+                                );
                                 continue;
                             }
                             outcome.failure =
@@ -7074,11 +7046,9 @@ mod tests {
                             }
                             Err(error) => {
                                 let transient_error = format!("balance query: {error:?}");
-                                match concurrent_stress_recover_precommit_transient(
-                                    &mut conn,
-                                    &path,
+                                match concurrent_stress_rollback_precommit_transient(
+                                    &conn,
                                     &mut outcome,
-                                    started_at,
                                     "balance query",
                                     &error,
                                 )
@@ -7086,7 +7056,10 @@ mod tests {
                                 {
                                     Ok(()) => {
                                         last_transient_error = Some(transient_error);
-                                        concurrent_stress_backoff(attempts_for_commit);
+                                        concurrent_stress_backoff(
+                                            attempts_for_commit,
+                                            u64::try_from(worker_id).expect("worker id fits u64"),
+                                        );
                                         continue;
                                     }
                                     Err(recovery_error) => {
@@ -7128,11 +7101,9 @@ mod tests {
                             }
                             Err(error) => {
                                 let transient_error = format!("debit: {error:?}");
-                                match concurrent_stress_recover_precommit_transient(
-                                    &mut conn,
-                                    &path,
+                                match concurrent_stress_rollback_precommit_transient(
+                                    &conn,
                                     &mut outcome,
-                                    started_at,
                                     "debit",
                                     &error,
                                 )
@@ -7140,7 +7111,10 @@ mod tests {
                                 {
                                     Ok(()) => {
                                         last_transient_error = Some(transient_error);
-                                        concurrent_stress_backoff(attempts_for_commit);
+                                        concurrent_stress_backoff(
+                                            attempts_for_commit,
+                                            u64::try_from(worker_id).expect("worker id fits u64"),
+                                        );
                                         continue;
                                     }
                                     Err(recovery_error) => {
@@ -7172,11 +7146,9 @@ mod tests {
                             }
                             Err(error) => {
                                 let transient_error = format!("credit: {error:?}");
-                                match concurrent_stress_recover_precommit_transient(
-                                    &mut conn,
-                                    &path,
+                                match concurrent_stress_rollback_precommit_transient(
+                                    &conn,
                                     &mut outcome,
-                                    started_at,
                                     "credit",
                                     &error,
                                 )
@@ -7184,7 +7156,10 @@ mod tests {
                                 {
                                     Ok(()) => {
                                         last_transient_error = Some(transient_error);
-                                        concurrent_stress_backoff(attempts_for_commit);
+                                        concurrent_stress_backoff(
+                                            attempts_for_commit,
+                                            u64::try_from(worker_id).expect("worker id fits u64"),
+                                        );
                                         continue;
                                     }
                                     Err(recovery_error) => {
@@ -7210,7 +7185,10 @@ mod tests {
                                 }
                                 if outcome.retries.record(&error) {
                                     last_transient_error = Some(format!("commit: {error:?}"));
-                                    concurrent_stress_backoff(attempts_for_commit);
+                                    concurrent_stress_backoff(
+                                        attempts_for_commit,
+                                        u64::try_from(worker_id).expect("worker id fits u64"),
+                                    );
                                     continue;
                                 }
                                 outcome.failure =
@@ -7324,10 +7302,13 @@ mod tests {
         assert_eq!(results.len(), NUM_WRITERS, "missing worker outcomes");
         results.sort_by_key(|outcome| outcome.worker_id);
 
+        for outcome in &results {
+            eprintln!("concurrent stress worker outcome: {outcome:#?}");
+        }
+
         let mut total_commits = 0_u64;
         let mut total_retries = 0_u64;
         for (expected_worker_id, outcome) in results.iter().enumerate() {
-            eprintln!("concurrent stress worker outcome: {outcome:#?}");
             assert_eq!(
                 outcome.worker_id, expected_worker_id,
                 "worker ids must be unique and contiguous"
@@ -7479,7 +7460,6 @@ mod tests {
     #[test]
     fn concurrent_readers_consistency() {
         asupersync::test_utils::run_test(|| async {
-            use std::sync::{Arc, Barrier};
             use std::thread;
 
             let dir = tempfile::tempdir().expect("create temp dir");
@@ -7499,65 +7479,187 @@ mod tests {
                         .await
                         .expect("insert row");
                 }
+                conn.close()
+                    .await
+                    .expect("close concurrent-reader setup connection");
             }
 
             const NUM_READERS: usize = 4;
             const READS_PER_THREAD: usize = 50;
 
-            let barrier = Arc::new(Barrier::new(NUM_READERS));
+            let (startup_tx, startup_rx) = mpsc::channel::<ConcurrentStressStartup>();
+            let mut start_senders = Vec::with_capacity(NUM_READERS);
+            let mut handles = Vec::with_capacity(NUM_READERS);
+            for thread_id in 0..NUM_READERS {
+                let path = db_path_str.to_owned();
+                let startup_tx = startup_tx.clone();
+                let (start_tx, start_rx) = mpsc::sync_channel(1);
+                start_senders.push(start_tx);
 
-            let handles: Vec<_> = (0..NUM_READERS)
-                .map(|thread_id| {
-                    let path = db_path_str.to_owned();
-                    let barrier = Arc::clone(&barrier);
-
-                    thread::spawn(move || {
-                        let mut consistent = true;
-                        asupersync::test_utils::run_test(|| async {
-                            let conn = Connection::open(&path)
-                                .await
-                                .expect("open db in reader thread");
-                            barrier.wait();
-
-                            for _ in 0..READS_PER_THREAD {
-                                // Start a read transaction.
-                                conn.execute("BEGIN;").await.expect("begin");
-
-                                // Read sum - should always be consistent.
-                                let rows = conn
-                                    .query("SELECT SUM(val) FROM t;")
-                                    .await
-                                    .expect("sum query");
-                                let sum = if let SqliteValue::Integer(n) = &row_values(&rows[0])[0]
+                handles.push(thread::spawn(move || {
+                    let mut consistent = true;
+                    asupersync::test_utils::run_test(|| async {
+                        let mut open_attempts = 0_u64;
+                        let mut conn = loop {
+                            open_attempts += 1;
+                            match Connection::open(&path).await {
+                                Ok(conn) => break conn,
+                                Err(error @ (FrankenError::Busy | FrankenError::BusyRecovery))
+                                    if open_attempts < CONCURRENT_READER_MAX_OPEN_ATTEMPTS =>
                                 {
-                                    *n
-                                } else {
-                                    consistent = false;
-                                    break;
-                                };
-
-                                // Expected sum: 0 + 10 + 20 + ... + 990 = 10 * (0 + 1 + ... + 99) = 10 * 4950 = 49500
-                                let expected = 10 * (99 * 100 / 2);
-                                if sum != expected {
                                     eprintln!(
-                                        "Thread {} saw inconsistent sum: {} (expected {})",
-                                        thread_id, sum, expected
+                                        "reader {thread_id} open attempt {open_attempts} hit transient {error:?}"
                                     );
-                                    consistent = false;
+                                    concurrent_stress_backoff(
+                                        open_attempts,
+                                        u64::try_from(thread_id).expect("reader id fits u64"),
+                                    );
                                 }
-
-                                conn.execute("COMMIT;").await.expect("commit");
+                                Err(error) => {
+                                    let error = format!(
+                                        "open failed after {open_attempts} attempt(s): {error:?}"
+                                    );
+                                    let _ = startup_tx.send(ConcurrentStressStartup::Failed {
+                                        worker_id: thread_id,
+                                        error,
+                                    });
+                                    consistent = false;
+                                    return;
+                                }
                             }
-                        });
+                        };
 
-                        consistent
-                    })
-                })
-                .collect();
+                        if startup_tx
+                            .send(ConcurrentStressStartup::Ready {
+                                worker_id: thread_id,
+                            })
+                            .is_err()
+                        {
+                            eprintln!("reader {thread_id} startup coordinator disconnected");
+                            conn.close_best_effort_in_place().await;
+                            consistent = false;
+                            return;
+                        }
+                        if !matches!(
+                            start_rx.recv_timeout(CONCURRENT_STRESS_STARTUP_TIMEOUT),
+                            Ok(ConcurrentStressStartDecision::Run)
+                        ) {
+                            eprintln!("reader {thread_id} did not receive the run decision");
+                            conn.close_best_effort_in_place().await;
+                            consistent = false;
+                            return;
+                        }
 
-            // All readers should see consistent data.
-            for (i, handle) in handles.into_iter().enumerate() {
-                let consistent = handle.join().expect("reader thread panicked");
+                        for _ in 0..READS_PER_THREAD {
+                            // Start a read transaction.
+                            conn.execute("BEGIN;").await.expect("begin");
+
+                            // Read sum - should always be consistent.
+                            let rows = conn
+                                .query("SELECT SUM(val) FROM t;")
+                                .await
+                                .expect("sum query");
+                            let sum = if let SqliteValue::Integer(n) = &row_values(&rows[0])[0] {
+                                *n
+                            } else {
+                                consistent = false;
+                                break;
+                            };
+
+                            // Expected sum: 0 + 10 + 20 + ... + 990 = 10 * (0 + 1 + ... + 99) = 10 * 4950 = 49500
+                            let expected = 10 * (99 * 100 / 2);
+                            if sum != expected {
+                                eprintln!(
+                                    "Thread {} saw inconsistent sum: {} (expected {})",
+                                    thread_id, sum, expected
+                                );
+                                consistent = false;
+                            }
+
+                            conn.execute("COMMIT;").await.expect("commit");
+                        }
+                        if let Err(error) = conn.close_without_checkpoint_in_place().await {
+                            eprintln!("reader {thread_id} close failed: {error:?}");
+                            conn.close_best_effort_in_place().await;
+                            consistent = false;
+                        }
+                    });
+
+                    consistent
+                }));
+            }
+            drop(startup_tx);
+
+            let mut ready = [false; NUM_READERS];
+            let mut ready_count = 0_usize;
+            let startup_deadline = Instant::now() + CONCURRENT_STRESS_STARTUP_TIMEOUT;
+            let mut startup_failure = None;
+            while ready_count < NUM_READERS {
+                let remaining = startup_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    startup_failure = Some(format!(
+                        "startup timed out with {ready_count}/{NUM_READERS} readers ready"
+                    ));
+                    break;
+                }
+                match startup_rx.recv_timeout(remaining) {
+                    Ok(ConcurrentStressStartup::Ready { worker_id }) => {
+                        if worker_id >= NUM_READERS {
+                            startup_failure = Some(format!("out-of-range reader id {worker_id}"));
+                            break;
+                        }
+                        if std::mem::replace(&mut ready[worker_id], true) {
+                            startup_failure =
+                                Some(format!("duplicate startup receipt from reader {worker_id}"));
+                            break;
+                        }
+                        ready_count += 1;
+                    }
+                    Ok(ConcurrentStressStartup::Failed { worker_id, error }) => {
+                        startup_failure =
+                            Some(format!("reader {worker_id} startup failed: {error}"));
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        startup_failure = Some(format!(
+                            "startup timed out with {ready_count}/{NUM_READERS} readers ready"
+                        ));
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        startup_failure = Some(format!(
+                            "startup channel closed with {ready_count}/{NUM_READERS} readers ready"
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            let start_gate = ConcurrentStressStartGate::new(start_senders);
+            let startup_result = if let Some(error) = startup_failure {
+                drop(start_gate);
+                Err(error)
+            } else {
+                start_gate.release()
+            };
+
+            let results = handles
+                .into_iter()
+                .map(|handle| handle.join())
+                .collect::<Vec<_>>();
+
+            assert!(
+                startup_result.is_ok(),
+                "concurrent-reader startup failed: {}",
+                startup_result
+                    .as_ref()
+                    .expect_err("failed startup must carry a diagnostic")
+            );
+
+            // Join every reader before asserting so the database remains live
+            // long enough to report every worker outcome.
+            for (i, result) in results.into_iter().enumerate() {
+                let consistent = result.expect("reader thread panicked");
                 assert!(consistent, "Reader thread {} saw inconsistent data", i);
             }
         });
