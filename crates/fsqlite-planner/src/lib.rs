@@ -14257,7 +14257,7 @@ mod tests {
                 expected_cost = path.estimated_cost;
                 cumulative_rows = path.estimated_rows;
             } else {
-                expected_cost += path.estimated_cost * cumulative_rows;
+                expected_cost = path.estimated_cost.mul_add(cumulative_rows, expected_cost);
                 cumulative_rows *= path.estimated_rows;
             }
         }

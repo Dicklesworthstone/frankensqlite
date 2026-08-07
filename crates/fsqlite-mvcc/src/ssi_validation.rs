@@ -3080,67 +3080,74 @@ mod tests {
 
     #[test]
     fn test_evidence_metrics_count_by_outcome() {
-        let before = ssi_evidence_metrics_snapshot();
+        with_ssi_evidence_test_config(
+            SsiEvidenceRecordingMode::CompactCommit,
+            SsiEvidenceBudgetConfig::default(),
+            || {
+                let before = ssi_evidence_metrics_snapshot();
 
-        let commit_txn = TxnToken::new(TxnId::new(90_001).unwrap(), TxnEpoch::new(0));
-        let commit_result = ssi_validate_and_publish(
-            commit_txn,
-            CommitSeq::new(1),
-            CommitSeq::new(2),
-            &[page_key(500)],
-            &[page_key(600)],
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-        );
-        let commit_ok = commit_result.expect("commit decision should be recorded");
+                let commit_txn = TxnToken::new(TxnId::new(90_001).unwrap(), TxnEpoch::new(0));
+                let commit_result = ssi_validate_and_publish(
+                    commit_txn,
+                    CommitSeq::new(1),
+                    CommitSeq::new(2),
+                    &[page_key(500)],
+                    &[page_key(600)],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                );
+                let commit_ok = commit_result.expect("commit decision should be recorded");
 
-        let abort_txn = TxnToken::new(TxnId::new(90_002).unwrap(), TxnEpoch::new(0));
-        let _reader = MockActiveTxn::new(90_003, 0, 1).with_reads(vec![page_key(700)]);
-        let _writer = MockActiveTxn::new(90_004, 0, 1).with_writes(vec![page_key(800)]);
+                let abort_txn = TxnToken::new(TxnId::new(90_002).unwrap(), TxnEpoch::new(0));
+                let _reader = MockActiveTxn::new(90_003, 0, 1).with_reads(vec![page_key(700)]);
+                let _writer = MockActiveTxn::new(90_004, 0, 1).with_writes(vec![page_key(800)]);
 
-        let _readers = vec![CommittedReaderInfo {
-            token: TxnToken::new(TxnId::new(90_003).unwrap(), TxnEpoch::new(0)),
-            begin_seq: CommitSeq::new(0),
-            commit_seq: CommitSeq::new(1),
-            had_in_rw: commit_ok.ssi_state.has_in_rw,
-            keys: vec![page_key(700)],
-        }];
+                let _readers = vec![CommittedReaderInfo {
+                    token: TxnToken::new(TxnId::new(90_003).unwrap(), TxnEpoch::new(0)),
+                    begin_seq: CommitSeq::new(0),
+                    commit_seq: CommitSeq::new(1),
+                    had_in_rw: commit_ok.ssi_state.has_in_rw,
+                    keys: vec![page_key(700)],
+                }];
 
-        let _writers = vec![CommittedWriterInfo {
-            token: TxnToken::new(TxnId::new(90_004).unwrap(), TxnEpoch::new(0)),
-            commit_seq: CommitSeq::new(2),
-            had_out_rw: commit_ok.ssi_state.has_out_rw,
-            keys: vec![page_key(800)],
-        }];
+                let _writers = vec![CommittedWriterInfo {
+                    token: TxnToken::new(TxnId::new(90_004).unwrap(), TxnEpoch::new(0)),
+                    commit_seq: CommitSeq::new(2),
+                    had_out_rw: commit_ok.ssi_state.has_out_rw,
+                    keys: vec![page_key(800)],
+                }];
 
-        let abort_result = ssi_validate_and_publish(
-            abort_txn,
-            CommitSeq::new(1),
-            CommitSeq::new(3),
-            &[page_key(800)],
-            &[page_key(700)],
-            &[&_reader],
-            &[&_writer],
-            &_readers,
-            &_writers,
-            false,
-        );
-        abort_result.expect_err("pivot abort should be recorded");
+                let abort_result = ssi_validate_and_publish(
+                    abort_txn,
+                    CommitSeq::new(1),
+                    CommitSeq::new(3),
+                    &[page_key(800)],
+                    &[page_key(700)],
+                    &[&_reader],
+                    &[&_writer],
+                    &_readers,
+                    &_writers,
+                    false,
+                );
+                abort_result.expect_err("pivot abort should be recorded");
 
-        let after = ssi_evidence_metrics_snapshot();
-        assert!(
-            after.fsqlite_evidence_records_total_commit
-                > before.fsqlite_evidence_records_total_commit
-        );
-        assert!(
-            after.fsqlite_evidence_records_total_abort
-                > before.fsqlite_evidence_records_total_abort
-        );
-        assert!(
-            after.fsqlite_evidence_records_total() >= before.fsqlite_evidence_records_total() + 2
+                let after = ssi_evidence_metrics_snapshot();
+                assert!(
+                    after.fsqlite_evidence_records_total_commit
+                        > before.fsqlite_evidence_records_total_commit
+                );
+                assert!(
+                    after.fsqlite_evidence_records_total_abort
+                        > before.fsqlite_evidence_records_total_abort
+                );
+                assert!(
+                    after.fsqlite_evidence_records_total()
+                        >= before.fsqlite_evidence_records_total() + 2
+                );
+            },
         );
     }
 
