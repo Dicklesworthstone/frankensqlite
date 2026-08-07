@@ -205,6 +205,17 @@ struct ReceiptManifestBinding {
     manifest_sha256: String,
 }
 
+struct ReceiptProvenance<'a> {
+    schema: &'a str,
+    baseline_source_commit: &'a str,
+    tested_source_commit: &'a str,
+    policy_sha256: &'a str,
+    policy_id: &'a str,
+    policy_version: &'a str,
+    manifest_bindings: &'a [ReceiptManifestBinding],
+    confidence_method: &'a str,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CalibrationOutcome {
@@ -551,38 +562,32 @@ fn validate_profile_artifacts(
 }
 
 fn validate_receipt_provenance(
-    receipt_schema: &str,
-    baseline_source_commit: &str,
-    tested_source_commit: &str,
-    policy_sha256: &str,
-    policy_id: &str,
-    policy_version: &str,
-    manifest_bindings: &[ReceiptManifestBinding],
-    confidence_method: &str,
+    receipt: ReceiptProvenance<'_>,
     expected_schema: &str,
     pack: &PerformanceAdmissionPack,
     policy: &AdmissionPolicy,
     label: &str,
 ) -> Result<(), String> {
-    if receipt_schema != expected_schema
-        || baseline_source_commit != pack.baseline.source_commit
-        || tested_source_commit != pack.tested.source_commit
-        || policy_sha256 != pack.policy.sha256
-        || policy_id != policy.policy_id
-        || policy_version != policy.policy_version
-        || confidence_method != policy.confidence_method
+    if receipt.schema != expected_schema
+        || receipt.baseline_source_commit != pack.baseline.source_commit
+        || receipt.tested_source_commit != pack.tested.source_commit
+        || receipt.policy_sha256 != pack.policy.sha256
+        || receipt.policy_id != policy.policy_id
+        || receipt.policy_version != policy.policy_version
+        || receipt.confidence_method != policy.confidence_method
     {
         return Err(format!(
             "{label} is not bound to the B/T source commits, policy, and confidence method"
         ));
     }
     let expected = expected_receipt_manifest_bindings(pack);
-    if manifest_bindings.len() != expected.len() {
+    if receipt.manifest_bindings.len() != expected.len() {
         return Err(format!(
             "{label} manifest provenance bindings must be unique and complete"
         ));
     }
-    let actual = manifest_bindings
+    let actual = receipt
+        .manifest_bindings
         .iter()
         .map(|binding| {
             (
@@ -611,14 +616,16 @@ fn validate_calibration_receipt(
     let receipt: CalibrationReceipt = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{label} is not a typed v2 receipt: {error}"))?;
     validate_receipt_provenance(
-        &receipt.schema_version,
-        &receipt.baseline_source_commit,
-        &receipt.tested_source_commit,
-        &receipt.policy_sha256,
-        &receipt.policy_id,
-        &receipt.policy_version,
-        &receipt.manifest_bindings,
-        &receipt.confidence_method,
+        ReceiptProvenance {
+            schema: &receipt.schema_version,
+            baseline_source_commit: &receipt.baseline_source_commit,
+            tested_source_commit: &receipt.tested_source_commit,
+            policy_sha256: &receipt.policy_sha256,
+            policy_id: &receipt.policy_id,
+            policy_version: &receipt.policy_version,
+            manifest_bindings: &receipt.manifest_bindings,
+            confidence_method: &receipt.confidence_method,
+        },
         CALIBRATION_RECEIPT_SCHEMA_V1,
         pack,
         policy,
@@ -655,14 +662,16 @@ fn validate_sensitivity_receipt(
     let receipt: SensitivityReceipt = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{label} is not a typed v2 receipt: {error}"))?;
     validate_receipt_provenance(
-        &receipt.schema_version,
-        &receipt.baseline_source_commit,
-        &receipt.tested_source_commit,
-        &receipt.policy_sha256,
-        &receipt.policy_id,
-        &receipt.policy_version,
-        &receipt.manifest_bindings,
-        &receipt.confidence_method,
+        ReceiptProvenance {
+            schema: &receipt.schema_version,
+            baseline_source_commit: &receipt.baseline_source_commit,
+            tested_source_commit: &receipt.tested_source_commit,
+            policy_sha256: &receipt.policy_sha256,
+            policy_id: &receipt.policy_id,
+            policy_version: &receipt.policy_version,
+            manifest_bindings: &receipt.manifest_bindings,
+            confidence_method: &receipt.confidence_method,
+        },
         SENSITIVITY_RECEIPT_SCHEMA_V1,
         pack,
         policy,
@@ -674,7 +683,7 @@ fn validate_sensitivity_receipt(
         let regressions =
             validate_sensitivity_observations(&outcome.observations, policy, rule, label)?;
         let lower = confidence_bound(&regressions, rule.confidence_level, BoundSide::Lower)?;
-        if lower < (1.0 + policy.sensitivity_injected_slowdown_minimum).ln() {
+        if lower < policy.sensitivity_injected_slowdown_minimum.ln_1p() {
             return Err(format!(
                 "sensitivity perturbation was not detected for {}/{}/{}",
                 key.0, key.1, key.2
@@ -736,7 +745,7 @@ fn evaluate_profile_measurements(
             )?);
         }
         let upper = confidence_bound(&regressions, rule.confidence_level, BoundSide::Upper)?;
-        if upper > (1.0 + rule.max_regression_fraction).ln() {
+        if upper > rule.max_regression_fraction.ln_1p() {
             return Err(format!(
                 "measured regression exceeds policy for {profile} {}/{}",
                 key.0, key.1
@@ -1021,8 +1030,8 @@ fn confidence_bound(values: &[f64], confidence_level: f64, side: BoundSide) -> R
         format!("unsupported confidence level {confidence_level} for {CONFIDENCE_METHOD_V1}")
     })?;
     Ok(match side {
-        BoundSide::Lower => mean - critical * standard_error,
-        BoundSide::Upper => mean + critical * standard_error,
+        BoundSide::Lower => critical.mul_add(-standard_error, mean),
+        BoundSide::Upper => critical.mul_add(standard_error, mean),
     })
 }
 
@@ -1849,7 +1858,7 @@ mod tests {
         assert!(
             super::confidence_bound(&regressions, rule.confidence_level, super::BoundSide::Lower,)
                 .expect("sensitivity confidence bound")
-                < (1.0 + policy.sensitivity_injected_slowdown_minimum).ln(),
+                < policy.sensitivity_injected_slowdown_minimum.ln_1p(),
             "undetected perturbation is derived from values"
         );
     }

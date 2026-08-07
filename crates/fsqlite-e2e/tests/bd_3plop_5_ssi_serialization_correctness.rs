@@ -189,6 +189,27 @@ fn ssi_serialization_correctness_single_writer_smoke() {
 }
 
 #[test]
+fn rollback_required_ignores_failed_begin_state() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = fsqlite::Connection::open(":memory:")
+            .await
+            .expect("open rollback-state fixture");
+
+        rollback_required(&conn)
+            .await
+            .expect("a failed BEGIN leaves no transaction to roll back");
+        conn.execute("BEGIN CONCURRENT;")
+            .await
+            .expect("begin rollback-state fixture transaction");
+        assert!(conn.in_transaction());
+        rollback_required(&conn)
+            .await
+            .expect("an active transaction must roll back");
+        assert!(!conn.in_transaction());
+    });
+}
+
+#[test]
 #[ignore = "long-running stress profile for bd-3plop.5 acceptance envelope"]
 fn ssi_serialization_correctness_stress_profile() {
     asupersync::test_utils::run_test(|| async {
@@ -736,6 +757,9 @@ async fn open_worker_connection(db_path: &Path) -> Result<fsqlite::Connection, F
 }
 
 async fn rollback_required(conn: &fsqlite::Connection) -> Result<(), FrankenError> {
+    if !conn.in_transaction() {
+        return Ok(());
+    }
     conn.execute("ROLLBACK;").await.map(|_| ())
 }
 

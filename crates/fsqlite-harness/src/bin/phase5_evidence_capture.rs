@@ -1879,10 +1879,12 @@ fn identities_from_run(root: &Path, run: &RunEvidence) -> Result<Vec<InventoryId
 }
 
 fn cargo_target_section(line: &str) -> Option<&str> {
-    if let Some(section) = line.strip_prefix("     Running ") {
-        if !section.is_empty() && section.contains(" (") && section.ends_with(')') {
-            return Some(section);
-        }
+    if let Some(section) = line.strip_prefix("     Running ")
+        && !section.is_empty()
+        && section.contains(" (")
+        && section.ends_with(')')
+    {
+        return Some(section);
     }
     let section = line.strip_prefix("   Doc-tests ")?;
     (!section.trim().is_empty() && section == section.trim_end()).then_some(section)
@@ -2557,9 +2559,9 @@ fn validate_persistent_citation_receipt(
     }
     if citation.build.profile != expected_profile.receipt_name()
         || citation.build.expected_opt_level != expected_profile.expected_opt_level()
-        || citation.build.rustflags.RUSTFLAGS != ""
-        || citation.build.rustflags.CARGO_ENCODED_RUSTFLAGS != ""
-        || citation.build.rustflags.CARGO_BUILD_RUSTFLAGS != ""
+        || !citation.build.rustflags.RUSTFLAGS.is_empty()
+        || !citation.build.rustflags.CARGO_ENCODED_RUSTFLAGS.is_empty()
+        || !citation.build.rustflags.CARGO_BUILD_RUSTFLAGS.is_empty()
         || citation.build.rustflags.policy != RUSTFLAGS_POLICY
         || !canonical_sha256(&citation.build.nonce)
         || citation.rch.actual_worker.trim().is_empty()
@@ -2576,13 +2578,20 @@ fn validate_persistent_citation_receipt(
     if citation.workload.benchmark != "persistent_concurrent_write_{1,8,16}t"
         || citation.workload.rows_per_thread != 1000
         || citation.workload.synchronous != "NORMAL"
-        || citation.workload.threads.as_slice() != &[1, 8, 16]
+        || citation.workload.threads.as_slice() != [1, 8, 16]
         || citation.workload.criterion.sample_size == 0
         || citation.workload.criterion.warmup_secs == 0
         || citation.workload.criterion.measurement_secs == 0
-        || citation.workload.criterion.export_root != "{phase}/criterion_measurements"
+        || citation.workload.criterion.export_root != concat!("{", "phase}/criterion_measurements")
         || citation.workload.criterion.headline_source
-            != "{phase}/criterion_measurements/{label}/{engine}/base/estimates.json"
+            != concat!(
+                "{",
+                "phase}/criterion_measurements/",
+                "{",
+                "label}/",
+                "{",
+                "engine}/base/estimates.json"
+            )
     {
         return Err(
             "persistent citation receipt does not retain the fixed release workload contract"
