@@ -356,6 +356,56 @@ fn frankensqlite_written_fts5_is_canonical_to_stock_sqlite() {
         // Everything below runs on stock SQLite (rusqlite, bundled).
         let stock = StockConnection::open(&db_path).expect("stock open of FrankenSQLite file");
 
+        // Compare the durable postings themselves, including column and token
+        // offsets, with a stock-built reference table. This turns an otherwise
+        // opaque FTS5 checksum failure into the exact term-level contract and
+        // catches tokenizer drift (for example `porter` must store `title` as
+        // `titl`) without replacing the integrity check below.
+        stock
+            .execute_batch(
+                "CREATE VIRTUAL TABLE temp.actual_vocab \
+                 USING fts5vocab(fts_messages, instance);",
+            )
+            .expect("stock could not expose FrankenSQLite-written FTS5 postings");
+        let reference = StockConnection::open_in_memory().expect("stock reference open");
+        reference
+            .execute_batch(
+                "CREATE VIRTUAL TABLE fts_messages USING fts5(\
+                     content, title, tokenize='porter'\
+                 );
+                 INSERT INTO fts_messages(content, title) VALUES
+                     ('the quick brown fox', 'first title'),
+                     ('jumps over the lazy dog', 'second title');
+                 CREATE VIRTUAL TABLE temp.reference_vocab
+                     USING fts5vocab(fts_messages, instance);",
+            )
+            .expect("build stock FTS5 reference postings");
+        let read_vocab = |conn: &StockConnection, table: &str| {
+            let mut statement = conn
+                .prepare(&format!(
+                    "SELECT term, doc, col, offset FROM {table} \
+                     ORDER BY term, doc, col, offset"
+                ))
+                .expect("prepare stock fts5vocab scan");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .expect("scan stock fts5vocab rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("decode stock fts5vocab rows")
+        };
+        assert_eq!(
+            read_vocab(&stock, "actual_vocab"),
+            read_vocab(&reference, "reference_vocab"),
+            "GH#300: durable term/rowid/column/offset postings must match stock SQLite"
+        );
+
         // 1. Both key-structured shadows must declare WITHOUT ROWID.
         //
         //    Each schema is read with its own static-message `expect` rather

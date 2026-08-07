@@ -3725,33 +3725,35 @@ impl Fts5Tokenizer for PorterTokenizer {
     }
 }
 
-/// Simplified Porter stemmer (covers common English suffixes).
+/// Porter stemmer compatible with SQLite's built-in FTS5 porter tokenizer.
 fn porter_stem(word: &str) -> String {
+    if word.len() > FTS5_PORTER_MAX_TOKEN || word.len() < 3 {
+        return word.to_owned();
+    }
+
     let mut s = word.to_owned();
 
     // Step 1a: plurals
-    if let Some(base) = s.strip_suffix("sses") {
-        s = format!("{base}ss");
-    } else if let Some(base) = s.strip_suffix("ies") {
-        s = format!("{base}i");
-    } else if s.ends_with('s') && !s.ends_with("ss") && s.len() > 3 {
+    if s.ends_with("sses") || s.ends_with("ies") {
+        s.truncate(s.len() - 2);
+    } else if s.ends_with('s') && !s.ends_with("ss") {
         s.pop();
     }
 
     // Step 1b: -ed, -ing
     if let Some(base) = s.strip_suffix("eed") {
-        if base.len() > 1 {
-            s = format!("{base}ee");
+        if measure(base) > 0 {
+            s.truncate(s.len() - 1);
         }
     } else if let Some(base) = s.strip_suffix("ed") {
         if contains_vowel(base) {
-            s = base.to_owned();
+            s.truncate(base.len());
             step1b_fixup(&mut s);
         }
     } else if let Some(base) = s.strip_suffix("ing")
         && contains_vowel(base)
     {
-        s = base.to_owned();
+        s.truncate(base.len());
         step1b_fixup(&mut s);
     }
 
@@ -3766,6 +3768,24 @@ fn porter_stem(word: &str) -> String {
 
     // Step 3: more suffixes
     apply_step3(&mut s);
+
+    // Step 4: strip suffixes only from stems with m > 1.
+    apply_step4(&mut s);
+
+    // Step 5a: remove terminal e for m > 1, or m == 1 unless the stem is CVC.
+    if let Some(base) = s.strip_suffix('e')
+        && (measure(base) > 1 || (measure(base) == 1 && !porter_ends_with_cvc(base)))
+    {
+        s.pop();
+    }
+
+    // Step 5b: reduce -ll to -l when m > 1.
+    if s.ends_with("ll") {
+        let stem_len = s.len() - 1;
+        if measure(&s[..stem_len]) > 1 {
+            s.pop();
+        }
+    }
 
     s
 }
@@ -3792,13 +3812,14 @@ fn porter_is_vowel(ch: char, has_previous: bool, previous_was_vowel: bool) -> bo
 fn step1b_fixup(s: &mut String) {
     if s.ends_with("at") || s.ends_with("bl") || s.ends_with("iz") {
         s.push('e');
-    } else if s.len() >= 2 {
-        let bytes = s.as_bytes();
-        let last = bytes[bytes.len() - 1];
-        let prev = bytes[bytes.len() - 2];
-        if last == prev && last.is_ascii_lowercase() && !matches!(last, b'l' | b's' | b'z') {
-            s.pop();
-        }
+    } else if porter_ends_with_double_consonant(s)
+        && !s.ends_with('l')
+        && !s.ends_with('s')
+        && !s.ends_with('z')
+    {
+        s.pop();
+    } else if measure(s) == 1 && porter_ends_with_cvc(s) {
+        s.push('e');
     }
 }
 
@@ -3809,9 +3830,17 @@ fn apply_step2(s: &mut String) {
         ("enci", "ence"),
         ("anci", "ance"),
         ("izer", "ize"),
+        ("bli", "ble"),
+        ("alli", "al"),
+        ("entli", "ent"),
+        ("eli", "e"),
+        ("ization", "ize"),
         ("alism", "al"),
         ("ation", "ate"),
         ("ator", "ate"),
+        ("iveness", "ive"),
+        ("fulness", "ful"),
+        ("ousness", "ous"),
         ("aliti", "al"),
         ("iviti", "ive"),
         ("ousli", "ous"),
@@ -3820,10 +3849,12 @@ fn apply_step2(s: &mut String) {
     ];
 
     for (suffix, replacement) in replacements {
-        if let Some(base) = s.strip_suffix(suffix)
-            && measure(base) > 0
-        {
-            *s = format!("{base}{replacement}");
+        if let Some(base) = s.strip_suffix(suffix) {
+            if measure(base) > 0 {
+                let stem_len = base.len();
+                s.truncate(stem_len);
+                s.push_str(replacement);
+            }
             return;
         }
     }
@@ -3841,13 +3872,66 @@ fn apply_step3(s: &mut String) {
     ];
 
     for (suffix, replacement) in replacements {
-        if let Some(base) = s.strip_suffix(suffix)
-            && measure(base) > 0
-        {
-            *s = format!("{base}{replacement}");
+        if let Some(base) = s.strip_suffix(suffix) {
+            if measure(base) > 0 {
+                let stem_len = base.len();
+                s.truncate(stem_len);
+                s.push_str(replacement);
+            }
             return;
         }
     }
+}
+
+fn apply_step4(s: &mut String) {
+    let suffixes = [
+        "ement", "ance", "ence", "able", "ible", "ment", "ant", "ent", "ion", "al", "er", "ic",
+        "ou", "ism", "ate", "iti", "ous", "ive", "ize",
+    ];
+
+    for suffix in suffixes {
+        if let Some(base) = s.strip_suffix(suffix) {
+            let ion_stem_is_valid = suffix != "ion" || base.ends_with('s') || base.ends_with('t');
+            if ion_stem_is_valid && measure(base) > 1 {
+                s.truncate(base.len());
+            }
+            return;
+        }
+    }
+}
+
+fn porter_vowel_pattern(s: &str) -> Vec<(char, bool)> {
+    let mut pattern = Vec::with_capacity(s.chars().count());
+    let mut has_previous = false;
+    let mut previous_was_vowel = false;
+    for ch in s.chars() {
+        let is_vowel = porter_is_vowel(ch, has_previous, previous_was_vowel);
+        pattern.push((ch, is_vowel));
+        has_previous = true;
+        previous_was_vowel = is_vowel;
+    }
+    pattern
+}
+
+fn porter_ends_with_double_consonant(s: &str) -> bool {
+    let pattern = porter_vowel_pattern(s);
+    if pattern.len() < 2 {
+        return false;
+    }
+    let previous = pattern[pattern.len() - 2];
+    let last = pattern[pattern.len() - 1];
+    previous.0 == last.0 && !last.1
+}
+
+fn porter_ends_with_cvc(s: &str) -> bool {
+    let pattern = porter_vowel_pattern(s);
+    if pattern.len() < 3 {
+        return false;
+    }
+    let antepenultimate = pattern[pattern.len() - 3];
+    let penultimate = pattern[pattern.len() - 2];
+    let last = pattern[pattern.len() - 1];
+    !antepenultimate.1 && penultimate.1 && !last.1 && !matches!(last.0, 'w' | 'x' | 'y')
 }
 
 /// Compute the "measure" m of a stem (number of VC sequences).
@@ -18311,6 +18395,23 @@ mod tests {
     #[test]
     fn test_porter_stem_step3_ful() {
         assert_eq!(porter_stem("hopeful"), "hope");
+    }
+
+    #[test]
+    fn test_porter_stem_sqlite_step4_and_step5_parity() {
+        // Canonical Porter examples that exercise the steps the FTS5 index
+        // checksum depends on. In particular, SQLite stores "title" as
+        // "titl"; diverging here makes a FrankenSQLite-written segment fail
+        // stock FTS5 integrity checking even when its b-tree is well-formed.
+        assert_eq!(porter_stem("revival"), "reviv");
+        assert_eq!(porter_stem("allowance"), "allow");
+        assert_eq!(porter_stem("inference"), "infer");
+        assert_eq!(porter_stem("probate"), "probat");
+        assert_eq!(porter_stem("rate"), "rate");
+        assert_eq!(porter_stem("cease"), "ceas");
+        assert_eq!(porter_stem("controll"), "control");
+        assert_eq!(porter_stem("roll"), "roll");
+        assert_eq!(porter_stem("title"), "titl");
     }
 
     #[test]

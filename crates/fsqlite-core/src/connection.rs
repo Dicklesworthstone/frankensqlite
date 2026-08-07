@@ -87,8 +87,8 @@ use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_ext_fts5::{
     FTS5_AVERAGES_ROWID, FTS5_STRUCTURE_ROWID, Fts5AveragesRecord, Fts5DocsizeRow, Fts5Expr,
     Fts5HighlightFunc, Fts5IdxRow, Fts5OnDiskReader, Fts5ScoreSnapshot, Fts5ShadowRows,
-    Fts5SnippetFunc, Fts5StructureRecord, Fts5Table, Fts5Tokenizer, build_expr,
-    decode_docsize_blob, highlight as fts5_highlight, parse_fts5_query, snippet as fts5_snippet,
+    Fts5SnippetFunc, Fts5StructureRecord, Fts5Table, build_expr, decode_docsize_blob,
+    highlight as fts5_highlight, parse_fts5_query, snippet as fts5_snippet,
 };
 #[cfg(feature = "ext-json")]
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
@@ -38410,7 +38410,7 @@ impl Connection {
                     Ok(count)
                 },
             )?;
-            self.persist_rootpage_zero_fts5_deleted_rowids(table_name, rowids)
+            self.persist_rootpage_zero_fts5_deleted_rowids(table_name)
                 .await?;
             return Ok(deleted);
         }
@@ -38793,76 +38793,15 @@ impl Connection {
                 .await;
         }
 
-        self.reset_rootpage_zero_fts5_segment_metadata(table_name, layout.column_count)
-            .await?;
-
-        let content_name = format!("{table_name}_content");
-        if self.schema_table_exists(&content_name) {
-            self.upsert_storage_table_rows(
-                &content_name,
-                rows.iter()
-                    .zip(inserted_rowids.iter().copied())
-                    .map(|(row, rowid)| {
-                        let texts = fts5_live_insert_row_text_values(row, layout.column_count);
-                        let mut values = Vec::with_capacity(texts.len() + 1);
-                        values.push(SqliteValue::Integer(rowid));
-                        values.extend(
-                            texts
-                                .into_iter()
-                                .map(|value| SqliteValue::Text(value.into())),
-                        );
-                        (rowid, values)
-                    }),
-            )
-            .await?;
-        }
-
-        let docsize_name = format!("{table_name}_docsize");
-        if self.schema_table_exists(&docsize_name) {
-            let (indexed_columns, tokenizer) = {
-                let instances = self.vtab_instances.borrow();
-                let key = table_name.to_ascii_uppercase();
-                let instance = instances.get(&key).ok_or_else(|| {
-                    FrankenError::Internal(format!("virtual table not found: {table_name}"))
-                })?;
-                let fts5 = instance
-                    .as_any()
-                    .downcast_ref::<Fts5Table>()
-                    .ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "rootpage=0 virtual table {table_name} is not an FTS5 instance"
-                        ))
-                    })?;
-                (
-                    fts5.indexed_columns().to_vec(),
-                    fts5.create_tokenizer_instance(),
-                )
-            };
-            self.upsert_storage_table_rows(
-                &docsize_name,
-                rows.iter()
-                    .zip(inserted_rowids.iter().copied())
-                    .map(|(row, rowid)| {
-                        let texts = fts5_live_insert_row_text_values(row, layout.column_count);
-                        let counts = fts5_docsize_counts_for_values(
-                            &texts,
-                            &indexed_columns,
-                            tokenizer.as_ref(),
-                        );
-                        let sz = encode_fts5_docsize_blob(&counts);
-                        (
-                            rowid,
-                            vec![
-                                SqliteValue::Integer(rowid),
-                                SqliteValue::Blob(Arc::from(sz.into_boxed_slice())),
-                            ],
-                        )
-                    }),
-            )
-            .await?;
-        }
-
-        Ok(true)
+        // A content-backed FTS5 table must keep its durable inverted index in
+        // lockstep with `_content`. Clearing `_data`/`_idx` and relying on a
+        // FrankenSQLite reopen to rebuild from `_content` leaves a database
+        // that live in-memory MATCH can query but stock SQLite correctly calls
+        // a malformed inverted index (GH #300). Re-encode the complete shadow
+        // set after the in-memory mutation so both engines observe the same
+        // committed index.
+        self.persist_rootpage_zero_fts5_shadow_rows(table_name)
+            .await
     }
 
     /// Persist a contentless rootpage-zero FTS5 INSERT as an incremental
@@ -39012,34 +38951,16 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    async fn persist_rootpage_zero_fts5_deleted_rowids(
-        &self,
-        table_name: &str,
-        rowids: &[i64],
-    ) -> Result<bool> {
-        let Some(layout) = self.rootpage_zero_fts5_persistence_layout(table_name)? else {
+    async fn persist_rootpage_zero_fts5_deleted_rowids(&self, table_name: &str) -> Result<bool> {
+        if self
+            .rootpage_zero_fts5_persistence_layout(table_name)?
+            .is_none()
+        {
             return Ok(false);
-        };
-        if !layout.has_internal_content_shadow {
-            return self
-                .persist_rootpage_zero_fts5_shadow_rows(table_name)
-                .await;
         }
 
-        self.reset_rootpage_zero_fts5_segment_metadata(table_name, layout.column_count)
-            .await?;
-
-        let content_name = format!("{table_name}_content");
-        if self.schema_table_exists(&content_name) {
-            self.delete_storage_table_rowids(&content_name, rowids)
-                .await?;
-        }
-        let docsize_name = format!("{table_name}_docsize");
-        if self.schema_table_exists(&docsize_name) {
-            self.delete_storage_table_rowids(&docsize_name, rowids)
-                .await?;
-        }
-        Ok(true)
+        self.persist_rootpage_zero_fts5_shadow_rows(table_name)
+            .await
     }
 
     #[cfg(feature = "ext-fts5")]
@@ -39095,24 +39016,6 @@ impl Connection {
             return false;
         }
         virtual_table_option_value(&create_stmt.args, "content").is_none()
-    }
-
-    #[cfg(feature = "ext-fts5")]
-    async fn reset_rootpage_zero_fts5_segment_metadata(
-        &self,
-        table_name: &str,
-        column_count: usize,
-    ) -> Result<()> {
-        self.replace_storage_table_rows(
-            &format!("{table_name}_data"),
-            empty_fts5_data_storage_rows(column_count),
-        )
-        .await?;
-        self.replace_storage_table_rows(
-            &format!("{table_name}_idx"),
-            std::iter::empty::<(i64, Vec<SqliteValue>)>(),
-        )
-        .await
     }
 
     #[cfg(feature = "ext-fts5")]
@@ -39344,30 +39247,6 @@ impl Connection {
                 }
                 let record = serialize_record(&values);
                 cursor.table_insert(cx, rowid, &record).await?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    #[cfg(feature = "ext-fts5")]
-    async fn delete_storage_table_rowids(&self, table_name: &str, rowids: &[i64]) -> Result<()> {
-        let root_page = {
-            let schema = self.schema.borrow();
-            schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(table_name))
-                .map(|table| table.root_page)
-                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
-        };
-        let root = page_number_from_schema_root(root_page, table_name, "table")?;
-
-        self.with_pager_write_txn(async |cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-            for rowid in rowids {
-                if cursor.table_move_to(cx, *rowid).await?.is_found() {
-                    cursor.delete(cx).await?;
-                }
             }
             Ok(())
         })
@@ -81472,62 +81351,6 @@ fn encode_fts5_docsize_blob(column_token_counts: &[u32]) -> Vec<u8> {
         blob.extend_from_slice(&scratch[..len]);
     }
     blob
-}
-
-#[cfg(feature = "ext-fts5")]
-fn empty_fts5_data_storage_rows(column_count: usize) -> Vec<(i64, Vec<SqliteValue>)> {
-    let averages = Fts5AveragesRecord::new(0, vec![0; column_count]).encode();
-    let structure = Fts5StructureRecord::empty_legacy(0).encode();
-    vec![
-        (
-            FTS5_AVERAGES_ROWID,
-            vec![
-                SqliteValue::Integer(FTS5_AVERAGES_ROWID),
-                SqliteValue::Blob(Arc::from(averages.into_boxed_slice())),
-            ],
-        ),
-        (
-            FTS5_STRUCTURE_ROWID,
-            vec![
-                SqliteValue::Integer(FTS5_STRUCTURE_ROWID),
-                SqliteValue::Blob(Arc::from(structure.into_boxed_slice())),
-            ],
-        ),
-    ]
-}
-
-#[cfg(feature = "ext-fts5")]
-fn fts5_live_insert_row_text_values(row: &LiveVtabInsertRow, column_count: usize) -> Vec<String> {
-    let mut values = row
-        .values
-        .iter()
-        .take(column_count)
-        .map(SqliteValue::to_text)
-        .collect::<Vec<_>>();
-    values.resize_with(column_count, String::new);
-    values
-}
-
-#[cfg(feature = "ext-fts5")]
-fn fts5_docsize_counts_for_values(
-    values: &[String],
-    indexed_columns: &[bool],
-    tokenizer: &dyn Fts5Tokenizer,
-) -> Vec<u32> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(idx, value)| {
-            if !indexed_columns.get(idx).copied().unwrap_or(true) {
-                return 0;
-            }
-            let mut count = 0_u32;
-            tokenizer.visit_tokens(value, &mut |_term, _start, _end, _colocated| {
-                count = count.saturating_add(1);
-            });
-            count
-        })
-        .collect()
 }
 
 fn canonical_sqlite_schema_name(name: &str) -> Option<&'static str> {
