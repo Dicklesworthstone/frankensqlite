@@ -22,10 +22,10 @@ async fn stat1_n_rows(conn: &Connection, table: &str) -> Option<u64> {
         .expect("sqlite_stat1 query");
     let mut out: Option<u64> = None;
     for row in &rows {
-        if let Some(fsqlite_types::value::SqliteValue::Text(stat)) = row.values().first() {
-            if let Some(parsed) = parse_stat1(stat.as_ref()) {
-                out = Some(parsed.n_rows);
-            }
+        if let Some(fsqlite_types::value::SqliteValue::Text(stat)) = row.values().first()
+            && let Some(parsed) = parse_stat1(stat.as_ref())
+        {
+            out = Some(parsed.n_rows);
         }
     }
     out

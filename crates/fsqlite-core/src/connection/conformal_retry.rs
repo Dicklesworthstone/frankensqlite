@@ -340,6 +340,6 @@ mod tests {
         for _ in 0..32 {
             b.record_success(Duration::from_secs(10));
         }
-        assert!(b.retry_allowed(Duration::from_secs(86_400)));
+        assert!(b.retry_allowed(Duration::from_hours(24)));
     }
 }

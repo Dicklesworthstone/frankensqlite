@@ -167311,13 +167311,13 @@ mod tests {
             let stats_after_reset = conn.query("PRAGMA raptorq_stats;").await.unwrap();
             let mut repairs_total = None;
             for row in stats_after_reset {
-                if let SqliteValue::Text(key) = row.get(0).unwrap() {
-                    if &**key == "repairs_total" {
-                        repairs_total = match row.get(1).unwrap() {
-                            SqliteValue::Integer(n) => Some(*n),
-                            _ => None,
-                        };
-                    }
+                if let SqliteValue::Text(key) = row.get(0).unwrap()
+                    && &**key == "repairs_total"
+                {
+                    repairs_total = match row.get(1).unwrap() {
+                        SqliteValue::Integer(n) => Some(*n),
+                        _ => None,
+                    };
                 }
             }
             assert_eq!(repairs_total, Some(0));
@@ -250547,10 +250547,10 @@ mod pager_routing_tests {
                         .await
                         .unwrap();
                     for row in &neighbors {
-                        if let SqliteValue::Text(neighbor) = &row.values()[0] {
-                            if visited.insert(neighbor.to_string()) {
-                                queue.push_back(neighbor.to_string());
-                            }
+                        if let SqliteValue::Text(neighbor) = &row.values()[0]
+                            && visited.insert(neighbor.to_string())
+                        {
+                            queue.push_back(neighbor.to_string());
                         }
                     }
                 }
@@ -250685,10 +250685,10 @@ mod pager_routing_tests {
                         .await
                         .unwrap();
                     for row in &neighbors {
-                        if let SqliteValue::Text(neighbor) = &row.values()[0] {
-                            if visited.insert(neighbor.to_string()) {
-                                queue.push_back(neighbor.to_string());
-                            }
+                        if let SqliteValue::Text(neighbor) = &row.values()[0]
+                            && visited.insert(neighbor.to_string())
+                        {
+                            queue.push_back(neighbor.to_string());
                         }
                     }
                 }

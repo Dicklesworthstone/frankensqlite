@@ -1088,26 +1088,14 @@ mod tests {
 
         xor_patch_wide_chunks(&mut via_wide, &patch).expect("wide chunk xor");
 
-        let mut dst_u64_chunks = via_u64_only.chunks_exact_mut(8);
-        let mut patch_u64_chunks = patch.chunks_exact(8);
-        for (dst_chunk, patch_chunk) in dst_u64_chunks.by_ref().zip(patch_u64_chunks.by_ref()) {
-            let dst_word = u64::from_ne_bytes(
-                dst_chunk
-                    .try_into()
-                    .expect("chunks_exact(8) must yield 8-byte chunk"),
-            );
-            let patch_word = u64::from_ne_bytes(
-                patch_chunk
-                    .try_into()
-                    .expect("chunks_exact(8) must yield 8-byte chunk"),
-            );
-            dst_chunk.copy_from_slice(&(dst_word ^ patch_word).to_ne_bytes());
+        let (dst_u64_chunks, dst_remainder) = via_u64_only.as_chunks_mut::<8>();
+        let (patch_u64_chunks, patch_remainder) = patch.as_chunks::<8>();
+        for (dst_chunk, patch_chunk) in dst_u64_chunks.iter_mut().zip(patch_u64_chunks) {
+            let dst_word = u64::from_ne_bytes(*dst_chunk);
+            let patch_word = u64::from_ne_bytes(*patch_chunk);
+            *dst_chunk = (dst_word ^ patch_word).to_ne_bytes();
         }
-        for (dst_byte, patch_byte) in dst_u64_chunks
-            .into_remainder()
-            .iter_mut()
-            .zip(patch_u64_chunks.remainder().iter())
-        {
+        for (dst_byte, patch_byte) in dst_remainder.iter_mut().zip(patch_remainder) {
             *dst_byte ^= *patch_byte;
         }
 
