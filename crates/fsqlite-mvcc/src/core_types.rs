@@ -1773,6 +1773,11 @@ pub struct Transaction {
     /// Optional Bloom-backed approximate membership filter for large read sets.
     pub read_set_bloom: Option<ReadSetBloom>,
     /// SSI witness-plane read evidence (§5.6.4).
+    ///
+    /// Page witnesses are retained exactly only while the read set is in
+    /// [`ReadSetStorageMode::Exact`]. After automatic Bloom promotion,
+    /// [`Self::read_set_maybe_contains`] is the bounded membership source for
+    /// additional page reads; non-page semantic witnesses remain exact here.
     pub read_keys: HashSet<WitnessKey>,
     /// SSI witness-plane write evidence (§5.6.4).
     pub write_keys: HashSet<WitnessKey>,
@@ -1885,17 +1890,21 @@ impl Transaction {
 
     /// Record a page read with the visible committed version.
     pub fn record_page_read(&mut self, page: PageNumber, version: CommitSeq) {
-        if let Some(bloom) = self.read_set_bloom.as_mut() {
-            // Bloom mode active: only Bloom + witness key tracking.
+        let keep_exact_page_witness = if let Some(bloom) = self.read_set_bloom.as_mut() {
+            // Bloom mode active: bounded approximate page membership replaces
+            // the otherwise-unbounded duplicate Page witness in `read_keys`.
             bloom.insert(page);
+            false
         } else if self.read_set_versions.len() >= Self::READ_SET_AUTO_BLOOM_THRESHOLD {
             // Auto-promote to Bloom mode: the exact read set has grown large
             // enough that the HashMap overhead dominates.  Switch to Bloom for
-            // all future inserts; existing entries remain for version lookups.
+            // all future inserts; existing entries and their Page witnesses
+            // remain for precise version lookups.
             let mut bloom = ReadSetBloom::new(ReadSetBloom::DEFAULT_BITS);
             bloom.insert(page);
             self.read_set_bloom = Some(bloom);
             self.read_set_storage_mode = ReadSetStorageMode::Bloom;
+            false
         } else {
             // Exact mode: track in HashMap for precise version lookups.
             self.read_set_versions
@@ -1906,8 +1915,11 @@ impl Transaction {
                     }
                 })
                 .or_insert(version);
+            true
+        };
+        if keep_exact_page_witness {
+            self.read_keys.insert(WitnessKey::Page(page));
         }
-        self.read_keys.insert(WitnessKey::Page(page));
     }
 
     /// Record a range-scan witness set for predicate-style tracking.
@@ -4066,6 +4078,47 @@ mod tests {
         assert!(
             txn.read_set_bloom.is_none(),
             "access tracking cleanup must release the bloom read-set allocation"
+        );
+    }
+
+    #[test]
+    fn test_transaction_auto_bloom_bounds_page_witness_keys() {
+        let txn_id = TxnId::new(52).unwrap();
+        let snap = Snapshot::new(CommitSeq::new(2), SchemaEpoch::ZERO);
+        let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snap, TransactionMode::Concurrent);
+        let total_reads = Transaction::READ_SET_AUTO_BLOOM_THRESHOLD + 512;
+
+        for raw_page in 1..=total_reads {
+            let page = PageNumber::new(u32::try_from(raw_page).unwrap()).unwrap();
+            txn.record_page_read(page, CommitSeq::new(2));
+        }
+
+        assert_eq!(
+            txn.read_set_versions.len(),
+            Transaction::READ_SET_AUTO_BLOOM_THRESHOLD,
+            "exact page-version storage must stop growing at the promotion threshold"
+        );
+        assert_eq!(
+            txn.read_keys
+                .iter()
+                .filter(|key| matches!(key, WitnessKey::Page(_)))
+                .count(),
+            Transaction::READ_SET_AUTO_BLOOM_THRESHOLD,
+            "duplicate page witnesses must stop growing when Bloom mode begins"
+        );
+        assert_eq!(txn.read_set_storage_mode, ReadSetStorageMode::Bloom);
+        assert!(txn.read_set_bloom.is_some());
+
+        let first_page = PageNumber::ONE;
+        let final_page = PageNumber::new(u32::try_from(total_reads).unwrap()).unwrap();
+        assert!(txn.read_keys.contains(&WitnessKey::Page(first_page)));
+        assert!(
+            !txn.read_keys.contains(&WitnessKey::Page(final_page)),
+            "post-promotion reads must not allocate exact page witnesses"
+        );
+        assert!(
+            txn.read_set_maybe_contains(final_page),
+            "Bloom membership must preserve post-promotion read evidence"
         );
     }
 

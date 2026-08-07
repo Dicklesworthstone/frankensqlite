@@ -16731,6 +16731,44 @@ where
         Ok(StagedPage::from_buf(buffer))
     }
 
+    /// Admit a snapshot page to the per-transaction read cache without
+    /// letting a large scan bypass the configured page-buffer ceiling.
+    ///
+    /// Once the cache reaches the pool capacity, first reads continue through
+    /// the normal pager/WAL snapshot path but are not pinned for the remaining
+    /// transaction lifetime. Existing entries may still be refreshed without
+    /// increasing retained memory.
+    fn cache_transaction_read_page(&self, page_no: PageNumber, page: &PageData) {
+        let mut txn_read_cache = self.txn_read_cache.borrow_mut();
+        if txn_read_cache.contains_key(&page_no) || txn_read_cache.len() < self.pool.capacity() {
+            txn_read_cache.insert(page_no, page.clone());
+        }
+    }
+
+    /// Fail closed instead of serving a potentially newer image after this
+    /// transaction has exhausted its bounded snapshot cache.
+    fn ensure_uncached_snapshot_sequence(
+        &self,
+        page_no: PageNumber,
+        observed_commit_seq: CommitSeq,
+    ) -> Result<()> {
+        if self.txn_read_cache.borrow().len() < self.pool.capacity()
+            || observed_commit_seq == self.published_visible_commit_seq.get()
+        {
+            return Ok(());
+        }
+        Err(FrankenError::BusySnapshot {
+            conflicting_pages: format!(
+                "page {} is not retained after the transaction read cache reached {} pages; \
+                 snapshot commit_seq {} != observed {}",
+                page_no.get(),
+                self.pool.capacity(),
+                self.published_visible_commit_seq.get().get(),
+                observed_commit_seq.get()
+            ),
+        })
+    }
+
     /// Submodular greedy prefetch selector (IMPL-8 / AG-O3 + AAC-P4).
     ///
     /// Given a set of prefetch candidates and a budget `B`, selects up to `B`
@@ -19830,6 +19868,10 @@ where
             if let Some(cached) = self.txn_read_cache.borrow().get(&page_no) {
                 return Ok(cached.clone());
             }
+            self.ensure_uncached_snapshot_sequence(
+                page_no,
+                self.published.snapshot().visible_commit_seq,
+            )?;
             let single_connection_fast_path = self.single_connection_fast_path_enabled();
             let trace_read_start =
                 tracing::enabled!(target: "fsqlite.snapshot_publication", tracing::Level::TRACE)
@@ -19858,9 +19900,7 @@ where
                             "resolved zero-filled page from published metadata"
                         );
                         let page = PageData::from_vec(vec![0_u8; self.pool.page_size()]);
-                        self.txn_read_cache
-                            .borrow_mut()
-                            .insert(page_no, page.clone());
+                        self.cache_transaction_read_page(page_no, &page);
                         return Ok(page);
                     }
                     self.published.record_retry();
@@ -19894,9 +19934,7 @@ where
                                 }),
                             "served page from published snapshot"
                         );
-                        self.txn_read_cache
-                            .borrow_mut()
-                            .insert(page_no, page.clone());
+                        self.cache_transaction_read_page(page_no, &page);
                         return Ok(page);
                     }
                     self.published.record_retry();
@@ -19922,9 +19960,7 @@ where
                 // bd-perf (V1.2): Use get_shared to get PageData directly,
                 // avoiding the 4KB memcpy + separate Arc allocation of get_copy.
                 if let Some(page_data) = self.cache.get_shared(page_no) {
-                    self.txn_read_cache
-                        .borrow_mut()
-                        .insert(page_no, page_data.clone());
+                    self.cache_transaction_read_page(page_no, &page_data);
                     return Ok(page_data);
                 }
             }
@@ -19935,9 +19971,11 @@ where
                     read_page_from_wal_backend(&self.wal_backend, cx, page_no).await?
             {
                 let page = PageData::from_vec(data);
-                self.txn_read_cache
-                    .borrow_mut()
-                    .insert(page_no, page.clone());
+                self.ensure_uncached_snapshot_sequence(
+                    page_no,
+                    self.published.snapshot().visible_commit_seq,
+                )?;
+                self.cache_transaction_read_page(page_no, &page);
                 return Ok(page);
             }
 
@@ -19945,6 +19983,7 @@ where
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            self.ensure_uncached_snapshot_sequence(page_no, inner.commit_seq)?;
             let data = inner
                 .read_page_copy(cx, &self.cache, &self.wal_backend, page_no)
                 .await?;
@@ -19964,9 +20003,7 @@ where
                     .publish_observed_page(cx, publish_update, page_no, page.clone());
             }
             // Cache the page read from inner.lock() for future reads.
-            self.txn_read_cache
-                .borrow_mut()
-                .insert(page_no, page.clone());
+            self.cache_transaction_read_page(page_no, &page);
             Ok(page)
         }
     }
@@ -23678,6 +23715,77 @@ mod tests {
                 assert!(pager.cache.contains(page_no));
             }
             txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn gh_291_transaction_read_cache_respects_page_buffer_max() {
+        asupersync::test_utils::run_test(|| async {
+            const PAGE_BUFFER_MAX: usize = 3;
+            let cx = Cx::new();
+            let pager = SimplePager::open_with_cx_and_page_buffer_max(
+                &cx,
+                MemoryVfs::new(),
+                Path::new("/bounded_transaction_read_cache.db"),
+                PageSize::DEFAULT,
+                Some(PAGE_BUFFER_MAX),
+            )
+            .await
+            .unwrap();
+
+            let mut pages = Vec::new();
+            for marker in 1_u8..=8 {
+                let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page_no = seed.allocate_page(&cx).await.unwrap();
+                seed.write_page(&cx, page_no, &sample_page(marker))
+                    .await
+                    .unwrap();
+                seed.commit(&cx).await.unwrap();
+                pages.push((page_no, marker));
+            }
+
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            for &(page_no, marker) in &pages {
+                let page = reader.get_page(&cx, page_no).await.unwrap();
+                assert_eq!(page.as_ref()[0], marker);
+                assert!(
+                    reader.txn_read_cache.borrow().len() <= PAGE_BUFFER_MAX,
+                    "a sequential scan must not pin more page images than page_buffer_max"
+                );
+            }
+            assert_eq!(reader.txn_read_cache.borrow().len(), PAGE_BUFFER_MAX);
+
+            let (first_page, first_marker) = pages[0];
+            assert_eq!(
+                reader.get_page(&cx, first_page).await.unwrap().as_ref()[0],
+                first_marker,
+                "a retained page must remain stable after cache saturation"
+            );
+            assert_eq!(reader.txn_read_cache.borrow().len(), PAGE_BUFFER_MAX);
+
+            let (uncached_page, uncached_marker) = *pages.last().unwrap();
+            let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            writer
+                .write_page(&cx, uncached_page, &sample_page(0xEE))
+                .await
+                .unwrap();
+            writer.commit(&cx).await.unwrap();
+
+            assert_eq!(
+                reader.get_page(&cx, first_page).await.unwrap().as_ref()[0],
+                first_marker,
+                "a cached baseline must survive a concurrent commit"
+            );
+            let error = reader
+                .get_page(&cx, uncached_page)
+                .await
+                .expect_err("an uncached page must fail closed after the snapshot advances");
+            assert!(
+                matches!(error, FrankenError::BusySnapshot { .. }),
+                "expected BusySnapshot for uncached page {uncached_page:?} (old marker \
+                 {uncached_marker}), got {error:?}"
+            );
+            reader.commit(&cx).await.unwrap();
         });
     }
 
