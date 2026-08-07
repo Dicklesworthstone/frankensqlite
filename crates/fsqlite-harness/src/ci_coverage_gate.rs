@@ -27,7 +27,12 @@
 //!
 //! - **bd-mblr.7.9.2**: Lane selection engine uses gate results
 //! - **bd-mblr.3.3**: Flake budget and quarantine workflow
+//!
+//! The same module owns the Turso adaptation cross-phase scorecard because it
+//! extends this gate's existing coverage and CI policy rather than introducing
+//! a second campaign runner or artifact format.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as FmtWrite;
 
@@ -43,6 +48,1066 @@ const BEAD_ID: &str = "bd-mblr.3.1.1";
 
 /// Schema version for report compatibility.
 pub const COVERAGE_GATE_SCHEMA_VERSION: &str = "1.0.0";
+
+/// Schema emitted by the Turso campaign promotion scorecard.
+pub const TURSO_CAMPAIGN_SCORECARD_SCHEMA_VERSION: &str = "1.0.0";
+
+const TURSO_NATIVE_LANES: [&str; 6] = [
+    "bd-turso-test-adaptation-zu081.5",
+    "bd-turso-test-adaptation-zu081.6",
+    "bd-turso-test-adaptation-zu081.8",
+    "bd-turso-test-adaptation-zu081.9",
+    "bd-turso-test-adaptation-zu081.19",
+    "bd-turso-test-adaptation-zu081.20",
+];
+
+const TURSO_OPTIONAL_DECISIONS: [&str; 7] = [
+    "bd-turso-test-adaptation-zu081.10",
+    "bd-turso-test-adaptation-zu081.11",
+    "bd-turso-test-adaptation-zu081.12",
+    "bd-turso-test-adaptation-zu081.13",
+    "bd-turso-test-adaptation-zu081.14",
+    "bd-turso-test-adaptation-zu081.15",
+    "bd-turso-test-adaptation-zu081.16",
+];
+
+/// Resource tier represented by a campaign receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignTier {
+    /// Fixed-seed change gate, bounded to ten minutes.
+    Presubmit,
+    /// Scheduled expansion, bounded to one hour per lane.
+    Nightly,
+    /// Explicitly budgeted operator or release campaign.
+    Manual,
+}
+
+impl CampaignTier {
+    const fn maximum_budget_seconds(self) -> Option<u64> {
+        match self {
+            Self::Presubmit => Some(600),
+            Self::Nightly => Some(3_600),
+            Self::Manual => None,
+        }
+    }
+
+    const fn minimum_retention_days(self) -> u32 {
+        match self {
+            Self::Presubmit => 7,
+            Self::Nightly => 30,
+            Self::Manual => 90,
+        }
+    }
+}
+
+/// Highest tier whose retained receipts are required by this scorecard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignPromotionStage {
+    /// Require only presubmit evidence.
+    Presubmit,
+    /// Require presubmit and nightly evidence.
+    Nightly,
+    /// Require presubmit, nightly, and manual/release evidence.
+    Release,
+}
+
+impl CampaignPromotionStage {
+    const fn required_tiers(self) -> &'static [CampaignTier] {
+        match self {
+            Self::Presubmit => &[CampaignTier::Presubmit],
+            Self::Nightly => &[CampaignTier::Presubmit, CampaignTier::Nightly],
+            Self::Release => &[
+                CampaignTier::Presubmit,
+                CampaignTier::Nightly,
+                CampaignTier::Manual,
+            ],
+        }
+    }
+}
+
+/// Portfolio decision for an external or optional campaign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignDisposition {
+    /// The lane is admitted and therefore gates CI.
+    Adopted,
+    /// The lane is deferred behind explicit re-entry conditions.
+    Deferred,
+    /// The lane is rejected for this campaign.
+    Rejected,
+    /// A gap-only route exists, but no concrete case has been admitted.
+    Conditional,
+}
+
+/// Completion state reported by one shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignRunStatus {
+    /// The configured seed range completed.
+    Completed,
+    /// The run was cancelled.
+    Cancelled,
+    /// The configured budget was consumed before exploration completed.
+    BudgetExhausted,
+    /// The runner stopped with unexplored work for another reason.
+    IncompleteExploration,
+}
+
+/// Scheduling claim made by a campaign receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryAccounting {
+    /// Execution was controlled and is reproducible from the schedule artifact.
+    Deterministic,
+    /// The history is useful evidence, but OS scheduling was not controlled.
+    ObservationOnly,
+    /// The lane does not produce transaction histories.
+    NotApplicable,
+}
+
+/// Required outcome accounting for a campaign shard.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignOutcomeCounts {
+    pub generated: u64,
+    pub executed: u64,
+    pub unsupported: u64,
+    pub invalid: u64,
+    pub skipped: u64,
+    pub timed_out: u64,
+    pub mismatched: u64,
+    pub crashed: u64,
+    pub reduced: u64,
+    pub promoted: u64,
+}
+
+impl CampaignOutcomeCounts {
+    fn terminal_total(self) -> Option<u64> {
+        self.executed
+            .checked_add(self.unsupported)?
+            .checked_add(self.invalid)?
+            .checked_add(self.skipped)?
+            .checked_add(self.timed_out)
+    }
+
+    fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            generated: self.generated.checked_add(other.generated)?,
+            executed: self.executed.checked_add(other.executed)?,
+            unsupported: self.unsupported.checked_add(other.unsupported)?,
+            invalid: self.invalid.checked_add(other.invalid)?,
+            skipped: self.skipped.checked_add(other.skipped)?,
+            timed_out: self.timed_out.checked_add(other.timed_out)?,
+            mismatched: self.mismatched.checked_add(other.mismatched)?,
+            crashed: self.crashed.checked_add(other.crashed)?,
+            reduced: self.reduced.checked_add(other.reduced)?,
+            promoted: self.promoted.checked_add(other.promoted)?,
+        })
+    }
+}
+
+/// One half-open deterministic seed interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignSeedShard {
+    pub index: u32,
+    pub count: u32,
+    pub start_seed: u64,
+    pub end_seed_exclusive: u64,
+}
+
+/// Coverage dimensions represented by a shard artifact.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignCoverageDimensions {
+    pub feature_ids: Vec<String>,
+    pub constructs: Vec<String>,
+    pub execution_lanes: Vec<String>,
+    pub fault_kinds: Vec<String>,
+    pub concurrency_workloads: Vec<String>,
+    pub reducer_families: Vec<String>,
+}
+
+/// Retained, hash-addressed evidence produced by a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignArtifactEvidence {
+    pub path: String,
+    pub sha256: String,
+    pub retention_days: u32,
+}
+
+/// Evidence receipt for one lane/tier/shard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignRunEvidence {
+    pub lane_id: String,
+    pub tier: CampaignTier,
+    pub shard: CampaignSeedShard,
+    pub expected_seed_count: u64,
+    pub budget_seconds: u64,
+    pub elapsed_seconds: u64,
+    pub status: CampaignRunStatus,
+    pub outcomes: CampaignOutcomeCounts,
+    pub coverage: CampaignCoverageDimensions,
+    pub history_accounting: HistoryAccounting,
+    pub required_lane_evidence_verified: bool,
+    pub public_replay_verified: bool,
+    pub replay_command: String,
+    pub artifacts: Vec<CampaignArtifactEvidence>,
+}
+
+/// Decision record for one optional/external child.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionalCampaignDecision {
+    pub bead_id: String,
+    pub disposition: CampaignDisposition,
+    pub admitted: bool,
+    pub rationale: String,
+}
+
+/// Repository-wide invariant represented by a retained command receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignGlobalGate {
+    CanonicalContractDriftGuard,
+    ConcurrentWriterDefaults,
+    NoTokioDependency,
+    TargetAccounting,
+    DocumentationProvenance,
+    WorkspaceFormat,
+    WorkspaceCheck,
+    WorkspaceClippy,
+    WorkspaceTests,
+}
+
+const CAMPAIGN_GLOBAL_GATES: [CampaignGlobalGate; 9] = [
+    CampaignGlobalGate::CanonicalContractDriftGuard,
+    CampaignGlobalGate::ConcurrentWriterDefaults,
+    CampaignGlobalGate::NoTokioDependency,
+    CampaignGlobalGate::TargetAccounting,
+    CampaignGlobalGate::DocumentationProvenance,
+    CampaignGlobalGate::WorkspaceFormat,
+    CampaignGlobalGate::WorkspaceCheck,
+    CampaignGlobalGate::WorkspaceClippy,
+    CampaignGlobalGate::WorkspaceTests,
+];
+
+/// Command and artifact proving one repository-wide invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignGlobalGateReceipt {
+    pub gate: CampaignGlobalGate,
+    pub passed: bool,
+    pub command: String,
+    pub artifact: CampaignArtifactEvidence,
+}
+
+/// Baseline used to reject silent skip/unsupported growth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignDriftControl {
+    pub baseline_unsupported: u64,
+    pub baseline_skipped: u64,
+    pub linked_contract_decision: Option<String>,
+}
+
+/// Complete input consumed by the Turso promotion gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TursoCampaignGateInput {
+    pub promotion_stage: CampaignPromotionStage,
+    pub workflow_id: String,
+    pub run_id: String,
+    pub build_id: String,
+    pub engine_sha: String,
+    pub engine_dirty: bool,
+    pub contract_hash: String,
+    pub profile_hash: String,
+    pub global_gate_receipts: Vec<CampaignGlobalGateReceipt>,
+    pub drift: CampaignDriftControl,
+    pub optional_decisions: Vec<OptionalCampaignDecision>,
+    pub runs: Vec<CampaignRunEvidence>,
+}
+
+impl TursoCampaignGateInput {
+    /// Deserialize a fail-closed campaign input.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
+/// Final promotion decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignPromotionOutcome {
+    Promote,
+    Hold,
+}
+
+/// One actionable campaign-gate failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CampaignGateDiagnostic {
+    pub code: String,
+    pub lane_id: Option<String>,
+    pub detail: String,
+}
+
+/// Bounded per-lane accounting retained in the scorecard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CampaignLaneSummary {
+    pub lane_id: String,
+    pub run_count: usize,
+    pub outcomes: CampaignOutcomeCounts,
+    pub deterministic_history_runs: usize,
+    pub observation_only_history_runs: usize,
+}
+
+/// Machine-readable promotion scorecard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TursoCampaignScorecard {
+    pub schema_version: String,
+    pub promotion_stage: CampaignPromotionStage,
+    pub outcome: CampaignPromotionOutcome,
+    pub workflow_id: String,
+    pub run_id: String,
+    pub build_id: String,
+    pub engine_sha: String,
+    pub engine_dirty: bool,
+    pub contract_hash: String,
+    pub profile_hash: String,
+    pub global_gate_receipts: Vec<CampaignGlobalGateReceipt>,
+    pub drift: CampaignDriftControl,
+    pub optional_decisions: Vec<OptionalCampaignDecision>,
+    pub runs: Vec<CampaignRunEvidence>,
+    pub totals: CampaignOutcomeCounts,
+    pub lane_summaries: Vec<CampaignLaneSummary>,
+    pub diagnostics: Vec<CampaignGateDiagnostic>,
+}
+
+impl TursoCampaignScorecard {
+    /// Serialize the complete scorecard artifact.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize a scorecard artifact.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    /// Render one bounded line per lane plus one final outcome line.
+    #[must_use]
+    pub fn render_bounded_summary(&self) -> String {
+        let mut output = String::new();
+        for lane in &self.lane_summaries {
+            let lane_errors = self
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.lane_id.as_deref() == Some(lane.lane_id.as_str()))
+                .count();
+            let _ = writeln!(
+                output,
+                "lane={} runs={} generated={} executed={} errors={lane_errors}",
+                lane.lane_id, lane.run_count, lane.outcomes.generated, lane.outcomes.executed
+            );
+        }
+        let global_errors = self
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.lane_id.is_none())
+            .count();
+        let error_codes = self
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = writeln!(
+            output,
+            "campaign={:?} stage={:?} global_errors={global_errors} error_codes={error_codes}",
+            self.outcome, self.promotion_stage,
+        );
+        output
+    }
+}
+
+fn campaign_diagnostic(
+    diagnostics: &mut Vec<CampaignGateDiagnostic>,
+    code: &str,
+    lane_id: Option<&str>,
+    detail: impl Into<String>,
+) {
+    diagnostics.push(CampaignGateDiagnostic {
+        code: code.to_owned(),
+        lane_id: lane_id.map(str::to_owned),
+        detail: detail.into(),
+    });
+}
+
+fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_campaign_run(run: &CampaignRunEvidence, diagnostics: &mut Vec<CampaignGateDiagnostic>) {
+    let lane_id = run.lane_id.as_str();
+    if run.budget_seconds == 0 {
+        campaign_diagnostic(
+            diagnostics,
+            "budget_zero",
+            Some(lane_id),
+            "a campaign budget must be explicit and non-zero",
+        );
+    }
+    if let Some(maximum) = run.tier.maximum_budget_seconds()
+        && run.budget_seconds > maximum
+    {
+        campaign_diagnostic(
+            diagnostics,
+            "tier_budget_exceeded",
+            Some(lane_id),
+            format!(
+                "tier={:?} budget={} maximum={maximum}",
+                run.tier, run.budget_seconds
+            ),
+        );
+    }
+    if run.elapsed_seconds > run.budget_seconds {
+        campaign_diagnostic(
+            diagnostics,
+            "elapsed_exceeds_budget",
+            Some(lane_id),
+            format!(
+                "elapsed={} budget={}",
+                run.elapsed_seconds, run.budget_seconds
+            ),
+        );
+    }
+    if run.status != CampaignRunStatus::Completed {
+        campaign_diagnostic(
+            diagnostics,
+            "campaign_incomplete",
+            Some(lane_id),
+            format!("status={:?}", run.status),
+        );
+    }
+
+    match run.outcomes.terminal_total() {
+        Some(terminal_total) if terminal_total == run.outcomes.generated => {}
+        Some(terminal_total) => campaign_diagnostic(
+            diagnostics,
+            "outcome_count_imbalance",
+            Some(lane_id),
+            format!(
+                "generated={} terminal_total={terminal_total}",
+                run.outcomes.generated
+            ),
+        ),
+        None => campaign_diagnostic(
+            diagnostics,
+            "outcome_count_overflow",
+            Some(lane_id),
+            "terminal outcome count overflowed u64",
+        ),
+    }
+    if run.outcomes.timed_out > 0 {
+        campaign_diagnostic(
+            diagnostics,
+            "timeout_is_not_pass",
+            Some(lane_id),
+            format!("timed_out={}", run.outcomes.timed_out),
+        );
+    }
+    if run.outcomes.mismatched > 0 || run.outcomes.crashed > 0 {
+        campaign_diagnostic(
+            diagnostics,
+            "semantic_or_crash_failure_present",
+            Some(lane_id),
+            format!(
+                "mismatched={} crashed={}",
+                run.outcomes.mismatched, run.outcomes.crashed
+            ),
+        );
+    }
+
+    match run.outcomes.mismatched.checked_add(run.outcomes.crashed) {
+        Some(failures) => {
+            if failures > run.outcomes.executed {
+                campaign_diagnostic(
+                    diagnostics,
+                    "failure_subcount_exceeds_executed",
+                    Some(lane_id),
+                    format!("failures={failures} executed={}", run.outcomes.executed),
+                );
+            }
+            if run.outcomes.reduced > failures {
+                campaign_diagnostic(
+                    diagnostics,
+                    "reduced_subcount_exceeds_failures",
+                    Some(lane_id),
+                    format!("reduced={} failures={failures}", run.outcomes.reduced),
+                );
+            }
+        }
+        None => campaign_diagnostic(
+            diagnostics,
+            "failure_subcount_overflow",
+            Some(lane_id),
+            "mismatch and crash count overflowed u64",
+        ),
+    }
+    if run.outcomes.promoted > run.outcomes.reduced {
+        campaign_diagnostic(
+            diagnostics,
+            "promoted_subcount_exceeds_reduced",
+            Some(lane_id),
+            format!(
+                "promoted={} reduced={}",
+                run.outcomes.promoted, run.outcomes.reduced
+            ),
+        );
+    }
+
+    if !run.required_lane_evidence_verified {
+        campaign_diagnostic(
+            diagnostics,
+            "required_lane_evidence_missing",
+            Some(lane_id),
+            "the public runner did not verify required execution lanes",
+        );
+    }
+    if !run.public_replay_verified || run.replay_command.trim().is_empty() {
+        campaign_diagnostic(
+            diagnostics,
+            "public_replay_missing",
+            Some(lane_id),
+            "a verified non-empty public replay command is required",
+        );
+    }
+    if run.artifacts.is_empty() {
+        campaign_diagnostic(
+            diagnostics,
+            "artifact_missing",
+            Some(lane_id),
+            "at least one retained artifact is required",
+        );
+    }
+    for artifact in &run.artifacts {
+        if artifact.path.trim().is_empty() || !is_lower_hex(&artifact.sha256, 64) {
+            campaign_diagnostic(
+                diagnostics,
+                "artifact_provenance_invalid",
+                Some(lane_id),
+                format!("path={} sha256={}", artifact.path, artifact.sha256),
+            );
+        }
+        let minimum_retention = run.tier.minimum_retention_days();
+        if artifact.retention_days < minimum_retention {
+            campaign_diagnostic(
+                diagnostics,
+                "artifact_retention_too_short",
+                Some(lane_id),
+                format!(
+                    "path={} retention_days={} minimum={minimum_retention}",
+                    artifact.path, artifact.retention_days
+                ),
+            );
+        }
+    }
+
+    if run.lane_id == "bd-turso-test-adaptation-zu081.8"
+        && run.history_accounting != HistoryAccounting::Deterministic
+    {
+        campaign_diagnostic(
+            diagnostics,
+            "production_history_not_deterministic",
+            Some(lane_id),
+            "the LabRuntime production-history lane must carry deterministic schedule evidence",
+        );
+    }
+    if run.lane_id == "bd-turso-test-adaptation-zu081.9"
+        && run.history_accounting != HistoryAccounting::ObservationOnly
+    {
+        campaign_diagnostic(
+            diagnostics,
+            "multiprocess_history_misclassified",
+            Some(lane_id),
+            "the OS-scheduled multiprocess lane must remain observation-only",
+        );
+    }
+}
+
+fn validate_seed_group(
+    lane_id: &str,
+    tier: CampaignTier,
+    runs: &[&CampaignRunEvidence],
+    diagnostics: &mut Vec<CampaignGateDiagnostic>,
+) {
+    let Some(first) = runs.first() else {
+        return;
+    };
+    if first.expected_seed_count == 0 || first.shard.count == 0 {
+        campaign_diagnostic(
+            diagnostics,
+            "seed_shard_configuration_invalid",
+            Some(lane_id),
+            format!(
+                "tier={tier:?} expected_seed_count={} shard_count={}",
+                first.expected_seed_count, first.shard.count
+            ),
+        );
+        return;
+    }
+
+    let expected_seed_count = first.expected_seed_count;
+    let shard_count = first.shard.count;
+    let mut ordered = runs.to_vec();
+    ordered.sort_by_key(|run| (run.shard.start_seed, run.shard.index));
+    let Some(first_ordered) = ordered.first() else {
+        return;
+    };
+    let mut indexes = BTreeSet::new();
+    let mut cursor = first_ordered.shard.start_seed;
+    let mut covered_seed_count = 0_u64;
+
+    for run in ordered {
+        if run.expected_seed_count != expected_seed_count || run.shard.count != shard_count {
+            campaign_diagnostic(
+                diagnostics,
+                "seed_shard_configuration_mismatch",
+                Some(lane_id),
+                format!("tier={tier:?} shard_index={}", run.shard.index),
+            );
+        }
+        if run.shard.index >= run.shard.count || !indexes.insert(run.shard.index) {
+            campaign_diagnostic(
+                diagnostics,
+                "seed_shard_index_invalid",
+                Some(lane_id),
+                format!(
+                    "tier={tier:?} shard_index={} shard_count={}",
+                    run.shard.index, run.shard.count
+                ),
+            );
+        }
+        if run.shard.start_seed != cursor || run.shard.end_seed_exclusive <= run.shard.start_seed {
+            campaign_diagnostic(
+                diagnostics,
+                "seed_shard_gap_or_overlap",
+                Some(lane_id),
+                format!(
+                    "tier={tier:?} expected_start={cursor} actual_range={}..{}",
+                    run.shard.start_seed, run.shard.end_seed_exclusive
+                ),
+            );
+        }
+        if let Some(shard_seed_count) = run
+            .shard
+            .end_seed_exclusive
+            .checked_sub(run.shard.start_seed)
+        {
+            if run.outcomes.generated != shard_seed_count {
+                campaign_diagnostic(
+                    diagnostics,
+                    "seed_shard_outcome_count_mismatch",
+                    Some(lane_id),
+                    format!(
+                        "tier={tier:?} shard_index={} seed_count={shard_seed_count} generated={}",
+                        run.shard.index, run.outcomes.generated
+                    ),
+                );
+            }
+            if let Some(sum) = covered_seed_count.checked_add(shard_seed_count) {
+                covered_seed_count = sum;
+            } else {
+                campaign_diagnostic(
+                    diagnostics,
+                    "seed_shard_coverage_overflow",
+                    Some(lane_id),
+                    format!("tier={tier:?}"),
+                );
+            }
+        }
+        cursor = run.shard.end_seed_exclusive;
+    }
+
+    if u32::try_from(indexes.len()) != Ok(shard_count) || covered_seed_count != expected_seed_count
+    {
+        campaign_diagnostic(
+            diagnostics,
+            "seed_shard_coverage_incomplete",
+            Some(lane_id),
+            format!(
+                "tier={tier:?} indexes={}/{} covered_seeds={covered_seed_count}/{expected_seed_count}",
+                indexes.len(),
+                shard_count
+            ),
+        );
+    }
+}
+
+/// Evaluate retained Turso campaign receipts against the cross-phase promotion contract.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn evaluate_turso_campaign_gate(input: &TursoCampaignGateInput) -> TursoCampaignScorecard {
+    let mut diagnostics = Vec::new();
+
+    for (field, value) in [
+        ("workflow_id", input.workflow_id.as_str()),
+        ("run_id", input.run_id.as_str()),
+        ("build_id", input.build_id.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "provenance_field_missing",
+                None,
+                format!("field={field}"),
+            );
+        }
+    }
+    if !is_lower_hex(&input.engine_sha, 40) {
+        campaign_diagnostic(
+            &mut diagnostics,
+            "engine_sha_invalid",
+            None,
+            format!("engine_sha={}", input.engine_sha),
+        );
+    }
+    if input.engine_dirty {
+        campaign_diagnostic(
+            &mut diagnostics,
+            "engine_dirty",
+            None,
+            "promotion evidence must be bound to a clean engine snapshot",
+        );
+    }
+    for (field, value) in [
+        ("contract_hash", input.contract_hash.as_str()),
+        ("profile_hash", input.profile_hash.as_str()),
+    ] {
+        if !is_lower_hex(value, 64) {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "provenance_hash_invalid",
+                None,
+                format!("field={field} value={value}"),
+            );
+        }
+    }
+
+    let required_retention_days = input
+        .promotion_stage
+        .required_tiers()
+        .last()
+        .map_or(7, |tier| tier.minimum_retention_days());
+    let mut global_gate_receipts = BTreeMap::new();
+    for receipt in &input.global_gate_receipts {
+        if global_gate_receipts.insert(receipt.gate, receipt).is_some() {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "global_gate_receipt_duplicate",
+                None,
+                format!("gate={:?}", receipt.gate),
+            );
+        }
+        if !receipt.passed {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "global_gate_failed",
+                None,
+                format!("gate={:?}", receipt.gate),
+            );
+        }
+        if receipt.command.trim().is_empty()
+            || receipt.artifact.path.trim().is_empty()
+            || !is_lower_hex(&receipt.artifact.sha256, 64)
+        {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "global_gate_provenance_invalid",
+                None,
+                format!("gate={:?}", receipt.gate),
+            );
+        }
+        if receipt.artifact.retention_days < required_retention_days {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "global_gate_retention_too_short",
+                None,
+                format!(
+                    "gate={:?} retention_days={} minimum={required_retention_days}",
+                    receipt.gate, receipt.artifact.retention_days
+                ),
+            );
+        }
+    }
+    for gate in CAMPAIGN_GLOBAL_GATES {
+        if !global_gate_receipts.contains_key(&gate) {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "global_gate_receipt_missing",
+                None,
+                format!("gate={gate:?}"),
+            );
+        }
+    }
+
+    let mut optional_by_id = BTreeMap::new();
+    for decision in &input.optional_decisions {
+        if optional_by_id
+            .insert(decision.bead_id.as_str(), decision)
+            .is_some()
+        {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "optional_decision_duplicate",
+                Some(&decision.bead_id),
+                "optional/external decision appears more than once",
+            );
+        }
+        if !TURSO_OPTIONAL_DECISIONS.contains(&decision.bead_id.as_str()) {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "optional_decision_unknown",
+                Some(&decision.bead_id),
+                "decision is not a Turso optional/external child",
+            );
+        }
+        if decision.rationale.trim().is_empty() {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "optional_decision_rationale_missing",
+                Some(&decision.bead_id),
+                "every disposition requires a bounded rationale",
+            );
+        }
+        let admission_is_consistent = match decision.disposition {
+            CampaignDisposition::Adopted => decision.admitted,
+            CampaignDisposition::Deferred
+            | CampaignDisposition::Rejected
+            | CampaignDisposition::Conditional => !decision.admitted,
+        };
+        if !admission_is_consistent {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "optional_decision_admission_invalid",
+                Some(&decision.bead_id),
+                format!(
+                    "disposition={:?} admitted={}",
+                    decision.disposition, decision.admitted
+                ),
+            );
+        }
+    }
+    for expected in TURSO_OPTIONAL_DECISIONS {
+        if !optional_by_id.contains_key(expected) {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "optional_decision_missing",
+                Some(expected),
+                "scorecard must list every optional/external child",
+            );
+        }
+    }
+
+    let mut gating_lanes = TURSO_NATIVE_LANES
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    for decision in &input.optional_decisions {
+        if decision.disposition == CampaignDisposition::Adopted && decision.admitted {
+            gating_lanes.insert(decision.bead_id.clone());
+        }
+    }
+
+    let mut sorted_runs = input.runs.clone();
+    sorted_runs.sort_by(|left, right| {
+        (left.lane_id.as_str(), left.tier, left.shard.index).cmp(&(
+            right.lane_id.as_str(),
+            right.tier,
+            right.shard.index,
+        ))
+    });
+    let mut grouped = BTreeMap::<(String, CampaignTier), Vec<&CampaignRunEvidence>>::new();
+    let mut totals = CampaignOutcomeCounts::default();
+    let mut coverage_dimensions: [BTreeSet<String>; 6] = std::array::from_fn(|_| BTreeSet::new());
+    let mut lane_accumulators =
+        BTreeMap::<String, (usize, CampaignOutcomeCounts, usize, usize)>::new();
+
+    for run in &sorted_runs {
+        if !gating_lanes.contains(&run.lane_id) {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "non_gating_lane_receipt",
+                Some(&run.lane_id),
+                "deferred, rejected, conditional, or unknown lanes cannot supply gate evidence",
+            );
+        }
+        validate_campaign_run(run, &mut diagnostics);
+        grouped
+            .entry((run.lane_id.clone(), run.tier))
+            .or_default()
+            .push(run);
+
+        if let Some(sum) = totals.checked_add(run.outcomes) {
+            totals = sum;
+        } else {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "campaign_total_overflow",
+                Some(&run.lane_id),
+                "aggregate campaign counts overflowed u64",
+            );
+        }
+
+        for value in &run.coverage.feature_ids {
+            coverage_dimensions[0].insert(value.clone());
+        }
+        for value in &run.coverage.constructs {
+            coverage_dimensions[1].insert(value.clone());
+        }
+        for value in &run.coverage.execution_lanes {
+            coverage_dimensions[2].insert(value.clone());
+        }
+        for value in &run.coverage.fault_kinds {
+            coverage_dimensions[3].insert(value.clone());
+        }
+        for value in &run.coverage.concurrency_workloads {
+            coverage_dimensions[4].insert(value.clone());
+        }
+        for value in &run.coverage.reducer_families {
+            coverage_dimensions[5].insert(value.clone());
+        }
+
+        let accumulator = lane_accumulators
+            .entry(run.lane_id.clone())
+            .or_insert_with(|| (0, CampaignOutcomeCounts::default(), 0, 0));
+        accumulator.0 += 1;
+        if let Some(sum) = accumulator.1.checked_add(run.outcomes) {
+            accumulator.1 = sum;
+        }
+        match run.history_accounting {
+            HistoryAccounting::Deterministic => accumulator.2 += 1,
+            HistoryAccounting::ObservationOnly => accumulator.3 += 1,
+            HistoryAccounting::NotApplicable => {}
+        }
+    }
+
+    for lane_id in &gating_lanes {
+        for tier in input.promotion_stage.required_tiers() {
+            let key = (lane_id.clone(), *tier);
+            match grouped.get(&key) {
+                Some(group) => validate_seed_group(lane_id, *tier, group, &mut diagnostics),
+                None => campaign_diagnostic(
+                    &mut diagnostics,
+                    "required_lane_tier_missing",
+                    Some(lane_id),
+                    format!("tier={tier:?}"),
+                ),
+            }
+        }
+    }
+
+    for (name, values) in [
+        ("feature", &coverage_dimensions[0]),
+        ("construct", &coverage_dimensions[1]),
+        ("execution_lane", &coverage_dimensions[2]),
+        ("fault", &coverage_dimensions[3]),
+        ("concurrency_workload", &coverage_dimensions[4]),
+        ("reducer_family", &coverage_dimensions[5]),
+    ] {
+        if values.is_empty() {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "coverage_dimension_missing",
+                None,
+                format!("dimension={name}"),
+            );
+        }
+    }
+
+    let drift_decision = input
+        .drift
+        .linked_contract_decision
+        .as_deref()
+        .filter(|decision| decision.starts_with("bd-") && decision.len() > 3);
+    if totals.unsupported > input.drift.baseline_unsupported && drift_decision.is_none() {
+        campaign_diagnostic(
+            &mut diagnostics,
+            "unsupported_count_drift",
+            None,
+            format!(
+                "baseline={} current={}",
+                input.drift.baseline_unsupported, totals.unsupported
+            ),
+        );
+    }
+    if totals.skipped > input.drift.baseline_skipped && drift_decision.is_none() {
+        campaign_diagnostic(
+            &mut diagnostics,
+            "skipped_count_drift",
+            None,
+            format!(
+                "baseline={} current={}",
+                input.drift.baseline_skipped, totals.skipped
+            ),
+        );
+    }
+
+    let lane_summaries = lane_accumulators
+        .into_iter()
+        .map(
+            |(
+                lane_id,
+                (run_count, outcomes, deterministic_history_runs, observation_only_history_runs),
+            )| CampaignLaneSummary {
+                lane_id,
+                run_count,
+                outcomes,
+                deterministic_history_runs,
+                observation_only_history_runs,
+            },
+        )
+        .collect();
+    let mut optional_decisions = input.optional_decisions.clone();
+    optional_decisions.sort_by(|left, right| left.bead_id.cmp(&right.bead_id));
+    let mut retained_global_gate_receipts = input.global_gate_receipts.clone();
+    retained_global_gate_receipts.sort_by_key(|receipt| receipt.gate);
+    let outcome = if diagnostics.is_empty() {
+        CampaignPromotionOutcome::Promote
+    } else {
+        CampaignPromotionOutcome::Hold
+    };
+
+    TursoCampaignScorecard {
+        schema_version: TURSO_CAMPAIGN_SCORECARD_SCHEMA_VERSION.to_owned(),
+        promotion_stage: input.promotion_stage,
+        outcome,
+        workflow_id: input.workflow_id.clone(),
+        run_id: input.run_id.clone(),
+        build_id: input.build_id.clone(),
+        engine_sha: input.engine_sha.clone(),
+        engine_dirty: input.engine_dirty,
+        contract_hash: input.contract_hash.clone(),
+        profile_hash: input.profile_hash.clone(),
+        global_gate_receipts: retained_global_gate_receipts,
+        drift: input.drift.clone(),
+        optional_decisions,
+        runs: sorted_runs,
+        totals,
+        lane_summaries,
+        diagnostics,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Threshold configuration
@@ -805,5 +1870,308 @@ mod tests {
     fn bead_id_set() {
         let report = run_default_gate();
         assert_eq!(report.bead_id, BEAD_ID);
+    }
+
+    fn campaign_optional_decisions() -> Vec<OptionalCampaignDecision> {
+        TURSO_OPTIONAL_DECISIONS
+            .into_iter()
+            .map(|bead_id| OptionalCampaignDecision {
+                bead_id: bead_id.to_owned(),
+                disposition: match bead_id {
+                    "bd-turso-test-adaptation-zu081.11" => CampaignDisposition::Rejected,
+                    "bd-turso-test-adaptation-zu081.16" => CampaignDisposition::Conditional,
+                    _ => CampaignDisposition::Deferred,
+                },
+                admitted: false,
+                rationale: format!("bounded decision for {bead_id}"),
+            })
+            .collect()
+    }
+
+    fn campaign_run(lane_id: &str, tier: CampaignTier) -> CampaignRunEvidence {
+        let history_accounting = match lane_id {
+            "bd-turso-test-adaptation-zu081.8" => HistoryAccounting::Deterministic,
+            "bd-turso-test-adaptation-zu081.9" => HistoryAccounting::ObservationOnly,
+            _ => HistoryAccounting::NotApplicable,
+        };
+        let budget_seconds = match tier {
+            CampaignTier::Presubmit => 600,
+            CampaignTier::Nightly => 3_600,
+            CampaignTier::Manual => 7_200,
+        };
+        CampaignRunEvidence {
+            lane_id: lane_id.to_owned(),
+            tier,
+            shard: CampaignSeedShard {
+                index: 0,
+                count: 1,
+                start_seed: 0,
+                end_seed_exclusive: 100,
+            },
+            expected_seed_count: 100,
+            budget_seconds,
+            elapsed_seconds: budget_seconds / 2,
+            status: CampaignRunStatus::Completed,
+            outcomes: CampaignOutcomeCounts {
+                generated: 100,
+                executed: 100,
+                ..CampaignOutcomeCounts::default()
+            },
+            coverage: CampaignCoverageDimensions {
+                feature_ids: vec!["SURF-SQL-CORE-001".to_owned()],
+                constructs: vec!["transaction".to_owned()],
+                execution_lanes: vec!["pager_backed_required".to_owned()],
+                fault_kinds: (lane_id == "bd-turso-test-adaptation-zu081.9")
+                    .then(|| "process_kill".to_owned())
+                    .into_iter()
+                    .collect(),
+                concurrency_workloads: [
+                    "bd-turso-test-adaptation-zu081.8",
+                    "bd-turso-test-adaptation-zu081.9",
+                    "bd-turso-test-adaptation-zu081.20",
+                ]
+                .contains(&lane_id)
+                .then(|| "bank_transfer".to_owned())
+                .into_iter()
+                .collect(),
+                reducer_families: [
+                    "bd-turso-test-adaptation-zu081.6",
+                    "bd-turso-test-adaptation-zu081.19",
+                    "bd-turso-test-adaptation-zu081.20",
+                ]
+                .contains(&lane_id)
+                .then(|| "canonical_minimizer".to_owned())
+                .into_iter()
+                .collect(),
+            },
+            history_accounting,
+            required_lane_evidence_verified: true,
+            public_replay_verified: true,
+            replay_command: format!("cargo test -p fsqlite-harness {lane_id}"),
+            artifacts: vec![CampaignArtifactEvidence {
+                path: format!("artifacts/{lane_id}/{tier:?}.json"),
+                sha256: "b".repeat(64),
+                retention_days: tier.minimum_retention_days(),
+            }],
+        }
+    }
+
+    fn passing_campaign_input(stage: CampaignPromotionStage) -> TursoCampaignGateInput {
+        let runs = TURSO_NATIVE_LANES
+            .into_iter()
+            .flat_map(|lane_id| {
+                stage
+                    .required_tiers()
+                    .iter()
+                    .map(move |tier| campaign_run(lane_id, *tier))
+            })
+            .collect();
+        TursoCampaignGateInput {
+            promotion_stage: stage,
+            workflow_id: "verification-gates.yml".to_owned(),
+            run_id: "run-42".to_owned(),
+            build_id: "build-42".to_owned(),
+            engine_sha: "a".repeat(40),
+            engine_dirty: false,
+            contract_hash: "c".repeat(64),
+            profile_hash: "d".repeat(64),
+            global_gate_receipts: CAMPAIGN_GLOBAL_GATES
+                .into_iter()
+                .map(|gate| CampaignGlobalGateReceipt {
+                    gate,
+                    passed: true,
+                    command: format!("verify {gate:?}"),
+                    artifact: CampaignArtifactEvidence {
+                        path: format!("artifacts/global/{gate:?}.log"),
+                        sha256: "e".repeat(64),
+                        retention_days: stage
+                            .required_tiers()
+                            .last()
+                            .map_or(7, |tier| tier.minimum_retention_days()),
+                    },
+                })
+                .collect(),
+            drift: CampaignDriftControl {
+                baseline_unsupported: 0,
+                baseline_skipped: 0,
+                linked_contract_decision: None,
+            },
+            optional_decisions: campaign_optional_decisions(),
+            runs,
+        }
+    }
+
+    fn campaign_diagnostic_codes(scorecard: &TursoCampaignScorecard) -> Vec<&str> {
+        scorecard
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn turso_release_scorecard_promotes_complete_retained_evidence() {
+        let input = passing_campaign_input(CampaignPromotionStage::Release);
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        assert_eq!(scorecard.outcome, CampaignPromotionOutcome::Promote);
+        assert!(scorecard.diagnostics.is_empty());
+        assert_eq!(scorecard.lane_summaries.len(), TURSO_NATIVE_LANES.len());
+        assert_eq!(
+            scorecard.optional_decisions.len(),
+            TURSO_OPTIONAL_DECISIONS.len()
+        );
+        assert_eq!(scorecard.totals.generated, 1_800);
+
+        let json = scorecard.to_json().expect("serialize scorecard");
+        let restored = TursoCampaignScorecard::from_json(&json).expect("restore scorecard");
+        assert_eq!(restored, scorecard);
+        assert_eq!(
+            scorecard.render_bounded_summary().lines().count(),
+            scorecard.lane_summaries.len() + 1
+        );
+    }
+
+    #[test]
+    fn turso_scorecard_rejects_count_imbalance_and_timeout_as_pass() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        input.runs[0].outcomes.executed = 98;
+        input.runs[0].outcomes.timed_out = 1;
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        let codes = campaign_diagnostic_codes(&scorecard);
+        assert_eq!(scorecard.outcome, CampaignPromotionOutcome::Hold);
+        assert!(codes.contains(&"outcome_count_imbalance"));
+        assert!(codes.contains(&"timeout_is_not_pass"));
+    }
+
+    #[test]
+    fn turso_scorecard_accepts_nonzero_seed_range_origins() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        input.runs[0].shard.start_seed = 4_200;
+        input.runs[0].shard.end_seed_exclusive = 4_300;
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        assert_eq!(scorecard.outcome, CampaignPromotionOutcome::Promote);
+    }
+
+    #[test]
+    fn turso_scorecard_rejects_seed_gaps_and_count_mismatch() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        let mut second_shard = input.runs[0].clone();
+        input.runs[0].shard = CampaignSeedShard {
+            index: 0,
+            count: 2,
+            start_seed: 4_200,
+            end_seed_exclusive: 4_250,
+        };
+        input.runs[0].outcomes.generated = 50;
+        input.runs[0].outcomes.executed = 50;
+        second_shard.shard = CampaignSeedShard {
+            index: 1,
+            count: 2,
+            start_seed: 4_251,
+            end_seed_exclusive: 4_301,
+        };
+        second_shard.outcomes.generated = 49;
+        second_shard.outcomes.executed = 49;
+        input.runs.push(second_shard);
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        let codes = campaign_diagnostic_codes(&scorecard);
+        assert!(codes.contains(&"seed_shard_gap_or_overlap"));
+        assert!(codes.contains(&"seed_shard_outcome_count_mismatch"));
+    }
+
+    #[test]
+    fn turso_scorecard_requires_linked_decision_for_skip_drift() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        input.runs[0].outcomes.executed = 98;
+        input.runs[0].outcomes.unsupported = 1;
+        input.runs[0].outcomes.skipped = 1;
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        let codes = campaign_diagnostic_codes(&scorecard);
+        assert!(codes.contains(&"unsupported_count_drift"));
+        assert!(codes.contains(&"skipped_count_drift"));
+
+        input.drift.linked_contract_decision = Some("bd-contract-decision".to_owned());
+        let approved = evaluate_turso_campaign_gate(&input);
+        assert_eq!(approved.outcome, CampaignPromotionOutcome::Promote);
+    }
+
+    #[test]
+    fn turso_scorecard_never_promotes_cancelled_or_incomplete_exploration() {
+        for status in [
+            CampaignRunStatus::Cancelled,
+            CampaignRunStatus::BudgetExhausted,
+            CampaignRunStatus::IncompleteExploration,
+        ] {
+            let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+            input.runs[0].status = status;
+            let scorecard = evaluate_turso_campaign_gate(&input);
+            assert_eq!(scorecard.outcome, CampaignPromotionOutcome::Hold);
+            assert!(campaign_diagnostic_codes(&scorecard).contains(&"campaign_incomplete"));
+        }
+    }
+
+    #[test]
+    fn turso_scorecard_only_gates_admitted_optional_lanes() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        let deferred = evaluate_turso_campaign_gate(&input);
+        assert_eq!(deferred.outcome, CampaignPromotionOutcome::Promote);
+
+        input.optional_decisions[0].disposition = CampaignDisposition::Adopted;
+        input.optional_decisions[0].admitted = true;
+        let adopted_without_evidence = evaluate_turso_campaign_gate(&input);
+        assert_eq!(
+            adopted_without_evidence.outcome,
+            CampaignPromotionOutcome::Hold
+        );
+        assert!(
+            campaign_diagnostic_codes(&adopted_without_evidence)
+                .contains(&"required_lane_tier_missing")
+        );
+    }
+
+    #[test]
+    fn turso_scorecard_requires_artifact_replay_and_global_invariants() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        input
+            .global_gate_receipts
+            .iter_mut()
+            .find(|receipt| receipt.gate == CampaignGlobalGate::NoTokioDependency)
+            .expect("no-Tokio gate receipt")
+            .passed = false;
+        input
+            .global_gate_receipts
+            .iter_mut()
+            .find(|receipt| receipt.gate == CampaignGlobalGate::ConcurrentWriterDefaults)
+            .expect("concurrent-default gate receipt")
+            .passed = false;
+        input.runs[0].public_replay_verified = false;
+        input.runs[0].artifacts[0].retention_days = 0;
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        let codes = campaign_diagnostic_codes(&scorecard);
+        assert!(codes.contains(&"global_gate_failed"));
+        assert!(codes.contains(&"public_replay_missing"));
+        assert!(codes.contains(&"artifact_retention_too_short"));
+    }
+
+    #[test]
+    fn turso_scorecard_separates_deterministic_and_observation_only_histories() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        let deterministic = input
+            .runs
+            .iter_mut()
+            .find(|run| run.lane_id == "bd-turso-test-adaptation-zu081.8")
+            .expect("deterministic history run");
+        deterministic.history_accounting = HistoryAccounting::ObservationOnly;
+        let multiprocess = input
+            .runs
+            .iter_mut()
+            .find(|run| run.lane_id == "bd-turso-test-adaptation-zu081.9")
+            .expect("multiprocess history run");
+        multiprocess.history_accounting = HistoryAccounting::Deterministic;
+
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        let codes = campaign_diagnostic_codes(&scorecard);
+        assert!(codes.contains(&"production_history_not_deterministic"));
+        assert!(codes.contains(&"multiprocess_history_misclassified"));
     }
 }

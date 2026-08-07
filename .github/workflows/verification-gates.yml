@@ -96,6 +96,107 @@ jobs:
           path: artifacts/backlog-quality-gate-e2e/
           retention-days: 21
 
+  turso-campaign-promotion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: never
+      TURSO_PROMOTION_STAGE: ${{ github.event_name == 'workflow_dispatch' && 'release' || github.event_name == 'schedule' && 'nightly' || 'presubmit' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Cache Turso campaign build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: turso-campaign-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            turso-campaign-${{ runner.os }}-
+
+      - name: Run bounded Turso promotion and replay smokes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/turso-campaign
+
+          cargo test --locked -p fsqlite-harness --lib \
+            ci_coverage_gate::tests::turso_ -- --test-threads=1 \
+            2>&1 | tee artifacts/turso-campaign/scorecard-contract.log
+          cargo check --locked -p fsqlite-harness --bin turso_campaign_gate \
+            2>&1 | tee artifacts/turso-campaign/scorecard-cli.log
+          cat > artifacts/turso-campaign/hold-input.json <<JSON
+          {
+            "promotion_stage": "${TURSO_PROMOTION_STAGE}",
+            "workflow_id": "${GITHUB_WORKFLOW}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "build_id": "${GITHUB_RUN_ATTEMPT}",
+            "engine_sha": "${GITHUB_SHA}",
+            "engine_dirty": false,
+            "contract_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "profile_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "global_gate_receipts": [],
+            "drift": {
+              "baseline_unsupported": 0,
+              "baseline_skipped": 0,
+              "linked_contract_decision": null
+            },
+            "optional_decisions": [],
+            "runs": []
+          }
+          JSON
+          if cargo run --locked -p fsqlite-harness --bin turso_campaign_gate -- \
+            --input artifacts/turso-campaign/hold-input.json \
+            --output artifacts/turso-campaign/hold-scorecard.json \
+            2>&1 | tee artifacts/turso-campaign/scorecard-hold.log; then
+            echo "incomplete promotion input unexpectedly passed" >&2
+            exit 1
+          fi
+          jq -e '.outcome == "hold" and (.diagnostics | length > 0)' \
+            artifacts/turso-campaign/hold-scorecard.json >/dev/null
+
+          cargo test --locked -p fsqlite-harness --lib \
+            differential_runner::tests::typed_divergence_bundles_replays_minimizes_and_promotes_fail_closed \
+            -- --exact --test-threads=1 \
+            2>&1 | tee artifacts/turso-campaign/typed-differential-replay.log
+          cargo test --locked -p fsqlite-harness --lib \
+            differential_runner::tests::structured_typed_reduction_bundles_replays_and_promotes_clean_process \
+            -- --exact --test-threads=1 \
+            2>&1 | tee artifacts/turso-campaign/sql-reduction.log
+          cargo test --locked -p fsqlite-harness \
+            --test bd_turso_test_adaptation_zu081_8_lab_history \
+            -- --test-threads=1 \
+            2>&1 | tee artifacts/turso-campaign/production-history.log
+          cargo test --locked -p fsqlite-harness \
+            --test bd_turso_test_adaptation_zu081_19_history_reduction \
+            -- --test-threads=1 \
+            2>&1 | tee artifacts/turso-campaign/history-reduction.log
+          cargo test --locked -p fsqlite-e2e --test seed_reproducibility \
+            stateful_operation_plan -- --test-threads=1 \
+            2>&1 | tee artifacts/turso-campaign/stateful-plan.log
+          cargo test --locked -p fsqlite-e2e --test bd_073kf_swarm_harness \
+            p6_recovery_smoke_classifies_precommit_and_acknowledged_kills \
+            -- --exact --test-threads=1 \
+            2>&1 | tee artifacts/turso-campaign/multiprocess-recovery.log
+
+          sha256sum artifacts/turso-campaign/*.log \
+            > artifacts/turso-campaign/sha256sums.txt
+
+      - name: Upload Turso promotion receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turso-campaign-promotion-${{ github.event_name }}-${{ github.run_id }}
+          path: artifacts/turso-campaign/
+          if-no-files-found: warn
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && 90 || 30 }}
+
   differential-ci-smoke:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
