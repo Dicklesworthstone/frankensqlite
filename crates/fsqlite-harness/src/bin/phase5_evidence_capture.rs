@@ -16,8 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fsqlite_harness::performance_release_admission::{
-    AdmissionPackReference, ArtifactDigest, PerformanceAdmissionGate, PerformanceAdmissionPack,
-    blocked_missing_authoritative_policy, validate_pack as validate_performance_admission_pack,
+    AdmissionPackReference, PerformanceAdmissionGate, PerformanceAdmissionPack,
+    blocked_missing_authoritative_policy,
+    validate_pack_at as validate_performance_admission_pack_at,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -679,105 +680,56 @@ fn stage_performance_admission(
     if !input.is_absolute() || !input.is_dir() {
         return Err("--performance-admission-pack-dir must name an absolute directory".to_owned());
     }
-    let pack_bytes = fs::read(input.join("admission-pack.json"))
-        .map_err(|error| format!("unable to read admission-pack.json: {error}"))?;
-    let mut pack: PerformanceAdmissionPack = serde_json::from_slice(&pack_bytes)
+    let pack_source = admission_input_path(input, "admission-pack.json")?;
+    let pack_bytes = read_regular(&pack_source)?;
+    let pack: PerformanceAdmissionPack = serde_json::from_slice(&pack_bytes)
         .map_err(|error| format!("invalid admission-pack.json: {error}"))?;
+    validate_performance_admission_pack_at(root, input, tested_commit, &pack, false)?;
+
+    let mut artifacts = vec![
+        &pack.policy,
+        &pack.calibration_receipt,
+        &pack.sensitivity_receipt,
+    ];
+    for candidate in [&pack.baseline, &pack.tested] {
+        for profile in &candidate.profiles {
+            artifacts.push(&profile.raw_report);
+            artifacts.push(&profile.raw_manifest);
+        }
+    }
+    let mut declared_paths = BTreeSet::new();
+    for artifact in &artifacts {
+        if artifact.path == "admission-pack.json" || !declared_paths.insert(&artifact.path) {
+            return Err(
+                "admission pack artifact paths must be unique and must not replace the pack"
+                    .to_owned(),
+            );
+        }
+    }
+
     let staging_dir = root.join(format!("{namespace}/performance-admission"));
     fs::create_dir(&staging_dir)
         .map_err(|error| format!("could not create {}: {error}", staging_dir.display()))?;
     let mut leaves = Vec::new();
-    let mut index = 0_usize;
-    let mut next_target = |source_path: &str| -> Result<String, String> {
-        let file_name = Path::new(source_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| "admission artifact name is not UTF-8".to_owned())?;
-        let target = format!("{namespace}/performance-admission/{index:02}-{file_name}");
-        index += 1;
-        Ok(target)
-    };
-    let mut stage_bytes =
-        |artifact: &mut ArtifactDigest, target: String, bytes: Vec<u8>| -> Result<(), String> {
-            let leaf = write_raw_new(root, &target, &bytes)?;
-            artifact.path = target;
-            artifact.sha256 = sha256_bytes(&bytes);
-            artifact.digest_algorithm = SHA256_ALGORITHM.to_owned();
-            leaves.push(leaf);
-            Ok(())
-        };
-    let policy_source = admission_input_path(input, &pack.policy.path)?;
-    let policy_target = next_target(&pack.policy.path)?;
-    stage_bytes(
-        &mut pack.policy,
-        policy_target,
-        read_regular(&policy_source)?,
-    )?;
-    for candidate in [&mut pack.baseline, &mut pack.tested] {
-        for profile in &mut candidate.profiles {
-            let report_source = admission_input_path(input, &profile.raw_report.path)?;
-            let manifest_source = admission_input_path(input, &profile.raw_manifest.path)?;
-            let report_target = next_target(&profile.raw_report.path)?;
-            let manifest_target = next_target(&profile.raw_manifest.path)?;
-            let mut report: Value = serde_json::from_slice(&read_regular(&report_source)?)
-                .map_err(|error| format!("invalid typed measurement report: {error}"))?;
-            report
-                .as_object_mut()
-                .ok_or_else(|| "typed measurement report must be a JSON object".to_owned())?
-                .insert(
-                    "raw_manifest_path".to_owned(),
-                    Value::String(manifest_target.clone()),
-                );
-            let report_bytes = serde_json::to_vec_pretty(&report)
-                .map_err(|error| format!("serialize staged measurement report: {error}"))?;
-            stage_bytes(&mut profile.raw_report, report_target, report_bytes)?;
-            let mut manifest: Value = serde_json::from_slice(&read_regular(&manifest_source)?)
-                .map_err(|error| format!("invalid typed measurement manifest: {error}"))?;
-            manifest
-                .as_object_mut()
-                .ok_or_else(|| "typed measurement manifest must be a JSON object".to_owned())?
-                .insert(
-                    "raw_report_sha256".to_owned(),
-                    Value::String(profile.raw_report.sha256.clone()),
-                );
-            let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-                .map_err(|error| format!("serialize staged measurement manifest: {error}"))?;
-            stage_bytes(&mut profile.raw_manifest, manifest_target, manifest_bytes)?;
-        }
-    }
-    let manifest_bindings = [&pack.baseline, &pack.tested]
-        .into_iter()
-        .zip(["baseline", "tested"])
-        .flat_map(|(candidate, side)| {
-            candidate.profiles.iter().map(move |profile| {
-                serde_json::json!({
-                    "side": side,
-                    "profile": profile.profile.clone(),
-                    "manifest_sha256": profile.raw_manifest.sha256.clone(),
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    for receipt in [&mut pack.calibration_receipt, &mut pack.sensitivity_receipt] {
-        let source = admission_input_path(input, &receipt.path)?;
-        let target = next_target(&receipt.path)?;
-        let mut document: Value = serde_json::from_slice(&read_regular(&source)?)
-            .map_err(|error| format!("invalid typed admission receipt: {error}"))?;
-        document
-            .as_object_mut()
-            .ok_or_else(|| "typed admission receipt must be a JSON object".to_owned())?
-            .insert(
-                "manifest_bindings".to_owned(),
-                Value::Array(manifest_bindings.clone()),
-            );
-        let bytes = serde_json::to_vec_pretty(&document)
-            .map_err(|error| format!("serialize staged admission receipt: {error}"))?;
-        stage_bytes(receipt, target, bytes)?;
+    for artifact in artifacts {
+        let source = admission_input_path(input, &artifact.path)?;
+        let target = format!("{namespace}/performance-admission/{}", artifact.path);
+        let target_parent = root
+            .join(&target)
+            .parent()
+            .ok_or_else(|| "staged admission artifact has no parent".to_owned())?
+            .to_owned();
+        fs::create_dir_all(&target_parent).map_err(|error| {
+            format!(
+                "could not create staged admission directory {}: {error}",
+                target_parent.display()
+            )
+        })?;
+        leaves.push(write_raw_new(root, &target, &read_regular(&source)?)?);
     }
     let pack_path = format!("{namespace}/performance-admission/admission-pack.json");
-    let rewritten = serde_json::to_vec_pretty(&pack).map_err(|error| error.to_string())?;
-    let pack_leaf = write_raw_new(root, &pack_path, &rewritten)?;
-    validate_performance_admission_pack(root, tested_commit, &pack, false)?;
+    let pack_leaf = write_raw_new(root, &pack_path, &pack_bytes)?;
+    validate_performance_admission_pack_at(root, &staging_dir, tested_commit, &pack, false)?;
     leaves.push(pack_leaf);
     Ok(StagedPerformanceAdmission {
         gate: PerformanceAdmissionGate {
@@ -790,7 +742,7 @@ fn stage_performance_admission(
                 .to_owned(),
             admission_pack: Some(AdmissionPackReference {
                 path: pack_path,
-                sha256: sha256_bytes(&rewritten),
+                sha256: sha256_bytes(&pack_bytes),
             }),
         },
         leaves,
@@ -809,7 +761,22 @@ fn admission_input_path(input: &Path, declared: &str) -> Result<PathBuf, String>
             "admission input artifact paths must be non-empty normal relative paths".to_owned(),
         );
     }
-    Ok(input.join(relative))
+    let canonical_input = input
+        .canonicalize()
+        .map_err(|error| format!("unable to canonicalize admission input root: {error}"))?;
+    let joined = canonical_input.join(relative);
+    let metadata = fs::symlink_metadata(&joined)
+        .map_err(|error| format!("unable to inspect admission input artifact: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("admission input artifacts must not be symlinks".to_owned());
+    }
+    let canonical = joined
+        .canonicalize()
+        .map_err(|error| format!("unable to canonicalize admission input artifact: {error}"))?;
+    if !canonical.starts_with(&canonical_input) {
+        return Err("admission input artifact resolves outside its canonical root".to_owned());
+    }
+    Ok(canonical)
 }
 
 fn repository_root() -> Result<PathBuf, String> {
@@ -2902,14 +2869,114 @@ fn prepare_external_baseline_root(
 mod tests {
     use super::{
         AdoptedRchJob, BUILD_SHAPING_ENV_EXACT, PackKind, PersistentCitationIdentity,
-        PersistentCriterion, PersistentProfile, PersistentWorkload, adopt_active_job,
-        completed_status_matches, external_pack_source_names, is_build_shaping_env,
-        missing_adopted_job_error, parallel_map_ordered, parse_options, parse_single_worker,
-        parse_worker_pool, pin_adopted_job, strict_rch_command, validate_cargo_profile_binding,
-        validate_persistent_citation_receipt, validate_persistent_profile_pairing,
-        validate_remote_target_mapping,
+        PersistentCriterion, PersistentProfile, PersistentWorkload, admission_input_path,
+        adopt_active_job, completed_status_matches, external_pack_source_names,
+        is_build_shaping_env, missing_adopted_job_error, parallel_map_ordered, parse_options,
+        parse_single_worker, parse_worker_pool, pin_adopted_job, strict_rch_command,
+        validate_cargo_profile_binding, validate_persistent_citation_receipt,
+        validate_persistent_profile_pairing, validate_remote_target_mapping,
     };
     use serde_json::Value;
+
+    use fsqlite_harness::performance_release_admission::{
+        ArtifactDigest, CandidateProvenance, PerformanceAdmissionPack,
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_input_rejects_symlinked_parent_escape() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("report.json"), b"outside").expect("outside report");
+        symlink(outside.path(), root.path().join("nested")).expect("symlinked parent");
+        assert!(
+            admission_input_path(root.path(), "nested/report.json")
+                .expect_err("ancestor symlink escape must fail")
+                .contains("outside its canonical root")
+        );
+    }
+
+    #[test]
+    fn staging_rejects_unvalidated_pack_before_writing() {
+        use std::fs;
+
+        fn git(root: &std::path::Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .expect("git output")
+                .trim()
+                .to_owned()
+        }
+
+        let root = tempfile::tempdir().expect("root");
+        git(root.path(), &["init", "--initial-branch=main"]);
+        git(root.path(), &["config", "user.name", "Keeper"]);
+        git(
+            root.path(),
+            &["config", "user.email", "keeper@example.invalid"],
+        );
+        fs::write(root.path().join("b"), b"b").expect("baseline file");
+        git(root.path(), &["add", "b"]);
+        git(root.path(), &["commit", "-m", "baseline"]);
+        let baseline = git(root.path(), &["rev-parse", "HEAD"]);
+        fs::write(root.path().join("t"), b"t").expect("tested file");
+        git(root.path(), &["add", "t"]);
+        git(root.path(), &["commit", "-m", "tested"]);
+        let tested = git(root.path(), &["rev-parse", "HEAD"]);
+
+        let input = tempfile::tempdir().expect("input");
+        let digest = ArtifactDigest {
+            path: "missing.json".to_owned(),
+            digest_algorithm: "sha2-256".to_owned(),
+            sha256: "0".repeat(64),
+        };
+        let pack = PerformanceAdmissionPack {
+            schema_version: "fsqlite.performance_release_admission_pack.v2".to_owned(),
+            baseline: CandidateProvenance {
+                source_commit: baseline,
+                host_fingerprint_sha256: "a".repeat(64),
+                toolchain_sha256: "b".repeat(64),
+                profiles: Vec::new(),
+            },
+            tested: CandidateProvenance {
+                source_commit: tested.clone(),
+                host_fingerprint_sha256: "a".repeat(64),
+                toolchain_sha256: "b".repeat(64),
+                profiles: Vec::new(),
+            },
+            policy: digest.clone(),
+            calibration_receipt: digest.clone(),
+            sensitivity_receipt: digest,
+            synthetic_fixture: false,
+        };
+        fs::write(
+            input.path().join("admission-pack.json"),
+            serde_json::to_vec(&pack).expect("serialize pack"),
+        )
+        .expect("write pack");
+        let namespace = "tests/artifacts/release-evidence/keeper";
+        assert!(
+            super::stage_performance_admission(root.path(), input.path(), namespace, &tested)
+                .expect_err("unvalidated pack must fail")
+                .contains("profiles must be exactly")
+        );
+        assert!(
+            !root
+                .path()
+                .join(format!("{namespace}/performance-admission"))
+                .exists(),
+            "capture must validate before creating staged evidence"
+        );
+    }
 
     #[test]
     fn capture_options_require_distinct_release_and_release_perf_packs() {
