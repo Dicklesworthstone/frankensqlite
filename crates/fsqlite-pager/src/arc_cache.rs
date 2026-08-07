@@ -3200,10 +3200,10 @@ mod tests {
                     cache.admit(key, page(key, 4096), lookup);
                 }
 
-                if op % 17 == 0 {
-                    if let Some(page) = cache.get(&key) {
-                        page.pin();
-                    }
+                if op % 17 == 0
+                    && let Some(page) = cache.get(&key)
+                {
+                    page.pin();
                 }
 
                 if op % 17 == 5 {

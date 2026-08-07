@@ -1410,7 +1410,7 @@ mod tests {
             }
             _ => {
                 // Adversarial mixed: periodic scans plus hot-set churn.
-                if step % 9 == 0 {
+                if step.is_multiple_of(9) {
                     1 + ((step_u32 / 9) % bounded_domain)
                 } else {
                     1 + (u32::from(raw) % hot_domain)
@@ -1769,14 +1769,15 @@ mod tests {
             }
 
             let mut metadata_ops = 1_usize;
-            let mut evicted = false;
-            if self.queue.len() >= self.capacity {
-                if let Some(victim) = self.queue.pop_front() {
-                    let _ = self.members.remove(&victim);
-                    metadata_ops = metadata_ops.saturating_add(2);
-                    evicted = true;
-                }
-            }
+            let evicted = if self.queue.len() >= self.capacity
+                && let Some(victim) = self.queue.pop_front()
+            {
+                let _ = self.members.remove(&victim);
+                metadata_ops = metadata_ops.saturating_add(2);
+                true
+            } else {
+                false
+            };
             self.queue.push_back(page_id);
             let _ = self.members.insert(page_id);
             metadata_ops = metadata_ops.saturating_add(2);
@@ -1924,7 +1925,7 @@ mod tests {
     fn sweep_capacity_pages(domain_pages: usize, percent: usize) -> usize {
         let scaled = domain_pages.saturating_mul(percent);
         let mut pages = scaled / 100;
-        if scaled % 100 != 0 {
+        if !scaled.is_multiple_of(100) {
             pages = pages.saturating_add(1);
         }
         pages.max(1)
@@ -2178,10 +2179,10 @@ mod tests {
             std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| String::from("target"));
         let mut path = std::path::PathBuf::from(target_dir);
         path.push("s3_fifo_benchmark_report.md");
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                panic!("failed to create benchmark report directory: {error}");
-            }
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            panic!("failed to create benchmark report directory: {error}");
         }
         if let Err(error) = std::fs::write(&path, report) {
             panic!("failed to write benchmark report: {error}");
