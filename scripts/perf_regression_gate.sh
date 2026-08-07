@@ -2050,13 +2050,11 @@ def v8_run():
         "release_eligible": False,
         "performance_admission": {
             "schema_version": "fsqlite.performance_release_admission.v2",
-            "status": "blocked_legacy_v9_report_and_missing_authoritative_policy",
+            "status": "blocked_missing_authoritative_performance_policy",
             "release_authorized": False,
-            "blockers": [
-                "legacy_v9_report_not_authorizing",
-                "missing_authoritative_performance_policy",
-            ],
-            "rationale": "The v9 analyzer is diagnostic-only. It cannot provide the immutable provenance-bound B/T admission pack required by the v2 release contract, and no authoritative acceptance policy artifact is currently supplied.",
+            "blockers": ["missing_authoritative_performance_policy"],
+            "rationale": "No authoritative acceptance policy artifact is available. The v9 analyzer is diagnostic-only and cannot authorize a release. A v2 authorization requires an immutable B/T pack with non-v9 reports, policy, raw evidence, calibration, and sensitivity receipts.",
+            "admission_pack": None,
         },
         "absolute_comparisons": comparisons,
         "scaling_comparisons": scaling_comparisons,

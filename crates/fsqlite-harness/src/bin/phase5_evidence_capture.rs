@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -16,7 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fsqlite_harness::performance_release_admission::{
-    PerformanceAdmissionGate, blocked_missing_authoritative_policy,
+    AdmissionPackReference, ArtifactDigest, PerformanceAdmissionGate, PerformanceAdmissionPack,
+    blocked_missing_authoritative_policy, validate_pack as validate_performance_admission_pack,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,7 +32,7 @@ const MANIFEST_NAME: &str = "manifest.json";
 const BASELINE: &str = "tests/regression_baseline.json";
 const GUARD_LOCATOR: &str = "crates/fsqlite-harness/tests/phase5_regression_guard.rs::phase5_regression_guard_full_workspace_against_baseline";
 const MAX_CAPTURE_WORKERS: usize = 2;
-const USAGE: &str = "usage: phase5_evidence_capture (--plan | --baseline-only --baseline-output-dir <absolute-external-dir> | --output <tests/artifacts/release-evidence/<commit>/manifest.json> --c1-pack-dir <absolute-external-dir> --persistent-release-pack-dir <absolute-external-dir> --persistent-release-perf-pack-dir <absolute-external-dir>) [--tested-commit <40-hex>]";
+const USAGE: &str = "usage: phase5_evidence_capture (--plan | --baseline-only --baseline-output-dir <absolute-external-dir> | --output <tests/artifacts/release-evidence/<commit>/manifest.json> --c1-pack-dir <absolute-external-dir> --persistent-release-pack-dir <absolute-external-dir> --persistent-release-perf-pack-dir <absolute-external-dir> [--performance-admission-pack-dir <absolute-external-dir>]) [--tested-commit <40-hex>]";
 
 #[derive(Debug, Deserialize)]
 struct Baseline {
@@ -211,6 +212,7 @@ struct Options {
     c1_pack_dir: Option<PathBuf>,
     persistent_release_pack_dir: Option<PathBuf>,
     persistent_release_perf_pack_dir: Option<PathBuf>,
+    performance_admission_pack_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -230,6 +232,11 @@ struct ValidatedPackInputs {
     persistent_release_perf_scorecard: Vec<u8>,
     persistent_release_perf_manifest: Vec<u8>,
     persistent_release_perf_provenance: Vec<u8>,
+}
+
+struct StagedPerformanceAdmission {
+    gate: PerformanceAdmissionGate,
+    leaves: Vec<EvidenceLeaf>,
 }
 
 #[derive(Debug)]
@@ -305,6 +312,7 @@ fn run() -> Result<(), String> {
     let persistent_release_perf_pack_dir = options
         .persistent_release_perf_pack_dir
         .ok_or_else(|| format!("missing --persistent-release-perf-pack-dir; {USAGE}"))?;
+    let performance_admission_pack_dir = options.performance_admission_pack_dir;
     let namespace = expected_namespace(&tested_commit);
     if output != format!("{namespace}/{MANIFEST_NAME}") {
         return Err(format!("--output must be `{namespace}/{MANIFEST_NAME}`"));
@@ -323,6 +331,10 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "phase-5 worker pool unexpectedly resolved empty".to_owned())?;
     let namespace_path = root.join(&namespace);
     prepare_evidence_namespace(&namespace_path, &namespace)?;
+    let staged_performance_admission = performance_admission_pack_dir
+        .as_deref()
+        .map(|directory| stage_performance_admission(&root, directory, &namespace, &tested_commit))
+        .transpose()?;
 
     let c1_scorecard = write_raw_new(
         &root,
@@ -527,7 +539,11 @@ fn run() -> Result<(), String> {
                 },
             },
         },
-        performance_regression_gate: blocked_missing_authoritative_policy(),
+        performance_regression_gate: staged_performance_admission
+            .as_ref()
+            .map_or_else(blocked_missing_authoritative_policy, |staged| {
+                staged.gate.clone()
+            }),
         evidence_pack: Vec::new(),
     };
     let manifest_path = format!("{namespace}/{MANIFEST_NAME}");
@@ -546,6 +562,10 @@ fn run() -> Result<(), String> {
     let mut manifest = provisional;
     manifest.signer_attestation = signing_leaf;
     manifest.evidence_pack = evidence_pack(&root, &manifest, &compiler_runs, &inventory_evidence)?;
+    if let Some(staged) = staged_performance_admission {
+        manifest.evidence_pack.extend(staged.leaves);
+        manifest.evidence_pack.sort();
+    }
     write_json_new(&root, &manifest_path, &manifest)?;
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({"manifest": manifest_path, "tested_commit": tested_commit, "runs": manifest.run_receipts.len(), "signature": manifest.signature_path})).map_err(|error| error.to_string())?);
     Ok(())
@@ -560,6 +580,7 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
     let mut c1_pack_dir = None;
     let mut persistent_release_pack_dir = None;
     let mut persistent_release_perf_pack_dir = None;
+    let mut performance_admission_pack_dir = None;
     let mut iter = arguments.iter().skip(1);
     while let Some(flag) = iter.next() {
         match flag.as_str() {
@@ -602,6 +623,12 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
                         format!("missing value after --persistent-release-perf-pack-dir; {USAGE}")
                     })?));
             }
+            "--performance-admission-pack-dir" if performance_admission_pack_dir.is_none() => {
+                performance_admission_pack_dir =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        format!("missing value after --performance-admission-pack-dir; {USAGE}")
+                    })?));
+            }
             _ => return Err(format!("unrecognized or duplicate `{flag}`; {USAGE}")),
         }
     }
@@ -625,7 +652,8 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         && output.is_none()
         && c1_pack_dir.is_none()
         && persistent_release_pack_dir.is_none()
-        && persistent_release_perf_pack_dir.is_none();
+        && persistent_release_perf_pack_dir.is_none()
+        && performance_admission_pack_dir.is_none();
     if modes != 1 || !(baseline_shape || capture_shape || plan_shape) {
         return Err(USAGE.to_owned());
     }
@@ -638,7 +666,150 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         c1_pack_dir,
         persistent_release_pack_dir,
         persistent_release_perf_pack_dir,
+        performance_admission_pack_dir,
     })
+}
+
+fn stage_performance_admission(
+    root: &Path,
+    input: &Path,
+    namespace: &str,
+    tested_commit: &str,
+) -> Result<StagedPerformanceAdmission, String> {
+    if !input.is_absolute() || !input.is_dir() {
+        return Err("--performance-admission-pack-dir must name an absolute directory".to_owned());
+    }
+    let pack_bytes = fs::read(input.join("admission-pack.json"))
+        .map_err(|error| format!("unable to read admission-pack.json: {error}"))?;
+    let mut pack: PerformanceAdmissionPack = serde_json::from_slice(&pack_bytes)
+        .map_err(|error| format!("invalid admission-pack.json: {error}"))?;
+    let staging_dir = root.join(format!("{namespace}/performance-admission"));
+    fs::create_dir(&staging_dir)
+        .map_err(|error| format!("could not create {}: {error}", staging_dir.display()))?;
+    let mut leaves = Vec::new();
+    let mut index = 0_usize;
+    let mut next_target = |source_path: &str| -> Result<String, String> {
+        let file_name = Path::new(source_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "admission artifact name is not UTF-8".to_owned())?;
+        let target = format!("{namespace}/performance-admission/{index:02}-{file_name}");
+        index += 1;
+        Ok(target)
+    };
+    let mut stage_bytes =
+        |artifact: &mut ArtifactDigest, target: String, bytes: Vec<u8>| -> Result<(), String> {
+            let leaf = write_raw_new(root, &target, &bytes)?;
+            artifact.path = target;
+            artifact.sha256 = sha256_bytes(&bytes);
+            artifact.digest_algorithm = SHA256_ALGORITHM.to_owned();
+            leaves.push(leaf);
+            Ok(())
+        };
+    let policy_source = admission_input_path(input, &pack.policy.path)?;
+    let policy_target = next_target(&pack.policy.path)?;
+    stage_bytes(
+        &mut pack.policy,
+        policy_target,
+        read_regular(&policy_source)?,
+    )?;
+    for candidate in [&mut pack.baseline, &mut pack.tested] {
+        for profile in &mut candidate.profiles {
+            let report_source = admission_input_path(input, &profile.raw_report.path)?;
+            let manifest_source = admission_input_path(input, &profile.raw_manifest.path)?;
+            let report_target = next_target(&profile.raw_report.path)?;
+            let manifest_target = next_target(&profile.raw_manifest.path)?;
+            let mut report: Value = serde_json::from_slice(&read_regular(&report_source)?)
+                .map_err(|error| format!("invalid typed measurement report: {error}"))?;
+            report
+                .as_object_mut()
+                .ok_or_else(|| "typed measurement report must be a JSON object".to_owned())?
+                .insert(
+                    "raw_manifest_path".to_owned(),
+                    Value::String(manifest_target.clone()),
+                );
+            let report_bytes = serde_json::to_vec_pretty(&report)
+                .map_err(|error| format!("serialize staged measurement report: {error}"))?;
+            stage_bytes(&mut profile.raw_report, report_target, report_bytes)?;
+            let mut manifest: Value = serde_json::from_slice(&read_regular(&manifest_source)?)
+                .map_err(|error| format!("invalid typed measurement manifest: {error}"))?;
+            manifest
+                .as_object_mut()
+                .ok_or_else(|| "typed measurement manifest must be a JSON object".to_owned())?
+                .insert(
+                    "raw_report_sha256".to_owned(),
+                    Value::String(profile.raw_report.sha256.clone()),
+                );
+            let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+                .map_err(|error| format!("serialize staged measurement manifest: {error}"))?;
+            stage_bytes(&mut profile.raw_manifest, manifest_target, manifest_bytes)?;
+        }
+    }
+    let manifest_bindings = [&pack.baseline, &pack.tested]
+        .into_iter()
+        .zip(["baseline", "tested"])
+        .flat_map(|(candidate, side)| {
+            candidate.profiles.iter().map(move |profile| {
+                serde_json::json!({
+                    "side": side,
+                    "profile": profile.profile.clone(),
+                    "manifest_sha256": profile.raw_manifest.sha256.clone(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    for receipt in [&mut pack.calibration_receipt, &mut pack.sensitivity_receipt] {
+        let source = admission_input_path(input, &receipt.path)?;
+        let target = next_target(&receipt.path)?;
+        let mut document: Value = serde_json::from_slice(&read_regular(&source)?)
+            .map_err(|error| format!("invalid typed admission receipt: {error}"))?;
+        document
+            .as_object_mut()
+            .ok_or_else(|| "typed admission receipt must be a JSON object".to_owned())?
+            .insert(
+                "manifest_bindings".to_owned(),
+                Value::Array(manifest_bindings.clone()),
+            );
+        let bytes = serde_json::to_vec_pretty(&document)
+            .map_err(|error| format!("serialize staged admission receipt: {error}"))?;
+        stage_bytes(receipt, target, bytes)?;
+    }
+    let pack_path = format!("{namespace}/performance-admission/admission-pack.json");
+    let rewritten = serde_json::to_vec_pretty(&pack).map_err(|error| error.to_string())?;
+    let pack_leaf = write_raw_new(root, &pack_path, &rewritten)?;
+    validate_performance_admission_pack(root, tested_commit, &pack, false)?;
+    leaves.push(pack_leaf);
+    Ok(StagedPerformanceAdmission {
+        gate: PerformanceAdmissionGate {
+            schema_version:
+                fsqlite_harness::performance_release_admission::ADMISSION_GATE_SCHEMA_V2.to_owned(),
+            status: "authorized".to_owned(),
+            release_authorized: true,
+            blockers: Vec::new(),
+            rationale: "Authorization is derived from the staged immutable v2 B/T admission pack."
+                .to_owned(),
+            admission_pack: Some(AdmissionPackReference {
+                path: pack_path,
+                sha256: sha256_bytes(&rewritten),
+            }),
+        },
+        leaves,
+    })
+}
+
+fn admission_input_path(input: &Path, declared: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(declared);
+    if declared.trim().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(
+            "admission input artifact paths must be non-empty normal relative paths".to_owned(),
+        );
+    }
+    Ok(input.join(relative))
 }
 
 fn repository_root() -> Result<PathBuf, String> {

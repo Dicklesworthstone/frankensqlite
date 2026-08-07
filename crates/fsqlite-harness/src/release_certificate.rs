@@ -56,10 +56,9 @@ use crate::parity_verification_workflow::{
     BEAD_ID as WORKFLOW_BEAD_ID, SCHEMA_VERSION as WORKFLOW_SCHEMA_VERSION, WorkflowOutcome,
     WorkflowPhase, WorkflowReport, validate_workflow_report,
 };
-use crate::performance_release_admission::{
-    PerformanceAdmissionGate, blocked_missing_authoritative_policy,
-    validate_gate as validate_performance_admission_gate,
-};
+#[cfg(test)]
+use crate::performance_release_admission::validate_gate as validate_performance_admission_gate;
+use crate::performance_release_admission::{PerformanceAdmissionGate, authorized_artifact_paths};
 use crate::score_engine::BayesianScorecard;
 
 #[allow(dead_code)]
@@ -4352,6 +4351,7 @@ fn validate_t16_binary_manifest_binding(
     Ok(())
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn validate_phase5_performance_regression_gate(
     workspace_root: &Path,
@@ -4380,11 +4380,12 @@ fn validate_phase5_manifest(
     {
         return Err("phase5_manifest_candidate_or_schema_mismatch".to_owned());
     }
-    validate_phase5_performance_regression_gate(
+    let authorization_paths = authorized_artifact_paths(
         workspace_root,
         tested_candidate_git_sha,
         &manifest.performance_regression_gate,
-    )?;
+    )
+    .map_err(|error| format!("phase5_performance_regression_gate_contract_invalid: {error}"))?;
     let expected_minisig_path =
         format!("{PHASE5_EVIDENCE_PREFIX}/{tested_candidate_git_sha}/signing/manifest.minisig");
     let declared_minisig_path = manifest.signature_path.as_str();
@@ -4543,6 +4544,22 @@ fn validate_phase5_manifest(
             t16_evidence = Some(semantic);
         }
         previous_locator = Some(locator);
+    }
+    for path in authorization_paths {
+        let leaf = manifest
+            .evidence_pack
+            .iter()
+            .find(|leaf| leaf.path == path)
+            .ok_or_else(|| {
+                format!("phase5_admission_artifact_missing_from_evidence_pack path={path}")
+            })?;
+        drop(load_bound_phase5_leaf(
+            evidence_root,
+            tested_candidate_git_sha,
+            leaf,
+            &binding,
+        )?);
+        insert_phase5_leaf(&mut referenced, &mut referenced_paths, leaf)?;
     }
     let expected_locators = expected_requirements
         .current_runs
@@ -5271,6 +5288,7 @@ fn build_and_publish_strict_certificate_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::performance_release_admission::blocked_missing_authoritative_policy;
 
     fn sample_phase5_leaf(path: &str) -> Phase5EvidenceLeaf {
         Phase5EvidenceLeaf {

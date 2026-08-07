@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use fsqlite_harness::performance_release_admission::{
-    PerformanceAdmissionGate as PerformanceRegressionGate, blocked_missing_authoritative_policy,
-    validate_gate as validate_performance_admission_gate,
+    PerformanceAdmissionGate as PerformanceRegressionGate, authorized_artifact_paths,
+    blocked_missing_authoritative_policy, validate_gate as validate_performance_admission_gate,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -3197,11 +3197,6 @@ fn validate_release_evidence_manifest(
         &manifest.tested_commit,
         "persistent/release-perf",
     )?;
-    validate_performance_regression_gate(
-        root,
-        &manifest.tested_commit,
-        &manifest.performance_regression_gate,
-    )?;
     validate_command_evidence_shape(&manifest.workspace.execution, "workspace")?;
     validate_command_evidence_commit_paths(
         &manifest.workspace.execution,
@@ -4790,6 +4785,12 @@ fn load_release_evidence_manifest_from_path(
     let manifest = serde_json::from_slice::<ReleaseEvidenceManifest>(&manifest_bytes)
         .map_err(|error| format!("unable to parse release evidence manifest: {error}"))?;
     let current_run_receipts = validate_release_evidence_manifest(&manifest, baseline)?;
+    let authorization_paths = authorized_artifact_paths(
+        root,
+        &manifest.tested_commit,
+        &manifest.performance_regression_gate,
+    )
+    .map_err(|error| format!("performance admission inventory invalid: {error}"))?;
     for entry in baseline.ignored_tests.iter().filter(|entry| {
         entry.policy == IgnorePolicy::RunForRelease && entry.locator() != RELEASE_GUARD_LOCATOR
     }) {
@@ -4957,6 +4958,29 @@ fn load_release_evidence_manifest_from_path(
                 digest_algorithm: leaf.blake3_algorithm.clone(),
                 digest: leaf.blake3.clone(),
             })?;
+        }
+        for path in &authorization_paths {
+            let leaf = manifest
+                .evidence_pack
+                .iter()
+                .find(|leaf| &leaf.path == path)
+                .ok_or_else(|| {
+                    format!("performance admission artifact missing from evidence_pack: `{path}`")
+                })?
+                .clone();
+            validate_evidence_leaf_shape(&leaf, "performance admission artifact")?;
+            canonical_commit_evidence_path(
+                &leaf.path,
+                &manifest.tested_commit,
+                "performance admission artifact",
+            )?;
+            drop(read_regular_evidence_file(
+                root,
+                &leaf.path,
+                &leaf.digest,
+                "performance admission artifact",
+            )?);
+            insert_pack_leaf(leaf)?;
         }
     }
     let actual_pack = manifest

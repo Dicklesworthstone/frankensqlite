@@ -20,6 +20,12 @@ pub const ADMISSION_PACK_SCHEMA_V2: &str = "fsqlite.performance_release_admissio
 const SHA256_ALGORITHM: &str = "sha2-256";
 const LEGACY_REPORT_SCHEMA_V9: &str = "fsqlite-e2e.mt_mvcc_bench_report.v9";
 const POLICY_BLOCKER: &str = "missing_authoritative_performance_policy";
+const POLICY_SCHEMA_V1: &str = "fsqlite.performance_admission_policy.v1";
+const MEASUREMENT_REPORT_SCHEMA_V1: &str = "fsqlite.performance_admission_measurement.v1";
+const MEASUREMENT_MANIFEST_SCHEMA_V1: &str =
+    "fsqlite.performance_admission_measurement_manifest.v1";
+const CALIBRATION_RECEIPT_SCHEMA_V1: &str = "fsqlite.performance_admission_calibration_receipt.v1";
+const SENSITIVITY_RECEIPT_SCHEMA_V1: &str = "fsqlite.performance_admission_sensitivity_receipt.v1";
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -82,8 +88,89 @@ pub struct ArtifactDigest {
     pub sha256: String,
 }
 
+/// The report is deliberately provenance-only: the policy artifact, rather
+/// than this verifier, owns any acceptance margin or numerical decision.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeasurementReport {
+    schema_version: String,
+    source_commit: String,
+    profile: String,
+    host_fingerprint_sha256: String,
+    toolchain_sha256: String,
+    feature_graph_sha256: String,
+    binary_nonce: String,
+    policy_id: String,
+    policy_version: String,
+    policy_sha256: String,
+    raw_manifest_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeasurementManifest {
+    schema_version: String,
+    source_commit: String,
+    profile: String,
+    host_fingerprint_sha256: String,
+    toolchain_sha256: String,
+    feature_graph_sha256: String,
+    binary_nonce: String,
+    policy_id: String,
+    policy_version: String,
+    policy_sha256: String,
+    raw_report_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionPolicy {
+    schema_version: String,
+    policy_id: String,
+    policy_version: String,
+    required_profiles: Vec<String>,
+    required_workloads: Vec<String>,
+    metric_rules: Vec<MetricRule>,
+    counterbalance_order: Vec<String>,
+    calibration_noise_multiplier: f64,
+    sensitivity_injected_slowdown_minimum: f64,
+    sensitivity_detection_required: bool,
+    no_waiver: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricRule {
+    metric: String,
+    direction: String,
+    max_regression_fraction: f64,
+    confidence_level: f64,
+    minimum_samples: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionReceipt {
+    schema_version: String,
+    baseline_source_commit: String,
+    tested_source_commit: String,
+    policy_sha256: String,
+    policy_id: String,
+    policy_version: String,
+    manifest_bindings: Vec<ReceiptManifestBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptManifestBinding {
+    side: String,
+    profile: String,
+    manifest_sha256: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AdmissionPredicates {
     pub source_provenance: bool,
     pub strict_ancestry: bool,
@@ -212,28 +299,293 @@ pub fn validate_pack(
             }
         }
     }
-    for (label, artifact) in [
-        ("policy", &pack.policy),
-        ("calibration receipt", &pack.calibration_receipt),
-        ("sensitivity receipt", &pack.sensitivity_receipt),
-    ] {
-        validate_artifact(workspace_root, artifact, label)?;
-    }
+    let policy = validate_policy(workspace_root, &pack.policy)?;
     for candidate in [&pack.baseline, &pack.tested] {
         for profile in &candidate.profiles {
-            validate_artifact(
+            validate_profile_artifacts(
                 workspace_root,
-                &profile.raw_report,
-                "raw measurement report",
-            )?;
-            validate_artifact(
-                workspace_root,
-                &profile.raw_manifest,
-                "raw measurement manifest",
+                candidate,
+                profile,
+                if candidate.source_commit == pack.baseline.source_commit {
+                    "baseline"
+                } else {
+                    "tested"
+                },
+                &policy,
+                &pack.policy.sha256,
             )?;
         }
     }
+    validate_receipt(
+        workspace_root,
+        &pack.calibration_receipt,
+        CALIBRATION_RECEIPT_SCHEMA_V1,
+        pack,
+        &policy,
+        "calibration receipt",
+    )?;
+    validate_receipt(
+        workspace_root,
+        &pack.sensitivity_receipt,
+        SENSITIVITY_RECEIPT_SCHEMA_V1,
+        pack,
+        &policy,
+        "sensitivity receipt",
+    )?;
     Ok(())
+}
+
+fn validate_profile_artifacts(
+    workspace_root: &Path,
+    candidate: &CandidateProvenance,
+    profile: &ProfileEvidence,
+    side: &str,
+    policy: &AdmissionPolicy,
+    policy_sha256: &str,
+) -> Result<(), String> {
+    let report_bytes = artifact_bytes(
+        workspace_root,
+        &profile.raw_report,
+        "raw measurement report",
+    )?;
+    let manifest_bytes = artifact_bytes(
+        workspace_root,
+        &profile.raw_manifest,
+        "raw measurement manifest",
+    )?;
+    let report: MeasurementReport = serde_json::from_slice(&report_bytes).map_err(|error| {
+        format!(
+            "{side} {} report is not a typed v2 measurement report: {error}",
+            profile.profile
+        )
+    })?;
+    let manifest: MeasurementManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            format!(
+                "{side} {} manifest is not a typed v2 measurement manifest: {error}",
+                profile.profile
+            )
+        })?;
+    if report.schema_version != profile.report_schema
+        || manifest.schema_version != MEASUREMENT_MANIFEST_SCHEMA_V1
+    {
+        return Err(format!(
+            "{side} {} report/manifest schemas do not match the v2 pack",
+            profile.profile
+        ));
+    }
+    for (field, report_value, manifest_value, expected) in [
+        (
+            "source commit",
+            &report.source_commit,
+            &manifest.source_commit,
+            &candidate.source_commit,
+        ),
+        (
+            "profile",
+            &report.profile,
+            &manifest.profile,
+            &profile.profile,
+        ),
+        (
+            "host fingerprint",
+            &report.host_fingerprint_sha256,
+            &manifest.host_fingerprint_sha256,
+            &candidate.host_fingerprint_sha256,
+        ),
+        (
+            "toolchain hash",
+            &report.toolchain_sha256,
+            &manifest.toolchain_sha256,
+            &candidate.toolchain_sha256,
+        ),
+        (
+            "feature graph hash",
+            &report.feature_graph_sha256,
+            &manifest.feature_graph_sha256,
+            &profile.feature_graph_sha256,
+        ),
+        (
+            "binary nonce",
+            &report.binary_nonce,
+            &manifest.binary_nonce,
+            &profile.binary_nonce,
+        ),
+    ] {
+        if report_value != expected || manifest_value != expected {
+            return Err(format!(
+                "{side} {} {field} is not bound to the v2 pack",
+                profile.profile
+            ));
+        }
+    }
+    for (field, report_value, manifest_value, expected) in [
+        (
+            "policy id",
+            report.policy_id.as_str(),
+            manifest.policy_id.as_str(),
+            policy.policy_id.as_str(),
+        ),
+        (
+            "policy version",
+            report.policy_version.as_str(),
+            manifest.policy_version.as_str(),
+            policy.policy_version.as_str(),
+        ),
+        (
+            "policy SHA-256",
+            report.policy_sha256.as_str(),
+            manifest.policy_sha256.as_str(),
+            policy_sha256,
+        ),
+    ] {
+        if report_value != expected || manifest_value != expected {
+            return Err(format!(
+                "{side} {} {field} is not bound to the typed policy",
+                profile.profile
+            ));
+        }
+    }
+    if report.raw_manifest_path != profile.raw_manifest.path
+        || manifest.raw_report_sha256 != profile.raw_report.sha256
+    {
+        return Err(format!(
+            "{side} {} report/manifest hashes are not mutually bound",
+            profile.profile
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt(
+    workspace_root: &Path,
+    artifact: &ArtifactDigest,
+    expected_schema: &str,
+    pack: &PerformanceAdmissionPack,
+    policy: &AdmissionPolicy,
+    label: &str,
+) -> Result<(), String> {
+    let bytes = artifact_bytes(workspace_root, artifact, label)?;
+    let receipt: AdmissionReceipt = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{label} is not a typed v2 receipt: {error}"))?;
+    if receipt.schema_version != expected_schema
+        || receipt.baseline_source_commit != pack.baseline.source_commit
+        || receipt.tested_source_commit != pack.tested.source_commit
+        || receipt.policy_sha256 != pack.policy.sha256
+        || receipt.policy_id != policy.policy_id
+        || receipt.policy_version != policy.policy_version
+    {
+        return Err(format!(
+            "{label} is not bound to the B/T source commits and policy"
+        ));
+    }
+    let expected = expected_receipt_manifest_bindings(pack);
+    if receipt.manifest_bindings.len() != expected.len() {
+        return Err(format!(
+            "{label} manifest provenance bindings must be unique and complete"
+        ));
+    }
+    let actual = receipt
+        .manifest_bindings
+        .into_iter()
+        .map(|binding| (binding.side, binding.profile, binding.manifest_sha256))
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!(
+            "{label} manifest provenance bindings do not exactly cover B/T profiles"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_policy(
+    workspace_root: &Path,
+    artifact: &ArtifactDigest,
+) -> Result<AdmissionPolicy, String> {
+    let bytes = artifact_bytes(workspace_root, artifact, "policy")?;
+    let policy: AdmissionPolicy = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("policy is not a typed v2 production policy: {error}"))?;
+    if policy.schema_version != POLICY_SCHEMA_V1
+        || policy.policy_id.trim().is_empty()
+        || policy.policy_version.trim().is_empty()
+    {
+        return Err("policy schema, id, and version are required for v2 authorization".to_owned());
+    }
+    if policy
+        .required_profiles
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        != ["release", "release-perf"]
+        || !unique_nonempty(&policy.required_workloads)
+        || !unique_nonempty(&policy.counterbalance_order)
+        || policy.counterbalance_order.len() != 2
+        || !policy
+            .counterbalance_order
+            .iter()
+            .any(|order| order == "baseline_first")
+        || !policy
+            .counterbalance_order
+            .iter()
+            .any(|order| order == "tested_first")
+        || !policy.calibration_noise_multiplier.is_finite()
+        || policy.calibration_noise_multiplier <= 0.0
+        || !policy.sensitivity_injected_slowdown_minimum.is_finite()
+        || !(0.0..=1.0).contains(&policy.sensitivity_injected_slowdown_minimum)
+        || policy.sensitivity_injected_slowdown_minimum <= 0.0
+        || !policy.sensitivity_detection_required
+        || !policy.no_waiver
+    {
+        return Err("policy acceptance-rule fields are incomplete or out of range".to_owned());
+    }
+    if policy.metric_rules.is_empty()
+        || !policy.metric_rules.iter().all(valid_metric_rule)
+        || policy
+            .metric_rules
+            .iter()
+            .map(|rule| rule.metric.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != policy.metric_rules.len()
+    {
+        return Err("policy metric rules must be unique, typed, and in range".to_owned());
+    }
+    Ok(policy)
+}
+
+fn unique_nonempty(values: &[String]) -> bool {
+    !values.is_empty()
+        && values.iter().all(|value| !value.trim().is_empty())
+        && values.iter().collect::<BTreeSet<_>>().len() == values.len()
+}
+
+fn valid_metric_rule(rule: &MetricRule) -> bool {
+    !rule.metric.trim().is_empty()
+        && matches!(
+            rule.direction.as_str(),
+            "higher_is_better" | "lower_is_better"
+        )
+        && rule.max_regression_fraction.is_finite()
+        && (0.0..1.0).contains(&rule.max_regression_fraction)
+        && rule.confidence_level.is_finite()
+        && (0.0..1.0).contains(&rule.confidence_level)
+        && rule.minimum_samples > 0
+}
+
+fn expected_receipt_manifest_bindings(
+    pack: &PerformanceAdmissionPack,
+) -> BTreeSet<(String, String, String)> {
+    let mut bindings = BTreeSet::new();
+    for (side, candidate) in [("baseline", &pack.baseline), ("tested", &pack.tested)] {
+        for profile in &candidate.profiles {
+            bindings.insert((
+                side.to_owned(),
+                profile.profile.clone(),
+                profile.raw_manifest.sha256.clone(),
+            ));
+        }
+    }
+    bindings
 }
 
 fn validate_candidate(candidate: &CandidateProvenance, label: &str) -> Result<(), String> {
@@ -259,11 +611,13 @@ fn validate_candidate(candidate: &CandidateProvenance, label: &str) -> Result<()
         if profile.report_schema == LEGACY_REPORT_SCHEMA_V9 {
             return Err("legacy v9 benchmark reports cannot authorize release".to_owned());
         }
-        if profile.report_schema.trim().is_empty()
+        if profile.report_schema != MEASUREMENT_REPORT_SCHEMA_V1
             || !is_lower_hex(&profile.feature_graph_sha256, 64)
             || !is_lower_hex(&profile.binary_nonce, 64)
         {
-            return Err(format!("{label} profile provenance is malformed"));
+            return Err(format!(
+                "{label} profile provenance must use the typed v2 report schema"
+            ));
         }
     }
     Ok(())
@@ -280,11 +634,11 @@ fn profile_by_name<'a>(
         .ok_or_else(|| format!("missing required profile `{expected}`"))
 }
 
-fn validate_artifact(
+fn artifact_bytes(
     workspace_root: &Path,
     artifact: &ArtifactDigest,
     label: &str,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     if artifact.digest_algorithm != SHA256_ALGORITHM || !is_lower_hex(&artifact.sha256, 64) {
         return Err(format!("{label} must carry a lowercase sha2-256 digest"));
     }
@@ -293,7 +647,37 @@ fn validate_artifact(
     if sha256(&bytes) != artifact.sha256 {
         return Err(format!("{label} digest does not match `{}`", artifact.path));
     }
-    Ok(())
+    Ok(bytes)
+}
+
+/// Returns the exact immutable files that make an authorizing decision.
+///
+/// Phase 5 consumers use this inventory to reject a manifest that omits a pack
+/// member or carries an unrelated extra member under authorization.
+pub fn authorized_artifact_paths(
+    workspace_root: &Path,
+    tested_commit: &str,
+    gate: &PerformanceAdmissionGate,
+) -> Result<BTreeSet<String>, String> {
+    validate_gate(workspace_root, tested_commit, gate)?;
+    let Some(reference) = &gate.admission_pack else {
+        return Ok(BTreeSet::new());
+    };
+    let pack_path = checked_path(workspace_root, &reference.path, "admission pack")?;
+    let pack: PerformanceAdmissionPack =
+        serde_json::from_slice(&read_regular(&pack_path, "admission pack")?)
+            .map_err(|error| format!("invalid v2 admission pack: {error}"))?;
+    let mut paths = BTreeSet::from([reference.path.clone(), pack.policy.path]);
+    for artifact in [&pack.calibration_receipt, &pack.sensitivity_receipt] {
+        paths.insert(artifact.path.clone());
+    }
+    for candidate in [&pack.baseline, &pack.tested] {
+        for profile in &candidate.profiles {
+            paths.insert(profile.raw_report.path.clone());
+            paths.insert(profile.raw_manifest.path.clone());
+        }
+    }
+    Ok(paths)
 }
 
 fn checked_path(workspace_root: &Path, raw: &str, label: &str) -> Result<PathBuf, String> {
@@ -353,7 +737,7 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
 fn sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{hasher:x}")
+    crate::bytes_to_lower_hex(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -363,9 +747,13 @@ mod tests {
     use super::{
         ADMISSION_GATE_SCHEMA_V2, ADMISSION_PACK_SCHEMA_V2, AdmissionPackReference,
         AdmissionPredicates, ArtifactDigest, CandidateProvenance, PerformanceAdmissionGate,
-        PerformanceAdmissionPack, ProfileEvidence, blocked_missing_authoritative_policy, sha256,
-        validate_gate, validate_pack,
+        PerformanceAdmissionPack, ProfileEvidence, authorized_artifact_paths,
+        blocked_missing_authoritative_policy, sha256, validate_candidate, validate_gate,
+        validate_pack,
     };
+
+    const TEST_POLICY_ID: &str = "test-only-structural-keeper-policy";
+    const TEST_POLICY_VERSION: &str = "test-v1";
 
     fn git(root: &Path, arguments: &[&str]) {
         assert!(
@@ -390,19 +778,55 @@ mod tests {
         }
     }
 
-    fn profile(root: &Path, side: &str, profile: &str, nonce: char) -> ProfileEvidence {
+    fn profile(
+        root: &Path,
+        side: &str,
+        profile: &str,
+        nonce: char,
+        source_commit: &str,
+        policy_sha256: &str,
+    ) -> ProfileEvidence {
+        let report_path = format!("evidence/{side}/{profile}/report.json");
+        let manifest_path = format!("evidence/{side}/{profile}/manifest.json");
+        let report = serde_json::json!({
+            "schema_version": "fsqlite.performance_admission_measurement.v1",
+            "source_commit": source_commit,
+            "profile": profile,
+            "host_fingerprint_sha256": "a".repeat(64),
+            "toolchain_sha256": "b".repeat(64),
+            "feature_graph_sha256": "e".repeat(64),
+            "binary_nonce": nonce.to_string().repeat(64),
+            "policy_id": TEST_POLICY_ID,
+            "policy_version": TEST_POLICY_VERSION,
+            "policy_sha256": policy_sha256,
+            "raw_manifest_path": manifest_path,
+        });
+        let raw_report = receipt(
+            root,
+            &report_path,
+            &serde_json::to_vec(&report).expect("serialize report"),
+        );
+        let manifest = serde_json::json!({
+            "schema_version": "fsqlite.performance_admission_measurement_manifest.v1",
+            "source_commit": source_commit,
+            "profile": profile,
+            "host_fingerprint_sha256": "a".repeat(64),
+            "toolchain_sha256": "b".repeat(64),
+            "feature_graph_sha256": "e".repeat(64),
+            "binary_nonce": nonce.to_string().repeat(64),
+            "policy_id": TEST_POLICY_ID,
+            "policy_version": TEST_POLICY_VERSION,
+            "policy_sha256": policy_sha256,
+            "raw_report_sha256": raw_report.sha256.clone(),
+        });
         ProfileEvidence {
             profile: profile.to_owned(),
             report_schema: "fsqlite.performance_admission_measurement.v1".to_owned(),
-            raw_report: receipt(
-                root,
-                &format!("evidence/{side}/{profile}/report.json"),
-                b"report",
-            ),
+            raw_report,
             raw_manifest: receipt(
                 root,
-                &format!("evidence/{side}/{profile}/manifest.json"),
-                b"manifest",
+                &manifest_path,
+                &serde_json::to_vec(&manifest).expect("serialize manifest"),
             ),
             feature_graph_sha256: "e".repeat(64),
             binary_nonce: nonce.to_string().repeat(64),
@@ -410,40 +834,100 @@ mod tests {
     }
 
     fn keeper(root: &Path, baseline: String, tested: String) -> PerformanceAdmissionPack {
+        let policy = receipt(
+            root,
+            "evidence/policy.json",
+            &serde_json::to_vec(&serde_json::json!({
+                "schema_version": "fsqlite.performance_admission_policy.v1",
+                "policy_id": TEST_POLICY_ID,
+                "policy_version": TEST_POLICY_VERSION,
+                "required_profiles": ["release", "release-perf"],
+                "required_workloads": ["synthetic-keeper-workload"],
+                "metric_rules": [{
+                    "metric": "synthetic-throughput",
+                    "direction": "higher_is_better",
+                    "max_regression_fraction": 0.1,
+                    "confidence_level": 0.95,
+                    "minimum_samples": 8,
+                }],
+                "counterbalance_order": ["baseline_first", "tested_first"],
+                "calibration_noise_multiplier": 1.5,
+                "sensitivity_injected_slowdown_minimum": 0.05,
+                "sensitivity_detection_required": true,
+                "no_waiver": true,
+            }))
+            .expect("serialize typed policy"),
+        );
+        let baseline_provenance = CandidateProvenance {
+            source_commit: baseline.clone(),
+            host_fingerprint_sha256: "a".repeat(64),
+            toolchain_sha256: "b".repeat(64),
+            profiles: vec![
+                profile(root, "baseline", "release", '1', &baseline, &policy.sha256),
+                profile(
+                    root,
+                    "baseline",
+                    "release-perf",
+                    '2',
+                    &baseline,
+                    &policy.sha256,
+                ),
+            ],
+        };
+        let tested_provenance = CandidateProvenance {
+            source_commit: tested.clone(),
+            host_fingerprint_sha256: "a".repeat(64),
+            toolchain_sha256: "b".repeat(64),
+            profiles: vec![
+                profile(root, "tested", "release", '3', &tested, &policy.sha256),
+                profile(root, "tested", "release-perf", '4', &tested, &policy.sha256),
+            ],
+        };
+        let manifest_bindings = [&baseline_provenance, &tested_provenance]
+            .into_iter()
+            .zip(["baseline", "tested"])
+            .flat_map(|(candidate, side)| {
+                candidate.profiles.iter().map(move |profile| {
+                    serde_json::json!({
+                        "side": side,
+                        "profile": profile.profile.clone(),
+                        "manifest_sha256": profile.raw_manifest.sha256.clone(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
         PerformanceAdmissionPack {
             schema_version: ADMISSION_PACK_SCHEMA_V2.to_owned(),
-            baseline: CandidateProvenance {
-                source_commit: baseline,
-                host_fingerprint_sha256: "a".repeat(64),
-                toolchain_sha256: "b".repeat(64),
-                profiles: vec![
-                    profile(root, "baseline", "release", '1'),
-                    profile(root, "baseline", "release-perf", '2'),
-                ],
-            },
-            tested: CandidateProvenance {
-                source_commit: tested,
-                host_fingerprint_sha256: "a".repeat(64),
-                toolchain_sha256: "b".repeat(64),
-                profiles: vec![
-                    profile(root, "tested", "release", '3'),
-                    profile(root, "tested", "release-perf", '4'),
-                ],
-            },
-            policy: receipt(
-                root,
-                "evidence/policy.json",
-                b"test policy; no production acceptance claim",
-            ),
+            baseline: baseline_provenance,
+            tested: tested_provenance,
+            policy: policy.clone(),
             calibration_receipt: receipt(
                 root,
                 "evidence/calibration.json",
-                b"synthetic calibration receipt",
+                &serde_json::to_vec(&serde_json::json!({
+                    "schema_version": "fsqlite.performance_admission_calibration_receipt.v1",
+                    "baseline_source_commit": baseline,
+                    "tested_source_commit": tested,
+                    "policy_sha256": policy.sha256,
+                    "policy_id": TEST_POLICY_ID,
+                    "policy_version": TEST_POLICY_VERSION,
+                    "manifest_bindings": manifest_bindings,
+                }))
+                .expect("serialize calibration receipt"),
             ),
             sensitivity_receipt: receipt(
                 root,
                 "evidence/sensitivity.json",
-                b"synthetic sensitivity receipt",
+                &serde_json::to_vec(&serde_json::json!({
+                    "schema_version": "fsqlite.performance_admission_sensitivity_receipt.v1",
+                    "baseline_source_commit": baseline,
+                    "tested_source_commit": tested,
+                    "policy_sha256": policy.sha256,
+                    "policy_id": TEST_POLICY_ID,
+                    "policy_version": TEST_POLICY_VERSION,
+                    "manifest_bindings": manifest_bindings,
+                }))
+                .expect("serialize sensitivity receipt"),
             ),
             predicates: AdmissionPredicates {
                 source_provenance: true,
@@ -454,12 +938,12 @@ mod tests {
                 calibration_receipt: true,
                 sensitivity_receipt: true,
             },
-            synthetic_fixture: true,
+            synthetic_fixture: false,
         }
     }
 
     #[test]
-    fn synthetic_keeper_exercises_every_v2_predicate_without_a_real_performance_claim() {
+    fn synthetic_keeper_exercises_authorizing_gate_without_a_real_performance_claim() {
         let repo = tempfile::tempdir().expect("repo");
         git(repo.path(), &["init", "--initial-branch=main"]);
         git(repo.path(), &["config", "user.name", "Keeper"]);
@@ -498,9 +982,35 @@ mod tests {
         .trim()
         .to_owned();
         let pack = keeper(repo.path(), baseline, tested.clone());
-        validate_pack(repo.path(), &tested, &pack, true)
-            .expect("synthetic keeper should validate only in test mode");
-        assert!(validate_pack(repo.path(), &tested, &pack, false).is_err());
+        let bytes = serde_json::to_vec(&pack).expect("serialize keeper");
+        fs::write(repo.path().join("evidence/admission-pack.json"), &bytes).expect("write keeper");
+        let gate = PerformanceAdmissionGate {
+            schema_version: ADMISSION_GATE_SCHEMA_V2.to_owned(),
+            status: "authorized".to_owned(),
+            release_authorized: true,
+            blockers: Vec::new(),
+            rationale: "synthetic keeper only; no performance claim".to_owned(),
+            admission_pack: Some(AdmissionPackReference {
+                path: "evidence/admission-pack.json".to_owned(),
+                sha256: sha256(&bytes),
+            }),
+        };
+        validate_gate(repo.path(), &tested, &gate).expect("keeper authorizes structurally");
+        assert_eq!(
+            authorized_artifact_paths(repo.path(), &tested, &gate)
+                .expect("authorized artifact inventory")
+                .len(),
+            12,
+            "pack, policy, two receipts, and B/T report/manifest pairs"
+        );
+        let mut mismatched = pack;
+        mismatched.baseline.host_fingerprint_sha256 = "f".repeat(64);
+        mismatched.tested.host_fingerprint_sha256 = "f".repeat(64);
+        assert!(
+            validate_pack(repo.path(), &tested, &mismatched, false)
+                .expect_err("report provenance must be cross-checked")
+                .contains("host fingerprint")
+        );
     }
 
     #[test]
@@ -571,7 +1081,11 @@ mod tests {
         pack.tested.profiles = pack.baseline.profiles.clone();
         pack.tested.profiles[0].binary_nonce = "3".repeat(64);
         pack.tested.profiles[1].binary_nonce = "4".repeat(64);
-        assert!(validate_pack(Path::new("."), &pack.tested.source_commit, &pack, false).is_err());
+        assert!(
+            validate_candidate(&pack.baseline, "baseline")
+                .expect_err("v9 must be rejected directly")
+                .contains("legacy v9")
+        );
         let malformed_authorization = PerformanceAdmissionGate {
             schema_version: ADMISSION_GATE_SCHEMA_V2.to_owned(),
             status: "authorized".to_owned(),
