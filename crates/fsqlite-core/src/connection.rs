@@ -259,6 +259,10 @@ const BEGIN_BUSY_HANDOFF_BASE_SPINS: u32 = 64;
 const BEGIN_BUSY_HANDOFF_MAX_SPINS: u32 = 2_048;
 const BEGIN_BUSY_HANDOFF_BASE_SLEEP_US: u64 = 1_000;
 const BEGIN_BUSY_HANDOFF_MAX_SLEEP_US: u64 = 50_000;
+// Connection admission can serialize while a peer verifies and publishes the
+// database namespace. Callers cannot raise PRAGMA busy_timeout until open has
+// completed, so bootstrap needs its own bounded floor for concurrent opens.
+const CONNECTION_BOOTSTRAP_BUSY_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BeginBusyRetryWait {
@@ -367,6 +371,7 @@ where
     let busy_timeout_ms = fsqlite_vdbe::pragma::ConnectionPragmaState::default()
         .busy_timeout_ms
         .max(0) as u64;
+    let busy_timeout_ms = busy_timeout_ms.max(CONNECTION_BOOTSTRAP_BUSY_TIMEOUT_MS);
     let deadline = Duration::from_millis(busy_timeout_ms);
     let started = Instant::now();
     let mut handoff = BeginBusyRetryHandoff::default();
@@ -811,7 +816,6 @@ thread_local! {
 static FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECURSIVE_CTE_DIRECT_EVAL_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECURSIVE_CTE_DIRECT_SYNC_EVAL_HITS: AtomicU64 = AtomicU64::new(0);
-static FSQLITE_RECURSIVE_CTE_PRECOMPILED_ARM_HITS: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static FSQLITE_RECURSIVE_CTE_INTEGER_SERIES_SUM_HITS_TLS: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
@@ -4925,7 +4929,6 @@ struct RecursiveCteIntegerSeriesSumPlan {
 #[allow(clippy::large_enum_variant)]
 enum RecursiveCteArmExecutionPlan {
     Direct(RecursiveCteDirectEvalPlan),
-    Precompiled(Arc<VdbeProgram>),
     Statement(SelectStatement),
 }
 
@@ -11376,6 +11379,30 @@ impl Drop for BoolCellRestoreGuard<'_> {
     }
 }
 
+struct TriggerChangeTrackingRestoreGuard<'a> {
+    conn: &'a Connection,
+    last_changes: usize,
+    last_insert_rowid: i64,
+}
+
+impl<'a> TriggerChangeTrackingRestoreGuard<'a> {
+    fn new(conn: &'a Connection) -> Self {
+        Self {
+            conn,
+            last_changes: conn.last_changes.get(),
+            last_insert_rowid: conn.last_insert_rowid.get(),
+        }
+    }
+}
+
+impl Drop for TriggerChangeTrackingRestoreGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.last_changes.set(self.last_changes);
+        self.conn.last_insert_rowid.set(self.last_insert_rowid);
+        self.conn.sync_change_tracking_context();
+    }
+}
+
 struct BoolRefCellRestoreGuard<'a> {
     cell: &'a RefCell<bool>,
     previous: bool,
@@ -12170,8 +12197,8 @@ impl Connection {
                 Err(_) => false,
             }
         };
-        let pager = retry_busy_connection_bootstrap(|| {
-            PagerBackend::open_with_requested_page_size_and_page_buffer_max(
+        retry_busy_connection_bootstrap(|| async {
+            let pager = PagerBackend::open_with_requested_page_size_and_page_buffer_max(
                 &path,
                 &bootstrap_cx,
                 requested_page_size,
@@ -12179,9 +12206,10 @@ impl Connection {
                 env.page_buffer_max(),
                 env.memory_vfs_config(),
             )
+            .await?;
+            Self::open_with_env_and_pager(path.clone(), env.clone(), pager, storage_was_empty).await
         })
-        .await?;
-        Self::open_with_env_and_pager(path, env, pager, storage_was_empty).await
+        .await
     }
 
     /// Import a self-contained SQLite database image into an in-memory connection
@@ -36254,7 +36282,8 @@ impl Connection {
             Statement::Select(select) => SelectRelationResolver::new(self).validate_select(select),
             Statement::Insert(insert) => {
                 if let InsertSource::Select(select) = &insert.source {
-                    SelectRelationResolver::new(self).validate_select(select)?;
+                    let scoped_select = insert_source_select_for_validation(insert, select);
+                    SelectRelationResolver::new(self).validate_select(&scoped_select)?;
                 }
                 Ok(())
             }
@@ -36295,6 +36324,8 @@ impl Connection {
             }
             Statement::Insert(insert) => {
                 if let InsertSource::Select(select) = &insert.source {
+                    let scoped_select = insert_source_select_for_validation(insert, select);
+                    let select = scoped_select.as_ref();
                     let column_reference_preflight =
                         select_requires_column_reference_preflight(select, self);
                     if column_reference_preflight {
@@ -51041,6 +51072,10 @@ impl Connection {
         // more boxing.
         #[cfg(test)]
         record_trigger_stack_probe(trigger_probe_site::TRIGGER_REENTRY);
+        // Trigger body DML contributes to total_changes(), but SQLite restores
+        // changes() and last_insert_rowid() when control returns to the outer
+        // statement. Restore those two values even when the trigger fails.
+        let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
         self.execute_statement(&statement, None).await?;
         Ok(TriggerStatementOutcome::Continue)
     }
@@ -69193,7 +69228,7 @@ impl Connection {
         // table via the connection's schema) and inserts them row-by-row.
         if let InsertSource::Select(ref select_stmt) = stripped.source {
             let source_rows = self
-                .execute_statement(&Statement::Select(select_stmt.as_ref().clone()), params)
+                .execute_select_via_memdb_fallback(select_stmt, params)
                 .await?;
             if source_rows.is_empty() {
                 self.reset_statement_change_count();
@@ -69531,8 +69566,6 @@ impl Connection {
         );
         self.rebuild_schema_indices();
         temp_tables.push((cte_name.clone(), root_page));
-        let op_cx = self.op_cx_after_background_status();
-
         // Execute the base case (first SELECT core only).
         let base_select = SelectStatement {
             with: None,
@@ -69569,11 +69602,6 @@ impl Connection {
                     self.recursive_cte_direct_eval_plan(cte_name, &col_names, &arm_select)
                 {
                     RecursiveCteArmExecutionPlan::Direct(plan)
-                } else if let Some(program) = self
-                    .recursive_cte_precompiled_arm_program(&arm_select)
-                    .await
-                {
-                    RecursiveCteArmExecutionPlan::Precompiled(Arc::new(program))
                 } else {
                     RecursiveCteArmExecutionPlan::Statement(arm_select)
                 };
@@ -69656,13 +69684,8 @@ impl Connection {
                         )?
                     }
                     _ => {
-                        self.execute_recursive_cte_arm_select(
-                            &op_cx,
-                            execution_plan,
-                            &working_set,
-                            params,
-                        )
-                        .await?
+                        self.execute_recursive_cte_arm_select(execution_plan, &working_set, params)
+                            .await?
                     }
                 };
                 for row in &arm_rows {
@@ -69706,7 +69729,6 @@ impl Connection {
 
     async fn execute_recursive_cte_arm_select(
         &self,
-        cx: &Cx,
         execution_plan: &RecursiveCteArmExecutionPlan,
         working_set: &[Vec<SqliteValue>],
         params: Option<&[SqliteValue]>,
@@ -69716,45 +69738,10 @@ impl Connection {
                 self.execute_recursive_cte_direct_eval_plan(plan, working_set, params)
                     .await
             }
-            RecursiveCteArmExecutionPlan::Precompiled(program) => {
-                FSQLITE_RECURSIVE_CTE_PRECOMPILED_ARM_HITS.fetch_add(1, AtomicOrdering::Relaxed);
-                let (rows, _, _) = self
-                    .execute_table_program_with_cx(
-                        program,
-                        params,
-                        false,
-                        TableExecutionRuntimeRequirements::read_path(),
-                        cx,
-                        false,
-                    )
-                    .await?;
-                Ok(rows)
-            }
             RecursiveCteArmExecutionPlan::Statement(select) => {
-                self.execute_statement(&Statement::Select(select.clone()), params)
-                    .await
+                self.execute_select_via_memdb_fallback(select, params).await
             }
         }
-    }
-
-    async fn recursive_cte_precompiled_arm_program(
-        &self,
-        select: &SelectStatement,
-    ) -> Option<VdbeProgram> {
-        if select.with.is_some()
-            || !select.body.compounds.is_empty()
-            || has_joins(select)
-            || has_subquery_source(select)
-            || has_table_function_source(select)
-            || has_window_functions(select)
-            || select_has_correlated_join_subquery(select)
-            || select_contains_match_operator(select)
-            || self.has_sqlite_schema_references(select)
-            || self.has_view_references(select)
-        {
-            return None;
-        }
-        self.compile_table_select(select).await.ok()
     }
 
     fn recursive_cte_direct_eval_plan(
@@ -81943,7 +81930,10 @@ fn rewrite_create_table_sql_for_alter(
         }
     }
 
-    Ok(create.to_string())
+    // SQLite's ALTER rewrite emits the table name immediately followed by the
+    // opening parenthesis. The general AST formatter uses a readability space;
+    // normalize that one known formatter boundary for sqlite_schema parity.
+    Ok(create.to_string().replacen(" (", "(", 1))
 }
 
 fn rewrite_create_table_foreign_key_parent_sql(
@@ -81969,7 +81959,7 @@ fn rewrite_create_table_foreign_key_parent_sql(
             clause.table.push_str(new_parent_table);
         }
     });
-    Ok(create.to_string())
+    Ok(create.to_string().replacen(" (", "(", 1))
 }
 
 fn render_create_table_sql<F>(
@@ -106527,6 +106517,18 @@ enum TableFunctionCatalogMatch {
     Missing,
     Ordinary,
     CallableVirtual,
+}
+
+fn insert_source_select_for_validation<'a>(
+    insert: &'a fsqlite_ast::InsertStatement,
+    select: &'a SelectStatement,
+) -> std::borrow::Cow<'a, SelectStatement> {
+    if select.with.is_some() || insert.with.is_none() {
+        return std::borrow::Cow::Borrowed(select);
+    }
+    let mut scoped = select.clone();
+    scoped.with.clone_from(&insert.with);
+    std::borrow::Cow::Owned(scoped)
 }
 
 struct SelectRelationResolver<'connection, 'select> {
@@ -173467,12 +173469,11 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
-    fn test_recursive_cte_precompiled_arm_fast_path_for_prepared_sum() {
+    fn test_recursive_cte_specialized_arm_fast_path_for_prepared_sum() {
         asupersync::test_utils::run_test(|| async {
             let _serial = super::fsqlite_core_test_serializer();
             FSQLITE_RECURSIVE_CTE_DIRECT_EVAL_HITS.store(0, AtomicOrdering::Relaxed);
             FSQLITE_RECURSIVE_CTE_DIRECT_SYNC_EVAL_HITS.store(0, AtomicOrdering::Relaxed);
-            FSQLITE_RECURSIVE_CTE_PRECOMPILED_ARM_HITS.store(0, AtomicOrdering::Relaxed);
             FSQLITE_RECURSIVE_CTE_DIRECT_SUM_CONSUMER_HITS.store(0, AtomicOrdering::Relaxed);
             FSQLITE_RECURSIVE_CTE_INTEGER_SERIES_SUM_HITS.store(0, AtomicOrdering::Relaxed);
 
@@ -173497,7 +173498,6 @@ mod transaction_lifecycle_tests {
                 FSQLITE_RECURSIVE_CTE_DIRECT_EVAL_HITS.load(AtomicOrdering::Relaxed) > 0
                     || FSQLITE_RECURSIVE_CTE_DIRECT_SYNC_EVAL_HITS.load(AtomicOrdering::Relaxed)
                         > 0
-                    || FSQLITE_RECURSIVE_CTE_PRECOMPILED_ARM_HITS.load(AtomicOrdering::Relaxed) > 0
                     || FSQLITE_RECURSIVE_CTE_INTEGER_SERIES_SUM_HITS.load(AtomicOrdering::Relaxed)
                         > 0,
                 "recursive CTE benchmark shape should stay on a specialized recursive-arm fast path"

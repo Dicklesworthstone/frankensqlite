@@ -112,11 +112,14 @@ async fn run_fsqlite_per_task(
             std::thread::spawn(move || {
                 let mut thread_result: Option<ThreadResult> = None;
                 asupersync::test_utils::run_test(|| async {
-                    let conn = fsqlite::Connection::open(&p).await.expect("thread open");
+                    let open_result = fsqlite::Connection::open(&p).await;
+                    // Every worker must reach the barrier even when admission
+                    // fails, otherwise one error strands all successful opens.
+                    bar.wait();
+                    let conn = open_result.expect("thread open");
                     conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
                         .await
                         .expect("pragma");
-                    bar.wait();
                     let t_start = Instant::now();
                     let base = (tid as u64) * RANGE_SIZE;
                     let mut completed = 0u64;
@@ -191,12 +194,14 @@ fn run_csqlite_per_task(
             let p = path_str.clone();
             let bar = Arc::clone(&barrier);
             std::thread::spawn(move || {
-                let conn = rusqlite::Connection::open(&p).expect("csqlite thread open");
-                conn.execute_batch(&format!(
-                    "PRAGMA journal_mode=WAL; PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"
-                ))
-                .expect("pragma");
+                let open_result = rusqlite::Connection::open(&p).and_then(|conn| {
+                    conn.execute_batch(&format!(
+                        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"
+                    ))?;
+                    Ok(conn)
+                });
                 bar.wait();
+                let conn = open_result.expect("csqlite thread open and pragma");
                 let t_start = Instant::now();
                 let base = (tid as u64) * RANGE_SIZE;
                 let mut completed = 0u64;
@@ -281,12 +286,12 @@ fn m2_panic_in_one_thread_others_unaffected() {
                 std::thread::spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         asupersync::test_utils::run_test(|| async {
-                            let conn =
-                                fsqlite::Connection::open(&p).await.expect("thread open");
+                            let open_result = fsqlite::Connection::open(&p).await;
+                            bar.wait();
+                            let conn = open_result.expect("thread open");
                             conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
                                 .await
                                 .expect("pragma");
-                            bar.wait();
 
                             if tid == panic_thread {
                                 panic!("intentional panic in thread {tid}");
@@ -465,7 +470,9 @@ fn m5_per_thread_logs_distinguishable() {
                 std::thread::spawn(move || {
                     let mut span_id_out: Option<String> = None;
                     asupersync::test_utils::run_test(|| async {
-                        let conn = fsqlite::Connection::open(&p).await.expect("thread open");
+                        let open_result = fsqlite::Connection::open(&p).await;
+                        bar.wait();
+                        let conn = open_result.expect("thread open");
                         conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
                             .await
                             .expect("pragma");
@@ -473,8 +480,6 @@ fn m5_per_thread_logs_distinguishable() {
                         let span_id = format!("span_{tid}_{:?}", std::thread::current().id());
                         let log_path = ld.join(format!("thread_{tid}.jsonl"));
                         let mut log_lines = Vec::new();
-
-                        bar.wait();
 
                         let base = (tid as u64) * RANGE_SIZE;
                         conn.execute("BEGIN").await.expect("begin");
@@ -602,11 +607,12 @@ fn m6_hot_page_contention() {
                 std::thread::spawn(move || {
                     let mut thread_result: Option<ThreadResult> = None;
                     asupersync::test_utils::run_test(|| async {
-                        let conn = fsqlite::Connection::open(&p).await.expect("thread open");
+                        let open_result = fsqlite::Connection::open(&p).await;
+                        bar.wait();
+                        let conn = open_result.expect("thread open");
                         conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
                             .await
                             .expect("pragma");
-                        bar.wait();
                         let t_start = Instant::now();
                         let mut completed = 0u64;
                         let mut failed = 0u64;
@@ -687,11 +693,12 @@ fn m7_fsqlite_output_readable_by_csqlite() {
                 let bar = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     asupersync::test_utils::run_test(|| async {
-                        let conn = fsqlite::Connection::open(&p).await.expect("thread open");
+                        let open_result = fsqlite::Connection::open(&p).await;
+                        bar.wait();
+                        let conn = open_result.expect("thread open");
                         conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
                             .await
                             .expect("pragma");
-                        bar.wait();
                         let base = (tid as u64) * RANGE_SIZE;
                         conn.execute("BEGIN").await.expect("begin");
                         for i in 0..100u64 {
