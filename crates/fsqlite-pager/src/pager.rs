@@ -10662,6 +10662,14 @@ impl PublishedPagerState {
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
         self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
 
+        // A fallback read may be the first page observed after metadata moved
+        // past the resident page plane. The observed page belongs to the new
+        // horizon, but every retained page still belongs to the old one. Drop
+        // those stale pages before marking the plane current; later fallback
+        // reads at this same horizon may then populate it incrementally.
+        if self.page_plane_visible_commit_seq() != update.visible_commit_seq {
+            self.pages.clear();
+        }
         self.pages.insert(page_no, page);
         let page_set_size = self.pages.len();
 
@@ -48152,6 +48160,93 @@ mod tests {
             CommitSeq::new(7),
             "bead_id={BEAD_ID} case=observed_page_keeps_commit_seq"
         );
+    }
+
+    #[test]
+    fn observed_page_publication_drops_pages_from_an_older_plane_only_once() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(4, CommitSeq::new(7), JournalMode::Wal, 0);
+        let cx = Cx::new();
+        let stale_page_no = PageNumber::new(2).unwrap();
+        let first_current_page_no = PageNumber::new(3).unwrap();
+        let second_current_page_no = PageNumber::new(4).unwrap();
+        let stale_page = PageData::from_vec(sample_page(0x27));
+        let first_current_page = PageData::from_vec(sample_page(0x38));
+        let second_current_page = PageData::from_vec(sample_page(0x48));
+
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(7),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            stale_page_no,
+            stale_page,
+        );
+        published.publish_metadata_only(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+        );
+
+        assert_eq!(
+            published.page_plane_visible_commit_seq(),
+            CommitSeq::new(7),
+            "metadata-only publication must leave the old page-plane horizon explicit"
+        );
+        assert!(published.publish_observed_page(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            first_current_page_no,
+            first_current_page.clone(),
+        ));
+
+        assert_eq!(
+            published.try_get_page(stale_page_no),
+            None,
+            "the first observed page at a newer horizon must not relabel older resident pages"
+        );
+        assert_eq!(
+            published.try_get_page(first_current_page_no),
+            Some(first_current_page.clone())
+        );
+        assert!(published.publish_observed_page(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            second_current_page_no,
+            second_current_page.clone(),
+        ));
+
+        assert_eq!(
+            published.try_get_page(first_current_page_no),
+            Some(first_current_page),
+            "same-horizon observations must accumulate instead of clearing each other"
+        );
+        assert_eq!(
+            published.try_get_page(second_current_page_no),
+            Some(second_current_page)
+        );
+        assert_eq!(published.page_plane_visible_commit_seq(), CommitSeq::new(8));
     }
 
     #[test]
