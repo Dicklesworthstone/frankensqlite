@@ -2005,6 +2005,33 @@ enum ConcurrentWriteTier {
     Tier2CommitSurfaceRare,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CONCURRENT_PAGE_LOCK_WINDOW_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        RefCell::new(None);
+}
+
+#[cfg(test)]
+fn install_concurrent_page_lock_window_hook(hook: impl FnOnce() + 'static) {
+    CONCURRENT_PAGE_LOCK_WINDOW_HOOK.with(|slot| {
+        let replaced = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            replaced.is_none(),
+            "concurrent page-lock window hook already installed"
+        );
+    });
+}
+
+#[inline]
+fn fire_concurrent_page_lock_window_hook() {
+    #[cfg(test)]
+    CONCURRENT_PAGE_LOCK_WINDOW_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 impl std::fmt::Debug for SharedTxnPageIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedTxnPageIo")
@@ -2166,6 +2193,22 @@ impl SharedTxnPageIo {
             })
     }
 
+    fn post_acquire_fcw_conflict(
+        ctx: &ConcurrentContext,
+        page_no: PageNumber,
+    ) -> Result<Option<CommitSeq>> {
+        if !ctx.handle.lock().holds_page_lock(page_no) {
+            return Err(FrankenError::Internal(format!(
+                "MVCC page-lock acquisition for page {} returned success without ownership",
+                page_no.get()
+            )));
+        }
+        Ok(ctx
+            .commit_index
+            .latest(page_no)
+            .filter(|seq| *seq > ctx.snapshot_high))
+    }
+
     // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
     // await in this function's body. The engine executes strictly
     // sequentially per connection, but the reachable-reentrancy audit and
@@ -2252,6 +2295,7 @@ impl SharedTxnPageIo {
                     .flatten()
                     .filter(|seq| *seq > ctx.snapshot_high);
                 let write_result = conflicting_commit_seq.is_none().then(|| {
+                    fire_concurrent_page_lock_window_hook();
                     concurrent_prepare_write_page(
                         &mut handle,
                         &ctx.lock_table,
@@ -2290,6 +2334,39 @@ impl SharedTxnPageIo {
                 FrankenError::Internal("write result must exist when snapshot is valid".to_owned())
             })? {
                 Ok(()) => {
+                    match Self::post_acquire_fcw_conflict(ctx, page_no) {
+                        Ok(None) => {}
+                        Ok(Some(conflicting_commit_seq)) => {
+                            add_vdbe_counter(&FSQLITE_VDBE_MVCC_STALE_SNAPSHOT_REJECTS_TOTAL, 1);
+                            let error = FrankenError::BusySnapshot {
+                                conflicting_pages: page_no.get().to_string(),
+                            };
+                            Self::restore_concurrent_page_state(
+                                ctx,
+                                &prior_page_state,
+                                &format!("{error}; MVCC post-acquire state restore failed"),
+                            )?;
+                            tracing::warn!(
+                                txn_id,
+                                commit_seq = conflicting_commit_seq.get(),
+                                snapshot_high,
+                                page_id = page_no.get(),
+                                visibility_decision = "write_post_acquire_snapshot_stale",
+                                conflict_reason = "fcw_base_drift",
+                                write_tier = "tier1_first_touch",
+                                "mvcc write rejected after page-lock acquisition"
+                            );
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            Self::restore_concurrent_page_state(
+                                ctx,
+                                &prior_page_state,
+                                &format!("{error}; MVCC post-acquire state restore failed"),
+                            )?;
+                            return Err(error);
+                        }
+                    }
                     tracing::debug!(
                         txn_id,
                         commit_seq = snapshot_high,
@@ -2475,6 +2552,7 @@ impl SharedTxnPageIo {
                     .flatten()
                     .filter(|seq| *seq > ctx.snapshot_high);
                 let write_result = conflicting_commit_seq.is_none().then(|| {
+                    fire_concurrent_page_lock_window_hook();
                     concurrent_prepare_write_page(
                         &mut handle,
                         &ctx.lock_table,
@@ -2512,6 +2590,39 @@ impl SharedTxnPageIo {
                 FrankenError::Internal("write result must exist when snapshot is valid".to_owned())
             })? {
                 Ok(()) => {
+                    match Self::post_acquire_fcw_conflict(ctx, page_no) {
+                        Ok(None) => {}
+                        Ok(Some(conflicting_commit_seq)) => {
+                            add_vdbe_counter(&FSQLITE_VDBE_MVCC_STALE_SNAPSHOT_REJECTS_TOTAL, 1);
+                            let error = FrankenError::BusySnapshot {
+                                conflicting_pages: page_no.get().to_string(),
+                            };
+                            if let Err(restore_error) = restore_concurrent_state() {
+                                return Err(FrankenError::Internal(format!(
+                                    "{error}; {restore_error}"
+                                )));
+                            }
+                            tracing::warn!(
+                                txn_id,
+                                commit_seq = conflicting_commit_seq.get(),
+                                snapshot_high,
+                                page_id = page_no.get(),
+                                visibility_decision = "write_post_acquire_snapshot_stale",
+                                conflict_reason = "fcw_base_drift",
+                                write_tier = "tier2_commit_surface_rare",
+                                "mvcc write rejected after page-lock acquisition"
+                            );
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            if let Err(restore_error) = restore_concurrent_state() {
+                                return Err(FrankenError::Internal(format!(
+                                    "{error}; {restore_error}"
+                                )));
+                            }
+                            return Err(error);
+                        }
+                    }
                     tracing::debug!(
                         txn_id,
                         commit_seq = snapshot_high,
@@ -2861,6 +2972,10 @@ fn track_concurrent_conflict_only_page(
     let track_started = metrics_enabled.then(Instant::now);
     let started = Instant::now();
     let deadline = Duration::from_millis(ctx.busy_timeout_ms);
+    let prior_page_state = {
+        let handle = ctx.handle.lock();
+        concurrent_page_state(&handle, page_no)
+    };
 
     loop {
         observe_execution_cancellation(cx)?;
@@ -2872,6 +2987,7 @@ fn track_concurrent_conflict_only_page(
                 .flatten()
                 .filter(|seq| *seq > ctx.snapshot_high);
             let track_result = conflicting_commit_seq.is_none().then(|| {
+                fire_concurrent_page_lock_window_hook();
                 concurrent_track_write_conflict_page(
                     &mut handle,
                     &ctx.lock_table,
@@ -2918,6 +3034,38 @@ fn track_concurrent_conflict_only_page(
             FrankenError::Internal("track result must exist when snapshot is valid".to_owned())
         })? {
             Ok(()) => {
+                match SharedTxnPageIo::post_acquire_fcw_conflict(ctx, page_no) {
+                    Ok(None) => {}
+                    Ok(Some(conflicting_commit_seq)) => {
+                        let error = FrankenError::BusySnapshot {
+                            conflicting_pages: page_no.get().to_string(),
+                        };
+                        SharedTxnPageIo::restore_concurrent_page_state(
+                            ctx,
+                            &prior_page_state,
+                            &format!("{error}; MVCC conflict-only state restore failed"),
+                        )?;
+                        tracing::warn!(
+                            txn_id,
+                            commit_seq = conflicting_commit_seq.get(),
+                            snapshot_high,
+                            page_id = page_no.get(),
+                            visibility_decision = "conflict_only_post_acquire_snapshot_stale",
+                            conflict_reason = "fcw_base_drift",
+                            operation,
+                            "mvcc conflict-only page rejected after lock acquisition"
+                        );
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        SharedTxnPageIo::restore_concurrent_page_state(
+                            ctx,
+                            &prior_page_state,
+                            &format!("{error}; MVCC conflict-only state restore failed"),
+                        )?;
+                        return Err(error);
+                    }
+                }
                 add_vdbe_counter_if(
                     metrics_enabled,
                     &FSQLITE_VDBE_MVCC_PAGE_ONE_CONFLICT_TRACKS_TOTAL,
@@ -3284,6 +3432,7 @@ impl PageWriter for SharedTxnPageIo {
                             .flatten()
                             .filter(|seq| *seq > ctx.snapshot_high);
                         let free_result = conflicting_commit_seq.is_none().then(|| {
+                            fire_concurrent_page_lock_window_hook();
                             concurrent_free_page(
                                 &mut handle,
                                 &ctx.lock_table,
@@ -3317,6 +3466,22 @@ impl PageWriter for SharedTxnPageIo {
                         )
                     })? {
                         Ok(()) => {
+                            if let Some(conflicting_commit_seq) =
+                                SharedTxnPageIo::post_acquire_fcw_conflict(ctx, page_no)?
+                            {
+                                tracing::warn!(
+                                    txn_id,
+                                    commit_seq = conflicting_commit_seq.get(),
+                                    snapshot_high,
+                                    page_id = page_no.get(),
+                                    visibility_decision = "free_post_acquire_snapshot_stale",
+                                    conflict_reason = "fcw_base_drift",
+                                    "mvcc free rejected after page-lock acquisition"
+                                );
+                                return Err(FrankenError::BusySnapshot {
+                                    conflicting_pages: page_no.get().to_string(),
+                                });
+                            }
                             tracing::debug!(
                                 txn_id,
                                 commit_seq = snapshot_high,
@@ -35453,6 +35618,82 @@ mod tests {
             lock_table.total_lock_count(),
             1,
             "contested page lock must remain owned only by the winning writer"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_revalidates_fcw_after_page_lock_acquisition() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::Snapshot;
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = run_async(pager.begin(&cx, TransactionMode::Concurrent)).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+        let target_page = PageNumber::new(97).expect("test page must be non-zero");
+        let page_bytes = vec![0x5A; PageSize::DEFAULT.as_usize()];
+
+        let (session_id, handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("writer session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("writer session handle must be present");
+            (session_id, handle)
+        };
+
+        let hook_commit_index = Arc::clone(&commit_index);
+        install_concurrent_page_lock_window_hook(move || {
+            hook_commit_index.update(target_page, CommitSeq::new(8));
+        });
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            txn,
+            session_id,
+            handle,
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+        let error = run_async(page_io.write_page(&cx, target_page, &page_bytes))
+            .expect_err("a commit published in the precheck/acquire window must reject the writer");
+        assert!(
+            matches!(error, FrankenError::BusySnapshot { .. }),
+            "expected post-acquire BusySnapshot, got {error}"
+        );
+        assert_eq!(
+            lock_table.total_lock_count(),
+            0,
+            "post-acquire FCW rejection must release the stale writer's page lock"
+        );
+
+        let guard = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let writer = guard
+            .get(session_id)
+            .expect("writer session should remain registered for rollback");
+        assert!(
+            writer.write_set().is_empty(),
+            "post-acquire FCW rejection must not stage a stale page marker"
+        );
+        assert!(
+            writer.held_locks().is_empty(),
+            "post-acquire FCW rejection must restore the prior page-lock state"
+        );
+        drop(writer);
+        drop(guard);
+        assert!(
+            !page_io.txn.borrow().has_pending_writes(),
+            "post-acquire FCW rejection must not reach the pager write set"
         );
     }
 
