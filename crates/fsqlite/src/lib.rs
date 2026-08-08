@@ -173,6 +173,7 @@ mod tests {
         from_id: i64,
         to_id: i64,
         amount: i64,
+        begin_seq: u64,
         commit_seq: u64,
     }
 
@@ -7054,6 +7055,9 @@ mod tests {
                                 Some(format!("unexpected BEGIN error: {error:?}"));
                             break;
                         }
+                        let begin_seq = conn
+                            .current_concurrent_snapshot_seq()
+                            .expect("successful concurrent BEGIN must bind its snapshot sequence");
 
                         let from_balance = match conn
                             .query(&format!(
@@ -7225,6 +7229,7 @@ mod tests {
                                     from_id,
                                     to_id,
                                     amount,
+                                    begin_seq,
                                     commit_seq,
                                 });
                                 attempts_for_commit = 0;

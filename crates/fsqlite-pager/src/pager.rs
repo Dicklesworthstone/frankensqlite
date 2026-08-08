@@ -3818,7 +3818,12 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
             }
         };
         if let Some(published) = self.published.as_ref() {
-            published.publish_prepared_parallel_wal_group(cx, publish_update, complete_group_pages);
+            published.publish_prepared_parallel_wal_group(
+                cx,
+                publish_update,
+                complete_group_pages,
+                receipt.certificate.commit_seq_lo,
+            );
         }
         *self
             .resolution
@@ -7287,6 +7292,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
             2
         };
         inner.next_page = inner.next_page.max(next_unallocated_page);
+        let certificate_commit_seq_lo = authorization.durability_receipt.certificate.commit_seq_lo;
         inner.record_local_wal_commit_at(publication_intent.visible_commit_seq);
         let committed_snapshot = Arc::new(PagerCommittedSnapshot::from_inner(&inner));
         *self
@@ -7307,6 +7313,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
             &self.cleanup_cx,
             update,
             complete_group_pages.clone(),
+            certificate_commit_seq_lo,
         );
         self.published
             .bind_parallel_wal_publication(publication_intent);
@@ -10430,6 +10437,7 @@ impl PublishedPagerState {
         cx: &Cx,
         update: PublishedPagerUpdate,
         complete_group_pages: HashMap<PageNumber, PageData>,
+        certificate_commit_seq_lo: CommitSeq,
     ) {
         #[cfg(test)]
         record_commit_fast_path_lock(CommitFastPathLockClass::PublishedPagerState);
@@ -10444,6 +10452,15 @@ impl PublishedPagerState {
         let start = Instant::now();
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
         self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
+
+        // When this certificate starts after the resident page plane's next
+        // sequence, an intervening peer commit is absent from
+        // `complete_group_pages`. The existing pages cannot be relabeled at
+        // the certificate high-water: evict them inside this same seqlock
+        // generation so misses fall through to the pinned WAL image.
+        if certificate_commit_seq_lo > self.page_plane_visible_commit_seq().next() {
+            self.pages.clear();
+        }
 
         let previous_db_size = self.db_size.load(AtomicOrdering::Acquire);
         let previous_visible_commit_seq = self.visible_commit_seq.load(AtomicOrdering::Acquire);
@@ -10469,7 +10486,13 @@ impl PublishedPagerState {
         batches: &[TransactionFrameBatch],
     ) -> Result<()> {
         let complete_group_pages = Self::prepare_parallel_wal_group_pages(batches)?;
-        self.publish_prepared_parallel_wal_group(cx, update, complete_group_pages);
+        let certificate_commit_seq_lo = self.page_plane_visible_commit_seq().next();
+        self.publish_prepared_parallel_wal_group(
+            cx,
+            update,
+            complete_group_pages,
+            certificate_commit_seq_lo,
+        );
         Ok(())
     }
 
@@ -51209,6 +51232,47 @@ mod tests {
         assert_eq!(intent.page_plane_visible_commit_seq, CommitSeq::new(2));
         assert_eq!(intent.db_size, 23);
         assert_eq!(intent.page_set_size, 2);
+    }
+
+    #[test]
+    fn parallel_wal_publication_gap_evicts_uncovered_resident_pages() {
+        let cx = Cx::new();
+        let published = PublishedPagerState::new(3, CommitSeq::new(1), JournalMode::Wal, 0);
+        let stale_page = PageNumber::new(2).unwrap();
+        let current_group_page = PageNumber::new(3).unwrap();
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(1),
+                db_size: 3,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            stale_page,
+            PageData::from_vec(sample_page(0x11)),
+        );
+
+        let current_page = PageData::from_vec(sample_page(0x33));
+        published.publish_prepared_parallel_wal_group(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(3),
+                db_size: 3,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            HashMap::from([(current_group_page, current_page.clone())]),
+            CommitSeq::new(3),
+        );
+
+        assert_eq!(published.try_get_page(stale_page), None);
+        assert_eq!(
+            published.try_get_page(current_group_page),
+            Some(current_page)
+        );
+        assert_eq!(published.page_plane_visible_commit_seq(), CommitSeq::new(3));
     }
 
     #[test]

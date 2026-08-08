@@ -188636,6 +188636,219 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_file_backed_begin_sequence_and_page_image_are_coherent() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("begin_sequence_page_image_coherence.db");
+            let db = db_path.to_string_lossy().to_string();
+
+            {
+                let mut setup = Connection::open(&db).await.unwrap();
+                setup
+                    .execute(
+                        "CREATE TABLE accounts (\
+                             id INTEGER PRIMARY KEY,\
+                             balance INTEGER NOT NULL,\
+                             payload TEXT NOT NULL\
+                         );",
+                    )
+                    .await
+                    .unwrap();
+                let payload = "x".repeat(512);
+                for id in 0_i64..20 {
+                    setup
+                        .execute_with_params(
+                            "INSERT INTO accounts VALUES (?1, 1000, ?2);",
+                            &[
+                                SqliteValue::Integer(id),
+                                SqliteValue::Text(payload.clone().into()),
+                            ],
+                        )
+                        .await
+                        .unwrap();
+                }
+                setup.close_without_checkpoint_in_place().await.unwrap();
+            }
+
+            let mut pager_a = Connection::open(&db).await.unwrap();
+            let pager_b = Connection::open(&db).await.unwrap();
+
+            pager_a.execute("BEGIN;").await.unwrap();
+            pager_a
+                .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 0;")
+                .await
+                .unwrap();
+            pager_a.execute("COMMIT;").await.unwrap();
+
+            pager_a.execute("BEGIN;").await.unwrap();
+            pager_b.execute("BEGIN;").await.unwrap();
+            pager_b
+                .execute("UPDATE accounts SET balance = balance + 7 WHERE id = 0;")
+                .await
+                .unwrap();
+            pager_b.execute("COMMIT;").await.unwrap();
+            let peer_commit = pager_b.last_local_commit_seq().unwrap();
+
+            pager_a
+                .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 19;")
+                .await
+                .unwrap();
+            pager_a.execute("COMMIT;").await.unwrap();
+            let gap_commit = pager_a.last_local_commit_seq().unwrap();
+            assert!(gap_commit > peer_commit);
+
+            pager_a.execute("BEGIN;").await.unwrap();
+            let refreshed_snapshot = pager_a.current_concurrent_snapshot_seq().unwrap();
+            assert!(
+                refreshed_snapshot >= gap_commit,
+                "the pager must bind at or after its gap-crossing commit: commit={gap_commit} snapshot={refreshed_snapshot}"
+            );
+            assert_eq!(
+                pager_a
+                    .query_row("SELECT balance FROM accounts WHERE id = 0;")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Integer(1008)),
+                "a gap-crossing disjoint commit must not relabel the pre-peer page image at the new sequence"
+            );
+            pager_a
+                .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;")
+                .await
+                .unwrap();
+            pager_a.execute("COMMIT;").await.unwrap();
+            pager_a.close_without_checkpoint_in_place().await.unwrap();
+
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            assert_eq!(
+                stock
+                    .query_row("SELECT balance FROM accounts WHERE id = 0;", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                1008,
+                "a sibling-row write must preserve the prior committed page image"
+            );
+            assert_eq!(
+                stock
+                    .query_row("SELECT balance FROM accounts WHERE id = 1;", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                1001
+            );
+            assert_eq!(
+                stock
+                    .query_row("SELECT balance FROM accounts WHERE id = 19;", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                1001
+            );
+        });
+    }
+
+    #[test]
+    fn test_file_backed_same_leaf_transfer_preserves_both_legs() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("same_leaf_transfer_atomicity.db");
+            let db = db_path.to_string_lossy().to_string();
+
+            {
+                let mut setup = Connection::open(&db).await.unwrap();
+                setup
+                    .execute(
+                        "CREATE TABLE accounts (\
+                             id INTEGER PRIMARY KEY,\
+                             balance INTEGER NOT NULL,\
+                             payload TEXT NOT NULL\
+                         );",
+                    )
+                    .await
+                    .unwrap();
+                let payload = "x".repeat(512);
+                for id in 0_i64..20 {
+                    setup
+                        .execute_with_params(
+                            "INSERT INTO accounts VALUES (?1, 1000, ?2);",
+                            &[
+                                SqliteValue::Integer(id),
+                                SqliteValue::Text(payload.clone().into()),
+                            ],
+                        )
+                        .await
+                        .unwrap();
+                }
+                setup.close_without_checkpoint_in_place().await.unwrap();
+            }
+
+            let mut transfer = Connection::open(&db).await.unwrap();
+            transfer.execute("BEGIN;").await.unwrap();
+            assert_eq!(
+                transfer
+                    .execute("UPDATE accounts SET balance = balance - 9 WHERE id = 0;")
+                    .await
+                    .unwrap(),
+                1
+            );
+            let pages_after_debit = transfer
+                .active_txn
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .pending_conflict_pages_conservative();
+            assert_eq!(
+                transfer
+                    .execute("UPDATE accounts SET balance = balance + 9 WHERE id = 1;")
+                    .await
+                    .unwrap(),
+                1
+            );
+            let pages_after_credit = transfer
+                .active_txn
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .pending_conflict_pages_conservative();
+            assert_eq!(
+                pages_after_credit, pages_after_debit,
+                "adjacent fixed-width rows must exercise the same staged leaf"
+            );
+            transfer.execute("COMMIT;").await.unwrap();
+            transfer.close_without_checkpoint_in_place().await.unwrap();
+
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            let durable = stock
+                .query_row(
+                    "SELECT COUNT(*), SUM(balance),\
+                     (SELECT balance FROM accounts WHERE id = 0),\
+                     (SELECT balance FROM accounts WHERE id = 1)\
+                     FROM accounts;",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(durable, (20, 20_000, 991, 1009));
+            assert_eq!(
+                stock
+                    .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+        });
+    }
+
+    #[test]
     fn test_file_backed_stale_debit_cannot_publish_only_later_credit() {
         asupersync::test_utils::run_test(|| async {
             let _serial = super::fsqlite_core_test_serializer();
