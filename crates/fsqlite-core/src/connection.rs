@@ -116,9 +116,9 @@ use fsqlite_pager::pager::DatabaseImageReceipt;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
-    PagerCommitProfileSnapshot, PagerPublishedSnapshot, SimplePager, TransactionKind,
-    WalCommitSyncPolicy, page_buffer_pool_metrics_snapshot, pager_commit_profile_snapshot,
-    reset_page_buffer_pool_metrics, reset_pager_commit_profile,
+    PagerCommitProfileSnapshot, PagerCommitState, PagerPublishedSnapshot, SimplePager,
+    TransactionKind, WalCommitSyncPolicy, page_buffer_pool_metrics_snapshot,
+    pager_commit_profile_snapshot, reset_page_buffer_pool_metrics, reset_pager_commit_profile,
 };
 use fsqlite_parser::lexer::Lexer;
 use fsqlite_parser::{Parser, StatementParseScratch, parse_statements_with_scratch};
@@ -53433,6 +53433,58 @@ impl Connection {
                     }
                 }
             }
+
+            // A pager error is not necessarily proof that the physical commit
+            // was rejected. Group-commit completion and rollback-journal Phase
+            // C can report a local finalization error after the exact WAL/database
+            // commit is already authorized. Preserve the prepared MVCC plan and
+            // drive that same transaction handle to a terminal pager state before
+            // deciding whether CommitIndex/SSI publication or rollback applies.
+            let mut post_durable_commit_error = None;
+            let mut obligation_retry_attempt = 0_u32;
+            loop {
+                let pager_state = {
+                    let txn_guard = self.active_txn.borrow();
+                    txn_guard
+                        .as_ref()
+                        .map_or(PagerCommitState::Committed, |txn| txn.pager_commit_state())
+                };
+                let error = match commit_res {
+                    Ok(()) => break,
+                    Err(error) => error,
+                };
+                match pager_state {
+                    PagerCommitState::NotCommitted => {
+                        commit_res = Err(error);
+                        break;
+                    }
+                    PagerCommitState::Committed => {
+                        post_durable_commit_error.get_or_insert(error);
+                        commit_res = Ok(());
+                        break;
+                    }
+                    PagerCommitState::InDoubt | PagerCommitState::DurableNeedsPublication => {
+                        post_durable_commit_error.get_or_insert(error);
+                        obligation_retry_attempt = obligation_retry_attempt.saturating_add(1);
+                        let wait = BeginBusyRetryWait {
+                            attempt: obligation_retry_attempt,
+                            spin_loops: begin_busy_retry_spin_loops(obligation_retry_attempt),
+                            sleep_for: begin_busy_retry_sleep(obligation_retry_attempt),
+                        };
+                        perform_begin_busy_retry_handoff(wait).await;
+                        let cleanup_cx = cx.create_child();
+                        let _cleanup_mask = cleanup_cx.masked();
+                        commit_res = {
+                            let mut txn_guard = self.active_txn.borrow_mut();
+                            if let Some(txn) = txn_guard.as_mut() {
+                                txn.commit(&cleanup_cx).await
+                            } else {
+                                Ok(())
+                            }
+                        };
+                    }
+                }
+            }
             record_hot_path_duration(
                 &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
                 commit_txn_roundtrip_start,
@@ -53451,7 +53503,7 @@ impl Connection {
 
             let commit_outcome = match commit_res {
                 Ok(()) => PhysicalCommitOutcome::Durable {
-                    post_durable_error: None,
+                    post_durable_error: post_durable_commit_error,
                 },
                 Err(error) => PhysicalCommitOutcome::NotCommitted(error),
             };
@@ -53460,7 +53512,11 @@ impl Connection {
             let commit_outcome = {
                 let mut commit_outcome = commit_outcome;
                 if let PhysicalCommitOutcome::Durable { post_durable_error } = &mut commit_outcome {
-                    *post_durable_error = take_post_durable_commit_error();
+                    if let Some(injected_error) = take_post_durable_commit_error()
+                        && post_durable_error.is_none()
+                    {
+                        *post_durable_error = Some(injected_error);
+                    }
                 }
                 commit_outcome
             };
