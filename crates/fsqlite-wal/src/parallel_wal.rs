@@ -1374,6 +1374,27 @@ impl ParallelWalDurabilityCombiner {
         }
     }
 
+    /// Raise the certificate allocator to an independently verified durable
+    /// visibility floor before assigning another interval.
+    ///
+    /// A long-lived process-local combiner can outlive a pager refresh or a
+    /// checkpoint handoff. In that case the pager's durable commit identity may
+    /// be newer than the combiner's last locally published certificate even
+    /// when no newer certificate record exists in the current WAL generation.
+    /// The caller must derive this floor from durable pager state while holding
+    /// the external writer gate.
+    pub fn reconcile_durable_visibility_floor(&self, durable_visible_commit_seq: CommitSeq) {
+        let _ordered_residue = self.claim_ordered_residue_blocking();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.visibility.visible_commit_seq = state
+            .visibility
+            .visible_commit_seq
+            .max(durable_visible_commit_seq);
+    }
+
     /// Advance this process-local combiner from an already-authorized durable
     /// sidecar tail before assigning the next interval.
     ///
@@ -5280,6 +5301,33 @@ mod tests {
             next.certificate.certificate_epoch,
             first.certificate.certificate_epoch + 1
         );
+    }
+
+    #[test]
+    fn durable_visibility_floor_prevents_reusing_an_older_commit_interval() {
+        let combiner = ParallelWalDurabilityCombiner::default();
+        let first = combiner
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("first certificate should publish");
+        assert_eq!(first.certificate.commit_seq_hi, CommitSeq::new(2));
+
+        combiner.reconcile_durable_visibility_floor(CommitSeq::new(10));
+        combiner.reconcile_durable_visibility_floor(CommitSeq::new(9));
+        assert_eq!(
+            combiner.visibility_snapshot().visible_commit_seq,
+            CommitSeq::new(10),
+            "a stale durable observation must not lower the allocator"
+        );
+
+        let mut next_request = durability_request(ParallelWalOperatingMode::Auto);
+        next_request.batch_ids = vec![201, 202];
+        let next = combiner
+            .certify_and_publish(next_request, |_| Ok(()))
+            .expect("the next certificate must start above the durable floor");
+        assert_eq!(next.certificate.commit_seq_lo, CommitSeq::new(11));
+        assert_eq!(next.certificate.commit_seq_hi, CommitSeq::new(12));
     }
 
     #[test]

@@ -1874,7 +1874,7 @@ impl GroupCommitQueue {
             .durability_combiner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(slot.get_or_insert_with(|| {
+        let combiner = Arc::clone(slot.get_or_insert_with(|| {
             Arc::new(ParallelWalDurabilityCombiner::new(
                 ParallelWalVisibilitySnapshot {
                     visible_commit_seq: initial_visible_commit_seq,
@@ -1882,7 +1882,13 @@ impl GroupCommitQueue {
                     ..ParallelWalVisibilitySnapshot::default()
                 },
             ))
-        }))
+        }));
+        drop(slot);
+        // The queue is process-global and can outlive a pager refresh or WAL
+        // checkpoint generation. Never let its certificate allocator trail the
+        // durable pager identity observed under the external writer gate.
+        combiner.reconcile_durable_visibility_floor(initial_visible_commit_seq);
+        combiner
     }
 
     async fn prepare_persisted_epoch(
@@ -23218,6 +23224,31 @@ mod tests {
                 "replayed or out-of-order Phase C callbacks must not double-count commits"
             );
         });
+    }
+
+    #[test]
+    fn group_commit_queue_reconciles_reused_combiner_to_durable_pager_floor() {
+        let queue = GroupCommitQueue::new(GroupCommitConfig::default());
+        let first = queue.durability_combiner(CommitSeq::new(3), 7);
+        assert_eq!(
+            first.visibility_snapshot().visible_commit_seq,
+            CommitSeq::new(3)
+        );
+
+        let reused = queue.durability_combiner(CommitSeq::new(10), 9);
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert_eq!(
+            reused.visibility_snapshot().visible_commit_seq,
+            CommitSeq::new(10),
+            "a reused queue must not allocate below the pager's durable identity"
+        );
+
+        let stale = queue.durability_combiner(CommitSeq::new(8), 9);
+        assert_eq!(
+            stale.visibility_snapshot().visible_commit_seq,
+            CommitSeq::new(10),
+            "a stale pager observation must not lower the combiner"
+        );
     }
 
     #[test]

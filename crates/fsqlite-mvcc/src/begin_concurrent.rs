@@ -3309,7 +3309,10 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
 ) {
     debug_assert!(
         committed_seq >= prepared.planned_commit_seq,
-        "final commit sequence must not move backwards from the planning frontier"
+        "final commit sequence {committed_seq} must not move backwards from planning frontier {} (session {}, tracked pages {})",
+        prepared.planned_commit_seq,
+        prepared.session_id,
+        prepared.write_set_pages.len(),
     );
 
     let Some(txn_id) = TxnId::new(prepared.session_id) else {

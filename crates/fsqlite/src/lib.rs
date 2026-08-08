@@ -7432,6 +7432,10 @@ mod tests {
                 .iter()
                 .flat_map(|outcome| &outcome.committed_transfers)
             {
+                assert!(
+                    transfer.commit_seq > transfer.begin_seq,
+                    "committed transfer must advance its BEGIN snapshot: {transfer:?}"
+                );
                 let from_index = usize::try_from(transfer.from_id)
                     .expect("concurrent stress source account fits usize");
                 let to_index = usize::try_from(transfer.to_id)
