@@ -37157,6 +37157,17 @@ impl Connection {
             return self.cte_result_column_names(cte, visible_ctes, active_ctes);
         }
 
+        // The virtual schema tables are materialized only after statement
+        // dispatch. Metadata consumers that run before that boundary still
+        // need the real catalog layout, especially for source columns used
+        // only by ORDER BY rather than projected into the result.
+        if is_sqlite_schema_name(relation_name) {
+            return sqlite_master_column_infos()
+                .into_iter()
+                .map(|column| column.name)
+                .collect();
+        }
+
         let scope = if requested_scope == PragmaSchemaScope::Unqualified
             && (self.table_exists_for_scope(relation_name, PragmaSchemaScope::Temp)
                 || self
