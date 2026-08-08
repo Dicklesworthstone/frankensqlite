@@ -64165,18 +64165,6 @@ impl Connection {
             .collect();
         let column_collations = self.build_join_col_collations(select);
         let column_affinities = self.build_join_col_affinities(select);
-        let using_column_projections = self.build_join_using_column_projections(
-            select,
-            &column_collations,
-            &column_affinities,
-        );
-        let _join_eval_collation_guard =
-            JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
-                column_collations,
-                column_affinities,
-                using_column_projections,
-                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
-            });
 
         // Resolve the INTEGER PRIMARY KEY column name so that rowid/_rowid_/oid
         // aliases in GROUP BY and result columns can be rewritten to the real name.
@@ -64507,6 +64495,42 @@ impl Connection {
             };
             (raw_select, col_map, result_descriptors)
         };
+
+        // Projection pruning changes column positions. Keep comparison
+        // metadata in the same projected order so expressions do not inherit
+        // a neighboring source column's affinity or collation.
+        let (column_collations, column_affinities) =
+            if let Some(source_indices) = projection_source_indices.as_ref() {
+                (
+                    source_indices
+                        .iter()
+                        .map(|&index| column_collations.get(index).cloned().unwrap_or(None))
+                        .collect(),
+                    source_indices
+                        .iter()
+                        .map(|&index| {
+                            column_affinities
+                                .get(index)
+                                .copied()
+                                .unwrap_or(TypeAffinity::Blob)
+                        })
+                        .collect(),
+                )
+            } else {
+                (column_collations, column_affinities)
+            };
+        let using_column_projections = self.build_join_using_column_projections(
+            select,
+            &column_collations,
+            &column_affinities,
+        );
+        let _join_eval_collation_guard =
+            JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                column_collations,
+                column_affinities,
+                using_column_projections,
+                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+            });
 
         // Build per-GROUP-BY-key collation info for collation-aware grouping.
         let group_collations: Vec<Option<String>> = group_by_exprs
@@ -69264,6 +69288,12 @@ impl Connection {
         let with_clause = with.ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
         let is_recursive = with_clause.recursive;
         let ctes = &with_clause.ctes;
+        // Recursive fallback joins read their working table from MemDatabase.
+        // Hydrate persistent rows before installing any CTE roots so a mixed
+        // persistent/working-table join uses one complete execution image.
+        let op_cx = self.op_cx_after_background_status();
+        self.refresh_memdb_from_active_txn_if_dirty(&op_cx)
+            .await?;
         // Resolve every non-recursive result schema before installing any CTE
         // temp table.  This keeps nested WITH scopes and sibling references
         // available even though executing a CTE cleans up its inner temporary

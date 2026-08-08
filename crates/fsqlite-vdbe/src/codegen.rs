@@ -20096,8 +20096,8 @@ fn codegen_insert_values(
                 let excluded_hidden_rowid_reg = rowid_reg;
 
                 // Optional WHERE clause on the DO UPDATE action.
-                if let Some(where_expr) = where_clause {
-                    let skip_update_label = b.emit_label();
+                let skip_update_label = if let Some(where_expr) = where_clause {
+                    let label = b.emit_label();
                     let where_reg = b.alloc_reg();
                     emit_upsert_expr(
                         b,
@@ -20114,107 +20114,111 @@ fn codegen_insert_values(
                         Opcode::IfNot,
                         where_reg,
                         1, // p3=1: jump on NULL (treat NULL as false)
-                        skip_update_label,
+                        label,
                         P4::None,
                         0,
                     );
-                    // Evaluate assignments into existing_regs.
-                    emit_upsert_assignments(
-                        b,
-                        assignments,
-                        table,
-                        existing_regs,
-                        &existing_ctx,
-                        &excluded_ctx,
-                        existing_hidden_rowid_reg,
-                        excluded_hidden_rowid_reg,
-                    )?;
-                    // Constraint checks after assignments (matches regular
-                    // UPDATE path). Previously missing — UPSERT DO UPDATE
-                    // could write data violating STRICT, CHECK, or NOT NULL.
-                    emit_strict_type_check(b, table, existing_regs);
-                    emit_check_constraints(b, table, existing_regs, None);
-                    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
-                    // Delete old index entries while cursor is still on
-                    // the old row (reads column values from the cursor).
-                    emit_index_deletes(b, table, cursor);
-                    // Pack updated record and insert with REPLACE.
-                    let update_rec = b.alloc_reg();
-                    b.emit_op(
-                        Opcode::MakeRecord,
-                        existing_regs,
-                        n_cols_i32,
-                        update_rec,
-                        make_insert_record_p4(table, &aff_str),
-                        0,
-                    );
-                    b.emit_op(
-                        Opcode::Insert,
-                        cursor,
-                        update_rec,
-                        update_rowid_reg,
-                        P4::Table(table.name.clone()),
-                        OE_REPLACE | OPFLAG_ISUPDATE,
-                    );
-                    emit_index_inserts(
-                        b,
-                        table,
-                        cursor,
-                        existing_regs,
-                        update_rowid_reg,
-                        Some(ConflictAction::Replace),
-                    );
-                    if !returning.is_empty() {
-                        emit_returning(b, cursor, table, returning, table_alias, update_rowid_reg)?;
-                    }
-                    b.resolve_label(skip_update_label);
+                    Some(label)
                 } else {
-                    // No WHERE clause — always update on conflict.
-                    emit_upsert_assignments(
-                        b,
-                        assignments,
-                        table,
-                        existing_regs,
-                        &existing_ctx,
-                        &excluded_ctx,
-                        existing_hidden_rowid_reg,
-                        excluded_hidden_rowid_reg,
-                    )?;
-                    // Constraint checks (same as WHERE branch above).
-                    emit_strict_type_check(b, table, existing_regs);
-                    emit_check_constraints(b, table, existing_regs, None);
-                    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
-                    // Delete old index entries while cursor is still on
-                    // the old row (reads column values from the cursor).
-                    emit_index_deletes(b, table, cursor);
-                    let update_rec = b.alloc_reg();
-                    b.emit_op(
-                        Opcode::MakeRecord,
-                        existing_regs,
-                        n_cols_i32,
-                        update_rec,
-                        make_insert_record_p4(table, &aff_str),
+                    None
+                };
+
+                emit_upsert_assignments(
+                    b,
+                    assignments,
+                    table,
+                    existing_regs,
+                    &existing_ctx,
+                    &excluded_ctx,
+                    existing_hidden_rowid_reg,
+                    excluded_hidden_rowid_reg,
+                )?;
+                // Validate the rewritten image before removing the old row.
+                emit_strict_type_check(b, table, existing_regs);
+                emit_check_constraints(b, table, existing_regs, None);
+                emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
+                emit_index_deletes(b, table, cursor);
+                b.emit_op(
+                    Opcode::Delete,
+                    cursor,
+                    0,
+                    0,
+                    P4::None,
+                    OPFLAG_ISUPDATE,
+                );
+
+                // An UPSERT assignment may rewrite the INTEGER PRIMARY KEY.
+                // Reinsert at the new rowid, not the conflict victim's old id.
+                let mut final_rowid_reg = update_rowid_reg;
+                if let Some(ipk_idx) = ctx
+                    .rowid_alias_col_idx
+                    .or_else(|| table.columns.iter().position(|column| column.is_ipk))
+                {
+                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                    let ipk_reg = existing_regs + ipk_idx as i32;
+                    let auto_label = b.emit_label();
+                    let rowid_done_label = b.emit_label();
+                    final_rowid_reg = b.alloc_reg();
+                    b.emit_jump_to_label(
+                        Opcode::IsNull,
+                        ipk_reg,
+                        0,
+                        auto_label,
+                        P4::None,
                         0,
                     );
+                    b.emit_op(Opcode::Copy, ipk_reg, final_rowid_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(
+                        Opcode::Goto,
+                        0,
+                        0,
+                        rowid_done_label,
+                        P4::None,
+                        0,
+                    );
+                    b.resolve_label(auto_label);
                     b.emit_op(
-                        Opcode::Insert,
+                        Opcode::NewRowid,
                         cursor,
-                        update_rec,
-                        update_rowid_reg,
-                        P4::Table(table.name.clone()),
-                        OE_REPLACE | OPFLAG_ISUPDATE,
+                        final_rowid_reg,
+                        i32::from(ctx.concurrent_mode),
+                        P4::None,
+                        0,
                     );
-                    emit_index_inserts(
-                        b,
-                        table,
-                        cursor,
-                        existing_regs,
-                        update_rowid_reg,
-                        Some(ConflictAction::Replace),
-                    );
-                    if !returning.is_empty() {
-                        emit_returning(b, cursor, table, returning, table_alias, update_rowid_reg)?;
-                    }
+                    b.emit_op(Opcode::Copy, final_rowid_reg, ipk_reg, 0, P4::None, 0);
+                    b.resolve_label(rowid_done_label);
+                }
+
+                let update_rec = b.alloc_reg();
+                b.emit_op(
+                    Opcode::MakeRecord,
+                    existing_regs,
+                    n_cols_i32,
+                    update_rec,
+                    make_insert_record_p4(table, &aff_str),
+                    0,
+                );
+                b.emit_op(
+                    Opcode::Insert,
+                    cursor,
+                    update_rec,
+                    final_rowid_reg,
+                    P4::Table(table.name.clone()),
+                    OE_REPLACE | OPFLAG_ISUPDATE,
+                );
+                emit_index_inserts(
+                    b,
+                    table,
+                    cursor,
+                    existing_regs,
+                    final_rowid_reg,
+                    Some(ConflictAction::Replace),
+                );
+                if !returning.is_empty() {
+                    emit_returning(b, cursor, table, returning, table_alias, final_rowid_reg)?;
+                }
+                if let Some(label) = skip_update_label {
+                    b.resolve_label(label);
                 }
 
                 b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
@@ -52542,6 +52546,20 @@ mod tests {
         assert!(
             predicate_guard < conflict_probe,
             "the attempted row must satisfy the partial predicate before probing the index"
+        );
+        let old_row_delete = program
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::Delete && op.p5 == OPFLAG_ISUPDATE)
+            .expect("UPSERT update must remove the conflict victim before reinsertion");
+        let update_insert = program
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::Insert && op.p5 & OPFLAG_ISUPDATE != 0)
+            .expect("UPSERT update must reinsert the rewritten row");
+        assert!(
+            conflict_probe < old_row_delete && old_row_delete < update_insert,
+            "UPSERT must decide the conflict before deleting and reinserting its victim"
         );
     }
 

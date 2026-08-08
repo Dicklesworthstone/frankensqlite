@@ -23208,6 +23208,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_vdbe_unique_halt_returns_constraint_error_without_mutation() {
+        let mut b = ProgramBuilder::new();
+        b.emit_op(
+            Opcode::Halt,
+            ErrorCode::Constraint as i32,
+            0,
+            0,
+            P4::Str("t.email".to_owned()),
+            OPFLAG_HALT_UNIQUE,
+        );
+        let program = b.finish().expect("program should finish");
+        let mut engine = VdbeEngine::new(program.register_count());
+        let error = run_async(engine.execute(&program)).expect_err("UNIQUE halt must fail");
+        assert!(
+            matches!(error, FrankenError::UniqueViolation { ref columns } if columns == "t.email"),
+            "unexpected UNIQUE halt error: {error:?}"
+        );
+        assert_eq!(engine.changes(), 0);
+    }
+
     // ── test_vdbe_disassemble_and_exec ──────────────────────────────────
     #[test]
     fn test_vdbe_disassemble_and_exec() {
