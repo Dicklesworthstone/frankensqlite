@@ -188321,6 +188321,125 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_file_backed_disjoint_commit_sequence_fences_intermediate_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("disjoint_commit_sequence_fence.db");
+            let db = db_path.to_string_lossy().to_string();
+
+            {
+                let setup = Connection::open(&db).await.unwrap();
+                setup
+                    .execute(
+                        "CREATE TABLE accounts (\
+                             id INTEGER PRIMARY KEY,\
+                             balance INTEGER NOT NULL,\
+                             payload TEXT NOT NULL\
+                         );",
+                    )
+                    .await
+                    .unwrap();
+                let payload = "x".repeat(512);
+                for id in 0_i64..100 {
+                    setup
+                        .execute_with_params(
+                            "INSERT INTO accounts VALUES (?1, 1000, ?2);",
+                            &[
+                                SqliteValue::Integer(id),
+                                SqliteValue::Text(payload.clone().into()),
+                            ],
+                        )
+                        .await
+                        .unwrap();
+                }
+                setup.close_without_checkpoint_in_place().await.unwrap();
+            }
+
+            let conn_a = Connection::open(&db).await.unwrap();
+            let conn_b = Connection::open(&db).await.unwrap();
+            let conn_c = Connection::open(&db).await.unwrap();
+            for conn in [&conn_a, &conn_b, &conn_c] {
+                conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
+                assert!(conn.is_concurrent_mode_default());
+            }
+
+            conn_a.execute("BEGIN;").await.unwrap();
+            conn_b.execute("BEGIN;").await.unwrap();
+            let shared_begin = conn_a.current_concurrent_snapshot_seq().unwrap();
+            assert_eq!(
+                conn_b.current_concurrent_snapshot_seq(),
+                Some(shared_begin),
+                "the two disjoint writers must start from one WAL horizon"
+            );
+            assert_eq!(
+                conn_a
+                    .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;")
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn_b
+                    .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 50;")
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            conn_a.execute("COMMIT;").await.unwrap();
+            conn_c.execute("BEGIN;").await.unwrap();
+            let intermediate_snapshot = conn_c.current_concurrent_snapshot_seq().unwrap();
+            assert!(
+                intermediate_snapshot > shared_begin,
+                "the intermediate reader must include writer A before writer B publishes"
+            );
+
+            conn_b.execute("COMMIT;").await.unwrap();
+            let writer_b_commit = conn_b
+                .last_local_commit_seq()
+                .expect("writer B must publish a commit sequence");
+            assert!(
+                writer_b_commit > intermediate_snapshot,
+                "a later durable WAL commit must be newer than a transaction that began before it: \
+                 shared_begin={} intermediate_snapshot={} writer_b_commit={}",
+                shared_begin,
+                intermediate_snapshot,
+                writer_b_commit
+            );
+
+            let stale_write = conn_c
+                .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 50;")
+                .await;
+            let stale_error = match stale_write {
+                Err(error) => error,
+                Ok(changes) => {
+                    assert_eq!(changes, 1);
+                    conn_c
+                        .execute("COMMIT;")
+                        .await
+                        .expect_err("FCW must reject writer C's stale page image")
+                }
+            };
+            assert!(
+                stale_error.is_transient(),
+                "the stale writer must fail with a retryable conflict: {stale_error}"
+            );
+            conn_c.execute("ROLLBACK;").await.unwrap();
+
+            let balance = conn_a
+                .query_row("SELECT balance FROM accounts WHERE id = 50;")
+                .await
+                .unwrap();
+            assert_eq!(
+                balance.get(0),
+                Some(&SqliteValue::Integer(1001)),
+                "writer B's committed row must survive the rejected stale writer"
+            );
+        });
+    }
+
+    #[test]
     fn test_disjoint_concurrent_prepared_insert_reuse_across_rounds_refreshes_snapshot() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
