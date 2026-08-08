@@ -3467,7 +3467,7 @@ impl PageWriter for SharedTxnPageIo {
                     })? {
                         Ok(()) => {
                             if let Some(conflicting_commit_seq) =
-                                SharedTxnPageIo::post_acquire_fcw_conflict(ctx, page_no)?
+                                Self::post_acquire_fcw_conflict(ctx, page_no)?
                             {
                                 tracing::warn!(
                                     txn_id,

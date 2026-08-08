@@ -53574,12 +53574,11 @@ impl Connection {
             #[cfg(test)]
             let commit_outcome = {
                 let mut commit_outcome = commit_outcome;
-                if let PhysicalCommitOutcome::Durable { post_durable_error } = &mut commit_outcome {
-                    if let Some(injected_error) = take_post_durable_commit_error()
-                        && post_durable_error.is_none()
-                    {
-                        *post_durable_error = Some(injected_error);
-                    }
+                if let PhysicalCommitOutcome::Durable { post_durable_error } = &mut commit_outcome
+                    && let Some(injected_error) = take_post_durable_commit_error()
+                    && post_durable_error.is_none()
+                {
+                    *post_durable_error = Some(injected_error);
                 }
                 commit_outcome
             };

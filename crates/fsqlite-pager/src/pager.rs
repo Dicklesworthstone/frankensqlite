@@ -4973,7 +4973,11 @@ async fn capture_wal_conflict_snapshot_at_begin(
         with_wal_backend(wal_backend, cx, |wal, cx| wal.begin_transaction(cx)).await?;
     }
     with_wal_backend_read(wal_backend, cx, |wal, _| {
-        Box::pin(async move { Ok(wal.pinned_read_snapshot()) })
+        Box::pin(async move {
+            Ok(wal
+                .pinned_read_snapshot()
+                .or_else(|| wal.published_snapshot()))
+        })
     })
     .await
 }
@@ -11444,7 +11448,8 @@ where
                     capture_wal_conflict_snapshot_at_begin(
                         &self.wal_backend,
                         cx,
-                        committed_refresh.wal_snapshot_initialized,
+                        committed_refresh.wal_snapshot_initialized
+                            || active_transactions_before_begin != 0,
                     )
                     .await?
                 } else {
@@ -11664,7 +11669,8 @@ where
                 capture_wal_conflict_snapshot_at_begin(
                     &self.wal_backend,
                     cx,
-                    committed_refresh.wal_snapshot_initialized,
+                    committed_refresh.wal_snapshot_initialized
+                        || active_transactions_before_begin != 0,
                 )
                 .await?
             } else {
@@ -11844,7 +11850,10 @@ where
         {
             return Err(FrankenError::BusyRecovery);
         }
-        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
+        let replacing_backend = has_wal_backend(&self.wal_backend)?;
+        let maintenance_lease = replacing_backend
+            .then(|| self.maintenance_gate.enter_exclusive_maintenance())
+            .transpose()?;
         if self
             .group_commit_queue
             .has_process_root_finalization_attempt()
@@ -11864,6 +11873,9 @@ where
             .wal_backend
             .write()
             .map_err(|_| FrankenError::internal("SharedWalBackend lock poisoned"))?;
+        if wal_guard.is_some() && maintenance_lease.is_none() {
+            return Err(FrankenError::Busy);
+        }
         *wal_guard = Some(Arc::new(AsyncRwLock::with_name("wal_backend", backend)));
         drop(wal_guard);
         Ok(())
@@ -12188,9 +12200,17 @@ where
         {
             return Err((FrankenError::BusyRecovery, backend));
         }
-        let _maintenance_lease = match self.maintenance_gate.enter_transaction() {
-            Ok(lease) => lease,
+        let replacing_backend = match has_wal_backend(&self.wal_backend) {
+            Ok(replacing) => replacing,
             Err(err) => return Err((err, backend)),
+        };
+        let maintenance_lease = if replacing_backend {
+            match self.maintenance_gate.enter_exclusive_maintenance() {
+                Ok(lease) => Some(lease),
+                Err(err) => return Err((err, backend)),
+            }
+        } else {
+            None
         };
         if self
             .group_commit_queue
@@ -12218,6 +12238,9 @@ where
                 ));
             }
         };
+        if wal_guard.is_some() && maintenance_lease.is_none() {
+            return Err((FrankenError::Busy, backend));
+        }
         *wal_guard = Some(Arc::new(AsyncRwLock::with_name(
             "wal_backend",
             Box::new(backend),
@@ -18162,6 +18185,13 @@ where
             };
         let batch_build_us = elapsed_profile_us(t_batch_build_start);
 
+        if !conflict_pages.is_empty() && conflict_snapshot.is_none() {
+            if let Some(attempt) = txn_attempt {
+                attempt.complete_not_committed_global()?;
+            }
+            return Err(FrankenError::Unsupported);
+        }
+
         let t_conflict_snapshot_start = detailed_metrics.then(Instant::now);
         let batch = attach_group_commit_conflict_metadata(
             batch,
@@ -21246,6 +21276,15 @@ where
         async move {
             if self.rollback_commit_finalization_pending {
                 self.finish_durable_rollback_commit(cx).await?;
+                return Ok(false);
+            }
+            // The WAL backend currently owns one shared read pin. Retaining a
+            // logical transaction would require advancing that pin and this
+            // transaction's FCW horizon together after durability, which the
+            // backend API cannot do infallibly. Finish the transaction instead;
+            // the caller will open a fresh, coherently pinned transaction.
+            if self.journal_mode == JournalMode::Wal {
+                self.commit(cx).await?;
                 return Ok(false);
             }
             settle_pending_group_commit_finalization_for_handle(
@@ -43004,7 +43043,8 @@ mod tests {
             let pager = SimplePager::open(UnixVfs::new(), &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
-            let (backend, _, _) = MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+            let (backend, begin_calls, _) =
+                MockWalBackend::with_shared_frames(StdArc::clone(&frames));
             pager.set_wal_backend(Box::new(backend)).unwrap();
             assert_eq!(
                 pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap(),
@@ -43032,15 +43072,26 @@ mod tests {
                 contested_page.get(),
             ));
 
+            let begin_calls_before_sibling = *begin_calls.lock().unwrap();
             let mut sibling = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                *begin_calls.lock().unwrap(),
+                begin_calls_before_sibling,
+                "a sibling BEGIN must reuse, not replace, the active backend read pin"
+            );
             let sibling_snapshot = sibling
                 .wal_conflict_snapshot
-                .expect("sibling must pin the externally advanced WAL");
-            assert!(sibling_snapshot.commit_count > stale_snapshot.commit_count);
+                .expect("sibling must reuse the active pager snapshot");
+            assert_eq!(sibling_snapshot, stale_snapshot);
             assert_eq!(
                 stale.wal_conflict_snapshot,
                 Some(stale_snapshot),
                 "a sibling BEGIN must not replace the stale transaction's FCW horizon"
+            );
+            assert_eq!(
+                stale.get_page(&cx, contested_page).await.unwrap().as_ref(),
+                &sample_page(0x22)[..],
+                "an uncached stale read must remain bound to the pager's active WAL pin"
             );
 
             stale
@@ -43051,9 +43102,59 @@ mod tests {
                 .commit(&cx)
                 .await
                 .expect_err("FCW must reject a page changed after this transaction began");
-            assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+            let FrankenError::BusySnapshot { conflicting_pages } = &error else {
+                panic!("FCW must reject with BusySnapshot: {error:?}");
+            };
+            let named = conflicting_pages
+                .split(',')
+                .filter_map(|raw| raw.trim().parse::<u32>().ok())
+                .collect::<Vec<_>>();
+            assert!(
+                named.contains(&contested_page.get()),
+                "BusySnapshot payload {conflicting_pages:?} must name page {}",
+                contested_page.get()
+            );
             stale.rollback(&cx).await.unwrap();
             sibling.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_wal_commit_rejects_missing_conflict_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wal_missing_conflict_snapshot.db");
+            let cx = Cx::new();
+            let pager = SimplePager::open(UnixVfs::new(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let (backend, _, _, _) = MockWalBackend::new();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            assert_eq!(
+                pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap(),
+                JournalMode::Wal
+            );
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, page, &sample_page(0x44)).await.unwrap();
+            txn.wal_conflict_snapshot = None;
+
+            assert!(matches!(
+                txn.commit(&cx).await,
+                Err(FrankenError::Unsupported)
+            ));
+            assert!(
+                txn.pending_group_commit_attempt.is_none(),
+                "pre-admission rejection must synchronously clear the pending attempt"
+            );
+            assert_eq!(
+                txn.pager_commit_state(),
+                PagerCommitState::NotCommitted,
+                "pre-admission rejection must not leave the transaction in doubt"
+            );
+            txn.rollback(&cx).await.unwrap();
         });
     }
 
@@ -46762,7 +46863,7 @@ mod tests {
     }
 
     #[test]
-    fn test_named_memory_vfs_wal_retain_records_physical_main_file_size() {
+    fn test_named_memory_vfs_wal_commit_records_physical_main_file_size() {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
             let vfs = MemoryVfs::new();
@@ -46791,8 +46892,8 @@ mod tests {
             let page = txn.allocate_page(&cx).await.unwrap();
             txn.write_page(&cx, page, &vec![0x6D; ps]).await.unwrap();
             assert!(
-                txn.commit_and_retain(&cx).await.unwrap(),
-                "named MemoryVfs must retain its admitted writer transaction"
+                !txn.commit_and_retain(&cx).await.unwrap(),
+                "WAL commit_and_retain must finish so the next transaction gets a coherent pin"
             );
 
             let (recorded_main_file_size, logical_db_size, db_file) = {
@@ -46814,7 +46915,7 @@ mod tests {
             );
             assert_eq!(
                 recorded_main_file_size, physical_main_file_size,
-                "retained WAL commit must record the named database's physical main-file size"
+                "WAL commit must record the named database's physical main-file size"
             );
             assert_ne!(
                 recorded_main_file_size,
@@ -46822,12 +46923,11 @@ mod tests {
                 "named MemoryVfs must not use the private :memory: synthetic size rule"
             );
 
-            txn.rollback(&cx).await.unwrap();
             let reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
             assert_eq!(
                 reader.get_page(&cx, page).await.unwrap().as_ref()[0],
                 0x6D,
-                "retained commit must keep its WAL-published page visible after finalization"
+                "commit must keep its WAL-published page visible after finalization"
             );
         });
     }
@@ -48781,6 +48881,41 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
                 "caller should own backend cleanup after a rejected install"
+            );
+        });
+    }
+
+    #[test]
+    fn test_set_wal_backend_owned_rejects_active_transaction() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let (initial_backend, _, _, _) = MockWalBackend::new();
+            pager.set_wal_backend(Box::new(initial_backend)).unwrap();
+
+            let cx = Cx::new();
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let dropped = Arc::new(Mutex::new(false));
+            let replacement = DropAwareWalBackend {
+                dropped: Arc::clone(&dropped),
+            };
+            let (error, replacement) = pager
+                .set_wal_backend_owned(replacement)
+                .expect_err("an active transaction must fence WAL backend replacement");
+            assert!(matches!(error, FrankenError::Busy));
+            assert!(
+                !*dropped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                "rejected replacement must remain caller-owned"
+            );
+
+            reader.rollback(&cx).await.unwrap();
+            drop(replacement);
+            assert!(
+                *dropped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                "caller must be able to clean up the rejected replacement"
             );
         });
     }
