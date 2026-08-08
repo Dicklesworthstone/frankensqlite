@@ -4964,6 +4964,20 @@ async fn with_wal_backend_read<T>(
     f(guard.as_ref(), cx).await
 }
 
+async fn capture_wal_conflict_snapshot_at_begin(
+    wal_backend: &SharedWalBackend,
+    cx: &Cx,
+    snapshot_initialized: bool,
+) -> Result<Option<traits::WalPublicationSnapshot>> {
+    if !snapshot_initialized {
+        with_wal_backend(wal_backend, cx, |wal, cx| wal.begin_transaction(cx)).await?;
+    }
+    with_wal_backend_read(wal_backend, cx, |wal, _| {
+        Box::pin(async move { Ok(wal.pinned_read_snapshot()) })
+    })
+    .await
+}
+
 enum WalReadLookup {
     Ready(Option<Vec<u8>>),
     NeedsWriteFallback,
@@ -11426,6 +11440,16 @@ where
                 if eager_writer && inner.writer_active {
                     return Err(FrankenError::Busy);
                 }
+                let wal_conflict_snapshot = if inner.journal_mode == JournalMode::Wal {
+                    capture_wal_conflict_snapshot_at_begin(
+                        &self.wal_backend,
+                        cx,
+                        committed_refresh.wal_snapshot_initialized,
+                    )
+                    .await?
+                } else {
+                    None
+                };
                 let active_transactions_after_begin =
                     inner.active_transactions.checked_add(1).ok_or_else(|| {
                         FrankenError::internal("active transaction count overflow during begin")
@@ -11473,6 +11497,7 @@ where
                     rollback_recovery_pending: Arc::clone(&inner.rollback_recovery_pending),
                     recovery_fence: Arc::clone(&self.recovery_fence),
                     read_only_pager: inner.access_mode.is_readonly(),
+                    wal_conflict_snapshot,
                     published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
                     published_db_size: Cell::new(bound_db_size),
                     write_set: PagePageMap::default(),
@@ -11635,11 +11660,16 @@ where
                 admission.mark_writer_baton_owned();
             }
 
-            if inner.journal_mode == JournalMode::Wal && !committed_refresh.wal_snapshot_initialized
-            {
-                with_wal_backend(&self.wal_backend, cx, |wal, cx| wal.begin_transaction(cx))
-                    .await?;
-            }
+            let wal_conflict_snapshot = if inner.journal_mode == JournalMode::Wal {
+                capture_wal_conflict_snapshot_at_begin(
+                    &self.wal_backend,
+                    cx,
+                    committed_refresh.wal_snapshot_initialized,
+                )
+                .await?
+            } else {
+                None
+            };
 
             inner.active_transactions =
                 inner.active_transactions.checked_add(1).ok_or_else(|| {
@@ -11679,6 +11709,7 @@ where
                 rollback_recovery_pending,
                 recovery_fence: Arc::clone(&self.recovery_fence),
                 read_only_pager,
+                wal_conflict_snapshot,
                 published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
                 published_db_size: Cell::new(published_snapshot.db_size),
                 write_set: PagePageMap::default(),
@@ -16120,6 +16151,10 @@ where
     /// The physical pager was opened read-only. This is stronger than a
     /// read-only transaction mode and must reject every later writer upgrade.
     read_only_pager: bool,
+    /// WAL visibility horizon captured for this exact transaction at BEGIN.
+    /// The backend's shared pinned snapshot can be replaced when a sibling
+    /// transaction begins, so commit-time FCW validation must not reread it.
+    wal_conflict_snapshot: Option<traits::WalPublicationSnapshot>,
     /// Visible commit sequence at snapshot capture. This remains fixed during
     /// reads; transaction-owned commit paths may advance it after publishing
     /// their own writes.
@@ -18045,6 +18080,10 @@ where
         };
 
         let mut publication_authorization = None;
+        let conflict_snapshot = with_wal_backend_read(wal_backend, cx, |wal, _| {
+            Box::pin(async move { Ok(wal.pinned_read_snapshot()) })
+        })
+        .await?;
         Self::commit_wal_group_commit_with_snapshot(
             cx,
             wal_backend,
@@ -18055,6 +18094,7 @@ where
             write_set,
             write_pages_sorted,
             conflict_pages,
+            conflict_snapshot,
             &[],
             queue,
             &mut publication_authorization,
@@ -18075,6 +18115,7 @@ where
         write_set: &HashMap<PageNumber, StagedPage, S>,
         write_pages_sorted: &[PageNumber],
         conflict_pages: &[PageNumber],
+        conflict_snapshot: Option<traits::WalPublicationSnapshot>,
         conflict_page_baselines: &[TransactionConflictPageBaseline],
         queue: &GroupCommitQueueRef,
         publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
@@ -18122,10 +18163,6 @@ where
         let batch_build_us = elapsed_profile_us(t_batch_build_start);
 
         let t_conflict_snapshot_start = detailed_metrics.then(Instant::now);
-        let conflict_snapshot = with_wal_backend_read(wal_backend, cx, |wal, _| {
-            Box::pin(async move { Ok(wal.pinned_read_snapshot()) })
-        })
-        .await?;
         let batch = attach_group_commit_conflict_metadata(
             batch,
             conflict_pages,
@@ -20790,6 +20827,7 @@ where
                     &self.write_set,
                     &self.write_pages_sorted,
                     &cross_process_conflict_pages,
+                    self.wal_conflict_snapshot,
                     &cross_process_conflict_page_baselines,
                     &self.group_commit_queue,
                     &mut wal_publication_authorization,
@@ -21475,6 +21513,7 @@ where
                         &self.write_set,
                         &self.write_pages_sorted,
                         &cross_process_conflict_pages,
+                        self.wal_conflict_snapshot,
                         &cross_process_conflict_page_baselines,
                         &self.group_commit_queue,
                         &mut wal_publication_authorization,
@@ -42951,6 +42990,70 @@ mod tests {
                 &sample_page(0xBB)[..],
                 "the disjoint writer's own page must be durable"
             );
+        });
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_wal_fcw_keeps_each_transactions_begin_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wal_begin_snapshot_fcw.db");
+            let cx = Cx::new();
+            let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+            let pager = SimplePager::open(UnixVfs::new(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let (backend, _, _) = MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            assert_eq!(
+                pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap(),
+                JournalMode::Wal
+            );
+
+            let contested_page = {
+                let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = seed.allocate_page(&cx).await.unwrap();
+                seed.write_page(&cx, page, &sample_page(0x22))
+                    .await
+                    .unwrap();
+                seed.commit(&cx).await.unwrap();
+                page
+            };
+
+            let mut stale = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let stale_snapshot = stale
+                .wal_conflict_snapshot
+                .expect("WAL transaction must retain its BEGIN snapshot");
+
+            frames.lock().unwrap().push((
+                contested_page.get(),
+                sample_page(0xAA),
+                contested_page.get(),
+            ));
+
+            let mut sibling = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let sibling_snapshot = sibling
+                .wal_conflict_snapshot
+                .expect("sibling must pin the externally advanced WAL");
+            assert!(sibling_snapshot.commit_count > stale_snapshot.commit_count);
+            assert_eq!(
+                stale.wal_conflict_snapshot,
+                Some(stale_snapshot),
+                "a sibling BEGIN must not replace the stale transaction's FCW horizon"
+            );
+
+            stale
+                .write_page(&cx, contested_page, &sample_page(0xBB))
+                .await
+                .unwrap();
+            let error = stale
+                .commit(&cx)
+                .await
+                .expect_err("FCW must reject a page changed after this transaction began");
+            assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+            stale.rollback(&cx).await.unwrap();
+            sibling.rollback(&cx).await.unwrap();
         });
     }
 

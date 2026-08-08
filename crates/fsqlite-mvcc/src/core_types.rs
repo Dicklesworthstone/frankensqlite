@@ -2189,11 +2189,17 @@ impl LeftRightCommitIndexShard {
     fn update(&self, page: PageNumber, seq: CommitSeq) {
         let _guard = self.writer_lock.lock();
         let active = self.active.load(Ordering::Acquire);
+        let current = if active == 0 {
+            self.left.read().get(&page).copied()
+        } else {
+            self.right.read().get(&page).copied()
+        };
+        let published = current.map_or(seq, |current| current.max(seq));
 
         if active == 0 {
-            self.right.write().insert(page, seq);
+            self.right.write().insert(page, published);
         } else {
-            self.left.write().insert(page, seq);
+            self.left.write().insert(page, published);
         }
 
         self.active.store(1 - active, Ordering::Release);
@@ -2208,9 +2214,9 @@ impl LeftRightCommitIndexShard {
         }
 
         if active == 0 {
-            self.left.write().insert(page, seq);
+            self.left.write().insert(page, published);
         } else {
-            self.right.write().insert(page, seq);
+            self.right.write().insert(page, published);
         }
     }
 
@@ -2338,7 +2344,7 @@ impl CommitIndex {
             // The sharded path is only needed for len()/debug/diagnostics,
             // which can lazily scan the fast array instead.
             if let Some(slot) = self.fast_slot(pgno) {
-                slot.store(seq.get(), Ordering::Release);
+                slot.fetch_max(seq.get(), Ordering::Release);
             }
             return;
         }
@@ -2385,7 +2391,7 @@ impl CommitIndex {
                 // Safe to use Relaxed: the Release fence above already
                 // guarantees ordering for all stores that follow.
                 if let Some(slot) = self.fast_slot(pgno) {
-                    slot.store(raw, Ordering::Relaxed);
+                    slot.fetch_max(raw, Ordering::Relaxed);
                 }
             } else {
                 let shard = &self.shards[self.shard_index(page)];
@@ -4245,6 +4251,23 @@ mod tests {
         index.update(page, CommitSeq::new(10));
         assert_eq!(index.latest(page), Some(CommitSeq::new(10)));
         assert_eq!(index.latest_seq(), Some(CommitSeq::new(10)));
+    }
+
+    #[test]
+    fn test_commit_index_rejects_per_page_sequence_regression() {
+        let index = CommitIndex::new();
+        let fast_page = PageNumber::new(42).unwrap();
+        let sharded_page =
+            PageNumber::new(u32::try_from(FAST_COMMIT_ARRAY_SIZE + 1).unwrap()).unwrap();
+
+        index.batch_update(&[fast_page, sharded_page], CommitSeq::new(20));
+        index.update(fast_page, CommitSeq::new(10));
+        index.update(sharded_page, CommitSeq::new(10));
+        index.batch_update(&[fast_page, sharded_page], CommitSeq::new(15));
+
+        assert_eq!(index.latest(fast_page), Some(CommitSeq::new(20)));
+        assert_eq!(index.latest(sharded_page), Some(CommitSeq::new(20)));
+        assert_eq!(index.latest_seq(), Some(CommitSeq::new(20)));
     }
 
     #[test]
