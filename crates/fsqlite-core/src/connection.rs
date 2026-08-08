@@ -86469,10 +86469,17 @@ impl SharedMvccKey {
     }
 }
 
-struct SharedMvccState {
+/// Process-wide MVCC coordination for one file-backed database identity.
+///
+/// Runtime regions and background services remain isolated per
+/// [`RuntimeContext`], but page ownership, FCW publication, rowid allocation,
+/// and commit clocks must be shared by every connection to the same file.
+/// Keying those data-plane structures by runtime let connections created on
+/// separate thread-local runtimes silently bypass one another's page locks.
+struct SharedMvccCoordinationState {
     registry: Arc<Mutex<ConcurrentRegistry>>,
     conflict_observer: Arc<MetricsObserver>,
-    connection_pool_registry: SharedConnectionPoolRegistry,
+    connection_pool_registry: Arc<SharedConnectionPoolRegistry>,
     lock_table: Arc<InProcessPageLockTable>,
     commit_index: Arc<CommitIndex>,
     rowid_allocator: Arc<ConcurrentRowIdAllocator>,
@@ -86481,6 +86488,42 @@ struct SharedMvccState {
     stable_commit_seq: Arc<AtomicU64>,
     committed_schema_cookie: Arc<AtomicU32>,
     open_connection_count: Arc<AtomicUsize>,
+}
+
+impl SharedMvccCoordinationState {
+    fn new() -> Self {
+        let conflict_observer = Arc::new(MetricsObserver::new(1024));
+        Self {
+            registry: Arc::new(Mutex::new(ConcurrentRegistry::new())),
+            conflict_observer: Arc::clone(&conflict_observer),
+            connection_pool_registry: Arc::new(SharedConnectionPoolRegistry::new()),
+            lock_table: Arc::new(InProcessPageLockTable::with_observer(
+                conflict_observer as Arc<dyn fsqlite_observability::ConflictObserver>,
+            )),
+            commit_index: Arc::new(CommitIndex::new()),
+            rowid_allocator: Arc::new(ConcurrentRowIdAllocator::new(SchemaEpoch::ZERO)),
+            active_commit_seqs: Arc::new(Mutex::new(smallvec::SmallVec::new())),
+            next_commit_seq: Arc::new(AtomicU64::new(1)),
+            stable_commit_seq: Arc::new(AtomicU64::new(0)),
+            committed_schema_cookie: Arc::new(AtomicU32::new(0)),
+            open_connection_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+struct SharedMvccState {
+    registry: Arc<Mutex<ConcurrentRegistry>>,
+    conflict_observer: Arc<MetricsObserver>,
+    connection_pool_registry: Arc<SharedConnectionPoolRegistry>,
+    lock_table: Arc<InProcessPageLockTable>,
+    commit_index: Arc<CommitIndex>,
+    rowid_allocator: Arc<ConcurrentRowIdAllocator>,
+    active_commit_seqs: Arc<Mutex<smallvec::SmallVec<[u64; 16]>>>,
+    next_commit_seq: Arc<AtomicU64>,
+    stable_commit_seq: Arc<AtomicU64>,
+    committed_schema_cookie: Arc<AtomicU32>,
+    open_connection_count: Arc<AtomicUsize>,
+    _coordination: Arc<SharedMvccCoordinationState>,
     _runtime: Arc<RuntimeContext>,
     runtime_state: Mutex<SharedRuntimeState>,
     /// Fast-path poison check: single atomic load instead of mutex lock.
@@ -86491,7 +86534,11 @@ struct SharedMvccState {
 }
 
 impl SharedMvccState {
-    fn new(key: SharedMvccKey, runtime: Arc<RuntimeContext>) -> Result<Self> {
+    fn new(
+        key: SharedMvccKey,
+        runtime: Arc<RuntimeContext>,
+        coordination: Arc<SharedMvccCoordinationState>,
+    ) -> Result<Self> {
         let mut regions = RegionTree::new();
         let db_root_cx = runtime
             .root_cx
@@ -86524,21 +86571,19 @@ impl SharedMvccState {
             region_kind = "write_coordinator"
         );
 
-        let conflict_observer = Arc::new(MetricsObserver::new(1024));
         Ok(Self {
-            registry: Arc::new(Mutex::new(ConcurrentRegistry::new())),
-            conflict_observer: Arc::clone(&conflict_observer),
-            connection_pool_registry: SharedConnectionPoolRegistry::new(),
-            lock_table: Arc::new(InProcessPageLockTable::with_observer(
-                conflict_observer as Arc<dyn fsqlite_observability::ConflictObserver>,
-            )),
-            commit_index: Arc::new(CommitIndex::new()),
-            rowid_allocator: Arc::new(ConcurrentRowIdAllocator::new(SchemaEpoch::ZERO)),
-            active_commit_seqs: Arc::new(Mutex::new(smallvec::SmallVec::new())),
-            next_commit_seq: Arc::new(AtomicU64::new(1)),
-            stable_commit_seq: Arc::new(AtomicU64::new(0)),
-            committed_schema_cookie: Arc::new(AtomicU32::new(0)),
-            open_connection_count: Arc::new(AtomicUsize::new(0)),
+            registry: Arc::clone(&coordination.registry),
+            conflict_observer: Arc::clone(&coordination.conflict_observer),
+            connection_pool_registry: Arc::clone(&coordination.connection_pool_registry),
+            lock_table: Arc::clone(&coordination.lock_table),
+            commit_index: Arc::clone(&coordination.commit_index),
+            rowid_allocator: Arc::clone(&coordination.rowid_allocator),
+            active_commit_seqs: Arc::clone(&coordination.active_commit_seqs),
+            next_commit_seq: Arc::clone(&coordination.next_commit_seq),
+            stable_commit_seq: Arc::clone(&coordination.stable_commit_seq),
+            committed_schema_cookie: Arc::clone(&coordination.committed_schema_cookie),
+            open_connection_count: Arc::clone(&coordination.open_connection_count),
+            _coordination: coordination,
             _runtime: runtime,
             runtime_state: Mutex::new(SharedRuntimeState {
                 key,
@@ -87067,6 +87112,9 @@ impl SharedMvccState {
 
 static SHARED_MVCC_STATE_BY_PATH: OnceLock<Mutex<HashMap<SharedMvccKey, Weak<SharedMvccState>>>> =
     OnceLock::new();
+static SHARED_MVCC_COORDINATION_BY_PATH: OnceLock<
+    Mutex<HashMap<String, Weak<SharedMvccCoordinationState>>>,
+> = OnceLock::new();
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -87128,8 +87176,16 @@ fn mvcc_state_path_key(path: &str) -> String {
         .into_owned()
 }
 
-fn mvcc_state_key(path: &str, runtime: &RuntimeContext) -> SharedMvccKey {
-    SharedMvccKey::new(mvcc_state_path_key(path), runtime)
+fn shared_mvcc_coordination_for_path(path_key: &str) -> Arc<SharedMvccCoordinationState> {
+    let coordination_map =
+        SHARED_MVCC_COORDINATION_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = lock_unpoisoned(coordination_map);
+    if let Some(existing) = map.get(path_key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let coordination = Arc::new(SharedMvccCoordinationState::new());
+    map.insert(path_key.to_owned(), Arc::downgrade(&coordination));
+    coordination
 }
 
 fn shared_mvcc_state_for_path(
@@ -87137,13 +87193,17 @@ fn shared_mvcc_state_for_path(
     runtime: Arc<RuntimeContext>,
 ) -> Result<Arc<SharedMvccState>> {
     if path == ":memory:" {
+        let coordination = Arc::new(SharedMvccCoordinationState::new());
         return Ok(Arc::new(SharedMvccState::new(
             SharedMvccKey::new(path.to_owned(), &runtime),
             runtime,
+            coordination,
         )?));
     }
 
-    let key = mvcc_state_key(path, &runtime);
+    let path_key = mvcc_state_path_key(path);
+    let coordination = shared_mvcc_coordination_for_path(&path_key);
+    let key = SharedMvccKey::new(path_key, &runtime);
     let state_map = SHARED_MVCC_STATE_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = lock_unpoisoned(state_map);
 
@@ -87151,7 +87211,7 @@ fn shared_mvcc_state_for_path(
         return Ok(existing);
     }
 
-    let state = Arc::new(SharedMvccState::new(key.clone(), runtime)?);
+    let state = Arc::new(SharedMvccState::new(key.clone(), runtime, coordination)?);
     map.insert(key, Arc::downgrade(&state));
     Ok(state)
 }
@@ -123976,6 +124036,25 @@ mod tests {
             );
             assert!(Arc::ptr_eq(&conn_a._shared_mvcc_state._runtime, &runtime_a));
             assert!(Arc::ptr_eq(&conn_b._shared_mvcc_state._runtime, &runtime_b));
+            assert!(
+                Arc::ptr_eq(
+                    &conn_a._shared_mvcc_state._coordination,
+                    &conn_b._shared_mvcc_state._coordination,
+                ),
+                "distinct runtimes must still share one process-wide MVCC data plane for the file"
+            );
+            assert!(Arc::ptr_eq(
+                &conn_a.concurrent_lock_table,
+                &conn_b.concurrent_lock_table
+            ));
+            assert!(Arc::ptr_eq(
+                &conn_a.concurrent_commit_index,
+                &conn_b.concurrent_commit_index
+            ));
+            assert!(Arc::ptr_eq(
+                &conn_a.concurrent_registry,
+                &conn_b.concurrent_registry
+            ));
 
             let state_a = lock_unpoisoned(&conn_a._shared_mvcc_state.runtime_state);
             let state_b = lock_unpoisoned(&conn_b._shared_mvcc_state.runtime_state);
