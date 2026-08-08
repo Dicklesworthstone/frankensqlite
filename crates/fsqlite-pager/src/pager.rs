@@ -21175,6 +21175,31 @@ where
         }
     }
 
+    fn pager_commit_state(&self) -> crate::traits::PagerCommitState {
+        use crate::traits::PagerCommitState;
+
+        if self.finished {
+            return if self.committed {
+                PagerCommitState::Committed
+            } else {
+                PagerCommitState::NotCommitted
+            };
+        }
+        if self.rollback_commit_finalization_pending || self.committed {
+            return PagerCommitState::DurableNeedsPublication;
+        }
+        if let Some(attempt) = self.pending_group_commit_attempt.as_ref() {
+            return match attempt.resolution() {
+                PendingGroupCommitTxnResolution::Pending => PagerCommitState::InDoubt,
+                PendingGroupCommitTxnResolution::Authorized(_) => {
+                    PagerCommitState::DurableNeedsPublication
+                }
+                PendingGroupCommitTxnResolution::NotCommitted => PagerCommitState::NotCommitted,
+            };
+        }
+        PagerCommitState::NotCommitted
+    }
+
     // bd-h9o9r: a sync mutex guard is held across an await in this
     // function's body; reachable-deadlock audit and lock-scope repair
     // belong to the Phase-C pager reconstruction.
@@ -22944,7 +22969,7 @@ where
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use crate::traits::{MvccPager, TransactionHandle, TransactionMode};
+    use crate::traits::{MvccPager, PagerCommitState, TransactionHandle, TransactionMode};
     use fsqlite_types::PageSize;
     use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
     use fsqlite_types::{BTreePageHeader, DatabaseHeader};
@@ -34491,9 +34516,10 @@ mod tests {
     /// H4 / F4: Crash during Phase C — after WAL frames are durable and
     /// commit_seq is updated, but before snapshot publish completes.
     ///
-    /// Proof obligation: commit returns Err, but WAL frames were written
-    /// (the mock backend recorded them). On a real system, recovery from
-    /// the durable WAL would rebuild correct state.
+    /// Proof obligation: the first commit returns `Err`, but the pager reports
+    /// that durability is already authorized and retains the exact publication
+    /// obligation. Retrying the same handle must finish publication exactly
+    /// once without losing the durable WAL frames.
     ///
     /// Replay: `cargo test -p fsqlite-pager --lib -- test_fault_during_phase_c --nocapture`
     #[test]
@@ -34536,6 +34562,20 @@ mod tests {
             assert!(
                 err.to_string().contains("fault_inject:during_phase_c"),
                 "error should identify the Phase C hook: {err}"
+            );
+            assert_eq!(
+                txn.pager_commit_state(),
+                PagerCommitState::DurableNeedsPublication,
+                "a post-WAL Phase C error must retain its publication obligation"
+            );
+
+            txn.commit(&cx)
+                .await
+                .expect("retrying the same authorized attempt must finish publication");
+            assert_eq!(
+                txn.pager_commit_state(),
+                PagerCommitState::Committed,
+                "the retained publication obligation must settle as committed"
             );
 
             // WAL frames should have been written (the error is AFTER WAL I/O).

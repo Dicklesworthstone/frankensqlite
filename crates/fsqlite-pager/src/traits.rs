@@ -825,6 +825,33 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
 // TransactionHandle
 // ---------------------------------------------------------------------------
 
+/// Pager-owned state of one physical commit attempt.
+///
+/// `Result<()>` alone cannot distinguish a failure before WAL acceptance from
+/// an error observed after the commit marker became durable. Upper layers must
+/// only run rollback semantics for [`NotCommitted`](Self::NotCommitted);
+/// every other nonterminal state retains a commit obligation that must be
+/// reconciled by retrying the same transaction handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagerCommitState {
+    /// No physical commit is pending and rollback is still permitted.
+    NotCommitted,
+    /// Physical I/O may have started, but the exact WAL verdict is not final.
+    InDoubt,
+    /// Durability is authorized; pager publication/finalization remains.
+    DurableNeedsPublication,
+    /// Pager durability and publication are terminally committed.
+    Committed,
+}
+
+impl PagerCommitState {
+    /// Whether rollback must not interpret the current attempt as uncommitted.
+    #[must_use]
+    pub const fn retains_commit_obligation(self) -> bool {
+        !matches!(self, Self::NotCommitted)
+    }
+}
+
 /// A handle to an active MVCC transaction.
 ///
 /// Provides page-level read/write access scoped to the transaction's
@@ -937,6 +964,15 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// WAL append, and version publish. Returns `SQLITE_BUSY_SNAPSHOT`
     /// (via `FrankenError::Busy`) on serialization failure.
     fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a;
+
+    /// Return the pager-owned physical commit state for this exact handle.
+    ///
+    /// Implementations must keep this state monotonic once durability is
+    /// authorized: cancellation or a later local error cannot turn
+    /// `DurableNeedsPublication` back into `NotCommitted`.
+    fn pager_commit_state(&self) -> PagerCommitState {
+        PagerCommitState::NotCommitted
+    }
 
     /// Commit dirty pages and reset for immediate reuse without destroying
     /// the transaction handle.
@@ -1248,6 +1284,14 @@ impl TransactionHandle for MockTransaction {
         }
     }
 
+    fn pager_commit_state(&self) -> PagerCommitState {
+        if self.committed {
+            PagerCommitState::Committed
+        } else {
+            PagerCommitState::NotCommitted
+        }
+    }
+
     fn is_writer(&self) -> bool {
         false
     }
@@ -1440,6 +1484,14 @@ impl TransactionHandle for MemoryMockTransaction {
         async move {
             self.committed = true;
             Ok(())
+        }
+    }
+
+    fn pager_commit_state(&self) -> PagerCommitState {
+        if self.committed {
+            PagerCommitState::Committed
+        } else {
+            PagerCommitState::NotCommitted
         }
     }
 
@@ -1753,6 +1805,10 @@ impl TransactionHandle for TransactionKind {
 
     fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
         async move { dispatch_transaction_kind!(self, txn => txn.commit(cx).await) }
+    }
+
+    fn pager_commit_state(&self) -> PagerCommitState {
+        dispatch_transaction_kind!(self, txn => txn.pager_commit_state())
     }
 
     fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
