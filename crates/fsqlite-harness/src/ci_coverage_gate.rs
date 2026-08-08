@@ -710,6 +710,16 @@ fn validate_campaign_run(run: &CampaignRunEvidence, diagnostics: &mut Vec<Campai
             "the LabRuntime production-history lane must carry deterministic schedule evidence",
         );
     }
+    if run.lane_id == "bd-turso-test-adaptation-zu081.19"
+        && run.history_accounting != HistoryAccounting::Deterministic
+    {
+        campaign_diagnostic(
+            diagnostics,
+            "history_reduction_not_deterministic",
+            Some(lane_id),
+            "history/schedule reduction must preserve deterministic schedule evidence",
+        );
+    }
     if run.lane_id == "bd-turso-test-adaptation-zu081.9"
         && run.history_accounting != HistoryAccounting::ObservationOnly
     {
@@ -1961,7 +1971,9 @@ mod tests {
 
     fn campaign_run(lane_id: &str, tier: CampaignTier) -> CampaignRunEvidence {
         let history_accounting = match lane_id {
-            "bd-turso-test-adaptation-zu081.8" => HistoryAccounting::Deterministic,
+            "bd-turso-test-adaptation-zu081.8" | "bd-turso-test-adaptation-zu081.19" => {
+                HistoryAccounting::Deterministic
+            }
             "bd-turso-test-adaptation-zu081.9" => HistoryAccounting::ObservationOnly,
             _ => HistoryAccounting::NotApplicable,
         };
@@ -2239,11 +2251,18 @@ mod tests {
             .find(|run| run.lane_id == "bd-turso-test-adaptation-zu081.9")
             .expect("multiprocess history run");
         multiprocess.history_accounting = HistoryAccounting::Deterministic;
+        let history_reduction = input
+            .runs
+            .iter_mut()
+            .find(|run| run.lane_id == "bd-turso-test-adaptation-zu081.19")
+            .expect("deterministic history reduction run");
+        history_reduction.history_accounting = HistoryAccounting::ObservationOnly;
 
         let scorecard = evaluate_turso_campaign_gate(&input);
         let codes = campaign_diagnostic_codes(&scorecard);
         assert!(codes.contains(&"production_history_not_deterministic"));
         assert!(codes.contains(&"multiprocess_history_misclassified"));
+        assert!(codes.contains(&"history_reduction_not_deterministic"));
     }
 
     #[test]
