@@ -72,7 +72,7 @@ const TURSO_OPTIONAL_DECISIONS: [&str; 7] = [
 ];
 
 const MAX_CAMPAIGN_SUMMARY_LANES: usize = 16;
-const MAX_CAMPAIGN_SUMMARY_LANE_ID_CHARS: usize = 96;
+const MAX_CAMPAIGN_SUMMARY_LANE_ID_BYTES: usize = 96;
 
 /// Resource tier represented by a campaign receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -410,11 +410,7 @@ impl TursoCampaignScorecard {
                 .iter()
                 .filter(|diagnostic| diagnostic.lane_id.as_deref() == Some(lane.lane_id.as_str()))
                 .count();
-            let lane_id = lane
-                .lane_id
-                .chars()
-                .take(MAX_CAMPAIGN_SUMMARY_LANE_ID_CHARS)
-                .collect::<String>();
+            let lane_id = bounded_utf8_prefix(&lane.lane_id, MAX_CAMPAIGN_SUMMARY_LANE_ID_BYTES);
             let _ = writeln!(
                 output,
                 "lane={} runs={} generated={} executed={} errors={lane_errors}",
@@ -468,6 +464,14 @@ fn is_lower_hex(value: &str, expected_len: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn bounded_utf8_prefix(value: &str, maximum_bytes: usize) -> &str {
+    let mut end = value.len().min(maximum_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn validate_campaign_run(run: &CampaignRunEvidence, diagnostics: &mut Vec<CampaignGateDiagnostic>) {
@@ -2291,6 +2295,10 @@ mod tests {
     #[test]
     fn turso_scorecard_summary_is_bounded_for_unknown_lane_spam() {
         let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        input.runs.push(campaign_run(
+            &format!("aaaaaaaa-{}", "界".repeat(100)),
+            CampaignTier::Presubmit,
+        ));
         for index in 0..20 {
             let mut run = campaign_run(
                 "unknown-lane-with-an-intentionally-overlong-identifier-that-must-not-expand-info-output-without-bound",
