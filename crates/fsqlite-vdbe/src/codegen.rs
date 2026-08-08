@@ -20138,14 +20138,7 @@ fn codegen_insert_values(
                 emit_check_constraints(b, table, existing_regs, None);
                 emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
                 emit_index_deletes(b, table, cursor);
-                b.emit_op(
-                    Opcode::Delete,
-                    cursor,
-                    0,
-                    0,
-                    P4::None,
-                    OPFLAG_ISUPDATE,
-                );
+                b.emit_op(Opcode::Delete, cursor, 0, 0, P4::None, OPFLAG_ISUPDATE);
 
                 // An UPSERT assignment may rewrite the INTEGER PRIMARY KEY.
                 // Reinsert at the new rowid, not the conflict victim's old id.
@@ -20159,23 +20152,9 @@ fn codegen_insert_values(
                     let auto_label = b.emit_label();
                     let rowid_done_label = b.emit_label();
                     final_rowid_reg = b.alloc_reg();
-                    b.emit_jump_to_label(
-                        Opcode::IsNull,
-                        ipk_reg,
-                        0,
-                        auto_label,
-                        P4::None,
-                        0,
-                    );
+                    b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
                     b.emit_op(Opcode::Copy, ipk_reg, final_rowid_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(
-                        Opcode::Goto,
-                        0,
-                        0,
-                        rowid_done_label,
-                        P4::None,
-                        0,
-                    );
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, rowid_done_label, P4::None, 0);
                     b.resolve_label(auto_label);
                     b.emit_op(
                         Opcode::NewRowid,

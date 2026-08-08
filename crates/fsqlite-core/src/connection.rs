@@ -69303,8 +69303,7 @@ impl Connection {
         // Hydrate persistent rows before installing any CTE roots so a mixed
         // persistent/working-table join uses one complete execution image.
         let op_cx = self.op_cx_after_background_status();
-        self.refresh_memdb_from_active_txn_if_dirty(&op_cx)
-            .await?;
+        self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
         // Resolve every non-recursive result schema before installing any CTE
         // temp table.  This keeps nested WITH scopes and sibling references
         // available even though executing a CTE cleans up its inner temporary

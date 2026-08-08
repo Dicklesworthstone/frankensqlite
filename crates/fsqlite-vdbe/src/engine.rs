@@ -8743,9 +8743,7 @@ impl VdbeEngine {
 
                 Opcode::Halt => {
                     if op.p1 != 0 {
-                        if op.p1 == ErrorCode::Constraint as i32
-                            && op.p5 == OPFLAG_HALT_UNIQUE
-                        {
+                        if op.p1 == ErrorCode::Constraint as i32 && op.p5 == OPFLAG_HALT_UNIQUE {
                             let columns = match &op.p4 {
                                 P4::Str(columns) => columns.clone(),
                                 _ => String::new(),
