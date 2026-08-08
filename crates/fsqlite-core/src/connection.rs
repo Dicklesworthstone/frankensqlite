@@ -29018,15 +29018,8 @@ impl Connection {
                     }
                     Ok(rows)
                 } else {
-                    let mut post_distinct_limit = None;
                     let arc_prog;
                     let program: &VdbeProgram = if let Some(p) = precompiled {
-                        if distinct && select.limit.is_some() {
-                            let canonical = canonicalize_select_placeholders(select)?;
-                            let bound =
-                                bind_placeholders_in_select_for_fallback(&canonical, params)?;
-                            post_distinct_limit = bound.limit;
-                        }
                         p
                     } else {
                         // Eagerly rewrite IN-subqueries that the VDBE codegen
@@ -29037,18 +29030,6 @@ impl Connection {
                         {
                             return Ok(rows);
                         }
-                        let compiled_select = if distinct && rewritten.limit.is_some() {
-                            let bound = bind_placeholders_in_select_for_fallback(
-                                rewritten.as_ref(),
-                                params,
-                            )?;
-                            post_distinct_limit = bound.limit;
-                            let mut unbounded = rewritten.as_ref().clone();
-                            unbounded.limit = None;
-                            Cow::Owned(unbounded)
-                        } else {
-                            rewritten
-                        };
                         let plan_span = tracing::span!(
                             target: "fsqlite.plan",
                             tracing::Level::TRACE,
@@ -29062,11 +29043,11 @@ impl Connection {
                         // parameter-sensitive literal lists before codegen.
                         // Use SelectStatement::to_string() directly to avoid
                         // cloning the entire AST into a Statement wrapper.
-                        let sql_text = compiled_select.to_string();
+                        let sql_text = rewritten.to_string();
                         let sql_key = Self::sql_hash(&sql_text);
                         arc_prog = self
                             .compile_with_cache(sql_key, &sql_text, async |conn| {
-                                conn.compile_table_select(compiled_select.as_ref()).await
+                                conn.compile_table_select(rewritten.as_ref()).await
                             })
                             .await?;
                         &arc_prog
@@ -29102,9 +29083,6 @@ impl Connection {
                     }
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
-                        if let Some(limit_clause) = post_distinct_limit.as_ref() {
-                            self.apply_limit_clause(&mut rows, limit_clause, None)?;
-                        }
                     }
                     // Defensive normalization for a direct built-in aggregate
                     // result whose VM accumulator is unexpectedly NULL.
@@ -32163,28 +32141,12 @@ impl Connection {
                 } else {
                     Vec::new()
                 };
-                let limit_clause = select.limit.clone();
-                let post_distinct_limit = if distinct && limit_clause.is_some() {
-                    canonicalize_select_placeholders(select)?.limit
-                } else {
-                    None
-                };
-                let program = if distinct && limit_clause.is_some() {
-                    let mut unbounded = select.clone();
-                    unbounded.limit = None;
-                    let compiled_sql = unbounded.to_string();
-                    let compiled_sql_key = Self::sql_hash(&compiled_sql);
-                    self.compile_with_cache(compiled_sql_key, &compiled_sql, async |conn| {
-                        conn.compile_table_select(&unbounded).await
-                    })
-                    .await?
-                } else {
-                    let sql_key = Self::sql_hash(sql);
-                    self.compile_with_cache(sql_key, sql, async |conn| {
+                let sql_key = Self::sql_hash(sql);
+                let program = self
+                    .compile_with_cache(sql_key, sql, async |conn| {
                         conn.compile_table_select(select).await
                     })
-                    .await?
-                };
+                    .await?;
                 Ok(PreparedStatement {
                     sql: Rc::<str>::from(sql),
                     program,
@@ -32193,7 +32155,7 @@ impl Connection {
                     distinct,
                     distinct_collations: prep_collations,
                     db: Some(Rc::clone(&self.db)),
-                    post_distinct_limit,
+                    post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
                     function_registry_generation,

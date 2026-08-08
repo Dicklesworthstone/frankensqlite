@@ -8213,9 +8213,9 @@ fn codegen_select_index_ordered_scan(
 
 /// Generate VDBE bytecode for `SELECT DISTINCT` without ORDER BY.
 ///
-/// Uses a two-pass sorter approach: scan all output columns into the sorter
-/// (all columns are sort keys), sort, then iterate and skip adjacent
-/// duplicate rows using packed-record comparison.
+/// Preserves source scan order by recording each projected tuple in an
+/// ephemeral membership index. LIMIT/OFFSET apply only after a tuple is known
+/// to be distinct, matching SQLite's first-occurrence semantics.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -8237,47 +8237,22 @@ fn codegen_select_distinct_scan(
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
     let num_data_cols = result_column_count_usize(columns, table);
-
-    // Sorter cursor is separate from the table cursor.
-    let sorter_cursor = cursor + 1;
-
-    // Open sorter with all output columns as sort keys (ascending).
-    let sort_order: String = "+".repeat(num_data_cols);
-    // Build one collation entry per flattened output slot. A syntactic `*`
-    // contributes every table column, so iterating result-column AST nodes
-    // would shift or drop declared collations on the expanded tuple.
-    let sort_collations: Vec<String> = (0..num_data_cols)
+    let distinct_cursor = cursor + 1;
+    let distinct_collations = (0..num_data_cols)
         .map(|slot| {
-            result_output_slot_collation(slot, columns, table, table_alias).unwrap_or_default()
+            result_output_slot_collation(slot, columns, table, table_alias)
+                .unwrap_or_else(|| "BINARY".to_owned())
         })
-        .collect();
-    let has_collation = sort_collations.iter().any(|c| !c.is_empty());
-    let p4_str = if has_collation {
-        // Keep the serialized metadata explicitly positional whenever any
-        // slot needs a named collation. Spelling out BINARY defaults makes it
-        // unambiguous that a later NOCASE/RTRIM entry belongs to that later
-        // flattened output slot.
-        let positional_collations = sort_collations
-            .iter()
-            .map(|collation| {
-                if collation.is_empty() {
-                    "BINARY"
-                } else {
-                    collation.as_str()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        format!("{sort_order}|{positional_collations}")
-    } else {
-        sort_order
-    };
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
     b.emit_op(
-        Opcode::SorterOpen,
-        sorter_cursor,
+        Opcode::OpenAutoindex,
+        distinct_cursor,
         out_col_count,
         0,
-        P4::Str(p4_str),
+        P4::Str(distinct_collations),
         0,
     );
 
@@ -8291,12 +8266,9 @@ fn codegen_select_distinct_scan(
         0,
     );
 
-    // === Pass 1: Scan rows into sorter ===
     let scan_start = b.current_addr();
-    let scan_done = b.emit_label();
-    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, scan_done, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
 
-    // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
         emit_where_filter(
@@ -8310,151 +8282,54 @@ fn codegen_select_distinct_scan(
         );
     }
 
-    // Read output columns into consecutive registers.
-    let sorter_base = b.alloc_regs(out_col_count);
-    emit_column_reads(b, cursor, columns, table, table_alias, schema, sorter_base)?;
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
 
-    // MakeRecord from all output columns, then SorterInsert.
-    let record_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        sorter_base,
-        out_col_count,
-        record_reg,
-        P4::None,
-        0,
-    );
-    b.emit_op(
-        Opcode::SorterInsert,
-        sorter_cursor,
-        record_reg,
-        0,
-        P4::None,
-        0,
-    );
-
-    // Skip label (for WHERE-filtered rows).
-    b.resolve_label(skip_label);
-
-    // Next row in scan.
-    let scan_body = (scan_start + 1) as i32;
-    b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
-
-    // End of pass 1: close table cursor.
-    b.resolve_label(scan_done);
-    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
-
-    // === Pass 2: Iterate sorted rows, skipping duplicates ===
-
-    // Allocate LIMIT/OFFSET counters.
-    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
-
-    // DISTINCT state (record compare against previous output row).
-    let cur_rec = b.alloc_reg();
-    let prev_rec = b.alloc_reg();
-    b.emit_op(Opcode::Null, 0, prev_rec, 0, P4::None, 0);
-    let dup_skip = b.emit_label();
-
-    // SorterSort: sort and position at first row; jump to done if empty.
-    b.emit_jump_to_label(
-        Opcode::SorterSort,
-        sorter_cursor,
-        0,
-        done_label,
-        P4::None,
-        0,
-    );
-
-    let sort_loop_body = b.current_addr();
-
-    // SorterData: decode current sorted row.
-    let sorted_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::SorterData,
-        sorter_cursor,
-        sorted_reg,
-        0,
-        P4::None,
-        0,
-    );
-
-    // Extract output columns from sorted record.
-    for i in 0..num_data_cols {
-        b.emit_op(
-            Opcode::Column,
-            sorter_cursor,
-            i as i32,
-            out_regs + i as i32,
-            P4::None,
-            0,
-        );
-    }
-
-    // DISTINCT: pack output into a record for tracking previous row.
+    let distinct_record = b.alloc_temp();
     b.emit_op(
         Opcode::MakeRecord,
         out_regs,
         out_col_count,
-        cur_rec,
+        distinct_record,
         P4::None,
         0,
     );
-
-    // Use SorterCompare for collation-aware dedup: compares current sorter
-    // row with prev_rec using the sorter's per-column collation info.
-    // Jumps to not_dup when keys differ (not a duplicate).
-    let not_dup = b.emit_label();
     b.emit_jump_to_label(
-        Opcode::SorterCompare,
-        sorter_cursor,
-        prev_rec,
-        not_dup,
+        Opcode::Found,
+        distinct_cursor,
+        distinct_record,
+        skip_label,
         P4::None,
         0,
     );
-    // Fall through = keys equal = duplicate, skip to dup_skip.
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, dup_skip, P4::None, 0);
-    b.resolve_label(not_dup);
+    b.emit_op(
+        Opcode::IdxInsert,
+        distinct_cursor,
+        distinct_record,
+        0,
+        P4::None,
+        0,
+    );
+    b.free_temp(distinct_record);
 
-    // Update previous record to current for next comparison.
-    b.emit_op(Opcode::Copy, cur_rec, prev_rec, 0, P4::None, 0);
-
-    // OFFSET applies after duplicate elimination.
-    let output_skip = b.emit_label();
     if let Some(off_r) = offset_reg {
-        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, output_skip, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
     }
 
-    // ResultRow.
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
 
-    // LIMIT: decrement limit counter; jump to done when zero.
     if let Some(lim_r) = limit_reg {
         b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
     }
 
-    // Duplicate skip label.
-    b.resolve_label(dup_skip);
+    b.resolve_label(skip_label);
+    let scan_body = (scan_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
 
-    // Output skip label (for OFFSET-skipped rows).
-    b.resolve_label(output_skip);
-
-    // SorterNext: advance to next sorted row.
-    b.emit_op(
-        Opcode::SorterNext,
-        sorter_cursor,
-        sort_loop_body as i32,
-        0,
-        P4::None,
-        0,
-    );
-
-    // Done: Close sorter + Halt.
     b.resolve_label(done_label);
-    b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, distinct_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
-    // End target for Init jump.
     b.resolve_label(end_label);
 
     Ok(())
@@ -27133,12 +27008,11 @@ fn result_output_slot_collation(
 ///
 /// SQLite has two observably different plans. A general ordered DISTINCT
 /// query retains the first projected output for each DISTINCT key and emits
-/// that stored value after sorting. When the ascending ORDER BY is exactly the
-/// flattened DISTINCT output tuple, SQLite instead uses the tuple as a grouping
-/// key and evaluates the selected expressions again for the representative
-/// source row. The latter distinction matters for volatile or failing
-/// expressions, so the classifier below intentionally requires every merge
-/// precondition rather than guessing from a partial ORDER BY match.
+/// that stored value after sorting. A function-bearing projection must also
+/// stay in that mode: the DISTINCT-to-GROUP-BY rewrite in current SQLite does
+/// not invoke a scalar function again when the representative is emitted.
+/// Plain exact ascending output tuples may retain only their representative
+/// source row and project it after sorting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrderedDistinctProjectionMode {
     StoredOutput,
@@ -27159,6 +27033,12 @@ fn ordered_distinct_projection_mode(
         || order_by.len() != output_count
         || order_output_slots.len() != output_count
         || sort_collations.len() != output_count
+        || columns.iter().any(|column| {
+            matches!(
+                column,
+                ResultColumn::Expr { expr, .. } if expr_contains_function_call(expr)
+            )
+        })
     {
         return OrderedDistinctProjectionMode::StoredOutput;
     }
@@ -39762,34 +39642,25 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // DISTINCT scan uses sorter: SorterOpen, Rewind/Next scan,
-        // SorterInsert, SorterSort, SorterData, MakeRecord (for dedup),
-        // SorterCompare + Goto (collation-aware dedup), Copy (update prev),
-        // ResultRow, SorterNext.
+        // Unordered DISTINCT preserves source order and probes a membership
+        // index before emitting each first-occurrence tuple.
         assert!(has_opcodes(
             &prog,
             &[
                 Opcode::Init,
                 Opcode::Transaction,
-                Opcode::SorterOpen,
+                Opcode::OpenAutoindex,
                 Opcode::OpenRead,
                 Opcode::Rewind,
                 Opcode::Column,
                 Opcode::Column,
                 Opcode::MakeRecord,
-                Opcode::SorterInsert,
+                Opcode::Found,
+                Opcode::IdxInsert,
+                Opcode::ResultRow,
                 Opcode::Next,
                 Opcode::Close,
-                Opcode::SorterSort,
-                Opcode::SorterData,
-                Opcode::Column,
-                Opcode::Column,
-                Opcode::MakeRecord,
-                Opcode::SorterCompare,
-                Opcode::Goto,
-                Opcode::Copy,
-                Opcode::ResultRow,
-                Opcode::SorterNext,
+                Opcode::Close,
             ]
         ));
     }
@@ -39805,15 +39676,15 @@ mod tests {
             codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
             let prog = b.finish().unwrap();
 
-            let sorter_open = prog
+            let distinct_open = prog
                 .ops()
                 .iter()
-                .find(|op| op.opcode == Opcode::SorterOpen)
-                .expect("unordered DISTINCT should open a tuple sorter");
-            assert_eq!(sorter_open.p2, 2, "{sql}");
+                .find(|op| op.opcode == Opcode::OpenAutoindex)
+                .expect("unordered DISTINCT should open a membership index");
+            assert_eq!(distinct_open.p2, 2, "{sql}");
             assert_eq!(
-                sorter_open.p4,
-                P4::Str("++|BINARY,NOCASE".to_owned()),
+                distinct_open.p4,
+                P4::Str("BINARY,NOCASE".to_owned()),
                 "{sql}: expanded output slots must retain positional column collations"
             );
         }
@@ -39847,23 +39718,23 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        let cmp_pos = prog
+        let found_pos = prog
             .ops()
             .iter()
-            .position(|op| op.opcode == Opcode::SorterCompare)
-            .expect("missing DISTINCT SorterCompare opcode");
+            .position(|op| op.opcode == Opcode::Found)
+            .expect("missing DISTINCT membership probe");
         let ifpos_pos = prog
             .ops()
             .iter()
             .position(|op| op.opcode == Opcode::IfPos)
             .expect("missing OFFSET IfPos opcode");
         assert!(
-            cmp_pos < ifpos_pos,
+            found_pos < ifpos_pos,
             "DISTINCT dedup must run before OFFSET filtering"
         );
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Null),
-            "expected DISTINCT previous-record register initialization"
+            !prog.ops().iter().any(|op| op.opcode == Opcode::SorterOpen),
+            "unordered DISTINCT must not sort before LIMIT/OFFSET"
         );
     }
 
@@ -43124,7 +42995,7 @@ mod tests {
     }
 
     #[test]
-    fn complex_in_distinct_function_output_order_reference_reprojects() {
+    fn complex_in_distinct_function_output_order_reference_is_stored() {
         let schema = test_schema_with_subquery_source();
         for sql in [
             "SELECT a IN \
@@ -43146,23 +43017,15 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 output_calls.len(),
-                2,
+                1,
                 "exact alias/ordinal/qualified-structural ordered DISTINCT must emit \
-                 one pass-1 evaluation and one second-stage projection: `{sql}`"
+                 exactly one projected function evaluation: `{sql}`"
             );
 
             let distinct_probe = ops
                 .iter()
                 .position(|op| op.opcode == Opcode::Found)
                 .expect("ordered DISTINCT should probe pass-1 membership");
-            let sorter_data = ops
-                .iter()
-                .position(|op| op.opcode == Opcode::SorterData)
-                .expect("ordered DISTINCT should restore its retained representative");
-            let representative_seek = ops
-                .iter()
-                .position(|op| op.opcode == Opcode::SeekRowid)
-                .expect("rowid-table reprojection should seek the representative source row");
             let source_cursor = ops
                 .iter()
                 .find(|op| {
@@ -43176,12 +43039,13 @@ mod tests {
                 .position(|op| op.opcode == Opcode::Close && op.p1 == source_cursor)
                 .expect("complex-IN should close source table s");
             assert!(
-                output_calls[0] < distinct_probe
-                    && sorter_data < representative_seek
-                    && representative_seek < output_calls[1]
-                    && output_calls[1] < source_close,
-                "pass 1 must preserve output-first membership, then pass 2 must restore \
-                 and reproject the retained representative before closing its rowid cursor: `{sql}`"
+                output_calls[0] < distinct_probe && distinct_probe < source_close,
+                "pass 1 must preserve output-first membership and retain that value \
+                 before closing its source cursor: `{sql}`"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+                "function-bearing ordered DISTINCT must not re-evaluate a representative: `{sql}`"
             );
             assert!(
                 ops.iter().any(|op| op.opcode == Opcode::SorterOpen)
@@ -44821,9 +44685,8 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 output_calls.len(),
-                2,
-                "[{label}] exact ascending DISTINCT output should be evaluated in pass 1 \
-                 and reprojected only for an emitted representative"
+                1,
+                "[{label}] function-bearing DISTINCT output should be evaluated once per source row"
             );
             assert!(
                 output_calls[0] < found_index,
@@ -44846,8 +44709,12 @@ mod tests {
                 return;
             };
             assert!(
-                offset_index < sorter_data_index && sorter_data_index < output_calls[1],
-                "[{label}] OFFSET must skip representatives before source restore and reprojection"
+                output_calls[0] < offset_index && offset_index < sorter_data_index,
+                "[{label}] OFFSET must skip representatives before reading stored output"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+                "[{label}] stored function output must not seek and reproject a source row"
             );
         };
 

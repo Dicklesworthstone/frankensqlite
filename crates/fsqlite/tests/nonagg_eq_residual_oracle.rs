@@ -152,10 +152,7 @@ async fn has_seek(c: &Connection, sql: &str) -> bool {
 }
 async fn has_seek_params(c: &Connection, sql: &str, params: &[SqliteValue]) -> bool {
     let explain_sql = format!("EXPLAIN {sql}");
-    c.prepare(&explain_sql)
-        .await
-        .unwrap()
-        .query_with_params(params)
+    c.query_with_params(&explain_sql, params)
         .await
         .unwrap()
         .iter()
@@ -688,7 +685,7 @@ fn ordered_distinct_deduplicates_output_tuple_instead_of_sort_key() {
 }
 
 #[test]
-fn ordered_distinct_reprojects_only_exact_ascending_output_tuple() {
+fn ordered_distinct_reuses_function_output_for_exact_ascending_tuple() {
     asupersync::test_utils::run_test(|| async {
         let (f, r) =
             setup(&["CREATE TABLE merged_rows (id INTEGER PRIMARY KEY, v INTEGER, k INTEGER);"])
@@ -724,7 +721,7 @@ fn ordered_distinct_reprojects_only_exact_ascending_output_tuple() {
                  FROM merged_rows ORDER BY tick(v) LIMIT 1",
             ),
             (
-                "ordered-distinct-merged-offset-skips-reprojection",
+                "ordered-distinct-merged-offset-reuses-output",
                 "SELECT DISTINCT tick(v) AS projected \
                  FROM merged_rows ORDER BY projected LIMIT 1 OFFSET 1",
             ),
@@ -750,7 +747,7 @@ fn ordered_distinct_reprojects_only_exact_ascending_output_tuple() {
                 frank_calls.as_ref(),
                 sqlite_calls.as_ref(),
                 sql,
-                4,
+                3,
                 label,
             )
             .await;
@@ -807,7 +804,7 @@ fn ordered_distinct_reprojects_only_exact_ascending_output_tuple() {
                 rusqlite::types::Value::Integer(1),
                 rusqlite::types::Value::Integer(1),
             ],
-            4,
+            3,
             "ordered-distinct-merged-prepared-offset",
         )
         .await;
@@ -828,7 +825,7 @@ fn ordered_distinct_reprojects_only_exact_ascending_output_tuple() {
 }
 
 #[test]
-fn ordered_distinct_reprojection_covers_star_generated_without_rowid_and_complex_in() {
+fn ordered_distinct_function_output_reuse_covers_generated_without_rowid_and_complex_in() {
     asupersync::test_utils::run_test(|| async {
         let (f, r) = setup(&[
             "CREATE TABLE star_rows (v INTEGER);",
@@ -918,7 +915,7 @@ fn ordered_distinct_reprojection_covers_star_generated_without_rowid_and_complex
                 frank_calls.as_ref(),
                 sqlite_calls.as_ref(),
                 sql,
-                4,
+                3,
                 label,
             )
             .await;
@@ -969,7 +966,7 @@ fn ordered_distinct_reprojection_covers_star_generated_without_rowid_and_complex
                 rusqlite::types::Value::Integer(1),
                 rusqlite::types::Value::Integer(1),
             ],
-            4,
+            3,
             "complex-in-ordered-distinct-merged-prepared-offset",
         )
         .await;
