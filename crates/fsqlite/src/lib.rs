@@ -169,6 +169,14 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct ConcurrentStressTransfer {
+        from_id: i64,
+        to_id: i64,
+        amount: i64,
+        commit_seq: u64,
+    }
+
+    #[derive(Debug)]
     struct ConcurrentStressWorkerOutcome {
         worker_id: usize,
         concurrent_mode_default: bool,
@@ -178,6 +186,7 @@ mod tests {
         retries: ConcurrentStressRetryCounts,
         elapsed: Duration,
         failure: Option<String>,
+        committed_transfers: Vec<ConcurrentStressTransfer>,
     }
 
     impl ConcurrentStressWorkerOutcome {
@@ -191,6 +200,7 @@ mod tests {
                 retries: ConcurrentStressRetryCounts::default(),
                 elapsed: Duration::ZERO,
                 failure: Some("worker exited without recording an outcome".to_owned()),
+                committed_transfers: Vec::new(),
             }
         }
     }
@@ -7208,6 +7218,15 @@ mod tests {
                         match conn.execute("COMMIT;").await {
                             Ok(_) => {
                                 outcome.commits += 1;
+                                let commit_seq = conn.last_local_commit_seq().expect(
+                                    "successful concurrent commit must publish its sequence",
+                                );
+                                outcome.committed_transfers.push(ConcurrentStressTransfer {
+                                    from_id,
+                                    to_id,
+                                    amount,
+                                    commit_seq,
+                                });
                                 attempts_for_commit = 0;
                                 last_transient_error = None;
                             }
@@ -7345,6 +7364,110 @@ mod tests {
             eprintln!("concurrent stress worker outcome: {outcome:#?}");
         }
 
+        // Always collect an independent committed-file verdict before any
+        // worker assertion can abort this keeper. A worker may fail because
+        // its transaction assembled a mixed page-version view, or because a
+        // writer actually published a malformed B-tree. Stock SQLite's scan,
+        // point lookup, aggregate, and integrity checker distinguish those
+        // two release-critical failure classes after every worker is closed.
+        let stock_diagnostic =
+            (|| -> Result<(i64, i64, i64, i64, Vec<String>, Vec<(i64, i64)>), String> {
+                let stock =
+                    rusqlite::Connection::open(&db_path).map_err(|error| error.to_string())?;
+                let row_count = stock
+                    .query_row("SELECT COUNT(*) FROM accounts;", [], |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                let balance_sum = stock
+                    .query_row("SELECT SUM(balance) FROM accounts;", [], |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                let point_count = stock
+                    .query_row("SELECT COUNT(*) FROM accounts WHERE id = 9;", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|error| error.to_string())?;
+                let scan_count = stock
+                    .query_row(
+                        "SELECT COUNT(*) FROM accounts NOT INDEXED WHERE id + 0 = 9;",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let mut statement = stock
+                    .prepare("PRAGMA integrity_check;")
+                    .map_err(|error| error.to_string())?;
+                let integrity = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|error| error.to_string())?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|error| error.to_string())?;
+                let mut statement = stock
+                    .prepare("SELECT id, balance FROM accounts ORDER BY id;")
+                    .map_err(|error| error.to_string())?;
+                let balances = statement
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                    .map_err(|error| error.to_string())?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|error| error.to_string())?;
+                Ok((
+                    row_count,
+                    balance_sum,
+                    point_count,
+                    scan_count,
+                    integrity,
+                    balances,
+                ))
+            })();
+        eprintln!("concurrent stress stock SQLite diagnostic: {stock_diagnostic:#?}");
+
+        if let Ok((_, _, _, _, _, durable_balances)) = &stock_diagnostic {
+            let account_count =
+                usize::try_from(NUM_ACCOUNTS).expect("concurrent stress account count fits usize");
+            let mut expected_balances = vec![INITIAL_BALANCE; account_count];
+            for transfer in results
+                .iter()
+                .flat_map(|outcome| &outcome.committed_transfers)
+            {
+                let from_index = usize::try_from(transfer.from_id)
+                    .expect("concurrent stress source account fits usize");
+                let to_index = usize::try_from(transfer.to_id)
+                    .expect("concurrent stress target account fits usize");
+                expected_balances[from_index] -= transfer.amount;
+                expected_balances[to_index] += transfer.amount;
+            }
+            let balance_mismatches = durable_balances
+                .iter()
+                .filter_map(|&(account_id, durable_balance)| {
+                    let account_index = usize::try_from(account_id)
+                        .expect("durable concurrent stress account id fits usize");
+                    let expected_balance = expected_balances[account_index];
+                    (durable_balance != expected_balance).then_some((
+                        account_id,
+                        expected_balance,
+                        durable_balance,
+                        durable_balance - expected_balance,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "concurrent stress durable balance mismatches (id, expected, durable, delta): \
+                 {balance_mismatches:?}"
+            );
+            for (account_id, _, _, _) in &balance_mismatches {
+                let mut touching_transfers = results
+                    .iter()
+                    .flat_map(|outcome| &outcome.committed_transfers)
+                    .filter(|transfer| {
+                        transfer.from_id == *account_id || transfer.to_id == *account_id
+                    })
+                    .collect::<Vec<_>>();
+                touching_transfers.sort_by_key(|transfer| transfer.commit_seq);
+                eprintln!(
+                    "concurrent stress committed touches for account {account_id}: \
+                     {touching_transfers:?}"
+                );
+            }
+        }
+
         let mut total_commits = 0_u64;
         let mut total_retries = 0_u64;
         for (expected_worker_id, outcome) in results.iter().enumerate() {
@@ -7440,6 +7563,124 @@ mod tests {
         let receipt_token = std::env::var(CONCURRENT_STRESS_RECEIPT_ENV)
             .expect("supervised child must inherit its receipt token");
         println!("{CONCURRENT_STRESS_RECEIPT_PREFIX}{receipt_token}");
+    }
+
+    #[test]
+    fn concurrent_credit_conflict_rollback_preserves_staged_debit() {
+        asupersync::test_utils::run_test(|| async {
+            const NUM_ACCOUNTS: i64 = 100;
+            const INITIAL_BALANCE: i64 = 1_000;
+            const EXPECTED_TOTAL: i64 = NUM_ACCOUNTS * INITIAL_BALANCE;
+
+            let dir = tempfile::tempdir().expect("create rollback-atomicity temp dir");
+            let db_path = dir.path().join("rollback-atomicity.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+            let setup = Connection::open(&db_path)
+                .await
+                .expect("open rollback-atomicity setup connection");
+            setup
+                .execute(
+                    "CREATE TABLE accounts (
+                        id INTEGER PRIMARY KEY,
+                        balance INTEGER,
+                        payload TEXT NOT NULL
+                    );",
+                )
+                .await
+                .expect("create rollback-atomicity accounts table");
+            let payload = "x".repeat(512);
+            for account_id in 0..NUM_ACCOUNTS {
+                setup
+                    .execute_with_params(
+                        "INSERT INTO accounts VALUES (?1, ?2, ?3);",
+                        &[
+                            SqliteValue::Integer(account_id),
+                            SqliteValue::Integer(INITIAL_BALANCE),
+                            SqliteValue::Text(payload.clone().into()),
+                        ],
+                    )
+                    .await
+                    .expect("insert rollback-atomicity account");
+            }
+            setup.close().await.expect("close setup connection");
+
+            let debit = Connection::open(&db_path)
+                .await
+                .expect("open debit connection");
+            let credit_blocker = Connection::open(&db_path)
+                .await
+                .expect("open credit-blocker connection");
+            debit.execute("BEGIN;").await.expect("begin debit txn");
+            credit_blocker
+                .execute("BEGIN;")
+                .await
+                .expect("begin credit-blocker txn");
+            assert_eq!(
+                debit
+                    .execute("UPDATE accounts SET balance = balance - 9 WHERE id = 0;")
+                    .await
+                    .expect("stage debit on first leaf"),
+                1
+            );
+            assert_eq!(
+                credit_blocker
+                    .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 99;")
+                    .await
+                    .expect("lock credit leaf from peer txn"),
+                1
+            );
+            let credit_error = debit
+                .execute("UPDATE accounts SET balance = balance + 9 WHERE id = 99;")
+                .await
+                .expect_err("credit page held by peer must reject the partial transfer");
+            assert!(
+                matches!(
+                    credit_error,
+                    FrankenError::Busy | FrankenError::BusySnapshot { .. }
+                ),
+                "credit conflict must be retryable, got {credit_error:?}"
+            );
+            debit
+                .execute("ROLLBACK;")
+                .await
+                .expect("rollback staged debit after credit conflict");
+            credit_blocker
+                .execute("ROLLBACK;")
+                .await
+                .expect("rollback credit blocker");
+            debit.close().await.expect("close debit connection");
+            credit_blocker
+                .close()
+                .await
+                .expect("close credit-blocker connection");
+
+            let verify = Connection::open(&db_path)
+                .await
+                .expect("open rollback-atomicity verification connection");
+            let row = verify
+                .query_row(
+                    "SELECT COUNT(*), SUM(balance),
+                     (SELECT balance FROM accounts WHERE id = 0),
+                     (SELECT balance FROM accounts WHERE id = 99)
+                     FROM accounts;",
+                )
+                .await
+                .expect("query rollback-atomicity invariants");
+            assert_eq!(
+                row_values(&row),
+                vec![
+                    SqliteValue::Integer(NUM_ACCOUNTS),
+                    SqliteValue::Integer(EXPECTED_TOTAL),
+                    SqliteValue::Integer(INITIAL_BALANCE),
+                    SqliteValue::Integer(INITIAL_BALANCE),
+                ],
+                "rolling back a transfer after its credit conflicts must discard its staged debit"
+            );
+            verify
+                .close()
+                .await
+                .expect("close rollback-atomicity verification connection");
+        });
     }
 
     #[test]
