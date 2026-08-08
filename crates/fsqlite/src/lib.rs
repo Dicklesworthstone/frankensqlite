@@ -178,6 +178,16 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct ConcurrentStressStockDiagnostic {
+        row_count: i64,
+        balance_sum: i64,
+        point_count: i64,
+        scan_count: i64,
+        integrity: Vec<String>,
+        balances: Vec<(i64, i64)>,
+    }
+
+    #[derive(Debug)]
     struct ConcurrentStressWorkerOutcome {
         worker_id: usize,
         concurrent_mode_default: bool,
@@ -7375,56 +7385,58 @@ mod tests {
         // writer actually published a malformed B-tree. Stock SQLite's scan,
         // point lookup, aggregate, and integrity checker distinguish those
         // two release-critical failure classes after every worker is closed.
-        let stock_diagnostic =
-            (|| -> Result<(i64, i64, i64, i64, Vec<String>, Vec<(i64, i64)>), String> {
-                let stock =
-                    rusqlite::Connection::open(&db_path).map_err(|error| error.to_string())?;
-                let row_count = stock
-                    .query_row("SELECT COUNT(*) FROM accounts;", [], |row| row.get(0))
-                    .map_err(|error| error.to_string())?;
-                let balance_sum = stock
-                    .query_row("SELECT SUM(balance) FROM accounts;", [], |row| row.get(0))
-                    .map_err(|error| error.to_string())?;
-                let point_count = stock
-                    .query_row("SELECT COUNT(*) FROM accounts WHERE id = 9;", [], |row| {
-                        row.get(0)
-                    })
-                    .map_err(|error| error.to_string())?;
-                let scan_count = stock
-                    .query_row(
-                        "SELECT COUNT(*) FROM accounts NOT INDEXED WHERE id + 0 = 9;",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| error.to_string())?;
-                let mut statement = stock
-                    .prepare("PRAGMA integrity_check;")
-                    .map_err(|error| error.to_string())?;
-                let integrity = statement
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .map_err(|error| error.to_string())?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(|error| error.to_string())?;
-                let mut statement = stock
-                    .prepare("SELECT id, balance FROM accounts ORDER BY id;")
-                    .map_err(|error| error.to_string())?;
-                let balances = statement
-                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
-                    .map_err(|error| error.to_string())?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(|error| error.to_string())?;
-                Ok((
-                    row_count,
-                    balance_sum,
-                    point_count,
-                    scan_count,
-                    integrity,
-                    balances,
-                ))
-            })();
+        let stock_diagnostic = (|| -> Result<ConcurrentStressStockDiagnostic, String> {
+            let stock = rusqlite::Connection::open(&db_path).map_err(|error| error.to_string())?;
+            let row_count = stock
+                .query_row("SELECT COUNT(*) FROM accounts;", [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            let balance_sum = stock
+                .query_row("SELECT SUM(balance) FROM accounts;", [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            let point_count = stock
+                .query_row("SELECT COUNT(*) FROM accounts WHERE id = 9;", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())?;
+            let scan_count = stock
+                .query_row(
+                    "SELECT COUNT(*) FROM accounts NOT INDEXED WHERE id + 0 = 9;",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let mut statement = stock
+                .prepare("PRAGMA integrity_check;")
+                .map_err(|error| error.to_string())?;
+            let integrity = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?;
+            let mut statement = stock
+                .prepare("SELECT id, balance FROM accounts ORDER BY id;")
+                .map_err(|error| error.to_string())?;
+            let balances = statement
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                .map_err(|error| error.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?;
+            Ok(ConcurrentStressStockDiagnostic {
+                row_count,
+                balance_sum,
+                point_count,
+                scan_count,
+                integrity,
+                balances,
+            })
+        })();
         eprintln!("concurrent stress stock SQLite diagnostic: {stock_diagnostic:#?}");
 
-        if let Ok((_, _, _, _, _, durable_balances)) = &stock_diagnostic {
+        if let Ok(ConcurrentStressStockDiagnostic {
+            balances: durable_balances,
+            ..
+        }) = &stock_diagnostic
+        {
             let account_count =
                 usize::try_from(NUM_ACCOUNTS).expect("concurrent stress account count fits usize");
             let mut expected_balances = vec![INITIAL_BALANCE; account_count];
@@ -7523,6 +7535,13 @@ mod tests {
             u64::try_from(NUM_WRITERS).expect("writer count fits u64") * OPS_PER_WRITER
         );
         eprintln!("concurrent stress total retries: {total_retries}");
+
+        let stock_diagnostic = stock_diagnostic.expect("stock SQLite diagnostic must complete");
+        assert_eq!(stock_diagnostic.row_count, NUM_ACCOUNTS);
+        assert_eq!(stock_diagnostic.balance_sum, EXPECTED_TOTAL);
+        assert_eq!(stock_diagnostic.point_count, 1);
+        assert_eq!(stock_diagnostic.scan_count, 1);
+        assert_eq!(stock_diagnostic.integrity, ["ok"]);
 
         let mut final_invariants = None;
         let mut final_integrity = None;
