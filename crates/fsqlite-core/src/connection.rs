@@ -198250,6 +198250,124 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_statement_savepoint_rollback_refreshes_join_hydration() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE events(\
+                    id INTEGER PRIMARY KEY, \
+                    user_id INTEGER NOT NULL, \
+                    action TEXT NOT NULL\
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE VIEW user_events AS \
+                 SELECT users.id, users.name, events.action \
+                 FROM users JOIN events ON events.user_id = users.id;",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO users VALUES (1, 'alice');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO events VALUES (1, 1, 'baseline');")
+                .await
+                .unwrap();
+
+            conn.execute("BEGIN;").await.unwrap();
+            let error = conn
+                .with_internal_statement_savepoint("join_hydration", async || -> Result<()> {
+                    conn.execute("INSERT INTO users VALUES (2, 'bob');").await?;
+                    conn.execute("INSERT INTO events VALUES (2, 2, 'rolled_back');")
+                        .await?;
+                    let rows = conn
+                        .query("SELECT id, name, action FROM user_events ORDER BY id;")
+                        .await?;
+                    assert_eq!(rows.len(), 2, "body read must hydrate the rolled-back row");
+                    Err(FrankenError::FunctionError(
+                        "forced statement rollback after JOIN hydration".to_owned(),
+                    ))
+                })
+                .await
+                .expect_err("forced error must roll back the internal statement savepoint");
+            assert!(matches!(error, FrankenError::FunctionError(message)
+                    if message == "forced statement rollback after JOIN hydration"));
+
+            let rows = conn
+                .query("SELECT id, name, action FROM user_events ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("alice".into()),
+                    SqliteValue::Text("baseline".into()),
+                ]],
+                "internal statement rollback must rebuild the JOIN mirror from the pager transaction"
+            );
+            conn.execute("COMMIT;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_statement_savepoint_rollback_discards_pending_insert_page_run_before_reload() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, note TEXT);")
+                .await
+                .unwrap();
+            let insert = conn
+                .prepare("INSERT INTO t VALUES (?1, ('name_' || ?1), ?2);")
+                .await
+                .unwrap();
+            let note = SqliteValue::Text(
+                "rolled-back buffered payload "
+                    .repeat(PREPARED_DIRECT_INSERT_PAGE_RUN_MIN_RECORD_BYTES / 16 + 8)
+                    .into(),
+            );
+
+            conn.execute("BEGIN;").await.unwrap();
+            let error = conn
+                .with_internal_statement_savepoint("pending_page_run", async || -> Result<()> {
+                    for rowid in 1_i64..=4_i64 {
+                        conn.execute_prepared_with_params(
+                            &insert,
+                            &[SqliteValue::Integer(rowid), note.clone()],
+                        )
+                        .await?;
+                    }
+                    assert!(
+                        conn.pending_direct_insert_page_run.borrow().is_some(),
+                        "explicit-rowid inserts must leave a body-owned buffered page run"
+                    );
+                    Err(FrankenError::FunctionError(
+                        "forced statement rollback with pending page run".to_owned(),
+                    ))
+                })
+                .await
+                .expect_err("forced error must roll back the buffered page run");
+            assert!(matches!(error, FrankenError::FunctionError(message)
+                    if message == "forced statement rollback with pending page run"));
+            assert!(
+                conn.pending_direct_insert_page_run.borrow().is_none(),
+                "rollback must discard the buffered page run before eager MemDatabase reload"
+            );
+
+            let row = conn.query_row("SELECT count(*) FROM t;").await.unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Integer(0));
+            conn.execute("COMMIT;").await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_prepared_direct_fk_statement_rollback_clears_deferred_memdb_upsert() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
