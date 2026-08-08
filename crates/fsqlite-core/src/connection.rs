@@ -188329,7 +188329,7 @@ mod pager_routing_tests {
             let db = db_path.to_string_lossy().to_string();
 
             {
-                let setup = Connection::open(&db).await.unwrap();
+                let mut setup = Connection::open(&db).await.unwrap();
                 setup
                     .execute(
                         "CREATE TABLE accounts (\
@@ -188435,6 +188435,135 @@ mod pager_routing_tests {
                 balance.get(0),
                 Some(&SqliteValue::Integer(1001)),
                 "writer B's committed row must survive the rejected stale writer"
+            );
+        });
+    }
+
+    #[test]
+    fn test_file_backed_multi_page_write_set_survives_interleaved_peer_commit() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("multi_page_interleaved_peer.db");
+            let db = db_path.to_string_lossy().to_string();
+
+            {
+                let mut setup = Connection::open(&db).await.unwrap();
+                setup
+                    .execute(
+                        "CREATE TABLE accounts (\
+                             id INTEGER PRIMARY KEY,\
+                             balance INTEGER NOT NULL,\
+                             payload TEXT NOT NULL\
+                         );",
+                    )
+                    .await
+                    .unwrap();
+                let payload = "x".repeat(512);
+                for id in 0_i64..100 {
+                    setup
+                        .execute_with_params(
+                            "INSERT INTO accounts VALUES (?1, 1000, ?2);",
+                            &[
+                                SqliteValue::Integer(id),
+                                SqliteValue::Text(payload.clone().into()),
+                            ],
+                        )
+                        .await
+                        .unwrap();
+                }
+                setup.close_without_checkpoint_in_place().await.unwrap();
+            }
+
+            let mut transfer = Connection::open(&db).await.unwrap();
+            let mut peer = Connection::open(&db).await.unwrap();
+            for conn in [&transfer, &peer] {
+                conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
+                assert!(conn.is_concurrent_mode_default());
+            }
+
+            transfer.execute("BEGIN;").await.unwrap();
+            peer.execute("BEGIN;").await.unwrap();
+            assert_eq!(
+                transfer
+                    .execute("UPDATE accounts SET balance = balance - 9 WHERE id = 0;")
+                    .await
+                    .unwrap(),
+                1
+            );
+            let pages_after_debit = transfer
+                .active_txn
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .pending_conflict_pages_conservative();
+            assert!(
+                !pages_after_debit.is_empty(),
+                "the staged debit must appear in the pager conflict surface"
+            );
+
+            assert_eq!(
+                peer.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 50;")
+                    .await
+                    .unwrap(),
+                1
+            );
+            peer.execute("COMMIT;").await.unwrap();
+
+            assert_eq!(
+                transfer
+                    .execute("UPDATE accounts SET balance = balance + 9 WHERE id = 99;")
+                    .await
+                    .unwrap(),
+                1
+            );
+            let pages_after_credit = transfer
+                .active_txn
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .pending_conflict_pages_conservative();
+            assert!(
+                pages_after_debit
+                    .iter()
+                    .all(|page| pages_after_credit.contains(page)),
+                "staging the credit must not discard the debit pages: debit={pages_after_debit:?} credit={pages_after_credit:?}"
+            );
+            assert!(
+                pages_after_credit.len() > pages_after_debit.len(),
+                "the distant credit must add a distinct leaf to the pager write set: debit={pages_after_debit:?} credit={pages_after_credit:?}"
+            );
+
+            transfer.execute("COMMIT;").await.unwrap();
+            transfer.close_without_checkpoint_in_place().await.unwrap();
+            peer.close_without_checkpoint_in_place().await.unwrap();
+
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            let durable = stock
+                .query_row(
+                    "SELECT COUNT(*), SUM(balance),\
+                     (SELECT balance FROM accounts WHERE id = 0),\
+                     (SELECT balance FROM accounts WHERE id = 50),\
+                     (SELECT balance FROM accounts WHERE id = 99)\
+                     FROM accounts;",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(durable, (100, 100_001, 991, 1001, 1009));
+            assert_eq!(
+                stock
+                    .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
             );
         });
     }
