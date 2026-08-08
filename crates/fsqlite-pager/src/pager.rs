@@ -10141,6 +10141,29 @@ impl PublishedPagerState {
         )
     }
 
+    /// Capture a publication snapshot only when both the metadata summary and
+    /// resident page plane still belong to `expected_commit_seq`.
+    ///
+    /// Callers must still recheck [`Self::current_sequence_gen`] after reading
+    /// a page. The checks here close the earlier window between a standalone
+    /// page-plane comparison and `snapshot()`, where a concurrent publication
+    /// could advance both planes before the snapshot was captured.
+    fn snapshot_for_page_plane(
+        &self,
+        expected_commit_seq: CommitSeq,
+    ) -> Option<PagerPublishedSnapshot> {
+        if self.page_plane_visible_commit_seq() != expected_commit_seq {
+            return None;
+        }
+        let snapshot = self.snapshot();
+        if snapshot.visible_commit_seq != expected_commit_seq
+            || self.page_plane_visible_commit_seq() != expected_commit_seq
+        {
+            return None;
+        }
+        Some(snapshot)
+    }
+
     fn should_skip_stale_publish(
         &self,
         cx: &Cx,
@@ -19973,10 +19996,10 @@ where
                 tracing::enabled!(target: "fsqlite.snapshot_publication", tracing::Level::TRACE)
                     .then(Instant::now);
             let mut published_retry_count = 0_usize;
-            while self.published.page_plane_visible_commit_seq()
-                == self.published_visible_commit_seq.get()
+            while let Some(snapshot) = self
+                .published
+                .snapshot_for_page_plane(self.published_visible_commit_seq.get())
             {
-                let snapshot = self.published.snapshot();
                 if page_no.get() > snapshot.db_size {
                     if self.published.current_sequence_gen() == snapshot.snapshot_gen {
                         tracing::trace!(
@@ -51304,6 +51327,42 @@ mod tests {
             Some(current_page)
         );
         assert_eq!(published.page_plane_visible_commit_seq(), CommitSeq::new(3));
+    }
+
+    #[test]
+    fn published_page_fast_path_rejects_newer_metadata_snapshot() {
+        let cx = Cx::new();
+        let published = PublishedPagerState::new(3, CommitSeq::new(1), JournalMode::Wal, 0);
+
+        assert!(
+            published
+                .snapshot_for_page_plane(CommitSeq::new(1))
+                .is_some()
+        );
+
+        published.publish_single_connection_metadata_update(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(2),
+                db_size: 3,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            false,
+        );
+
+        assert_eq!(
+            published.page_plane_visible_commit_seq(),
+            CommitSeq::new(1),
+            "metadata-only publication deliberately leaves the resident page plane behind"
+        );
+        assert!(
+            published
+                .snapshot_for_page_plane(CommitSeq::new(1))
+                .is_none(),
+            "the fast path must not pair an old page plane with newer publication metadata"
+        );
     }
 
     #[test]
