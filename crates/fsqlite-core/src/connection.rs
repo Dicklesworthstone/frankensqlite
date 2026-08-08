@@ -188680,63 +188680,62 @@ mod pager_routing_tests {
             }
 
             transfer.execute("BEGIN;").await.unwrap();
-            peer.execute("BEGIN;").await.unwrap();
             assert_eq!(
                 transfer
-                    .execute("UPDATE accounts SET balance = balance - 9 WHERE id = 0;")
+                    .query_row("SELECT balance FROM accounts WHERE id = 0;")
                     .await
-                    .unwrap(),
-                1
-            );
-            let pages_after_debit = transfer
-                .active_txn
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .pending_conflict_pages_conservative();
-            assert!(
-                !pages_after_debit.is_empty(),
-                "the staged debit must appear in the pager conflict surface"
+                    .unwrap()
+                    .values()[0],
+                SqliteValue::Integer(1000),
+                "the transfer must pin a stale debit-leaf image without acquiring its write lock"
             );
 
+            peer.execute("BEGIN;").await.unwrap();
             assert_eq!(
-                peer.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;")
+                peer.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 0;")
                     .await
                     .unwrap(),
                 1
-            );
-            let peer_pages = peer
-                .active_txn
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .pending_conflict_pages_conservative();
-            assert!(
-                pages_after_debit
-                    .iter()
-                    .any(|page| peer_pages.contains(page)),
-                "the peer's sibling-row update must overlap the debit leaf: debit={pages_after_debit:?} peer={peer_pages:?}"
             );
             peer.execute("COMMIT;").await.unwrap();
 
+            assert_eq!(
+                transfer
+                    .execute("UPDATE accounts SET balance = balance + 9 WHERE id = 99;")
+                    .await
+                    .unwrap(),
+                1,
+                "the stale transaction must stage its disjoint credit before first-touching the changed debit leaf"
+            );
+            let pages_after_credit = transfer
+                .active_txn
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .pending_conflict_pages_conservative();
+            assert!(
+                !pages_after_credit.is_empty(),
+                "the staged credit must appear in the pager conflict surface"
+            );
+
             let stale_error = match transfer
-                .execute("UPDATE accounts SET balance = balance + 9 WHERE id = 99;")
+                .execute("UPDATE accounts SET balance = balance - 9 WHERE id = 0;")
                 .await
             {
                 Err(error) => error,
                 Ok(changes) => {
                     assert_eq!(changes, 1);
-                    let pages_after_credit = transfer
+                    let pages_after_debit = transfer
                         .active_txn
                         .borrow()
                         .as_ref()
                         .unwrap()
                         .pending_conflict_pages_conservative();
                     assert!(
-                        pages_after_debit
+                        pages_after_credit
                             .iter()
-                            .all(|page| pages_after_credit.contains(page)),
-                        "staging the credit must retain every stale debit page until FCW rejects the transaction: debit={pages_after_debit:?} credit={pages_after_credit:?}"
+                            .all(|page| pages_after_debit.contains(page)),
+                        "staging the stale debit must retain every already-staged credit page until FCW rejects the transaction: credit={pages_after_credit:?} debit={pages_after_debit:?}"
                     );
                     transfer
                         .execute("COMMIT;")
@@ -188774,7 +188773,7 @@ mod pager_routing_tests {
                 .unwrap();
             assert_eq!(
                 durable,
-                (100, 100_001, 1000, 1001, 1000),
+                (100, 100_001, 1001, 1000, 1000),
                 "a rejected stale transfer must publish neither its debit nor its credit"
             );
             assert_eq!(

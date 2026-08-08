@@ -451,11 +451,10 @@ fn v6_multi_trigger_view_rollback() {
 }
 
 // ─── V7: View with JOIN across trigger-modified tables + rollback ───
-// CONFIRMED BUG: trigger side-effects leak through VIEW JOIN after
-// SAVEPOINT ROLLBACK. The view shows 2 rows instead of 1.
+// Regression: trigger side-effects must not leak through a VIEW JOIN after
+// SAVEPOINT rollback, including ROLLBACK TO followed directly by COMMIT.
 
 #[test]
-#[ignore = "bd-dpjhw: VIEW JOIN shows aborted trigger state after SAVEPOINT ROLLBACK"]
 fn v7_view_join_trigger_rollback() {
     asupersync::test_utils::run_test(|| async {
         let conn = open_conn().await;
