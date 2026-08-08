@@ -53977,6 +53977,15 @@ impl Connection {
             // savepoint-rollback committed view.
             self.invalidate_qfs_on_rollback();
             self.restore_snapshot(cx, &snap).await?;
+            // A read inside the savepoint may have rebuilt the MemDatabase row
+            // mirror wholesale from the active pager transaction. That reload
+            // is intentionally not represented in the MemDatabase undo log, so
+            // restoring the saved undo token cannot remove rows hydrated after
+            // the savepoint. Force the next read boundary to rebuild from the
+            // pager transaction after its savepoint rollback; otherwise JOIN
+            // fallback can serve the stale mirror while direct pager reads show
+            // the correctly rolled-back rows (GH #143 / bd-dpjhw).
+            self.memdb_requires_active_txn_reload.set(true);
             // MVCC GC (bd-3bql / 5E.5): After savepoint rollback, trigger GC if scheduler permits.
             self.maybe_gc_tick();
         } else {
@@ -188559,6 +188568,156 @@ mod pager_routing_tests {
                 )
                 .unwrap();
             assert_eq!(durable, (100, 100_001, 991, 1001, 1009));
+            assert_eq!(
+                stock
+                    .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+        });
+    }
+
+    #[test]
+    fn test_file_backed_stale_debit_cannot_publish_only_later_credit() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("stale_debit_atomicity.db");
+            let db = db_path.to_string_lossy().to_string();
+
+            {
+                let mut setup = Connection::open(&db).await.unwrap();
+                setup
+                    .execute(
+                        "CREATE TABLE accounts (\
+                             id INTEGER PRIMARY KEY,\
+                             balance INTEGER NOT NULL,\
+                             payload TEXT NOT NULL\
+                         );",
+                    )
+                    .await
+                    .unwrap();
+                let payload = "x".repeat(512);
+                for id in 0_i64..100 {
+                    setup
+                        .execute_with_params(
+                            "INSERT INTO accounts VALUES (?1, 1000, ?2);",
+                            &[
+                                SqliteValue::Integer(id),
+                                SqliteValue::Text(payload.clone().into()),
+                            ],
+                        )
+                        .await
+                        .unwrap();
+                }
+                setup.close_without_checkpoint_in_place().await.unwrap();
+            }
+
+            let mut transfer = Connection::open(&db).await.unwrap();
+            let mut peer = Connection::open(&db).await.unwrap();
+            for conn in [&transfer, &peer] {
+                conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
+                assert!(conn.is_concurrent_mode_default());
+            }
+
+            transfer.execute("BEGIN;").await.unwrap();
+            peer.execute("BEGIN;").await.unwrap();
+            assert_eq!(
+                transfer
+                    .execute("UPDATE accounts SET balance = balance - 9 WHERE id = 0;")
+                    .await
+                    .unwrap(),
+                1
+            );
+            let pages_after_debit = transfer
+                .active_txn
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .pending_conflict_pages_conservative();
+            assert!(
+                !pages_after_debit.is_empty(),
+                "the staged debit must appear in the pager conflict surface"
+            );
+
+            assert_eq!(
+                peer.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;")
+                    .await
+                    .unwrap(),
+                1
+            );
+            let peer_pages = peer
+                .active_txn
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .pending_conflict_pages_conservative();
+            assert!(
+                pages_after_debit
+                    .iter()
+                    .any(|page| peer_pages.contains(page)),
+                "the peer's sibling-row update must overlap the debit leaf: debit={pages_after_debit:?} peer={peer_pages:?}"
+            );
+            peer.execute("COMMIT;").await.unwrap();
+
+            let stale_error = match transfer
+                .execute("UPDATE accounts SET balance = balance + 9 WHERE id = 99;")
+                .await
+            {
+                Err(error) => error,
+                Ok(changes) => {
+                    assert_eq!(changes, 1);
+                    let pages_after_credit = transfer
+                        .active_txn
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .pending_conflict_pages_conservative();
+                    assert!(
+                        pages_after_debit
+                            .iter()
+                            .all(|page| pages_after_credit.contains(page)),
+                        "staging the credit must retain every stale debit page until FCW rejects the transaction: debit={pages_after_debit:?} credit={pages_after_credit:?}"
+                    );
+                    transfer
+                        .execute("COMMIT;")
+                        .await
+                        .expect_err("the stale debit page must reject the whole transfer")
+                }
+            };
+            assert!(
+                stale_error.is_transient(),
+                "the stale transfer must fail with a retryable conflict: {stale_error}"
+            );
+            drop(transfer.execute("ROLLBACK;").await);
+            transfer.close_without_checkpoint_in_place().await.unwrap();
+            peer.close_without_checkpoint_in_place().await.unwrap();
+
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            let durable = stock
+                .query_row(
+                    "SELECT COUNT(*), SUM(balance),\
+                     (SELECT balance FROM accounts WHERE id = 0),\
+                     (SELECT balance FROM accounts WHERE id = 1),\
+                     (SELECT balance FROM accounts WHERE id = 99)\
+                     FROM accounts;",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                durable,
+                (100, 100_001, 1000, 1001, 1000),
+                "a rejected stale transfer must publish neither its debit nor its credit"
+            );
             assert_eq!(
                 stock
                     .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))

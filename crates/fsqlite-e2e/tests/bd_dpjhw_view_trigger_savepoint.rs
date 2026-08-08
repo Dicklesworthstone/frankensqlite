@@ -512,6 +512,24 @@ fn v7_view_join_trigger_rollback() {
             .await
             .expect("after")
             .len();
+        let users_after = conn
+            .query("SELECT id, name FROM users ORDER BY id")
+            .await
+            .expect("users after rollback");
+        assert_eq!(
+            users_after.len(),
+            1,
+            "ROLLBACK TO must remove the user inserted inside the savepoint"
+        );
+        let events_after = conn
+            .query("SELECT id, user_id, action FROM events ORDER BY id")
+            .await
+            .expect("events after rollback");
+        assert_eq!(
+            events_after.len(),
+            1,
+            "ROLLBACK TO must remove the trigger row inserted inside the savepoint"
+        );
         assert_eq!(
             after, baseline,
             "BUG: VIEW JOIN shows {} rows after rollback, expected {} (trigger state leaked)",
