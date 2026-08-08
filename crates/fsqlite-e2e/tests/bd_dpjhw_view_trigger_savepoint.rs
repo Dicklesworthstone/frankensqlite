@@ -535,5 +535,55 @@ fn v7_view_join_trigger_rollback() {
             "BUG: VIEW JOIN shows {} rows after rollback, expected {} (trigger state leaked)",
             after, baseline
         );
+
+        // COMMIT is legal immediately after ROLLBACK TO, without releasing
+        // the still-active savepoint. Repair the mirror while the rolled-back
+        // pager transaction is still available; a later :memory: read cannot
+        // reconstruct it after COMMIT drops that handle.
+        conn.execute("BEGIN").await.expect("begin commit-gap case");
+        conn.execute("SAVEPOINT commit_gap")
+            .await
+            .expect("savepoint commit-gap case");
+        conn.execute("INSERT INTO users VALUES (3, 'carol')")
+            .await
+            .expect("insert carol");
+        assert_eq!(
+            conn.query("SELECT * FROM v_user_events")
+                .await
+                .expect("mid commit-gap case")
+                .len(),
+            2,
+            "carol and her trigger row must be visible before rollback"
+        );
+        conn.execute("ROLLBACK TO commit_gap")
+            .await
+            .expect("rollback commit-gap case");
+        conn.execute("COMMIT")
+            .await
+            .expect("commit without releasing savepoint");
+
+        let after_commit = conn
+            .query("SELECT * FROM v_user_events")
+            .await
+            .expect("view after rollback then commit")
+            .len();
+        assert_eq!(
+            after_commit, baseline,
+            "ROLLBACK TO followed directly by COMMIT must not preserve trigger state"
+        );
+        assert_eq!(
+            conn.query("SELECT id, name FROM users ORDER BY id")
+                .await
+                .expect("users after rollback then commit")
+                .len(),
+            1
+        );
+        assert_eq!(
+            conn.query("SELECT id, user_id, action FROM events ORDER BY id")
+                .await
+                .expect("events after rollback then commit")
+                .len(),
+            1
+        );
     });
 }

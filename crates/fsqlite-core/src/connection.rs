@@ -27441,7 +27441,45 @@ impl Connection {
                 if pager_rollback_succeeded {
                     self.txn_metrics_note_rollback();
                     self.clear_prepared_direct_insert_append_hint();
-                    self.restore_snapshot(cx, &snapshot).await?;
+                    // The failed statement may have buffered pager writes or
+                    // mirror upserts after the internal savepoint was opened.
+                    // Discard them before reloading, or the reload helper could
+                    // flush rolled-back work back into the transaction.
+                    self.clear_pending_direct_write_runs();
+                    self.clear_pending_memdb_direct_upserts();
+                    self.clear_fk_parent_validation_cache();
+                    self.invalidate_qfs_on_rollback();
+                    if let Err(restore_error) = self.restore_snapshot(cx, &snapshot).await {
+                        let boundary_error = FrankenError::Internal(format!(
+                            "statement savepoint snapshot restore failed after {purpose}: \
+                             {statement_error}; restore failed: {restore_error}"
+                        ));
+                        return Err(self
+                            .rollback_after_savepoint_boundary_failure(
+                                cx,
+                                &format!(
+                                    "statement savepoint snapshot restore failed after {purpose}"
+                                ),
+                                boundary_error,
+                            )
+                            .await);
+                    }
+                    if let Err(reload_error) = self.refresh_memdb_after_savepoint_rollback(cx).await
+                    {
+                        let boundary_error = FrankenError::Internal(format!(
+                            "statement savepoint MemDatabase reload failed after {purpose}: \
+                             {statement_error}; reload failed: {reload_error}"
+                        ));
+                        return Err(self
+                            .rollback_after_savepoint_boundary_failure(
+                                cx,
+                                &format!(
+                                    "statement savepoint MemDatabase reload failed after {purpose}"
+                                ),
+                                boundary_error,
+                            )
+                            .await);
+                    }
                 }
 
                 Err(statement_error)
@@ -52299,6 +52337,19 @@ impl Connection {
         std::future::ready(self.restore_live_vtab_registry_to(cx, snap.live_vtab_registry_undo_len))
     }
 
+    /// Rebuild the execution mirror after the pager has rolled back a savepoint.
+    ///
+    /// Reads inside the savepoint may have hydrated the entire `MemDatabase`
+    /// from the active pager transaction. That hydration is not represented in
+    /// the MemDatabase undo log, so restoring the saved undo token alone cannot
+    /// remove rows that the pager just rolled back. Repair eagerly while the
+    /// authoritative transaction handle is still available; deferring until a
+    /// later read is unsafe when the next statement is `COMMIT`.
+    async fn refresh_memdb_after_savepoint_rollback(&self, cx: &Cx) -> Result<()> {
+        self.memdb_requires_active_txn_reload.set(true);
+        self.refresh_memdb_from_active_txn_if_dirty(cx).await
+    }
+
     /// Restore the MemDatabase and connection-local schema state in a snapshot.
     ///
     /// Full transaction rollback uses this before reloading persistent pager
@@ -53976,16 +54027,24 @@ impl Connection {
             // the next consultation will reseed from the post-
             // savepoint-rollback committed view.
             self.invalidate_qfs_on_rollback();
-            self.restore_snapshot(cx, &snap).await?;
-            // A read inside the savepoint may have rebuilt the MemDatabase row
-            // mirror wholesale from the active pager transaction. That reload
-            // is intentionally not represented in the MemDatabase undo log, so
-            // restoring the saved undo token cannot remove rows hydrated after
-            // the savepoint. Force the next read boundary to rebuild from the
-            // pager transaction after its savepoint rollback; otherwise JOIN
-            // fallback can serve the stale mirror while direct pager reads show
-            // the correctly rolled-back rows (GH #143 / bd-dpjhw).
-            self.memdb_requires_active_txn_reload.set(true);
+            if let Err(error) = self.restore_snapshot(cx, &snap).await {
+                return Err(self
+                    .rollback_after_savepoint_boundary_failure(
+                        cx,
+                        &format!("ROLLBACK TO {sp_name} snapshot restore failed"),
+                        error,
+                    )
+                    .await);
+            }
+            if let Err(error) = self.refresh_memdb_after_savepoint_rollback(cx).await {
+                return Err(self
+                    .rollback_after_savepoint_boundary_failure(
+                        cx,
+                        &format!("ROLLBACK TO {sp_name} MemDatabase reload failed"),
+                        error,
+                    )
+                    .await);
+            }
             // MVCC GC (bd-3bql / 5E.5): After savepoint rollback, trigger GC if scheduler permits.
             self.maybe_gc_tick();
         } else {
