@@ -17397,6 +17397,18 @@ impl Connection {
             "memory".clone_into(&mut self.pragma_state.borrow_mut().journal_mode);
             return Ok(());
         }
+
+        // `SimplePager::open` validates the main database header and publishes
+        // its persisted journal mode before the connection layer installs a
+        // WAL backend.  Do not start a pager transaction to rediscover that
+        // same header while the validated mode is already WAL: WAL reads
+        // require the backend that `apply_current_journal_mode_to_pager`
+        // installs immediately after this bootstrap step.
+        if self.pager.journal_mode() == JournalMode::Wal {
+            "wal".clone_into(&mut self.pragma_state.borrow_mut().journal_mode);
+            return Ok(());
+        }
+
         let header = self.pragma_database_header().await.ok().flatten();
         let header_requests_wal = header
             .as_ref()
@@ -124061,6 +124073,11 @@ mod tests {
             assert_eq!(state_a.open_connections, 1);
             assert_eq!(state_b.open_connections, 1);
             assert_ne!(state_a.key.runtime_id, state_b.key.runtime_id);
+            drop(state_a);
+            drop(state_b);
+
+            conn_a.close().await.unwrap();
+            conn_b.close().await.unwrap();
         });
     }
 
@@ -168231,6 +168248,35 @@ mod tests {
                 reopened.pager.journal_mode(),
                 fsqlite_pager::JournalMode::Delete
             );
+        });
+    }
+
+    #[test]
+    fn test_pragma_journal_mode_wal_persists_across_reopen() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("journal_mode_wal_reopen.db");
+            let db_str = db_path.to_str().unwrap();
+
+            {
+                let conn = Connection::open(db_str).await.unwrap();
+                conn.execute("CREATE TABLE t(x INTEGER);").await.unwrap();
+                conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+                conn.close().await.unwrap();
+            }
+
+            let reopened = Connection::open(db_str).await.unwrap();
+            let rows = reopened.query("PRAGMA journal_mode;").await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("wal".into()));
+            assert_eq!(
+                reopened.pager.journal_mode(),
+                fsqlite_pager::JournalMode::Wal
+            );
+            let rows = reopened.query("SELECT x FROM t;").await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+            reopened.close().await.unwrap();
         });
     }
 
