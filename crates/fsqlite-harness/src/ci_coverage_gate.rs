@@ -50,7 +50,7 @@ const BEAD_ID: &str = "bd-mblr.3.1.1";
 pub const COVERAGE_GATE_SCHEMA_VERSION: &str = "1.0.0";
 
 /// Schema emitted by the Turso campaign promotion scorecard.
-pub const TURSO_CAMPAIGN_SCORECARD_SCHEMA_VERSION: &str = "1.0.0";
+pub const TURSO_CAMPAIGN_SCORECARD_SCHEMA_VERSION: &str = "2.0.0";
 
 const TURSO_NATIVE_LANES: [&str; 6] = [
     "bd-turso-test-adaptation-zu081.5",
@@ -70,6 +70,9 @@ const TURSO_OPTIONAL_DECISIONS: [&str; 7] = [
     "bd-turso-test-adaptation-zu081.15",
     "bd-turso-test-adaptation-zu081.16",
 ];
+
+const MAX_CAMPAIGN_SUMMARY_LANES: usize = 16;
+const MAX_CAMPAIGN_SUMMARY_LANE_ID_CHARS: usize = 96;
 
 /// Resource tier represented by a campaign receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -137,8 +140,6 @@ pub enum CampaignDisposition {
     Deferred,
     /// The lane is rejected for this campaign.
     Rejected,
-    /// A gap-only route exists, but no concrete case has been admitted.
-    Conditional,
 }
 
 /// Completion state reported by one shard.
@@ -403,16 +404,28 @@ impl TursoCampaignScorecard {
     #[must_use]
     pub fn render_bounded_summary(&self) -> String {
         let mut output = String::new();
-        for lane in &self.lane_summaries {
+        for lane in self.lane_summaries.iter().take(MAX_CAMPAIGN_SUMMARY_LANES) {
             let lane_errors = self
                 .diagnostics
                 .iter()
                 .filter(|diagnostic| diagnostic.lane_id.as_deref() == Some(lane.lane_id.as_str()))
                 .count();
+            let lane_id = lane
+                .lane_id
+                .chars()
+                .take(MAX_CAMPAIGN_SUMMARY_LANE_ID_CHARS)
+                .collect::<String>();
             let _ = writeln!(
                 output,
                 "lane={} runs={} generated={} executed={} errors={lane_errors}",
-                lane.lane_id, lane.run_count, lane.outcomes.generated, lane.outcomes.executed
+                lane_id, lane.run_count, lane.outcomes.generated, lane.outcomes.executed
+            );
+        }
+        if self.lane_summaries.len() > MAX_CAMPAIGN_SUMMARY_LANES {
+            let _ = writeln!(
+                output,
+                "lanes_omitted={}",
+                self.lane_summaries.len() - MAX_CAMPAIGN_SUMMARY_LANES
             );
         }
         let global_errors = self
@@ -619,6 +632,70 @@ fn validate_campaign_run(run: &CampaignRunEvidence, diagnostics: &mut Vec<Campai
                     "path={} retention_days={} minimum={minimum_retention}",
                     artifact.path, artifact.retention_days
                 ),
+            );
+        }
+    }
+
+    let coverage_dimensions = [
+        ("feature", &run.coverage.feature_ids),
+        ("construct", &run.coverage.constructs),
+        ("execution_lane", &run.coverage.execution_lanes),
+        ("fault", &run.coverage.fault_kinds),
+        ("concurrency_workload", &run.coverage.concurrency_workloads),
+        ("reducer_family", &run.coverage.reducer_families),
+    ];
+    if coverage_dimensions
+        .iter()
+        .all(|(_, values)| values.is_empty())
+    {
+        campaign_diagnostic(
+            diagnostics,
+            "run_coverage_missing",
+            Some(lane_id),
+            "a gating run must report at least one coverage dimension",
+        );
+    }
+    for (dimension, values) in coverage_dimensions {
+        if values.iter().any(|value| value.trim().is_empty()) {
+            campaign_diagnostic(
+                diagnostics,
+                "coverage_dimension_value_invalid",
+                Some(lane_id),
+                format!("dimension={dimension}"),
+            );
+        }
+    }
+
+    let required_dimensions: &[(&str, &[String])] = match run.lane_id.as_str() {
+        "bd-turso-test-adaptation-zu081.5" => &[
+            ("feature", &run.coverage.feature_ids),
+            ("construct", &run.coverage.constructs),
+            ("execution_lane", &run.coverage.execution_lanes),
+        ],
+        "bd-turso-test-adaptation-zu081.6" | "bd-turso-test-adaptation-zu081.19" => {
+            &[("reducer_family", &run.coverage.reducer_families)]
+        }
+        "bd-turso-test-adaptation-zu081.8" => &[
+            ("execution_lane", &run.coverage.execution_lanes),
+            ("concurrency_workload", &run.coverage.concurrency_workloads),
+        ],
+        "bd-turso-test-adaptation-zu081.9" => &[
+            ("fault", &run.coverage.fault_kinds),
+            ("concurrency_workload", &run.coverage.concurrency_workloads),
+        ],
+        "bd-turso-test-adaptation-zu081.20" => &[
+            ("construct", &run.coverage.constructs),
+            ("concurrency_workload", &run.coverage.concurrency_workloads),
+        ],
+        _ => &[],
+    };
+    for (dimension, values) in required_dimensions {
+        if values.is_empty() {
+            campaign_diagnostic(
+                diagnostics,
+                "required_lane_coverage_missing",
+                Some(lane_id),
+                format!("dimension={dimension}"),
             );
         }
     }
@@ -892,9 +969,7 @@ pub fn evaluate_turso_campaign_gate(input: &TursoCampaignGateInput) -> TursoCamp
         }
         let admission_is_consistent = match decision.disposition {
             CampaignDisposition::Adopted => decision.admitted,
-            CampaignDisposition::Deferred
-            | CampaignDisposition::Rejected
-            | CampaignDisposition::Conditional => !decision.admitted,
+            CampaignDisposition::Deferred | CampaignDisposition::Rejected => !decision.admitted,
         };
         if !admission_is_consistent {
             campaign_diagnostic(
@@ -1877,11 +1952,7 @@ mod tests {
             .into_iter()
             .map(|bead_id| OptionalCampaignDecision {
                 bead_id: bead_id.to_owned(),
-                disposition: match bead_id {
-                    "bd-turso-test-adaptation-zu081.11" => CampaignDisposition::Rejected,
-                    "bd-turso-test-adaptation-zu081.16" => CampaignDisposition::Conditional,
-                    _ => CampaignDisposition::Deferred,
-                },
+                disposition: CampaignDisposition::Deferred,
                 admitted: false,
                 rationale: format!("bounded decision for {bead_id}"),
             })
@@ -2173,5 +2244,47 @@ mod tests {
         let codes = campaign_diagnostic_codes(&scorecard);
         assert!(codes.contains(&"production_history_not_deterministic"));
         assert!(codes.contains(&"multiprocess_history_misclassified"));
+    }
+
+    #[test]
+    fn turso_scorecard_rejects_blank_and_missing_lane_coverage() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        let sql_reducer = input
+            .runs
+            .iter_mut()
+            .find(|run| run.lane_id == "bd-turso-test-adaptation-zu081.6")
+            .expect("SQL reducer run");
+        sql_reducer.coverage.reducer_families.clear();
+        let operation_plan = input
+            .runs
+            .iter_mut()
+            .find(|run| run.lane_id == "bd-turso-test-adaptation-zu081.20")
+            .expect("operation-plan run");
+        operation_plan.coverage.constructs = vec!["   ".to_owned()];
+
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        let codes = campaign_diagnostic_codes(&scorecard);
+        assert_eq!(scorecard.outcome, CampaignPromotionOutcome::Hold);
+        assert!(codes.contains(&"required_lane_coverage_missing"));
+        assert!(codes.contains(&"coverage_dimension_value_invalid"));
+    }
+
+    #[test]
+    fn turso_scorecard_summary_is_bounded_for_unknown_lane_spam() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        for index in 0..20 {
+            let mut run = campaign_run(
+                "unknown-lane-with-an-intentionally-overlong-identifier-that-must-not-expand-info-output-without-bound",
+                CampaignTier::Presubmit,
+            );
+            run.lane_id.push_str(&format!("-{index:02}"));
+            input.runs.push(run);
+        }
+
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        let summary = scorecard.render_bounded_summary();
+        assert!(summary.lines().count() <= MAX_CAMPAIGN_SUMMARY_LANES + 2);
+        assert!(summary.contains("lanes_omitted="));
+        assert!(summary.lines().all(|line| line.len() < 240));
     }
 }

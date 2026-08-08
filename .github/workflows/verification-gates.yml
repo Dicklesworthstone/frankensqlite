@@ -96,7 +96,7 @@ jobs:
           path: artifacts/backlog-quality-gate-e2e/
           retention-days: 21
 
-  turso-campaign-promotion:
+  turso-campaign-gate-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -120,7 +120,7 @@ jobs:
           restore-keys: |
             turso-campaign-${{ runner.os }}-
 
-      - name: Run bounded Turso promotion and replay smokes
+      - name: Run bounded Turso gate and replay smokes
         shell: bash
         run: |
           set -euo pipefail
@@ -188,13 +188,13 @@ jobs:
           sha256sum artifacts/turso-campaign/*.log \
             > artifacts/turso-campaign/sha256sums.txt
 
-      - name: Upload Turso promotion receipts
+      - name: Upload Turso gate-smoke receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: turso-campaign-promotion-${{ github.event_name }}-${{ github.run_id }}
+          name: turso-campaign-gate-smoke-${{ github.event_name }}-${{ github.run_id }}
           path: artifacts/turso-campaign/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: ${{ github.event_name == 'workflow_dispatch' && 90 || 30 }}
 
   differential-ci-smoke:
