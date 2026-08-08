@@ -1389,10 +1389,14 @@ impl ParallelWalDurabilityCombiner {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.visibility.visible_commit_seq = state
-            .visibility
-            .visible_commit_seq
-            .max(durable_visible_commit_seq);
+        if durable_visible_commit_seq > state.visibility.visible_commit_seq {
+            state.visibility.visible_commit_seq = durable_visible_commit_seq;
+            // The previous checksum identifies the certificate that established
+            // the old horizon. Once an independently verified pager floor moves
+            // past it, an equal authorized seed must be allowed to bind the new
+            // horizon's certificate identity.
+            state.last_certificate_crc32c = 0;
+        }
     }
 
     /// Advance this process-local combiner from an already-authorized durable
@@ -5313,21 +5317,40 @@ mod tests {
             .expect("first certificate should publish");
         assert_eq!(first.certificate.commit_seq_hi, CommitSeq::new(2));
 
-        combiner.reconcile_durable_visibility_floor(CommitSeq::new(10));
-        combiner.reconcile_durable_visibility_floor(CommitSeq::new(9));
+        let peer = ParallelWalDurabilityCombiner::new(ParallelWalVisibilitySnapshot {
+            visible_commit_seq: first.certificate.commit_seq_hi,
+            db_size_pages: first.certificate.db_size_pages,
+            ..ParallelWalVisibilitySnapshot::default()
+        });
+        peer.reconcile_authorized_seed(&first.certificate)
+            .expect("peer should import the first certificate");
+        let mut peer_request = durability_request(ParallelWalOperatingMode::Auto);
+        peer_request.batch_size = 1;
+        peer_request.batch_ids = vec![201];
+        peer_request.lane_record_counts = vec![1];
+        let peer_commit = peer
+            .certify_and_publish(peer_request, |_| Ok(()))
+            .expect("peer should publish the next certificate");
+        assert_eq!(peer_commit.certificate.commit_seq_hi, CommitSeq::new(3));
+
+        combiner.reconcile_durable_visibility_floor(CommitSeq::new(3));
+        combiner
+            .reconcile_authorized_seed(&peer_commit.certificate)
+            .expect("an equal durable seed must bind after the pager floor advances");
+        combiner.reconcile_durable_visibility_floor(CommitSeq::new(2));
         assert_eq!(
             combiner.visibility_snapshot().visible_commit_seq,
-            CommitSeq::new(10),
+            CommitSeq::new(3),
             "a stale durable observation must not lower the allocator"
         );
 
         let mut next_request = durability_request(ParallelWalOperatingMode::Auto);
-        next_request.batch_ids = vec![201, 202];
+        next_request.batch_ids = vec![301, 302];
         let next = combiner
             .certify_and_publish(next_request, |_| Ok(()))
             .expect("the next certificate must start above the durable floor");
-        assert_eq!(next.certificate.commit_seq_lo, CommitSeq::new(11));
-        assert_eq!(next.certificate.commit_seq_hi, CommitSeq::new(12));
+        assert_eq!(next.certificate.commit_seq_lo, CommitSeq::new(4));
+        assert_eq!(next.certificate.commit_seq_hi, CommitSeq::new(5));
     }
 
     #[test]
