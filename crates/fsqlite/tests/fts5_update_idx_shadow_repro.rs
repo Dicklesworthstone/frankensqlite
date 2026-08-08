@@ -364,7 +364,7 @@ fn frankensqlite_written_fts5_is_canonical_to_stock_sqlite() {
         stock
             .execute_batch(
                 "CREATE VIRTUAL TABLE temp.actual_vocab \
-                 USING fts5vocab(fts_messages, instance);",
+                 USING fts5vocab(main, fts_messages, instance);",
             )
             .expect("stock could not expose FrankenSQLite-written FTS5 postings");
         let reference = StockConnection::open_in_memory().expect("stock reference open");
@@ -377,7 +377,7 @@ fn frankensqlite_written_fts5_is_canonical_to_stock_sqlite() {
                      ('the quick brown fox', 'first title'),
                      ('jumps over the lazy dog', 'second title');
                  CREATE VIRTUAL TABLE temp.reference_vocab
-                     USING fts5vocab(fts_messages, instance);",
+                     USING fts5vocab(main, fts_messages, instance);",
             )
             .expect("build stock FTS5 reference postings");
         let read_vocab = |conn: &StockConnection, table: &str| {
