@@ -245,6 +245,12 @@ const OPFLAG_ISUPDATE: u16 = 0x10;
 /// Marks a WITHOUT ROWID table-row `IdxDelete` whose deleted logical row is an
 /// exact REPLACE victim needed by connection-layer inbound FK enforcement.
 const OPFLAG_REPLACE_VICTIM: u16 = 0x20;
+/// Counts a successful clustered-table `IdxInsert` as one logical row change.
+/// This is reserved for WITHOUT ROWID table roots, never secondary indexes.
+const OPFLAG_IDX_NCHANGE: u16 = 0x40;
+/// Marks a `Halt(SQLITE_CONSTRAINT)` emitted after a non-mutating UNIQUE
+/// preflight. P4 contains the constraint's column label.
+const OPFLAG_HALT_UNIQUE: u16 = 0x01;
 const STORAGE_CURSOR_LAYOUT_PREFIX_BYTES: usize = 256;
 #[cfg(test)]
 const VDBE_ENGINE_INLINE_SIZE_BUDGET_BYTES: usize = 3 * 1024;
@@ -8737,6 +8743,15 @@ impl VdbeEngine {
 
                 Opcode::Halt => {
                     if op.p1 != 0 {
+                        if op.p1 == ErrorCode::Constraint as i32
+                            && op.p5 == OPFLAG_HALT_UNIQUE
+                        {
+                            let columns = match &op.p4 {
+                                P4::Str(columns) => columns.clone(),
+                                _ => String::new(),
+                            };
+                            return Err(FrankenError::UniqueViolation { columns });
+                        }
                         let msg = match &op.p4 {
                             P4::Str(s) => s.clone(),
                             _ => format!("halt with error code {}", op.p1),
@@ -10899,6 +10914,8 @@ impl VdbeEngine {
                     #[allow(clippy::cast_possible_truncation)]
                     let oe_flag = ((op.p5 >> 1) & 0x0F) as u8;
                     let n_idx_cols = op.p3 as usize;
+                    let count_logical_change = (op.p5 & OPFLAG_IDX_NCHANGE) != 0;
+                    let mut inserted = false;
 
                     // If a previous IdxInsert for the same row triggered IGNORE,
                     // skip all remaining index inserts for this row before touching
@@ -11083,6 +11100,7 @@ impl VdbeEngine {
                                 };
                                 match unique_insert_result {
                                     Ok(()) => {
+                                        inserted = true;
                                         if let (Some(prefix), Some(position)) = (
                                             rightmost_prefix_after_insert,
                                             sc.cursor.position_stamp(),
@@ -11209,6 +11227,7 @@ impl VdbeEngine {
                                                     cursor_id,
                                                     key_blob.clone(),
                                                 );
+                                                inserted = true;
                                             }
                                             // Default: propagate the error
                                             // (ABORT/FAIL/ROLLBACK).
@@ -11259,6 +11278,7 @@ impl VdbeEngine {
                                     DecodeCacheInvalidationReason::WriteMutation,
                                 );
                                 self.push_pending_idx_entry(cursor_id, key_blob.clone());
+                                inserted = true;
                             }
                         }
                     }
@@ -11266,6 +11286,9 @@ impl VdbeEngine {
                     // support indexes (they're a no-op there).
                     if sideband_active {
                         self.make_record_lookaside.replace_cleared_buf(key_blob);
+                    }
+                    if count_logical_change && inserted {
+                        self.changes = self.changes.saturating_add(1);
                     }
                     pc += 1;
                 }

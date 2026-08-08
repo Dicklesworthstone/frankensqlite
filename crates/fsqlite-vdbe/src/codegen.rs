@@ -202,6 +202,11 @@ const OPFLAG_ISUPDATE: u16 = 0x10;
 /// Marks a WITHOUT ROWID table-row `IdxDelete` as an implicit REPLACE
 /// deletion whose exact OLD row must be reported for inbound FK actions.
 const OPFLAG_REPLACE_VICTIM: u16 = 0x20;
+/// Counts a successful clustered-table `IdxInsert` as one logical row change.
+/// Secondary-index maintenance must never carry this flag.
+const OPFLAG_IDX_NCHANGE: u16 = 0x40;
+/// Marks a non-mutating UNIQUE constraint halt. P4 carries the column label.
+const OPFLAG_HALT_UNIQUE: u16 = 0x01;
 
 /// Convert AST `ConflictAction` to p5 OE_* flag value.
 fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
@@ -23512,7 +23517,7 @@ fn emit_without_rowid_update_rewrite(
         rec_reg,
         n_pk as i32,
         P4::Table(format!("{}.{}", table.name, pk_label)),
-        1u16 | (OE_ABORT << 1),
+        1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE,
     );
     emit_without_rowid_index_inserts(
         b,
@@ -23531,7 +23536,7 @@ fn emit_without_rowid_update_rewrite(
 /// constraint validation, conflict resolution (ABORT/IGNORE/REPLACE), the table
 /// b-tree `IdxInsert`, and secondary-index maintenance.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn emit_without_rowid_row_insert(
     b: &mut ProgramBuilder,
     table: &TableSchema,
@@ -23601,95 +23606,194 @@ fn emit_without_rowid_row_insert(
 
     let pk_label = without_rowid_pk_label(table, pk_indices);
 
-    if oe_flag == OE_REPLACE || oe_flag == OE_IGNORE {
-        // Probe the primary key: build a PK-prefix key and test for an existing
-        // row. NoConflict falls through (cursor positioned on the conflicting
-        // row) when a match exists, else jumps to `do_insert`.
-        let pk_probe_regs = b.alloc_regs(n_pk as i32);
-        for (j, &pk_col) in pk_indices.iter().enumerate() {
-            b.emit_op(
-                Opcode::Copy,
-                val_regs + pk_col as i32,
-                pk_probe_regs + j as i32,
+    // Decide every UNIQUE action before mutating the clustered table. A
+    // WITHOUT ROWID secondary entry ends in the composite PK, not a rowid, so
+    // the engine's rowid-table REPLACE path cannot identify its victim.
+    let pk_probe_regs = b.alloc_regs(n_pk as i32);
+    for (j, &pk_col) in pk_indices.iter().enumerate() {
+        b.emit_op(
+            Opcode::Copy,
+            val_regs + pk_col as i32,
+            pk_probe_regs + j as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+    let pk_probe_rec = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        pk_probe_regs,
+        n_pk as i32,
+        pk_probe_rec,
+        P4::None,
+        0,
+    );
+    let pk_victim_flag = b.alloc_reg();
+    b.emit_op(Opcode::Integer, 0, pk_victim_flag, 0, P4::None, 0);
+    let pk_clear = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::NoConflict,
+        table_cursor,
+        pk_probe_rec,
+        pk_clear,
+        P4::None,
+        0,
+    );
+    if oe_flag == OE_IGNORE {
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
+    } else if oe_flag == OE_REPLACE {
+        b.emit_op(Opcode::Integer, 1, pk_victim_flag, 0, P4::None, 0);
+    } else {
+        b.emit_op(
+            Opcode::Halt,
+            ErrorCode::Constraint as i32,
+            0,
+            0,
+            P4::Str(format!("{}.{}", table.name, pk_label)),
+            OPFLAG_HALT_UNIQUE,
+        );
+    }
+    b.resolve_label(pk_clear);
+
+    let unique_index_slots: Vec<(usize, i32, i32)> = table
+        .indexes
+        .iter()
+        .enumerate()
+        .filter(|(_, index)| index.is_unique && index.key_term_count() > 0)
+        .map(|(idx_offset, _)| {
+            let flag = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, flag, 0, P4::None, 0);
+            let victim_pk = b.alloc_regs(n_pk as i32);
+            (idx_offset, flag, victim_pk)
+        })
+        .collect();
+
+    for &(idx_offset, victim_flag, victim_pk_regs) in &unique_index_slots {
+        let index = &table.indexes[idx_offset];
+        let idx_oe = effective_oe(stmt_level, index.conflict_action);
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        let n_idx_cols = index.key_term_count();
+        let idx_clear = b.emit_label();
+        let scan_ctx = ScanCtx {
+            cursor: table_cursor,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: Some(val_regs),
+            secondaries: &[],
+        };
+        emit_index_predicate_guard(b, index, &scan_ctx, idx_clear);
+
+        let probe_regs = b.alloc_regs(n_idx_cols as i32);
+        for key_pos in 0..n_idx_cols {
+            emit_index_key_term(b, index, key_pos, probe_regs + key_pos as i32, &scan_ctx);
+            b.emit_jump_to_label(
+                Opcode::IsNull,
+                probe_regs + key_pos as i32,
                 0,
+                idx_clear,
                 P4::None,
                 0,
             );
         }
-        let pk_probe_rec = b.alloc_reg();
+        let probe_rec = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
-            pk_probe_regs,
-            n_pk as i32,
-            pk_probe_rec,
+            probe_regs,
+            n_idx_cols as i32,
+            probe_rec,
             P4::None,
             0,
         );
-        let do_insert = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::NoConflict,
+            idx_cursor,
+            probe_rec,
+            idx_clear,
+            P4::None,
+            0,
+        );
+        for j in 0..n_pk {
+            b.emit_op(
+                Opcode::Column,
+                idx_cursor,
+                (n_idx_cols + j) as i32,
+                victim_pk_regs + j as i32,
+                P4::None,
+                0,
+            );
+        }
+        if idx_oe == OE_IGNORE {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
+        } else if idx_oe == OE_REPLACE {
+            b.emit_op(Opcode::Integer, 1, victim_flag, 0, P4::None, 0);
+        } else {
+            b.emit_op(
+                Opcode::Halt,
+                ErrorCode::Constraint as i32,
+                0,
+                0,
+                P4::Str(format!("{}.{}", table.name, index.key_label())),
+                OPFLAG_HALT_UNIQUE,
+            );
+        }
+        b.resolve_label(idx_clear);
+    }
+
+    let emit_victim_delete = |b: &mut ProgramBuilder, flag: i32, victim_pk_regs: i32| {
+        let victim_done = b.emit_label();
+        b.emit_jump_to_label(Opcode::IfNot, flag, 1, victim_done, P4::None, 0);
+        let victim_rec = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            victim_pk_regs,
+            n_pk as i32,
+            victim_rec,
+            P4::None,
+            0,
+        );
         b.emit_jump_to_label(
             Opcode::NoConflict,
             table_cursor,
-            pk_probe_rec,
-            do_insert,
+            victim_rec,
+            victim_done,
             P4::None,
             0,
         );
-        if oe_flag == OE_IGNORE {
-            // Conflict: skip this row entirely.
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
-        } else {
-            // REPLACE: delete the conflicting row's secondary index entries and
-            // the old table row, then fall through to insert the new row.
-            emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
-            b.emit_op(
-                Opcode::IdxDelete,
-                table_cursor,
-                0,
-                0,
-                P4::Table(table.name.clone()),
-                OPFLAG_REPLACE_VICTIM,
-            );
-        }
-        b.resolve_label(do_insert);
-        // Any conflicting row has been removed, so insert cannot conflict.
-        let rec_reg = b.alloc_reg();
+        emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
         b.emit_op(
-            Opcode::MakeRecord,
-            val_regs,
-            n_cols as i32,
-            rec_reg,
-            P4::Affinity(aff_str),
-            0,
-        );
-        b.emit_op(
-            Opcode::IdxInsert,
+            Opcode::IdxDelete,
             table_cursor,
-            rec_reg,
-            n_pk as i32,
-            P4::Table(format!("{}.{}", table.name, pk_label)),
-            1u16 | (OE_ABORT << 1),
-        );
-    } else {
-        // ABORT / FAIL / ROLLBACK: rely on the engine's UNIQUE check on the
-        // leading `n_pk` (primary-key) columns of the record.
-        let rec_reg = b.alloc_reg();
-        b.emit_op(
-            Opcode::MakeRecord,
-            val_regs,
-            n_cols as i32,
-            rec_reg,
-            P4::Affinity(aff_str),
             0,
+            0,
+            P4::Table(table.name.clone()),
+            OPFLAG_REPLACE_VICTIM,
         );
-        b.emit_op(
-            Opcode::IdxInsert,
-            table_cursor,
-            rec_reg,
-            n_pk as i32,
-            P4::Table(format!("{}.{}", table.name, pk_label)),
-            1u16 | (oe_flag << 1),
-        );
+        b.resolve_label(victim_done);
+    };
+    emit_victim_delete(b, pk_victim_flag, pk_probe_regs);
+    for &(_, victim_flag, victim_pk_regs) in &unique_index_slots {
+        emit_victim_delete(b, victim_flag, victim_pk_regs);
     }
+
+    let rec_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        val_regs,
+        n_cols as i32,
+        rec_reg,
+        P4::Affinity(aff_str),
+        0,
+    );
+    b.emit_op(
+        Opcode::IdxInsert,
+        table_cursor,
+        rec_reg,
+        n_pk as i32,
+        P4::Table(format!("{}.{}", table.name, pk_label)),
+        1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE,
+    );
 
     // Secondary-index maintenance (skipped by the IGNORE conflict path, which
     // jumps straight to `row_done`).
@@ -23700,7 +23804,7 @@ fn emit_without_rowid_row_insert(
         val_regs,
         pk_indices,
         stmt_level,
-        false,
+        true,
     );
 
     // RETURNING: emit the inserted row image. Placed on the insert path so an
@@ -23881,7 +23985,7 @@ fn emit_without_rowid_upsert_row(
             table.name,
             without_rowid_pk_label(table, pk_indices)
         )),
-        1u16 | (OE_ABORT << 1),
+        1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE,
     );
     emit_without_rowid_index_inserts(
         b,
