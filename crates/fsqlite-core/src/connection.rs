@@ -19435,9 +19435,8 @@ impl Connection {
             }
         }
 
-        let can_stream_with_row_handler = stmt.db.is_some()
-            && stmt.deferred_query_statement.is_none()
-            && !stmt.distinct;
+        let can_stream_with_row_handler =
+            stmt.db.is_some() && stmt.deferred_query_statement.is_none() && !stmt.distinct;
 
         if !can_stream_with_row_handler {
             let rows = self
@@ -28997,9 +28996,7 @@ impl Connection {
                         // AST so ORDER/LIMIT staging, volatile projections,
                         // and RHS collation metadata reach codegen intact.
                         let rewritten = self.rewrite_subqueries(select, params).await?;
-                        if let Some(rows) =
-                            self.try_direct_count_star_in_list(&rewritten)?
-                        {
+                        if let Some(rows) = self.try_direct_count_star_in_list(&rewritten)? {
                             return Ok(rows);
                         }
                         let plan_span = tracing::span!(
@@ -85751,10 +85748,7 @@ fn in_subquery_needs_eager_eval(sub: &SelectStatement, conn: &Connection) -> boo
 /// minus schema lookup: one plain base table, no joins, one projection, and no
 /// feature rejected by both emitters. Only shapes consumed natively may carry
 /// placeholders past dispatch routing.
-fn in_subquery_matches_native_probe_source_shape(
-    sub: &SelectStatement,
-    conn: &Connection,
-) -> bool {
+fn in_subquery_matches_native_probe_source_shape(sub: &SelectStatement, conn: &Connection) -> bool {
     if sub.with.is_some() || !sub.body.compounds.is_empty() {
         return false;
     }
