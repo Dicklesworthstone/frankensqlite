@@ -112,10 +112,9 @@ const MAX_RETRY_SLEEP_MS: u64 = 25;
 const CSQLITE_RETRY_ALGORITHM: &str = "csqlite.per-operation.fixed-1ms.busy-or-locked.max-512.v1";
 const FSQLITE_RETRY_BACKOFF_ALGORITHM: &str = "fsqlite.whole-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-timeout.v1";
 const CSQLITE_ONE_ROW_RETRY_ALGORITHM: &str = "csqlite.whole-one-row-transaction.fixed-1ms.busy-or-locked.max-512-or-shared-worker-timeout.v1";
-const FSQLITE_ONE_ROW_RETRY_BACKOFF_ALGORITHM: &str = "fsqlite.prepare-or-whole-one-row-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-shared-worker-timeout.v2";
+const FSQLITE_ONE_ROW_RETRY_BACKOFF_ALGORITHM: &str = "fsqlite.prepare-rollback-cleanup-or-whole-one-row-transaction.step-exp-every-8-cap-25ms-plus-thread-attempt-jitter-0-to-4ms.max-512-or-shared-worker-timeout.v3";
 const CSQLITE_ONE_ROW_RETRY_UNIT: &str = "whole one-row BEGIN/INSERT/COMMIT transaction attempt";
-const FSQLITE_ONE_ROW_RETRY_UNIT: &str =
-    "statement preparation or whole one-row BEGIN CONCURRENT/INSERT/COMMIT transaction attempt";
+const FSQLITE_ONE_ROW_RETRY_UNIT: &str = "statement preparation, retryable ROLLBACK cleanup, or whole one-row BEGIN CONCURRENT/INSERT/COMMIT transaction attempt";
 const FSQLITE_RETRYABLE_ERRORS: &str = "Busy|BusyRecovery|BusySnapshot|DatabaseLocked|\
     WriteConflict|SerializationFailure|PageBufferCapacityExhausted";
 /// Base wall-clock retry budget for one bulk transaction attempt loop, or one
@@ -243,7 +242,9 @@ const PASS_OVER_PASS_MAX_RATIO_DROP_PCT: f64 = 5.0;
 const REPORT_SCHEMA_V7: &str = "fsqlite-e2e.mt_mvcc_bench_report.v7";
 #[cfg(test)]
 const REPORT_SCHEMA_V8: &str = "fsqlite-e2e.mt_mvcc_bench_report.v8";
+#[cfg(test)]
 const REPORT_SCHEMA_V9: &str = "fsqlite-e2e.mt_mvcc_bench_report.v9";
+const REPORT_SCHEMA_V10: &str = "fsqlite-e2e.mt_mvcc_bench_report.v10";
 const SETTINGS_INTERPRETATION: &str = "Both engines proved the listed effective PRAGMA values; \
     equal names and readbacks do not establish cross-engine semantic equivalence.";
 const ACCOUNTING_INTERPRETATION: &str = "offered and committed writes share one row unit; \
@@ -258,9 +259,9 @@ const NON_CITABLE_REASON: &str = "v7 binds the running executable, build/runtime
     semantics, external validation (and, when absent, capture) of a build-attested resolved \
     dependency/feature-graph digest, counterbalanced topology receipts, immutable manifest, \
     retained baseline history, and independent verification.";
-const NON_CITABLE_REASON_V9: &str = "v9 extends the explicit one-row transaction/retry-unit \
-    contract with retryable statement-preparation truth under the shared worker deadline and an \
-    exact v2 FSQLite retry identity; it retains an optional build-attested resolved \
+const NON_CITABLE_REASON_V10: &str = "v10 binds the explicit one-row transaction/retry-unit \
+    contract to bounded Busy/BusyRecovery ROLLBACK cleanup under the shared worker deadline and \
+    an exact v3 FSQLite retry identity; it retains an optional build-attested resolved \
     dependency/feature-graph digest, but remains non-citable: bd-uh1fv still requires an external \
     watchdog, sanitized environment, matched retry/deadline semantics, counterbalanced topology \
     receipts, immutable manifest, retained baseline history, and independent verification; a \
@@ -269,7 +270,7 @@ const RELEASE_REGRESSION_SCOPE: &str = "Narrow same-process, same-host F/C write
     comparison for only the requested mt-mvcc-bench workload/configurations; this report does not \
     cover the shipped release profile, other workloads or platforms, long-term baseline retention, \
     independent reproduction, or overall release eligibility.";
-const RELEASE_REGRESSION_SCOPE_V9: &str = "Narrow same-process, same-host F/C writer-throughput \
+const RELEASE_REGRESSION_SCOPE_V10: &str = "Narrow same-process, same-host F/C writer-throughput \
     comparison for only this report's attested selected Cargo profile and the requested \
     mt-mvcc-bench workload/configurations; this report does not cover other workloads or platforms, \
     long-term baseline retention, independent reproduction, or overall release eligibility.";
@@ -286,21 +287,21 @@ impl TransactionGranularity {
     const fn report_schema(self) -> &'static str {
         match self {
             Self::Bulk => REPORT_SCHEMA_V7,
-            Self::OneRow => REPORT_SCHEMA_V9,
+            Self::OneRow => REPORT_SCHEMA_V10,
         }
     }
 
     const fn non_citable_reason(self) -> &'static str {
         match self {
             Self::Bulk => NON_CITABLE_REASON,
-            Self::OneRow => NON_CITABLE_REASON_V9,
+            Self::OneRow => NON_CITABLE_REASON_V10,
         }
     }
 
     const fn release_regression_scope(self) -> &'static str {
         match self {
             Self::Bulk => RELEASE_REGRESSION_SCOPE,
-            Self::OneRow => RELEASE_REGRESSION_SCOPE_V9,
+            Self::OneRow => RELEASE_REGRESSION_SCOPE_V10,
         }
     }
 
@@ -1436,7 +1437,7 @@ fn provenance_evidence_is_valid(
     subject: &SubjectIdentityReceipt,
     environment: &ComparisonEnvironmentReceipt,
 ) -> bool {
-    // This predicate only proves that the v7/v9 in-process diagnostic receipts
+    // This predicate only proves that the v7/v10 in-process diagnostic receipts
     // were complete and stable for this run. It does not fill the
     // schema-specific external-verification gaps, so a true result must remain
     // non-citable.
@@ -1539,7 +1540,7 @@ fn print_usage_and_exit(code: i32) -> ! {
          note: writer counts above MAX_CONCURRENT_WRITERS are reported and skipped;\n\
          counts above host available_parallelism are measured only as non-comparable diagnostics.\n\
          note: --one-row-per-transaction retries each complete one-row transaction and emits the\n\
-         non-citable v9 report; the default bulk transaction retains the v7 analyzer contract.\n\
+         non-citable v10 report; the default bulk transaction retains the v7 analyzer contract.\n\
          note: --rows-per-thread=0 reduces the run to shared-file worker open + synchronized start,\n\
          which is the minimal repro for the 13+ thread startup-open failure."
     );
@@ -1964,7 +1965,7 @@ fn transaction_contract_is_valid(
             let Some(contract) = contract else {
                 return false;
             };
-            if schema_version != REPORT_SCHEMA_V9
+            if schema_version != REPORT_SCHEMA_V10
                 || rows_per_thread == 0
                 || contract.granularity != TransactionGranularity::OneRow.label()
                 || contract.rows_per_transaction != 1
@@ -4064,6 +4065,10 @@ enum OneRowAttempt {
         stage: OneRowRetryStage,
         error: fsqlite::FrankenError,
     },
+    RollbackRequired {
+        stage: OneRowRetryStage,
+        error: fsqlite::FrankenError,
+    },
 }
 
 fn prepare_fsqlite_one_row_with_retry<'context, Context, Prepared, Prepare>(
@@ -4099,6 +4104,47 @@ where
             Err(error) => {
                 return Err(format!(
                     "[fsqlite t{tid}] one-row PREPARE failed after {} retries: {error}",
+                    retry_budget.attempts()
+                ));
+            }
+        }
+    }
+}
+
+const fn fsqlite_rollback_error_is_retryable(error: &fsqlite::FrankenError) -> bool {
+    matches!(
+        error,
+        fsqlite::FrankenError::Busy | fsqlite::FrankenError::BusyRecovery
+    )
+}
+
+fn rollback_fsqlite_one_row_with_retry<Rollback>(
+    tid: usize,
+    retry_budget: &mut FsqliteRetryBudget,
+    mut rollback: Rollback,
+) -> Result<usize, String>
+where
+    Rollback: FnMut() -> Result<(), fsqlite::FrankenError>,
+{
+    let mut retries = 0usize;
+    loop {
+        match rollback() {
+            Ok(()) => return Ok(retries),
+            Err(error) if fsqlite_rollback_error_is_retryable(&error) => {
+                let Some(wait) = retry_budget.next_wait(tid) else {
+                    return Err(format!(
+                        "one-row ROLLBACK exhausted shared worker retry budget after {} retries: {error}",
+                        retry_budget.attempts()
+                    ));
+                };
+                retries = retries
+                    .checked_add(1)
+                    .ok_or_else(|| "one-row ROLLBACK retry counter overflow".to_owned())?;
+                thread::sleep(wait);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "one-row ROLLBACK failed after {} retries: {error}",
                     retry_budget.attempts()
                 ));
             }
@@ -4151,77 +4197,83 @@ fn run_fsqlite_one_row_transactions(
                     .checked_add(1)
                     .ok_or_else(|| format!("[fsqlite t{tid}] write-attempt counter overflow"))?;
                 if let Err(error) = stmt.execute_with_params(&params).await {
-                    let rollback = conn.execute("ROLLBACK").await;
-                    if let Err(rollback_error) = rollback {
-                        return Err(format!(
-                            "[fsqlite t{tid}] one-row INSERT failed for id {id}: {error}; \
-                             mandatory rollback also failed: {rollback_error}"
-                        ));
-                    }
-                    if one_row_failure_disposition(
-                        OneRowRetryStage::Insert,
-                        fsqlite_error_is_retryable(&error),
-                        Some(true),
-                    ) == OneRowFailureDisposition::Retry
-                    {
-                        return Ok(OneRowAttempt::Retry {
-                            stage: OneRowRetryStage::Insert,
-                            error,
-                        });
-                    }
-                    return Err(format!(
-                        "[fsqlite t{tid}] one-row INSERT failed for id {id}: {error}; duplicate \
-                         and constraint errors are fail-closed and are never accepted as proof of \
-                         the intended id+payload"
-                    ));
+                    return Ok(OneRowAttempt::RollbackRequired {
+                        stage: OneRowRetryStage::Insert,
+                        error,
+                    });
                 }
 
                 match conn.execute("COMMIT").await {
                     Ok(_) => Ok(OneRowAttempt::Committed),
-                    Err(error) => {
-                        let rollback = conn.execute("ROLLBACK").await;
-                        if let Err(rollback_error) = rollback {
-                            return Err(format!(
-                                "[fsqlite t{tid}] one-row COMMIT failed for id {id}: {error}; \
-                                 mandatory rollback also failed: {rollback_error}; ambiguous \
-                                 commit state is fail-closed"
-                            ));
-                        }
-                        if one_row_failure_disposition(
-                            OneRowRetryStage::Commit,
-                            fsqlite_error_is_retryable(&error),
-                            Some(true),
-                        ) == OneRowFailureDisposition::Retry
-                        {
-                            Ok(OneRowAttempt::Retry {
-                                stage: OneRowRetryStage::Commit,
-                                error,
-                            })
-                        } else {
-                            Err(format!(
-                                "[fsqlite t{tid}] one-row COMMIT failed for id {id}: {error}"
-                            ))
-                        }
-                    }
+                    Err(error) => Ok(OneRowAttempt::RollbackRequired {
+                        stage: OneRowRetryStage::Commit,
+                        error,
+                    }),
                 }
             })?;
 
-            match outcome {
+            let (stage, error, rollback_retries) = match outcome {
                 OneRowAttempt::Committed => break,
-                OneRowAttempt::Retry { stage, error } => {
-                    let Some(wait) = retry_budget.next_wait(tid) else {
-                        return Err(format!(
-                            "[fsqlite t{tid}] one-row transaction for id {id} exhausted retry \
-                             budget at {stage} after {} retries: {error}",
-                            retry_budget.attempts()
-                        ));
-                    };
-                    retried_transactions = retried_transactions
-                        .checked_add(1)
-                        .ok_or_else(|| format!("[fsqlite t{tid}] retry counter overflow"))?;
-                    thread::sleep(wait);
+                OneRowAttempt::Retry { stage, error } => (stage, error, 0),
+                OneRowAttempt::RollbackRequired { stage, error } => {
+                    let rollback_retries = rollback_fsqlite_one_row_with_retry(
+                        tid,
+                        &mut retry_budget,
+                        || fsqlite_e2e::block_on(conn.execute("ROLLBACK")).map(|_| ()),
+                    )
+                    .map_err(|rollback_error| match stage {
+                        OneRowRetryStage::Insert => format!(
+                            "[fsqlite t{tid}] one-row INSERT failed for id {id}: {error}; \
+                             mandatory rollback also failed: {rollback_error}"
+                        ),
+                        OneRowRetryStage::Commit => format!(
+                            "[fsqlite t{tid}] one-row COMMIT failed for id {id}: {error}; \
+                             mandatory rollback also failed: {rollback_error}; ambiguous \
+                             commit state is fail-closed"
+                        ),
+                        OneRowRetryStage::Prepare | OneRowRetryStage::Begin => format!(
+                            "[fsqlite t{tid}] one-row {stage} unexpectedly required rollback for \
+                             id {id}: {error}"
+                        ),
+                    })?;
+                    if one_row_failure_disposition(
+                        stage,
+                        fsqlite_error_is_retryable(&error),
+                        Some(true),
+                    ) != OneRowFailureDisposition::Retry
+                    {
+                        return Err(match stage {
+                            OneRowRetryStage::Insert => format!(
+                                "[fsqlite t{tid}] one-row INSERT failed for id {id}: {error}; \
+                                 duplicate and constraint errors are fail-closed and are never \
+                                 accepted as proof of the intended id+payload"
+                            ),
+                            OneRowRetryStage::Commit => format!(
+                                "[fsqlite t{tid}] one-row COMMIT failed for id {id}: {error}"
+                            ),
+                            OneRowRetryStage::Prepare | OneRowRetryStage::Begin => format!(
+                                "[fsqlite t{tid}] one-row {stage} unexpectedly required rollback \
+                                 for id {id}: {error}"
+                            ),
+                        });
+                    }
+                    (stage, error, rollback_retries)
                 }
-            }
+            };
+            retried_transactions = retried_transactions
+                .checked_add(rollback_retries)
+                .ok_or_else(|| format!("[fsqlite t{tid}] retry counter overflow"))?;
+            let Some(wait) = retry_budget.next_wait(tid) else {
+                return Err(format!(
+                    "[fsqlite t{tid}] one-row transaction for id {id} exhausted retry \
+                     budget at {stage} after {} retries: {error}",
+                    retry_budget.attempts()
+                ));
+            };
+            retried_transactions = retried_transactions
+                .checked_add(1)
+                .ok_or_else(|| format!("[fsqlite t{tid}] retry counter overflow"))?;
+            thread::sleep(wait);
         }
     }
     Ok((attempted_writes, retried_transactions))
@@ -4419,7 +4471,7 @@ fn run_fsqlite(
                 tid as i64 * ROWID_BASE_STRIDE
             };
             // The v7 bulk path below prepares once per transaction attempt.
-            // The v9 one-row path retains one successfully prepared statement
+            // The v10 one-row path retains one successfully prepared statement
             // per worker across all row transactions, matching its rusqlite
             // reference arm. Transient preparation failures may retry under
             // the shared worker deadline. In both modes, bind+execute rather
@@ -5506,7 +5558,7 @@ mod tests {
         }
     }
 
-    fn minimal_v9_one_row_report() -> MtMvccBenchReport {
+    fn minimal_v10_one_row_report() -> MtMvccBenchReport {
         let retry_policy = retry_policy_receipt_for_granularity(
             fsqlite_retry_timeout(1, 1),
             false,
@@ -5522,9 +5574,9 @@ mod tests {
             retry_policy.clone(),
         );
         let mut report = minimal_v7_report();
-        report.schema_version = REPORT_SCHEMA_V9;
-        report.non_citable_reason = NON_CITABLE_REASON_V9;
-        report.release_regression_scope = RELEASE_REGRESSION_SCOPE_V9;
+        report.schema_version = REPORT_SCHEMA_V10;
+        report.non_citable_reason = NON_CITABLE_REASON_V10;
+        report.release_regression_scope = RELEASE_REGRESSION_SCOPE_V10;
         report.transaction_contract =
             transaction_contract_receipt(TransactionGranularity::OneRow, &retry_policy);
         report.configuration_receipts = vec![configuration];
@@ -5746,8 +5798,8 @@ mod tests {
     }
 
     #[test]
-    fn v9_one_row_report_binds_granularity_retry_units_and_non_citable_status() {
-        let report = minimal_v9_one_row_report();
+    fn v10_one_row_report_binds_granularity_retry_units_and_non_citable_status() {
+        let report = minimal_v10_one_row_report();
         assert!(transaction_contract_is_valid(
             report.schema_version,
             TransactionGranularity::OneRow,
@@ -5756,12 +5808,12 @@ mod tests {
             &report.configuration_receipts,
         ));
 
-        let value = serde_json::to_value(&report).expect("v9 one-row report must serialize");
-        assert_eq!(value["schema_version"], REPORT_SCHEMA_V9);
+        let value = serde_json::to_value(&report).expect("v10 one-row report must serialize");
+        assert_eq!(value["schema_version"], REPORT_SCHEMA_V10);
         assert_eq!(value["citable"], false);
         assert_eq!(
             value["release_regression_scope"],
-            RELEASE_REGRESSION_SCOPE_V9,
+            RELEASE_REGRESSION_SCOPE_V10,
         );
         assert_eq!(
             value["transaction_contract"]["granularity"],
@@ -5790,7 +5842,7 @@ mod tests {
 
     #[test]
     fn one_row_report_contract_fails_closed_on_missing_or_mismatched_truth() {
-        let report = minimal_v9_one_row_report();
+        let report = minimal_v10_one_row_report();
         assert!(!transaction_contract_is_valid(
             REPORT_SCHEMA_V7,
             TransactionGranularity::OneRow,
@@ -5812,6 +5864,13 @@ mod tests {
             None,
             &report.configuration_receipts,
         ));
+        assert!(!transaction_contract_is_valid(
+            REPORT_SCHEMA_V10,
+            TransactionGranularity::OneRow,
+            report.rows_per_thread,
+            None,
+            &report.configuration_receipts,
+        ));
 
         let mut invalid_configurations = report.configuration_receipts.clone();
         invalid_configurations[0]
@@ -5820,7 +5879,7 @@ mod tests {
             .expect("test configuration retry policy")
             .csqlite_retry_unit = "individual INSERT operation".to_owned();
         assert!(!transaction_contract_is_valid(
-            REPORT_SCHEMA_V9,
+            REPORT_SCHEMA_V10,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
             report.transaction_contract.as_ref(),
@@ -5834,14 +5893,14 @@ mod tests {
             .expect("test configuration retry policy")
             .shared_worker_retry_timeout_ms = None;
         assert!(!transaction_contract_is_valid(
-            REPORT_SCHEMA_V9,
+            REPORT_SCHEMA_V10,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
             report.transaction_contract.as_ref(),
             &missing_shared_deadline,
         ));
 
-        let mut coordinated_drift = minimal_v9_one_row_report();
+        let mut coordinated_drift = minimal_v10_one_row_report();
         coordinated_drift
             .transaction_contract
             .as_mut()
@@ -5853,7 +5912,7 @@ mod tests {
             .expect("test configuration retry policy")
             .csqlite_retry_unit = "individual INSERT operation".to_owned();
         assert!(!transaction_contract_is_valid(
-            REPORT_SCHEMA_V9,
+            REPORT_SCHEMA_V10,
             TransactionGranularity::OneRow,
             coordinated_drift.rows_per_thread,
             coordinated_drift.transaction_contract.as_ref(),
@@ -7103,7 +7162,7 @@ mod tests {
     }
 
     #[test]
-    fn one_row_measurement_validation_requires_the_v9_retry_policy() {
+    fn one_row_measurement_validation_requires_the_v10_retry_policy() {
         let mut row = valid_history_row(8, 100, 200, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
         let one_row_policy = retry_policy_receipt_for_granularity(
             fsqlite_retry_timeout(8, DEFAULT_ROWS_PER_THREAD),
@@ -7307,6 +7366,76 @@ mod tests {
         assert_eq!(prepare_calls, 1);
         assert!(error.contains("one-row PREPARE exhausted shared worker retry budget"));
         assert!(error.contains("after 0 retries"));
+    }
+
+    #[test]
+    fn one_row_rollback_cleanup_retries_busy_recovery_within_shared_budget() {
+        let mut retry_budget = FsqliteRetryBudget::new(Duration::from_secs(1));
+        let mut rollback_calls = 0usize;
+
+        let retries = rollback_fsqlite_one_row_with_retry(0, &mut retry_budget, || {
+            rollback_calls += 1;
+            if rollback_calls == 1 {
+                Err(fsqlite::FrankenError::BusyRecovery)
+            } else {
+                Ok(())
+            }
+        })
+        .expect("a retryable rollback cleanup failure must recover inside the shared budget");
+
+        assert_eq!(rollback_calls, 2);
+        assert_eq!(retries, 1);
+        assert_eq!(retry_budget.attempts(), 1);
+    }
+
+    #[test]
+    fn one_row_rollback_cleanup_rejects_an_expired_shared_deadline() {
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test instant supports a two-second lookback");
+        let mut retry_budget = FsqliteRetryBudget::with_started(started, Duration::from_secs(1));
+        let mut rollback_calls = 0usize;
+
+        let error = rollback_fsqlite_one_row_with_retry(0, &mut retry_budget, || {
+            rollback_calls += 1;
+            Err::<(), _>(fsqlite::FrankenError::BusyRecovery)
+        })
+        .expect_err("an expired shared deadline must reject a retryable rollback cleanup failure");
+
+        assert_eq!(rollback_calls, 1);
+        assert_eq!(retry_budget.attempts(), 0);
+        assert!(error.contains("one-row ROLLBACK exhausted shared worker retry budget"));
+        assert!(error.contains("after 0 retries"));
+    }
+
+    #[test]
+    fn one_row_rollback_cleanup_rejects_nonretryable_errors_without_retrying() {
+        let mut retry_budget = FsqliteRetryBudget::new(Duration::from_secs(1));
+        let mut rollback_calls = 0usize;
+
+        let error = rollback_fsqlite_one_row_with_retry(0, &mut retry_budget, || {
+            rollback_calls += 1;
+            Err::<(), _>(fsqlite::FrankenError::BusySnapshot {
+                conflicting_pages: "2".to_owned(),
+            })
+        })
+        .expect_err("a nonretryable rollback cleanup failure must fail closed");
+
+        assert_eq!(rollback_calls, 1);
+        assert_eq!(retry_budget.attempts(), 0);
+        assert!(error.contains("one-row ROLLBACK failed after 0 retries"));
+        assert!(error.contains("snapshot conflict on pages: 2"));
+        assert!(fsqlite_rollback_error_is_retryable(
+            &fsqlite::FrankenError::Busy
+        ));
+        assert!(fsqlite_rollback_error_is_retryable(
+            &fsqlite::FrankenError::BusyRecovery
+        ));
+        assert!(!fsqlite_rollback_error_is_retryable(
+            &fsqlite::FrankenError::BusySnapshot {
+                conflicting_pages: "2".to_owned(),
+            }
+        ));
     }
 
     #[test]

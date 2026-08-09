@@ -7977,7 +7977,7 @@ impl<F: VfsFile> PagerInner<F> {
                             {
                                 Some(logical.visible_commit_seq)
                             }
-                            (Some(_), Some(_)) | (None, Some(_)) => {
+                            (Some(_) | None, Some(_)) => {
                                 return Err(FrankenError::WalCorrupt {
                                     detail: "logical WAL reader horizon does not match the pinned snapshot"
                                         .to_owned(),

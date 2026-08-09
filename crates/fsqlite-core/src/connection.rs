@@ -16975,14 +16975,19 @@ impl Connection {
             .set(self.schema_cookie());
     }
 
-    fn concurrent_snapshot_from_publication(&self, publication: BoundPagerPublication) -> Snapshot {
-        let finalized_commit_seq = self.current_global_commit_seq();
-        let publication_commit_seq = publication.snapshot.visible_commit_seq;
-        let local_visible_commit_seq = (*self.memdb_visible_commit_seq.borrow()).max(
+    #[inline]
+    fn local_execution_visible_commit_seq(&self) -> CommitSeq {
+        (*self.memdb_visible_commit_seq.borrow()).max(
             self.last_local_commit_seq
                 .borrow()
                 .unwrap_or(CommitSeq::ZERO),
-        );
+        )
+    }
+
+    fn concurrent_snapshot_from_publication(&self, publication: BoundPagerPublication) -> Snapshot {
+        let finalized_commit_seq = self.current_global_commit_seq();
+        let publication_commit_seq = publication.snapshot.visible_commit_seq;
+        let local_visible_commit_seq = self.local_execution_visible_commit_seq();
         let requested_snapshot_commit_seq = publication_commit_seq.max(local_visible_commit_seq);
         let snapshot_commit_seq = if requested_snapshot_commit_seq > finalized_commit_seq {
             tracing::debug!(
@@ -17021,7 +17026,19 @@ impl Connection {
             return Ok(());
         };
 
-        if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
+        let memdb_visible_commit_seq = *self.memdb_visible_commit_seq.borrow();
+        let local_execution_visible_commit_seq = self.local_execution_visible_commit_seq();
+        if bound_visible_commit_seq < local_execution_visible_commit_seq {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages: format!(
+                    "opened pager visibility {} predates connection execution visibility {}",
+                    bound_visible_commit_seq.get(),
+                    local_execution_visible_commit_seq.get()
+                ),
+            });
+        }
+
+        if bound_visible_commit_seq > memdb_visible_commit_seq {
             self.discard_cached_vdbe_engine();
             if hot_path_profile_enabled() {
                 FSQLITE_MEMDB_REFRESH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
@@ -53848,15 +53865,31 @@ impl Connection {
         }
     }
 
+    /// Restore a pager transaction after a rollback attempt that made no
+    /// terminal progress. The pager deliberately reports these two conditions
+    /// while another transaction's finalization is still being resolved; the
+    /// caller must be able to retry the same rollback once that work settles.
+    fn restore_retryable_rollback_transaction(
+        &self,
+        active_txn: &mut Option<TransactionKind>,
+        error: &FrankenError,
+    ) -> bool {
+        if !matches!(error, FrankenError::Busy | FrankenError::BusyRecovery) {
+            return false;
+        }
+        let Some(txn) = active_txn.take() else {
+            return false;
+        };
+        debug_assert!(self.active_txn.borrow().is_none());
+        *self.active_txn.borrow_mut() = Some(txn);
+        true
+    }
+
     async fn execute_rollback_with_cx(
         &self,
         cx: &Cx,
         rb: &fsqlite_ast::RollbackStatement,
     ) -> Result<()> {
-        // bd-do0d6: a full rollback discards any postponed deferred FK checks.
-        if rb.to_savepoint.is_none() {
-            self.deferred_fk_checks.borrow_mut().clear();
-        }
         // AAC-P6: any rollback invalidates the prepared-DML micro-batch.
         self.stmt_microbatch_flush();
         self.discard_cached_vdbe_engine();
@@ -54024,10 +54057,28 @@ impl Connection {
                 ));
             }
 
+            // Roll back the pager transaction: discard all dirty pages and
+            // release writer locks. After this, the pager reflects the
+            // pre-transaction committed state.
+            let mut active_txn = self.active_txn.borrow_mut().take();
+            let rollback_result = if let Some(txn) = active_txn.as_mut() {
+                txn.rollback(cx).await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = &rollback_result
+                && self.restore_retryable_rollback_transaction(&mut active_txn, error)
+            {
+                return rollback_result;
+            }
+            drop(active_txn);
+
             self.clear_pending_direct_write_runs();
 
-            // MVCC concurrent-writer abort (bd-14zc / 5E.1):
-            // When in concurrent mode, call concurrent_abort to release page locks.
+            // MVCC concurrent-writer abort (bd-14zc / 5E.1): only release the
+            // session once pager rollback has reached a terminal result. A
+            // retryable recovery wait must leave both sides available for the
+            // caller's next ROLLBACK attempt.
             if self.concurrent_txn.get() {
                 if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
                     let mut registry = lock_unpoisoned(&self.concurrent_registry);
@@ -54039,15 +54090,6 @@ impl Connection {
                 }
                 self.clear_memory_concurrent_synced_write_roots();
             }
-
-            // Roll back the pager transaction: discard all dirty pages and
-            // release writer locks. After this, the pager reflects the
-            // pre-transaction committed state.
-            let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
-                txn.rollback(cx).await
-            } else {
-                Ok(())
-            };
             let live_vtab_result = self.live_vtab_rollback_all(cx);
             let live_vtab_registry_result = self.restore_live_vtab_registry_to(cx, 0);
             self.clear_pending_memdb_direct_upserts();
@@ -54070,6 +54112,10 @@ impl Connection {
             let reload_result = self.reload_memdb_from_pager(cx).await;
 
             // Clear transaction state.
+            // bd-do0d6: a terminal full rollback discards any postponed
+            // deferred FK checks. Keep them intact while rollback remains
+            // retryable so a caller cannot accidentally commit around them.
+            self.deferred_fk_checks.borrow_mut().clear();
             *self.txn_snapshot.borrow_mut() = None;
             self.savepoints.borrow_mut().clear();
             self.in_transaction.set(false);
@@ -54124,7 +54170,7 @@ impl Connection {
             };
             // Bind the implicit transaction snapshot to the pager's published
             // visibility plane before opening the pager txn.
-            let concurrent_snapshot = if is_concurrent {
+            let mut concurrent_snapshot = if is_concurrent {
                 let publication = self
                     .bind_pager_publication(cx, "savepoint_implicit_begin")
                     .await?;
@@ -54135,6 +54181,19 @@ impl Connection {
             let mut txn = self
                 .begin_pager_txn_with_busy_timeout(&self.pager, cx, pager_mode, is_concurrent)
                 .await?;
+            if let Some(snapshot) = concurrent_snapshot.as_mut()
+                && let Err(error) = self
+                    .refresh_concurrent_begin_from_open_txn(
+                        cx,
+                        &mut txn,
+                        snapshot,
+                        self.should_eagerly_hydrate_memdb_rows(),
+                    )
+                    .await
+            {
+                let _ = txn.rollback(cx).await;
+                return Err(error);
+            }
             let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
                 let session_id = lock_unpoisoned(&self.concurrent_registry)
                     .begin_concurrent(snapshot)
@@ -164387,6 +164446,115 @@ mod tests {
     }
 
     #[test]
+    fn test_concurrent_begin_rejects_execution_image_newer_than_opened_pager_visibility() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("begin_execution_image_ahead_of_pager.db");
+            let path_str = path.to_str().unwrap();
+
+            let conn = Connection::open(path_str).await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 0);").await.unwrap();
+
+            let cx = conn.op_cx().unwrap();
+            let mut txn = conn
+                .begin_pager_txn_with_busy_timeout(
+                    &conn.pager,
+                    &cx,
+                    TransactionMode::Concurrent,
+                    true,
+                )
+                .await
+                .unwrap();
+            let opened_visible_commit_seq = txn
+                .published_visible_commit_seq_hint()
+                .expect("opened pager transaction should expose its bound visibility");
+            let newer_execution_seq = opened_visible_commit_seq.next();
+            *conn.memdb_visible_commit_seq.borrow_mut() = newer_execution_seq;
+            let mut snapshot = Snapshot::new(
+                newer_execution_seq,
+                SchemaEpoch::new((*conn.schema_cookie.borrow()).into()),
+            );
+
+            let error = conn
+                .refresh_concurrent_begin_from_open_txn(&cx, &mut txn, &mut snapshot, true)
+                .await
+                .expect_err("a pager image older than the execution image must never be mixed");
+            assert!(
+                matches!(
+                    error,
+                    FrankenError::BusySnapshot { ref conflicting_pages }
+                        if conflicting_pages.contains("opened pager visibility")
+                ),
+                "the mismatched begin must fail transiently: {error}"
+            );
+            assert_eq!(
+                snapshot.high, newer_execution_seq,
+                "a rejected rebind must not relabel the newer execution image with the opened pager sequence"
+            );
+
+            txn.rollback(&cx).await.unwrap();
+            conn.close_without_checkpoint_in_place().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_implicit_concurrent_savepoint_rebases_execution_image_to_opened_pager_visibility() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join("savepoint_opened_pager_visibility_rebase.db");
+            let path_str = path.to_str().unwrap();
+
+            let conn_a = Connection::open(path_str).await.unwrap();
+            conn_a
+                .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .await
+                .unwrap();
+            conn_a
+                .execute("INSERT INTO t VALUES (1, 0);")
+                .await
+                .unwrap();
+
+            let conn_b = Connection::open(path_str).await.unwrap();
+            assert_eq!(
+                conn_b
+                    .query_row("SELECT v FROM t WHERE id = 1;")
+                    .await
+                    .unwrap()
+                    .values()[0],
+                SqliteValue::Integer(0),
+                "seed read should populate conn_b's execution image before the peer advances it"
+            );
+
+            conn_a
+                .execute("UPDATE t SET v = 1 WHERE id = 1;")
+                .await
+                .unwrap();
+
+            conn_b.execute("SAVEPOINT coherent_begin;").await.unwrap();
+            assert_eq!(
+                conn_b
+                    .query_row("SELECT v FROM t WHERE id = 1;")
+                    .await
+                    .unwrap()
+                    .values()[0],
+                SqliteValue::Integer(1),
+                "implicit concurrent SAVEPOINT must reload the execution image from its opened pager snapshot"
+            );
+            conn_b.execute("ROLLBACK;").await.unwrap();
+
+            conn_b.close_without_checkpoint_in_place().await.unwrap();
+            conn_a.close_without_checkpoint_in_place().await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_begin_after_busy_snapshot_rollback_refreshes_execution_image() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
@@ -164586,6 +164754,48 @@ mod tests {
             conn.execute("BEGIN DEFERRED;").await.unwrap();
             assert!(!conn.is_concurrent_transaction());
             conn.execute("COMMIT;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_retryable_rollback_failure_preserves_live_transaction_for_retry() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("BEGIN CONCURRENT;").await.unwrap();
+
+            let mut active_txn = conn.active_txn.borrow_mut().take();
+            assert!(
+                active_txn.is_some(),
+                "BEGIN CONCURRENT must install the pager transaction before rollback"
+            );
+            assert!(
+                conn.restore_retryable_rollback_transaction(
+                    &mut active_txn,
+                    &FrankenError::BusyRecovery,
+                ),
+                "a transient pager rollback result must restore its live handle"
+            );
+            assert!(
+                active_txn.is_none(),
+                "the retryable transaction must be returned to the connection"
+            );
+            assert!(
+                conn.in_transaction.get() && conn.is_concurrent_transaction(),
+                "retryable rollback must leave the transaction lifecycle active"
+            );
+            assert!(
+                conn.active_txn.borrow().is_some() && conn.has_concurrent_session(),
+                "retryable rollback must retain both pager and MVCC state"
+            );
+
+            conn.execute("ROLLBACK;").await.unwrap();
+            assert!(
+                !conn.in_transaction.get()
+                    && !conn.is_concurrent_transaction()
+                    && conn.active_txn.borrow().is_none()
+                    && !conn.has_concurrent_session(),
+                "a subsequent rollback must finish the preserved transaction exactly once"
+            );
         });
     }
 
