@@ -823,3 +823,149 @@ fn without_rowid_update_pk_and_secondary_victim_are_same_row() {
         .await;
     });
 }
+
+/// bd-yuj70 — composite (multi-column) PRIMARY KEY: the victim's key is more
+/// than one column, so PK capture, victim re-seek, and self-conflict detection
+/// must all operate on the full composite key record, not a single term.
+#[test]
+fn without_rowid_update_or_replace_composite_pk_victim() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (a TEXT NOT NULL, b INTEGER NOT NULL, v TEXT NOT NULL, \
+                 PRIMARY KEY (a, b)) WITHOUT ROWID",
+                "CREATE INDEX wr_v ON wr(v)",
+                "INSERT INTO wr VALUES ('x',1,'one'),('x',2,'two'),('y',1,'three')",
+                // Re-key ('x',1) onto ('x',2): composite-key victim with a
+                // secondary entry that must disappear with it.
+                "UPDATE OR REPLACE wr SET b = 2, v = 'moved' WHERE a = 'x' AND b = 1",
+                // Self-rewrite of a composite key must not treat the row as
+                // its own victim.
+                "UPDATE OR REPLACE wr SET a = 'y', b = 1, v = 'kept' WHERE a = 'y' AND b = 1",
+            ],
+            &[
+                "SELECT a, b, v FROM wr ORDER BY a, b",
+                "SELECT v, a, b FROM wr ORDER BY v",
+                "SELECT a, b FROM wr WHERE v = 'two'",
+                "SELECT count(*) FROM wr",
+            ],
+            "without_rowid_update_or_replace_composite_pk_victim",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — `UPDATE OR REPLACE ... RETURNING` on a WITHOUT ROWID table must
+/// return the updated row (never the replaced victim), matching stock SQLite.
+#[test]
+fn without_rowid_update_or_replace_returning() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("open frank");
+        let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+        for s in [
+            "CREATE TABLE wr (k TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID",
+            "CREATE UNIQUE INDEX wr_n ON wr(n)",
+            "INSERT INTO wr VALUES ('a',1),('b',2)",
+        ] {
+            f.execute(s).await.expect("frank setup");
+            r.execute_batch(s).expect("csql setup");
+        }
+        // Re-keys 'a' onto 'b' (PK victim) while also taking b's unique n.
+        let dml = "UPDATE OR REPLACE wr SET k = 'b', n = 2 WHERE k = 'a' RETURNING k, n";
+        let frank = frank_rows(&f, dml).await.expect("frank returning");
+        let csql = sqlite_rows(&r, dml).expect("csql returning");
+        assert_eq!(
+            frank, csql,
+            "without_rowid_update_or_replace_returning: RETURNING mismatch"
+        );
+        let verify = "SELECT k, n FROM wr ORDER BY k";
+        assert_eq!(
+            frank_rows(&f, verify).await.expect("frank verify"),
+            sqlite_rows(&r, verify).expect("csql verify"),
+            "without_rowid_update_or_replace_returning: post-state mismatch"
+        );
+    });
+}
+
+/// bd-yuj70 — trigger semantics around the REPLACE victim. With default
+/// `recursive_triggers = OFF`, stock SQLite fires the UPDATE triggers for the
+/// updated row but does NOT fire DELETE triggers for the replaced victim; the
+/// firing log must match exactly.
+#[test]
+fn without_rowid_update_or_replace_victim_triggers_default() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID",
+                "CREATE TABLE log (ev TEXT, key TEXT)",
+                "CREATE TRIGGER wr_del AFTER DELETE ON wr BEGIN \
+                 INSERT INTO log VALUES ('delete', OLD.k); END",
+                "CREATE TRIGGER wr_upd AFTER UPDATE ON wr BEGIN \
+                 INSERT INTO log VALUES ('update', NEW.k); END",
+                "INSERT INTO wr VALUES ('a',1),('b',2)",
+                "UPDATE OR REPLACE wr SET k = 'b' WHERE k = 'a'",
+            ],
+            &[
+                "SELECT k, n FROM wr ORDER BY k",
+                "SELECT ev, key FROM log ORDER BY ev, key",
+            ],
+            "without_rowid_update_or_replace_victim_triggers_default",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — with `PRAGMA recursive_triggers = ON`, stock SQLite DOES fire
+/// DELETE triggers for the replaced victim.
+#[test]
+fn without_rowid_update_or_replace_victim_triggers_recursive() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE wr (k TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID",
+                "CREATE TABLE log (ev TEXT, key TEXT)",
+                "CREATE TRIGGER wr_del AFTER DELETE ON wr BEGIN \
+                 INSERT INTO log VALUES ('delete', OLD.k); END",
+                "INSERT INTO wr VALUES ('a',1),('b',2)",
+                "UPDATE OR REPLACE wr SET k = 'b' WHERE k = 'a'",
+            ],
+            &[
+                "SELECT k, n FROM wr ORDER BY k",
+                "SELECT ev, key FROM log ORDER BY ev, key",
+            ],
+            "without_rowid_update_or_replace_victim_triggers_recursive",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — foreign keys: deleting the REPLACE victim must respect inbound
+/// FK constraints. A victim parent with dependent children makes the statement
+/// fail in stock SQLite (immediate NO ACTION); a childless victim succeeds.
+#[test]
+fn without_rowid_update_or_replace_victim_fk_enforcement() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE parent (k TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID",
+                "CREATE TABLE child (c TEXT PRIMARY KEY, pk TEXT NOT NULL REFERENCES parent(k)) \
+                 WITHOUT ROWID",
+                "INSERT INTO parent VALUES ('a',1),('b',2),('c',3)",
+                "INSERT INTO child VALUES ('c1','b')",
+                // Victim 'b' has a child: both engines must reject.
+                "UPDATE OR REPLACE parent SET k = 'b' WHERE k = 'a'",
+                // Victim 'c' is childless: both engines must replace it.
+                "UPDATE OR REPLACE parent SET k = 'c' WHERE k = 'a'",
+            ],
+            &[
+                "SELECT k, n FROM parent ORDER BY k",
+                "SELECT c, pk FROM child ORDER BY c",
+                "PRAGMA foreign_key_check",
+            ],
+            "without_rowid_update_or_replace_victim_fk_enforcement",
+        )
+        .await;
+    });
+}
