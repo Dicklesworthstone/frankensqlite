@@ -50506,9 +50506,16 @@ impl Connection {
     /// Apply inbound FK semantics for exact rows deleted by VDBE REPLACE
     /// handling. Victims are taken locally before nested FK actions can execute
     /// another table program and replace the connection handoff slot.
+    ///
+    /// C SQLite fires DELETE triggers for rows removed by REPLACE conflict
+    /// resolution if and only if `PRAGMA recursive_triggers = ON`, and those
+    /// trigger programs run during conflict resolution — before the causing
+    /// statement's own AFTER triggers. This method is invoked before those
+    /// AFTER triggers, so firing the victim triggers here preserves that
+    /// ordering.
     async fn enforce_fk_on_replace_victims(&self, table_name: &str) -> Result<()> {
         let victims = std::mem::take(&mut *self.last_replace_victims.borrow_mut());
-        if victims.is_empty() || !self.fk_cascade_propagation_enabled() {
+        if victims.is_empty() {
             return Ok(());
         }
 
@@ -50521,15 +50528,53 @@ impl Connection {
             .ok_or_else(|| FrankenError::NoSuchTable {
                 name: table_name.to_owned(),
             })?;
+        for victim in &victims {
+            if victim.root_page != table_root_page {
+                return Err(FrankenError::internal(format!(
+                    "REPLACE victim root-page mismatch for {table_name}: expected {table_root_page}, got {}",
+                    victim.root_page
+                )));
+            }
+        }
+
+        let fire_victim_delete_triggers = self.pragma_state.borrow().recursive_triggers
+            && {
+                let delete_event = fsqlite_ast::TriggerEvent::Delete;
+                self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::Before,
+                    &delete_event,
+                ) || self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::After,
+                    &delete_event,
+                )
+            };
+        if fire_victim_delete_triggers {
+            let delete_event = fsqlite_ast::TriggerEvent::Delete;
+            for victim in &victims {
+                // The victim row is already removed from storage, so a BEFORE
+                // DELETE body observing the table sees post-delete state; the
+                // OLD.* frame values below are exact. RAISE outcomes propagate
+                // as statement errors like any other trigger failure.
+                self.fire_before_triggers(
+                    table_name,
+                    &delete_event,
+                    Some(&victim.values),
+                    None,
+                )
+                .await?;
+                self.fire_after_triggers(table_name, &delete_event, Some(&victim.values), None)
+                    .await?;
+            }
+        }
+
+        if !self.fk_cascade_propagation_enabled() {
+            return Ok(());
+        }
 
         self.with_statement_fk_validation_scope(false, async move || {
-            for victim in victims {
-                if victim.root_page != table_root_page {
-                    return Err(FrankenError::internal(format!(
-                        "REPLACE victim root-page mismatch for {table_name}: expected {table_root_page}, got {}",
-                        victim.root_page
-                    )));
-                }
+            for victim in &victims {
                 for action in self
                     .check_fk_on_replace_victim(table_name, &victim.values)
                     .await?

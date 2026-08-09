@@ -175,3 +175,75 @@ fn update_or_fail_errors_on_violation() {
         .await;
     });
 }
+
+/// bd-yuj70 — REPLACE conflict resolution fires the victim's DELETE triggers
+/// if and only if `PRAGMA recursive_triggers = ON` (rowid-table arm; the
+/// WITHOUT ROWID arm lives in without_rowid_dml_oracle_e2e).
+#[test]
+fn update_or_replace_victim_delete_triggers_default_off() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
+                "CREATE TABLE log (ev TEXT, victim INTEGER)",
+                "CREATE TRIGGER t_del AFTER DELETE ON t BEGIN \
+                 INSERT INTO log VALUES ('delete', OLD.id); END",
+                "INSERT INTO t VALUES (1,10),(2,20)",
+                "UPDATE OR REPLACE t SET u = 20 WHERE id = 1", // id2 is the victim
+            ],
+            &[
+                "SELECT id, u FROM t ORDER BY id",
+                "SELECT ev, victim FROM log ORDER BY victim", // empty: OFF suppresses
+            ],
+            "update_or_replace_victim_delete_triggers_default_off",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn update_or_replace_victim_delete_triggers_recursive_on() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
+                "CREATE TABLE log (ev TEXT, victim INTEGER)",
+                "CREATE TRIGGER t_del AFTER DELETE ON t BEGIN \
+                 INSERT INTO log VALUES ('delete', OLD.id); END",
+                "INSERT INTO t VALUES (1,10),(2,20)",
+                "UPDATE OR REPLACE t SET u = 20 WHERE id = 1", // id2 is the victim
+            ],
+            &[
+                "SELECT id, u FROM t ORDER BY id",
+                "SELECT ev, victim FROM log ORDER BY victim", // ('delete', 2)
+            ],
+            "update_or_replace_victim_delete_triggers_recursive_on",
+        )
+        .await;
+    });
+}
+
+/// bd-yuj70 — same rule for INSERT OR REPLACE victims.
+#[test]
+fn insert_or_replace_victim_delete_triggers_recursive_on() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
+                "CREATE TABLE log (ev TEXT, victim INTEGER)",
+                "CREATE TRIGGER t_del AFTER DELETE ON t BEGIN \
+                 INSERT INTO log VALUES ('delete', OLD.id); END",
+                "INSERT INTO t VALUES (1,10),(2,20)",
+                "INSERT OR REPLACE INTO t VALUES (2, 99)", // id2 replaced
+            ],
+            &[
+                "SELECT id, u FROM t ORDER BY id",
+                "SELECT ev, victim FROM log ORDER BY victim", // ('delete', 2)
+            ],
+            "insert_or_replace_victim_delete_triggers_recursive_on",
+        )
+        .await;
+    });
+}
