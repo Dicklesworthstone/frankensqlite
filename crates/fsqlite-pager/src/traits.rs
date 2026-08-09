@@ -474,13 +474,17 @@ pub trait WalBackend: Send + Sync {
         Box::pin(async { Err(FrankenError::Unsupported) })
     }
 
-    /// Return the newest durable certificate whose sidecar record is
-    /// authorized by this backend's live WAL generation, complete frame
-    /// boundary, and commit marker.
+    /// Return the newest durable certificate usable to seed the next logical
+    /// commit clock.
     ///
-    /// File-backed implementations use this under the existing writer gate to
-    /// seed process-local combiner clocks before assigning another interval.
-    /// Backends without a cross-process durable namespace have no seed.
+    /// A current-generation record is authorized against its complete frame
+    /// boundary and commit marker. After a checkpoint reset, a file-backed
+    /// backend may instead return the persisted certificate handoff from the
+    /// previous generation solely to continue the writer-side clock. That
+    /// handoff is not reader visibility; use
+    /// [`Self::pinned_logical_read_snapshot`] for a generation-bound reader
+    /// horizon. Backends without a cross-process durable namespace have no
+    /// seed.
     fn latest_authorized_parallel_wal_commit_certificate<'a>(
         &'a mut self,
         _cx: &'a Cx,
