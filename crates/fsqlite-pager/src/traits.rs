@@ -19,7 +19,7 @@ use std::pin::Pin;
 use crate::pager::SimpleTransaction;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::{PageData, PageNumber, PageSize};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
 #[cfg(all(feature = "native", target_os = "linux"))]
 use fsqlite_vfs::IoUringVfs;
 #[cfg(all(feature = "native", unix))]
@@ -140,6 +140,23 @@ impl WalPublicationSnapshot {
     }
 }
 
+/// Logical commit horizon bound to one already-pinned WAL read snapshot.
+///
+/// A physical WAL commit marker may represent more than one logical parallel
+/// commit. Implementations may report that wider horizon only when it is
+/// authorized for this exact WAL generation and final committed frame. It is
+/// intentionally distinct from a combiner clock seed: a checkpoint handoff
+/// from an earlier generation is never a reader-visible snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalLogicalReadSnapshot {
+    /// WAL generation containing the authorized logical horizon.
+    pub generation: WalGenerationIdentity,
+    /// Final committed WAL frame included by the logical horizon.
+    pub last_commit_frame: Option<usize>,
+    /// Global logical commit sequence visible through that exact horizon.
+    pub visible_commit_seq: CommitSeq,
+}
+
 /// Durable recovery verdict for one exact certificate/WAL interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParallelWalCommitReconciliation {
@@ -209,6 +226,19 @@ pub trait WalBackend: Send + Sync {
     #[must_use]
     fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
         None
+    }
+
+    /// Return an authorized logical horizon for the currently pinned reader
+    /// snapshot, if the backend can prove one.
+    ///
+    /// The returned generation and final frame must exactly match
+    /// [`Self::pinned_read_snapshot`]. Implementations must return `None` when
+    /// their only available certificate belongs to an earlier WAL generation.
+    fn pinned_logical_read_snapshot<'a>(
+        &'a self,
+        _cx: &'a Cx,
+    ) -> WalFuture<'a, Option<WalLogicalReadSnapshot>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Refresh the published WAL visibility summary without pinning a new

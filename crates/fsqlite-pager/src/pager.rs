@@ -48800,6 +48800,157 @@ mod tests {
     }
 
     #[test]
+    fn logical_pinned_wal_horizon_must_match_the_reader_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::traits::{WalBackend, WalLogicalReadSnapshot, WalPublicationSnapshot};
+
+            struct LogicalPinnedHorizonWalBackend {
+                snapshot: WalPublicationSnapshot,
+                logical_snapshot: WalLogicalReadSnapshot,
+            }
+
+            impl WalBackend for LogicalPinnedHorizonWalBackend {
+                fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+
+                fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+                    Some(self.snapshot)
+                }
+
+                fn pinned_logical_read_snapshot<'a>(
+                    &'a self,
+                    _cx: &'a Cx,
+                ) -> WalFuture<'a, Option<WalLogicalReadSnapshot>> {
+                    Box::pin(async { Ok(Some(self.logical_snapshot)) })
+                }
+
+                fn append_frame<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    _page_number: u32,
+                    _page_data: &'a [u8],
+                    _db_size_if_commit: u32,
+                ) -> WalFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+
+                fn read_page<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    _page_number: u32,
+                ) -> WalFuture<'a, Option<Vec<u8>>> {
+                    Box::pin(async { Ok(None) })
+                }
+
+                fn sync(&mut self, _cx: &Cx) -> Result<()> {
+                    Ok(())
+                }
+
+                fn frame_count(&self) -> usize {
+                    1
+                }
+
+                fn checkpoint<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    mode: crate::traits::CheckpointMode,
+                    _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
+                    _backfilled_frames: u32,
+                    _oldest_reader_frame: Option<u32>,
+                ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                    Box::pin(async move {
+                        Ok(crate::traits::CheckpointResult {
+                            total_frames: 1,
+                            frames_backfilled: 0,
+                            completed: false,
+                            wal_was_reset: false,
+                            requested_mode: mode,
+                            effective_mode: mode,
+                        })
+                    })
+                }
+            }
+
+            let cx = Cx::new();
+            let generation = WalGenerationIdentity {
+                checkpoint_seq: 9,
+                salts: fsqlite_wal::WalSalts {
+                    salt1: 0x1111_2222,
+                    salt2: 0x3333_4444,
+                },
+            };
+            let physical_snapshot = WalPublicationSnapshot {
+                publication_seq: 1,
+                generation,
+                last_commit_frame: Some(0),
+                commit_count: 1,
+                latest_frame_entries: 1,
+                index_is_partial: false,
+            };
+            let logical_snapshot = WalLogicalReadSnapshot {
+                generation,
+                last_commit_frame: Some(0),
+                visible_commit_seq: CommitSeq::new(42),
+            };
+
+            let (pager, _) = test_pager().await;
+            pager
+                .set_wal_backend(Box::new(LogicalPinnedHorizonWalBackend {
+                    snapshot: physical_snapshot,
+                    logical_snapshot,
+                }))
+                .expect("install matching logical-horizon WAL backend");
+            pager
+                .set_journal_mode(&cx, JournalMode::Wal)
+                .await
+                .expect("enable WAL mode");
+            let inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let probe = inner
+                .probe_visible_commit_seq(&cx, &pager.wal_backend)
+                .await
+                .expect("matching logical horizon is accepted");
+            assert_eq!(
+                probe.visible_commit_seq,
+                CommitSeq::new(42),
+                "the logical group horizon must not collapse to one physical marker"
+            );
+            drop(inner);
+
+            let mismatched_generation = WalGenerationIdentity {
+                checkpoint_seq: generation.checkpoint_seq.saturating_add(1),
+                salts: generation.salts,
+            };
+            let (mismatched_pager, _) = test_pager().await;
+            mismatched_pager
+                .set_wal_backend(Box::new(LogicalPinnedHorizonWalBackend {
+                    snapshot: physical_snapshot,
+                    logical_snapshot: WalLogicalReadSnapshot {
+                        generation: mismatched_generation,
+                        ..logical_snapshot
+                    },
+                }))
+                .expect("install mismatched logical-horizon WAL backend");
+            mismatched_pager
+                .set_journal_mode(&cx, JournalMode::Wal)
+                .await
+                .expect("enable WAL mode");
+            let inner = mismatched_pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let err = inner
+                .probe_visible_commit_seq(&cx, &mismatched_pager.wal_backend)
+                .await
+                .expect_err("logical horizon from another WAL generation is rejected");
+            assert!(matches!(err, FrankenError::WalCorrupt { .. }));
+        });
+    }
+
+    #[test]
     fn test_refresh_committed_state_restores_probe_identity_on_page1_error() {
         asupersync::test_utils::run_test(|| async {
             use crate::traits::{WalBackend, WalPublicationSnapshot};
