@@ -43270,6 +43270,15 @@ mod tests {
             sorter_p4, "+|NOCASE",
             "bare ORDER alias wins a same-named BINARY source column and inherits output NOCASE"
         );
+        let membership_open = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::OpenAutoindex)
+            .expect("complex IN should materialize its selected membership set");
+        assert_eq!(
+            membership_open.p4,
+            P4::Collation("NOCASE".to_owned()),
+            "the RHS output collation must govern the final membership probe"
+        );
     }
 
     #[test]
