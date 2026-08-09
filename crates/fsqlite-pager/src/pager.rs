@@ -11744,7 +11744,11 @@ where
             let original_db_size = inner.db_size;
             let journal_mode = inner.journal_mode;
             let pool = self.pool.clone();
-            let published_snapshot = self.published.snapshot();
+            // The WAL backend pinned this exact refreshed image above. Shared
+            // publication may advance after that pin, so binding the
+            // transaction to a later global snapshot would mix two images.
+            let bound_visible_commit_seq = inner.commit_seq;
+            let bound_db_size = inner.db_size;
             let cleanup_cx = cleanup_child_cx(cx);
             let memory_db_bump_alloc =
                 self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
@@ -11776,8 +11780,8 @@ where
                 recovery_fence: Arc::clone(&self.recovery_fence),
                 read_only_pager,
                 wal_conflict_snapshot,
-                published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
-                published_db_size: Cell::new(published_snapshot.db_size),
+                published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
+                published_db_size: Cell::new(bound_db_size),
                 write_set: PagePageMap::default(),
                 write_pages_sorted: Vec::new(),
                 freed_pages: Vec::new(),
@@ -29917,6 +29921,7 @@ mod tests {
         /// per-backend (per pager handle) like the real adapter's pinned
         /// snapshot.
         pinned_snapshot: StdMutex<Option<traits::WalPublicationSnapshot>>,
+        publish_after_begin: Option<(Arc<PublishedPagerState>, PublishedPagerUpdate)>,
     }
 
     /// Derive a publication snapshot from the shared mock frame log: commit
@@ -29960,6 +29965,7 @@ mod tests {
                     fail_append_before_write: false,
                     fail_sync_after_append: false,
                     pinned_snapshot: StdMutex::new(None),
+                    publish_after_begin: None,
                 },
                 frames,
                 begin_calls,
@@ -29993,6 +29999,7 @@ mod tests {
                     fail_append_before_write: false,
                     fail_sync_after_append: false,
                     pinned_snapshot: StdMutex::new(None),
+                    publish_after_begin: None,
                 },
                 frames,
                 begin_calls,
@@ -30020,6 +30027,7 @@ mod tests {
                     fail_append_before_write: false,
                     fail_sync_after_append: false,
                     pinned_snapshot: StdMutex::new(None),
+                    publish_after_begin: None,
                 },
                 begin_calls,
                 batch_calls,
@@ -30052,6 +30060,7 @@ mod tests {
                     fail_append_before_write: false,
                     fail_sync_after_append: false,
                     pinned_snapshot: StdMutex::new(None),
+                    publish_after_begin: None,
                 },
                 frames,
                 begin_calls,
@@ -30080,6 +30089,7 @@ mod tests {
                     fail_append_before_write: false,
                     fail_sync_after_append: true,
                     pinned_snapshot: StdMutex::new(None),
+                    publish_after_begin: None,
                 },
                 frames,
                 sync_calls,
@@ -30108,11 +30118,21 @@ mod tests {
                     fail_append_before_write: true,
                     fail_sync_after_append: false,
                     pinned_snapshot: StdMutex::new(None),
+                    publish_after_begin: None,
                 },
                 frames,
                 sync_calls,
                 reconcile_calls,
             )
+        }
+
+        fn with_publish_after_begin(
+            mut self,
+            published: Arc<PublishedPagerState>,
+            update: PublishedPagerUpdate,
+        ) -> Self {
+            self.publish_after_begin = Some((published, update));
+            self
         }
     }
 
@@ -31161,7 +31181,7 @@ mod tests {
     }
 
     impl crate::traits::WalBackend for MockWalBackend {
-        fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        fn begin_transaction<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
             Box::pin(async move {
                 let mut begin_calls = self.begin_calls.lock().unwrap();
                 *begin_calls += 1;
@@ -31172,6 +31192,9 @@ mod tests {
                 // transaction began.
                 let snapshot = mock_wal_publication_snapshot(&self.frames.lock().unwrap());
                 *self.pinned_snapshot.lock().unwrap() = Some(snapshot);
+                if let Some((published, update)) = &self.publish_after_begin {
+                    published.publish_metadata_only(cx, *update);
+                }
                 Ok(())
             })
         }
@@ -43114,6 +43137,72 @@ mod tests {
                 &sample_page(0xBB)[..],
                 "the disjoint writer's own page must be durable"
             );
+        });
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn file_begin_binds_the_refreshed_wal_snapshot_when_publication_advances() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wal_begin_publication_advance.db");
+            let cx = Cx::new();
+            let pager = SimplePager::open(UnixVfs::new(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let (backend, frames, _, _) = MockWalBackend::new();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            assert_eq!(
+                pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap(),
+                JournalMode::Wal
+            );
+
+            let seeded_page = {
+                let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = seed.allocate_page(&cx).await.unwrap();
+                seed.write_page(&cx, page, &sample_page(0x4A))
+                    .await
+                    .unwrap();
+                seed.commit(&cx).await.unwrap();
+                page
+            };
+
+            let (expected_commit_seq, expected_db_size, newer_update) = {
+                let inner = pager.inner.lock().unwrap();
+                (
+                    inner.commit_seq,
+                    inner.db_size,
+                    PublishedPagerUpdate {
+                        visible_commit_seq: inner.commit_seq.next(),
+                        db_size: inner.db_size.saturating_add(1),
+                        journal_mode: inner.journal_mode,
+                        freelist_count: inner.freelist.len(),
+                        checkpoint_active: inner.checkpoint_active,
+                    },
+                )
+            };
+            let (backend, _, _) = MockWalBackend::with_shared_frames(frames);
+            let backend =
+                backend.with_publish_after_begin(Arc::clone(&pager.published), newer_update);
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                pager.published.snapshot().visible_commit_seq,
+                newer_update.visible_commit_seq,
+                "the fixture must advance shared publication after the WAL read pin is captured"
+            );
+            assert_eq!(
+                reader.published_visible_commit_seq.get(),
+                expected_commit_seq,
+                "a file transaction must remain bound to its refreshed WAL snapshot"
+            );
+            assert_eq!(reader.snapshot_db_size(), expected_db_size);
+            assert_eq!(
+                reader.get_page(&cx, seeded_page).await.unwrap().as_ref(),
+                &sample_page(0x4A)[..]
+            );
+            reader.rollback(&cx).await.unwrap();
         });
     }
 
