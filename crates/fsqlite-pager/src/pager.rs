@@ -7958,12 +7958,9 @@ impl<F: VfsFile> PagerInner<F> {
             .commit_seq
             .get()
             .saturating_sub(previous_wal_visible_commit_count);
-        let (
-            physical_wal_visible_commit_count,
-            wal_generation,
-            logical_visible_commit_seq,
-        ) = if self.journal_mode == JournalMode::Wal {
-            with_wal_backend(wal_backend, cx, |wal, cx| {
+        let (physical_wal_visible_commit_count, wal_generation, logical_visible_commit_seq) =
+            if self.journal_mode == JournalMode::Wal {
+                with_wal_backend(wal_backend, cx, |wal, cx| {
                 Box::pin(async move {
                     wal.begin_transaction(cx).await?;
                     let snapshot = wal.pinned_read_snapshot();
@@ -7996,9 +7993,9 @@ impl<F: VfsFile> PagerInner<F> {
                 })
             })
             .await?
-        } else {
-            (0, None, None)
-        };
+            } else {
+                (0, None, None)
+            };
         let wal_snapshot_initialized = self.journal_mode == JournalMode::Wal;
 
         let cached_wal_base_is_current = self.journal_mode == JournalMode::Wal
