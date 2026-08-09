@@ -2059,7 +2059,13 @@ fn glob_match_inner(pat: &[char], txt: &[char], mut pi: usize, mut ti: usize) ->
                 let mut first = true;
                 while pi < pat.len() && (first || pat[pi] != ']') {
                     first = false;
-                    if pi + 2 < pat.len() && pat[pi + 1] == '-' {
+                    // `X-Y` is a range only when Y is not the closing
+                    // bracket: C SQLite's patternCompare treats a `-`
+                    // immediately before `]` as a literal dash, so
+                    // `[a-c-]` is {a..c, '-'} and `[^A-Za-z0-9._:-]`
+                    // ends with a literal '-' rather than a `:-]` range
+                    // that would swallow the class terminator.
+                    if pi + 2 < pat.len() && pat[pi + 1] == '-' && pat[pi + 2] != ']' {
                         let lo = pat[pi];
                         let hi = pat[pi + 2];
                         if txt[ti] >= lo && txt[ti] <= hi {
@@ -4847,6 +4853,42 @@ mod tests {
             .unwrap(),
             SqliteValue::Integer(1)
         );
+    }
+
+    #[test]
+    fn test_glob_trailing_dash_in_character_class_is_literal() {
+        // Regression (found via eidetic_engine_cli bd-1eeyw): C SQLite's
+        // patternCompare treats a `-` immediately before `]` as a literal
+        // class member, never as a range opener. The old parser consumed
+        // `:-]` in `[^A-Za-z0-9._:-]` as a range from ':' to ']', swallowed
+        // the class terminator, and derailed the rest of the pattern — so
+        // `peer_abc/123 GLOB '*[^A-Za-z0-9._:-]*'` returned 0 and a
+        // NOT-GLOB CHECK constraint admitted invalid identifiers.
+        let glob = |pattern: &str, text: &str| {
+            invoke2(
+                &GlobFunc,
+                SqliteValue::Text(SmallText::from_string(pattern)),
+                SqliteValue::Text(SmallText::from_string(text)),
+            )
+            .unwrap()
+        };
+        // '/' is outside the allowed set: the negated class must match it.
+        assert_eq!(
+            glob("*[^A-Za-z0-9._:-]*", "peer_abc/123"),
+            SqliteValue::Integer(1)
+        );
+        // Every allowed byte class: no negated-class match anywhere.
+        assert_eq!(
+            glob("*[^A-Za-z0-9._:-]*", "peer_a.b:c-"),
+            SqliteValue::Integer(0)
+        );
+        // Positive class: trailing dash is a literal member.
+        assert_eq!(glob("[a-c-]", "-"), SqliteValue::Integer(1));
+        assert_eq!(glob("[a-c-]", "b"), SqliteValue::Integer(1));
+        assert_eq!(glob("[a-c-]", "d"), SqliteValue::Integer(0));
+        // A dash as the very first member is likewise literal.
+        assert_eq!(glob("[-a]", "-"), SqliteValue::Integer(1));
+        assert_eq!(glob("[-a]", "b"), SqliteValue::Integer(0));
     }
 
     #[test]
