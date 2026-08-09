@@ -6101,7 +6101,6 @@ struct PreparedStatementTemplate {
     distinct: bool,
     distinct_collations: Vec<Option<String>>,
     table_backed: bool,
-    post_distinct_limit: Option<LimitClause>,
     schema_cookie: u32,
     schema_generation: u64,
     function_registry_generation: u64,
@@ -6130,7 +6129,6 @@ impl PreparedStatementTemplate {
             distinct: stmt.distinct,
             distinct_collations: stmt.distinct_collations.clone(),
             table_backed: stmt.db.is_some(),
-            post_distinct_limit: stmt.post_distinct_limit.clone(),
             schema_cookie: stmt.schema_cookie,
             schema_generation: stmt.schema_generation,
             function_registry_generation: stmt.function_registry_generation,
@@ -6209,7 +6207,6 @@ impl PreparedStatementTemplate {
             distinct: self.distinct,
             distinct_collations: self.distinct_collations.clone(),
             db: self.table_backed.then(|| Rc::clone(&conn.db)),
-            post_distinct_limit: self.post_distinct_limit.clone(),
             schema_cookie: self.schema_cookie,
             schema_generation: self.schema_generation,
             function_registry_generation: self.function_registry_generation,
@@ -6241,12 +6238,6 @@ pub struct PreparedStatement<'conn> {
     /// For table-backed SELECT, the statement must execute against the same
     /// MemDatabase as the Connection that prepared it.
     db: Option<Rc<RefCell<MemDatabase>>>,
-    /// For table-backed `SELECT DISTINCT ... LIMIT/OFFSET`, we compile an
-    /// unbounded program and apply the LIMIT/OFFSET after de-duplication.
-    ///
-    /// This mirrors `Connection::execute_statement`'s distinct+limit handling
-    /// to avoid returning too few rows when LIMIT is applied before DISTINCT.
-    post_distinct_limit: Option<LimitClause>,
     /// Schema cookie captured at prepare time (bd-3mmj). Used by the
     /// engine's `ReadCookie` opcode and prepared-statement invalidation.
     schema_cookie: u32,
@@ -6901,7 +6892,6 @@ impl PreparedStatement<'_> {
             distinct: self.distinct,
             distinct_collations: self.distinct_collations.clone(),
             db: self.db.as_ref().map(Rc::clone),
-            post_distinct_limit: self.post_distinct_limit.clone(),
             schema_cookie: self.schema_cookie,
             schema_generation: self.schema_generation,
             function_registry_generation: self.function_registry_generation,
@@ -7061,7 +7051,6 @@ impl PreparedStatement<'_> {
     fn can_use_query_row_result_row_cap(&self) -> bool {
         self.deferred_query_statement.is_none()
             && !self.distinct
-            && self.post_distinct_limit.is_none()
             && match self.expression_postprocess.as_ref() {
                 Some(postprocess) => postprocess.order_by.is_empty() && postprocess.limit.is_none(),
                 None => true,
@@ -19224,9 +19213,6 @@ impl Connection {
                     let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
                     dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
                 }
-                if let Some(limit_clause) = stmt.post_distinct_limit.as_ref() {
-                    self.apply_limit_clause(&mut rows, limit_clause, Some(params))?;
-                }
                 self.note_connection_statement_execution_count(1);
                 return Ok(rows);
             }
@@ -19254,9 +19240,6 @@ impl Connection {
                 let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
                 dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
             }
-            if let Some(limit_clause) = stmt.post_distinct_limit.as_ref() {
-                self.apply_limit_clause(&mut rows, limit_clause, Some(params))?;
-            }
             self.note_connection_statement_execution_count(1);
             return Ok(rows);
         }
@@ -19282,9 +19265,6 @@ impl Connection {
             if stmt.distinct {
                 let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
                 dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
-            }
-            if let Some(limit_clause) = stmt.post_distinct_limit.as_ref() {
-                self.apply_limit_clause(&mut rows, limit_clause, Some(params))?;
             }
             self.note_connection_statement_execution_count(1);
             return Ok(rows);
@@ -19319,9 +19299,6 @@ impl Connection {
             if stmt.distinct {
                 let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
                 dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
-            }
-            if let Some(limit_clause) = stmt.post_distinct_limit.as_ref() {
-                self.apply_limit_clause(&mut rows, limit_clause, Some(params))?;
             }
             self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
                 .await?;
@@ -19395,9 +19372,6 @@ impl Connection {
             let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
             dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
         }
-        if let Some(limit_clause) = stmt.post_distinct_limit.as_ref() {
-            self.apply_limit_clause(&mut rows, limit_clause, Some(params))?;
-        }
         self.note_connection_statement_execution_count(1);
         Ok(rows)
     }
@@ -19463,8 +19437,7 @@ impl Connection {
 
         let can_stream_with_row_handler = stmt.db.is_some()
             && stmt.deferred_query_statement.is_none()
-            && !stmt.distinct
-            && stmt.post_distinct_limit.is_none();
+            && !stmt.distinct;
 
         if !can_stream_with_row_handler {
             let rows = self
@@ -19754,9 +19727,6 @@ impl Connection {
         if stmt.distinct {
             let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
             dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
-        }
-        if let Some(limit_clause) = stmt.post_distinct_limit.as_ref() {
-            self.apply_limit_clause(&mut rows, limit_clause, params)?;
         }
         let row_result = exactly_one_row_or_error(rows);
         if let Ok(row) = &row_result {
@@ -29022,11 +28992,13 @@ impl Connection {
                     let program: &VdbeProgram = if let Some(p) = precompiled {
                         p
                     } else {
-                        // Eagerly rewrite IN-subqueries that the VDBE codegen
-                        // cannot handle (e.g. those with GROUP BY / HAVING).
-                        let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                        // Rewrite only IN subqueries that native VDBE codegen
+                        // cannot handle. Supported probes must retain their
+                        // AST so ORDER/LIMIT staging, volatile projections,
+                        // and RHS collation metadata reach codegen intact.
+                        let rewritten = self.rewrite_subqueries(select, params).await?;
                         if let Some(rows) =
-                            self.try_direct_count_star_in_list(rewritten.as_ref())?
+                            self.try_direct_count_star_in_list(&rewritten)?
                         {
                             return Ok(rows);
                         }
@@ -29047,7 +29019,7 @@ impl Connection {
                         let sql_key = Self::sql_hash(&sql_text);
                         arc_prog = self
                             .compile_with_cache(sql_key, &sql_text, async |conn| {
-                                conn.compile_table_select(rewritten.as_ref()).await
+                                conn.compile_table_select(&rewritten).await
                             })
                             .await?;
                         &arc_prog
@@ -32039,7 +32011,6 @@ impl Connection {
             distinct: false,
             distinct_collations: Vec::new(),
             db: None,
-            post_distinct_limit: None,
             schema_cookie: self.schema_cookie(),
             schema_generation: self.schema_generation(),
             function_registry_generation: self.function_registry_generation(),
@@ -32085,7 +32056,6 @@ impl Connection {
                     db: prepared_query_fast_path
                         .as_ref()
                         .map(|_| Rc::clone(&self.db)),
-                    post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
                     function_registry_generation,
@@ -32120,7 +32090,6 @@ impl Connection {
                     distinct: prep_distinct,
                     distinct_collations: prep_collations,
                     db: None,
-                    post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
                     function_registry_generation,
@@ -32155,7 +32124,6 @@ impl Connection {
                     distinct,
                     distinct_collations: prep_collations,
                     db: Some(Rc::clone(&self.db)),
-                    post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
                     function_registry_generation,
@@ -32228,7 +32196,6 @@ impl Connection {
                         distinct: false,
                         distinct_collations: Vec::new(),
                         db: Some(Rc::clone(&self.db)),
-                        post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
@@ -32278,7 +32245,6 @@ impl Connection {
                         distinct: false,
                         distinct_collations: Vec::new(),
                         db: None,
-                        post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
@@ -32331,7 +32297,6 @@ impl Connection {
                         distinct: false,
                         distinct_collations: Vec::new(),
                         db,
-                        post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
@@ -32355,7 +32320,6 @@ impl Connection {
                         distinct: false,
                         distinct_collations: Vec::new(),
                         db: None,
-                        post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
@@ -32408,7 +32372,6 @@ impl Connection {
                         distinct: false,
                         distinct_collations: Vec::new(),
                         db,
-                        post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
@@ -32432,7 +32395,6 @@ impl Connection {
                         distinct: false,
                         distinct_collations: Vec::new(),
                         db: None,
-                        post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
@@ -32457,7 +32419,6 @@ impl Connection {
                 distinct: false,
                 distinct_collations: Vec::new(),
                 db: None,
-                post_distinct_limit: None,
                 schema_cookie: self.schema_cookie(),
                 schema_generation: self.schema_generation(),
                 function_registry_generation,
@@ -34691,7 +34652,7 @@ impl Connection {
         let has_expression_only_order = expression_only && !select.order_by.is_empty();
         let has_expression_only_window =
             expression_only && expression_only_has_window_functions(select);
-        let has_post_distinct_limit_subquery = is_distinct_select(select)
+        let has_distinct_limit_subquery = is_distinct_select(select)
             && select
                 .limit
                 .as_ref()
@@ -34709,7 +34670,7 @@ impl Connection {
             || has_expression_only_where
             || has_expression_only_order
             || has_expression_only_window
-            || has_post_distinct_limit_subquery
+            || has_distinct_limit_subquery
             || select.with.is_some()
             || self.has_view_references(select)
             || self.has_sqlite_schema_references(select)
@@ -85214,16 +85175,13 @@ fn in_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -> bo
         || conn.select_result_column_count(sub, &[], &mut Vec::new()) != 1
         // frankensim-kl17o: see exists_subquery_supported_by_vdbe.
         //
-        // bd-2dgf5 carve-out: a non-correlated, probe-source-shaped IN
-        // subquery never goes through the prepare-time IN-rewrite fold — the
-        // VDBE consumes it via resolve_in_probe_source, evaluating the
-        // residual WHERE per execution (placeholders lower through emit_expr
-        // to Opcode::Variable and rebind fresh each run, exactly like the
-        // EXISTS semijoin carve-out at fa85adfc). Without this exception the
-        // parameterized variant fell to the interpreted outer full scan
-        // (~600x slower than C SQLite at 10k outer rows).
+        // bd-2dgf5 carve-out: a non-correlated native probe-source IN
+        // subquery never goes through the prepare-time IN-rewrite fold. Both
+        // the simple and ORDER/LIMIT emitters lower numbered placeholders to
+        // Opcode::Variable and rebind fresh each run. Without this exception
+        // parameterized probes fall to interpreted outer scans.
         || (select_contains_any_placeholder(sub)
-            && !in_subquery_matches_probe_source_shape(sub, conn))
+            && !in_subquery_matches_native_probe_source_shape(sub, conn))
     {
         return false;
     }
@@ -85259,10 +85217,10 @@ fn in_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -> bo
 /// Return whether eager complex-IN fallback would evaluate a volatile
 /// projection at the wrong DISTINCT/ORDER stage.
 ///
-/// Native VDBE lowering retains the selected representative source row and
-/// reprojects from it at the SQLite-compatible stage. The generic eager
-/// connection fallback still evaluates this shape too early or too often, so
-/// only paths that would leave native lowering must fail closed.
+/// Native VDBE lowering stores the projected value at the SQLite-compatible
+/// stage. The generic eager connection fallback still evaluates this shape too
+/// early or too often, so only paths that would leave native lowering must fail
+/// closed.
 fn in_subquery_has_ordered_distinct_function_fallback_hazard(sub: &SelectStatement) -> bool {
     let SelectCore::Select {
         distinct,
@@ -85789,19 +85747,15 @@ fn in_subquery_needs_eager_eval(sub: &SelectStatement, conn: &Connection) -> boo
     })
 }
 
-/// Structural mirror of the VDBE's `resolve_in_probe_source` acceptance
-/// (crates/fsqlite-vdbe/src/codegen.rs) for `InSet::Subquery`, minus the
-/// schema lookup: a single plain base table, no joins, a single simple
-/// projection, and none of the features either probe path rejects. Used by
-/// the bd-2dgf5 kl17o carve-out — only shapes the compiled path consumes
-/// natively (residual WHERE evaluated per execution) may carry placeholders
-/// past the dispatch routing.
-fn in_subquery_matches_probe_source_shape(sub: &SelectStatement, conn: &Connection) -> bool {
-    if sub.with.is_some()
-        || !sub.body.compounds.is_empty()
-        || !sub.order_by.is_empty()
-        || sub.limit.is_some()
-    {
+/// Structural mirror of the VDBE's simple and complex IN-probe admission,
+/// minus schema lookup: one plain base table, no joins, one projection, and no
+/// feature rejected by both emitters. Only shapes consumed natively may carry
+/// placeholders past dispatch routing.
+fn in_subquery_matches_native_probe_source_shape(
+    sub: &SelectStatement,
+    conn: &Connection,
+) -> bool {
+    if sub.with.is_some() || !sub.body.compounds.is_empty() {
         return false;
     }
     let SelectCore::Select {
@@ -157921,8 +157875,8 @@ mod tests {
                     .all(|row| row.values() == [SqliteValue::Integer(0)])
             );
 
-            // Native complex-IN lowering retains the representative source row
-            // and reprojects at SQLite's second stage.
+            // Native complex-IN lowering stores the projected value once and
+            // reuses it after DISTINCT/ORDER selection.
             for native_deferred_projection_sql in [
                 "SELECT 1 IN (SELECT DISTINCT abs(y) AS x \
                  FROM rhs_semantics ORDER BY x LIMIT 1);",
@@ -157935,14 +157889,14 @@ mod tests {
                 assert_eq!(
                     direct[0].values(),
                     &[SqliteValue::Integer(1)],
-                    "native representative reprojection failed for \
+                    "native stored projection failed for \
                      `{native_deferred_projection_sql}`"
                 );
                 let prepared = conn.prepare(native_deferred_projection_sql).await.unwrap();
                 assert_eq!(
                     prepared.query().await.unwrap()[0].values(),
                     &[SqliteValue::Integer(1)],
-                    "prepared native representative reprojection failed for \
+                    "prepared native stored projection failed for \
                      `{native_deferred_projection_sql}`"
                 );
             }
