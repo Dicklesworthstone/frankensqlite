@@ -19435,9 +19435,8 @@ impl Connection {
             }
         }
 
-        let can_stream_with_row_handler = stmt.db.is_some()
-            && stmt.deferred_query_statement.is_none()
-            && !stmt.distinct;
+        let can_stream_with_row_handler =
+            stmt.db.is_some() && stmt.deferred_query_statement.is_none() && !stmt.distinct;
 
         if !can_stream_with_row_handler {
             let rows = self
@@ -28997,9 +28996,7 @@ impl Connection {
                         // AST so ORDER/LIMIT staging, volatile projections,
                         // and RHS collation metadata reach codegen intact.
                         let rewritten = self.rewrite_subqueries(select, params).await?;
-                        if let Some(rows) =
-                            self.try_direct_count_star_in_list(&rewritten)?
-                        {
+                        if let Some(rows) = self.try_direct_count_star_in_list(&rewritten)? {
                             return Ok(rows);
                         }
                         let plan_span = tracing::span!(
@@ -32104,6 +32101,7 @@ impl Connection {
                 })
             }
             Statement::Select(select) => {
+                let canonical_select = canonicalize_select_placeholders(select)?;
                 let distinct = is_distinct_select(select);
                 let prep_collations = if distinct {
                     select_result_collations(select, &self.schema.borrow())
@@ -32113,7 +32111,7 @@ impl Connection {
                 let sql_key = Self::sql_hash(sql);
                 let program = self
                     .compile_with_cache(sql_key, sql, async |conn| {
-                        conn.compile_table_select(select).await
+                        conn.compile_table_select(&canonical_select).await
                     })
                     .await?;
                 Ok(PreparedStatement {
@@ -85418,18 +85416,9 @@ fn in_subquery_has_unresolved_local_name(sub: &SelectStatement, conn: &Connectio
         return true;
     }
     if sub.order_by.iter().any(|term| {
-        matches!(
-            &term.expr,
-            Expr::Literal(Literal::Integer(ordinal), _) if *ordinal != 1
-        ) || matches!(
-            &term.expr,
-            Expr::UnaryOp {
-                op: UnaryOp::Plus | UnaryOp::Negate,
-                expr,
-                ..
-            } if matches!(expr.as_ref(), Expr::Literal(Literal::Integer(_), _))
-        ) || (resolve_order_term_idx(&term.expr, columns).is_none()
-            && !in_subquery_expr_names_resolve(&term.expr, table, table_label, &output_aliases))
+        connection_order_by_integer_ordinal(&term.expr).is_some_and(|ordinal| ordinal != 1)
+            || (resolve_order_term_idx(&term.expr, columns).is_none()
+                && !in_subquery_expr_names_resolve(&term.expr, table, table_label, &output_aliases))
     }) {
         return true;
     }
@@ -85658,13 +85647,15 @@ fn in_subquery_has_forbidden_outer_reference_position(
                 )
             })
         });
+    let output_aliases = collect_select_core_result_aliases(&sub.body.select);
     group_has_external
         || sub.order_by.iter().any(|term| {
             !ordering_term_resolves_to_any_select_output(term, sub)
-                && expr_has_external_column_ref_with_schema_in_core(
+                && expr_has_external_column_ref_with_schema_in_core_and_locals(
                     &term.expr,
                     &sub.body.select,
                     &schema,
+                    &output_aliases,
                 )
         })
         || sub.limit.as_ref().is_some_and(|limit| {
@@ -85751,10 +85742,7 @@ fn in_subquery_needs_eager_eval(sub: &SelectStatement, conn: &Connection) -> boo
 /// minus schema lookup: one plain base table, no joins, one projection, and no
 /// feature rejected by both emitters. Only shapes consumed natively may carry
 /// placeholders past dispatch routing.
-fn in_subquery_matches_native_probe_source_shape(
-    sub: &SelectStatement,
-    conn: &Connection,
-) -> bool {
+fn in_subquery_matches_native_probe_source_shape(sub: &SelectStatement, conn: &Connection) -> bool {
     if sub.with.is_some() || !sub.body.compounds.is_empty() {
         return false;
     }
@@ -89908,6 +89896,7 @@ fn rewrite_in_expr<'a>(
                 not,
                 span,
             } => {
+                let mut preserve_native_scalar_operand = false;
                 if let Cow::Owned(normalized) = normalize_bare_singleton_in_subquery(set) {
                     *set = normalized;
                 }
@@ -89930,6 +89919,9 @@ fn rewrite_in_expr<'a>(
                         // frankensim-kl17o: parameter-dependent IN subqueries must
                         // not be materialized without bindings (see the Exists arm).
                         && !(params.is_none() && select_contains_any_placeholder(sub));
+                    preserve_native_scalar_operand = vdbe_supported
+                        && !should_eager_rewrite
+                        && scalar_in_operand_supported_by_complex_vdbe(inner, sub, conn);
                     if in_subquery_has_ordered_distinct_function_fallback_hazard(sub)
                         && (!vdbe_supported || should_eager_rewrite)
                     {
@@ -89977,7 +89969,9 @@ fn rewrite_in_expr<'a>(
                         rewrite_in_expr(e, conn, rewrite_in_subqueries, params).await?;
                     }
                 }
-                rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
+                if !preserve_native_scalar_operand {
+                    rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
+                }
                 // Keep vector IN intact. The connection evaluator compares a
                 // row operand once, preserves three-valued tuple semantics,
                 // and applies the final RHS row's per-field affinity/collation
@@ -101294,7 +101288,7 @@ fn resolve_order_term_idx(expr: &Expr, columns: &[ResultColumn]) -> Option<usize
 
     if let Some(ordinal) = connection_order_by_integer_ordinal(base_expr) {
         let pos = usize::try_from(ordinal).unwrap_or(0);
-        return (pos >= 1 && pos <= columns.len()).then_some(pos - 1);
+        return pos.checked_sub(1).filter(|&index| index < columns.len());
     }
     if let Some(col_name) = expr_col_name(base_expr) {
         let order_table = if let Expr::Column(col_ref, _) = base_expr {
@@ -108171,6 +108165,11 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                     for column in columns {
                         if let ResultColumn::Expr { expr, .. } = column {
                             self.validate_expr(expr, scope, SelectOutputAliasUse::None)?;
+                            if matches!(expr, Expr::RowValue(_, _)) {
+                                return Err(FrankenError::FunctionError(
+                                    "row value misused".to_owned(),
+                                ));
+                            }
                         }
                     }
                     if let Some(predicate) = having {
@@ -219454,6 +219453,23 @@ mod pager_routing_tests {
         );
 
         assert_eq!(resolve_order_term_idx(&order_expr, &columns), None);
+    }
+
+    #[test]
+    fn test_resolve_order_term_idx_rejects_nonpositive_ordinals_without_panicking() {
+        let columns = vec![ResultColumn::Expr {
+            expr: Expr::Column(ColumnRef::bare("value"), Span::ZERO),
+            alias: None,
+        }];
+        let zero = Expr::Literal(Literal::Integer(0), Span::ZERO);
+        let negative = Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        };
+
+        assert_eq!(resolve_order_term_idx(&zero, &columns), None);
+        assert_eq!(resolve_order_term_idx(&negative, &columns), None);
     }
 
     #[test]

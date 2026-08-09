@@ -210,11 +210,16 @@ async fn both_reject_params(
     sqlite_params: &[rusqlite::types::Value],
     label: &str,
 ) {
-    let frank_error = frank_rows_params(f, sql, frank_params)
-        .await
-        .expect_err("FrankenSQLite must reject the invalid SQL shape");
-    let sqlite_error = sqlite_rows_params(r, sql, sqlite_params)
-        .expect_err("SQLite must reject the invalid SQL shape");
+    let frank_error = match frank_rows_params(f, sql, frank_params).await {
+        Ok(rows) => {
+            panic!("[{label}] FrankenSQLite accepted invalid SQL `{sql}` with rows {rows:?}")
+        }
+        Err(error) => error,
+    };
+    let sqlite_error = match sqlite_rows_params(r, sql, sqlite_params) {
+        Ok(rows) => panic!("[{label}] SQLite accepted invalid SQL `{sql}` with rows {rows:?}"),
+        Err(error) => error,
+    };
     assert!(
         !frank_error.is_empty() && !sqlite_error.is_empty(),
         "[{label}] both engines must report a concrete error"
@@ -271,6 +276,34 @@ async fn cmp_counting_identity(
     assert_eq!(
         frank_count, expected_calls,
         "[{label}] unexpected tick() call count: `{sql}`"
+    );
+}
+
+async fn cmp_counting_identity_reference_may_reproject(
+    f: &Connection,
+    r: &rusqlite::Connection,
+    frank_calls: &AtomicUsize,
+    sqlite_calls: &AtomicUsize,
+    sql: &str,
+    expected_source_rows: usize,
+    label: &str,
+) {
+    frank_calls.store(0, Ordering::Relaxed);
+    sqlite_calls.store(0, Ordering::Relaxed);
+    assert_eq!(
+        frank_rows(f, sql).await,
+        sqlite_rows(r, sql),
+        "[{label}] result diverged: `{sql}`"
+    );
+    let frank_count = frank_calls.load(Ordering::Relaxed);
+    let sqlite_count = sqlite_calls.load(Ordering::Relaxed);
+    assert_eq!(
+        frank_count, expected_source_rows,
+        "[{label}] FrankenSQLite must evaluate tick() once per source row: `{sql}`"
+    );
+    assert!(
+        (expected_source_rows..=expected_source_rows + 1).contains(&sqlite_count),
+        "[{label}] unexpected SQLite tick() call count {sqlite_count}: `{sql}`"
     );
 }
 
@@ -935,13 +968,13 @@ fn ordered_distinct_function_output_reuse_covers_generated_without_rowid_and_com
                  FROM star_rows LIMIT 1",
             ),
         ] {
-            cmp_counting_identity(
+            cmp_counting_identity_reference_may_reproject(
                 &f,
                 &r,
                 frank_calls.as_ref(),
                 sqlite_calls.as_ref(),
                 sql,
-                9,
+                8,
                 label,
             )
             .await;
@@ -1192,6 +1225,11 @@ fn in_subquery_selection_and_three_valued_semantics_match_sqlite() {
                 "alias-collision-inherits-output-collation",
                 "SELECT id, 'a' IN \
                  (SELECT v AS k FROM alias_collision_rhs ORDER BY k LIMIT 1) FROM qn",
+            ),
+            (
+                "source-inside-order-expression",
+                "SELECT id, 1 IN \
+                 (SELECT v FROM scan_rhs ORDER BY v + 0 LIMIT 1) FROM qn",
             ),
             (
                 "alias-inside-order-expression",

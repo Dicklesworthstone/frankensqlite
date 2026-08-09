@@ -563,6 +563,8 @@ pub struct ProgramBuilder {
     regs: RegisterAllocator,
     /// Counter for anonymous placeholder numbering (1-based).
     next_anon_placeholder: u32,
+    /// Next cursor reserved for nested subqueries and other auxiliary scans.
+    next_aux_cursor: i32,
     /// Table-to-index cursor metadata for REPLACE conflict resolution.
     table_index_meta: HashMap<i32, Vec<fsqlite_types::opcode::IndexCursorMeta>>,
     /// Schema-owned expression surrounding the current emission, if any.
@@ -577,9 +579,21 @@ impl ProgramBuilder {
             labels: Vec::new(),
             regs: RegisterAllocator::new(),
             next_anon_placeholder: 1,
+            next_aux_cursor: 16_384,
             table_index_meta: HashMap::new(),
             schema_evaluation_context: None,
         }
+    }
+
+    /// Reserve a contiguous range of auxiliary cursor identifiers.
+    fn alloc_aux_cursor_range(&mut self, count: i32) -> i32 {
+        assert!(count > 0, "auxiliary cursor range must be non-empty");
+        let base = self.next_aux_cursor;
+        self.next_aux_cursor = self
+            .next_aux_cursor
+            .checked_add(count)
+            .expect("auxiliary cursor identifier overflow");
+        base
     }
 
     /// Emit a complete schema-owned expression under `context`.

@@ -2857,6 +2857,22 @@ pub fn codegen_select(
     }
 
     let table = find_table(schema, table_name)?;
+    let rewritten_order_by = stmt
+        .order_by
+        .iter()
+        .map(|term| {
+            let mut rewritten = term.clone();
+            if resolve_order_by_output_expr(&term.expr, columns).is_none() {
+                rewritten.expr = rewrite_having_select_aliases(&term.expr, columns, table);
+            }
+            rewritten
+        })
+        .collect::<Vec<_>>();
+    if rewritten_order_by != stmt.order_by {
+        let mut rewritten_stmt = stmt.clone();
+        rewritten_stmt.order_by = rewritten_order_by;
+        return codegen_select(b, &rewritten_stmt, schema, ctx);
+    }
     // bd-ujuzr: SQLite resolves a result-column alias referenced in the WHERE
     // clause when no real table column matches.  Substitute aliases up front (a
     // real column always wins), reusing the HAVING alias-rewrite, so both
@@ -27008,11 +27024,10 @@ fn result_output_slot_collation(
 ///
 /// SQLite has two observably different plans. A general ordered DISTINCT
 /// query retains the first projected output for each DISTINCT key and emits
-/// that stored value after sorting. A function-bearing projection must also
-/// stay in that mode: the DISTINCT-to-GROUP-BY rewrite in current SQLite does
-/// not invoke a scalar function again when the representative is emitted.
-/// Plain exact ascending output tuples may retain only their representative
-/// source row and project it after sorting.
+/// that stored value after sorting. Plain exact ascending output tuples may
+/// retain only their representative source row and project it after sorting.
+/// Function-bearing projections retain their stored result so a volatile
+/// function is evaluated exactly once per source row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrderedDistinctProjectionMode {
     StoredOutput,
@@ -27365,7 +27380,8 @@ fn validate_single_table_order_by_terms(
                 )));
             }
         }
-        let expr = resolve_order_by_output_expr(&term.expr, columns).unwrap_or(&term.expr);
+        let rewritten = rewrite_having_select_aliases(&term.expr, columns, table);
+        let expr = resolve_order_by_output_expr(&rewritten, columns).unwrap_or(&rewritten);
         validate_single_table_expr_columns(expr, table, table_alias)?;
     }
     Ok(())
@@ -30615,7 +30631,7 @@ fn try_emit_complex_in_subquery(
 
     // The selected RHS is retained for the lifetime of the statement, so each
     // complex IN expression needs its own stable cursor range.
-    let cursor_base = 16_384 + (b.current_addr() as i32 * 4);
+    let cursor_base = b.alloc_aux_cursor_range(4);
     let subq_cursor = cursor_base;
     let sorter_cursor = cursor_base + 1;
     let distinct_cursor = cursor_base + 2;
@@ -33361,10 +33377,9 @@ fn emit_scalar_subquery(
         }
     };
 
-    // Use a unique temp cursor id so multiple scalar subqueries in the same
-    // statement do not collide, and keep it open across outer rows.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let sub_cursor = 16_384 + b.current_addr() as i32;
+    // Keep each scalar source open across outer rows without colliding with
+    // complex-IN or sibling scalar-subquery cursors.
+    let sub_cursor = b.alloc_aux_cursor_range(1);
 
     let done_label = b.emit_label();
 
@@ -42860,6 +42875,7 @@ mod tests {
     #[test]
     fn complex_in_uncorrelated_scalar_lhs_preserves_affinity_and_rhs_first_order() {
         let mut schema = test_schema_with_subquery_source();
+        schema[1].columns[0].affinity = 'B';
         schema[1].columns[0].type_name = Some("TEXT".to_owned());
         let mut integer_column = ColumnInfo::basic("x", 'D', false);
         integer_column.type_name = Some("INTEGER".to_owned());
@@ -42903,6 +42919,25 @@ mod tests {
                     "a FROM-less scalar LHS should not open a source cursor"
                 );
             }
+            let opened_cursors = ops
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        op.opcode,
+                        Opcode::OpenRead | Opcode::OpenAutoindex | Opcode::SorterOpen
+                    )
+                })
+                .map(|op| op.p1)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                opened_cursors
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                opened_cursors.len(),
+                "nested scalar and complex-IN sources must use disjoint cursor identifiers"
+            );
             assert!(
                 ops.iter()
                     .filter(|op| {
@@ -42918,6 +42953,51 @@ mod tests {
                 "eligible uncorrelated scalar LHS must remain on native complex-IN codegen"
             );
         }
+    }
+
+    #[test]
+    fn complex_in_uncorrelated_scalar_lhs_applies_affinity_at_runtime() {
+        let mut schema = test_schema_with_subquery_source();
+        schema[1].columns[0].affinity = 'B';
+        schema[1].columns[0].type_name = Some("TEXT".to_owned());
+        let mut integer_column = ColumnInfo::basic("x", 'D', false);
+        integer_column.type_name = Some("INTEGER".to_owned());
+        schema.push(TableSchema {
+            name: "scalar_lhs".to_owned(),
+            root_page: 4,
+            columns: vec![integer_column],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        });
+
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 2);
+        db.get_table_mut(2)
+            .expect("outer table should exist")
+            .insert_row(1, vec![SqliteValue::Integer(0), SqliteValue::Integer(0)]);
+        db.create_table_at(3, 1);
+        db.get_table_mut(3)
+            .expect("RHS table should exist")
+            .insert_row(1, vec![SqliteValue::Text("01".into())]);
+        db.create_table_at(4, 1);
+        db.get_table_mut(4)
+            .expect("scalar table should exist")
+            .insert_row(1, vec![SqliteValue::Integer(1)]);
+
+        let stmt = select_sql(
+            "SELECT (SELECT x FROM scalar_lhs) IN \
+             (SELECT b FROM s ORDER BY rowid LIMIT 1) FROM t",
+        );
+        let rows = execute_codegen_select_with_storage_cursor(&stmt, &schema, db);
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(1)]],
+            "INTEGER scalar-result affinity must make text '01' match integer 1"
+        );
     }
 
     #[test]
@@ -43278,6 +43358,44 @@ mod tests {
             membership_open.p4,
             P4::Collation("NOCASE".to_owned()),
             "the RHS output collation must govern the final membership probe"
+        );
+    }
+
+    #[test]
+    fn complex_in_rewrites_aliases_nested_in_order_expressions() {
+        let ops = in_subquery_program_ops(
+            "SELECT a IN (SELECT b AS k FROM s ORDER BY k + 0 LIMIT 1) FROM t",
+            &test_schema_with_subquery_source(),
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SorterOpen),
+            "nested ORDER alias should stay in native complex-IN lowering"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Add),
+            "nested ORDER alias should emit its rewritten arithmetic expression"
+        );
+        let source_cursor = ops
+            .iter()
+            .find_map(|op| {
+                (op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(name) if name == "s"))
+                    .then_some(op.p1)
+            })
+            .expect("complex RHS should open s");
+        let add_index = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Add)
+            .expect("rewritten ORDER expression should add");
+        assert!(
+            ops[..add_index]
+                .iter()
+                .any(|op| op.opcode == Opcode::Column && op.p1 == source_cursor && op.p2 == 0),
+            "rewritten ORDER expression should read source column b"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| op.opcode == Opcode::Halt && op.p1 == ErrorCode::Internal as i32),
+            "validation must apply the same nested alias rewrite as code generation"
         );
     }
 
