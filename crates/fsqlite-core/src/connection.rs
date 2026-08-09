@@ -164453,7 +164453,7 @@ mod tests {
             let path = dir.path().join("begin_execution_image_ahead_of_pager.db");
             let path_str = path.to_str().unwrap();
 
-            let conn = Connection::open(path_str).await.unwrap();
+            let mut conn = Connection::open(path_str).await.unwrap();
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
                 .await
                 .unwrap();
@@ -164511,7 +164511,7 @@ mod tests {
                 .join("savepoint_opened_pager_visibility_rebase.db");
             let path_str = path.to_str().unwrap();
 
-            let conn_a = Connection::open(path_str).await.unwrap();
+            let mut conn_a = Connection::open(path_str).await.unwrap();
             conn_a
                 .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
                 .await
@@ -164521,7 +164521,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let conn_b = Connection::open(path_str).await.unwrap();
+            let mut conn_b = Connection::open(path_str).await.unwrap();
             assert_eq!(
                 conn_b
                     .query_row("SELECT v FROM t WHERE id = 1;")
