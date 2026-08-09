@@ -7958,22 +7958,46 @@ impl<F: VfsFile> PagerInner<F> {
             .commit_seq
             .get()
             .saturating_sub(previous_wal_visible_commit_count);
-        let (wal_visible_commit_count, wal_generation) = if self.journal_mode == JournalMode::Wal {
+        let (
+            physical_wal_visible_commit_count,
+            wal_generation,
+            logical_visible_commit_seq,
+        ) = if self.journal_mode == JournalMode::Wal {
             with_wal_backend(wal_backend, cx, |wal, cx| {
                 Box::pin(async move {
                     wal.begin_transaction(cx).await?;
                     let snapshot = wal.pinned_read_snapshot();
-                    let commit_count = if let Some(snapshot) = snapshot {
+                    let physical_commit_count = if let Some(snapshot) = snapshot {
                         snapshot.commit_count
                     } else {
                         wal.committed_txn_count(cx).await?
                     };
-                    Ok((commit_count, snapshot.map(|s| s.generation)))
+                    let logical_visible_commit_seq =
+                        match (snapshot, wal.pinned_logical_read_snapshot(cx).await?) {
+                            (Some(pinned), Some(logical))
+                                if logical.generation == pinned.generation
+                                    && logical.last_commit_frame == pinned.last_commit_frame =>
+                            {
+                                Some(logical.visible_commit_seq)
+                            }
+                            (Some(_), Some(_)) | (None, Some(_)) => {
+                                return Err(FrankenError::WalCorrupt {
+                                    detail: "logical WAL reader horizon does not match the pinned snapshot"
+                                        .to_owned(),
+                                });
+                            }
+                            (_, None) => None,
+                        };
+                    Ok((
+                        physical_commit_count,
+                        snapshot.map(|s| s.generation),
+                        logical_visible_commit_seq,
+                    ))
                 })
             })
             .await?
         } else {
-            (0, None)
+            (0, None, None)
         };
         let wal_snapshot_initialized = self.journal_mode == JournalMode::Wal;
 
@@ -7982,7 +8006,7 @@ impl<F: VfsFile> PagerInner<F> {
             // may have been replaced at the same length by another process
             // (notably WAL-mode VACUUM). File size + WAL generation alone
             // cannot prove that base unchanged.
-            && wal_visible_commit_count != 0
+            && physical_wal_visible_commit_count != 0
             && file_size == self.committed_db_file_size_bytes
             && wal_generation.is_some()
             && self.committed_wal_generation == wal_generation;
@@ -8021,6 +8045,20 @@ impl<F: VfsFile> PagerInner<F> {
             ));
             (base_commit_seq, u64::from(raw_base_change_counter))
         };
+        // A parallel WAL group may collapse multiple logical commits behind a
+        // single physical marker. A current-generation certificate can widen
+        // that count only when it was bound above to this exact pinned read
+        // snapshot. The physical count remains the conservative fallback for
+        // backends that cannot prove a logical horizon.
+        let wal_visible_commit_count = logical_visible_commit_seq
+            .map(|logical_visible_commit_seq| {
+                physical_wal_visible_commit_count.max(
+                    logical_visible_commit_seq
+                        .get()
+                        .saturating_sub(base_commit_seq),
+                )
+            })
+            .unwrap_or(physical_wal_visible_commit_count);
         let visible_commit_seq =
             CommitSeq::new(base_commit_seq.saturating_add(wal_visible_commit_count));
         let durable_identity_changed = file_size != previous_file_size

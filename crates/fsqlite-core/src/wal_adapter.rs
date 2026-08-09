@@ -15,7 +15,7 @@ use std::sync::Arc;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::traits::{
     PreparedWalChecksumSeed, PreparedWalFinalizationState, PreparedWalFrameBatch,
-    PreparedWalFrameMeta, WalFrameRef, WalFuture,
+    PreparedWalFrameMeta, WalFrameRef, WalFuture, WalLogicalReadSnapshot,
 };
 use fsqlite_pager::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, ParallelWalCommitReconciliation,
@@ -23,7 +23,7 @@ use fsqlite_pager::{
 };
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-use fsqlite_types::{PageNumber, PageSize};
+use fsqlite_types::{CommitSeq, PageNumber, PageSize};
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_vfs::DatabaseNamespaceBinding;
 use fsqlite_vfs::{SyncKind, Vfs, VfsFile, VfsWriteCompletion};
@@ -3234,6 +3234,85 @@ where
         self.inner.pinned_read_snapshot()
     }
 
+    fn pinned_logical_read_snapshot<'a>(
+        &'a self,
+        cx: &'a Cx,
+    ) -> WalFuture<'a, Option<WalLogicalReadSnapshot>> {
+        Box::pin(async move {
+            let Some(pinned) = self.inner.pinned_read_snapshot() else {
+                return Ok(None);
+            };
+            let Some(last_commit_frame) = pinned.last_commit_frame else {
+                return Ok(None);
+            };
+            let Some(record) = self
+                .latest_authorized_durable_certificate_record(cx)
+                .await?
+            else {
+                return Ok(None);
+            };
+            if record.wal_generation != pinned.generation {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "current logical WAL certificate generation differs from pinned reader"
+                        .to_owned(),
+                });
+            }
+            let certificate_commit_frame =
+                usize::try_from(record.wal_frame_end.checked_sub(1).ok_or_else(|| {
+                    FrankenError::WalCorrupt {
+                        detail: "current logical WAL certificate ends at frame zero".to_owned(),
+                    }
+                })?)
+                .map_err(|_| FrankenError::WalCorrupt {
+                    detail: "current logical WAL certificate frame exceeds usize".to_owned(),
+                })?;
+            if certificate_commit_frame > last_commit_frame {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "current logical WAL certificate extends past pinned reader horizon"
+                        .to_owned(),
+                });
+            }
+
+            let first_tail_frame =
+                usize::try_from(record.wal_frame_end).map_err(|_| FrankenError::WalCorrupt {
+                    detail: "logical WAL tail frame exceeds usize".to_owned(),
+                })?;
+            let mut tail_commit_count = 0_u64;
+            if first_tail_frame <= last_commit_frame {
+                for frame_index in first_tail_frame..=last_commit_frame {
+                    if self
+                        .inner
+                        .inner()
+                        .read_frame_header(cx, frame_index)
+                        .await?
+                        .is_commit()
+                    {
+                        tail_commit_count = tail_commit_count.checked_add(1).ok_or_else(|| {
+                            FrankenError::WalCorrupt {
+                                detail: "logical WAL tail commit count overflow".to_owned(),
+                            }
+                        })?;
+                    }
+                }
+            }
+            let visible_commit_seq = CommitSeq::new(
+                record
+                    .certificate
+                    .commit_seq_hi
+                    .get()
+                    .checked_add(tail_commit_count)
+                    .ok_or_else(|| FrankenError::WalCorrupt {
+                        detail: "logical WAL visible commit sequence overflow".to_owned(),
+                    })?,
+            );
+            Ok(Some(WalLogicalReadSnapshot {
+                generation: pinned.generation,
+                last_commit_frame: pinned.last_commit_frame,
+                visible_commit_seq,
+            }))
+        })
+    }
+
     fn refresh_published_snapshot<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -5154,6 +5233,28 @@ mod tests {
             .expect("read checkpoint certificate clock handoff")
             .expect("reset generation retains the last consumed certificate clock");
         assert_eq!(checkpoint_seed, second_receipt.certificate);
+        second_backend
+            .begin_transaction(&cx)
+            .expect("pin reset-generation reader snapshot");
+        let reset_pinned = second_backend
+            .pinned_read_snapshot()
+            .expect("reset-generation reader snapshot");
+        assert_eq!(
+            reset_pinned.generation,
+            second_backend.inner.inner().generation_identity(),
+            "reader snapshot must bind the reset WAL generation"
+        );
+        assert_eq!(
+            reset_pinned.last_commit_frame, None,
+            "truncate checkpoint leaves no current-generation commit marker"
+        );
+        assert_eq!(
+            second_backend
+                .pinned_logical_read_snapshot(&cx)
+                .expect("inspect reset-generation reader horizon"),
+            None,
+            "an earlier-generation checkpoint handoff is a clock seed, never reader visibility"
+        );
 
         let post_checkpoint_combiner = fsqlite_wal::ParallelWalDurabilityCombiner::default();
         post_checkpoint_combiner
@@ -5191,6 +5292,73 @@ mod tests {
                 .expect("read post-checkpoint current-generation certificate")
                 .expect("post-checkpoint certificate is authorized"),
             post_checkpoint_receipt.certificate
+        );
+        second_backend
+            .begin_transaction(&cx)
+            .expect("pin post-checkpoint reader snapshot");
+        let pinned = second_backend
+            .pinned_read_snapshot()
+            .expect("post-checkpoint reader snapshot");
+        let logical = second_backend
+            .pinned_logical_read_snapshot(&cx)
+            .expect("inspect post-checkpoint reader horizon")
+            .expect("current-generation certificate exposes a reader horizon");
+        assert_eq!(logical.generation, pinned.generation);
+        assert_eq!(logical.last_commit_frame, pinned.last_commit_frame);
+        assert_eq!(
+            logical.visible_commit_seq,
+            post_checkpoint_receipt.certificate.commit_seq_hi
+        );
+    }
+
+    #[test]
+    fn pinned_logical_reader_horizon_counts_physical_tail_after_current_certificate() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, certificate) = make_authorized_certificate_backend(&vfs, &cx);
+
+        backend
+            .begin_transaction(&cx)
+            .expect("pin certificate reader snapshot");
+        let initial_pinned = backend
+            .pinned_read_snapshot()
+            .expect("initial reader snapshot");
+        let initial_logical = backend
+            .pinned_logical_read_snapshot(&cx)
+            .expect("inspect certificate reader horizon")
+            .expect("current certificate exposes reader horizon");
+        assert_eq!(initial_logical.generation, initial_pinned.generation);
+        assert_eq!(
+            initial_logical.last_commit_frame,
+            initial_pinned.last_commit_frame
+        );
+        assert_eq!(
+            initial_logical.visible_commit_seq, certificate.commit_seq_hi,
+            "certificate horizon is exact when no later physical commit exists"
+        );
+
+        let tail_page = sample_page(0x45);
+        backend
+            .append_frame(&cx, 2, &tail_page, 2)
+            .expect("append later ordinary commit marker");
+        backend
+            .sync(&cx)
+            .expect("sync later ordinary commit marker");
+        backend
+            .begin_transaction(&cx)
+            .expect("repin reader after ordinary tail commit");
+        let pinned = backend
+            .pinned_read_snapshot()
+            .expect("reader snapshot includes ordinary tail commit");
+        let logical = backend
+            .pinned_logical_read_snapshot(&cx)
+            .expect("inspect reader horizon with ordinary tail")
+            .expect("current certificate remains reader-authoritative");
+        assert_eq!(logical.generation, pinned.generation);
+        assert_eq!(logical.last_commit_frame, pinned.last_commit_frame);
+        assert_eq!(
+            logical.visible_commit_seq.get(),
+            certificate.commit_seq_hi.get() + 1
         );
     }
 
