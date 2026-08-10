@@ -102,8 +102,11 @@ fn gh327_ddl_against_open_peer_write_txn_is_bounded_and_recovers() {
         // Peer connection holds an open write transaction touching the table
         // the DDL selects from — the two-region shape from the field log.
         conn_a.execute("BEGIN").await.expect("A begin");
+        // Predicate-neutral write: renaming keeps the DDL's `version > 1`
+        // subquery membership identical whether the CTAS snapshot lands
+        // before or after this commit.
         conn_a
-            .execute("UPDATE skills SET version = version + 1 WHERE id = 2")
+            .execute("UPDATE skills SET name = 'beta-renamed' WHERE id = 2")
             .await
             .expect("A uncommitted write");
 
@@ -156,10 +159,13 @@ fn gh327_ddl_against_open_peer_write_txn_is_bounded_and_recovers() {
 
         // The peer's committed write must be intact.
         let rows = conn_b
-            .query("SELECT version FROM skills WHERE id = 2")
+            .query("SELECT name FROM skills WHERE id = 2")
             .await
             .expect("peer write visible");
-        assert_eq!(rows[0].values()[0], fsqlite_types::SqliteValue::Integer(2));
+        assert_eq!(
+            rows[0].values()[0],
+            fsqlite_types::SqliteValue::Text("beta-renamed".to_owned().into())
+        );
 
         let integrity = conn_b
             .query("PRAGMA integrity_check;")
@@ -167,7 +173,7 @@ fn gh327_ddl_against_open_peer_write_txn_is_bounded_and_recovers() {
             .expect("integrity");
         assert_eq!(
             integrity[0].values()[0],
-            fsqlite_types::SqliteValue::Text("ok".to_owned()),
+            fsqlite_types::SqliteValue::Text("ok".to_owned().into()),
             "database must stay integrity-clean after the contended DDL"
         );
 
