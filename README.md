@@ -34,13 +34,13 @@ The current runnable engine is already real, but still hybrid. Compatibility mod
 Linux and macOS:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.sh?$(date +%s)" | bash -s -- --version v0.1.17
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.ps1?$([DateTime]::UtcNow.Ticks)" | iex
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.ps1?$([DateTime]::UtcNow.Ticks)"))) -Version v0.1.17
 ```
 
 The installers select the native release artifact, require its SHA-256 entry,
@@ -52,8 +52,11 @@ post-install verification controls are documented by `install.sh --help` and
 `Get-Help ./install.ps1 -Detailed`. Rust users can instead install the CLI with
 `cargo install fsqlite-cli --locked`. Prebuilt installer support covers
 v0.1.16-v0.1.17 and resumes with v0.2.0; v0.1.18-v0.1.19 did not publish native
-signed artifact sets. When `minisign` is present, a missing or invalid
-signature fails closed rather than silently downgrading authenticity.
+signed artifact sets. GitHub `latest` is still the epoch-1 release `v0.1.17`,
+so the installers require an explicit version rather than auto-resolving that
+legacy signing epoch; drop `--version` / `-Version` once a non-legacy latest
+(such as `v0.2.0`) is published. When `minisign` is present, a missing or
+invalid signature fails closed rather than silently downgrading authenticity.
 
 ### Why FrankenSQLite?
 

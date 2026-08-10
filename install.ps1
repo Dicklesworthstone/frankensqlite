@@ -40,9 +40,11 @@ HTTP or HTTPS proxy URI. Defaults to HTTPS_PROXY, then HTTP_PROXY.
 Preserve the unique temporary directory for diagnostics.
 
 .EXAMPLE
-irm "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.ps1?$([DateTime]::UtcNow.Ticks)" | iex
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.ps1?$([DateTime]::UtcNow.Ticks)"))) -Version v0.1.17
 
-Installs the latest release with a cache-busting request.
+Installs the current published release with a cache-busting request. GitHub
+latest is still epoch-1 v0.1.17, so -Version must be explicit until a
+non-legacy latest ships.
 
 .EXAMPLE
 .\install.ps1 -Version v0.2.0 -Destination C:\Tools\FrankenSQLite
