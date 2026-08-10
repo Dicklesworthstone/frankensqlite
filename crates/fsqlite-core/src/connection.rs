@@ -29628,8 +29628,10 @@ impl Connection {
                     self.log_mem_execution_fallback("update", "with_clause_materialization")?;
                     return self.execute_update_with_ctes(update, params).await;
                 }
-                let (mut effective_update, _limited_row_count_hint) =
-                    self.materialize_update_limit_scope(update, params).await?;
+                let canonical_update = canonicalize_update_placeholders(update)?;
+                let (mut effective_update, _limited_row_count_hint) = self
+                    .materialize_update_limit_scope(&canonical_update, params)
+                    .await?;
                 let table_name = &effective_update.table.name.name;
                 let targets_shadowed_main =
                     self.targets_shadowed_main(&effective_update.table.name);
@@ -114877,6 +114879,44 @@ fn placeholder_to_index(
     }
 }
 
+fn canonicalize_update_placeholders(
+    update: &fsqlite_ast::UpdateStatement,
+) -> Result<fsqlite_ast::UpdateStatement> {
+    let mut normalized = update.clone();
+    let mut bind_state = BindParamState::default();
+
+    if let Some(with_clause) = &mut normalized.with {
+        for cte in &mut with_clause.ctes {
+            canonicalize_select_placeholders_in_statement(&mut cte.query, &mut bind_state)?;
+        }
+    }
+    for assignment in &mut normalized.assignments {
+        canonicalize_expr_placeholders(&mut assignment.value, &mut bind_state)?;
+    }
+    if let Some(from_clause) = &mut normalized.from {
+        canonicalize_placeholders_in_from_clause(from_clause, &mut bind_state)?;
+    }
+    if let Some(where_clause) = &mut normalized.where_clause {
+        canonicalize_expr_placeholders(where_clause, &mut bind_state)?;
+    }
+    for column in &mut normalized.returning {
+        if let ResultColumn::Expr { expr, .. } = column {
+            canonicalize_expr_placeholders(expr, &mut bind_state)?;
+        }
+    }
+    for ordering in &mut normalized.order_by {
+        canonicalize_expr_placeholders(&mut ordering.expr, &mut bind_state)?;
+    }
+    if let Some(limit_clause) = &mut normalized.limit {
+        canonicalize_expr_placeholders(&mut limit_clause.limit, &mut bind_state)?;
+        if let Some(offset) = &mut limit_clause.offset {
+            canonicalize_expr_placeholders(offset, &mut bind_state)?;
+        }
+    }
+
+    Ok(normalized)
+}
+
 fn canonicalize_select_placeholders(select: &SelectStatement) -> Result<SelectStatement> {
     let mut normalized = select.clone();
     let mut bind_state = BindParamState::default();
@@ -147954,6 +147994,60 @@ mod tests {
     }
 
     #[test]
+    fn test_before_update_trigger_preserves_anonymous_parameter_slots() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE log (id INTEGER, old_name TEXT, new_name TEXT);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'carol');")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TRIGGER trg_before_update_params BEFORE UPDATE ON t \
+                 BEGIN INSERT INTO log VALUES (OLD.id, OLD.name, NEW.name); END;",
+            )
+            .await
+            .unwrap();
+
+            let update = conn
+                .prepare("UPDATE t SET name = ? WHERE id = ?;")
+                .await
+                .unwrap();
+            assert_eq!(
+                update
+                    .execute_with_params(&[
+                        SqliteValue::Text("bob".into()),
+                        SqliteValue::Integer(2),
+                    ])
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            let rows = conn
+                .query("SELECT id, old_name, new_name FROM log;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                row_values(&rows[0]),
+                &[
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("carol".into()),
+                    SqliteValue::Text("bob".into()),
+                ]
+            );
+            let rows = conn.query("SELECT name FROM t ORDER BY id;").await.unwrap();
+            assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("alice".into()));
+            assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("bob".into()));
+        });
+    }
+
+    #[test]
     fn test_trigger_column_binding_is_case_insensitive() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -148746,9 +148840,11 @@ mod tests {
                     .execute("UPDATE ring1 SET n = n + 1;")
                     .await
                     .expect("suppressed BEFORE re-entry must not consume the depth budget");
-                let mut expected = vec![1_i64; MAX_TRIGGER_DEPTH];
-                expected[0] = 2;
-                assert_eq!(ring_values(&at_limit, MAX_TRIGGER_DEPTH).await, expected);
+                assert_eq!(
+                    ring_values(&at_limit, MAX_TRIGGER_DEPTH).await,
+                    vec![1_i64; MAX_TRIGGER_DEPTH],
+                    "BEFORE bodies must not make the outer UPDATE re-evaluate its SET expression"
+                );
                 assert_trigger_program_state_clean(&at_limit);
 
                 let over_limit =
