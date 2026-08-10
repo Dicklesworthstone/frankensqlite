@@ -2823,6 +2823,27 @@ where
                 ],
             );
         }
+        // GH #294: when the handoff sidecar already carries exactly this
+        // record, rewriting it would only bump its mtime/ctime on every
+        // close-time checkpoint. The existing bytes were durably synced by
+        // the write that produced them, so the fence already holds.
+        if existed {
+            let file_size = file.file_size(cx)?;
+            if file_size == u64::try_from(record_bytes.len()).unwrap_or(u64::MAX) {
+                let mut current = vec![0_u8; record_bytes.len()];
+                let unchanged = file
+                    .read(cx, &mut current, 0)
+                    .await
+                    .is_ok_and(|bytes_read| {
+                        bytes_read == record_bytes.len() && current == record_bytes
+                    });
+                if unchanged {
+                    let cleanup_cx = cx.create_child();
+                    let _cleanup_mask = cleanup_cx.masked();
+                    return file.close(&cleanup_cx);
+                }
+            }
+        }
         // This fence is written before the checkpoint is allowed to reset the
         // WAL generation. Once the in-place replacement starts, finish it
         // under a cancellation mask; if any stage fails, the checkpoint

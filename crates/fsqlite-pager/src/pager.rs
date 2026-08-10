@@ -22735,10 +22735,32 @@ where
                 // ctime on every open/close cycle, so compare first and only
                 // touch the file when the page content genuinely differs.
                 let mut existing = vec![0_u8; data.len()];
-                let already_backfilled = db_file
-                    .read(cx, &mut existing, offset)
-                    .await
-                    .is_ok_and(|bytes_read| bytes_read == data.len() && existing == data);
+                let already_backfilled =
+                    db_file
+                        .read(cx, &mut existing, offset)
+                        .await
+                        .is_ok_and(|bytes_read| {
+                            bytes_read == data.len()
+                                && if page_no == PageNumber::ONE
+                                    && data.len() >= DATABASE_HEADER_SIZE
+                                {
+                                    // Page 1 compares with the patch-owned header
+                                    // fields masked out: `patch_page1_header`
+                                    // re-stamps the change counter (24..32) and
+                                    // version-valid-for (92..96) after every real
+                                    // backfill, so the on-disk values are the
+                                    // authoritative successors of the frame's
+                                    // values. Re-writing the frame's stale copy
+                                    // would dirty the pass and re-stamp the header
+                                    // with a drifted commit clock on every
+                                    // open/close cycle (GH #294).
+                                    existing[..24] == data[..24]
+                                        && existing[32..92] == data[32..92]
+                                        && existing[96..] == data[96..]
+                                } else {
+                                    existing == data
+                                }
+                        });
                 if !already_backfilled {
                     db_file.write(cx, data, offset).await?;
                     self.dirty = true;
