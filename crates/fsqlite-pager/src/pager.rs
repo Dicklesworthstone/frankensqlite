@@ -22639,6 +22639,12 @@ where
     inner: Arc<Mutex<PagerInner<V::File>>>,
     cache: Arc<ShardedPageCache>,
     published: Arc<PublishedPagerState>,
+    /// True once this checkpoint pass has actually mutated the database file
+    /// (page write or truncation). GH #294: a checkpoint that finds every
+    /// frame already backfilled byte-for-byte must leave the main file — its
+    /// header change counter included — completely untouched, so `sync`
+    /// only re-stamps the page-1 header after a real mutation.
+    dirty: bool,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePagerCheckpointWriter<V> where V::File: Send + Sync {}
@@ -22683,6 +22689,15 @@ where
             });
         }
 
+        let mut patched_fields = [0_u8; 8];
+        patched_fields[..4].copy_from_slice(&current_change_counter.to_be_bytes());
+        patched_fields[4..].copy_from_slice(&db_size.to_be_bytes());
+        // GH #294: when the on-disk header already carries the exact values
+        // this patch would stamp, rewriting them would only bump the main
+        // file's mtime/ctime. Skip the redundant write.
+        if page1[24..32] == patched_fields && page1[92..96] == patched_fields[..4] {
+            return Ok(());
+        }
         page1[24..28].copy_from_slice(&current_change_counter.to_be_bytes());
         page1[28..32].copy_from_slice(&db_size.to_be_bytes());
         page1[92..96].copy_from_slice(&current_change_counter.to_be_bytes());
@@ -22713,7 +22728,21 @@ where
             let offset = u64::from(page_no.get() - 1) * page_size as u64;
             {
                 let db_file = shared_db_file_read(&db_file, cx).await?;
-                db_file.write(cx, data, offset).await?;
+                // GH #294: the pager-level checkpoint entry always restarts
+                // from frame zero, so close-time passive checkpoints revisit
+                // frames an earlier checkpoint already backfilled. Re-writing
+                // identical bytes would still bump the main file's mtime and
+                // ctime on every open/close cycle, so compare first and only
+                // touch the file when the page content genuinely differs.
+                let mut existing = vec![0_u8; data.len()];
+                let already_backfilled = db_file
+                    .read(cx, &mut existing, offset)
+                    .await
+                    .is_ok_and(|bytes_read| bytes_read == data.len() && existing == data);
+                if !already_backfilled {
+                    db_file.write(cx, data, offset).await?;
+                    self.dirty = true;
+                }
             }
 
             {
@@ -22722,7 +22751,7 @@ where
                 })?;
                 inner.db_size = inner.db_size.max(page_no.get());
             }
-            if page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE {
+            if page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE && self.dirty {
                 self.patch_page1_header(cx).await?;
             }
 
@@ -22760,9 +22789,16 @@ where
                 )
             };
             let target_size = u64::from(n_pages) * page_size as u64;
-            shared_db_file_write(&db_file, cx)
-                .await?
-                .truncate(cx, target_size)?;
+            {
+                let db_file = shared_db_file_write(&db_file, cx).await?;
+                // GH #294: skip the physical truncation when the file already
+                // has the target length so a no-op checkpoint pass never
+                // updates the main file's timestamps.
+                if db_file.file_size(cx)? != target_size {
+                    db_file.truncate(cx, target_size)?;
+                    self.dirty = true;
+                }
+            }
             let mut inner = self
                 .inner
                 .lock()
@@ -22798,7 +22834,17 @@ where
             // Ensure header page_count reflects the final db_size after all
             // checkpoint writes/truncation, even if page 1 was checkpointed early.
             // ShardedPageCache is internally synchronized, so no lock needed.
-            self.patch_page1_header(cx).await?;
+            //
+            // GH #294: only re-stamp the header when this checkpoint pass
+            // actually mutated the database file. A pass that found every
+            // frame already backfilled must not rewrite the change counter:
+            // the pager's commit clock re-counts still-visible WAL commits on
+            // every open, so an unconditional stamp inflates the header
+            // change counter (bytes 24-27 / 92-95) and bumps the main file's
+            // timestamps once per open/close cycle.
+            if self.dirty {
+                self.patch_page1_header(cx).await?;
+            }
             // Durability barrier FIRST, publication second (GH #195): the
             // published pager plane must never advertise checkpoint state whose
             // backing writes have not survived their sync barrier. On sync
@@ -22860,6 +22906,7 @@ where
             inner: Arc::clone(&self.inner),
             cache: Arc::clone(&self.cache),
             published: Arc::clone(&self.published),
+            dirty: false,
         }
     }
 

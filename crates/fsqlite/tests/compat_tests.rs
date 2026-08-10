@@ -988,10 +988,14 @@ fn gh294_default_flags_schema_only_open_preserves_every_database_artifact() {
             )
             .await
             .expect("seed WAL-backed row");
+        // Settle the fixture with the default close path: the close-time
+        // passive checkpoint backfills the WAL into the main file, so the
+        // snapshot below captures a database with no outstanding checkpoint
+        // work. Every later schema-only session must then be a strict no-op.
         writable
-            .close_without_checkpoint()
+            .close()
             .await
-            .expect("close fixture writer without a checkpoint");
+            .expect("close fixture writer with its settling checkpoint");
 
         let namespace_gate = suffixed_path(&path, "-fsqlite-ns-gate");
         let namespace_use = suffixed_path(&path, "-fsqlite-ns-use");
@@ -1014,39 +1018,53 @@ fn gh294_default_flags_schema_only_open_preserves_every_database_artifact() {
             .expect("set namespace identity timestamp sentinel");
         let before = snapshot_directory_files(dir.path());
 
-        let reader = open_with_flags(
-            path_str,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .await
-        .expect("re-open existing generation with default read-write flags");
-        let schema_row = reader
-            .query_row("SELECT name FROM sqlite_schema WHERE type = 'table'")
+        // Cycle 1: open + schema/catalog + row query, close WITHOUT the
+        // close-time checkpoint. Only open/query-side mutation would show here.
+        // Cycle 2: the same session shape but with the default `close()` path,
+        // whose passive checkpoint is exactly what GH #294 observed mutating
+        // the main-file header change counter and timestamps on every open.
+        for close_with_checkpoint in [false, true] {
+            let reader = open_with_flags(
+                path_str,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            )
             .await
-            .expect("schema-only catalog query");
-        assert_eq!(
-            schema_row.get(0),
-            Some(&SqliteValue::Text("artifact_probe".to_owned().into()))
-        );
-        let row = reader
-            .query_row("SELECT id, value FROM artifact_probe")
-            .await
-            .expect("query the WAL-backed row");
-        assert_eq!(row.get(0), Some(&SqliteValue::Integer(1)));
-        assert_eq!(
-            row.get(1),
-            Some(&SqliteValue::Text("preserved".to_owned().into()))
-        );
-        reader
-            .close_without_checkpoint()
-            .await
-            .expect("close schema-only default-flag connection without a checkpoint");
+            .expect("re-open existing generation with default read-write flags");
+            let schema_row = reader
+                .query_row("SELECT name FROM sqlite_schema WHERE type = 'table'")
+                .await
+                .expect("schema-only catalog query");
+            assert_eq!(
+                schema_row.get(0),
+                Some(&SqliteValue::Text("artifact_probe".to_owned().into()))
+            );
+            let row = reader
+                .query_row("SELECT id, value FROM artifact_probe")
+                .await
+                .expect("query the WAL-backed row");
+            assert_eq!(row.get(0), Some(&SqliteValue::Integer(1)));
+            assert_eq!(
+                row.get(1),
+                Some(&SqliteValue::Text("preserved".to_owned().into()))
+            );
+            if close_with_checkpoint {
+                reader
+                    .close()
+                    .await
+                    .expect("close schema-only default-flag connection normally");
+            } else {
+                reader
+                    .close_without_checkpoint()
+                    .await
+                    .expect("close schema-only default-flag connection without a checkpoint");
+            }
 
-        assert_eq!(
-            snapshot_directory_files(dir.path()),
-            before,
-            "GH #294 default-flag schema-only open/query must preserve exact artifact keys plus all bytes, modification times, and Unix change times"
-        );
+            assert_eq!(
+                snapshot_directory_files(dir.path()),
+                before,
+                "GH #294 default-flag schema-only open/query (close_with_checkpoint={close_with_checkpoint}) must preserve exact artifact keys plus all bytes, modification times, and Unix change times"
+            );
+        }
     });
 }
 
