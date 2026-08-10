@@ -29628,9 +29628,11 @@ impl Connection {
                     self.log_mem_execution_fallback("update", "with_clause_materialization")?;
                     return self.execute_update_with_ctes(update, params).await;
                 }
-                let (effective_update, _limited_row_count_hint) =
+                let (mut effective_update, _limited_row_count_hint) =
                     self.materialize_update_limit_scope(update, params).await?;
                 let table_name = &effective_update.table.name.name;
+                let targets_shadowed_main =
+                    self.targets_shadowed_main(&effective_update.table.name);
                 // Collect columns being updated for UPDATE OF trigger matching.
                 let update_cols: Vec<String> = effective_update
                     .assignments
@@ -29707,6 +29709,21 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
+                // SQLite computes the candidate NEW row before firing BEFORE
+                // triggers. A trigger may mutate the target row recursively,
+                // but the outer UPDATE must still apply the already-computed
+                // values rather than evaluating its SET expressions again
+                // against that mutated storage state.
+                let froze_before_update_assignments = has_before_update && trigger_rows.len() == 1;
+                if froze_before_update_assignments {
+                    self.freeze_update_assignments_to_trigger_new_values(
+                        table_name,
+                        targets_shadowed_main,
+                        &mut effective_update.assignments,
+                        &trigger_rows[0].1,
+                    )?;
+                }
+
                 // FK enforcement on UPDATE:
                 // 1. Parent-side: check old values aren't orphaning children
                 //    (uses cascade-propagation gate so multi-level cascades work)
@@ -29747,26 +29764,27 @@ impl Connection {
                 }
 
                 let arc_prog;
-                let program: &VdbeProgram = if let Some(p) = precompiled {
-                    p
-                } else {
-                    let plan_span = tracing::span!(
-                        target: "fsqlite.plan",
-                        tracing::Level::TRACE,
-                        "plan",
-                        stage = "compile_table_update"
-                    );
-                    record_trace_span_created();
-                    let _plan_guard = plan_span.enter();
-                    let sql_text = effective_update.to_string();
-                    let sql_key = Self::sql_hash(&sql_text);
-                    arc_prog = self
-                        .compile_with_cache(sql_key, &sql_text, async |conn| {
-                            conn.compile_table_update(&effective_update)
-                        })
-                        .await?;
-                    &arc_prog
-                };
+                let program: &VdbeProgram =
+                    if let Some(p) = precompiled.filter(|_| !froze_before_update_assignments) {
+                        p
+                    } else {
+                        let plan_span = tracing::span!(
+                            target: "fsqlite.plan",
+                            tracing::Level::TRACE,
+                            "plan",
+                            stage = "compile_table_update"
+                        );
+                        record_trace_span_created();
+                        let _plan_guard = plan_span.enter();
+                        let sql_text = effective_update.to_string();
+                        let sql_key = Self::sql_hash(&sql_text);
+                        arc_prog = self
+                            .compile_with_cache(sql_key, &sql_text, async |conn| {
+                                conn.compile_table_update(&effective_update)
+                            })
+                            .await?;
+                        &arc_prog
+                    };
                 let (rows, affected, _) = self
                     .execute_table_program_with_cx(
                         program,
@@ -37400,7 +37418,7 @@ impl Connection {
                 .find(|table| table.name.eq_ignore_ascii_case(table_name))
         }
         .ok_or_else(|| FrankenError::NoSuchTable {
-            name: table_name.clone(),
+            name: table_name.to_owned(),
         })?;
 
         let locator_columns = if table.without_rowid {
@@ -39966,6 +39984,62 @@ impl Connection {
             trigger_rows.push((old_values, new_values));
         }
         Ok(trigger_rows)
+    }
+
+    fn freeze_update_assignments_to_trigger_new_values(
+        &self,
+        table_name: &str,
+        targets_shadowed_main: bool,
+        assignments: &mut [fsqlite_ast::Assignment],
+        new_values: &[SqliteValue],
+    ) -> Result<()> {
+        let visible_schema = self.schema.borrow();
+        let shadowed_schema = self.shadowed_main_tables.borrow();
+        let table = if targets_shadowed_main {
+            shadowed_schema.get(&table_name.to_ascii_lowercase())
+        } else {
+            visible_schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+        }
+        .ok_or_else(|| FrankenError::NoSuchTable {
+            name: table_name.to_owned(),
+        })?;
+        if new_values.len() != table.columns.len() {
+            return Err(FrankenError::Internal(format!(
+                "UPDATE trigger snapshot width mismatch: table columns={}, NEW values={}",
+                table.columns.len(),
+                new_values.len()
+            )));
+        }
+
+        for assignment in assignments {
+            assignment.value = match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => {
+                    let index = table.column_index(column).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "UPDATE trigger snapshot: unknown column `{column}`"
+                        ))
+                    })?;
+                    value_to_literal_expr(new_values[index].clone())
+                }
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => {
+                    let values = columns
+                        .iter()
+                        .map(|column| {
+                            let index = table.column_index(column).ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "UPDATE trigger snapshot: unknown column `{column}`"
+                                ))
+                            })?;
+                            Ok(value_to_literal_expr(new_values[index].clone()))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Expr::RowValue(values, Span::ZERO)
+                }
+            };
+        }
+        Ok(())
     }
 
     async fn collect_delete_trigger_rows(
@@ -148513,6 +148587,12 @@ mod tests {
 
     #[test]
     fn recursive_trigger_depth_limit_accepts_exact_boundary_and_rejects_next() {
+        run_on_large_stack("recursive-depth-boundary", || {
+            recursive_trigger_depth_limit_accepts_exact_boundary_and_rejects_next_body();
+        });
+    }
+
+    fn recursive_trigger_depth_limit_accepts_exact_boundary_and_rejects_next_body() {
         asupersync::test_utils::run_test(|| async {
             let at_limit = build_bounded_trigger_chain(MAX_TRIGGER_DEPTH).await;
             at_limit
@@ -148618,71 +148698,76 @@ mod tests {
     /// suppression would reject this statement at the cap.
     #[test]
     fn recursive_off_after_ring_admits_exact_depth_and_rejects_next() {
-        asupersync::test_utils::run_test(|| async {
-            let at_limit = build_recursive_off_trigger_ring("AFTER", MAX_TRIGGER_DEPTH).await;
-            at_limit
-                .execute("UPDATE ring1 SET n = n + 1;")
-                .await
-                .expect("suppressed re-entry must not consume the depth budget");
-            // ring1 is updated by the outer statement AND by the last
-            // trigger's body (whose own trigger is suppressed); every other
-            // table is updated exactly once by its predecessor's body.
-            let mut expected = vec![1_i64; MAX_TRIGGER_DEPTH];
-            expected[0] = 2;
-            assert_eq!(ring_values(&at_limit, MAX_TRIGGER_DEPTH).await, expected);
-            assert_trigger_program_state_clean(&at_limit);
+        run_on_large_stack("recursive-off-after-ring-boundary", || {
+            asupersync::test_utils::run_test(|| async {
+                let at_limit = build_recursive_off_trigger_ring("AFTER", MAX_TRIGGER_DEPTH).await;
+                at_limit
+                    .execute("UPDATE ring1 SET n = n + 1;")
+                    .await
+                    .expect("suppressed re-entry must not consume the depth budget");
+                // ring1 is updated by the outer statement AND by the last
+                // trigger's body (whose own trigger is suppressed); every other
+                // table is updated exactly once by its predecessor's body.
+                let mut expected = vec![1_i64; MAX_TRIGGER_DEPTH];
+                expected[0] = 2;
+                assert_eq!(ring_values(&at_limit, MAX_TRIGGER_DEPTH).await, expected);
+                assert_trigger_program_state_clean(&at_limit);
 
-            // One more distinct trigger in the ring is a ninth ADMITTED body
-            // and must be rejected with the typed depth error, unwinding all
-            // charged frames and rolling back every nested write.
-            let over_limit = build_recursive_off_trigger_ring("AFTER", MAX_TRIGGER_DEPTH + 1).await;
-            let error = over_limit
-                .execute("UPDATE ring1 SET n = n + 1;")
-                .await
-                .expect_err("the ninth admitted trigger body must exceed the cap");
-            assert!(
-                matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
-                "expected typed depth error, got {error:?}"
-            );
-            assert_eq!(
-                ring_values(&over_limit, MAX_TRIGGER_DEPTH + 1).await,
-                vec![0_i64; MAX_TRIGGER_DEPTH + 1],
-                "the failed statement must roll back every nested trigger write"
-            );
-            assert_trigger_program_state_clean(&over_limit);
+                // One more distinct trigger in the ring is a ninth ADMITTED body
+                // and must be rejected with the typed depth error, unwinding all
+                // charged frames and rolling back every nested write.
+                let over_limit =
+                    build_recursive_off_trigger_ring("AFTER", MAX_TRIGGER_DEPTH + 1).await;
+                let error = over_limit
+                    .execute("UPDATE ring1 SET n = n + 1;")
+                    .await
+                    .expect_err("the ninth admitted trigger body must exceed the cap");
+                assert!(
+                    matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                    "expected typed depth error, got {error:?}"
+                );
+                assert_eq!(
+                    ring_values(&over_limit, MAX_TRIGGER_DEPTH + 1).await,
+                    vec![0_i64; MAX_TRIGGER_DEPTH + 1],
+                    "the failed statement must roll back every nested trigger write"
+                );
+                assert_trigger_program_state_clean(&over_limit);
+            });
         });
     }
 
     /// bd-wymdl.1: same exact boundary for BEFORE-timing triggers.
     #[test]
     fn recursive_off_before_ring_admits_exact_depth_and_rejects_next() {
-        asupersync::test_utils::run_test(|| async {
-            let at_limit = build_recursive_off_trigger_ring("BEFORE", MAX_TRIGGER_DEPTH).await;
-            at_limit
-                .execute("UPDATE ring1 SET n = n + 1;")
-                .await
-                .expect("suppressed BEFORE re-entry must not consume the depth budget");
-            let mut expected = vec![1_i64; MAX_TRIGGER_DEPTH];
-            expected[0] = 2;
-            assert_eq!(ring_values(&at_limit, MAX_TRIGGER_DEPTH).await, expected);
-            assert_trigger_program_state_clean(&at_limit);
+        run_on_large_stack("recursive-off-before-ring-boundary", || {
+            asupersync::test_utils::run_test(|| async {
+                let at_limit = build_recursive_off_trigger_ring("BEFORE", MAX_TRIGGER_DEPTH).await;
+                at_limit
+                    .execute("UPDATE ring1 SET n = n + 1;")
+                    .await
+                    .expect("suppressed BEFORE re-entry must not consume the depth budget");
+                let mut expected = vec![1_i64; MAX_TRIGGER_DEPTH];
+                expected[0] = 2;
+                assert_eq!(ring_values(&at_limit, MAX_TRIGGER_DEPTH).await, expected);
+                assert_trigger_program_state_clean(&at_limit);
 
-            let over_limit =
-                build_recursive_off_trigger_ring("BEFORE", MAX_TRIGGER_DEPTH + 1).await;
-            let error = over_limit
-                .execute("UPDATE ring1 SET n = n + 1;")
-                .await
-                .expect_err("the ninth admitted BEFORE trigger body must exceed the cap");
-            assert!(
-                matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
-                "expected typed depth error, got {error:?}"
-            );
-            assert_eq!(
-                ring_values(&over_limit, MAX_TRIGGER_DEPTH + 1).await,
-                vec![0_i64; MAX_TRIGGER_DEPTH + 1],
-                "the failed statement must roll back every nested trigger write"
-            );
-            assert_trigger_program_state_clean(&over_limit);
+                let over_limit =
+                    build_recursive_off_trigger_ring("BEFORE", MAX_TRIGGER_DEPTH + 1).await;
+                let error = over_limit
+                    .execute("UPDATE ring1 SET n = n + 1;")
+                    .await
+                    .expect_err("the ninth admitted BEFORE trigger body must exceed the cap");
+                assert!(
+                    matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                    "expected typed depth error, got {error:?}"
+                );
+                assert_eq!(
+                    ring_values(&over_limit, MAX_TRIGGER_DEPTH + 1).await,
+                    vec![0_i64; MAX_TRIGGER_DEPTH + 1],
+                    "the failed statement must roll back every nested trigger write"
+                );
+                assert_trigger_program_state_clean(&over_limit);
+            });
         });
     }
 
@@ -148721,46 +148806,48 @@ mod tests {
     /// bd-wymdl.1: INSTEAD OF triggers charge depth only after suppression.
     #[test]
     fn recursive_off_instead_of_ring_admits_exact_depth_and_rejects_next() {
-        asupersync::test_utils::run_test(|| async {
-            let at_limit = build_recursive_off_instead_of_ring(MAX_TRIGGER_DEPTH).await;
-            at_limit
-                .execute("UPDATE v1 SET n = 1;")
-                .await
-                .expect("suppressed INSTEAD OF re-entry must not consume the depth budget");
-            let rows = at_limit
-                .query("SELECT entry FROM body_log ORDER BY entry;")
-                .await
-                .unwrap();
-            let executed: Vec<SqliteValue> =
-                rows.iter().map(|row| row_values(row)[0].clone()).collect();
-            let expected: Vec<SqliteValue> = (1..=MAX_TRIGGER_DEPTH)
-                .map(|i| SqliteValue::Integer(i64::try_from(i).unwrap()))
-                .collect();
-            assert_eq!(
-                executed, expected,
-                "every admitted INSTEAD OF body must run exactly once"
-            );
-            assert_trigger_program_state_clean(&at_limit);
+        run_on_large_stack("recursive-off-instead-of-ring-boundary", || {
+            asupersync::test_utils::run_test(|| async {
+                let at_limit = build_recursive_off_instead_of_ring(MAX_TRIGGER_DEPTH).await;
+                at_limit
+                    .execute("UPDATE v1 SET n = 1;")
+                    .await
+                    .expect("suppressed INSTEAD OF re-entry must not consume the depth budget");
+                let rows = at_limit
+                    .query("SELECT entry FROM body_log ORDER BY entry;")
+                    .await
+                    .unwrap();
+                let executed: Vec<SqliteValue> =
+                    rows.iter().map(|row| row_values(row)[0].clone()).collect();
+                let expected: Vec<SqliteValue> = (1..=MAX_TRIGGER_DEPTH)
+                    .map(|i| SqliteValue::Integer(i64::try_from(i).unwrap()))
+                    .collect();
+                assert_eq!(
+                    executed, expected,
+                    "every admitted INSTEAD OF body must run exactly once"
+                );
+                assert_trigger_program_state_clean(&at_limit);
 
-            let over_limit = build_recursive_off_instead_of_ring(MAX_TRIGGER_DEPTH + 1).await;
-            let error = over_limit
-                .execute("UPDATE v1 SET n = 1;")
-                .await
-                .expect_err("the ninth admitted INSTEAD OF body must exceed the cap");
-            assert!(
-                matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
-                "expected typed depth error, got {error:?}"
-            );
-            let rows = over_limit
-                .query("SELECT COUNT(*) FROM body_log;")
-                .await
-                .unwrap();
-            assert_eq!(
-                row_values(&rows[0])[0],
-                SqliteValue::Integer(0),
-                "the failed statement must roll back every logged body"
-            );
-            assert_trigger_program_state_clean(&over_limit);
+                let over_limit = build_recursive_off_instead_of_ring(MAX_TRIGGER_DEPTH + 1).await;
+                let error = over_limit
+                    .execute("UPDATE v1 SET n = 1;")
+                    .await
+                    .expect_err("the ninth admitted INSTEAD OF body must exceed the cap");
+                assert!(
+                    matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                    "expected typed depth error, got {error:?}"
+                );
+                let rows = over_limit
+                    .query("SELECT COUNT(*) FROM body_log;")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row_values(&rows[0])[0],
+                    SqliteValue::Integer(0),
+                    "the failed statement must roll back every logged body"
+                );
+                assert_trigger_program_state_clean(&over_limit);
+            });
         });
     }
 
@@ -149486,55 +149573,51 @@ mod tests {
             conn.execute("CREATE TABLE t (n INTEGER);").await.unwrap();
             conn.execute("INSERT INTO t VALUES (0);").await.unwrap();
 
-            conn.execute(
-                "CREATE TRIGGER t_detach AFTER UPDATE ON t BEGIN DETACH DATABASE aux; END;",
-            )
-            .await
-            .unwrap();
+            // The parser enforces the same grammar C SQLite does: trigger
+            // bodies admit only SELECT/INSERT/UPDATE/DELETE, so ATTACH and
+            // DETACH fail closed at CREATE TRIGGER time — earlier than any
+            // runtime admission, and before any registry mutation.
             let error = conn
-                .execute("UPDATE t SET n = 1;")
+                .execute(
+                    "CREATE TRIGGER t_detach AFTER UPDATE ON t BEGIN DETACH DATABASE aux; END;",
+                )
                 .await
-                .expect_err("DETACH inside a trigger body must fail closed");
+                .expect_err("DETACH inside a trigger body must fail closed at parse");
             assert!(
                 error
                     .to_string()
-                    .contains("not allowed inside trigger bodies"),
+                    .contains("trigger body statement must be SELECT, INSERT, UPDATE, or DELETE"),
                 "unexpected trigger-body DETACH rejection: {error}"
             );
             assert!(
                 conn.attached_schemas.borrow().find("aux").is_some(),
-                "aux must remain attached after the rejected trigger body"
+                "aux must remain attached after the rejected trigger definition"
             );
-            let rows = conn.query("SELECT n FROM t;").await.unwrap();
-            assert_eq!(
-                row_values(&rows[0])[0],
-                SqliteValue::Integer(0),
-                "the failed statement must roll back the triggering UPDATE"
-            );
-            assert_trigger_program_state_clean(&conn);
 
-            conn.execute("DROP TRIGGER t_detach;").await.unwrap();
-            conn.execute(&format!(
-                "CREATE TRIGGER t_attach AFTER UPDATE ON t \
-                 BEGIN ATTACH DATABASE '{}' AS extra; END;",
-                new_path.to_string_lossy()
-            ))
-            .await
-            .unwrap();
             let error = conn
-                .execute("UPDATE t SET n = 1;")
+                .execute(&format!(
+                    "CREATE TRIGGER t_attach AFTER UPDATE ON t \
+                     BEGIN ATTACH DATABASE '{}' AS extra; END;",
+                    new_path.to_string_lossy()
+                ))
                 .await
-                .expect_err("ATTACH inside a trigger body must fail closed");
+                .expect_err("ATTACH inside a trigger body must fail closed at parse");
             assert!(
                 error
                     .to_string()
-                    .contains("not allowed inside trigger bodies"),
+                    .contains("trigger body statement must be SELECT, INSERT, UPDATE, or DELETE"),
                 "unexpected trigger-body ATTACH rejection: {error}"
             );
             assert!(
                 conn.attached_schemas.borrow().find("extra").is_none(),
                 "the rejected trigger-body ATTACH must not mutate the registry"
             );
+
+            // Neither rejected definition may leave a trigger behind or
+            // disturb normal DML on the subject table.
+            conn.execute("UPDATE t SET n = 1;").await.unwrap();
+            let rows = conn.query("SELECT n FROM t;").await.unwrap();
+            assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
             assert_trigger_program_state_clean(&conn);
         });
     }
