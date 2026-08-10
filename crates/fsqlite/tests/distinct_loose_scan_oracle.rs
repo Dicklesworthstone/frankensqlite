@@ -83,12 +83,10 @@ async fn assert_same(f: &Connection, r: &rusqlite::Connection, sql: &str) {
     );
 }
 
-/// Order-insensitive comparison for DECLINE-control shapes: bare-DISTINCT row
-/// order on the sorter fallback is implementation-defined and already diverges
-/// from C SQLite (fsqlite sorts ascending; C emits first-seen scan order) —
-/// tracked as bd-distinct-scan-order-divergence-zv52i, pre-existing on main.
-/// The controls here only need to prove the SET is correct and the shape fell
-/// back without semantic drift.
+/// Order-insensitive comparison for DECLINE-control shapes. The ordinary
+/// DISTINCT fallback preserves first-seen scan order, while an index-backed
+/// loose scan emits index order. These controls only need to prove the set is
+/// correct and the shape fell back without semantic drift.
 async fn assert_same_set(f: &Connection, r: &rusqlite::Connection, sql: &str) {
     let mut fv: Vec<String> = f_rows(f, sql).await.lines().map(str::to_owned).collect();
     let mut rv: Vec<String> = r_rows(r, sql).lines().map(str::to_owned).collect();
@@ -104,7 +102,7 @@ async fn assert_same_set(f: &Connection, r: &rusqlite::Connection, sql: &str) {
 /// term is the DISTINCT column. Only index column 0 is read and the probe is a 1-field prefix, so
 /// entries sharing the leading value (with different trailing terms) are all cleared by one
 /// `SeekGT [value]` exactly like a single-column index. Byte-exact vs rusqlite, and the skip scan
-/// must fire (no dedup sorter) even though only a composite index exists.
+/// must fire (no ephemeral DISTINCT membership index) even though only a composite index exists.
 #[test]
 fn distinct_loose_scan_composite_leading_term_matches_rusqlite() {
     asupersync::test_utils::run_test(|| async {
@@ -128,8 +126,8 @@ fn distinct_loose_scan_composite_leading_term_matches_rusqlite() {
         )
         .await;
         assert!(
-            !has_op(&f, "SELECT DISTINCT a FROM ct", "SorterOpen").await,
-            "loose scan should serve SELECT DISTINCT a over the composite index idx_ab(a, b) (no SorterOpen)"
+            !has_op(&f, "SELECT DISTINCT a FROM ct", "OpenAutoindex").await,
+            "loose scan should serve SELECT DISTINCT a over the composite index idx_ab(a, b) (no DISTINCT membership index)"
         );
         assert_same(&f, &r, "SELECT DISTINCT a FROM ct").await;
         assert_same(&f, &r, "SELECT DISTINCT a FROM ct ORDER BY a").await;
@@ -153,7 +151,7 @@ fn distinct_loose_scan_composite_leading_term_matches_rusqlite() {
         )
         .await;
         assert!(
-            !has_op(&f2, "SELECT DISTINCT s FROM cts", "SorterOpen").await,
+            !has_op(&f2, "SELECT DISTINCT s FROM cts", "OpenAutoindex").await,
             "loose scan should serve SELECT DISTINCT s over composite idx_sn(s, n)"
         );
         assert_same(&f2, &r2, "SELECT DISTINCT s FROM cts").await;
@@ -176,7 +174,7 @@ fn distinct_loose_scan_composite_leading_term_matches_rusqlite() {
         )
         .await;
         assert!(
-            !has_op(&f3, "SELECT DISTINCT a FROM cd", "SorterOpen").await,
+            !has_op(&f3, "SELECT DISTINCT a FROM cd", "OpenAutoindex").await,
             "loose scan should serve SELECT DISTINCT a over idx_ad(a ASC, b DESC) — only leading term governs"
         );
         assert_same(&f3, &r3, "SELECT DISTINCT a FROM cd").await;
@@ -199,7 +197,7 @@ fn distinct_loose_scan_composite_leading_term_matches_rusqlite() {
             &bins,
         )
         .await;
-        assert!(!has_op(&f4, "SELECT DISTINCT a FROM cb", "SorterOpen").await);
+        assert!(!has_op(&f4, "SELECT DISTINCT a FROM cb", "OpenAutoindex").await);
         assert_same(&f4, &r4, "SELECT DISTINCT a FROM cb").await;
     });
 }
@@ -207,8 +205,9 @@ fn distinct_loose_scan_composite_leading_term_matches_rusqlite() {
 /// `SELECT DISTINCT a, b, …` (N columns) served by the loose/skip scan over an index whose LEADING N
 /// key terms are exactly those columns in SELECT order: the scan reads index columns 0..N-1, emits the
 /// tuple once, and `SeekGT [v0..vN-1]` skips the whole run. Byte-exact vs rusqlite (both walk the same
-/// covering index in the same order); the skip scan must fire (no dedup sorter). Reversed / non-prefix
-/// column orders correctly DECLINE to the sorter (still correct — asserted as a set).
+/// covering index in the same order); the skip scan must fire (no ephemeral DISTINCT membership
+/// index). Reversed / non-prefix column orders correctly DECLINE to the ordinary membership path
+/// (still correct — asserted as a set).
 #[test]
 fn distinct_loose_scan_multi_column_prefix_matches_rusqlite() {
     asupersync::test_utils::run_test(|| async {
@@ -236,8 +235,8 @@ fn distinct_loose_scan_multi_column_prefix_matches_rusqlite() {
         )
         .await;
         assert!(
-            !has_op(&f, "SELECT DISTINCT a, b FROM mt", "SorterOpen").await,
-            "multi-col loose scan should serve SELECT DISTINCT a, b over idx_ab(a, b) (no SorterOpen)"
+            !has_op(&f, "SELECT DISTINCT a, b FROM mt", "OpenAutoindex").await,
+            "multi-col loose scan should serve SELECT DISTINCT a, b over idx_ab(a, b) (no DISTINCT membership index)"
         );
         assert_same(&f, &r, "SELECT DISTINCT a, b FROM mt").await;
         assert_same(&f, &r, "SELECT DISTINCT a, b FROM mt ORDER BY a, b").await;
@@ -261,7 +260,7 @@ fn distinct_loose_scan_multi_column_prefix_matches_rusqlite() {
         )
         .await;
         assert!(
-            !has_op(&f2, "SELECT DISTINCT a, b FROM pt", "SorterOpen").await,
+            !has_op(&f2, "SELECT DISTINCT a, b FROM pt", "OpenAutoindex").await,
             "multi-col loose scan should serve SELECT DISTINCT a, b over the 3-term prefix idx_abc(a, b, c)"
         );
         assert_same(&f2, &r2, "SELECT DISTINCT a, b FROM pt").await;
@@ -285,17 +284,17 @@ fn distinct_loose_scan_multi_column_prefix_matches_rusqlite() {
         )
         .await;
         assert!(
-            !has_op(&f3, "SELECT DISTINCT s, n FROM st", "SorterOpen").await,
+            !has_op(&f3, "SELECT DISTINCT s, n FROM st", "OpenAutoindex").await,
             "multi-col loose scan should serve SELECT DISTINCT s, n over idx_sn(s, n)"
         );
         assert_same(&f3, &r3, "SELECT DISTINCT s, n FROM st").await;
 
-        // ---- DECLINE controls: reversed / non-prefix column order falls back to the sorter (still
-        // correct as a SET; bare-DISTINCT row order on the fallback is implementation-defined). ----
+        // ---- DECLINE control: reversed / non-prefix column order falls back to the ordinary
+        // DISTINCT membership index (still correct as a set). ----
         // `DISTINCT b, a` is NOT the leading prefix of idx_ab(a, b) in order, so it must decline.
         assert!(
-            has_op(&f, "SELECT DISTINCT b, a FROM mt", "SorterOpen").await,
-            "reversed column order must decline the loose scan (falls to the sorter)"
+            has_op(&f, "SELECT DISTINCT b, a FROM mt", "OpenAutoindex").await,
+            "reversed column order must decline the loose scan (uses DISTINCT membership index)"
         );
         assert_same_set(&f, &r, "SELECT DISTINCT b, a FROM mt").await;
     });
@@ -322,10 +321,10 @@ fn distinct_loose_scan_matches_rusqlite() {
             &ins,
         )
         .await;
-        // The loose scan must have fired (no dedup sorter) for the eligible shape.
+        // The loose scan must have fired (no DISTINCT membership index) for the eligible shape.
         assert!(
-            !has_op(&f, "SELECT DISTINCT a FROM t", "SorterOpen").await,
-            "loose scan should serve SELECT DISTINCT a (no SorterOpen)"
+            !has_op(&f, "SELECT DISTINCT a FROM t", "OpenAutoindex").await,
+            "loose scan should serve SELECT DISTINCT a (no DISTINCT membership index)"
         );
         assert_same(&f, &r, "SELECT DISTINCT a FROM t").await;
         assert_same(&f, &r, "SELECT DISTINCT a FROM t ORDER BY a").await;
@@ -348,7 +347,7 @@ fn distinct_loose_scan_matches_rusqlite() {
             &tins,
         )
         .await;
-        assert!(!has_op(&f2, "SELECT DISTINCT s FROM tt", "SorterOpen").await);
+        assert!(!has_op(&f2, "SELECT DISTINCT s FROM tt", "OpenAutoindex").await);
         assert_same(&f2, &r2, "SELECT DISTINCT s FROM tt").await;
 
         // ---- Edge tables. ----
@@ -394,6 +393,10 @@ fn distinct_loose_scan_matches_rusqlite() {
             ],
         )
         .await;
+        assert!(
+            has_op(&fc, "SELECT DISTINCT s FROM nc", "OpenAutoindex").await,
+            "NOCASE DISTINCT must decline the BINARY-only loose scan"
+        );
         assert_same_set(&fc, &rc, "SELECT DISTINCT s FROM nc").await;
 
         // ---- Control: non-indexed column falls back. ----
@@ -404,6 +407,10 @@ fn distinct_loose_scan_matches_rusqlite() {
                 .collect::<Vec<_>>(),
         )
         .await;
+        assert!(
+            has_op(&fn_, "SELECT DISTINCT b FROM ni", "OpenAutoindex").await,
+            "non-indexed DISTINCT must use the ordinary membership path"
+        );
         assert_same_set(&fn_, &rn, "SELECT DISTINCT b FROM ni").await;
     });
 }
