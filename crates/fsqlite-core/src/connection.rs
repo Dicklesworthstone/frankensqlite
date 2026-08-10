@@ -121961,7 +121961,7 @@ mod tests {
         ImplicitAutoindexSlot, InProcessPageLockTable, IoPollStrategy, LiveVtabRegistryUndo,
         MAX_TRIGGER_DEPTH, MAX_TRIGGER_PROGRAM_DEPTH, PagerBackend, PagerPublishedSnapshot,
         PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState,
-        SimplePager, Snapshot, TriggerDepthLimitOverrideGuard, TriggerFrame,
+        SimplePager, Snapshot, TriggerDepthLimitOverrideGuard, TriggerFrame, TriggerFrameGuard,
         arm_trigger_stack_probe, attached_schema_key, bind_placeholders_in_select_for_fallback,
         build_canonical_hash_join_key, canonical_hash_join_value, canonicalize_select_placeholders,
         cmp_values_with_comparison_affinity, implicit_autoindex_layout, init_global_runtime,
@@ -149451,12 +149451,21 @@ mod tests {
         });
     }
 
-    /// Build a main-schema trigger whose body deletes the root of an
-    /// `fk_links`-deep ON DELETE CASCADE chain living entirely in the
-    /// attached `aux` schema. Aggregate admitted depth = `fk_links + 1`
-    /// (one main trigger frame + the child's FK cascade programs), which is
-    /// only enforced if the child charges the SAME budget as the parent.
-    async fn build_cross_schema_trigger_fk_chain(
+    /// Build an `fk_links`-deep ON DELETE CASCADE chain living entirely in
+    /// the attached `aux` schema.
+    ///
+    /// C SQLite's trigger grammar (and ours — see `parse_dml_target_name`)
+    /// rejects qualified table names inside trigger bodies, and unqualified
+    /// trigger-body names never resolve into attached schemas, so SQL alone
+    /// cannot express "main trigger body drives an attached cascade". The
+    /// cross-schema recursive program is therefore driven through the real
+    /// delegation entry point — a top-level qualified DELETE — while the
+    /// parent connection holds an active trigger frame (the exact state a
+    /// delegated statement observes mid-program). Aggregate admitted depth =
+    /// `fk_links + 1` (one main trigger frame + the child's FK cascade
+    /// programs), which is only enforced if the delegated child charges the
+    /// SAME budget as the parent.
+    async fn build_cross_schema_fk_chain(
         aux_path: &std::path::Path,
         fk_links: usize,
     ) -> Connection {
@@ -149494,22 +149503,27 @@ mod tests {
                 .await
                 .unwrap();
         }
-        conn.execute("CREATE TABLE start (id INTEGER PRIMARY KEY);")
-            .await
-            .unwrap();
-        conn.execute("INSERT INTO start VALUES (1);").await.unwrap();
-        conn.execute(
-            "CREATE TRIGGER start_trg AFTER DELETE ON start \
-             BEGIN DELETE FROM aux.f0 WHERE id = OLD.id; END;",
-        )
-        .await
-        .unwrap();
         conn
     }
 
-    /// bd-wymdl.3 criterion 2: a main-trigger → attached-FK-cascade program
-    /// charges ONE aggregate budget: depth 50 succeeds, attempt 51 fails,
-    /// and the attached child does not reset the boundary to zero.
+    /// Push one parent trigger frame (test seam standing in for an active
+    /// main-schema trigger program — SQL cannot hold one open across a
+    /// qualified statement, see [`build_cross_schema_fk_chain`]).
+    fn push_parent_program_frame(conn: &Connection) -> TriggerFrameGuard<'_> {
+        conn.push_trigger_frame(TriggerFrame {
+            table_name: "start".to_owned(),
+            trigger_name: "start_trg".to_owned(),
+            column_names: Vec::new(),
+            rowid_alias_col_idx: None,
+            old_row: None,
+            new_row: None,
+        })
+    }
+
+    /// bd-wymdl.3 criterion 2: an active main program plus a delegated
+    /// attached-FK-cascade charges ONE aggregate budget: depth 50 succeeds,
+    /// attempt 51 fails, and the attached child does not reset the boundary
+    /// to zero.
     #[test]
     fn cross_schema_recursive_program_budget_is_not_reset_by_attach_delegation() {
         run_on_large_stack("cross-schema-budget-50", || {
@@ -149517,15 +149531,17 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
 
                 // 49 FK links + 1 main trigger frame = aggregate 50: admitted.
-                let at_limit = build_cross_schema_trigger_fk_chain(
+                let at_limit = build_cross_schema_fk_chain(
                     &dir.path().join("aux-at-limit.db"),
                     MAX_TRIGGER_PROGRAM_DEPTH - 1,
                 )
                 .await;
+                let frame_guard = push_parent_program_frame(&at_limit);
                 at_limit
-                    .execute("DELETE FROM start WHERE id = 1;")
+                    .execute("DELETE FROM aux.f0 WHERE id = 1;")
                     .await
                     .expect("cross-schema aggregate depth of exactly 50 must be admitted");
+                drop(frame_guard);
                 let rows = at_limit
                     .query(&format!(
                         "SELECT COUNT(*) FROM aux.f{};",
@@ -149548,14 +149564,17 @@ mod tests {
                     .unwrap();
 
                 // 50 FK links: the deepest cascade is aggregate admission 51
-                // and must be rejected even though it runs on the child.
-                let over_limit = build_cross_schema_trigger_fk_chain(
+                // and must be rejected even though it runs on the child. If
+                // delegation reset the budget to zero, the child would admit
+                // all 50 cascade programs and the DELETE would succeed.
+                let over_limit = build_cross_schema_fk_chain(
                     &dir.path().join("aux-over-limit.db"),
                     MAX_TRIGGER_PROGRAM_DEPTH,
                 )
                 .await;
+                let frame_guard = push_parent_program_frame(&over_limit);
                 let error = over_limit
-                    .execute("DELETE FROM start WHERE id = 1;")
+                    .execute("DELETE FROM aux.f0 WHERE id = 1;")
                     .await
                     .expect_err(
                         "cross-schema aggregate admission 51 must be rejected; \
@@ -149565,24 +149584,18 @@ mod tests {
                     matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
                     "expected typed depth error, got {error:?}"
                 );
-                let rows = over_limit
-                    .query("SELECT COUNT(*) FROM start;")
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    row_values(&rows[0])[0],
-                    SqliteValue::Integer(1),
-                    "the failed outer statement must roll back the main schema"
-                );
-                let rows = over_limit
-                    .query("SELECT COUNT(*) FROM aux.f0;")
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    row_values(&rows[0])[0],
-                    SqliteValue::Integer(1),
-                    "the failed delegated statement must roll back the attached schema"
-                );
+                drop(frame_guard);
+                for i in 0..=MAX_TRIGGER_PROGRAM_DEPTH {
+                    let rows = over_limit
+                        .query(&format!("SELECT COUNT(*) FROM aux.f{i};"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        row_values(&rows[0])[0],
+                        SqliteValue::Integer(1),
+                        "the failed delegated statement must roll back aux.f{i}"
+                    );
+                }
                 assert_trigger_program_state_clean(&over_limit);
                 over_limit
                     .with_attached_connection("aux", |child| {
