@@ -7692,10 +7692,6 @@ impl VdbeEngine {
             );
         }
         self.sync_storage_table_delete_into_memdb_mirror(tbl_cursor_id, conflict_rowid);
-        eprintln!(
-            "DBG-yuj70 native_replace_row rowid={conflict_rowid} captured={}",
-            replace_victim.is_some()
-        );
         if let Some(replace_victim) = replace_victim {
             self.replace_victims.push(replace_victim);
         }
@@ -10789,7 +10785,6 @@ impl VdbeEngine {
                                 }
                             }
                             for (victim_rowid, old_values) in mem_replace_victims {
-                                eprintln!("DBG-yuj70 mem victim rowid={victim_rowid}");
                                 let victim = self.logical_replace_victim(
                                     root,
                                     &old_values,
