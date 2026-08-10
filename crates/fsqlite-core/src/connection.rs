@@ -7187,7 +7187,7 @@ impl PreparedStatement<'_> {
         let concurrent_ctx = self.conn.concurrent_exec_context()?;
 
         let cached = self.conn.cached_vdbe_engine.borrow_mut().take();
-        let ((result, txn_back), engine_back) = execute_table_program_with_db(
+        let ((result, txn_back), mut engine_back) = execute_table_program_with_db(
             self.program.as_ref(),
             params,
             func_registry,
@@ -7220,6 +7220,10 @@ impl PreparedStatement<'_> {
         let memdb_count_shortcuts_safe_after_exec = engine_back
             .as_ref()
             .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
+        let replace_victims = engine_back
+            .as_mut()
+            .map(VdbeEngine::take_replace_victims)
+            .unwrap_or_default();
         *self.conn.cached_vdbe_engine.borrow_mut() = engine_back;
         *self.conn.active_txn.borrow_mut() = txn_back;
 
@@ -7249,6 +7253,19 @@ impl PreparedStatement<'_> {
                         self.conn.memdb_rows_loaded.set(false);
                         self.conn.memdb_requires_active_txn_reload.set(true);
                     }
+                }
+                // UPDATE OR REPLACE may implicitly delete other rows. Run the
+                // victim FK and (recursive_triggers) delete-trigger semantics
+                // after restoring the prepared path's MemDB state, matching the
+                // deferred table-program path.
+                if !replace_victims.is_empty()
+                    && let Some(fast_path) = self.prepared_update_delete_fast_path()
+                {
+                    let victim_table = fast_path.table_name.clone();
+                    *self.conn.last_replace_victims.borrow_mut() = replace_victims;
+                    self.conn
+                        .enforce_fk_on_replace_victims(&victim_table)
+                        .await?;
                 }
                 if track_last_insert_rowid && let Some(last_insert_rowid) = last_insert_rowid {
                     self.conn
@@ -23311,6 +23328,12 @@ impl Connection {
             stmt.execute_table_program_dml_with_reuse(execution_cx, params, true)
                 .await?
         };
+        // INSERT OR REPLACE may implicitly delete other rows through the
+        // reusable table-program lanes, which do not route victim handoff.
+        // Run victim FK and (recursive_triggers) delete-trigger semantics
+        // before statement-level FK checks, matching the deferred path.
+        self.enforce_replace_victims_from_cached_engine(table_name)
+            .await?;
         // Gate FK enforcement on a row actually landing: an OR IGNORE PK
         // conflict drops the row (affected == 0) and SQLite does not FK-check a
         // row it never inserted (#111).
@@ -26313,6 +26336,14 @@ impl Connection {
         let (affected, _) = stmt
             .execute_table_program_dml_with_reuse(execution_cx, params, false)
             .await?;
+        // UPDATE OR REPLACE may implicitly delete other rows. The fast lane
+        // consumes its victims inline; the reuse-mode lane parks them in the
+        // cached engine, so harvest and enforce here.
+        if let Some(fast_path) = stmt.prepared_update_delete_fast_path() {
+            let victim_table = fast_path.table_name.clone();
+            self.enforce_replace_victims_from_cached_engine(&victim_table)
+                .await?;
+        }
         self.record_statement_changes(affected);
         Ok(affected)
     }
@@ -32472,10 +32503,27 @@ impl Connection {
         }
 
         let table_name = insert.table.name.as_str();
-        if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
-            && self.table_is_foreign_key_parent(table_name)
-        {
-            return false;
+        if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace) {
+            if self.table_is_foreign_key_parent(table_name) {
+                return false;
+            }
+            // The direct BtCursor lane deletes PK-conflict victims without
+            // victim handoff, so it cannot fire the victim DELETE triggers
+            // required under PRAGMA recursive_triggers = ON. CREATE/DROP
+            // TRIGGER bumps the schema cookie, so prepare-time gating stays
+            // valid for the statement's cached lifetime.
+            let delete_event = fsqlite_ast::TriggerEvent::Delete;
+            if self.has_matching_triggers(
+                table_name,
+                fsqlite_ast::TriggerTiming::Before,
+                &delete_event,
+            ) || self.has_matching_triggers(
+                table_name,
+                fsqlite_ast::TriggerTiming::After,
+                &delete_event,
+            ) {
+                return false;
+            }
         }
         if self.has_live_vtab_instance(table_name) {
             return false;
@@ -50503,6 +50551,26 @@ impl Connection {
         Ok(result_actions)
     }
 
+    /// Harvest REPLACE victims left in the parked VDBE engine by a prepared
+    /// table-program lane (which does not route through
+    /// `execute_table_program_with_cx`) and run the victim FK and
+    /// delete-trigger semantics for them. The engine clears its victim list at
+    /// the start of every program run, so anything present here belongs to the
+    /// program that just finished.
+    async fn enforce_replace_victims_from_cached_engine(&self, table_name: &str) -> Result<()> {
+        let victims = self
+            .cached_vdbe_engine
+            .borrow_mut()
+            .as_mut()
+            .map(VdbeEngine::take_replace_victims)
+            .unwrap_or_default();
+        if victims.is_empty() {
+            return Ok(());
+        }
+        *self.last_replace_victims.borrow_mut() = victims;
+        self.enforce_fk_on_replace_victims(table_name).await
+    }
+
     /// Apply inbound FK semantics for exact rows deleted by VDBE REPLACE
     /// handling. Victims are taken locally before nested FK actions can execute
     /// another table program and replace the connection handoff slot.
@@ -50515,11 +50583,6 @@ impl Connection {
     /// ordering.
     async fn enforce_fk_on_replace_victims(&self, table_name: &str) -> Result<()> {
         let victims = std::mem::take(&mut *self.last_replace_victims.borrow_mut());
-        eprintln!(
-            "DBG-yuj70 enforce_fk_on_replace_victims table={table_name} victims={} recursive={}",
-            victims.len(),
-            self.pragma_state.borrow().recursive_triggers
-        );
         if victims.is_empty() {
             return Ok(());
         }
@@ -50542,19 +50605,18 @@ impl Connection {
             }
         }
 
-        let fire_victim_delete_triggers = self.pragma_state.borrow().recursive_triggers
-            && {
-                let delete_event = fsqlite_ast::TriggerEvent::Delete;
-                self.has_matching_triggers(
-                    table_name,
-                    fsqlite_ast::TriggerTiming::Before,
-                    &delete_event,
-                ) || self.has_matching_triggers(
-                    table_name,
-                    fsqlite_ast::TriggerTiming::After,
-                    &delete_event,
-                )
-            };
+        let fire_victim_delete_triggers = self.pragma_state.borrow().recursive_triggers && {
+            let delete_event = fsqlite_ast::TriggerEvent::Delete;
+            self.has_matching_triggers(
+                table_name,
+                fsqlite_ast::TriggerTiming::Before,
+                &delete_event,
+            ) || self.has_matching_triggers(
+                table_name,
+                fsqlite_ast::TriggerTiming::After,
+                &delete_event,
+            )
+        };
         if fire_victim_delete_triggers {
             let delete_event = fsqlite_ast::TriggerEvent::Delete;
             for victim in &victims {
@@ -50562,13 +50624,8 @@ impl Connection {
                 // DELETE body observing the table sees post-delete state; the
                 // OLD.* frame values below are exact. RAISE outcomes propagate
                 // as statement errors like any other trigger failure.
-                self.fire_before_triggers(
-                    table_name,
-                    &delete_event,
-                    Some(&victim.values),
-                    None,
-                )
-                .await?;
+                self.fire_before_triggers(table_name, &delete_event, Some(&victim.values), None)
+                    .await?;
                 self.fire_after_triggers(table_name, &delete_event, Some(&victim.values), None)
                     .await?;
             }

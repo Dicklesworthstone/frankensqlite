@@ -35360,6 +35360,10 @@ fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
             "CREATE TABLE c_update_replace (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_update_replace(id) ON DELETE CASCADE)",
             "INSERT INTO p_update_replace VALUES (1, 'AAA'), (2, 'BBB')",
             "INSERT INTO c_update_replace VALUES (1, 1), (2, 2)",
+            "CREATE TABLE p_update_replace_prepared (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+            "CREATE TABLE c_update_replace_prepared (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_update_replace_prepared(id) ON DELETE CASCADE)",
+            "INSERT INTO p_update_replace_prepared VALUES (1, 'AAA'), (2, 'BBB')",
+            "INSERT INTO c_update_replace_prepared VALUES (1, 1), (2, 2)",
         ];
         apply_fsqlite_statements(&fconn, &action_setup).await;
         apply_rusqlite_statements(&rconn, &action_setup);
@@ -35390,6 +35394,30 @@ fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
             assert_eq!(fconn.execute(sql).await.unwrap(), 1);
             assert_eq!(rconn.execute(sql, []).unwrap(), 1);
         }
+        let prepared_update_replace = fconn
+            .prepare("UPDATE OR REPLACE p_update_replace_prepared SET symbol = ?1 WHERE id = ?2")
+            .await
+            .unwrap();
+        let mut oracle_prepared_update_replace = rconn
+            .prepare("UPDATE OR REPLACE p_update_replace_prepared SET symbol = ?1 WHERE id = ?2")
+            .unwrap();
+        assert_eq!(
+            fconn
+                .execute_prepared_with_params(
+                    &prepared_update_replace,
+                    &[SqliteValue::Text("BBB".into()), SqliteValue::Integer(1)],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            oracle_prepared_update_replace
+                .execute(rusqlite::params!["BBB", 1_i64])
+                .unwrap(),
+            1
+        );
+        drop(oracle_prepared_update_replace);
         assert_logged_atomic_oracle_snapshot(
             "replace_fk_actions",
             &fconn,
@@ -35407,6 +35435,8 @@ fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
                 "SELECT id, tenant, parent_id FROM c_without_rowid ORDER BY id",
                 "SELECT id, symbol FROM p_update_replace ORDER BY id",
                 "SELECT id, parent_id FROM c_update_replace ORDER BY id",
+                "SELECT id, symbol FROM p_update_replace_prepared ORDER BY id",
+                "SELECT id, parent_id FROM c_update_replace_prepared ORDER BY id",
                 "PRAGMA foreign_key_check",
                 "SELECT changes(), total_changes(), last_insert_rowid()",
             ],
