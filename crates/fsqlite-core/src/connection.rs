@@ -50515,6 +50515,11 @@ impl Connection {
     /// ordering.
     async fn enforce_fk_on_replace_victims(&self, table_name: &str) -> Result<()> {
         let victims = std::mem::take(&mut *self.last_replace_victims.borrow_mut());
+        eprintln!(
+            "DBG-yuj70 enforce_fk_on_replace_victims table={table_name} victims={} recursive={}",
+            victims.len(),
+            self.pragma_state.borrow().recursive_triggers
+        );
         if victims.is_empty() {
             return Ok(());
         }

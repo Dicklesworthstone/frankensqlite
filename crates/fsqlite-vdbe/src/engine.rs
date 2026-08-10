@@ -7692,6 +7692,10 @@ impl VdbeEngine {
             );
         }
         self.sync_storage_table_delete_into_memdb_mirror(tbl_cursor_id, conflict_rowid);
+        eprintln!(
+            "DBG-yuj70 native_replace_row rowid={conflict_rowid} captured={}",
+            replace_victim.is_some()
+        );
         if let Some(replace_victim) = replace_victim {
             self.replace_victims.push(replace_victim);
         }
@@ -10695,6 +10699,11 @@ impl VdbeEngine {
                             } else {
                                 decode_record_with_metrics(&record_val, self.collect_vdbe_metrics)?
                             };
+                            // Exact rows implicitly deleted by REPLACE below;
+                            // pushed into `replace_victims` after the &mut db
+                            // borrow ends so the connection can run victim FK
+                            // and delete-trigger semantics.
+                            let mut mem_replace_victims: Vec<(i64, Vec<SqliteValue>)> = Vec::new();
                             if let Some(db) = self.db.as_mut() {
                                 // Check rowid conflict first.
                                 let rowid_conflict = db
@@ -10733,8 +10742,27 @@ impl VdbeEngine {
                                                 // Delete conflicting rows that are not the new rowid
                                                 // (which will be replaced by upsert_row).
                                                 if conflict_rid != rowid {
+                                                    if let Some(old_values) = db
+                                                        .get_table(root)
+                                                        .and_then(|t| {
+                                                            t.row_values_by_rowid(conflict_rid)
+                                                        })
+                                                    {
+                                                        mem_replace_victims.push((
+                                                            conflict_rid,
+                                                            old_values.to_vec(),
+                                                        ));
+                                                    }
                                                     db.delete_rowid(root, conflict_rid);
                                                 }
+                                            }
+                                            if rowid_conflict
+                                                && let Some(old_values) = db
+                                                    .get_table(root)
+                                                    .and_then(|t| t.row_values_by_rowid(rowid))
+                                            {
+                                                mem_replace_victims
+                                                    .push((rowid, old_values.to_vec()));
                                             }
                                             db.upsert_row(root, rowid, values);
                                             actually_inserted = true;
@@ -10760,6 +10788,15 @@ impl VdbeEngine {
                                     db.upsert_row(root, rowid, values);
                                     actually_inserted = true;
                                 }
+                            }
+                            for (victim_rowid, old_values) in mem_replace_victims {
+                                eprintln!("DBG-yuj70 mem victim rowid={victim_rowid}");
+                                let victim = self.logical_replace_victim(
+                                    root,
+                                    &old_values,
+                                    Some(victim_rowid),
+                                );
+                                self.replace_victims.push(victim);
                             }
                         }
                         Ok(None)
