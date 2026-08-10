@@ -22790,7 +22790,7 @@ where
             };
             let target_size = u64::from(n_pages) * page_size as u64;
             {
-                let db_file = shared_db_file_write(&db_file, cx).await?;
+                let mut db_file = shared_db_file_write(&db_file, cx).await?;
                 // GH #294: skip the physical truncation when the file already
                 // has the target length so a no-op checkpoint pass never
                 // updates the main file's timestamps.
