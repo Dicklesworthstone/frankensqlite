@@ -2800,8 +2800,15 @@ still serves as an authoritative reference.
   and verified on Unix for `OpenFlags::SQLITE_OPEN_READ_ONLY` opens of a database
   FrankenSQLite has opened before: regression coverage snapshots every
   directory entry and modification time across an open plus a WAL-backed query
-  and requires full byte equality. Broader default-open behavior remains under
-  #294; first-contact namespace mutation remains tracked in #140.
+  and requires full byte equality. Default read-write opens are covered too:
+  the close-time passive checkpoint is a strict no-op when the WAL is already
+  fully backfilled, so a steady-state open plus schema-only or row reads —
+  closed with or without a checkpoint — leaves the main database, WAL,
+  WAL-certificate, SHM, and namespace artifacts byte- and
+  timestamp-identical (regression-verified on Unix). A checkpoint that has
+  real work (unbackfilled WAL frames, database growth, header repair) still
+  writes; that is the documented recovery/checkpoint exception.
+  First-contact namespace mutation remains tracked in #140.
 - **Windows WAL lock interoperability does not yet extend to shared-memory
   contents.** FrankenSQLite mirrors ordinary WAL lock slots onto stock
   SQLite's real `-shm` lock bytes, but its shared-memory region contents remain
