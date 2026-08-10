@@ -27518,6 +27518,7 @@ impl Connection {
                 let mut cleanup_errors = Vec::new();
                 let mut pager_rollback_succeeded = false;
                 let mut concurrent_rollback_succeeded = true;
+                let mut cleanup_crossed_savepoint_boundary = false;
                 if let Some(concurrent_snap) = concurrent_snapshot.as_ref() {
                     if let Some(session_id) = *self.concurrent_session_id.borrow() {
                         let registry = lock_unpoisoned(&self.concurrent_registry);
@@ -27529,6 +27530,7 @@ impl Connection {
                                 concurrent_snap,
                             ) {
                                 concurrent_rollback_succeeded = false;
+                                cleanup_crossed_savepoint_boundary = true;
                                 cleanup_errors.push(format!(
                                     "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
                                 ));
@@ -27556,6 +27558,7 @@ impl Connection {
                 {
                     match txn.rollback_to_savepoint(cx, &savepoint_name) {
                         Ok(()) => {
+                            cleanup_crossed_savepoint_boundary = true;
                             pager_rollback_succeeded = true;
                             if let Err(err) = txn.release_savepoint(cx, &savepoint_name) {
                                 cleanup_errors.push(format!(
@@ -27563,9 +27566,12 @@ impl Connection {
                                 ));
                             }
                         }
-                        Err(err) => cleanup_errors.push(format!(
-                            "pager rollback_to_savepoint('{savepoint_name}') failed: {err}"
-                        )),
+                        Err(err) => {
+                            cleanup_crossed_savepoint_boundary = true;
+                            cleanup_errors.push(format!(
+                                "pager rollback_to_savepoint('{savepoint_name}') failed: {err}"
+                            ));
+                        }
                     }
                 }
 
@@ -27591,6 +27597,9 @@ impl Connection {
                         "statement savepoint rollback failed after {purpose}: {statement_error}; cleanup failed: {}",
                         cleanup_errors.join("; ")
                     ));
+                    if !cleanup_crossed_savepoint_boundary {
+                        return Err(boundary_error);
+                    }
                     return Err(self
                         .rollback_after_savepoint_boundary_failure(
                             cx,
