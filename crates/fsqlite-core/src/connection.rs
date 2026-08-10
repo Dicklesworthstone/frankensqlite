@@ -148771,46 +148771,55 @@ mod tests {
     /// false charge for the suppressed entry diverges).
     #[test]
     fn differential_recursive_off_ring_matches_rusqlite() {
-        asupersync::test_utils::run_test(|| async {
-            for timing in ["BEFORE", "AFTER"] {
-                let sqlite = rusqlite::Connection::open_in_memory().unwrap();
-                for i in 1..=MAX_TRIGGER_DEPTH {
-                    sqlite
-                        .execute_batch(&format!(
-                            "CREATE TABLE ring{i} (n INTEGER); INSERT INTO ring{i} VALUES (0);"
-                        ))
-                        .unwrap();
-                }
-                for i in 1..=MAX_TRIGGER_DEPTH {
-                    let next = if i == MAX_TRIGGER_DEPTH { 1 } else { i + 1 };
-                    sqlite
-                        .execute_batch(&format!(
-                            "CREATE TRIGGER ring_trg{i} {timing} UPDATE ON ring{i} \
-                             BEGIN UPDATE ring{next} SET n = n + 1; END;"
-                        ))
-                        .unwrap();
-                }
-                sqlite.execute("UPDATE ring1 SET n = n + 1;", []).unwrap();
-                let reference: Vec<i64> = (1..=MAX_TRIGGER_DEPTH)
-                    .map(|i| {
-                        sqlite
-                            .query_row(&format!("SELECT n FROM ring{i};"), [], |row| row.get(0))
-                            .unwrap()
-                    })
-                    .collect();
+        run_on_large_stack(
+            "connection::tests::differential_recursive_off_ring_matches_rusqlite",
+            || {
+                asupersync::test_utils::run_test(|| async {
+                    for timing in ["BEFORE", "AFTER"] {
+                        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+                        for i in 1..=MAX_TRIGGER_DEPTH {
+                            sqlite
+                                .execute_batch(&format!(
+                                    "CREATE TABLE ring{i} (n INTEGER); \
+                                     INSERT INTO ring{i} VALUES (0);"
+                                ))
+                                .unwrap();
+                        }
+                        for i in 1..=MAX_TRIGGER_DEPTH {
+                            let next = if i == MAX_TRIGGER_DEPTH { 1 } else { i + 1 };
+                            sqlite
+                                .execute_batch(&format!(
+                                    "CREATE TRIGGER ring_trg{i} {timing} UPDATE ON ring{i} \
+                                     BEGIN UPDATE ring{next} SET n = n + 1; END;"
+                                ))
+                                .unwrap();
+                        }
+                        sqlite.execute("UPDATE ring1 SET n = n + 1;", []).unwrap();
+                        let reference: Vec<i64> = (1..=MAX_TRIGGER_DEPTH)
+                            .map(|i| {
+                                sqlite
+                                    .query_row(&format!("SELECT n FROM ring{i};"), [], |row| {
+                                        row.get(0)
+                                    })
+                                    .unwrap()
+                            })
+                            .collect();
 
-                let franken = build_recursive_off_trigger_ring(timing, MAX_TRIGGER_DEPTH).await;
-                franken
-                    .execute("UPDATE ring1 SET n = n + 1;")
-                    .await
-                    .expect("stock-SQLite-compatible suppression semantics");
-                assert_eq!(
-                    ring_values(&franken, MAX_TRIGGER_DEPTH).await,
-                    reference,
-                    "{timing} ring diverged from C SQLite suppression semantics"
-                );
-            }
-        });
+                        let franken =
+                            build_recursive_off_trigger_ring(timing, MAX_TRIGGER_DEPTH).await;
+                        franken
+                            .execute("UPDATE ring1 SET n = n + 1;")
+                            .await
+                            .expect("stock-SQLite-compatible suppression semantics");
+                        assert_eq!(
+                            ring_values(&franken, MAX_TRIGGER_DEPTH).await,
+                            reference,
+                            "{timing} ring diverged from C SQLite suppression semantics"
+                        );
+                    }
+                });
+            },
+        );
     }
 
     /// bd-wymdl.1 criterion 4: the RAII guards that a dropped (cancelled)
@@ -148846,54 +148855,60 @@ mod tests {
     /// writes, and remain usable.
     #[test]
     fn dropping_recursive_trigger_execute_future_restores_recursion_state() {
-        asupersync::test_utils::run_test(|| async {
-            let conn = build_bounded_trigger_chain(MAX_TRIGGER_DEPTH).await;
-            let completed = {
-                let mut future = std::pin::pin!(conn.execute("UPDATE a SET n = 1;"));
-                let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
-                let mut completed = None;
-                for _ in 0..100_000 {
-                    match future.as_mut().poll(&mut task_cx) {
-                        std::task::Poll::Ready(result) => {
-                            completed = Some(result);
-                            break;
-                        }
-                        std::task::Poll::Pending => {
-                            if !conn.trigger_frame_stack.borrow().is_empty() {
-                                // Mid-program pending point observed: cancel
-                                // here by dropping the future (loop exit).
-                                break;
+        run_on_large_stack(
+            "connection::tests::dropping_recursive_trigger_execute_future_restores_recursion_state",
+            || {
+                asupersync::test_utils::run_test(|| async {
+                    let conn = build_bounded_trigger_chain(MAX_TRIGGER_DEPTH).await;
+                    let completed = {
+                        let mut future = std::pin::pin!(conn.execute("UPDATE a SET n = 1;"));
+                        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+                        let mut completed = None;
+                        for _ in 0..100_000 {
+                            match future.as_mut().poll(&mut task_cx) {
+                                std::task::Poll::Ready(result) => {
+                                    completed = Some(result);
+                                    break;
+                                }
+                                std::task::Poll::Pending => {
+                                    if !conn.trigger_frame_stack.borrow().is_empty() {
+                                        // Mid-program pending point observed:
+                                        // cancel here by dropping the future
+                                        // (loop exit).
+                                        break;
+                                    }
+                                }
                             }
                         }
+                        completed
+                    };
+                    // Whether the future completed or was dropped mid-program,
+                    // the recursion counters must be fully restored ...
+                    assert_trigger_program_state_clean(&conn);
+                    // ... and the statement must have been atomic: either fully
+                    // applied or fully rolled back.
+                    let rows = conn
+                        .query("SELECT (SELECT n FROM a), (SELECT n FROM b);")
+                        .await
+                        .expect("connection must remain usable after cancellation");
+                    let observed = row_values(&rows[0]);
+                    if let Some(result) = completed {
+                        result.expect("bounded chain at the cap must succeed");
+                        assert_ne!(
+                            observed,
+                            vec![SqliteValue::Integer(0), SqliteValue::Integer(0)],
+                            "a completed statement must have applied its writes"
+                        );
+                    } else {
+                        assert_eq!(
+                            observed,
+                            vec![SqliteValue::Integer(0), SqliteValue::Integer(0)],
+                            "a cancelled statement must leave no partial writes"
+                        );
                     }
-                }
-                completed
-            };
-            // Whether the future completed or was dropped mid-program, the
-            // recursion counters must be fully restored ...
-            assert_trigger_program_state_clean(&conn);
-            // ... and the statement must have been atomic: either fully
-            // applied or fully rolled back.
-            let rows = conn
-                .query("SELECT (SELECT n FROM a), (SELECT n FROM b);")
-                .await
-                .expect("connection must remain usable after cancellation");
-            let observed = row_values(&rows[0]);
-            if let Some(result) = completed {
-                result.expect("bounded chain at the cap must succeed");
-                assert_ne!(
-                    observed,
-                    vec![SqliteValue::Integer(0), SqliteValue::Integer(0)],
-                    "a completed statement must have applied its writes"
-                );
-            } else {
-                assert_eq!(
-                    observed,
-                    vec![SqliteValue::Integer(0), SqliteValue::Integer(0)],
-                    "a cancelled statement must leave no partial writes"
-                );
-            }
-        });
+                });
+            },
+        );
     }
 
     // ─── bd-wymdl.2: coherent trigger/FK depth overrides and the exact
