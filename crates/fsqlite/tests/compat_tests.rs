@@ -966,6 +966,92 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
 
 #[cfg(all(feature = "native", any(unix, windows)))]
 #[test]
+fn gh294_default_flags_schema_only_open_preserves_every_database_artifact() {
+    asupersync::test_utils::run_test(|| async {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default_open_artifact_stability.db");
+        let path_str = path.to_str().unwrap();
+
+        let writable = open_with_flags(
+            path_str,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .await
+        .expect("create FrankenSQLite generation");
+        writable
+            .execute_batch(
+                "CREATE TABLE artifact_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO artifact_probe(value) VALUES ('preserved');",
+            )
+            .await
+            .expect("seed WAL-backed row");
+        writable
+            .close_without_checkpoint()
+            .await
+            .expect("close fixture writer without a checkpoint");
+
+        let namespace_gate = suffixed_path(&path, "-fsqlite-ns-gate");
+        let namespace_use = suffixed_path(&path, "-fsqlite-ns-use");
+        let wal = suffixed_path(&path, "-wal");
+        let wal_certificate = suffixed_path(&path, "-wal-cert");
+        assert!(
+            namespace_gate.exists() && namespace_use.exists(),
+            "writer must publish the namespace sidecars"
+        );
+        assert!(
+            wal.exists() && wal_certificate.exists(),
+            "fixture must retain a WAL companion plus certificate for readback"
+        );
+        let sentinel_modified = UNIX_EPOCH + Duration::from_hours(262_968);
+        File::options()
+            .write(true)
+            .open(&namespace_use)
+            .expect("open namespace identity for timestamp sentinel")
+            .set_times(FileTimes::new().set_modified(sentinel_modified))
+            .expect("set namespace identity timestamp sentinel");
+        let before = snapshot_directory_files(dir.path());
+
+        let reader = open_with_flags(
+            path_str,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .await
+        .expect("re-open existing generation with default read-write flags");
+        let schema_row = reader
+            .query_row("SELECT name FROM sqlite_schema WHERE type = 'table'")
+            .await
+            .expect("schema-only catalog query");
+        assert_eq!(
+            schema_row.get(0),
+            Some(&SqliteValue::Text("artifact_probe".to_owned().into()))
+        );
+        let row = reader
+            .query_row("SELECT id, value FROM artifact_probe")
+            .await
+            .expect("query the WAL-backed row");
+        assert_eq!(row.get(0), Some(&SqliteValue::Integer(1)));
+        assert_eq!(
+            row.get(1),
+            Some(&SqliteValue::Text("preserved".to_owned().into()))
+        );
+        reader
+            .close_without_checkpoint()
+            .await
+            .expect("close schema-only default-flag connection without a checkpoint");
+
+        assert_eq!(
+            snapshot_directory_files(dir.path()),
+            before,
+            "GH #294 default-flag schema-only open/query must preserve exact artifact keys plus all bytes, modification times, and Unix change times"
+        );
+    });
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
 fn open_with_flags_read_only_opens_stock_database_without_touching_it() {
     asupersync::test_utils::run_test(|| async {
         // GH #140 (partial): a stock SQLite database that FrankenSQLite has
