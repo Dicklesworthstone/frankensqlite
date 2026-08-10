@@ -2467,7 +2467,12 @@ Execution model:
     Each body statement is dispatched independently through the normal
     trigger/FK/constraint/transaction pipeline.
     Pure-trigger admission currently stops at depth 8. Trigger and FK-action
-    programs also share an aggregate admission ceiling of 50.
+    programs also share an aggregate admission ceiling of 50. That aggregate
+    budget is preserved across attached-schema delegation: statements executed
+    on an attached child connection inherit the delegating connection's active
+    recursive-program depth, and ATTACH/DETACH are rejected while any
+    trigger/FK program is active (trigger bodies cannot run them at all,
+    matching C SQLite's trigger-body grammar).
     Neither ceiling is a release-certified native-stack safety claim: the
     required out-of-process requested-1-MiB-stack matrix must pass in both debug
     and the exact release profile, with target and toolchain provenance, before

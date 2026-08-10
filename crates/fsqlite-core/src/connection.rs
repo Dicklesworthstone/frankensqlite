@@ -467,6 +467,14 @@ thread_local! {
     // abort) on a pinned stack, without a recompile per candidate value.
     static TRIGGER_DEPTH_LIMIT_OVERRIDE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+
+    // bd-wymdl.2: the aggregate trigger/FK recursive-program cap override.
+    // Kept in lock-step with `TRIGGER_DEPTH_LIMIT_OVERRIDE` by
+    // `set_trigger_depth_limit_override` so a raised local trigger cap can
+    // never be silently truncated by the production aggregate cap of
+    // `MAX_TRIGGER_PROGRAM_DEPTH`, which produced false depth diagnostics.
+    static TRIGGER_PROGRAM_DEPTH_LIMIT_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Effective trigger-recursion depth limit.
@@ -482,10 +490,66 @@ fn trigger_depth_limit() -> usize {
     MAX_TRIGGER_DEPTH
 }
 
-/// Override the trigger depth limit on the current thread (test-only).
+/// Effective aggregate trigger/FK recursive-program depth limit.
+///
+/// Always `MAX_TRIGGER_PROGRAM_DEPTH` outside `cfg(test)`. Under test the
+/// override is updated together with [`trigger_depth_limit`] (bd-wymdl.2) so
+/// the two admission caps stay coherent: the aggregate cap is never allowed to
+/// drop below a raised local trigger cap.
+#[inline]
+fn trigger_program_depth_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = TRIGGER_PROGRAM_DEPTH_LIMIT_OVERRIDE.with(std::cell::Cell::get) {
+        return limit;
+    }
+    MAX_TRIGGER_PROGRAM_DEPTH
+}
+
+/// Override the trigger depth limits on the current thread (test-only).
+///
+/// bd-wymdl.2: sets BOTH the local trigger cap and the aggregate trigger/FK
+/// recursive-program cap coherently. The aggregate cap becomes
+/// `max(limit, MAX_TRIGGER_PROGRAM_DEPTH)` so raising the local cap for a
+/// depth sweep cannot be silently truncated at 50, while lowering the local
+/// cap never shrinks the aggregate semantic budget. Prefer
+/// [`TriggerDepthLimitOverrideGuard`], which restores both on `Drop`.
 #[cfg(test)]
 fn set_trigger_depth_limit_override(limit: Option<usize>) {
     TRIGGER_DEPTH_LIMIT_OVERRIDE.with(|cell| cell.set(limit));
+    TRIGGER_PROGRAM_DEPTH_LIMIT_OVERRIDE
+        .with(|cell| cell.set(limit.map(|value| value.max(MAX_TRIGGER_PROGRAM_DEPTH))));
+}
+
+/// RAII override for the trigger depth limits (test-only, bd-wymdl.2).
+///
+/// Captures the previous values of both thread-local overrides and restores
+/// them on `Drop`, so nested overrides and panicking tests cannot leak a
+/// modified limit into later tests on the same thread.
+#[cfg(test)]
+struct TriggerDepthLimitOverrideGuard {
+    previous_local: Option<usize>,
+    previous_program: Option<usize>,
+}
+
+#[cfg(test)]
+impl TriggerDepthLimitOverrideGuard {
+    fn new(limit: usize) -> Self {
+        let previous_local = TRIGGER_DEPTH_LIMIT_OVERRIDE.with(std::cell::Cell::get);
+        let previous_program = TRIGGER_PROGRAM_DEPTH_LIMIT_OVERRIDE.with(std::cell::Cell::get);
+        set_trigger_depth_limit_override(Some(limit));
+        Self {
+            previous_local,
+            previous_program,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TriggerDepthLimitOverrideGuard {
+    fn drop(&mut self) {
+        TRIGGER_DEPTH_LIMIT_OVERRIDE.with(|cell| cell.set(self.previous_local));
+        TRIGGER_PROGRAM_DEPTH_LIMIT_OVERRIDE.with(|cell| cell.set(self.previous_program));
+    }
 }
 
 /// Arm the trigger-recursion stack probe on the current thread (test-only).
@@ -10480,6 +10544,13 @@ pub struct Connection {
     /// actions (matches C SQLite behavior where FK actions do not re-trigger
     /// FK checking).
     fk_cascade_depth: Cell<usize>,
+    /// Recursive-program depth inherited from a delegating parent connection
+    /// (bd-wymdl.3). Attached-schema statements execute on a separately opened
+    /// child `Connection`; seeding this baseline at every delegation makes
+    /// trigger/FK programs that cross the main/attached boundary charge ONE
+    /// aggregate recursive-program budget instead of resetting it to zero.
+    /// Always zero outside an active delegation (restored by RAII guard).
+    inherited_recursive_program_depth: Cell<usize>,
     /// Pending `DEFERRABLE INITIALLY DEFERRED` parent-existence checks recorded
     /// during an explicit transaction, rechecked at COMMIT (bd-do0d6). Each
     /// entry is `(child_table_name, row_values_in_storage_order)`.
@@ -11233,9 +11304,12 @@ struct FkCascadeDepthGuard<'a> {
 }
 
 impl<'a> FkCascadeDepthGuard<'a> {
-    fn try_enter(depth: &'a Cell<usize>, active_trigger_frames: usize) -> Result<Self> {
+    /// `other_active_programs` is every non-FK charge against the shared
+    /// aggregate budget: active trigger frames plus any recursive-program
+    /// depth inherited across attached-schema delegation (bd-wymdl.3).
+    fn try_enter(depth: &'a Cell<usize>, other_active_programs: usize) -> Result<Self> {
         let current = depth.get();
-        if current.saturating_add(active_trigger_frames) >= MAX_TRIGGER_PROGRAM_DEPTH {
+        if current.saturating_add(other_active_programs) >= trigger_program_depth_limit() {
             return Err(FrankenError::TriggerRecursionDepthExceeded);
         }
         depth.set(current + 1);
@@ -11248,6 +11322,33 @@ impl Drop for FkCascadeDepthGuard<'_> {
         // saturating_sub: a guard can never legitimately see zero here, but a
         // panic-unwind through nested cascades must not underflow.
         self.depth.set(self.depth.get().saturating_sub(1));
+    }
+}
+
+/// RAII seed for a child connection's inherited recursive-program depth
+/// (bd-wymdl.3).
+///
+/// Set on the attached child for the duration of one delegated statement and
+/// restored on `Drop`, so cancellation (dropping the delegation future at any
+/// await point), statement errors, and success all return the child to its
+/// prior baseline. Save/restore (rather than set/clear) keeps nested
+/// delegations well-formed.
+struct InheritedRecursiveProgramDepthGuard<'a> {
+    cell: &'a Cell<usize>,
+    previous: usize,
+}
+
+impl<'a> InheritedRecursiveProgramDepthGuard<'a> {
+    fn seed(cell: &'a Cell<usize>, depth: usize) -> Self {
+        let previous = cell.get();
+        cell.set(depth);
+        Self { cell, previous }
+    }
+}
+
+impl Drop for InheritedRecursiveProgramDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
     }
 }
 
@@ -11920,6 +12021,7 @@ impl Connection {
             force_full_schema_reload_once: Cell::new(false),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
+            inherited_recursive_program_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
             statement_fk_validation_depth: Cell::new(0),
@@ -12385,6 +12487,7 @@ impl Connection {
             force_full_schema_reload_once: Cell::new(false),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
+            inherited_recursive_program_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
             statement_fk_validation_depth: Cell::new(0),
@@ -12912,6 +13015,12 @@ impl Connection {
         let conn = attached_connections.get(&key).ok_or_else(|| {
             FrankenError::Internal(format!("attached connection missing for schema: {schema}"))
         })?;
+        // bd-wymdl.3: the delegated statement must charge the SAME aggregate
+        // trigger/FK recursive-program budget as the delegating connection.
+        let _budget_seed = InheritedRecursiveProgramDepthGuard::seed(
+            &conn.inherited_recursive_program_depth,
+            self.active_recursive_program_depth(),
+        );
         f(conn.as_ref())
     }
 
@@ -12924,6 +13033,14 @@ impl Connection {
         let conn = attached_connections.get(&key).ok_or_else(|| {
             FrankenError::Internal(format!("attached connection missing for schema: {schema}"))
         })?;
+        // bd-wymdl.3: the delegated statement must charge the SAME aggregate
+        // trigger/FK recursive-program budget as the delegating connection.
+        // The guard restores the child's baseline even when this future is
+        // dropped at an await point (cancellation).
+        let _budget_seed = InheritedRecursiveProgramDepthGuard::seed(
+            &conn.inherited_recursive_program_depth,
+            self.active_recursive_program_depth(),
+        );
         f(conn.as_ref()).await
     }
 
@@ -29990,6 +30107,12 @@ impl Connection {
                 self.execute_explain(stmt, *query_plan, params).await
             }
             Statement::Attach(attach) => {
+                // bd-wymdl.3: never mutate the attached-database registry while
+                // a recursive trigger/FK program is active — the aggregate
+                // recursive-program budget's identity must stay stable for the
+                // whole program. Trigger bodies already reject ATTACH/DETACH at
+                // the statement boundary; this guards every other entry path.
+                self.reject_registry_mutation_during_recursive_program("ATTACH")?;
                 let path_rows = self
                     .execute_statement(
                         &Statement::Select(SelectStatement {
@@ -30052,6 +30175,8 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Detach(schema_name) => {
+                // bd-wymdl.3: see the ATTACH arm above.
+                self.reject_registry_mutation_during_recursive_program("DETACH")?;
                 self.attached_schemas.borrow_mut().detach(schema_name)?;
                 self.attached_connections
                     .borrow_mut()
@@ -49836,14 +49961,40 @@ impl Connection {
         self.pragma_state.borrow().foreign_keys
     }
 
+    /// Total recursive-program depth currently charged against this
+    /// connection's aggregate trigger/FK budget: active FK-action programs,
+    /// active trigger frames, and (bd-wymdl.3) the depth inherited from a
+    /// delegating parent connection across an attached-schema boundary.
+    fn active_recursive_program_depth(&self) -> usize {
+        self.inherited_recursive_program_depth
+            .get()
+            .saturating_add(self.fk_cascade_depth.get())
+            .saturating_add(self.trigger_frame_stack.borrow().len())
+    }
+
+    /// Reject ATTACH/DETACH while any trigger/FK recursive program is active
+    /// (bd-wymdl.3): mutating the attached-database registry mid-program would
+    /// change the identity of the shared recursive-program budget.
+    fn reject_registry_mutation_during_recursive_program(
+        &self,
+        action: &'static str,
+    ) -> Result<()> {
+        if self.active_recursive_program_depth() > 0 {
+            return Err(FrankenError::ParseError {
+                offset: 0,
+                detail: format!(
+                    "{action} is not allowed while a trigger or foreign-key \
+                     program is executing"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Reject admission of one more trigger or FK-action program when the
     /// connection-wide aggregate recursion budget is already exhausted.
     fn ensure_trigger_program_admission_available(&self) -> Result<()> {
-        let active_programs = self
-            .fk_cascade_depth
-            .get()
-            .saturating_add(self.trigger_frame_stack.borrow().len());
-        if active_programs >= MAX_TRIGGER_PROGRAM_DEPTH {
+        if self.active_recursive_program_depth() >= trigger_program_depth_limit() {
             return Err(FrankenError::TriggerRecursionDepthExceeded);
         }
         Ok(())
@@ -49863,7 +50014,10 @@ impl Connection {
     fn enter_fk_cascade(&self) -> Result<FkCascadeDepthGuard<'_>> {
         FkCascadeDepthGuard::try_enter(
             &self.fk_cascade_depth,
-            self.trigger_frame_stack.borrow().len(),
+            self.trigger_frame_stack
+                .borrow()
+                .len()
+                .saturating_add(self.inherited_recursive_program_depth.get()),
         )
     }
 
@@ -51104,6 +51258,19 @@ impl Connection {
             return Err(FrankenError::ParseError {
                 offset: 0,
                 detail: "transaction control statements are not allowed inside trigger bodies"
+                    .to_owned(),
+            });
+        }
+        // bd-wymdl.3: C SQLite's trigger-body grammar only admits
+        // SELECT/INSERT/UPDATE/DELETE, so ATTACH/DETACH can never run inside a
+        // trigger program there. Our parser accepts them syntactically, so
+        // fail closed here: mutating the attached-database registry while a
+        // recursive program is executing would change the identity of the
+        // shared recursive-program budget mid-program.
+        if matches!(&statement, Statement::Attach(_) | Statement::Detach(_)) {
+            return Err(FrankenError::ParseError {
+                offset: 0,
+                detail: "ATTACH and DETACH statements are not allowed inside trigger bodies"
                     .to_owned(),
             });
         }
@@ -121669,8 +121836,9 @@ mod tests {
         FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
         FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, HashJoinKeyMode, HashJoinPair,
         ImplicitAutoindexSlot, InProcessPageLockTable, IoPollStrategy, LiveVtabRegistryUndo,
-        MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot, PragmaSchemaScope, Row,
-        RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
+        MAX_TRIGGER_DEPTH, MAX_TRIGGER_PROGRAM_DEPTH, PagerBackend, PagerPublishedSnapshot,
+        PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState,
+        SimplePager, Snapshot, TriggerDepthLimitOverrideGuard, TriggerFrame,
         arm_trigger_stack_probe, attached_schema_key, bind_placeholders_in_select_for_fallback,
         build_canonical_hash_join_key, canonical_hash_join_value, canonicalize_select_placeholders,
         cmp_values_with_comparison_affinity, implicit_autoindex_layout, init_global_runtime,
@@ -121680,9 +121848,9 @@ mod tests {
         qualify_persistent_view_relations, resolve_used_window_spec,
         retry_busy_connection_bootstrap, select_contains_any_placeholder,
         set_trigger_depth_limit_override, statement_contains_rewritable_subquery,
-        substitute_outer_refs_in_select, take_trigger_stack_probe,
-        validate_named_window_definitions, visit_select_qualified_names, wal_file_present_with_vfs,
-        wal_path_for_db_path,
+        substitute_outer_refs_in_select, take_trigger_stack_probe, trigger_depth_limit,
+        trigger_program_depth_limit, validate_named_window_definitions,
+        visit_select_qualified_names, wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{
@@ -148360,6 +148528,990 @@ mod tests {
                 over_limit.trigger_frame_stack.borrow().is_empty(),
                 "rejected boundary execution must unwind every admitted trigger frame"
             );
+        });
+    }
+
+    // ─── bd-wymdl.1: charge trigger depth only after recursive_triggers
+    //     suppression ─────────────────────────────────────────────────────
+
+    /// Build a ring of `tables` distinct tables, each carrying one `timing`
+    /// UPDATE trigger whose body updates the next table in the ring. With
+    /// `PRAGMA recursive_triggers` at its default OFF, the last trigger's
+    /// re-entry into the first is SUPPRESSED (same trigger name already on
+    /// the frame stack), so a ring of exactly `tables` admitted bodies must
+    /// complete without any depth charge for the suppressed entry.
+    async fn build_recursive_off_trigger_ring(timing: &str, tables: usize) -> Connection {
+        let conn = Connection::open(":memory:").await.unwrap();
+        for i in 1..=tables {
+            conn.execute(&format!("CREATE TABLE ring{i} (n INTEGER);"))
+                .await
+                .unwrap();
+            conn.execute(&format!("INSERT INTO ring{i} VALUES (0);"))
+                .await
+                .unwrap();
+        }
+        for i in 1..=tables {
+            let next = if i == tables { 1 } else { i + 1 };
+            conn.execute(&format!(
+                "CREATE TRIGGER ring_trg{i} {timing} UPDATE ON ring{i} \
+                 BEGIN UPDATE ring{next} SET n = n + 1; END;"
+            ))
+            .await
+            .unwrap();
+        }
+        conn
+    }
+
+    /// Assert the recursion, transaction, and savepoint state a suppressed or
+    /// completed trigger program must leave behind (bd-wymdl.1 criterion 3).
+    fn assert_trigger_program_state_clean(conn: &Connection) {
+        assert!(
+            conn.trigger_frame_stack.borrow().is_empty(),
+            "trigger frame stack must unwind completely"
+        );
+        assert_eq!(conn.fk_cascade_depth.get(), 0, "FK depth must be restored");
+        assert_eq!(
+            conn.inherited_recursive_program_depth.get(),
+            0,
+            "inherited budget must be zero outside delegation"
+        );
+        assert!(!conn.in_transaction(), "no transaction may remain open");
+        assert!(
+            conn.savepoints.borrow().is_empty(),
+            "no user savepoint may remain"
+        );
+        assert_eq!(
+            conn.internal_statement_savepoint_depth.get(),
+            0,
+            "internal statement savepoints must unwind"
+        );
+    }
+
+    async fn ring_values(conn: &Connection, tables: usize) -> Vec<i64> {
+        let mut values = Vec::with_capacity(tables);
+        for i in 1..=tables {
+            let rows = conn
+                .query(&format!("SELECT n FROM ring{i};"))
+                .await
+                .unwrap();
+            match row_values(&rows[0])[0] {
+                SqliteValue::Integer(n) => values.push(n),
+                ref other => panic!("unexpected ring{i} value {other:?}"),
+            }
+        }
+        values
+    }
+
+    /// bd-wymdl.1: with `recursive_triggers = OFF`, an exact
+    /// `MAX_TRIGGER_DEPTH`-trigger re-entry ring reaches all eight admitted
+    /// bodies. The suppressed ninth entry (ring_trg1 re-entered by ring_trg8's
+    /// body) must NOT be charged against the depth budget: charging before
+    /// suppression would reject this statement at the cap.
+    #[test]
+    fn recursive_off_after_ring_admits_exact_depth_and_rejects_next() {
+        asupersync::test_utils::run_test(|| async {
+            let at_limit = build_recursive_off_trigger_ring("AFTER", MAX_TRIGGER_DEPTH).await;
+            at_limit
+                .execute("UPDATE ring1 SET n = n + 1;")
+                .await
+                .expect("suppressed re-entry must not consume the depth budget");
+            // ring1 is updated by the outer statement AND by the last
+            // trigger's body (whose own trigger is suppressed); every other
+            // table is updated exactly once by its predecessor's body.
+            let mut expected = vec![1_i64; MAX_TRIGGER_DEPTH];
+            expected[0] = 2;
+            assert_eq!(ring_values(&at_limit, MAX_TRIGGER_DEPTH).await, expected);
+            assert_trigger_program_state_clean(&at_limit);
+
+            // One more distinct trigger in the ring is a ninth ADMITTED body
+            // and must be rejected with the typed depth error, unwinding all
+            // charged frames and rolling back every nested write.
+            let over_limit = build_recursive_off_trigger_ring("AFTER", MAX_TRIGGER_DEPTH + 1).await;
+            let error = over_limit
+                .execute("UPDATE ring1 SET n = n + 1;")
+                .await
+                .expect_err("the ninth admitted trigger body must exceed the cap");
+            assert!(
+                matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                "expected typed depth error, got {error:?}"
+            );
+            assert_eq!(
+                ring_values(&over_limit, MAX_TRIGGER_DEPTH + 1).await,
+                vec![0_i64; MAX_TRIGGER_DEPTH + 1],
+                "the failed statement must roll back every nested trigger write"
+            );
+            assert_trigger_program_state_clean(&over_limit);
+        });
+    }
+
+    /// bd-wymdl.1: same exact boundary for BEFORE-timing triggers.
+    #[test]
+    fn recursive_off_before_ring_admits_exact_depth_and_rejects_next() {
+        asupersync::test_utils::run_test(|| async {
+            let at_limit = build_recursive_off_trigger_ring("BEFORE", MAX_TRIGGER_DEPTH).await;
+            at_limit
+                .execute("UPDATE ring1 SET n = n + 1;")
+                .await
+                .expect("suppressed BEFORE re-entry must not consume the depth budget");
+            let mut expected = vec![1_i64; MAX_TRIGGER_DEPTH];
+            expected[0] = 2;
+            assert_eq!(ring_values(&at_limit, MAX_TRIGGER_DEPTH).await, expected);
+            assert_trigger_program_state_clean(&at_limit);
+
+            let over_limit =
+                build_recursive_off_trigger_ring("BEFORE", MAX_TRIGGER_DEPTH + 1).await;
+            let error = over_limit
+                .execute("UPDATE ring1 SET n = n + 1;")
+                .await
+                .expect_err("the ninth admitted BEFORE trigger body must exceed the cap");
+            assert!(
+                matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                "expected typed depth error, got {error:?}"
+            );
+            assert_eq!(
+                ring_values(&over_limit, MAX_TRIGGER_DEPTH + 1).await,
+                vec![0_i64; MAX_TRIGGER_DEPTH + 1],
+                "the failed statement must roll back every nested trigger write"
+            );
+            assert_trigger_program_state_clean(&over_limit);
+        });
+    }
+
+    /// Build a ring of `views` INSTEAD OF UPDATE triggers. Each body records
+    /// its execution in `body_log` and re-enters the next view; the final
+    /// view's re-entry of view 1 is suppressed under `recursive_triggers=OFF`.
+    async fn build_recursive_off_instead_of_ring(views: usize) -> Connection {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE body_log (entry INTEGER);")
+            .await
+            .unwrap();
+        for i in 1..=views {
+            conn.execute(&format!("CREATE TABLE base{i} (n INTEGER);"))
+                .await
+                .unwrap();
+            conn.execute(&format!("INSERT INTO base{i} VALUES (0);"))
+                .await
+                .unwrap();
+            conn.execute(&format!("CREATE VIEW v{i} AS SELECT n FROM base{i};"))
+                .await
+                .unwrap();
+        }
+        for i in 1..=views {
+            let next = if i == views { 1 } else { i + 1 };
+            conn.execute(&format!(
+                "CREATE TRIGGER v_trg{i} INSTEAD OF UPDATE ON v{i} \
+                 BEGIN INSERT INTO body_log VALUES ({i}); \
+                 UPDATE v{next} SET n = 1; END;"
+            ))
+            .await
+            .unwrap();
+        }
+        conn
+    }
+
+    /// bd-wymdl.1: INSTEAD OF triggers charge depth only after suppression.
+    #[test]
+    fn recursive_off_instead_of_ring_admits_exact_depth_and_rejects_next() {
+        asupersync::test_utils::run_test(|| async {
+            let at_limit = build_recursive_off_instead_of_ring(MAX_TRIGGER_DEPTH).await;
+            at_limit
+                .execute("UPDATE v1 SET n = 1;")
+                .await
+                .expect("suppressed INSTEAD OF re-entry must not consume the depth budget");
+            let rows = at_limit
+                .query("SELECT entry FROM body_log ORDER BY entry;")
+                .await
+                .unwrap();
+            let executed: Vec<SqliteValue> =
+                rows.iter().map(|row| row_values(row)[0].clone()).collect();
+            let expected: Vec<SqliteValue> = (1..=MAX_TRIGGER_DEPTH)
+                .map(|i| SqliteValue::Integer(i64::try_from(i).unwrap()))
+                .collect();
+            assert_eq!(
+                executed, expected,
+                "every admitted INSTEAD OF body must run exactly once"
+            );
+            assert_trigger_program_state_clean(&at_limit);
+
+            let over_limit = build_recursive_off_instead_of_ring(MAX_TRIGGER_DEPTH + 1).await;
+            let error = over_limit
+                .execute("UPDATE v1 SET n = 1;")
+                .await
+                .expect_err("the ninth admitted INSTEAD OF body must exceed the cap");
+            assert!(
+                matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                "expected typed depth error, got {error:?}"
+            );
+            let rows = over_limit
+                .query("SELECT COUNT(*) FROM body_log;")
+                .await
+                .unwrap();
+            assert_eq!(
+                row_values(&rows[0])[0],
+                SqliteValue::Integer(0),
+                "the failed statement must roll back every logged body"
+            );
+            assert_trigger_program_state_clean(&over_limit);
+        });
+    }
+
+    /// bd-wymdl.1 differential: the recursive_triggers=OFF suppression ring
+    /// must produce byte-identical table values in C SQLite (rusqlite, where
+    /// SQLITE_MAX_TRIGGER_DEPTH=1000 leaves an 8-ring far below every cap) and
+    /// FrankenSQLite (where the ring sits exactly AT the local cap, so any
+    /// false charge for the suppressed entry diverges).
+    #[test]
+    fn differential_recursive_off_ring_matches_rusqlite() {
+        asupersync::test_utils::run_test(|| async {
+            for timing in ["BEFORE", "AFTER"] {
+                let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+                for i in 1..=MAX_TRIGGER_DEPTH {
+                    sqlite
+                        .execute_batch(&format!(
+                            "CREATE TABLE ring{i} (n INTEGER); INSERT INTO ring{i} VALUES (0);"
+                        ))
+                        .unwrap();
+                }
+                for i in 1..=MAX_TRIGGER_DEPTH {
+                    let next = if i == MAX_TRIGGER_DEPTH { 1 } else { i + 1 };
+                    sqlite
+                        .execute_batch(&format!(
+                            "CREATE TRIGGER ring_trg{i} {timing} UPDATE ON ring{i} \
+                             BEGIN UPDATE ring{next} SET n = n + 1; END;"
+                        ))
+                        .unwrap();
+                }
+                sqlite.execute("UPDATE ring1 SET n = n + 1;", []).unwrap();
+                let reference: Vec<i64> = (1..=MAX_TRIGGER_DEPTH)
+                    .map(|i| {
+                        sqlite
+                            .query_row(&format!("SELECT n FROM ring{i};"), [], |row| row.get(0))
+                            .unwrap()
+                    })
+                    .collect();
+
+                let franken = build_recursive_off_trigger_ring(timing, MAX_TRIGGER_DEPTH).await;
+                franken
+                    .execute("UPDATE ring1 SET n = n + 1;")
+                    .await
+                    .expect("stock-SQLite-compatible suppression semantics");
+                assert_eq!(
+                    ring_values(&franken, MAX_TRIGGER_DEPTH).await,
+                    reference,
+                    "{timing} ring diverged from C SQLite suppression semantics"
+                );
+            }
+        });
+    }
+
+    /// bd-wymdl.1 criterion 4: the RAII guards that a dropped (cancelled)
+    /// execution future runs are exactly what restores recursion state.
+    #[test]
+    fn trigger_frame_and_fk_guards_restore_state_on_drop() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let frame_guard = conn.push_trigger_frame(TriggerFrame {
+                table_name: "t".to_owned(),
+                trigger_name: "trg".to_owned(),
+                column_names: Vec::new(),
+                rowid_alias_col_idx: None,
+                old_row: None,
+                new_row: None,
+            });
+            assert_eq!(conn.trigger_frame_stack.borrow().len(), 1);
+            let fk_guard = conn.enter_fk_cascade().unwrap();
+            assert_eq!(conn.fk_cascade_depth.get(), 1);
+            assert_eq!(conn.active_recursive_program_depth(), 2);
+            // Dropping mid-program — which is what dropping an execute()
+            // future at any await point does — must restore both counters.
+            drop(fk_guard);
+            assert_eq!(conn.fk_cascade_depth.get(), 0);
+            drop(frame_guard);
+            assert_trigger_program_state_clean(&conn);
+        });
+    }
+
+    /// bd-wymdl.1 criterion 4: drop the execution future mid-flight if a
+    /// pending point with charged frames is observable; in every case the
+    /// connection must come back with zeroed recursion counters, no partial
+    /// writes, and remain usable.
+    #[test]
+    fn dropping_recursive_trigger_execute_future_restores_recursion_state() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = build_bounded_trigger_chain(MAX_TRIGGER_DEPTH).await;
+            let completed = {
+                let mut future = std::pin::pin!(conn.execute("UPDATE a SET n = 1;"));
+                let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+                let mut completed = None;
+                for _ in 0..100_000 {
+                    match future.as_mut().poll(&mut task_cx) {
+                        std::task::Poll::Ready(result) => {
+                            completed = Some(result);
+                            break;
+                        }
+                        std::task::Poll::Pending => {
+                            if !conn.trigger_frame_stack.borrow().is_empty() {
+                                // Mid-program pending point observed: cancel
+                                // here by dropping the future (loop exit).
+                                break;
+                            }
+                        }
+                    }
+                }
+                completed
+            };
+            // Whether the future completed or was dropped mid-program, the
+            // recursion counters must be fully restored ...
+            assert_trigger_program_state_clean(&conn);
+            // ... and the statement must have been atomic: either fully
+            // applied or fully rolled back.
+            let rows = conn
+                .query("SELECT (SELECT n FROM a), (SELECT n FROM b);")
+                .await
+                .expect("connection must remain usable after cancellation");
+            let observed = row_values(&rows[0]);
+            if let Some(result) = completed {
+                result.expect("bounded chain at the cap must succeed");
+                assert_ne!(
+                    observed,
+                    vec![SqliteValue::Integer(0), SqliteValue::Integer(0)],
+                    "a completed statement must have applied its writes"
+                );
+            } else {
+                assert_eq!(
+                    observed,
+                    vec![SqliteValue::Integer(0), SqliteValue::Integer(0)],
+                    "a cancelled statement must leave no partial writes"
+                );
+            }
+        });
+    }
+
+    // ─── bd-wymdl.2: coherent trigger/FK depth overrides and the exact
+    //     50/51 aggregate recursive-program boundary ──────────────────────
+
+    /// bd-wymdl.2 criterion 1: the test-only override updates BOTH the local
+    /// trigger cap and the aggregate trigger/FK cap coherently, and restores
+    /// both on Drop (including nested overrides).
+    #[test]
+    fn depth_override_guard_updates_both_limits_and_restores_on_drop() {
+        assert_eq!(trigger_depth_limit(), MAX_TRIGGER_DEPTH);
+        assert_eq!(trigger_program_depth_limit(), MAX_TRIGGER_PROGRAM_DEPTH);
+        {
+            let _outer = TriggerDepthLimitOverrideGuard::new(64);
+            assert_eq!(trigger_depth_limit(), 64);
+            assert_eq!(
+                trigger_program_depth_limit(),
+                64,
+                "raising the local cap must raise the aggregate cap with it"
+            );
+            {
+                let _inner = TriggerDepthLimitOverrideGuard::new(3);
+                assert_eq!(trigger_depth_limit(), 3);
+                assert_eq!(
+                    trigger_program_depth_limit(),
+                    MAX_TRIGGER_PROGRAM_DEPTH,
+                    "lowering the local cap must not shrink the aggregate budget"
+                );
+            }
+            assert_eq!(trigger_depth_limit(), 64, "inner Drop must restore outer");
+            assert_eq!(trigger_program_depth_limit(), 64);
+        }
+        assert_eq!(trigger_depth_limit(), MAX_TRIGGER_DEPTH);
+        assert_eq!(trigger_program_depth_limit(), MAX_TRIGGER_PROGRAM_DEPTH);
+    }
+
+    /// Run `test` on a thread with an explicit large stack: aggregate-depth
+    /// boundary programs execute ~50 nested statement pipelines, far beyond a
+    /// default 2 MiB test stack in debug builds (~186 KiB/level measured).
+    fn run_on_large_stack(name: &str, test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn large-stack test thread")
+            .join()
+            .expect("large-stack test thread panicked");
+    }
+
+    /// bd-wymdl.2 criterion 5: a 64-entry chain proves the override itself
+    /// (both caps observed at 64) without changing production policy.
+    #[test]
+    fn override_sixty_four_entry_trigger_chain_proves_coherent_override() {
+        run_on_large_stack("override-64-entry-chain", || {
+            asupersync::test_utils::run_test(|| async {
+                let _override = TriggerDepthLimitOverrideGuard::new(64);
+                let at_limit = build_bounded_trigger_chain(64).await;
+                at_limit
+                    .execute("UPDATE a SET n = 1;")
+                    .await
+                    .expect("64 trigger entries must be admitted under the 64 override");
+                assert_trigger_program_state_clean(&at_limit);
+
+                let over_limit = build_bounded_trigger_chain(65).await;
+                let error = over_limit
+                    .execute("UPDATE a SET n = 1;")
+                    .await
+                    .expect_err("the 65th entry must be rejected under the 64 override");
+                assert!(
+                    matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                    "expected typed depth error, got {error:?}"
+                );
+                assert_trigger_program_state_clean(&over_limit);
+            });
+        });
+        // Production policy is unchanged: the override is thread-local and
+        // scoped, and the compile-time constants keep their released values.
+        assert_eq!(MAX_TRIGGER_DEPTH, 8);
+        assert_eq!(MAX_TRIGGER_PROGRAM_DEPTH, 50);
+        assert_eq!(trigger_depth_limit(), MAX_TRIGGER_DEPTH);
+        assert_eq!(trigger_program_depth_limit(), MAX_TRIGGER_PROGRAM_DEPTH);
+    }
+
+    /// Build `trigger → fk_links FK cascades → trigger`: DELETE FROM start
+    /// fires start_trg (program 1), whose body deletes the FK chain root;
+    /// the chain charges `fk_links` FK-action programs; the deepest table's
+    /// AFTER DELETE trigger is the final admitted program.
+    /// Aggregate admitted depth = `fk_links + 2`.
+    async fn build_trigger_fk_trigger_chain(fk_links: usize) -> Connection {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+        conn.execute("CREATE TABLE trigger_log (entry INTEGER);")
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE f0 (id INTEGER PRIMARY KEY);")
+            .await
+            .unwrap();
+        for i in 1..=fk_links {
+            let parent = i - 1;
+            conn.execute(&format!(
+                "CREATE TABLE f{i} (id INTEGER PRIMARY KEY, \
+                 parent INTEGER REFERENCES f{parent}(id) ON DELETE CASCADE);"
+            ))
+            .await
+            .unwrap();
+        }
+        conn.execute("INSERT INTO f0 VALUES (1);").await.unwrap();
+        for i in 1..=fk_links {
+            conn.execute(&format!("INSERT INTO f{i} VALUES (1, 1);"))
+                .await
+                .unwrap();
+        }
+        conn.execute("CREATE TABLE start (id INTEGER PRIMARY KEY);")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO start VALUES (1);").await.unwrap();
+        conn.execute(
+            "CREATE TRIGGER start_trg AFTER DELETE ON start \
+             BEGIN DELETE FROM f0 WHERE id = OLD.id; END;",
+        )
+        .await
+        .unwrap();
+        conn.execute(&format!(
+            "CREATE TRIGGER tail_trg AFTER DELETE ON f{fk_links} \
+             BEGIN INSERT INTO trigger_log VALUES (1); END;"
+        ))
+        .await
+        .unwrap();
+        conn
+    }
+
+    /// bd-wymdl.2 criterion 2: trigger → 48 FK → trigger succeeds at the
+    /// exact aggregate depth of 50; trigger → 49 FK → trigger rejects the
+    /// 51st admission with full unwind and rollback.
+    #[test]
+    fn mixed_trigger_fk_trigger_boundary_is_exactly_fifty() {
+        run_on_large_stack("trigger-fk-trigger-50", || {
+            asupersync::test_utils::run_test(|| async {
+                // 48 FK links + the two trigger programs = aggregate 50.
+                let at_limit = build_trigger_fk_trigger_chain(MAX_TRIGGER_PROGRAM_DEPTH - 2).await;
+                at_limit
+                    .execute("DELETE FROM start WHERE id = 1;")
+                    .await
+                    .expect("aggregate depth of exactly 50 must be admitted");
+                let rows = at_limit
+                    .query("SELECT COUNT(*) FROM trigger_log;")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row_values(&rows[0])[0],
+                    SqliteValue::Integer(1),
+                    "the 50th program (tail trigger) must have executed"
+                );
+                let rows = at_limit
+                    .query(&format!(
+                        "SELECT COUNT(*) FROM f{};",
+                        MAX_TRIGGER_PROGRAM_DEPTH - 2
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row_values(&rows[0])[0],
+                    SqliteValue::Integer(0),
+                    "the full cascade chain must have executed"
+                );
+                assert_trigger_program_state_clean(&at_limit);
+
+                // 49 FK links: the tail trigger would be admission 51.
+                let over_limit =
+                    build_trigger_fk_trigger_chain(MAX_TRIGGER_PROGRAM_DEPTH - 1).await;
+                let error = over_limit
+                    .execute("DELETE FROM start WHERE id = 1;")
+                    .await
+                    .expect_err("aggregate admission 51 must be rejected");
+                assert!(
+                    matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                    "expected typed depth error, got {error:?}"
+                );
+                // Full statement rollback: the parent row, every chain row,
+                // and the log must be untouched.
+                let rows = over_limit
+                    .query("SELECT COUNT(*) FROM start;")
+                    .await
+                    .unwrap();
+                assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+                for i in 0..MAX_TRIGGER_PROGRAM_DEPTH {
+                    let rows = over_limit
+                        .query(&format!("SELECT COUNT(*) FROM f{i};"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        row_values(&rows[0])[0],
+                        SqliteValue::Integer(1),
+                        "chain table f{i} must be rolled back"
+                    );
+                }
+                let rows = over_limit
+                    .query("SELECT COUNT(*) FROM trigger_log;")
+                    .await
+                    .unwrap();
+                assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(0));
+                assert_trigger_program_state_clean(&over_limit);
+            });
+        });
+    }
+
+    /// Build `FK → trigger → tail_fk_links FK cascades`: DELETE FROM p
+    /// cascades into c (program 1); c's AFTER DELETE trigger (program 2)
+    /// deletes the root of a second cascade chain (programs 3..).
+    /// Aggregate admitted depth = `tail_fk_links + 2`.
+    async fn build_fk_trigger_fk_chain(tail_fk_links: usize) -> Connection {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+        conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY);")
+            .await
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+             parent INTEGER REFERENCES p(id) ON DELETE CASCADE);",
+        )
+        .await
+        .unwrap();
+        conn.execute("CREATE TABLE g0 (id INTEGER PRIMARY KEY);")
+            .await
+            .unwrap();
+        for i in 1..=tail_fk_links {
+            let parent = i - 1;
+            conn.execute(&format!(
+                "CREATE TABLE g{i} (id INTEGER PRIMARY KEY, \
+                 parent INTEGER REFERENCES g{parent}(id) ON DELETE CASCADE);"
+            ))
+            .await
+            .unwrap();
+        }
+        conn.execute("INSERT INTO p VALUES (1);").await.unwrap();
+        conn.execute("INSERT INTO c VALUES (1, 1);").await.unwrap();
+        conn.execute("INSERT INTO g0 VALUES (1);").await.unwrap();
+        for i in 1..=tail_fk_links {
+            conn.execute(&format!("INSERT INTO g{i} VALUES (1, 1);"))
+                .await
+                .unwrap();
+        }
+        conn.execute(
+            "CREATE TRIGGER c_trg AFTER DELETE ON c \
+             BEGIN DELETE FROM g0 WHERE id = OLD.id; END;",
+        )
+        .await
+        .unwrap();
+        conn
+    }
+
+    /// bd-wymdl.2 criterion 3: FK → trigger → 48 FK succeeds at 50; the
+    /// 49-link variant rejects attempt 51 with full unwind and rollback.
+    #[test]
+    fn mixed_fk_trigger_fk_boundary_is_exactly_fifty() {
+        run_on_large_stack("fk-trigger-fk-50", || {
+            asupersync::test_utils::run_test(|| async {
+                let at_limit = build_fk_trigger_fk_chain(MAX_TRIGGER_PROGRAM_DEPTH - 2).await;
+                at_limit
+                    .execute("DELETE FROM p WHERE id = 1;")
+                    .await
+                    .expect("aggregate depth of exactly 50 must be admitted");
+                let rows = at_limit
+                    .query(&format!(
+                        "SELECT COUNT(*) FROM g{};",
+                        MAX_TRIGGER_PROGRAM_DEPTH - 2
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row_values(&rows[0])[0],
+                    SqliteValue::Integer(0),
+                    "the deepest cascade (program 50) must have executed"
+                );
+                assert_trigger_program_state_clean(&at_limit);
+
+                let over_limit = build_fk_trigger_fk_chain(MAX_TRIGGER_PROGRAM_DEPTH - 1).await;
+                let error = over_limit
+                    .execute("DELETE FROM p WHERE id = 1;")
+                    .await
+                    .expect_err("aggregate admission 51 must be rejected");
+                assert!(
+                    matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                    "expected typed depth error, got {error:?}"
+                );
+                let rows = over_limit.query("SELECT COUNT(*) FROM p;").await.unwrap();
+                assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+                let rows = over_limit.query("SELECT COUNT(*) FROM c;").await.unwrap();
+                assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+                for i in 0..MAX_TRIGGER_PROGRAM_DEPTH {
+                    let rows = over_limit
+                        .query(&format!("SELECT COUNT(*) FROM g{i};"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        row_values(&rows[0])[0],
+                        SqliteValue::Integer(1),
+                        "chain table g{i} must be rolled back"
+                    );
+                }
+                assert_trigger_program_state_clean(&over_limit);
+            });
+        });
+    }
+
+    // ─── bd-wymdl.3: one recursive-program budget across ATTACH delegation ──
+
+    /// bd-wymdl.3 criterion 1: attached-schema delegation seeds the child
+    /// connection with the parent's active recursive-program depth and
+    /// restores the child baseline afterwards.
+    #[test]
+    fn attached_delegation_seeds_child_recursive_program_budget() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let aux_path = dir.path().join("seed-aux.db");
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(&format!(
+                "ATTACH DATABASE '{}' AS aux;",
+                aux_path.to_string_lossy()
+            ))
+            .await
+            .unwrap();
+
+            let frame_guard = conn.push_trigger_frame(TriggerFrame {
+                table_name: "t".to_owned(),
+                trigger_name: "trg".to_owned(),
+                column_names: Vec::new(),
+                rowid_alias_col_idx: None,
+                old_row: None,
+                new_row: None,
+            });
+            let fk_guard = conn.enter_fk_cascade().unwrap();
+            conn.with_attached_connection("aux", |child| {
+                assert_eq!(
+                    child.inherited_recursive_program_depth.get(),
+                    2,
+                    "delegation must seed the parent's active program depth"
+                );
+                assert_eq!(child.active_recursive_program_depth(), 2);
+                child
+                    .ensure_trigger_program_admission_available()
+                    .expect("depth 2 of 50 must still admit programs");
+                Ok(())
+            })
+            .unwrap();
+            drop(fk_guard);
+            drop(frame_guard);
+            conn.with_attached_connection("aux", |child| {
+                assert_eq!(
+                    child.inherited_recursive_program_depth.get(),
+                    0,
+                    "the child baseline must be restored after delegation"
+                );
+                Ok(())
+            })
+            .unwrap();
+        });
+    }
+
+    /// Build a main-schema trigger whose body deletes the root of an
+    /// `fk_links`-deep ON DELETE CASCADE chain living entirely in the
+    /// attached `aux` schema. Aggregate admitted depth = `fk_links + 1`
+    /// (one main trigger frame + the child's FK cascade programs), which is
+    /// only enforced if the child charges the SAME budget as the parent.
+    async fn build_cross_schema_trigger_fk_chain(
+        aux_path: &std::path::Path,
+        fk_links: usize,
+    ) -> Connection {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute(&format!(
+            "ATTACH DATABASE '{}' AS aux;",
+            aux_path.to_string_lossy()
+        ))
+        .await
+        .unwrap();
+        // PRAGMA forwarding to attached child connections does not exist yet,
+        // so arm FK enforcement on the child directly (test-only access).
+        conn.with_attached_connection("aux", |child| {
+            child.pragma_state.borrow_mut().foreign_keys = true;
+            Ok(())
+        })
+        .unwrap();
+        conn.execute("CREATE TABLE aux.f0 (id INTEGER PRIMARY KEY);")
+            .await
+            .unwrap();
+        for i in 1..=fk_links {
+            let parent = i - 1;
+            conn.execute(&format!(
+                "CREATE TABLE aux.f{i} (id INTEGER PRIMARY KEY, \
+                 parent INTEGER REFERENCES f{parent}(id) ON DELETE CASCADE);"
+            ))
+            .await
+            .unwrap();
+        }
+        conn.execute("INSERT INTO aux.f0 VALUES (1);")
+            .await
+            .unwrap();
+        for i in 1..=fk_links {
+            conn.execute(&format!("INSERT INTO aux.f{i} VALUES (1, 1);"))
+                .await
+                .unwrap();
+        }
+        conn.execute("CREATE TABLE start (id INTEGER PRIMARY KEY);")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO start VALUES (1);").await.unwrap();
+        conn.execute(
+            "CREATE TRIGGER start_trg AFTER DELETE ON start \
+             BEGIN DELETE FROM aux.f0 WHERE id = OLD.id; END;",
+        )
+        .await
+        .unwrap();
+        conn
+    }
+
+    /// bd-wymdl.3 criterion 2: a main-trigger → attached-FK-cascade program
+    /// charges ONE aggregate budget: depth 50 succeeds, attempt 51 fails,
+    /// and the attached child does not reset the boundary to zero.
+    #[test]
+    fn cross_schema_recursive_program_budget_is_not_reset_by_attach_delegation() {
+        run_on_large_stack("cross-schema-budget-50", || {
+            asupersync::test_utils::run_test(|| async {
+                let dir = tempfile::tempdir().unwrap();
+
+                // 49 FK links + 1 main trigger frame = aggregate 50: admitted.
+                let at_limit = build_cross_schema_trigger_fk_chain(
+                    &dir.path().join("aux-at-limit.db"),
+                    MAX_TRIGGER_PROGRAM_DEPTH - 1,
+                )
+                .await;
+                at_limit
+                    .execute("DELETE FROM start WHERE id = 1;")
+                    .await
+                    .expect("cross-schema aggregate depth of exactly 50 must be admitted");
+                let rows = at_limit
+                    .query(&format!(
+                        "SELECT COUNT(*) FROM aux.f{};",
+                        MAX_TRIGGER_PROGRAM_DEPTH - 1
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row_values(&rows[0])[0],
+                    SqliteValue::Integer(0),
+                    "the deepest attached cascade must have executed"
+                );
+                assert_trigger_program_state_clean(&at_limit);
+                at_limit
+                    .with_attached_connection("aux", |child| {
+                        assert_eq!(child.fk_cascade_depth.get(), 0);
+                        assert_eq!(child.inherited_recursive_program_depth.get(), 0);
+                        Ok(())
+                    })
+                    .unwrap();
+
+                // 50 FK links: the deepest cascade is aggregate admission 51
+                // and must be rejected even though it runs on the child.
+                let over_limit = build_cross_schema_trigger_fk_chain(
+                    &dir.path().join("aux-over-limit.db"),
+                    MAX_TRIGGER_PROGRAM_DEPTH,
+                )
+                .await;
+                let error = over_limit
+                    .execute("DELETE FROM start WHERE id = 1;")
+                    .await
+                    .expect_err(
+                        "cross-schema aggregate admission 51 must be rejected; \
+                         succeeding means ATTACH delegation reset the budget",
+                    );
+                assert!(
+                    matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                    "expected typed depth error, got {error:?}"
+                );
+                let rows = over_limit
+                    .query("SELECT COUNT(*) FROM start;")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row_values(&rows[0])[0],
+                    SqliteValue::Integer(1),
+                    "the failed outer statement must roll back the main schema"
+                );
+                let rows = over_limit
+                    .query("SELECT COUNT(*) FROM aux.f0;")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row_values(&rows[0])[0],
+                    SqliteValue::Integer(1),
+                    "the failed delegated statement must roll back the attached schema"
+                );
+                assert_trigger_program_state_clean(&over_limit);
+                over_limit
+                    .with_attached_connection("aux", |child| {
+                        assert_eq!(child.fk_cascade_depth.get(), 0);
+                        assert_eq!(child.inherited_recursive_program_depth.get(), 0);
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+        });
+    }
+
+    /// bd-wymdl.3 criterion 4: ATTACH/DETACH may not run while a recursive
+    /// trigger/FK program is active; the registry must be untouched.
+    #[test]
+    fn attach_detach_rejected_during_active_recursive_program() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let aux_path = dir.path().join("reject-aux.db");
+            let aux_sql = format!("ATTACH DATABASE '{}' AS aux;", aux_path.to_string_lossy());
+            let conn = Connection::open(":memory:").await.unwrap();
+
+            let frame_guard = conn.push_trigger_frame(TriggerFrame {
+                table_name: "t".to_owned(),
+                trigger_name: "trg".to_owned(),
+                column_names: Vec::new(),
+                rowid_alias_col_idx: None,
+                old_row: None,
+                new_row: None,
+            });
+            let error = conn
+                .execute(&aux_sql)
+                .await
+                .expect_err("ATTACH during an active recursive program must fail closed");
+            assert!(
+                error.to_string().contains("ATTACH is not allowed"),
+                "unexpected ATTACH rejection: {error}"
+            );
+            assert!(
+                conn.attached_schemas.borrow().find("aux").is_none(),
+                "the rejected ATTACH must not mutate the schema registry"
+            );
+            drop(frame_guard);
+
+            // With no active program the same ATTACH succeeds, and DETACH is
+            // then rejected under an active program.
+            conn.execute(&aux_sql).await.expect("plain ATTACH works");
+            let fk_guard = conn.enter_fk_cascade().unwrap();
+            let error = conn
+                .execute("DETACH DATABASE aux;")
+                .await
+                .expect_err("DETACH during an active recursive program must fail closed");
+            assert!(
+                error.to_string().contains("DETACH is not allowed"),
+                "unexpected DETACH rejection: {error}"
+            );
+            assert!(
+                conn.attached_schemas.borrow().find("aux").is_some(),
+                "the rejected DETACH must not mutate the schema registry"
+            );
+            drop(fk_guard);
+            conn.execute("DETACH DATABASE aux;")
+                .await
+                .expect("plain DETACH works after the program ends");
+        });
+    }
+
+    /// bd-wymdl.3 criterion 4: ATTACH/DETACH inside trigger bodies fail
+    /// closed before any registry mutation (C SQLite's trigger grammar cannot
+    /// even express them).
+    #[test]
+    fn attach_detach_inside_trigger_bodies_fail_closed() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let attached_path = dir.path().join("body-attached.db");
+            let new_path = dir.path().join("body-new.db");
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(&format!(
+                "ATTACH DATABASE '{}' AS aux;",
+                attached_path.to_string_lossy()
+            ))
+            .await
+            .unwrap();
+            conn.execute("CREATE TABLE t (n INTEGER);").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (0);").await.unwrap();
+
+            conn.execute(
+                "CREATE TRIGGER t_detach AFTER UPDATE ON t BEGIN DETACH DATABASE aux; END;",
+            )
+            .await
+            .unwrap();
+            let error = conn
+                .execute("UPDATE t SET n = 1;")
+                .await
+                .expect_err("DETACH inside a trigger body must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("not allowed inside trigger bodies"),
+                "unexpected trigger-body DETACH rejection: {error}"
+            );
+            assert!(
+                conn.attached_schemas.borrow().find("aux").is_some(),
+                "aux must remain attached after the rejected trigger body"
+            );
+            let rows = conn.query("SELECT n FROM t;").await.unwrap();
+            assert_eq!(
+                row_values(&rows[0])[0],
+                SqliteValue::Integer(0),
+                "the failed statement must roll back the triggering UPDATE"
+            );
+            assert_trigger_program_state_clean(&conn);
+
+            conn.execute("DROP TRIGGER t_detach;").await.unwrap();
+            conn.execute(&format!(
+                "CREATE TRIGGER t_attach AFTER UPDATE ON t \
+                 BEGIN ATTACH DATABASE '{}' AS extra; END;",
+                new_path.to_string_lossy()
+            ))
+            .await
+            .unwrap();
+            let error = conn
+                .execute("UPDATE t SET n = 1;")
+                .await
+                .expect_err("ATTACH inside a trigger body must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("not allowed inside trigger bodies"),
+                "unexpected trigger-body ATTACH rejection: {error}"
+            );
+            assert!(
+                conn.attached_schemas.borrow().find("extra").is_none(),
+                "the rejected trigger-body ATTACH must not mutate the registry"
+            );
+            assert_trigger_program_state_clean(&conn);
         });
     }
 
