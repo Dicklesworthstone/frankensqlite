@@ -50542,19 +50542,18 @@ impl Connection {
             }
         }
 
-        let fire_victim_delete_triggers = self.pragma_state.borrow().recursive_triggers
-            && {
-                let delete_event = fsqlite_ast::TriggerEvent::Delete;
-                self.has_matching_triggers(
-                    table_name,
-                    fsqlite_ast::TriggerTiming::Before,
-                    &delete_event,
-                ) || self.has_matching_triggers(
-                    table_name,
-                    fsqlite_ast::TriggerTiming::After,
-                    &delete_event,
-                )
-            };
+        let fire_victim_delete_triggers = self.pragma_state.borrow().recursive_triggers && {
+            let delete_event = fsqlite_ast::TriggerEvent::Delete;
+            self.has_matching_triggers(
+                table_name,
+                fsqlite_ast::TriggerTiming::Before,
+                &delete_event,
+            ) || self.has_matching_triggers(
+                table_name,
+                fsqlite_ast::TriggerTiming::After,
+                &delete_event,
+            )
+        };
         if fire_victim_delete_triggers {
             let delete_event = fsqlite_ast::TriggerEvent::Delete;
             for victim in &victims {
@@ -50562,13 +50561,8 @@ impl Connection {
                 // DELETE body observing the table sees post-delete state; the
                 // OLD.* frame values below are exact. RAISE outcomes propagate
                 // as statement errors like any other trigger failure.
-                self.fire_before_triggers(
-                    table_name,
-                    &delete_event,
-                    Some(&victim.values),
-                    None,
-                )
-                .await?;
+                self.fire_before_triggers(table_name, &delete_event, Some(&victim.values), None)
+                    .await?;
                 self.fire_after_triggers(table_name, &delete_event, Some(&victim.values), None)
                     .await?;
             }

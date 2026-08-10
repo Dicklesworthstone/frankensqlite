@@ -10742,9 +10742,8 @@ impl VdbeEngine {
                                                 // Delete conflicting rows that are not the new rowid
                                                 // (which will be replaced by upsert_row).
                                                 if conflict_rid != rowid {
-                                                    if let Some(old_values) = db
-                                                        .get_table(root)
-                                                        .and_then(|t| {
+                                                    if let Some(old_values) =
+                                                        db.get_table(root).and_then(|t| {
                                                             t.row_values_by_rowid(conflict_rid)
                                                         })
                                                     {
