@@ -328,11 +328,11 @@ impl TwoPhaseCommitSender {
     ///
     /// # Errors
     ///
-    /// Returns the checkpoint error when `cx` is cancelled before a slot
+    /// Returns [`FrankenError::Abort`] when `cx` is cancelled before a slot
     /// becomes available.
     pub fn reserve(&self, cx: &Cx) -> Result<SendPermit> {
         loop {
-            cx.checkpoint()?;
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             if let Some(permit) = self.try_reserve_for(RESERVE_CHECKPOINT_INTERVAL) {
                 return Ok(permit);
             }
