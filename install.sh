@@ -2,11 +2,10 @@
 #
 # FrankenSQLite installer
 #
-# One-line install while GitHub latest remains the legacy v0.1.17 release:
-#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.sh?$(date +%s)" | bash -s -- --version v0.1.17
+# One-line install (cache-busting query avoids stale proxy/CDN copies):
+#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.sh?$(date +%s)" | bash
 #
 # Examples:
-#   bash install.sh --version v0.1.17
 #   bash install.sh --version v0.2.0
 #   bash install.sh --offline ./fsqlite-0.2.0-linux_amd64.tar.gz --checksum SHA256
 #
