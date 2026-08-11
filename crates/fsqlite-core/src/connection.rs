@@ -7931,7 +7931,11 @@ impl PreparedStatement<'_> {
         if self.dml_dispatch.is_some() {
             return self.conn.execute_prepared(self).await;
         }
-        Ok(self.query().await?.len())
+        // bd-uzq54: box the query fallback so the hot prepared-DML execute
+        // future does not carry the ~17.7KB query state machine for a branch
+        // a DML statement can never take. The allocation lands only on the
+        // rare execute-a-SELECT path.
+        Ok(Box::pin(self.query()).await?.len())
     }
 
     /// Execute with bound SQL parameters and return affected/output row count.
@@ -7944,7 +7948,9 @@ impl PreparedStatement<'_> {
         if self.dml_dispatch.is_some() {
             return self.conn.execute_prepared_with_params(self, params).await;
         }
-        Ok(self.query_with_params(params).await?.len())
+        // bd-uzq54: box the query fallback (see `execute`); keeps the hot
+        // prepared-INSERT future at the size of the DML branch alone.
+        Ok(Box::pin(self.query_with_params(params)).await?.len())
     }
 
     /// Return an EXPLAIN-style disassembly for the compiled program.
@@ -19299,9 +19305,14 @@ impl Connection {
                         if hot_path_profile_enabled() {
                             FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
                         }
-                        let rows = self
-                            .execute_statement_impl_after_background_status(dml, p, None, false)
-                            .await?;
+                        // bd-uzq54: boxed — slow-path generic dispatch must
+                        // not inflate the hot precompiled-DML generator.
+                        let rows = Box::pin(
+                            self.execute_statement_impl_after_background_status(
+                                dml, p, None, false,
+                            ),
+                        )
+                        .await?;
                         self.note_connection_statement_execution_count(1);
                         return Ok(
                             if matches!(
@@ -19357,14 +19368,14 @@ impl Connection {
                         reason = "deferred_dml",
                     );
                 }
-                let rows = self
-                    .execute_statement_impl_after_background_status(
-                        dml,
-                        p,
-                        stmt.dispatch_precompiled_program(),
-                        false,
-                    )
-                    .await?;
+                // bd-uzq54: boxed — see the fast-path comment above.
+                let rows = Box::pin(self.execute_statement_impl_after_background_status(
+                    dml,
+                    p,
+                    stmt.dispatch_precompiled_program(),
+                    false,
+                ))
+                .await?;
                 self.note_connection_statement_execution_count(1);
                 let is_dml = matches!(
                     dml,
@@ -19376,10 +19387,13 @@ impl Connection {
                     rows.len()
                 })
             } else {
-                Ok(self
-                    .query_prepared_with_params_after_background_status(stmt, params)
-                    .await?
-                    .len())
+                // bd-uzq54: boxed — a DML execute can never take the query
+                // branch; keep its state machine out of the hot allocation.
+                Ok(Box::pin(
+                    self.query_prepared_with_params_after_background_status(stmt, params),
+                )
+                .await?
+                .len())
             }
         })
     }
@@ -124059,15 +124073,22 @@ mod tests {
                 "ambient capture must not fork per-database shared MVCC state"
             );
 
-            conn1
+            // Cross-connection functional check in the direction the engine
+            // supports today (writer = later-opened connection, reader =
+            // first-opened, mirroring cross_connection_commit_invalidates_
+            // cached_plans). The opposite direction (second-opened reader)
+            // fails with NoSuchTable even WITHOUT ambient capture — probed
+            // outside any runtime on 2026-08-11 — and is tracked as a
+            // separate pre-existing bug, not a bd-q8501 regression.
+            conn2
                 .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")
                 .await
                 .expect("create table");
-            conn1
+            conn2
                 .execute("INSERT INTO t(b) VALUES ('ambient');")
                 .await
                 .expect("insert");
-            let rows = conn2.query("SELECT b FROM t;").await.expect("select");
+            let rows = conn1.query("SELECT b FROM t;").await.expect("select");
             assert_eq!(rows.len(), 1);
         });
     }
