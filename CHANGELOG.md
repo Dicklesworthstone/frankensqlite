@@ -103,11 +103,23 @@ FrankenSQLite changed. Read **Breaking changes** before upgrading.
 
 ### Changed
 
-- **All 27 workspace members bumped `0.2.1 -> 0.3.0` in lockstep**, including
-  every internal dependency edge, so no member can resolve a mixed-version
-  sibling. `Cargo.lock` re-resolves the four Asupersync-family packages and
-  the 27 internal packages; no external dependency other than Asupersync
-  changed.
+- **All 27 workspace members bumped `0.2.1 -> 0.3.0` in lockstep.** The bump
+  covers 27 internal dependency declarations in the workspace root plus 38
+  explicit per-manifest version sites, so no member can resolve a
+  mixed-version sibling. `Cargo.lock` re-resolves the four Asupersync-family
+  packages and the 27 internal packages; no external dependency other than
+  Asupersync changed.
+
+  **25 of the 27 members are published to crates.io.** `fsqlite-e2e` and
+  `fsqlite-harness` are marked `publish = false` and are workspace-only test
+  infrastructure; they are versioned in lockstep so the workspace resolves
+  coherently, but they do not appear on crates.io and no release artifact is
+  expected for them.
+
+- **GitHub Actions no longer has a release path.** The `Release` workflow's
+  `v*` tag trigger is removed and its publish job is disabled fail-closed;
+  releases are cut exclusively through DSR. Tagging a version no longer
+  publishes anything.
 
 ### Known limitations carried from 0.2.1 and 0.2.0
 
