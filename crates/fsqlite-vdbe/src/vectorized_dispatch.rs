@@ -586,7 +586,11 @@ impl WorkStealingDispatcher {
         F: Fn(&PipelineTask, usize) -> R + Send + Sync + 'static,
     {
         runtime.block_on(async {
-            let cx = Cx::<cap::All>::new();
+            // Prefer the ambient runtime Cx installed by `block_on` so the
+            // dispatch inherits the caller's cancellation/budget lineage;
+            // mint a full-capability Cx only when no ambient context exists
+            // (these `*_on_runtime` wrappers are currently harness-facing).
+            let cx = Cx::<cap::All>::current().unwrap_or_else(Cx::<cap::All>::new);
             self.execute_with_barriers(&cx, pipelines, execute).await
         })
     }
@@ -604,7 +608,9 @@ impl WorkStealingDispatcher {
         F: Fn(&PipelineTask, usize) -> R + Send + Sync + 'static,
     {
         runtime.block_on(async {
-            let cx = Cx::<cap::All>::new();
+            // See execute_with_barriers_on_runtime: inherit ambient lineage
+            // when present, mint only as a fallback.
+            let cx = Cx::<cap::All>::current().unwrap_or_else(Cx::<cap::All>::new);
             self.execute_with_barriers_with_context(&cx, pipelines, context, execute)
                 .await
         })
