@@ -390,6 +390,23 @@ where
     Err(err)
 }
 
+/// GH #333: transient conflict classes that an *autocommit* statement may
+/// transparently absorb by re-executing on a fresh snapshot. A failed
+/// autocommit statement has fully rolled back before its error surfaces, so
+/// re-running it is always safe; `BusySnapshot` in particular can never be
+/// resolved by re-committing (the writes were validated against a stale
+/// snapshot) — only by re-executing the statement.
+///
+/// Explicit transactions are deliberately excluded by the callers: a
+/// `BusySnapshot` on explicit `COMMIT` is the documented first-committer-wins
+/// contract (see the GH #327 receipt) and must surface to the application.
+const fn autocommit_statement_conflict_is_retryable(error: &FrankenError) -> bool {
+    matches!(
+        error,
+        FrankenError::Busy | FrankenError::BusyRecovery | FrankenError::BusySnapshot { .. }
+    )
+}
+
 /// Maximum trigger recursion depth (F-PGM.11).
 ///
 /// SQLite defines `SQLITE_MAX_TRIGGER_DEPTH = 1000`, but each Rust recursion
@@ -17874,7 +17891,28 @@ impl Connection {
             if best_effort {
                 let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive).await;
             } else {
-                let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive).await?;
+                match self.pager.checkpoint(&cx, CheckpointMode::Passive).await {
+                    Ok(_) => {}
+                    // GH #333: the close-time passive checkpoint is
+                    // opportunistic WAL hygiene, not part of the close
+                    // contract — `close_without_checkpoint` documents that a
+                    // WAL-preserving close is fully correct and the next open
+                    // recovers the WAL normally. Under concurrent
+                    // same-file connections the checkpoint routinely loses
+                    // its maintenance-fence race to a sibling's write or
+                    // close; surfacing that transient contention made
+                    // `close()` itself fail. Skip the checkpoint instead.
+                    // Non-transient errors (corruption, I/O) still propagate.
+                    Err(error) if error.is_transient() => {
+                        tracing::debug!(
+                            target: "fsqlite.close",
+                            %error,
+                            "skipping close-time passive checkpoint under transient \
+                             contention; WAL is preserved for the next open"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
 
@@ -18847,7 +18885,7 @@ impl Connection {
         {
             let prepared = self.prepare_after_background_status(sql).await?;
             return self
-                .execute_prepared_with_params_after_background_status(&prepared, &[], false)
+                .execute_prepared_autocommit_with_conflict_retry(&prepared, &[])
                 .await;
         }
         let mut last_count = 0;
@@ -19136,8 +19174,74 @@ impl Connection {
         // after that transaction's guard was dropped would write inside the
         // abandoned transaction instead of rolling it back first.
         self.settle_pending_transaction_cleanup().await?;
-        self.execute_prepared_with_params_after_background_status(stmt, params, false)
+        self.execute_prepared_autocommit_with_conflict_retry(stmt, params)
             .await
+    }
+
+    /// Whether the connection is at an autocommit statement boundary, i.e. a
+    /// failed statement executed now has no surviving transaction state and
+    /// may be transparently re-executed.
+    fn autocommit_conflict_retry_boundary(&self) -> bool {
+        !self.in_transaction.get()
+            && !self.implicit_txn.get()
+            && self.active_txn.borrow().is_none()
+    }
+
+    /// GH #333: execute a prepared statement, transparently re-executing it on
+    /// transient conflict errors while the connection is in autocommit mode.
+    ///
+    /// Concurrent-mode autocommit writes commit under first-committer-wins
+    /// validation, so two connections updating the same page race and the
+    /// loser fails with `BusySnapshot` even though `busy_timeout` budget
+    /// remains. For an autocommit statement the engine owns the whole
+    /// begin→execute→commit cycle and the failed attempt has fully rolled
+    /// back, so the statement is re-executed on a fresh snapshot within the
+    /// `busy_timeout` budget — mirroring how stock SQLite's busy handler
+    /// absorbs writer contention for autocommit statements. Explicit
+    /// transactions never enter the retry (the conflict must surface so the
+    /// application can replay the transaction).
+    async fn execute_prepared_autocommit_with_conflict_retry(
+        &self,
+        stmt: &PreparedStatement<'_>,
+        params: &[SqliteValue],
+    ) -> Result<usize> {
+        let autocommit_entry = self.autocommit_conflict_retry_boundary();
+        let mut result = self
+            .execute_prepared_with_params_after_background_status(stmt, params, false)
+            .await;
+        if !autocommit_entry
+            || !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error))
+        {
+            return result;
+        }
+        let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+        let deadline = Duration::from_millis(busy_timeout_ms);
+        let started = Instant::now();
+        let mut handoff = BeginBusyRetryHandoff::default();
+        while let Some(wait) = handoff.next_wait(started, deadline) {
+            // Conformal SLO cap, matching the commit-path busy loop: stop
+            // retrying once the latency SLO disqualifies further attempts.
+            if !self
+                .conformal_retry_budget
+                .borrow()
+                .retry_allowed(started.elapsed())
+            {
+                break;
+            }
+            perform_begin_busy_retry_handoff(wait).await;
+            // The failed attempt must have fully unwound; if any transaction
+            // state survived, re-executing would not be an autocommit retry.
+            if !self.autocommit_conflict_retry_boundary() {
+                break;
+            }
+            result = self
+                .execute_prepared_with_params_after_background_status(stmt, params, false)
+                .await;
+            if !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error)) {
+                break;
+            }
+        }
+        result
     }
 
     // Prepared DML re-enters statement execution (triggers, FK cascades), which
@@ -124042,8 +124146,20 @@ mod tests {
             let db_path = dir.path().join("ambient-capture.db");
             let db_path = db_path.to_string_lossy().into_owned();
 
-            let conn1 = Connection::open(&db_path).await.expect("open conn1");
-            let conn2 = Connection::open(&db_path).await.expect("open conn2");
+            // Resolve the default env ONCE for both opens: concurrent tests
+            // (test_global_runtime_context_does_not_capture_ambient_native_cx)
+            // call init_global_runtime and can swap the process-global context
+            // between two bare `Connection::open` calls, which would fork the
+            // (path, runtime_id) SharedMvccState key and flake the ptr_eq
+            // assertion below. The per-connection ambient capture under test
+            // happens in the open path regardless of how the env was obtained.
+            let env = ConnectionEnv::default();
+            let conn1 = Connection::open_with_env(&db_path, env.clone())
+                .await
+                .expect("open conn1");
+            let conn2 = Connection::open_with_env(&db_path, env)
+                .await
+                .expect("open conn2");
 
             assert!(
                 conn1.root_cx.attached_native_cx().is_some(),
