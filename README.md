@@ -957,7 +957,7 @@ Write transactions submit commit requests through an MPSC channel to a single wr
 
 ## Structured Concurrency, Cancellation, and Supervision
 
-FrankenSQLite adopts asupersync's **region tree** as the lifetime model for all concurrency. Every background worker, coordinator, replicator, and long-lived service runs as a region-owned task or actor. No task may outlive the `Database` root region. There are no detached tasks.
+FrankenSQLite uses a **region tree** as the lifetime model for all concurrency: `fsqlite-core` maintains its own `RegionTree` bookkeeping over asupersync root-region tasks (spawned via `RuntimeHandle::try_spawn` with registered handles, startup checkpoints, and shutdown signals), rather than asupersync's child-region `Scope` API directly. Every background worker, coordinator, replicator, and long-lived service runs as a region-owned task or actor under that tree. No task may outlive the `Database` root region. There are no detached tasks.
 
 **Region tree (conceptual):**
 
