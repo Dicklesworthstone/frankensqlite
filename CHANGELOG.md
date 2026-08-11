@@ -21,19 +21,31 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ## [0.3.0] -- unreleased (Asupersync 0.4.3 compatibility)
 
-Lockstep `0.2.1 -> 0.3.0` bump of all 27 workspace members. Dependency-scope
-release: no feature work, no bug fixes, and **no performance claim** --
-nothing here was measured, and the release-gate performance matrix remains
-out of scope.
+Lockstep `0.2.1 -> 0.3.0` bump of all 27 workspace members. The only edits in
+this release are dependency constraints and version numbers: no hand-authored
+FrankenSQLite feature work, no hand-authored bug fixes, and **no performance
+claim** -- nothing here was measured, and the release-gate performance matrix
+remains out of scope.
 
-> **BREAKING, with no hand-authored source change.** Not a contradiction:
-> the break is in the *identity* of a type FrankenSQLite exposes, not in any
-> line of FrankenSQLite code. Every public signature keeps its exact shape;
-> one of the types appearing in those signatures comes from a dependency that
-> has moved to an incompatible major-compatibility lane. A caller who
-> upgrades FrankenSQLite and Asupersync together needs no code edits. A
-> caller who upgrades only FrankenSQLite gets type errors. That is why this
-> is a `0.3.0` family and not a `0.2.2` patch.
+**This is not a behavior-free release.** The async runtime underneath
+FrankenSQLite changed. Read **Breaking changes** before upgrading.
+
+> **BREAKING on two independent axes, neither of which is a hand-edited
+> FrankenSQLite signature.**
+>
+> 1. **Type identity.** Every public signature keeps its exact shape, but some
+>    of them name Asupersync types, and Asupersync `0.3.x` and `0.4.x` are
+>    non-interchangeable. A caller that upgrades only FrankenSQLite gets type
+>    errors.
+> 2. **Runtime behavior.** Asupersync `0.4.0`-`0.4.3` changed scheduler,
+>    lifecycle, cancellation, blocking-driver, stream-context, and
+>    poll-panic-containment semantics. Upgrading FrankenSQLite swaps the
+>    runtime that executes your database operations.
+>
+> So moving the Asupersync dependency in the same change is necessary but not
+> sufficient: callers must also revalidate cancellation and runtime behavior
+> against the new runtime. That is why this is a `0.3.0` family and not a
+> `0.2.2` patch.
 
 ### Breaking changes
 
@@ -54,9 +66,40 @@ out of scope.
   across to a FrankenSQLite built against 0.4.x.
 
   *Migration:* move your own `asupersync` dependency to `>=0.4.3,<0.5` in the
-  same change that moves `fsqlite` to `0.3`. No FrankenSQLite call site
-  changes. A caller pinning `fsqlite = "0.2"` keeps the 0.2.1 API against
-  Asupersync 0.3.10 and is not upgraded silently.
+  same change that moves `fsqlite` to `0.3`; the two cannot be upgraded
+  separately. No FrankenSQLite call site needs a signature edit, but see the
+  runtime-behavior entry below -- a clean compile is not sufficient evidence
+  that this upgrade is safe for your application. A caller pinning
+  `fsqlite = "0.2"` keeps the 0.2.1 API against Asupersync 0.3.10 and is not
+  upgraded silently.
+
+- **Asupersync `0.4.0`-`0.4.3` changes runtime behavior under FrankenSQLite.**
+  FrankenSQLite does not create its own runtime -- the caller's `Cx` and
+  executor drive every async operation -- so these are behavior changes to the
+  engine as your application observes it, even though no FrankenSQLite source
+  file changed. Per Asupersync's own changelog, the deltas across that range
+  include: scheduler and lifecycle repairs (timed-task promotion on injected
+  ready work, worker-spawn failure completing affected tasks, deferred regions
+  draining before leak diagnostics, causal ordering of spawn effects);
+  cancellation-safe synchronization fixes (waiter-ID wraparound, rejected
+  repolls of completed MPSC reservations, restored interrupted semaphore
+  acquisitions, preserved `RwLock` queue order, linearized `OnceCell` waiter
+  state, mutex rank released before wakeup); I/O boundary changes (buffered
+  seeks accounting for unread buffered data, bounded backpressure on framed
+  writes); capability-context retention in ATP progress streams, which
+  preserves sender wake registration and cancellation observation; an internal
+  blocking driver that owns its wake and parking semantics and refuses runtime
+  scheduler contexts before polling; and owned poll wrappers that contain
+  polling and terminal-cleanup panics.
+
+  *What this means for you:* revalidate cancellation, shutdown, and timeout
+  behavior for your workload after upgrading -- particularly anything that
+  cancels queries in flight, relies on `Drop` timing, or depends on task
+  scheduling order. FrankenSQLite makes **no claim** that these runtime
+  changes are behavior-preserving for your application, and **no performance
+  claim** in either direction: Asupersync's own `0.4.2` notes record its owned
+  blocking-driver ready path as slower in a recorded micro-measurement, and
+  FrankenSQLite has not measured the effect of any of this.
 
 ### Changed
 
@@ -72,7 +115,10 @@ The v0.2.0 limitations in `README.md` still apply, including UTF-8-only text
 encoding, unwired page encryption (`PRAGMA key` silently ignored), the
 documented FTS5/R-Tree/STRICT edge divergences, and first-contact sidecar
 creation on never-before-opened stock databases (GH #140). This release
-changes no engine behavior, so it neither fixes nor adds to that list.
+contains no hand-authored engine change, so it fixes none of them and adds
+none of its own. That is a statement about FrankenSQLite's own code, not a
+guarantee that observable behavior is identical to 0.2.1: the runtime beneath
+the engine changed, as described under **Breaking changes**.
 
 ---
 
