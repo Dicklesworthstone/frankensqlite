@@ -15,6 +15,16 @@
 //!   facade entries per sample.
 //! * **arm `ready_control` (d):** N+2 `block_on(ready(()))` entries with NO
 //!   database work — the pure runtime-entry slope.
+//! * **arm `worker_facade_params` (e, bd-zofy2):** per-op parameterized
+//!   `execute_with_params_sync` on the worker facade. N+2 crossings; the
+//!   parse-fair per-op contrast for arm (f).
+//! * **arm `worker_batched` (f, bd-zofy2):** the transaction-scoped facade
+//!   entry — `begin_transaction_sync` + ONE
+//!   `execute_many_with_params_in_transaction_sync` + `commit_transaction_sync`
+//!   = exactly 3 crossings per sample regardless of N. PREDECLARED CONFOUND:
+//!   the (f)-vs-(e) delta bundles crossing amortization with per-command
+//!   parse/prepare amortization inside the worker; both are reported and the
+//!   crossing share is bounded via the bd-rp4rt coefficients.
 //!
 //! Every bridge/facade entry is counted by an in-binary atomic counter and the
 //! EXACT per-sample count is recorded; elapsed is regressed (per-arm OLS plus
@@ -49,11 +59,13 @@ const WARMUP_ROUNDS: usize = 2;
 const LCG_SEED: u64 = 0x5dee_ce66_d1ce_b00c;
 const BOOTSTRAP_RESAMPLES: usize = 2000;
 
-const ARM_NAMES: [&str; 4] = [
+const ARM_NAMES: [&str; 6] = [
     "single_entry",
     "per_op_bridge",
     "worker_facade",
     "ready_control",
+    "worker_facade_params",
+    "worker_batched",
 ];
 
 struct Lcg(u64);
@@ -176,15 +188,7 @@ fn run_worker_facade(rows: usize) -> Sample {
     BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
     let elapsed = start.elapsed();
     let calls = BRIDGE_ENTRIES.load(Ordering::Relaxed) - before;
-    let counted = conn
-        .query_row_sync("SELECT COUNT(*) FROM bridge_probe")
-        .expect("count bridge_probe");
-    match counted.get(0) {
-        Some(fsqlite::SqliteValue::Integer(v)) => {
-            assert_eq!(*v, i64::try_from(rows).expect("row count fits i64"));
-        }
-        other => panic!("expected integer count, got {other:?}"),
-    }
+    verify_worker_count(&conn, rows);
     conn.close_sync().expect("close worker connection");
     Sample {
         arm: 2,
@@ -212,12 +216,103 @@ fn run_ready_control(rows: usize) -> Sample {
     }
 }
 
+/// Arm (e): per-op parameterized worker facade — parse-fair contrast for (f).
+#[allow(clippy::cast_precision_loss)]
+fn run_worker_facade_params(rows: usize) -> Sample {
+    let mut conn = fsqlite::AsyncConnection::open_sync(":memory:").expect("open worker :memory:");
+    BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    conn.execute_sync("CREATE TABLE bridge_probe (v INTEGER)")
+        .expect("create bridge_probe");
+    BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    let before = BRIDGE_ENTRIES.load(Ordering::Relaxed);
+    let start = Instant::now();
+    conn.begin_transaction_sync().expect("begin");
+    BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    for i in 0..rows {
+        conn.execute_with_params_sync(
+            "INSERT INTO bridge_probe VALUES (?1)",
+            &[fsqlite::SqliteValue::Integer(
+                i64::try_from(i).expect("row index fits i64"),
+            )],
+        )
+        .expect("insert");
+        BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    }
+    conn.commit_transaction_sync().expect("commit");
+    BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    let elapsed = start.elapsed();
+    let calls = BRIDGE_ENTRIES.load(Ordering::Relaxed) - before;
+    verify_worker_count(&conn, rows);
+    conn.close_sync().expect("close worker connection");
+    Sample {
+        arm: 4,
+        rows,
+        bridge_calls: calls,
+        elapsed_ns: elapsed.as_nanos() as f64,
+    }
+}
+
+/// Arm (f): transaction-scoped facade entry — 3 crossings regardless of N.
+#[allow(clippy::cast_precision_loss)]
+fn run_worker_batched(rows: usize) -> Sample {
+    let mut conn = fsqlite::AsyncConnection::open_sync(":memory:").expect("open worker :memory:");
+    BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    conn.execute_sync("CREATE TABLE bridge_probe (v INTEGER)")
+        .expect("create bridge_probe");
+    BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    // Parameter-set construction is workload prep, outside the timed window;
+    // the facade's own to_vec clone stays inside it, as every consumer pays it.
+    let parameter_sets: Vec<Vec<fsqlite::SqliteValue>> = (0..rows)
+        .map(|i| {
+            vec![fsqlite::SqliteValue::Integer(
+                i64::try_from(i).expect("row index fits i64"),
+            )]
+        })
+        .collect();
+    let before = BRIDGE_ENTRIES.load(Ordering::Relaxed);
+    let start = Instant::now();
+    conn.begin_transaction_sync().expect("begin");
+    BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    conn.execute_many_with_params_in_transaction_sync(
+        "INSERT INTO bridge_probe VALUES (?1)",
+        &parameter_sets,
+    )
+    .expect("batched insert");
+    BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    conn.commit_transaction_sync().expect("commit");
+    BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    let elapsed = start.elapsed();
+    let calls = BRIDGE_ENTRIES.load(Ordering::Relaxed) - before;
+    verify_worker_count(&conn, rows);
+    conn.close_sync().expect("close worker connection");
+    Sample {
+        arm: 5,
+        rows,
+        bridge_calls: calls,
+        elapsed_ns: elapsed.as_nanos() as f64,
+    }
+}
+
+fn verify_worker_count(conn: &fsqlite::AsyncConnection, rows: usize) {
+    let counted = conn
+        .query_row_sync("SELECT COUNT(*) FROM bridge_probe")
+        .expect("count bridge_probe");
+    match counted.get(0) {
+        Some(fsqlite::SqliteValue::Integer(v)) => {
+            assert_eq!(*v, i64::try_from(rows).expect("row count fits i64"));
+        }
+        other => panic!("expected integer count, got {other:?}"),
+    }
+}
+
 fn run_arm(arm: usize, rows: usize) -> Sample {
     match arm {
         0 => run_single_entry(rows),
         1 => run_per_op_bridge(rows),
         2 => run_worker_facade(rows),
         3 => run_ready_control(rows),
+        4 => run_worker_facade_params(rows),
+        5 => run_worker_batched(rows),
         _ => unreachable!("unknown arm"),
     }
 }
@@ -359,7 +454,7 @@ fn main() {
     let mut samples: Vec<Sample> = Vec::with_capacity(ROUNDS * LEVELS.len() * ARM_NAMES.len());
     for round in 0..ROUNDS {
         for &rows in &LEVELS {
-            let mut order = [0usize, 1, 2, 3];
+            let mut order = [0usize, 1, 2, 3, 4, 5];
             rng.shuffle(&mut order);
             for &arm in &order {
                 samples.push(run_arm(arm, rows));
@@ -380,7 +475,10 @@ fn main() {
         let points: Vec<(f64, f64)> = arm_samples
             .iter()
             .map(|s| {
-                let x = if arm == 0 {
+                // Arms with constant per-sample crossings (single_entry = 1,
+                // worker_batched = 3) regress on rows; the rest on the exact
+                // recorded crossing count.
+                let x = if arm == 0 || arm == 5 {
                     s.rows as f64
                 } else {
                     s.bridge_calls as f64
@@ -390,7 +488,11 @@ fn main() {
             .collect();
         let (slope, intercept, r2) = ols(&points);
         let (lo, hi) = bootstrap_slope_ci(&points, arm as u64 + 1);
-        let regressor = if arm == 0 { "rows" } else { "bridge_calls" };
+        let regressor = if arm == 0 || arm == 5 {
+            "rows"
+        } else {
+            "bridge_calls"
+        };
         println!(
             "arm={name} regressor={regressor} slope_ns={slope:.1} ci95=[{lo:.1},{hi:.1}] \
              intercept_ns={intercept:.1} r2={r2:.5} n={}",
@@ -413,6 +515,12 @@ fn main() {
     // position: samples are grouped 4-at-a-time per (round, level).
     let mut overhead_reports = Vec::new();
     for (arm, name) in ARM_NAMES.iter().enumerate().skip(1) {
+        // worker_batched has a CONSTANT crossing delta (3 - 1 = 2) at every
+        // level, so a bridge-delta regression is degenerate for it; its
+        // contrasts are reported per-row below instead.
+        if arm == 5 {
+            continue;
+        }
         let mut points = Vec::new();
         for chunk in samples.chunks(ARM_NAMES.len()) {
             let base = chunk
@@ -445,6 +553,46 @@ fn main() {
         }));
     }
 
+    // bd-zofy2 dedicated contrasts: per-(round, level) paired deltas
+    // regressed on rows. facade_minus_batched = the per-row saving from the
+    // transaction-scoped facade entry (crossing + per-command parse/prepare
+    // amortization, bundled — predeclared confound); batched_minus_single =
+    // the residual per-row cost of the worker path once crossings are
+    // amortized to 3 per transaction.
+    let mut batched_reports = Vec::new();
+    for (other_arm, base_arm, label) in [
+        (4usize, 5usize, "worker_facade_params_minus_worker_batched"),
+        (5, 0, "worker_batched_minus_single_entry"),
+    ] {
+        let mut points = Vec::new();
+        for chunk in samples.chunks(ARM_NAMES.len()) {
+            let base = chunk
+                .iter()
+                .find(|s| s.arm == base_arm)
+                .expect("base arm present in every (round, level) block");
+            let other = chunk
+                .iter()
+                .find(|s| s.arm == other_arm)
+                .expect("contrast arm present in every (round, level) block");
+            points.push((other.rows as f64, other.elapsed_ns - base.elapsed_ns));
+        }
+        let (slope, intercept, r2) = ols(&points);
+        let (lo, hi) = bootstrap_slope_ci(&points, 0x200 + other_arm as u64);
+        println!(
+            "contrast {label}: slope_ns_per_row={slope:.1} ci95=[{lo:.1},{hi:.1}] \
+             intercept_ns={intercept:.1} r2={r2:.5} pairs={}",
+            points.len()
+        );
+        batched_reports.push(serde_json::json!({
+            "contrast": label,
+            "slope_ns_per_row": slope,
+            "slope_ci95": [lo, hi],
+            "intercept_ns": intercept,
+            "r_squared": r2,
+            "n_pairs": points.len(),
+        }));
+    }
+
     // Per-(arm, level) medians for the record.
     let mut medians = Vec::new();
     for (arm, name) in ARM_NAMES.iter().enumerate() {
@@ -466,6 +614,7 @@ fn main() {
         "loadavg_end": read_trimmed("/proc/loadavg"),
         "arm_regressions": arm_reports,
         "overhead_regressions": overhead_reports,
+        "batched_contrasts": batched_reports,
         "per_level_medians": medians,
         "samples": samples.iter().map(|s| serde_json::json!({
             "arm": ARM_NAMES[s.arm],
