@@ -1,10 +1,28 @@
 name: fsqlite-wasm CI
 
+# DSR IS THE SOLE PUBLISHER FOR THIS PROJECT, FOR BOTH crates.io AND npm.
+#
+# This workflow builds and tests the WASM package; it must never publish it.
+# Two publish paths were removed deliberately:
+#   1. The `release: types: [published]` trigger, which started this workflow
+#      when a GitHub Release was published and ran `npm publish` with
+#      `secrets.NPM_TOKEN`.
+#   2. The `workflow_dispatch` `publish` input, which allowed a manual publish.
+# The `npm-publish` job below is additionally disabled fail-closed by a
+# `false &&` sentinel in its `if:`, so the publish path cannot run even if a
+# trigger or input is reintroduced by accident.
+#
+# The job body is retained, not deleted, so the packaging and provenance steps
+# stay reviewable as a reference for DSR. The `pull_request` and `push` CI
+# triggers below are ordinary build/test and are intentionally unchanged.
+#
+# See also `.github/workflows/release.yml`, disabled the same way for crates.io.
+
 on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish the generated npm package to npmjs.org"
+        description: "Inert: publishing is DSR-only and disabled in this workflow"
         required: false
         type: boolean
         default: false
@@ -38,9 +56,6 @@ on:
       - "tsconfig.base.json"
       - "scripts/build_fsqlite_wasm_package.sh"
       - "LICENSE"
-  release:
-    types:
-      - published
 
 permissions:
   contents: read
@@ -528,7 +543,12 @@ jobs:
 
   npm-publish:
     needs: build-test-package
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+    # FAIL-CLOSED: the leading `false &&` disables this job unconditionally.
+    # npm publishing is DSR-only. The original guard is preserved verbatim
+    # after the sentinel so the intended conditions stay on the record;
+    # removing only the `false &&` would restore the previous behavior, which
+    # requires an explicit decision to move publishing off DSR.
+    if: ${{ false && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish == true)) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

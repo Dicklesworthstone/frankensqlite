@@ -21,11 +21,14 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ## [0.3.0] -- unreleased (Asupersync 0.4.3 compatibility)
 
-Lockstep `0.2.1 -> 0.3.0` bump of all 27 workspace members. The only edits in
-this release are dependency constraints and version numbers: no hand-authored
-FrankenSQLite feature work, no hand-authored bug fixes, and **no performance
-claim** -- nothing here was measured, and the release-gate performance matrix
-remains out of scope.
+Lockstep `0.2.1 -> 0.3.0` bump of all 27 workspace members. No hand-authored
+change to FrankenSQLite's engine or package-runtime source: the source-level
+edits are dependency constraints and version numbers, so no feature work, no
+bug fixes, and **no performance claim** -- nothing here was measured, and the
+release-gate performance matrix remains out of scope. Release *infrastructure*
+did change: the release workflows and the release-architecture note were
+edited to remove the GitHub Actions publish paths, as described under
+**Changed**.
 
 **This is not a behavior-free release.** The async runtime underneath
 FrankenSQLite changed. Read **Breaking changes** before upgrading.
@@ -110,16 +113,29 @@ FrankenSQLite changed. Read **Breaking changes** before upgrading.
   packages and the 27 internal packages; no external dependency other than
   Asupersync changed.
 
-  **25 of the 27 members are published to crates.io.** `fsqlite-e2e` and
+  **25 of the 27 members are publishable; 2 are not.** `fsqlite-e2e` and
   `fsqlite-harness` are marked `publish = false` and are workspace-only test
   infrastructure; they are versioned in lockstep so the workspace resolves
-  coherently, but they do not appear on crates.io and no release artifact is
-  expected for them.
+  coherently, but they are never uploaded to crates.io and no release artifact
+  is expected for them. Publishable is a manifest property, not a receipt: no
+  0.3.0 crate has been published to crates.io, and nothing in this entry should
+  be read as evidence that one has.
 
-- **GitHub Actions no longer has a release path.** The `Release` workflow's
-  `v*` tag trigger is removed and its publish job is disabled fail-closed;
-  releases are cut exclusively through DSR. Tagging a version no longer
-  publishes anything.
+- **GitHub Actions no longer has any release path, for either registry.**
+  DSR is the sole publisher of both the crates.io crates and the npm package.
+  Two workflows previously published:
+  - `Release` would publish all 25 publishable crates to crates.io on any
+    `v*` tag push. Its tag trigger is removed and its publish job is disabled
+    fail-closed.
+  - `fsqlite-wasm CI` ran `npm publish` with an `NPM_TOKEN` when a GitHub
+    Release was published, and exposed a manual `publish` dispatch input. Its
+    `release` trigger is removed, the input is inert, and its publish job is
+    disabled fail-closed.
+
+  Neither tagging a version nor publishing a GitHub Release now publishes
+  anything anywhere. Both job bodies are retained, disabled, as reviewable
+  references for DSR. The remaining `pull_request`/`push` CI in the WASM
+  workflow is unchanged and still builds and tests the package.
 
 ### Known limitations carried from 0.2.1 and 0.2.0
 

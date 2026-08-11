@@ -17,19 +17,32 @@ Local-tree facts checked for this revision:
 
 - The workspace has 27 members, all locally declared at `0.3.0`; two members
   (`fsqlite-e2e`, `fsqlite-harness`) are marked `publish = false`, leaving 25
-  published crates.
+  publishable crates. Publishable is a manifest property: no `0.3.0` crate has
+  been published to crates.io, and registry state is live state to be checked
+  at cut time, never inferred from this document.
 - `v0.1.19` is the semantic and crates.io preceding release tag, but it is not
   an ancestor of current `main`; `v0.1.18` is the latest released ancestor. A
   commit count relative to `v0.1.19` is intentionally omitted because it
   changes as release preparation lands and is not a release-readiness metric.
 - `CHANGELOG.md` contains an unreleased `0.3.0` section describing the next
   lockstep release, scoped to Asupersync 0.4.3 compatibility.
-- **DSR is the sole release path. GitHub Actions does not publish.** The
-  checked-in release workflow's `v*` tag trigger has been removed and its
-  publish job is disabled fail-closed, so tagging a version publishes nothing.
-  Its 25-crate sequence is retained in-file as a reviewable reference for the
-  topological order DSR must follow; it is documentation now, not automation,
-  and it was never a topology proof.
+- **DSR is the sole release path, for both registries. GitHub Actions does not
+  publish.** Two checked-in workflows previously did:
+  - `release.yml` would publish the 25 publishable crates to crates.io on any
+    `v*` tag push. Its tag trigger is removed and its publish job is disabled
+    fail-closed, so tagging a version publishes nothing. Its 25-crate sequence
+    is retained in-file as a reviewable reference for the topological order
+    DSR must follow; it is documentation now, not automation, and it was never
+    a topology proof.
+  - `fsqlite-wasm-ci.yml` ran `npm publish` with an `NPM_TOKEN` on GitHub
+    Release publication, and exposed a manual `publish` dispatch input. The
+    `release` trigger is removed, the input is inert, and its publish job is
+    disabled fail-closed. Its build/test CI on `pull_request` and `push` is
+    unchanged.
+
+  A sweep of all nine workflows found no other publish step and no remaining
+  `release` or tag trigger anywhere. **The npm package is part of the release
+  surface** and is DSR's responsibility alongside the crates.
 - The Unix and PowerShell installers both resolve an unspecified version from
   the latest GitHub Release and require a SHA-256 manifest; when `minisign` is
   available they also verify its signature.
