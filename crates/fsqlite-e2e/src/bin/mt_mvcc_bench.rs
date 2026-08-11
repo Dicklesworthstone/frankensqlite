@@ -6138,7 +6138,11 @@ mod tests {
         RunResult {
             worker_startup_elapsed: Duration::from_millis(1),
             workload_elapsed: Duration::from_millis(elapsed_ms),
-            settings: expected_effective_settings("test_engine", DEFAULT_WAL_AUTOCHECKPOINT_PAGES),
+            settings: expected_effective_settings(
+                "test_engine",
+                DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+                SynchronousMode::Normal,
+            ),
             accounting: WorkAccounting {
                 offered_writes: total_rows,
                 attempted_writes: total_rows,
@@ -6190,7 +6194,11 @@ mod tests {
         wal_autocheckpoint_pages: i64,
     ) -> RunResult {
         let mut sample = sample_result(elapsed_ms, total_rows, 0);
-        sample.settings = expected_effective_settings(concurrent_mode, wal_autocheckpoint_pages);
+        sample.settings = expected_effective_settings(
+            concurrent_mode,
+            wal_autocheckpoint_pages,
+            SynchronousMode::Normal,
+        );
         sample
     }
 
@@ -6644,7 +6652,11 @@ mod tests {
 
     #[test]
     fn worker_join_aggregates_every_terminal_error_before_returning() {
-        let settings = expected_effective_settings("test_engine", DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        let settings = expected_effective_settings(
+            "test_engine",
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            SynchronousMode::Normal,
+        );
         let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let success_counter = Arc::clone(&completed);
         let final_error_counter = Arc::clone(&completed);
