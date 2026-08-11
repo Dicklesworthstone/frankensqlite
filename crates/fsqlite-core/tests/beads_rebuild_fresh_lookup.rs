@@ -204,6 +204,7 @@ fn reopen_after_same_path_file_replacement_reads_new_incarnation() {
                 .await
                 .unwrap();
             }
+            conn.close().await.unwrap();
         }
 
         {
@@ -216,6 +217,7 @@ fn reopen_after_same_path_file_replacement_reads_new_incarnation() {
             conn.execute("INSERT INTO marker(value) VALUES ('new-incarnation');")
                 .await
                 .unwrap();
+            conn.close().await.unwrap();
         }
 
         std::fs::rename(&replacement_path, &db_path).unwrap();
@@ -255,6 +257,7 @@ fn vacuum_into_compacts_database_with_trailing_whole_page_slack() {
             conn.execute("INSERT INTO marker(value) VALUES ('survives');")
                 .await
                 .unwrap();
+            conn.close().await.unwrap();
         }
 
         let logical_len = std::fs::metadata(&db_path).unwrap().len();
