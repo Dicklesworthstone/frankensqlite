@@ -1517,6 +1517,87 @@ mod commit_repair_async_tests {
     }
 
     #[test]
+    fn test_drop_inside_runtime_task_does_not_deadlock() {
+        // Coordinator owns its own runtime with an in-flight repair worker.
+        let coordinator_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("coordinator runtime");
+        let root_cx = Cx::new();
+        let coordinator = CommitRepairCoordinator::new(
+            CommitRepairConfig {
+                repair_enabled: true,
+            },
+            coordinator_runtime,
+            &root_cx,
+            InMemoryCommitRepairIo::default(),
+            DeterministicRepairGenerator::new(Duration::from_millis(50), 64),
+        );
+        coordinator
+            .commit(&[0xAB; 64])
+            .expect("commit should schedule repair");
+        assert_eq!(coordinator.pending_background_repair_count(), 1);
+
+        // Drop the coordinator from inside another runtime's task context.
+        // The old Drop implementation called `self.runtime.block_on` here,
+        // re-entering the runtime (asupersync refuses nested scheduler
+        // contexts); the guarded shutdown must detach instead.
+        let outer_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("outer runtime");
+        let drop_task = outer_runtime
+            .handle()
+            .try_spawn(async move {
+                drop(coordinator);
+                true
+            })
+            .expect("spawn drop task");
+        let completed = outer_runtime.block_on(drop_task);
+        assert!(
+            completed,
+            "dropping the coordinator inside a runtime task must complete without deadlock"
+        );
+    }
+
+    #[test]
+    fn test_wait_for_background_repair_inside_runtime_requeues_instead_of_blocking() {
+        let coordinator_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("coordinator runtime");
+        let root_cx = Cx::new();
+        let coordinator = Arc::new(CommitRepairCoordinator::new(
+            CommitRepairConfig {
+                repair_enabled: true,
+            },
+            coordinator_runtime,
+            &root_cx,
+            InMemoryCommitRepairIo::default(),
+            DeterministicRepairGenerator::new(Duration::from_millis(25), 64),
+        ));
+        coordinator
+            .commit(&[0xCD; 64])
+            .expect("commit should schedule repair");
+
+        // From inside a runtime context the join must refuse to block and
+        // re-queue the in-flight handle instead of deadlocking.
+        let outer_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("outer runtime");
+        let coordinator_in_task = Arc::clone(&coordinator);
+        let wait_result =
+            outer_runtime.block_on(async move { coordinator_in_task.wait_for_background_repair() });
+        assert!(
+            wait_result.is_err(),
+            "in-flight workers cannot be joined from inside a runtime context"
+        );
+
+        // From outside any runtime context the re-queued handle joins fine.
+        coordinator
+            .wait_for_background_repair()
+            .expect("outside a runtime context the re-queued worker must join");
+        assert_eq!(coordinator.pending_background_repair_count(), 0);
+    }
+
+    #[test]
     fn test_commit_receipt_latency_tracks_critical_path_io() {
         #[derive(Debug)]
         struct DelayedIo {
