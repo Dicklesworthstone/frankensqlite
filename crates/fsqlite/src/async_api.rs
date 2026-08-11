@@ -2551,8 +2551,9 @@ impl Drop for AsyncConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::Budget as NativeBudget;
     use asupersync::runtime::RuntimeBuilder;
-    use fsqlite_types::cx::{Budget, Cx};
+    use fsqlite_types::cx::Cx;
 
     fn test_runtime() -> Runtime {
         RuntimeBuilder::current_thread()
@@ -4623,57 +4624,60 @@ mod tests {
     }
 
     #[test]
-    fn attached_runtime_cx_preserves_budget_and_joins_worker_without_detach() {
+    fn attached_runtime_budget_selects_preflight_and_async_close_cleans_once() {
         let runtime = test_runtime();
+        let exhausted_native =
+            runtime.request_cx_with_budget(NativeBudget::INFINITE.with_poll_quota(0));
 
         runtime.block_on(async {
-            let native = NativeCx::current().expect("block_on must install a runtime Cx");
-            let cx = Cx::with_budget(
-                Budget::INFINITE
-                    .with_poll_quota(64)
-                    .with_cost_quota(128)
-                    .with_priority(7),
-            );
-            cx.set_native_cx(native.clone());
+            let caller_cx = Cx::new();
+            let budget_limited_cx = Cx::new();
+            budget_limited_cx.set_native_cx(exhausted_native.clone());
 
-            let attached = cx
-                .attached_native_cx()
-                .expect("the fsqlite Cx must retain the runtime-native context");
+            let mut conn = AsyncConnection::open(&caller_cx, ":memory:")
+                .await
+                .expect("ambient runtime Cx should open the worker-backed connection");
+            let state = Arc::clone(&conn.state);
+            conn.execute(
+                &caller_cx,
+                "CREATE TABLE attached_runtime_budget (value INTEGER)",
+            )
+            .await
+            .expect("ambient runtime Cx should dispatch the schema operation");
+
+            let error = conn
+                .execute(
+                    &budget_limited_cx,
+                    "INSERT INTO attached_runtime_budget VALUES (1)",
+                )
+                .await
+                .expect_err("the attached exhausted runtime budget must stop this operation");
+            assert!(
+                matches!(error, FrankenError::Interrupt),
+                "attached runtime-budget exhaustion must map to Interrupt: {error:?}"
+            );
+            assert!(
+                conn.query(&caller_cx, "SELECT value FROM attached_runtime_budget")
+                    .await
+                    .expect("ambient runtime Cx should query after rejected operation")
+                    .is_empty(),
+                "the attached exhausted budget must prevent the selected SQL effect"
+            );
+
             assert_eq!(
-                attached.task_id(),
-                native.task_id(),
-                "fsqlite must use the current runtime Cx, not a detached replacement"
+                state.cleanup_calls.load(Ordering::Acquire),
+                0,
+                "a running worker must not report cleanup before explicit close"
             );
-            let effective_budget = cx.native_spawn_budget(&attached);
-            assert_eq!(effective_budget.poll_quota, 64);
-            assert_eq!(effective_budget.cost_quota, Some(128));
-            assert_eq!(effective_budget.priority, 7);
-
-            let mut conn = AsyncConnection::open(&cx, ":memory:")
-                .await
-                .expect("attached runtime Cx should open the worker-backed connection");
-            conn.execute(&cx, "CREATE TABLE attached_runtime (value INTEGER)")
-                .await
-                .expect("attached runtime Cx should dispatch to the worker");
-            conn.close(&cx)
+            conn.close(&caller_cx)
                 .await
                 .expect("async close should join through the runtime blocking pool");
-
             assert!(
-                conn.execute(&cx, "SELECT 1").await.is_err(),
+                conn.execute(&caller_cx, "SELECT 1").await.is_err(),
                 "a joined worker must not accept commands after explicit close"
             );
-            assert!(
-                Runtime::current_handle().is_some(),
-                "async close must leave the caller on its original runtime"
-            );
-            assert_eq!(
-                NativeCx::current()
-                    .expect("runtime Cx must remain installed after close")
-                    .task_id(),
-                native.task_id(),
-                "async close must not replace the caller's runtime context"
-            );
+            assert_eq!(state.cleanup_calls.load(Ordering::Acquire), 1);
+            assert_eq!(state.phase(), WorkerPhase::Terminal);
         });
     }
 
