@@ -245,7 +245,8 @@ fn run_fsqlite(n_threads: usize, rows: i64, reads_per_thread: usize) -> EngineMe
     {
         let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.clone()))
             .expect("fsqlite open seed");
-        let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"));
+        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"))
+            .expect("seed connection must enable concurrent mode (bd-fd1ra: no discarded PRAGMA results)");
         fsqlite_e2e::block_on(
             conn.execute("CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, payload TEXT)"),
         )
@@ -275,7 +276,9 @@ fn run_fsqlite(n_threads: usize, rows: i64, reads_per_thread: usize) -> EngineMe
         handles.push(thread::spawn(move || {
             let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.as_str().to_owned()))
                 .expect("fsqlite open");
-            let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"));
+            fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")).expect(
+                "reader connection must enable concurrent mode (bd-fd1ra: no discarded PRAGMA results)",
+            );
             let stmt =
                 fsqlite_e2e::block_on(conn.prepare("SELECT payload FROM bench WHERE id = ?1"))
                     .expect("prepare select");
