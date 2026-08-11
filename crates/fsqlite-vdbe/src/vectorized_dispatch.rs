@@ -586,11 +586,11 @@ impl WorkStealingDispatcher {
         F: Fn(&PipelineTask, usize) -> R + Send + Sync + 'static,
     {
         runtime.block_on(async {
-            // Prefer the ambient runtime Cx installed by `block_on` so the
-            // dispatch inherits the caller's cancellation/budget lineage;
-            // mint a full-capability Cx only when no ambient context exists
-            // (these `*_on_runtime` wrappers are currently harness-facing).
-            let cx = Cx::<cap::All>::current().unwrap_or_else(Cx::<cap::All>::new);
+            // This is fsqlite-types' own capability Cx (not asupersync's);
+            // it has no ambient stack, so minting is its normal construction.
+            // These `*_on_runtime` wrappers are harness-facing; async callers
+            // with a real caller Cx use `execute_with_barriers` directly.
+            let cx = Cx::<cap::All>::new();
             self.execute_with_barriers(&cx, pipelines, execute).await
         })
     }
@@ -608,9 +608,9 @@ impl WorkStealingDispatcher {
         F: Fn(&PipelineTask, usize) -> R + Send + Sync + 'static,
     {
         runtime.block_on(async {
-            // See execute_with_barriers_on_runtime: inherit ambient lineage
-            // when present, mint only as a fallback.
-            let cx = Cx::<cap::All>::current().unwrap_or_else(Cx::<cap::All>::new);
+            // See execute_with_barriers_on_runtime: fsqlite-types' Cx has no
+            // ambient stack; minting is normal for these harness wrappers.
+            let cx = Cx::<cap::All>::new();
             self.execute_with_barriers_with_context(&cx, pipelines, context, execute)
                 .await
         })

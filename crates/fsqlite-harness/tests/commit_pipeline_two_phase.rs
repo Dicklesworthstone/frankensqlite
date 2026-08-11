@@ -6,6 +6,7 @@ use fsqlite_core::commit_repair::{
     CommitRequest, TrackedSender, conformal_batch_size, little_law_capacity, optimal_batch_size,
     two_phase_commit_channel,
 };
+use fsqlite_types::cx::Cx;
 
 fn req(txn_id: u64) -> CommitRequest {
     CommitRequest::new(
@@ -18,7 +19,7 @@ fn req(txn_id: u64) -> CommitRequest {
 #[test]
 fn test_reserve_then_send_succeeds() {
     let (sender, receiver) = two_phase_commit_channel(4);
-    let permit = sender.reserve();
+    let permit = sender.reserve(&Cx::new()).expect("reserve should succeed");
     let seq = permit.reservation_seq();
     permit.send(req(seq));
 
@@ -31,7 +32,7 @@ fn test_reserve_then_send_succeeds() {
 #[test]
 fn test_reserve_then_abort_releases_slot() {
     let (sender, _receiver) = two_phase_commit_channel(1);
-    let permit = sender.reserve();
+    let permit = sender.reserve(&Cx::new()).expect("reserve should succeed");
     permit.abort();
 
     let retry = sender.try_reserve_for(Duration::from_millis(100));
@@ -43,8 +44,8 @@ fn test_reserve_blocks_at_capacity() {
     let (sender, _receiver) = two_phase_commit_channel(2);
     let sender_a = sender.clone();
     let sender_b = sender.clone();
-    let _a = sender_a.reserve();
-    let _b = sender_b.reserve();
+    let _a = sender_a.reserve(&Cx::new()).expect("reserve should succeed");
+    let _b = sender_b.reserve(&Cx::new()).expect("reserve should succeed");
 
     let (tx, rx) = std_mpsc::channel();
     let sender_worker = sender.clone();
@@ -63,7 +64,7 @@ fn test_reserve_blocks_at_capacity() {
 #[test]
 fn test_cancel_during_reserve_no_leak() {
     let (sender, _receiver) = two_phase_commit_channel(1);
-    let held = sender.reserve();
+    let held = sender.reserve(&Cx::new()).expect("reserve should succeed");
     let timed_out = sender.try_reserve_for(Duration::from_millis(5));
     assert!(timed_out.is_none());
     assert_eq!(sender.occupancy(), 1, "no ghost slot should be consumed");
@@ -74,7 +75,7 @@ fn test_cancel_during_reserve_no_leak() {
 #[test]
 fn test_cancel_between_reserve_and_send() {
     let (sender, _receiver) = two_phase_commit_channel(1);
-    let permit = sender.reserve();
+    let permit = sender.reserve(&Cx::new()).expect("reserve should succeed");
     drop(permit);
     let retry = sender.try_reserve_for(Duration::from_millis(100));
     assert!(
@@ -86,9 +87,9 @@ fn test_cancel_between_reserve_and_send() {
 #[test]
 fn test_out_of_order_send_completion_still_delivers_by_reservation_sequence() {
     let (sender, receiver) = two_phase_commit_channel(4);
-    let permit1 = sender.reserve();
-    let permit2 = sender.reserve();
-    let permit3 = sender.reserve();
+    let permit1 = sender.reserve(&Cx::new()).expect("reserve should succeed");
+    let permit2 = sender.reserve(&Cx::new()).expect("reserve should succeed");
+    let permit3 = sender.reserve(&Cx::new()).expect("reserve should succeed");
 
     let seq1 = permit1.reservation_seq();
     let seq2 = permit2.reservation_seq();
@@ -122,7 +123,7 @@ fn test_out_of_order_send_completion_still_delivers_by_reservation_sequence() {
 fn test_fifo_ordering() {
     let (sender, receiver) = two_phase_commit_channel(4);
     for _ in 0..3 {
-        let permit = sender.reserve();
+        let permit = sender.reserve(&Cx::new()).expect("reserve should succeed");
         let seq = permit.reservation_seq();
         permit.send(req(seq));
     }
@@ -147,7 +148,7 @@ fn test_tracked_sender_detects_leaked_permit() {
     let (sender, _receiver) = two_phase_commit_channel(2);
     let tracked = TrackedSender::new(sender);
     {
-        let _permit = tracked.reserve();
+        let _permit = tracked.reserve(&Cx::new()).expect("tracked reserve should succeed");
     }
     assert_eq!(tracked.leaked_permit_count(), 1);
 }
@@ -157,7 +158,7 @@ fn test_tracked_sender_normal_send_no_violation() {
     let (sender, receiver) = two_phase_commit_channel(2);
     let tracked = TrackedSender::new(sender);
 
-    let permit = tracked.reserve();
+    let permit = tracked.reserve(&Cx::new()).expect("tracked reserve should succeed");
     permit.send(req(11));
 
     let _ = receiver
@@ -171,7 +172,7 @@ fn test_tracked_sender_explicit_abort_no_violation() {
     let (sender, _receiver) = two_phase_commit_channel(2);
     let tracked = TrackedSender::new(sender);
 
-    let permit = tracked.reserve();
+    let permit = tracked.reserve(&Cx::new()).expect("tracked reserve should succeed");
     permit.abort();
 
     assert_eq!(tracked.leaked_permit_count(), 0);
@@ -181,7 +182,7 @@ fn test_tracked_sender_explicit_abort_no_violation() {
 fn test_coordinator_drains_batch() {
     let (sender, receiver) = two_phase_commit_channel(8);
     for txn_id in 0_u64..8 {
-        let permit = sender.reserve();
+        let permit = sender.reserve(&Cx::new()).expect("reserve should succeed");
         permit.send(req(txn_id));
     }
 
