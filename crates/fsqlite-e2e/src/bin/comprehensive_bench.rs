@@ -9126,6 +9126,20 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// bd-pzjg8: the hot-path profile counters are process-global atomics, so
+    /// a test that opens a profiling window and asserts exact counts races
+    /// any concurrently-running test that drives real engine work (a parallel
+    /// test's autocommit inserts bled 3 extra fast-lane hits into
+    /// `large_benchmark_insert_keeps_results_and_direct_fast_lane_counters`).
+    /// Every test that executes engine SQL — not only the counter-asserting
+    /// one — must hold this serializer, mirroring fsqlite-core's
+    /// `fsqlite_core_test_serializer` pattern. Poisoning is ignored: a
+    /// panicked predecessor must not cascade into unrelated failures.
+    fn engine_test_serializer() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn sample_measurement(label: &str, row_count: usize, durations_ms: &[u64]) -> Measurement {
         Measurement {
             label: label.to_owned(),
@@ -9316,6 +9330,7 @@ mod tests {
 
     #[test]
     fn unpolled_execute_variants_do_not_mutate_benchmark_fixture() {
+        let _serial = engine_test_serializer();
         fsqlite_e2e::block_on(async {
             let conn = fsqlite::Connection::open(":memory:")
                 .await
@@ -9353,6 +9368,7 @@ mod tests {
 
     #[test]
     fn dropped_parameterized_execute_preserves_transaction_ownership() {
+        let _serial = engine_test_serializer();
         fsqlite_e2e::block_on(async {
             let conn = fsqlite::Connection::open(":memory:")
                 .await
@@ -9435,6 +9451,7 @@ mod tests {
 
     #[test]
     fn narrow_parameterized_insert_returns_exact_rows() {
+        let _serial = engine_test_serializer();
         fsqlite_e2e::block_on(async {
             let conn = fsqlite::Connection::open(":memory:")
                 .await
@@ -9494,6 +9511,7 @@ mod tests {
 
     #[test]
     fn large_benchmark_insert_keeps_results_and_direct_fast_lane_counters() {
+        let _serial = engine_test_serializer();
         fsqlite_e2e::block_on(async {
             const ROWS: i64 = 32;
 
@@ -9858,6 +9876,7 @@ mod tests {
 
     #[test]
     fn concurrent_samples_prove_real_worker_settings_and_completed_work() {
+        let _serial = engine_test_serializer();
         for (engine, sample) in [
             (
                 "csqlite",
@@ -11345,6 +11364,7 @@ mod tests {
     #[cfg(feature = "bridge-experiment")]
     #[test]
     fn parameter_control_actual_routes_and_oracles_pass_fail_closed_preflights() {
+        let _serial = engine_test_serializer();
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("parameter-control test runtime should build");
@@ -11692,6 +11712,7 @@ mod tests {
     #[cfg(feature = "bridge-experiment")]
     #[test]
     fn bridge_worker_sample_accounts_for_every_command_and_checks_rows() {
+        let _serial = engine_test_serializer();
         let sample = bridge_sample_insert_worker(3, 7, 2).expect("worker sample should run");
         assert_eq!(sample.workload, BridgeWorkload::RawExecuteWithParams);
         assert_eq!(sample.arm, BridgeArm::WorkerSyncFacade);
