@@ -124073,13 +124073,15 @@ mod tests {
                 "ambient capture must not fork per-database shared MVCC state"
             );
 
-            // Cross-connection functional check in the direction the engine
-            // supports today (writer = later-opened connection, reader =
-            // first-opened, mirroring cross_connection_commit_invalidates_
-            // cached_plans). The opposite direction (second-opened reader)
-            // fails with NoSuchTable even WITHOUT ambient capture — probed
-            // outside any runtime on 2026-08-11 — and is tracked as a
-            // separate pre-existing bug, not a bd-q8501 regression.
+            // Functional receipt: writes work under ambient capture and the
+            // commit clock stays SHARED across the two default connections
+            // (same idiom as test_cross_connection_commit_seq_shared_file_
+            // backed). A cross-connection `query` of a table created after
+            // both opens fails with NoSuchTable in BOTH directions even
+            // WITHOUT ambient capture — probed outside any runtime on
+            // 2026-08-11, tracked as pre-existing bug bd-bhp83 — so this
+            // test deliberately avoids that broken path.
+            let conn1_seq_before = conn1.current_global_commit_seq();
             conn2
                 .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")
                 .await
@@ -124088,8 +124090,12 @@ mod tests {
                 .execute("INSERT INTO t(b) VALUES ('ambient');")
                 .await
                 .expect("insert");
-            let rows = conn1.query("SELECT b FROM t;").await.expect("select");
+            let rows = conn2.query("SELECT b FROM t;").await.expect("select");
             assert_eq!(rows.len(), 1);
+            assert!(
+                conn1.current_global_commit_seq() > conn1_seq_before,
+                "conn1 must observe conn2's commits through the shared clock"
+            );
         });
     }
 
@@ -186939,13 +186945,16 @@ fts5(title, body, content=docs, content_rowid=id)'
                 status.get("pager_backend_kind").map(String::as_str),
                 Some("iouring")
             );
+            // 3d1dc5c9d (shared-dispatcher vfs) renamed the backend identifier
+            // from "asupersync" to "asupersync-shared-uring"; assert the
+            // canonical name the vfs's own tests use (uring.rs).
             assert_eq!(
                 status.get("io_uring_backend").map(String::as_str),
-                Some("asupersync")
+                Some("asupersync-shared-uring")
             );
             assert_eq!(
                 status.get("initial_status").map(String::as_str),
-                Some("available:asupersync")
+                Some("available:asupersync-shared-uring")
             );
 
             match status.get("disabled").map(String::as_str) {
@@ -186953,7 +186962,7 @@ fts5(title, body, content=docs, content_rowid=id)'
                     assert_eq!(status.get("available").map(String::as_str), Some("1"));
                     assert_eq!(
                         status.get("status").map(String::as_str),
-                        Some("available:asupersync")
+                        Some("available:asupersync-shared-uring")
                     );
                     assert_eq!(
                         status.get("disable_reason").map(String::as_str),
@@ -186962,11 +186971,9 @@ fts5(title, body, content=docs, content_rowid=id)'
                 }
                 Some("1") => {
                     assert_eq!(status.get("available").map(String::as_str), Some("0"));
-                    assert!(
-                        status
-                            .get("status")
-                            .is_some_and(|value| value.starts_with("disabled:asupersync:"))
-                    );
+                    assert!(status.get("status").is_some_and(
+                        |value| value.starts_with("disabled:asupersync-shared-uring:")
+                    ));
                     assert_ne!(
                         status.get("disable_reason").map(String::as_str),
                         Some("NULL")
