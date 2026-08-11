@@ -1,6 +1,7 @@
 use fsqlite_core::connection::Connection;
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
+use std::io::Write as _;
 
 async fn table_issue_ids(conn: &Connection) -> Vec<String> {
     conn.query("SELECT id FROM issues ORDER BY rowid")
@@ -178,5 +179,118 @@ fn file_backed_rebuild_reopen_text_lookup_matches_full_scan_default_mode() {
 fn file_backed_rebuild_reopen_text_lookup_matches_full_scan_reject_mem_fallback() {
     asupersync::test_utils::run_test(|| async {
         run_rebuilt_reopen_lookup_matrix(true).await;
+    });
+}
+
+#[test]
+fn reopen_after_same_path_file_replacement_reads_new_incarnation() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replace-reopen.db");
+        let replacement_path = dir.path().join("replacement.db");
+
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned())
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE marker(value TEXT NOT NULL);")
+                .await
+                .unwrap();
+            for value in ["old-1", "old-2", "old-3"] {
+                conn.execute_with_params(
+                    "INSERT INTO marker(value) VALUES (?)",
+                    &[SqliteValue::Text(value.into())],
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        {
+            let conn = Connection::open(replacement_path.to_string_lossy().into_owned())
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE marker(value TEXT NOT NULL);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO marker(value) VALUES ('new-incarnation');")
+                .await
+                .unwrap();
+        }
+
+        std::fs::rename(&replacement_path, &db_path).unwrap();
+
+        let reopened = Connection::open(db_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let rows = reopened
+            .query("SELECT value FROM marker ORDER BY rowid")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].values()[0].as_text(),
+            Some("new-incarnation"),
+            "same-path reopen must read the replacement inode"
+        );
+        assert_eq!(rows.len(), 1);
+    });
+}
+
+#[test]
+fn vacuum_into_compacts_database_with_trailing_whole_page_slack() {
+    asupersync::test_utils::run_test(|| async {
+        const PAGE_SIZE: usize = 4096;
+        const APPENDED_PAGES: usize = 64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("trailing-slack.db");
+        let compacted_path = dir.path().join("compacted.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(db_str.clone()).await.unwrap();
+            conn.execute("CREATE TABLE marker(value TEXT NOT NULL);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO marker(value) VALUES ('survives');")
+                .await
+                .unwrap();
+        }
+
+        let logical_len = std::fs::metadata(&db_path).unwrap().len();
+        let mut db_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&db_path)
+            .unwrap();
+        db_file
+            .write_all(&vec![0_u8; PAGE_SIZE * APPENDED_PAGES])
+            .unwrap();
+        db_file.flush().unwrap();
+        drop(db_file);
+        assert!(std::fs::metadata(&db_path).unwrap().len() > logical_len);
+
+        let conn = Connection::open(db_str).await.unwrap();
+        conn.execute_with_params(
+            "VACUUM INTO ?1;",
+            &[SqliteValue::Text(
+                compacted_path.to_string_lossy().into_owned().into(),
+            )],
+        )
+        .await
+        .unwrap();
+
+        let compacted = Connection::open(compacted_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let rows = compacted.query("SELECT value FROM marker").await.unwrap();
+        assert_eq!(rows[0].values()[0].as_text(), Some("survives"));
+
+        let bytes = std::fs::read(&compacted_path).unwrap();
+        let header_pages = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+        assert_eq!(
+            u64::from(header_pages) * PAGE_SIZE as u64,
+            bytes.len() as u64,
+            "VACUUM INTO output must omit source trailing slack"
+        );
     });
 }
