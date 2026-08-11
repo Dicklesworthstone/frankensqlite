@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-ext-rtree"
-version = "0.2.1"
+version = "0.3.0"
 description = "R-tree and geopoly spatial index extension"
 edition.workspace = true
 license-file.workspace = true

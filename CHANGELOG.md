@@ -19,39 +19,60 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [Unreleased]
+## [0.3.0] -- unreleased (Asupersync 0.4.3 compatibility)
 
-Dependency-compatibility work only. No functional change, no API surface
-change authored here, and **no performance claim**: nothing in this section
-was measured, and the release-gate performance matrix remains out of scope.
+Lockstep `0.2.1 -> 0.3.0` bump of all 27 workspace members. Dependency-scope
+release: no feature work, no bug fixes, and **no performance claim** --
+nothing here was measured, and the release-gate performance matrix remains
+out of scope.
 
-### Changed
+> **BREAKING, with no hand-authored source change.** Not a contradiction:
+> the break is in the *identity* of a type FrankenSQLite exposes, not in any
+> line of FrankenSQLite code. Every public signature keeps its exact shape;
+> one of the types appearing in those signatures comes from a dependency that
+> has moved to an incompatible major-compatibility lane. A caller who
+> upgrades FrankenSQLite and Asupersync together needs no code edits. A
+> caller who upgrades only FrankenSQLite gets type errors. That is why this
+> is a `0.3.0` family and not a `0.2.2` patch.
 
-- **Workspace Asupersync constraint moved from `0.3.10` to `>=0.4.3,<0.5`.**
-  Asupersync 0.4.x re-anchors APIs already shipped in 0.3.10 and pins
-  `franken-kernel`, `franken-decision`, and `franken-evidence` at `^0.4.3`, so
-  the runtime family moves in lockstep. `Cargo.lock` re-resolves those four
-  packages and nothing else. This is what lets FrankenSQLite and FrankenSearch
+### Breaking changes
+
+- **Asupersync moves from `0.3.10` to `>=0.4.3,<0.5`.** Asupersync 0.4.x
+  re-anchors APIs already shipped in 0.3.10 and pins `franken-kernel`,
+  `franken-decision`, and `franken-evidence` at `^0.4.3`, so the runtime
+  family moves in lockstep. This is what lets FrankenSQLite and FrankenSearch
   share one Asupersync runtime universe in a single dependency graph
   (`bd-asupersync-043-compat-release-dk9ra`).
 
-  **This is a breaking change for downstream callers, not a patch.**
-  `fsqlite-types` exposes Asupersync types in its public API under the
-  `native` feature — `Cx::set_native_cx`, `Cx::attached_native_cx`, and
-  `Cx::native_spawn_budget` name `asupersync::Cx` and `asupersync::Budget` in
-  their signatures — so the Asupersync compatibility range is part of
-  FrankenSQLite's public contract. A consumer holding `asupersync = "0.3"`
-  cannot hand its `Cx` to a FrankenSQLite built against 0.4.x; the two are
-  distinct types. Under Cargo's 0.x rules the minor version is the
-  compatibility axis, so this ships as a coordinated **0.3.0** family across
-  the workspace rather than as a 0.2.2 patch, and a caller pinning
-  `fsqlite = "0.2"` is not upgraded silently.
+  *Why it is breaking:* `fsqlite-types` names Asupersync types in its public
+  API under the `native` feature -- `Cx::set_native_cx`,
+  `Cx::attached_native_cx`, and `Cx::native_spawn_budget` take or return
+  `asupersync::Cx` and `asupersync::Budget`. Under Cargo's 0.x rules the
+  minor version is the compatibility axis, so `asupersync` 0.3.x and 0.4.x
+  are distinct, non-interchangeable types even where their definitions are
+  identical. A consumer still on `asupersync = "0.3"` cannot hand its `Cx`
+  across to a FrankenSQLite built against 0.4.x.
 
-  Package versions are deliberately **not** bumped in this entry; the
-  lockstep `0.2.1 -> 0.3.0` bump and the release itself are separate,
-  still-pending steps of the same bead. Workspace build, test, format,
-  clippy, packaging, and publish-dry-run validation for this constraint
-  change is pending and owned by root central validation.
+  *Migration:* move your own `asupersync` dependency to `>=0.4.3,<0.5` in the
+  same change that moves `fsqlite` to `0.3`. No FrankenSQLite call site
+  changes. A caller pinning `fsqlite = "0.2"` keeps the 0.2.1 API against
+  Asupersync 0.3.10 and is not upgraded silently.
+
+### Changed
+
+- **All 27 workspace members bumped `0.2.1 -> 0.3.0` in lockstep**, including
+  every internal dependency edge, so no member can resolve a mixed-version
+  sibling. `Cargo.lock` re-resolves the four Asupersync-family packages and
+  the 27 internal packages; no external dependency other than Asupersync
+  changed.
+
+### Known limitations carried from 0.2.1 and 0.2.0
+
+The v0.2.0 limitations in `README.md` still apply, including UTF-8-only text
+encoding, unwired page encryption (`PRAGMA key` silently ignored), the
+documented FTS5/R-Tree/STRICT edge divergences, and first-contact sidecar
+creation on never-before-opened stock databases (GH #140). This release
+changes no engine behavior, so it neither fixes nor adds to that list.
 
 ---
 
