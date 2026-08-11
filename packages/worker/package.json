@@ -1,6 +1,6 @@
 {
   "name": "@frankensqlite/worker",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Worker host and protocol for FrankenSQLite WebAssembly bindings",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -35,7 +35,7 @@
     "LICENSE"
   ],
   "peerDependencies": {
-    "@frankensqlite/core": "^0.2.0"
+    "@frankensqlite/core": "^0.3.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
