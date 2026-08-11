@@ -19,6 +19,42 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [Unreleased]
+
+Dependency-compatibility work only. No functional change, no API surface
+change authored here, and **no performance claim**: nothing in this section
+was measured, and the release-gate performance matrix remains out of scope.
+
+### Changed
+
+- **Workspace Asupersync constraint moved from `0.3.10` to `>=0.4.3,<0.5`.**
+  Asupersync 0.4.x re-anchors APIs already shipped in 0.3.10 and pins
+  `franken-kernel`, `franken-decision`, and `franken-evidence` at `^0.4.3`, so
+  the runtime family moves in lockstep. `Cargo.lock` re-resolves those four
+  packages and nothing else. This is what lets FrankenSQLite and FrankenSearch
+  share one Asupersync runtime universe in a single dependency graph
+  (`bd-asupersync-043-compat-release-dk9ra`).
+
+  **This is a breaking change for downstream callers, not a patch.**
+  `fsqlite-types` exposes Asupersync types in its public API under the
+  `native` feature — `Cx::set_native_cx`, `Cx::attached_native_cx`, and
+  `Cx::native_spawn_budget` name `asupersync::Cx` and `asupersync::Budget` in
+  their signatures — so the Asupersync compatibility range is part of
+  FrankenSQLite's public contract. A consumer holding `asupersync = "0.3"`
+  cannot hand its `Cx` to a FrankenSQLite built against 0.4.x; the two are
+  distinct types. Under Cargo's 0.x rules the minor version is the
+  compatibility axis, so this ships as a coordinated **0.3.0** family across
+  the workspace rather than as a 0.2.2 patch, and a caller pinning
+  `fsqlite = "0.2"` is not upgraded silently.
+
+  Package versions are deliberately **not** bumped in this entry; the
+  lockstep `0.2.1 -> 0.3.0` bump and the release itself are separate,
+  still-pending steps of the same bead. Workspace build, test, format,
+  clippy, packaging, and publish-dry-run validation for this constraint
+  change is pending and owned by root central validation.
+
+---
+
 ## [0.2.1] -- 2026-08-11 (correctness patch: mutation-free opens, FTS5 durability, REPLACE-victim semantics)
 
 Bugfix-only patch release. No new features, no API changes, and **no
