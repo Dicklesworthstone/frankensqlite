@@ -185,7 +185,7 @@ rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
 # every fsqlite crate. Keep this registry-resolvable so downstream git consumers
 # can build FrankenSQLite without a private `/dp/asupersync` checkout; local
 # asupersync development belongs in an uncommitted Cargo patch/config override.
-asupersync = { version = "0.3.10", default-features = false }
+asupersync = { version = "0.4.3", default-features = false }
 futures-lite = "2.6.1"
 
 # Dev dependencies
