@@ -1108,10 +1108,7 @@ struct RepairDrainReport {
 /// preserving panic containment via `catch_unwind`. Inside a runtime context,
 /// completed handles are harvested with a single manual poll and still-running
 /// handles are returned in `unjoined` for the caller to re-queue or detach.
-fn drain_repair_handles(
-    runtime: &Runtime,
-    handles: Vec<AsyncJoinHandle<()>>,
-) -> RepairDrainReport {
+fn drain_repair_handles(runtime: &Runtime, handles: Vec<AsyncJoinHandle<()>>) -> RepairDrainReport {
     let mut report = RepairDrainReport {
         observed_panic: false,
         unjoined: Vec::new(),
@@ -2239,14 +2236,20 @@ mod two_phase_pipeline_tests {
         let (sender, _receiver) = two_phase_commit_channel(2);
         let sender_a = sender.clone();
         let sender_b = sender.clone();
-        let permit_a = sender_a.reserve(&Cx::new()).expect("reserve should succeed");
-        let permit_b = sender_b.reserve(&Cx::new()).expect("reserve should succeed");
+        let permit_a = sender_a
+            .reserve(&Cx::new())
+            .expect("reserve should succeed");
+        let permit_b = sender_b
+            .reserve(&Cx::new())
+            .expect("reserve should succeed");
 
         let (tx, rx) = std_mpsc::channel();
         let sender_for_worker = sender.clone();
         let join = thread::spawn(move || {
             let started = Instant::now();
-            let permit = sender_for_worker.reserve(&Cx::new()).expect("reserve should succeed");
+            let permit = sender_for_worker
+                .reserve(&Cx::new())
+                .expect("reserve should succeed");
             let elapsed = started.elapsed();
             tx.send(elapsed)
                 .expect("elapsed send should succeed for backpressure test");
@@ -2277,7 +2280,9 @@ mod two_phase_pipeline_tests {
             joins.push(thread::spawn(move || {
                 let mut local = Vec::new();
                 for _ in 0..10 {
-                    let permit = sender_clone.reserve(&Cx::new()).expect("reserve should succeed");
+                    let permit = sender_clone
+                        .reserve(&Cx::new())
+                        .expect("reserve should succeed");
                     let seq = permit.reservation_seq();
                     permit.send(request(seq));
                     local.push(seq);
@@ -2307,7 +2312,9 @@ mod two_phase_pipeline_tests {
         let tracked = TrackedSender::new(sender.clone());
 
         {
-            let _leaked = tracked.reserve(&Cx::new()).expect("tracked reserve should succeed");
+            let _leaked = tracked
+                .reserve(&Cx::new())
+                .expect("tracked reserve should succeed");
         }
 
         assert_eq!(tracked.leaked_permit_count(), 1);

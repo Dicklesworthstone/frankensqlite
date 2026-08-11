@@ -124014,6 +124014,211 @@ mod tests {
         });
     }
 
+    /// bd-q8501: a DEFAULT `Connection::open` inside a consumer-built
+    /// asupersync runtime must capture the ambient runtime per connection —
+    /// attached native `Cx` on the connection root (the io_uring gate
+    /// condition) plus a pinned `RuntimeHandle` — while the process-global
+    /// context stays detached and same-path default opens keep sharing one
+    /// `SharedMvccState`.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_default_open_inside_consumer_runtime_captures_ambient_io_native_cx() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ambient-capture.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+
+            let conn1 = Connection::open(&db_path).await.expect("open conn1");
+            let conn2 = Connection::open(&db_path).await.expect("open conn2");
+
+            assert!(
+                conn1.root_cx.attached_native_cx().is_some(),
+                "default open inside a runtime must attach an io native Cx \
+                 (io_uring gate condition, bd-q8501)"
+            );
+            assert!(
+                conn1._ambient_io_runtime_handle.is_some(),
+                "default open inside a runtime must pin the captured RuntimeHandle"
+            );
+            assert!(
+                conn2.root_cx.attached_native_cx().is_some(),
+                "every default open inside the runtime captures independently"
+            );
+            assert!(
+                RuntimeContext::global().root_cx.attached_native_cx().is_none(),
+                "per-connection capture must not attach anything to the \
+                 process-global context"
+            );
+            assert!(
+                RuntimeContext::global().native_runtime_handle().is_none(),
+                "per-connection capture must not bind the process-global \
+                 context to the ambient runtime"
+            );
+            assert!(
+                Arc::ptr_eq(&conn1._shared_mvcc_state, &conn2._shared_mvcc_state),
+                "ambient capture must not fork per-database shared MVCC state"
+            );
+
+            conn1
+                .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")
+                .await
+                .expect("create table");
+            conn1
+                .execute("INSERT INTO t(b) VALUES ('ambient');")
+                .await
+                .expect("insert");
+            let rows = conn2.query("SELECT b FROM t;").await.expect("select");
+            assert_eq!(rows.len(), 1);
+        });
+    }
+
+    /// bd-q8501: a DEFAULT `Connection::open` OUTSIDE any asupersync runtime
+    /// must keep working on the detached process-global fallback with no
+    /// ambient capture.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_default_open_outside_runtime_uses_detached_fallback() {
+        use std::task::{Context, Poll, Waker};
+        use std::time::{Duration, Instant};
+
+        // Minimal busy-poll executor: no asupersync runtime is installed on
+        // this thread, so `Runtime::current_handle()` is `None` throughout.
+        fn poll_to_completion<F: std::future::Future>(future: F) -> F::Output {
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            let mut future = std::pin::pin!(future);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                match future.as_mut().poll(&mut cx) {
+                    Poll::Ready(output) => return output,
+                    Poll::Pending => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "future did not complete outside a runtime"
+                        );
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+
+        assert!(
+            asupersync::runtime::Runtime::current_handle().is_none(),
+            "test precondition: no ambient runtime on this thread"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no-runtime-fallback.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+
+        let conn = poll_to_completion(Connection::open(&db_path)).expect("open outside runtime");
+        assert!(
+            conn.root_cx.attached_native_cx().is_none(),
+            "no ambient runtime -> no attached io native Cx (fallback unchanged)"
+        );
+        assert!(
+            conn._ambient_io_runtime_handle.is_none(),
+            "no ambient runtime -> nothing to pin"
+        );
+
+        poll_to_completion(conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY);"))
+            .expect("create table outside runtime");
+        poll_to_completion(conn.execute("INSERT INTO t(a) VALUES (1);"))
+            .expect("insert outside runtime");
+        let rows = poll_to_completion(conn.query("SELECT a FROM t;")).expect("select");
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// bd-q8501 engagement receipt: on Linux with the uring feature, a DEFAULT
+    /// `Connection::open` inside a consumer-built multithreaded runtime must
+    /// reach the io_uring backend for real page I/O. Uses the same
+    /// introspection idiom as bd-fo6xw (io_uring latency counters behind
+    /// `PRAGMA fsqlite.io_uring_stats`). Counters are process-global, so the
+    /// workload runs under the core test serializer and the assertion is
+    /// gated on the ring actually being available on this kernel.
+    #[cfg(all(target_os = "linux", feature = "linux-asupersync-uring"))]
+    #[test]
+    fn test_default_open_inside_consumer_runtime_engages_io_uring_data_path() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        fn pragma_value_map(rows: &[Row]) -> HashMap<String, String> {
+            rows.iter()
+                .filter_map(|row| {
+                    let name = match row.values().first() {
+                        Some(SqliteValue::Text(name)) => name.to_string(),
+                        _ => return None,
+                    };
+                    let value = match row.values().get(1) {
+                        Some(SqliteValue::Null) => "NULL".to_owned(),
+                        Some(SqliteValue::Integer(value)) => value.to_string(),
+                        Some(SqliteValue::Text(value)) => value.to_string(),
+                        Some(other) => format!("{other:?}"),
+                        None => return None,
+                    };
+                    Some((name, value))
+                })
+                .collect()
+        }
+
+        let _serial = super::fsqlite_core_test_serializer();
+        let runtime = RuntimeBuilder::new()
+            .worker_threads(2)
+            .build()
+            .expect("consumer runtime build");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("uring-engagement.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&db_path).await.expect("default open");
+            assert!(
+                conn.root_cx.attached_native_cx().is_some(),
+                "default open inside consumer runtime must satisfy the uring gate"
+            );
+
+            let status =
+                pragma_value_map(&conn.query("PRAGMA io_uring_status;").await.unwrap());
+            assert_eq!(
+                status.get("pager_backend_kind").map(String::as_str),
+                Some("iouring"),
+                "file-backed default open must select the io_uring pager backend"
+            );
+            if status.get("available").map(String::as_str) != Some("1") {
+                // Ring unavailable/disabled on this kernel: fallback engagement
+                // is covered elsewhere; nothing further to prove here.
+                return;
+            }
+
+            let before = fsqlite_observability::io_uring_latency_snapshot();
+            conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")
+                .await
+                .expect("create table");
+            for i in 0..64_i64 {
+                conn.execute(&format!(
+                    "INSERT INTO t(b) VALUES ('row-{i}-payload-payload-payload');"
+                ))
+                .await
+                .expect("insert");
+            }
+            let _ = conn.query("PRAGMA wal_checkpoint(TRUNCATE);").await;
+            let rows = conn.query("SELECT count(*) FROM t;").await.expect("scan");
+            assert_eq!(rows.len(), 1);
+            let after = fsqlite_observability::io_uring_latency_snapshot();
+
+            assert!(
+                after.read_samples_total + after.write_samples_total
+                    > before.read_samples_total + before.write_samples_total,
+                "io_uring data path must record samples for a default open \
+                 inside a consumer runtime (before: r={} w={}, after: r={} w={})",
+                before.read_samples_total,
+                before.write_samples_total,
+                after.read_samples_total,
+                after.write_samples_total,
+            );
+        });
+    }
+
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     #[test]
     fn test_open_with_env_inherits_seeded_runtime_native_lineage() {
