@@ -44,8 +44,12 @@ fn test_reserve_blocks_at_capacity() {
     let (sender, _receiver) = two_phase_commit_channel(2);
     let sender_a = sender.clone();
     let sender_b = sender.clone();
-    let _a = sender_a.reserve(&Cx::new()).expect("reserve should succeed");
-    let _b = sender_b.reserve(&Cx::new()).expect("reserve should succeed");
+    let _a = sender_a
+        .reserve(&Cx::new())
+        .expect("reserve should succeed");
+    let _b = sender_b
+        .reserve(&Cx::new())
+        .expect("reserve should succeed");
 
     let (tx, rx) = std_mpsc::channel();
     let sender_worker = sender.clone();
@@ -148,7 +152,9 @@ fn test_tracked_sender_detects_leaked_permit() {
     let (sender, _receiver) = two_phase_commit_channel(2);
     let tracked = TrackedSender::new(sender);
     {
-        let _permit = tracked.reserve(&Cx::new()).expect("tracked reserve should succeed");
+        let _permit = tracked
+            .reserve(&Cx::new())
+            .expect("tracked reserve should succeed");
     }
     assert_eq!(tracked.leaked_permit_count(), 1);
 }
@@ -158,7 +164,9 @@ fn test_tracked_sender_normal_send_no_violation() {
     let (sender, receiver) = two_phase_commit_channel(2);
     let tracked = TrackedSender::new(sender);
 
-    let permit = tracked.reserve(&Cx::new()).expect("tracked reserve should succeed");
+    let permit = tracked
+        .reserve(&Cx::new())
+        .expect("tracked reserve should succeed");
     permit.send(req(11));
 
     let _ = receiver
@@ -172,7 +180,9 @@ fn test_tracked_sender_explicit_abort_no_violation() {
     let (sender, _receiver) = two_phase_commit_channel(2);
     let tracked = TrackedSender::new(sender);
 
-    let permit = tracked.reserve(&Cx::new()).expect("tracked reserve should succeed");
+    let permit = tracked
+        .reserve(&Cx::new())
+        .expect("tracked reserve should succeed");
     permit.abort();
 
     assert_eq!(tracked.leaked_permit_count(), 0);
