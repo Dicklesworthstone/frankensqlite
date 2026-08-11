@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-parser"
-version = "0.2.0"
+version = "0.2.1"
 description = "Hand-written SQL parser with explicit-state Pratt and SELECT machines"
 edition.workspace = true
 license-file.workspace = true
