@@ -2552,7 +2552,7 @@ impl Drop for AsyncConnection {
 mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
-    use fsqlite_types::cx::Cx;
+    use fsqlite_types::cx::{Budget, Cx};
 
     fn test_runtime() -> Runtime {
         RuntimeBuilder::current_thread()
@@ -4619,6 +4619,128 @@ mod tests {
             .expect("FIFO schema query should succeed");
         assert!(rows.is_empty(), "cancelled command must have no SQL effect");
         conn.close_sync().expect("close should succeed");
+        drop(runtime);
+    }
+
+    #[test]
+    fn attached_runtime_cx_preserves_budget_and_joins_worker_without_detach() {
+        let runtime = test_runtime();
+
+        runtime.block_on(async {
+            let native = NativeCx::current().expect("block_on must install a runtime Cx");
+            let cx = Cx::with_budget(
+                Budget::INFINITE
+                    .with_poll_quota(64)
+                    .with_cost_quota(128)
+                    .with_priority(7),
+            );
+            cx.set_native_cx(native.clone());
+
+            let attached = cx
+                .attached_native_cx()
+                .expect("the fsqlite Cx must retain the runtime-native context");
+            assert_eq!(
+                attached.task_id(),
+                native.task_id(),
+                "fsqlite must use the current runtime Cx, not a detached replacement"
+            );
+            let effective_budget = cx.native_spawn_budget(&attached);
+            assert_eq!(effective_budget.poll_quota, 64);
+            assert_eq!(effective_budget.cost_quota, Some(128));
+            assert_eq!(effective_budget.priority, 7);
+
+            let mut conn = AsyncConnection::open(&cx, ":memory:")
+                .await
+                .expect("attached runtime Cx should open the worker-backed connection");
+            conn.execute(&cx, "CREATE TABLE attached_runtime (value INTEGER)")
+                .await
+                .expect("attached runtime Cx should dispatch to the worker");
+            conn.close(&cx)
+                .await
+                .expect("async close should join through the runtime blocking pool");
+
+            assert!(
+                conn.execute(&cx, "SELECT 1").await.is_err(),
+                "a joined worker must not accept commands after explicit close"
+            );
+            assert!(
+                Runtime::current_handle().is_some(),
+                "async close must leave the caller on its original runtime"
+            );
+            assert_eq!(
+                NativeCx::current()
+                    .expect("runtime Cx must remain installed after close")
+                    .task_id(),
+                native.task_id(),
+                "async close must not replace the caller's runtime context"
+            );
+        });
+    }
+
+    #[test]
+    fn attached_runtime_native_cancellation_after_publication_returns_interrupt_without_effect() {
+        let mut conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
+        let release_tx = stall_worker(&conn);
+        let signal = Arc::clone(&conn.sender().expect("worker sender").signal);
+        let operation = Cx::new();
+        let runtime = test_runtime();
+
+        let result = runtime.block_on(async {
+            let native = NativeCx::current().expect("test must run in an asupersync runtime");
+            operation.set_native_cx(native.clone());
+            assert_eq!(
+                operation
+                    .attached_native_cx()
+                    .expect("operation must retain the runtime Cx")
+                    .task_id(),
+                native.task_id(),
+                "operation must share the caller runtime Cx"
+            );
+
+            let mut execute = Box::pin(conn.execute(
+                &operation,
+                "CREATE TABLE attached_native_cancelled_after_publication (id INTEGER PRIMARY KEY)",
+            ));
+            while signal.async_publications.load(Ordering::Acquire) == 0 {
+                assert!(
+                    future::poll_once(&mut execute).await.is_none(),
+                    "queued command must remain pending while the worker is gated"
+                );
+                future::yield_now().await;
+            }
+
+            native.set_cancel_reason(asupersync::types::CancelReason::user(
+                "attached native cancellation after publication",
+            ));
+            assert!(
+                !operation.is_cancel_requested(),
+                "native-only cancellation must not mutate local FSQLite cancellation state"
+            );
+            assert!(
+                future::poll_once(&mut execute).await.is_none(),
+                "caller cancellation must wait for the worker's terminal outcome"
+            );
+            release_tx
+                .send(())
+                .expect("worker gate should still accept its release");
+            execute.await
+        });
+
+        assert!(
+            matches!(result, Err(FrankenError::Interrupt)),
+            "worker-confirmed native cancellation should surface as Interrupt: {result:?}"
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'attached_native_cancelled_after_publication'",
+            )
+            .expect("schema query should succeed after releasing the worker");
+        assert!(
+            rows.is_empty(),
+            "cancelled command must have no late SQL effect"
+        );
+        conn.close_sync().expect("close should join the worker");
         drop(runtime);
     }
 
