@@ -30,7 +30,13 @@
   beads.
 
 ## Notes
-# Dependency Upgrade Log
+
+- Version rules honored: nightly toolchain pin untouched; path deps and
+  intra-workspace 0.2.1 pins untouched.
+
+---
+
+# Dependency Upgrade Log (previous sweep)
 
 **Date:** 2026-06-19
 **Project:** FrankenSQLite
