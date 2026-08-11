@@ -2,6 +2,7 @@ use std::thread;
 use std::time::Duration;
 
 use fsqlite_core::commit_repair::{CommitRequest, two_phase_commit_channel};
+use fsqlite_types::cx::Cx;
 
 fn req(txn_id: u64) -> CommitRequest {
     CommitRequest::new(
@@ -18,7 +19,11 @@ fn test_e2e_commit_pipeline_cancel_safety() {
     // Force "cancel during reserve" deterministically by temporarily saturating capacity.
     let mut blockers = Vec::new();
     for _ in 0..16 {
-        blockers.push(sender.reserve());
+        blockers.push(
+            sender
+                .reserve(&Cx::new())
+                .expect("reserve should succeed while capacity remains"),
+        );
     }
 
     let mut reserve_cancel_workers = Vec::new();
@@ -48,7 +53,9 @@ fn test_e2e_commit_pipeline_cancel_safety() {
     for writer_id in 0_u64..40 {
         let sender_clone = sender.clone();
         writers.push(thread::spawn(move || {
-            let permit = sender_clone.reserve();
+            let permit = sender_clone
+                .reserve(&Cx::new())
+                .expect("writer reserve should succeed");
             let seq = permit.reservation_seq();
 
             if writer_id < 10 {

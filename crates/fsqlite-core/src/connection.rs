@@ -2589,6 +2589,59 @@ pub fn init_global_runtime(config: RuntimeConfig) -> Arc<RuntimeContext> {
     runtime
 }
 
+/// bd-q8501: per-connection ambient runtime capture for the DEFAULT open path.
+///
+/// `Connection::open` resolves the process-global [`RuntimeContext`], which
+/// deliberately captures no runtime handle (see
+/// [`RuntimeContext::new_process_global`]): binding the GLOBAL context to one
+/// ambient runtime would spawn services on a runtime that may be dropped and
+/// leak that capture into every later open on any other runtime. A
+/// PER-CONNECTION capture has neither problem — the handle taken here belongs
+/// to the runtime this connection is being opened inside, and it is pinned by
+/// this connection alone. The global context itself stays detached.
+///
+/// The minted `Cx` follows the bd-fo6xw MINT-AND-EXIT contract (see
+/// [`RuntimeContext::io_native_cx`]): `RuntimeHandle::try_spawn_with_cx`
+/// creates a root-region task that hands out a clone of its `Cx` and returns
+/// immediately. The clone remains a valid spawner after the task exits because
+/// the spawn gateway and pending-spawn counter are `Arc`s into the runtime's
+/// root region. Lifetime proof: the returned [`RuntimeHandle`] is stored on
+/// the `Connection` (`_ambient_io_runtime_handle`), so `Connection` ->
+/// `RuntimeHandle` -> `RuntimeInner` keeps the root region and gateway alive
+/// for as long as any operation on this connection can run — the same pinning
+/// argument [`RuntimeContext::io_native_cx`] documents for context-owned
+/// captures.
+///
+/// The handoff is awaited rather than blocked on so a `current_thread`
+/// consumer runtime can poll the minting task while open is suspended;
+/// blocking the executor thread here would deadlock single-threaded runtimes.
+///
+/// Returns `None` — leaving the detached-fallback path unchanged — when the
+/// root `Cx` already carries an attached native context (the env's
+/// [`RuntimeContext`] provided one), when there is no ambient asupersync
+/// runtime (plain synchronous callers), or when the mint fails.
+///
+/// [`RuntimeHandle`]: asupersync::runtime::RuntimeHandle
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+async fn capture_ambient_io_native_cx(
+    root_cx: &Cx,
+) -> Option<asupersync::runtime::RuntimeHandle> {
+    if root_cx.attached_native_cx().is_some() {
+        return None;
+    }
+    let handle = asupersync::runtime::Runtime::current_handle()?;
+    let ambient = asupersync::Cx::current()?;
+    let (tx, mut rx) = asupersync::channel::oneshot::channel::<asupersync::Cx>();
+    handle
+        .try_spawn_with_cx(move |cx: asupersync::Cx| async move {
+            let _ = tx.send_blocking(cx);
+        })
+        .ok()?;
+    let io_cx = rx.recv(&ambient).await.ok()?;
+    root_cx.set_native_cx(io_cx);
+    Some(handle)
+}
+
 /// Connection-scoped environment for selecting the runtime context and
 /// tuning resource limits.
 ///
@@ -10614,6 +10667,16 @@ pub struct Connection {
     /// Keeps the per-database shared MVCC bundle alive while this connection
     /// is open, so same-path connections reuse the same state entry.
     _shared_mvcc_state: Arc<SharedMvccState>,
+    /// bd-q8501: pins the ambient consumer runtime captured at open time so
+    /// the io_uring data path stays valid on the DEFAULT open path. `Some`
+    /// only when the env's [`RuntimeContext`] supplied no native `Cx` and an
+    /// ambient asupersync runtime existed when this connection was opened.
+    /// Holding the strong handle keeps `RuntimeInner` — and therefore the
+    /// spawn gateway carried by the io `Cx` attached to `root_cx` — alive for
+    /// the connection's lifetime: the bd-fo6xw lifetime proof (Connection ->
+    /// RuntimeHandle -> RuntimeInner) applied per connection.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    _ambient_io_runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
     /// Region owned by this connection under the shared per-database root.
     runtime_region: Region,
     /// Session ID for the current concurrent transaction (if any).
@@ -11921,6 +11984,14 @@ impl Connection {
         // an explicit native Cx. No-op for the process-global default context.
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         env.runtime().attach_io_native_cx_if_missing(&root_cx);
+        // bd-q8501: DEFAULT opens resolve the detached process-global context,
+        // so the line above is a no-op for plain library users. Capture the
+        // consumer's ambient runtime per connection instead so the io_uring
+        // data path engages for `Connection::open` inside an asupersync
+        // runtime; outside any runtime this yields `None` and the Unix
+        // fallback path is unchanged.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        let ambient_io_runtime_handle = capture_ambient_io_native_cx(&root_cx).await;
 
         let collation_registry = Arc::new(Mutex::new(CollationRegistry::new()));
         let mut conn = Self {
@@ -12035,6 +12106,8 @@ impl Connection {
             ssi_evidence_ledger: SsiEvidenceLedger::new(4096),
             concurrent_registry: Arc::clone(&shared_mvcc_state.registry),
             _shared_mvcc_state: Arc::clone(&shared_mvcc_state),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            _ambient_io_runtime_handle: ambient_io_runtime_handle,
             runtime_region,
             concurrent_session_id: RefCell::new(None),
             memory_concurrent_synced_write_roots: RefCell::new(SmallVec::new()),
@@ -12386,6 +12459,14 @@ impl Connection {
         // an explicit native Cx. No-op for the process-global default context.
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         env.runtime().attach_io_native_cx_if_missing(&root_cx);
+        // bd-q8501: DEFAULT opens resolve the detached process-global context,
+        // so the line above is a no-op for plain library users. Capture the
+        // consumer's ambient runtime per connection instead so the io_uring
+        // data path engages for `Connection::open` inside an asupersync
+        // runtime; outside any runtime this yields `None` and the Unix
+        // fallback path is unchanged.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        let ambient_io_runtime_handle = capture_ambient_io_native_cx(&root_cx).await;
 
         let eager_memdb_rows = pager_is_memory;
         let collation_registry = Arc::new(Mutex::new(CollationRegistry::new()));
@@ -12504,6 +12585,8 @@ impl Connection {
             // MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2)
             concurrent_registry: Arc::clone(&shared_mvcc_state.registry),
             _shared_mvcc_state: Arc::clone(&shared_mvcc_state),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            _ambient_io_runtime_handle: ambient_io_runtime_handle,
             runtime_region,
             concurrent_session_id: RefCell::new(None),
             memory_concurrent_synced_write_roots: RefCell::new(SmallVec::new()),

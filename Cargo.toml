@@ -189,6 +189,8 @@ rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
 # with FrankenSearch. 0.4.x re-anchors APIs already shipped in 0.3.10 and pins
 # franken-kernel/-decision/-evidence at `^0.4.3`, so the whole family moves in
 # lockstep; a caret on 0.3.x would silently fork that family across consumers.
+# Remote had pinned 0.4.3 exactly; the compatible range is a strict superset and
+# keeps this tree in the same universe as frankensearch's ceiling raise.
 asupersync = { version = ">=0.4.3,<0.5", default-features = false }
 futures-lite = "2.6.1"
 
