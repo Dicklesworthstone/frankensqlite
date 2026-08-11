@@ -19,6 +19,33 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.3.0] -- 2026-08-11 (asupersync 0.4.3 universe)
+
+Dependency-driven minor release. The workspace `asupersync` requirement moves
+from `^0.3.10` to `0.4.3`. Because asupersync types (`Cx`, scopes, sync
+primitives) appear in fsqlite's public API, changing the asupersync line is a
+breaking change for consumers under 0.x semver rules, so every workspace crate
+is bumped to 0.3.0. Beyond the dependency move, the delta since 0.2.1 is one
+small error-surface fix; the remaining commits are release bookkeeping (issue
+tracker updates and the 0.2.1 changelog date).
+
+### Changed
+
+- **asupersync 0.4.3 (breaking).** The workspace now pins
+  `asupersync = { version = "0.4.3", default-features = false }` (previously
+  `^0.3.10`). Consumers must use an asupersync 0.4.x `Cx`/runtime with this
+  release; 0.3.x and 0.4.x asupersync types do not unify.
+
+### Fixed
+
+- **`ExpressionTooDeep` parse errors are mapped, not swallowed.**
+  `parse_error_to_franken_error` now distinguishes
+  `ParseErrorKind::ExpressionTooDeep` from ordinary syntax/recursion failures,
+  so callers receive `FrankenError::ExpressionTooDeep` carrying the bound
+  maximum instead of a generic `ParseError`. `MAX_TRIGGER_PROGRAM_DEPTH` is
+  now public so harnesses and probes share the engine's trigger-depth
+  admission budget.
+
 ## [0.2.1] -- 2026-08-11 (correctness patch: mutation-free opens, FTS5 durability, REPLACE-victim semantics)
 
 Bugfix-only patch release. No new features, no API changes, and **no

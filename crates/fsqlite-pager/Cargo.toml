@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-pager"
-version = "0.2.1"
+version = "0.3.0"
 description = "Page cache and journal management"
 edition.workspace = true
 license-file.workspace = true
@@ -30,11 +30,11 @@ bench-internals = []
 foldhash = "0.2.0"
 smallvec = { version = "1.15.2", features = ["const_generics", "union", "const_new"] }
 bumpalo = { version = "3", features = ["collections"] }
-fsqlite-types = { path = "../fsqlite-types", version = "0.2.1", default-features = false }
-fsqlite-error = { path = "../fsqlite-error", version = "0.2.1" }
+fsqlite-types = { path = "../fsqlite-types", version = "0.3.0", default-features = false }
+fsqlite-error = { path = "../fsqlite-error", version = "0.3.0" }
 fsqlite-observability = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.2.1", default-features = false }
-fsqlite-wal = { path = "../fsqlite-wal", version = "0.2.1", default-features = false }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.3.0", default-features = false }
+fsqlite-wal = { path = "../fsqlite-wal", version = "0.3.0", default-features = false }
 xxhash-rust = { workspace = true }
 chacha20poly1305 = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
@@ -61,7 +61,7 @@ tempfile = { workspace = true }
 # versionless so Cargo strips the dev edge when packaging and avoids a publish
 # cycle while pager tests still use the workspace MVCC source.
 fsqlite-mvcc = { path = "../fsqlite-mvcc", default-features = false }
-fsqlite-wal = { path = "../fsqlite-wal", version = "0.2.1", default-features = false }
+fsqlite-wal = { path = "../fsqlite-wal", version = "0.3.0", default-features = false }
 serde_json = { workspace = true }
 criterion = { workspace = true }
 sha2 = { workspace = true }
