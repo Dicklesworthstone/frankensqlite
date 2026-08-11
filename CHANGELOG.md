@@ -19,6 +19,137 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.3.0] -- unreleased (Asupersync 0.4.3 compatibility)
+
+Lockstep `0.2.1 -> 0.3.0` bump of all 27 workspace members. No hand-authored
+change to FrankenSQLite's engine or package-runtime source: the source-level
+edits are dependency constraints and version numbers, so no feature work, no
+bug fixes, and **no performance claim** -- nothing here was measured, and the
+release-gate performance matrix remains out of scope. Release *infrastructure*
+did change: the release workflows and the release-architecture note were
+edited to remove the GitHub Actions publish paths, as described under
+**Changed**.
+
+**This is not a behavior-free release.** The async runtime underneath
+FrankenSQLite changed. Read **Breaking changes** before upgrading.
+
+> **BREAKING on two independent axes, neither of which is a hand-edited
+> FrankenSQLite signature.**
+>
+> 1. **Type identity.** Every public signature keeps its exact shape, but some
+>    of them name Asupersync types, and Asupersync `0.3.x` and `0.4.x` are
+>    non-interchangeable. A caller that upgrades only FrankenSQLite gets type
+>    errors.
+> 2. **Runtime behavior.** Asupersync `0.4.0`-`0.4.3` changed scheduler,
+>    lifecycle, cancellation, blocking-driver, stream-context, and
+>    poll-panic-containment semantics. Upgrading FrankenSQLite swaps the
+>    runtime that executes your database operations.
+>
+> So moving the Asupersync dependency in the same change is necessary but not
+> sufficient: callers must also revalidate cancellation and runtime behavior
+> against the new runtime. That is why this is a `0.3.0` family and not a
+> `0.2.2` patch.
+
+### Breaking changes
+
+- **Asupersync moves from `0.3.10` to `>=0.4.3,<0.5`.** Asupersync 0.4.x
+  re-anchors APIs already shipped in 0.3.10 and pins `franken-kernel`,
+  `franken-decision`, and `franken-evidence` at `^0.4.3`, so the runtime
+  family moves in lockstep. This is what lets FrankenSQLite and FrankenSearch
+  share one Asupersync runtime universe in a single dependency graph
+  (`bd-asupersync-043-compat-release-dk9ra`).
+
+  *Why it is breaking:* `fsqlite-types` names Asupersync types in its public
+  API under the `native` feature -- `Cx::set_native_cx`,
+  `Cx::attached_native_cx`, and `Cx::native_spawn_budget` take or return
+  `asupersync::Cx` and `asupersync::Budget`. Under Cargo's 0.x rules the
+  minor version is the compatibility axis, so `asupersync` 0.3.x and 0.4.x
+  are distinct, non-interchangeable types even where their definitions are
+  identical. A consumer still on `asupersync = "0.3"` cannot hand its `Cx`
+  across to a FrankenSQLite built against 0.4.x.
+
+  *Migration:* move your own `asupersync` dependency to `>=0.4.3,<0.5` in the
+  same change that moves `fsqlite` to `0.3`; the two cannot be upgraded
+  separately. No FrankenSQLite call site needs a signature edit, but see the
+  runtime-behavior entry below -- a clean compile is not sufficient evidence
+  that this upgrade is safe for your application. A caller pinning
+  `fsqlite = "0.2"` keeps the 0.2.1 API against Asupersync 0.3.10 and is not
+  upgraded silently.
+
+- **Asupersync `0.4.0`-`0.4.3` changes runtime behavior under FrankenSQLite.**
+  FrankenSQLite does not create its own runtime -- the caller's `Cx` and
+  executor drive every async operation -- so these are behavior changes to the
+  engine as your application observes it, even though no FrankenSQLite source
+  file changed. Per Asupersync's own changelog, the deltas across that range
+  include: scheduler and lifecycle repairs (timed-task promotion on injected
+  ready work, worker-spawn failure completing affected tasks, deferred regions
+  draining before leak diagnostics, causal ordering of spawn effects);
+  cancellation-safe synchronization fixes (waiter-ID wraparound, rejected
+  repolls of completed MPSC reservations, restored interrupted semaphore
+  acquisitions, preserved `RwLock` queue order, linearized `OnceCell` waiter
+  state, mutex rank released before wakeup); I/O boundary changes (buffered
+  seeks accounting for unread buffered data, bounded backpressure on framed
+  writes); capability-context retention in ATP progress streams, which
+  preserves sender wake registration and cancellation observation; an internal
+  blocking driver that owns its wake and parking semantics and refuses runtime
+  scheduler contexts before polling; and owned poll wrappers that contain
+  polling and terminal-cleanup panics.
+
+  *What this means for you:* revalidate cancellation, shutdown, and timeout
+  behavior for your workload after upgrading -- particularly anything that
+  cancels queries in flight, relies on `Drop` timing, or depends on task
+  scheduling order. FrankenSQLite makes **no claim** that these runtime
+  changes are behavior-preserving for your application, and **no performance
+  claim** in either direction: Asupersync's own `0.4.2` notes record its owned
+  blocking-driver ready path as slower in a recorded micro-measurement, and
+  FrankenSQLite has not measured the effect of any of this.
+
+### Changed
+
+- **All 27 workspace members bumped `0.2.1 -> 0.3.0` in lockstep.** The bump
+  covers 27 internal dependency declarations in the workspace root plus 38
+  explicit per-manifest version sites, so no member can resolve a
+  mixed-version sibling. `Cargo.lock` re-resolves the four Asupersync-family
+  packages and the 27 internal packages; no external dependency other than
+  Asupersync changed.
+
+  **25 of the 27 members are publishable; 2 are not.** `fsqlite-e2e` and
+  `fsqlite-harness` are marked `publish = false` and are workspace-only test
+  infrastructure; they are versioned in lockstep so the workspace resolves
+  coherently, but they are never uploaded to crates.io and no release artifact
+  is expected for them. Publishable is a manifest property, not a receipt: no
+  0.3.0 crate has been published to crates.io, and nothing in this entry should
+  be read as evidence that one has.
+
+- **GitHub Actions no longer has any release path, for either registry.**
+  DSR is the sole publisher of both the crates.io crates and the npm package.
+  Two workflows previously published:
+  - `Release` would publish all 25 publishable crates to crates.io on any
+    `v*` tag push. Its tag trigger is removed and its publish job is disabled
+    fail-closed.
+  - `fsqlite-wasm CI` ran `npm publish` with an `NPM_TOKEN` when a GitHub
+    Release was published, and exposed a manual `publish` dispatch input. Its
+    `release` trigger is removed, the input is inert, and its publish job is
+    disabled fail-closed.
+
+  Neither tagging a version nor publishing a GitHub Release now publishes
+  anything anywhere. Both job bodies are retained, disabled, as reviewable
+  references for DSR. The remaining `pull_request`/`push` CI in the WASM
+  workflow is unchanged and still builds and tests the package.
+
+### Known limitations carried from 0.2.1 and 0.2.0
+
+The v0.2.0 limitations in `README.md` still apply, including UTF-8-only text
+encoding, unwired page encryption (`PRAGMA key` silently ignored), the
+documented FTS5/R-Tree/STRICT edge divergences, and first-contact sidecar
+creation on never-before-opened stock databases (GH #140). This release
+contains no hand-authored engine change, so it fixes none of them and adds
+none of its own. That is a statement about FrankenSQLite's own code, not a
+guarantee that observable behavior is identical to 0.2.1: the runtime beneath
+the engine changed, as described under **Breaking changes**.
+
+---
+
 ## [0.2.1] -- 2026-08-11 (correctness patch: mutation-free opens, FTS5 durability, REPLACE-victim semantics)
 
 Bugfix-only patch release. No new features, no API changes, and **no

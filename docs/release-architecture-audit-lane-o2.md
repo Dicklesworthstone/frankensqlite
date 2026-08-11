@@ -15,18 +15,34 @@ locations, public-key material, or momentary service status.
 
 Local-tree facts checked for this revision:
 
-- The workspace has 27 members, all locally declared at `0.2.0`; two members
-  are marked `publish = false`.
+- The workspace has 27 members, all locally declared at `0.3.0`; two members
+  (`fsqlite-e2e`, `fsqlite-harness`) are marked `publish = false`, leaving 25
+  publishable crates. Publishable is a manifest property: no `0.3.0` crate has
+  been published to crates.io, and registry state is live state to be checked
+  at cut time, never inferred from this document.
 - `v0.1.19` is the semantic and crates.io preceding release tag, but it is not
   an ancestor of current `main`; `v0.1.18` is the latest released ancestor. A
   commit count relative to `v0.1.19` is intentionally omitted because it
   changes as release preparation lands and is not a release-readiness metric.
-- `CHANGELOG.md` contains an unreleased `0.2.0` section describing the next
-  lockstep release.
-- The checked-in release workflow contains an explicit 25-crate publish order,
-  checks that its crate set matches the publishable workspace set, and checks
-  every crate version against the tag before publishing. Its dependency order
-  requires an independent review; the workflow does not validate topology.
+- `CHANGELOG.md` contains an unreleased `0.3.0` section describing the next
+  lockstep release, scoped to Asupersync 0.4.3 compatibility.
+- **DSR is the sole release path, for both registries. GitHub Actions does not
+  publish.** Two checked-in workflows previously did:
+  - `release.yml` would publish the 25 publishable crates to crates.io on any
+    `v*` tag push. Its tag trigger is removed and its publish job is disabled
+    fail-closed, so tagging a version publishes nothing. Its 25-crate sequence
+    is retained in-file as a reviewable reference for the topological order
+    DSR must follow; it is documentation now, not automation, and it was never
+    a topology proof.
+  - `fsqlite-wasm-ci.yml` ran `npm publish` with an `NPM_TOKEN` on GitHub
+    Release publication, and exposed a manual `publish` dispatch input. The
+    `release` trigger is removed, the input is inert, and its publish job is
+    disabled fail-closed. Its build/test CI on `pull_request` and `push` is
+    unchanged.
+
+  A sweep of all nine workflows found no other publish step and no remaining
+  `release` or tag trigger anywhere. **The npm package is part of the release
+  surface** and is DSR's responsibility alongside the crates.
 - The Unix and PowerShell installers both resolve an unspecified version from
   the latest GitHub Release and require a SHA-256 manifest; when `minisign` is
   available they also verify its signature.
@@ -42,7 +58,7 @@ They are release-time checks, not properties of this document.
 The project uses a lockstep workspace version. A release cut therefore changes
 the workspace crates, internal dependency requirements, the changelog heading,
 and the release tag as one coherent line. The tag version is the provenance
-anchor used by the publish workflow's validation.
+anchor DSR validates each crate version against; no automation consumes the tag.
 
 For every lockstep minor cut, review each internal dependency requirement
 rather than assuming its old semver upper bound admits the new line. In
@@ -51,17 +67,19 @@ still becoming permanent registry metadata after publication.
 
 ### Publish DAG
 
-The checked-in release workflow lists 25 publishable crates in an order that an
+The disabled release workflow lists 25 publishable crates in an order that an
 independent manifest review found consistent with normal-dependency topology.
-The workflow itself checks that the crate set exactly matches Cargo metadata,
-then requires every package version to equal the release tag; it does not prove
-that the configured order is topological. Two workspace members are
-intentionally non-publishable.
+Two of the 27 workspace members are intentionally non-publishable. That list
+survives as the reference sequence for DSR; because the workflow no longer
+runs, the crate-set and version checks it used to perform are now DSR's
+responsibility, not automation's.
 
-That validation is useful, but it is not evidence that a release is ready:
-metadata, lockfile, credentials, registry state, and the actual workflow policy
-must all be checked at cut time. A manual release should preserve the same
-leaf-to-root dependency order and stop on the first publish failure.
+DSR must therefore itself confirm, at cut time, that the crate set matches
+Cargo metadata and that every package version equals the release tag. Neither
+check has ever proven that the configured order is topological, so the
+leaf-to-root order still needs its independent review, and publishing must
+stop on the first failure. Metadata, lockfile, credentials, and registry state
+are all live state to be checked at cut time.
 
 ### Installer and artifact contract
 
@@ -107,9 +125,9 @@ Both installers require a `SHA256SUMS.txt` manifest and, when the verifier is
 present, a matching `SHA256SUMS.txt.minisig`. Neither installer falls back to a
 bare `SHA256SUMS` name or to per-asset `.sha256` sidecars.
 
-No current release path produces that file. The crates.io publish workflow
-emits no binary assets or checksums, and the local fallback releaser emits a
-bare `SHA256SUMS` plus per-asset one-liners. The fallback releaser also signs
+No current release path produces that file. A crates.io publish emits no binary
+assets or checksums, and the local fallback releaser emits a bare `SHA256SUMS`
+plus per-asset one-liners. The fallback releaser also signs
 only files matching the tool-name prefix, so a checksum manifest is never
 signed automatically under either name.
 
@@ -145,7 +163,7 @@ a versioned name, a compatibility name, and architecture aliases that spell
 `amd64` as `x86_64` and `arm64` as `aarch64` — and it also emits a per-asset
 `.sha256` one-liner for every name it publishes.
 
-For v0.2.0 the closed published surface is 43 assets, matching v0.1.17's shape:
+For v0.3.0 the closed published surface is 43 assets, matching v0.1.17's shape:
 five primary archives, five architecture aliases, ten per-name `.sha256`
 sidecars, five primary-archive signatures, five primary-archive provenance
 files and their five signatures, `SHA256SUMS` and `SHA256SUMS.txt` plus both
@@ -180,18 +198,19 @@ SBOM generation is a standalone step, not part of build or release. Generated
 documents are named from a truncated archive basename and carry no license
 field, so a release that requires license provenance must record it separately.
 
-### v0.2.0 artifact decisions
+### v0.3.0 artifact decisions
 
 The prior release line published per-archive provenance, per-archive
-signatures, and a single dependency inventory in SPDX form. v0.2.0 preserves
-that surface, but producing it is not automatic:
+signatures, and a single dependency inventory in SPDX form. v0.3.0 preserves
+that surface, but producing it is not automatic -- and with the release
+workflow disabled, none of it can fall back to Actions:
 
 - **Provenance generation is a required standalone stage.** Attestation is not
   part of build or release; generate one source/tag-bound provenance file for
   each primary archive and verify all five before upload.
 - **SPDX output is required and must be rehearsed.** The prior release
-  published an SPDX inventory, so v0.2.0 must prove the SPDX generator and the
-  exact `frankensqlite-0.2.0.sbom.spdx.json` name before upload.
+  published an SPDX inventory, so v0.3.0 must prove the SPDX generator and the
+  exact `frankensqlite-0.3.0.sbom.spdx.json` name before upload.
 - **Non-archive files are not signed automatically.** Automatic signing
   matches files by tool-name prefix, so checksum manifests, the build
   manifest, the dependency inventory, and provenance files fall outside it.
@@ -225,14 +244,15 @@ with the associated test and compatibility evidence.
 
 | Hold point | Why it is one-way | Required proof before crossing |
 |---|---|---|
-| Create and push a version tag | A published tag becomes release provenance; correcting it normally requires a new version. | Freeze commit, exact version agreement, and recorded source SHA. |
+| Create and push a version tag | A published tag becomes release provenance; correcting it normally requires a new version. Since the tag trigger is disabled, tagging no longer publishes, but it is still one-way as provenance. | Freeze commit, exact version agreement, and recorded source SHA. |
 | Publish each crate | A crate version cannot be reused; a failure can leave a partial registry line. | Full dependency order, dry-run evidence, credentials, and a stop-on-failure plan. |
 | Create the public release and upload artifacts | This changes the default installer target and exposes artifacts to users. | Matrix artifacts, manifest/signature verification, and installer rehearsal. |
 | Rotate signing policy | Existing installers must still select the intended trust policy. | Explicit compatibility review of both installers and an exact-version verification. |
 
-Do not rely on a presumed workflow state to make tagging safe. Before creating a
-tag, establish whether any enabled automation reacts to it and whether that
-behavior is intended for this cut.
+Do not rely on a presumed workflow state to make tagging safe. The `v*` tag
+trigger is disabled and the publish job is fail-closed, so no checked-in
+automation should react to a tag; verify that this is still true in the tree
+you are cutting from rather than trusting this sentence.
 
 ## Shortest safe critical path
 
