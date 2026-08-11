@@ -148,3 +148,140 @@ fn gh333_concurrent_same_file_open_update_from_two_threads_100_iters() {
         failures.join("\n")
     );
 }
+
+/// GH #333 stall-shape receipt: a worker that panics mid-workload (after
+/// `Connection::open`, its handle abandoned to unwind) must not wedge or fail
+/// the sibling. The issue's worst arm was an indefinite hang where one worker
+/// panicked before reaching its coordination point and the sibling waited
+/// forever; at engine level the guarantee is that an abandoned connection
+/// (panicked thread, no `close()`) leaves no state behind that blocks or
+/// spuriously fails a concurrent open→UPDATE→close on the same file.
+const PANIC_ITERATIONS: u32 = 25;
+
+#[test]
+fn gh333_worker_panic_after_open_does_not_wedge_or_fail_sibling() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut failures: Vec<String> = Vec::new();
+
+    for i in 0..PANIC_ITERATIONS {
+        let path_s = dir
+            .path()
+            .join(format!("panic-{i}.db"))
+            .to_string_lossy()
+            .into_owned();
+        {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("seed runtime");
+            let conn = rt
+                .block_on(fsqlite::Connection::open(path_s.clone()))
+                .expect("seed open");
+            rt.block_on(conn.execute("CREATE TABLE t (k TEXT PRIMARY KEY, v INTEGER)"))
+                .expect("seed create table");
+            rt.block_on(conn.execute("INSERT INTO t (k, v) VALUES ('a', 0)"))
+                .expect("seed insert");
+            rt.block_on(conn.close()).expect("seed close");
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel::<(usize, Result<(), String>)>();
+
+        // Worker 0: open, then panic with the connection abandoned to unwind.
+        let panic_handle = {
+            let path_s = path_s.clone();
+            let barrier = Arc::clone(&barrier);
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let body = move || -> Result<(), String> {
+                    barrier.wait();
+                    let rt = RuntimeBuilder::current_thread()
+                        .build()
+                        .map_err(|e| format!("runtime: {e}"))?;
+                    let _conn = rt
+                        .block_on(fsqlite::Connection::open(path_s))
+                        .map_err(|e| format!("open[panicker]: {e:?}"))?;
+                    panic!("injected GH #333 worker panic after open");
+                };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+                    .unwrap_or_else(|_| Err("panicked (expected)".to_owned()));
+                let _ = tx.send((0, outcome));
+            })
+        };
+        // Worker 1: the sibling must complete the full workload.
+        let sibling_handle = {
+            let path_s = path_s.clone();
+            let barrier = Arc::clone(&barrier);
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let body = move || -> Result<(), String> {
+                    barrier.wait();
+                    let rt = RuntimeBuilder::current_thread()
+                        .build()
+                        .map_err(|e| format!("runtime: {e}"))?;
+                    let conn = rt
+                        .block_on(fsqlite::Connection::open(path_s))
+                        .map_err(|e| format!("open[sibling]: {e:?}"))?;
+                    rt.block_on(conn.execute("UPDATE t SET v = v + 1 WHERE k = 'a'"))
+                        .map_err(|e| format!("update[sibling]: {e:?}"))?;
+                    rt.block_on(conn.close())
+                        .map_err(|e| format!("close[sibling]: {e:?}"))?;
+                    Ok(())
+                };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+                    .unwrap_or_else(|panic| {
+                        let msg = panic
+                            .downcast_ref::<&str>()
+                            .map(ToString::to_string)
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic payload".to_owned());
+                        Err(format!("sibling panicked: {msg}"))
+                    });
+                let _ = tx.send((1, outcome));
+            })
+        };
+        drop(tx);
+
+        let mut reported = 0usize;
+        let mut hang = false;
+        while reported < 2 {
+            match rx.recv_timeout(ITERATION_TIMEOUT) {
+                Ok((_, Ok(()))) => {
+                    reported += 1;
+                }
+                // The panicker's injected panic is the expected outcome for
+                // worker 0; any other error (e.g. its open failing) is real.
+                Ok((0, Err(msg))) if msg == "panicked (expected)" => {
+                    reported += 1;
+                }
+                Ok((w, Err(msg))) => {
+                    failures.push(format!("iter {i}: worker {w}: {msg}"));
+                    reported += 1;
+                }
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                    failures.push(format!(
+                        "iter {i}: HANG — sibling (or panicker) never reported within \
+                         {ITERATION_TIMEOUT:?} after injected panic (GH #333 stall shape)"
+                    ));
+                    hang = true;
+                    break;
+                }
+            }
+        }
+        if hang {
+            break;
+        }
+        panic_handle
+            .join()
+            .expect("panicker thread reported via channel");
+        sibling_handle
+            .join()
+            .expect("sibling thread reported via channel");
+    }
+
+    assert!(
+        failures.is_empty(),
+        "GH #333 panic-sibling keeper: failures={}/{PANIC_ITERATIONS}\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
