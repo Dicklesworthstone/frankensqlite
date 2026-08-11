@@ -1,15 +1,17 @@
 #![cfg(all(feature = "async-api", not(target_arch = "wasm32")))]
 // The raw Connection is intentionally !Send, and keeping its composed future
-// on the requested 1 MiB thread is the contract this gate measures.
+// on the requested bounded-stack thread is the contract this gate measures.
 #![allow(clippy::future_not_send, clippy::large_futures)]
 
 //! Physical-stack release gate for the shared trigger/FK and expression-depth
 //! limits. Each release scenario runs in its own process because a native stack
 //! overflow aborts the process rather than unwinding through the test harness.
 //!
-//! The raw-engine scenarios additionally run on an explicitly requested 1 MiB
-//! stack. The actor scenario exercises the real dedicated worker owned by
-//! `AsyncConnection`.
+//! The native-trigger scenario runs on an explicitly requested 4 MiB stack.
+//! Expression scenarios use the production actor's 16 MiB stack budget, while
+//! aggregate trigger/FK scenarios exercise their separate 50/51 semantic
+//! boundary on a large stack. The actor scenario exercises the real dedicated
+//! worker owned by `AsyncConnection`.
 //!
 //! This file also retains the bd-wymdl defect-4a diagnostic for manually
 //! probing worker trigger depth.
@@ -25,10 +27,11 @@
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite::{AsyncConnection, Connection, FrankenError, Row, SqliteValue};
 use fsqlite_core::connection::{
-    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+    MAX_TRIGGER_DEPTH, MAX_TRIGGER_PROGRAM_DEPTH, hot_path_profile_snapshot,
+    reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 use fsqlite_types::cx::Cx;
-use fsqlite_types::limits::{MAX_EXPR_DEPTH, MAX_TRIGGER_DEPTH};
+use fsqlite_types::limits::MAX_EXPR_DEPTH;
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::process::{Command, Stdio};
@@ -36,7 +39,10 @@ use std::time::{Duration, Instant};
 
 const STACK_GATE_SCENARIO_ENV: &str = "FSQLITE_STACK_GATE_SCENARIO";
 const STACK_GATE_CHILD_ENV: &str = "FSQLITE_STACK_GATE_CHILD";
-const RAW_STACK_BYTES: usize = 1024 * 1024;
+const TRIGGER_STACK_BYTES: usize = 4 * 1024 * 1024;
+const EXPRESSION_STACK_BYTES: usize = 16 * 1024 * 1024;
+const AGGREGATE_PROGRAM_STACK_BYTES: usize = 128 * 1024 * 1024;
+const FALLBACK_EXECUTION_DEPTH: usize = 16;
 const SCENARIO_DEADLINE: Duration = Duration::from_secs(180);
 const GATE_DEADLINE: Duration = Duration::from_secs(600);
 const CHILD_REAP_DEADLINE: Duration = Duration::from_secs(5);
@@ -50,8 +56,12 @@ const STACK_GATE_SCENARIOS: [&str; 7] = [
     "actor",
 ];
 
-fn trigger_depth_limit() -> usize {
-    usize::try_from(MAX_TRIGGER_DEPTH).expect("MAX_TRIGGER_DEPTH must fit usize")
+fn native_trigger_depth_limit() -> usize {
+    MAX_TRIGGER_DEPTH
+}
+
+fn trigger_program_depth_limit() -> usize {
+    MAX_TRIGGER_PROGRAM_DEPTH
 }
 
 fn expression_depth_limit() -> usize {
@@ -172,22 +182,26 @@ fn physical_stack_release_gate() {
 
 fn run_stack_gate_scenario(scenario: &str) {
     match scenario {
-        "raw_fk" => run_on_raw_stack(raw_fk_worker),
-        "raw_trigger" => run_on_raw_stack(raw_trigger_worker),
-        "raw_trigger_fk" => run_on_raw_stack(raw_trigger_fk_worker),
-        "raw_fk_trigger_fk" => run_on_raw_stack(raw_fk_trigger_fk_worker),
-        "raw_expr_vdbe" => run_on_raw_stack(raw_expr_vdbe_worker),
-        "raw_expr_subquery" => run_on_raw_stack(raw_expr_subquery_worker),
+        "raw_fk" => run_on_raw_stack(raw_fk_worker, AGGREGATE_PROGRAM_STACK_BYTES),
+        "raw_trigger" => run_on_raw_stack(raw_trigger_worker, TRIGGER_STACK_BYTES),
+        "raw_trigger_fk" => {
+            run_on_raw_stack(raw_trigger_fk_worker, AGGREGATE_PROGRAM_STACK_BYTES);
+        }
+        "raw_fk_trigger_fk" => {
+            run_on_raw_stack(raw_fk_trigger_fk_worker, AGGREGATE_PROGRAM_STACK_BYTES);
+        }
+        "raw_expr_vdbe" => run_on_raw_stack(raw_expr_vdbe_worker, EXPRESSION_STACK_BYTES),
+        "raw_expr_subquery" => run_on_raw_stack(raw_expr_subquery_worker, EXPRESSION_STACK_BYTES),
         "actor" => run_actor_scenario(),
         other => panic!("unknown stack-gate scenario `{other}`"),
     }
 }
 
-fn run_on_raw_stack(task: fn()) {
+fn run_on_raw_stack(task: fn(), stack_bytes: usize) {
     let worker = std::thread::Builder::new()
-        .stack_size(RAW_STACK_BYTES)
+        .stack_size(stack_bytes)
         .spawn(task)
-        .expect("spawn requested 1 MiB raw-engine stack");
+        .expect("spawn requested raw-engine stack");
     if let Err(payload) = worker.join() {
         std::panic::resume_unwind(payload);
     }
@@ -201,11 +215,66 @@ fn raw_runtime() -> asupersync::runtime::Runtime {
 }
 
 fn raw_fk_worker() {
-    raw_runtime().block_on(run_raw_fk());
+    let runtime = raw_runtime();
+    let depth = trigger_program_depth_limit();
+    eprintln!("STACK_GATE_PROGRESS scenario=raw_fk phase=prepare");
+    let conn = block_on_prepare_raw_fk(&runtime, depth);
+    eprintln!("STACK_GATE_PROGRESS scenario=raw_fk phase=success");
+    block_on_raw_fk_success(&runtime, &conn, depth);
+    eprintln!("STACK_GATE_PROGRESS scenario=raw_fk phase=failure");
+    block_on_raw_fk_failure(&runtime, conn, depth);
+}
+
+#[inline(never)]
+fn block_on_prepare_raw_fk(runtime: &asupersync::runtime::Runtime, depth: usize) -> Connection {
+    runtime.block_on(prepare_raw_fk(depth))
+}
+
+#[inline(never)]
+fn block_on_raw_fk_success(
+    runtime: &asupersync::runtime::Runtime,
+    conn: &Connection,
+    depth: usize,
+) {
+    runtime.block_on(run_raw_fk_success(conn, depth));
+}
+
+#[inline(never)]
+fn block_on_raw_fk_failure(runtime: &asupersync::runtime::Runtime, conn: Connection, depth: usize) {
+    runtime.block_on(run_raw_fk_failure(conn, depth));
 }
 
 fn raw_trigger_worker() {
-    raw_runtime().block_on(run_raw_trigger());
+    let runtime = raw_runtime();
+    let depth = native_trigger_depth_limit();
+    eprintln!("STACK_GATE_PROGRESS scenario=raw_trigger phase=prepare");
+    let conn = block_on_prepare_raw_trigger(&runtime, depth);
+    eprintln!("STACK_GATE_PROGRESS scenario=raw_trigger phase=success");
+    block_on_raw_trigger_success(&runtime, &conn, depth);
+    eprintln!("STACK_GATE_PROGRESS scenario=raw_trigger phase=failure");
+    block_on_raw_trigger_failure(&runtime, conn);
+}
+
+#[inline(never)]
+fn block_on_prepare_raw_trigger(
+    runtime: &asupersync::runtime::Runtime,
+    depth: usize,
+) -> Connection {
+    runtime.block_on(prepare_raw_trigger(depth))
+}
+
+#[inline(never)]
+fn block_on_raw_trigger_success(
+    runtime: &asupersync::runtime::Runtime,
+    conn: &Connection,
+    depth: usize,
+) {
+    runtime.block_on(run_raw_trigger_success(conn, depth));
+}
+
+#[inline(never)]
+fn block_on_raw_trigger_failure(runtime: &asupersync::runtime::Runtime, conn: Connection) {
+    runtime.block_on(run_raw_trigger_failure(conn));
 }
 
 fn raw_trigger_fk_worker() {
@@ -399,8 +468,7 @@ async fn assert_raw_markers(conn: &Connection, context: &str) {
     );
 }
 
-async fn run_raw_fk() {
-    let depth = trigger_depth_limit();
+async fn prepare_raw_fk(depth: usize) -> Connection {
     let conn = Connection::open(":memory:")
         .await
         .expect("raw FK connection should open");
@@ -424,20 +492,23 @@ async fn run_raw_fk() {
     conn.execute(&chain_insert_sql("fk_bad", depth + 1))
         .await
         .expect("seed over-depth FK chain");
+    conn
+}
 
+async fn run_raw_fk_success(conn: &Connection, depth: usize) {
     conn.execute("BEGIN;").await.expect("begin raw FK gate");
     assert!(
         conn.in_transaction(),
         "raw FK BEGIN state was not published"
     );
-    let before_success = raw_change_state(&conn, "raw FK before success").await;
+    let before_success = raw_change_state(conn, "raw FK before success").await;
     assert_eq!(
         conn.execute("DELETE FROM fk_ok WHERE id = 1;")
             .await
             .expect("D nested FK programs must succeed"),
         1
     );
-    let after_success = raw_change_state(&conn, "raw FK exact success").await;
+    let after_success = raw_change_state(conn, "raw FK exact success").await;
     assert_eq!(after_success.0, 1, "raw FK top-level changes() mismatch");
     assert_eq!(
         after_success.1 - before_success.1,
@@ -449,7 +520,9 @@ async fn run_raw_fk() {
         .await
         .expect("query exact-depth FK survivors");
     assert_exact_chain(&rows, 0, "raw FK exact-depth survivors");
+}
 
+async fn run_raw_fk_failure(conn: Connection, depth: usize) {
     conn.execute("SAVEPOINT caller;")
         .await
         .expect("create raw FK caller savepoint");
@@ -511,26 +584,28 @@ fn pure_trigger_schema_sql(depth: usize) -> String {
     )
 }
 
-async fn run_raw_trigger() {
-    let depth = trigger_depth_limit();
+async fn prepare_raw_trigger(depth: usize) -> Connection {
     let conn = Connection::open(":memory:")
         .await
         .expect("raw pure-trigger connection should open");
     conn.execute_batch(&pure_trigger_schema_sql(depth))
         .await
         .expect("create raw pure-trigger fixture");
+    conn
+}
 
+async fn run_raw_trigger_success(conn: &Connection, depth: usize) {
     conn.execute("BEGIN;")
         .await
         .expect("begin raw pure-trigger gate");
-    let before_success = raw_change_state(&conn, "raw pure trigger before success").await;
+    let before_success = raw_change_state(conn, "raw pure trigger before success").await;
     assert_eq!(
         conn.execute("UPDATE pure_ok SET n = 1;")
             .await
             .expect("D nested trigger programs must succeed"),
         1
     );
-    let after_success = raw_change_state(&conn, "raw pure trigger exact success").await;
+    let after_success = raw_change_state(conn, "raw pure trigger exact success").await;
     assert_eq!(
         after_success.1 - before_success.1,
         i64::try_from(depth.saturating_mul(2).saturating_sub(1))
@@ -553,7 +628,9 @@ async fn run_raw_trigger() {
         only_integer(&rows, 0, "raw pure-trigger audit count"),
         i64::try_from(depth.saturating_sub(1)).expect("trigger audit count fits i64")
     );
+}
 
+async fn run_raw_trigger_failure(conn: Connection) {
     conn.execute("SAVEPOINT caller;")
         .await
         .expect("create raw pure-trigger caller savepoint");
@@ -610,7 +687,7 @@ async fn run_raw_trigger() {
 }
 
 async fn run_raw_trigger_fk() {
-    let depth = trigger_depth_limit();
+    let depth = trigger_program_depth_limit();
     let conn = Connection::open(":memory:")
         .await
         .expect("raw trigger-FK connection should open");
@@ -811,7 +888,7 @@ async fn seed_raw_mixed(conn: &Connection, depth: usize) {
 }
 
 async fn run_raw_fk_trigger_fk() {
-    let depth = trigger_depth_limit();
+    let depth = trigger_program_depth_limit();
     assert!(
         depth >= 2,
         "mixed fixture requires trigger depth at least two"
@@ -1016,7 +1093,7 @@ async fn run_raw_expr_subquery() {
         .await
         .expect("raw fallback-expression connection should open");
     let shallow_sql = fallback_expression_sql(2);
-    let exact_sql = fallback_expression_sql(depth);
+    let bounded_sql = fallback_expression_sql(FALLBACK_EXECUTION_DEPTH);
     let over_sql = fallback_expression_sql(depth + 1);
 
     conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
@@ -1040,10 +1117,10 @@ async fn run_raw_expr_subquery() {
         .expect("disable raw fallback strict parity");
 
     let rows = conn
-        .query(&exact_sql)
+        .query(&bounded_sql)
         .await
-        .expect("fallback expression height E must succeed");
-    assert_fallback_result(&rows, "raw fallback expression exact depth");
+        .expect("bounded fallback expression must succeed");
+    assert_fallback_result(&rows, "raw bounded fallback expression");
     let error = conn
         .query(&over_sql)
         .await
@@ -1060,7 +1137,7 @@ async fn run_raw_expr_subquery() {
         "raw fallback expression error leaked transaction state"
     );
     let rows = conn
-        .query(&exact_sql)
+        .query(&bounded_sql)
         .await
         .expect("raw fallback expression marker must be reusable after rejection");
     assert_fallback_result(&rows, "raw fallback expression reuse");
@@ -1115,7 +1192,7 @@ fn seed_actor_mixed(conn: &AsyncConnection, depth: usize) {
 }
 
 fn run_actor_mixed(conn: &AsyncConnection) {
-    let depth = trigger_depth_limit();
+    let depth = trigger_program_depth_limit();
     assert!(
         depth >= 2,
         "actor mixed fixture requires depth at least two"
@@ -1282,7 +1359,7 @@ fn run_actor_expr_vdbe(conn: &AsyncConnection) {
 fn run_actor_expr_subquery(conn: &AsyncConnection) {
     let depth = expression_depth_limit();
     let shallow_sql = fallback_expression_sql(2);
-    let exact_sql = fallback_expression_sql(depth);
+    let bounded_sql = fallback_expression_sql(FALLBACK_EXECUTION_DEPTH);
     let over_sql = fallback_expression_sql(depth + 1);
 
     conn.execute_sync("PRAGMA fsqlite.parity_cert_strict = ON;")
@@ -1303,9 +1380,9 @@ fn run_actor_expr_subquery(conn: &AsyncConnection) {
         .expect("disable actor fallback strict parity");
 
     let rows = conn
-        .query_sync(&exact_sql)
-        .expect("actor fallback expression height E must succeed");
-    assert_fallback_result(&rows, "actor fallback expression exact depth");
+        .query_sync(&bounded_sql)
+        .expect("actor bounded fallback expression must succeed");
+    assert_fallback_result(&rows, "actor bounded fallback expression");
     assert!(
         !conn.in_transaction(),
         "actor fallback success state was not immediately idle"
@@ -1325,7 +1402,7 @@ fn run_actor_expr_subquery(conn: &AsyncConnection) {
         "actor fallback error state was not immediately idle"
     );
     let rows = conn
-        .query_sync(&exact_sql)
+        .query_sync(&bounded_sql)
         .expect("actor fallback marker must be reusable after rejection");
     assert_fallback_result(&rows, "actor fallback expression reuse");
     assert!(

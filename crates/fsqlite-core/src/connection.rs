@@ -397,8 +397,8 @@ where
 /// including VDBE dispatch + expression evaluation). Keep at least a 2x margin
 /// below the observed 2 MiB test-thread stack boundary: compiler changes can
 /// grow these frames, and the limit must fire before the process aborts. The
-/// regression test exercises this boundary on an explicit 1 MiB stack.
-const MAX_TRIGGER_DEPTH: usize = 8;
+/// regression test exercises this boundary on an explicit 4 MiB stack.
+pub const MAX_TRIGGER_DEPTH: usize = 8;
 
 /// Maximum number of rebuilds permitted when a reentrant metadata callback
 /// changes the scalar-function registry while a statement snapshot is formed.
@@ -410,7 +410,7 @@ const FUNCTION_REGISTRY_STABILITY_ATTEMPTS: usize = 4;
 /// `SQLITE_MAX_TRIGGER_DEPTH` budget. FrankenSQLite's native Rust trigger
 /// recursion has the smaller [`MAX_TRIGGER_DEPTH`] stack-safety cap above, but
 /// the two program kinds must still share this semantic admission budget.
-const MAX_TRIGGER_PROGRAM_DEPTH: usize = 50;
+pub const MAX_TRIGGER_PROGRAM_DEPTH: usize = 50;
 
 static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -26783,10 +26783,18 @@ impl Connection {
     }
 
     fn parse_error_to_franken_error(parse_error: fsqlite_parser::ParseError) -> FrankenError {
-        FrankenError::ParseError {
-            #[allow(clippy::cast_sign_loss)]
-            offset: parse_error.span.start as usize,
-            detail: parse_error.message,
+        match parse_error.kind {
+            fsqlite_parser::ParseErrorKind::ExpressionTooDeep { max } => {
+                FrankenError::ExpressionTooDeep {
+                    max: usize::try_from(max).unwrap_or(usize::MAX),
+                }
+            }
+            fsqlite_parser::ParseErrorKind::Syntax
+            | fsqlite_parser::ParseErrorKind::RecursionLimit => FrankenError::ParseError {
+                #[allow(clippy::cast_sign_loss)]
+                offset: parse_error.span.start as usize,
+                detail: parse_error.message,
+            },
         }
     }
 

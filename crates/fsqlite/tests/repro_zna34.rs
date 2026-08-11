@@ -88,23 +88,52 @@ fn run_one_iteration(n_threads: usize) -> Vec<String> {
                     "PRAGMA cache_size = -64000;",
                     "PRAGMA fsqlite.concurrent_mode = ON;",
                 ] {
-                    if let Err(error) = conn.execute(pragma).await {
-                        let message = format!("[t{tid}] startup {pragma} failed: {error:?}");
-                        errs.lock().unwrap().push(message.clone());
-                        let _ = startup_tx.send((tid, Err(message)));
-                        return;
+                    let mut pragma_attempts = 0_u32;
+                    loop {
+                        pragma_attempts += 1;
+                        match conn.execute(pragma).await {
+                            Ok(_) => break,
+                            Err(error)
+                                if is_retryable(&error) && pragma_attempts < MAX_RETRIES =>
+                            {
+                                conflicts.fetch_add(1, Ordering::Relaxed);
+                                thread::sleep(Duration::from_micros(
+                                    100 * u64::from(pragma_attempts),
+                                ));
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "[t{tid}] startup {pragma} failed after {pragma_attempts} attempts: {error:?}"
+                                );
+                                errs.lock().unwrap().push(message.clone());
+                                let _ = startup_tx.send((tid, Err(message)));
+                                return;
+                            }
+                        }
                     }
                 }
                 let insert_sql = format!(
                     "INSERT INTO bench_{tid} VALUES (?1, ('t' || ?1), (?1 * 7));"
                 );
-                let stmt = match conn.prepare(&insert_sql).await {
-                    Ok(stmt) => stmt,
-                    Err(error) => {
-                        let message = format!("[t{tid}] startup prepare failed: {error:?}");
-                        errs.lock().unwrap().push(message.clone());
-                        let _ = startup_tx.send((tid, Err(message)));
-                        return;
+                let mut prepare_attempts = 0_u32;
+                let stmt = loop {
+                    prepare_attempts += 1;
+                    match conn.prepare(&insert_sql).await {
+                        Ok(stmt) => break stmt,
+                        Err(error) if is_retryable(&error) && prepare_attempts < MAX_RETRIES => {
+                            conflicts.fetch_add(1, Ordering::Relaxed);
+                            thread::sleep(Duration::from_micros(
+                                100 * u64::from(prepare_attempts),
+                            ));
+                        }
+                        Err(error) => {
+                            let message = format!(
+                                "[t{tid}] startup prepare failed after {prepare_attempts} attempts: {error:?}"
+                            );
+                            errs.lock().unwrap().push(message.clone());
+                            let _ = startup_tx.send((tid, Err(message)));
+                            return;
+                        }
                     }
                 };
                 if startup_tx.send((tid, Ok(()))).is_err() || start_rx.recv() != Ok(true) {

@@ -10903,7 +10903,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let two_arm_orders = bridge_two_arm_orders(100, &mut rng)
             .expect("complete complementary two-arm pairs should be valid");
-        for pair in two_arm_orders.chunks_exact(2) {
+        for pair in two_arm_orders.as_chunks::<2>().0 {
             for order in pair {
                 assert_eq!(order[0], order[3]);
                 assert_eq!(order[1], order[2]);
@@ -10960,7 +10960,7 @@ mod tests {
             parameter_control_orders(72, &mut rng).expect("36 complete pairs should be valid");
         assert_eq!(orders.len(), 72);
         let mut null_first = 0_usize;
-        for pair in orders.chunks_exact(2) {
+        for pair in orders.as_chunks::<2>().0 {
             for order in pair {
                 assert_eq!(order.roles[0], order.roles[3]);
                 assert_eq!(order.roles[1], order.roles[2]);
@@ -14559,7 +14559,7 @@ fn bridge_bootstrap_median_ci95(
     seed: u64,
 ) -> Result<(f64, f64, usize), String> {
     debug_assert!(!values.is_empty());
-    if cluster_width == 0 || values.len() % cluster_width != 0 {
+    if cluster_width == 0 || !values.len().is_multiple_of(cluster_width) {
         return Err(format!(
             "bootstrap requires complete width-{cluster_width} clusters for {} values",
             values.len()
@@ -14825,7 +14825,7 @@ fn bridge_two_arm_orders(
     block_count: usize,
     rng: &mut StdRng,
 ) -> Result<Vec<[BridgeArm; 4]>, String> {
-    if block_count == 0 || block_count % 2 != 0 {
+    if block_count == 0 || !block_count.is_multiple_of(2) {
         return Err(format!(
             "two-arm ordering requires complete complementary ABBA/BAAB block pairs, got {block_count} blocks"
         ));
@@ -14858,7 +14858,7 @@ fn bridge_three_arm_orders(
     block_count: usize,
     rng: &mut StdRng,
 ) -> Result<Vec<[BridgeArm; 6]>, String> {
-    if block_count == 0 || block_count % 3 != 0 {
+    if block_count == 0 || !block_count.is_multiple_of(3) {
         return Err(format!(
             "three-arm ordering requires complete three-block carryover cycles, got {block_count} blocks"
         ));
@@ -14901,7 +14901,7 @@ fn parameter_control_orders(
     block_count: usize,
     rng: &mut StdRng,
 ) -> Result<Vec<ParameterControlBlockOrder>, String> {
-    if block_count == 0 || block_count % 2 != 0 {
+    if block_count == 0 || !block_count.is_multiple_of(2) {
         return Err(format!(
             "parameter controls require complete complementary ABBA/BAAB block pairs, got {block_count} blocks"
         ));
@@ -16080,7 +16080,7 @@ fn bridge_balanced_ready_count_orders(
     }
     let width = operation_counts.len();
     let cycle_blocks = width.saturating_mul(2);
-    if block_count == 0 || block_count % cycle_blocks != 0 {
+    if block_count == 0 || !block_count.is_multiple_of(cycle_blocks) {
         return Err(format!(
             "ready count ordering requires a whole balanced Williams cycle: \
              block_count={block_count}, required multiple={cycle_blocks}"

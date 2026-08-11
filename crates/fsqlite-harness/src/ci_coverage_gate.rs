@@ -412,7 +412,7 @@ impl TursoCampaignScorecard {
                 .iter()
                 .filter(|diagnostic| diagnostic.lane_id.as_deref() == Some(lane.lane_id.as_str()))
                 .count();
-            let lane_id = bounded_utf8_prefix(&lane.lane_id, MAX_CAMPAIGN_SUMMARY_LANE_ID_BYTES);
+            let lane_id = bounded_summary_field(&lane.lane_id, MAX_CAMPAIGN_SUMMARY_LANE_ID_BYTES);
             let _ = writeln!(
                 output,
                 "lane={} runs={} generated={} executed={} errors={lane_errors}",
@@ -469,12 +469,20 @@ fn is_nonzero_lower_hex(value: &str, expected_len: usize) -> bool {
         && value.bytes().any(|byte| byte != b'0')
 }
 
-fn bounded_utf8_prefix(value: &str, maximum_bytes: usize) -> &str {
-    let mut end = value.len().min(maximum_bytes);
-    while !value.is_char_boundary(end) {
-        end -= 1;
+fn bounded_summary_field(value: &str, maximum_bytes: usize) -> String {
+    let mut output = String::with_capacity(value.len().min(maximum_bytes));
+    for character in value.chars() {
+        let character = if character.is_whitespace() || character.is_control() {
+            '_'
+        } else {
+            character
+        };
+        if output.len() + character.len_utf8() > maximum_bytes {
+            break;
+        }
+        output.push(character);
     }
-    &value[..end]
+    output
 }
 
 fn validate_campaign_run(run: &CampaignRunEvidence, diagnostics: &mut Vec<CampaignGateDiagnostic>) {
@@ -2377,7 +2385,7 @@ mod tests {
     fn turso_scorecard_summary_is_bounded_for_unknown_lane_spam() {
         let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
         input.runs.push(campaign_run(
-            &format!("aaaaaaaa-{}", "界".repeat(100)),
+            &format!("aaaaaaaa-\n\r\t{}\u{2028}", "界".repeat(100)),
             CampaignTier::Presubmit,
         ));
         for index in 0..20 {
@@ -2394,5 +2402,10 @@ mod tests {
         assert!(summary.lines().count() <= MAX_CAMPAIGN_SUMMARY_LANES + 2);
         assert!(summary.contains("lanes_omitted="));
         assert!(summary.lines().all(|line| line.len() < 240));
+        assert!(
+            !summary
+                .chars()
+                .any(|character| matches!(character, '\r' | '\t' | '\u{2028}'))
+        );
     }
 }

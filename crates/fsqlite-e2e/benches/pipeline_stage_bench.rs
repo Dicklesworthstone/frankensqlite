@@ -899,7 +899,7 @@ fn contract_median_u128(values: &mut [u128]) -> u128 {
     assert!(!values.is_empty(), "median requires samples");
     values.sort_unstable();
     let upper = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         let lower_value = values[upper - 1];
         lower_value + (values[upper] - lower_value) / 2
     } else {
@@ -912,7 +912,7 @@ fn contract_median_f64(values: &mut [f64]) -> f64 {
     assert!(!values.is_empty(), "median requires samples");
     values.sort_by(f64::total_cmp);
     let upper = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         f64::midpoint(values[upper - 1], values[upper])
     } else {
         values[upper]

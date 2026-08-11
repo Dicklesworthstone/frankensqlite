@@ -1301,34 +1301,34 @@ impl DashboardModel {
         }
 
         // Verdict.
-        if let Some(succeeded) = r.succeeded {
-            if y < inner.y + inner.height {
-                let (icon, color) = if succeeded {
-                    ("RECOVERED", PackedRgba::rgb(80, 255, 80))
-                } else {
-                    ("FAILED", PackedRgba::rgb(255, 80, 80))
-                };
-                let verdict_line = format!("  FrankenSQLite: {icon}");
-                Paragraph::new(verdict_line)
-                    .style(Style::new().fg(color).bold())
-                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
-                y += 1;
-            }
+        if let Some(succeeded) = r.succeeded
+            && y < inner.y + inner.height
+        {
+            let (icon, color) = if succeeded {
+                ("RECOVERED", PackedRgba::rgb(80, 255, 80))
+            } else {
+                ("FAILED", PackedRgba::rgb(255, 80, 80))
+            };
+            let verdict_line = format!("  FrankenSQLite: {icon}");
+            Paragraph::new(verdict_line)
+                .style(Style::new().fg(color).bold())
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
         }
 
         // C SQLite integrity result.
-        if let Some(passed) = r.csqlite_integrity_passed {
-            if y < inner.y + inner.height {
-                let (icon, color) = if passed {
-                    ("integrity OK", PackedRgba::rgb(160, 160, 160))
-                } else {
-                    ("INTEGRITY FAILED", PackedRgba::rgb(255, 80, 80))
-                };
-                let line = format!("  C SQLite: {icon}");
-                Paragraph::new(line)
-                    .style(Style::new().fg(color))
-                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
-            }
+        if let Some(passed) = r.csqlite_integrity_passed
+            && y < inner.y + inner.height
+        {
+            let (icon, color) = if passed {
+                ("integrity OK", PackedRgba::rgb(160, 160, 160))
+            } else {
+                ("INTEGRITY FAILED", PackedRgba::rgb(255, 80, 80))
+            };
+            let line = format!("  C SQLite: {icon}");
+            Paragraph::new(line)
+                .style(Style::new().fg(color))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
         }
     }
 }
@@ -1792,7 +1792,7 @@ fn format_count(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(ch);
@@ -2105,33 +2105,6 @@ fn parse_u16_csv(value: &str) -> Vec<u16> {
         .filter_map(|raw| raw.trim().parse::<u16>().ok())
         .filter(|n| *n > 0)
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicUsize;
-
-    #[test]
-    fn spawn_background_task_runs_on_runtime_blocking_pool() {
-        let runtime = RuntimeBuilder::new()
-            .blocking_threads(1, 1)
-            .build()
-            .expect("dashboard runtime should build for test");
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter_for_task = Arc::clone(&counter);
-
-        let handle = spawn_background_task(&runtime, move || {
-            counter_for_task.fetch_add(1, Ordering::Relaxed);
-        });
-
-        handle.wait();
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            1,
-            "background task should run exactly once",
-        );
-    }
 }
 
 fn parse_csv(value: &str) -> Vec<String> {
@@ -2966,4 +2939,31 @@ ADVANCED TUI:
     q               Quit
 ";
     print!("{text}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn spawn_background_task_runs_on_runtime_blocking_pool() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("dashboard runtime should build for test");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_task = Arc::clone(&counter);
+
+        let handle = spawn_background_task(&runtime, move || {
+            counter_for_task.fetch_add(1, Ordering::Relaxed);
+        });
+
+        handle.wait();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "background task should run exactly once",
+        );
+    }
 }

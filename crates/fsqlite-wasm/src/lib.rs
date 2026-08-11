@@ -1695,7 +1695,9 @@ fn threshold_bytes_from_percent(max_bytes: usize, percent: usize) -> Result<usiz
 
 #[cfg(feature = "diagnostics")]
 fn exact_wasm_page_count(bytes: usize) -> Option<usize> {
-    (bytes % WASM_LINEAR_MEMORY_PAGE_BYTES == 0).then_some(bytes / WASM_LINEAR_MEMORY_PAGE_BYTES)
+    bytes
+        .is_multiple_of(WASM_LINEAR_MEMORY_PAGE_BYTES)
+        .then_some(bytes / WASM_LINEAR_MEMORY_PAGE_BYTES)
 }
 
 #[cfg(feature = "diagnostics")]
