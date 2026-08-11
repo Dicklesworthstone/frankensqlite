@@ -29,10 +29,22 @@
   vs the currently-inactive uring data path) runs separately; findings become
   beads.
 
+### Compatible-range sweep (post-asupersync)
+
+- **`cargo update`:** 98 packages moved to latest compatible versions
+  (patch/minor within existing ranges; notable: bytes 1.11→1.12, cc 1.2→1.4,
+  clap 4.6.1→4.6.6, blake3 1.8.5→1.8.6, crossbeam-* patches).
+- **Verification:** `cargo check --workspace` clean; `cargo test -p fsqlite
+  --lib` 658 passed / 0 failed; `cargo clippy --workspace --all-targets --
+  -D warnings` clean.
+
 ## Notes
 
 - Version rules honored: nightly toolchain pin untouched; path deps and
   intra-workspace 0.2.1 pins untouched.
+- Audit follow-ups filed as beads: bd-q8501 (default-path io_uring
+  engagement), bd-vsbt7 (Cx-aware commit-repair reservation), bd-01he5
+  (doc refresh); upstream asupersync-0fya65 (RuntimeHandle::request_cx_with_budget).
 
 ---
 
