@@ -19,7 +19,7 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.2.1] -- UNRELEASED (correctness patch: mutation-free opens, FTS5 durability, REPLACE-victim semantics)
+## [0.2.1] -- 2026-08-11 (correctness patch: mutation-free opens, FTS5 durability, REPLACE-victim semantics)
 
 Bugfix-only patch release. No new features, no API changes, and **no
 performance claims**: the release-gate performance matrix (T16 and the
