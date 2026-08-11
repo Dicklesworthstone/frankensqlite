@@ -19,6 +19,61 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.2.1] -- UNRELEASED (correctness patch: mutation-free opens, FTS5 durability, REPLACE-victim semantics)
+
+Bugfix-only patch release. No new features, no API changes, and **no
+performance claims**: the release-gate performance matrix (T16 and the
+same-source re-verification tracked by `bd-dqdoe`) remains open and is not
+part of this release's scope.
+
+### Fixed
+
+- **Opening a database no longer mutates it (GH #294).** Steady-state
+  read-only and schema-only opens of an already-initialized database leave
+  every on-disk artifact byte-identical with unchanged mtime/ctime: the
+  close-path passive checkpoint no longer re-backfills already-backfilled WAL
+  frames or re-stamps the page-1 header change counter when nothing changed,
+  and the `-wal-cert-head` sidecar is no longer rewritten byte-identically on
+  every checkpoint. Durability fences are unchanged. Receipted by directory
+  snapshot-equality tests over both close variants (Unix; first-contact
+  sidecar creation on never-before-opened stock databases remains and is
+  tracked by GH #140).
+- **FTS5 oversized flushes no longer brick the index (GH #328 / cass#369).**
+  The segment writer now partitions a flush across multiple `_data` leaves,
+  each kept under the u16 term-offset ceiling, instead of failing the write
+  with `segment leaf term offset exceeds u16` and leaving a large contentless
+  index permanently unable to accept inserts or merges. A term whose single
+  doclist alone exceeds the ceiling is skipped with a warning rather than
+  failing the segment.
+- **FTS5 deferred-validation open (cass#368).** Opening a database with a
+  corrupt FTS5 shadow-structure record no longer fails at `Connection::open`;
+  validation is deferred so repair tooling can reach the table.
+- **FTS5 overlong terms are skipped, not fatal (cass#362).** Terms exceeding
+  the term-length cap are skipped consistently across all tokenizer
+  construction paths instead of failing the segment write.
+- **`INSERT`/`UPDATE OR REPLACE` victim semantics.** Replaced rows now run
+  their inbound foreign-key enforcement on every prepared execution lane, and
+  fire their DELETE triggers when `PRAGMA recursive_triggers = ON`, matching
+  stock SQLite ordering (victim triggers before the causing statement's own
+  AFTER triggers). WITHOUT ROWID `UPDATE OR REPLACE` resolves conflicts in a
+  strict three-phase plan (decide, delete victims + old row, insert new) so
+  victim secondary-index entries can never be orphaned.
+- **Trigger-depth contracts.** Depth is charged only after
+  `recursive_triggers` suppression; the trigger and FK-action recursive
+  program budgets are governed by one coherent pair of limits with the exact
+  50/51 aggregate boundary enforced in both mixed directions; ATTACH
+  delegation preserves one recursive-program budget across schemas; and
+  ATTACH/DETACH inside trigger bodies fail closed at `CREATE TRIGGER` time.
+
+### Known limitations carried from 0.2.0
+
+The v0.2.0 limitations in `README.md` still apply, including UTF-8-only text
+encoding, unwired page encryption (`PRAGMA key` silently ignored), and the
+documented FTS5/R-Tree/STRICT edge divergences. Every open GitHub issue has an
+explicit v0.2.0 disposition recorded on the tracker (`bd-fubxp`).
+
+---
+
 ## [0.2.0] -- 2026-08-04 (async storage stack, adaptive skip-scan execution, parallel-WAL durability certificates)
 
 Next full-workspace lockstep release (`0.1.19 -> 0.2.0`). `v0.1.19` is the

@@ -18233,13 +18233,17 @@ mod tests {
 
     #[test]
     fn test_porter_stem_step1b_at_suffix() {
-        // "conflated" -> strip "ed" -> "conflat" -> fixup: ends with "at" -> "conflate"
-        assert_eq!(porter_stem("conflated"), "conflate");
+        // "conflated" -> step 1b strips "ed" -> "conflat" -> at-fixup -> "conflate",
+        // then step 5a strips the final e (m("conflat") = 2 > 1) -> "conflat".
+        // Stock-verified: fts5vocab over tokenize='porter' stores "conflat".
+        assert_eq!(porter_stem("conflated"), "conflat");
     }
 
     #[test]
     fn test_porter_stem_step1b_bl_suffix() {
-        assert_eq!(porter_stem("troubled"), "trouble");
+        // "troubled" -> step 1b -> "trouble", then step 5a strips the final e
+        // (m("troubl") = 1 and "ubl" is not CVC). Stock-verified: "troubl".
+        assert_eq!(porter_stem("troubled"), "troubl");
     }
 
     #[test]
@@ -18255,8 +18259,10 @@ mod tests {
 
     #[test]
     fn test_porter_stem_eed() {
-        // "agreed" -> "eed" suffix -> base "agr" (len > 1) -> "agree"
-        assert_eq!(porter_stem("agreed"), "agree");
+        // "agreed" -> step 1b "eed" rule -> "agree", then step 5a strips the
+        // final e (m("agre") = 1 and "gre" is not CVC). Stock-verified:
+        // fts5vocab over tokenize='porter' stores "agre".
+        assert_eq!(porter_stem("agreed"), "agre");
     }
 
     #[test]
@@ -18389,7 +18395,9 @@ mod tests {
 
     #[test]
     fn test_porter_stem_step2_ational() {
-        assert_eq!(porter_stem("relational"), "relate");
+        // "relational" -> step 2 -> "relate", then step 5a strips the final e
+        // (m("relat") = 2 > 1). Stock-verified: "relat".
+        assert_eq!(porter_stem("relational"), "relat");
     }
 
     #[test]
