@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-vfs"
-version = "0.2.1"
+version = "0.3.0"
 description = "Virtual filesystem abstraction layer"
 edition.workspace = true
 license-file.workspace = true
@@ -14,7 +14,7 @@ linux-asupersync-uring = ["native", "dep:asupersync"]
 
 [dependencies]
 smallvec = "1.15"
-fsqlite-types = { version = "0.2.1", path = "../fsqlite-types", default-features = false }
+fsqlite-types = { version = "0.3.0", path = "../fsqlite-types", default-features = false }
 fsqlite-error = { workspace = true }
 fsqlite-observability = { workspace = true }
 asupersync = { workspace = true, optional = true }
