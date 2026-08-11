@@ -1,0 +1,2619 @@
+{
+  "provenance": {
+    "bead": "bd-rp4rt",
+    "parent_bead": "bd-dqdoe",
+    "build_git_sha": "4d0981aa99f11a06dfc06817b3eb0736f7967376",
+    "build_git_branch": "main",
+    "build_git_dirty": "true",
+    "build_profile": "release",
+    "build_opt_level": "3",
+    "elf_sha256": "0ef1de561aff442e99d99ccc4363f8c5eac10563c5b120bb1db1d3755bc91c26",
+    "elf_bytes": 22556296,
+    "exe_path": "/data/tmp/cargo-target/release-perf/bridge-overhead-bench",
+    "hostname": "superserver",
+    "cpus_allowed_list": "56-63",
+    "loadavg_start": "13.39 11.87 13.58 26/9973 2614702",
+    "levels": [
+      100,
+      200,
+      400,
+      800,
+      1600
+    ],
+    "rounds": 20,
+    "warmup_rounds": 2,
+    "lcg_seed": "0x5deece66d1ceb00c",
+    "bootstrap_resamples": 2000,
+    "bridge_api": "fsqlite_e2e::block_on (thread-local reused asupersync Runtime) / AsyncConnection *_sync facade"
+  },
+  "loadavg_end": "13.28 11.88 13.57 7/9941 2615180",
+  "arm_regressions": [
+    {
+      "arm": "single_entry",
+      "regressor": "rows",
+      "slope_ns_per_unit": 6735.613758064528,
+      "slope_ci95": [
+        6481.632617336554,
+        7108.138422074351
+      ],
+      "intercept_ns": -234250.25000000765,
+      "r_squared": 0.9741056979392385,
+      "n_samples": 100
+    },
+    {
+      "arm": "per_op_bridge",
+      "regressor": "bridge_calls",
+      "slope_ns_per_unit": 8111.763675403238,
+      "slope_ci95": [
+        8004.431393391723,
+        8218.11464532097
+      ],
+      "intercept_ns": -243465.24610081443,
+      "r_squared": 0.9938899242436203,
+      "n_samples": 100
+    },
+    {
+      "arm": "worker_facade",
+      "regressor": "bridge_calls",
+      "slope_ns_per_unit": 20496.2300087366,
+      "slope_ci95": [
+        19161.170818135313,
+        22066.94981796288
+      ],
+      "intercept_ns": 194968.054565835,
+      "r_squared": 0.9507625792259975,
+      "n_samples": 100
+    },
+    {
+      "arm": "ready_control",
+      "regressor": "bridge_calls",
+      "slope_ns_per_unit": 613.2545833333334,
+      "slope_ci95": [
+        611.4605425722048,
+        615.1652034872532
+      ],
+      "intercept_ns": 2576.9991666666283,
+      "r_squared": 0.9997403982291407,
+      "n_samples": 100
+    }
+  ],
+  "overhead_regressions": [
+    {
+      "contrast": "per_op_bridge_minus_single_entry",
+      "slope_ns_per_extra_bridge_call": 1376.1499173387076,
+      "slope_ci95": [
+        995.0800958605898,
+        1661.6151468554226
+      ],
+      "intercept_ns": 5632.381332662556,
+      "r_squared": 0.5231892347379671,
+      "n_pairs": 100
+    },
+    {
+      "contrast": "worker_facade_minus_single_entry",
+      "slope_ns_per_extra_bridge_call": 13760.616250672016,
+      "slope_ci95": [
+        12553.565233459945,
+        15118.556761650341
+      ],
+      "intercept_ns": 456450.14833267813,
+      "r_squared": 0.9109364000097903,
+      "n_pairs": 100
+    },
+    {
+      "contrast": "ready_control_minus_single_entry",
+      "slope_ns_per_extra_bridge_call": -6122.359174731194,
+      "slope_ci95": [
+        -6491.213402346844,
+        -5870.712652533953
+      ],
+      "intercept_ns": 244176.11750807124,
+      "r_squared": 0.9687426750325321,
+      "n_pairs": 100
+    }
+  ],
+  "per_level_medians": [
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "median_elapsed_ns": 584968.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "median_elapsed_ns": 1073317.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "median_elapsed_ns": 2267482.5
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "median_elapsed_ns": 5167130.5
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "median_elapsed_ns": 10242726.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "median_elapsed_ns": 853126.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "median_elapsed_ns": 1461383.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "median_elapsed_ns": 2756562.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "median_elapsed_ns": 6323311.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "median_elapsed_ns": 12780636.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "median_elapsed_ns": 2092036.5
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "median_elapsed_ns": 3915502.5
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "median_elapsed_ns": 7653465.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "median_elapsed_ns": 15359687.5
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "median_elapsed_ns": 30079706.5
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "median_elapsed_ns": 63027.5
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "median_elapsed_ns": 123560.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "median_elapsed_ns": 249819.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "median_elapsed_ns": 496398.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "median_elapsed_ns": 984125.5
+    }
+  ],
+  "samples": [
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 1009537.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2388322.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 689452.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 62156.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1480313.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 4515359.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 125474.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1156662.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2376720.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 10019595.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 246608.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2523494.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 5745877.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 5212685.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 500401.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 17572273.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 38756545.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12949836.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10859057.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 971016.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2564169.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 63879.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1044242.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 552768.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1239625.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 5164797.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 124371.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1424149.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2856473.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 1903521.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 243353.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 9891348.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 4876029.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6546617.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 19177389.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 499860.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 32508404.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 983980.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12749223.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10360019.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 723796.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1994280.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 63819.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 671068.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1495272.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 998197.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 122688.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 5399432.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2579908.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 8244214.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2647154.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 256287.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 16332928.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 505129.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 5913589.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 5236519.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 40500368.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 989260.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10852034.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12497044.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 885436.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 62025.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 516290.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2161119.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 4219187.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1484321.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1032851.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 122638.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 3068277.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 253030.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 10483068.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2636053.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 21399081.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 505690.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 4938706.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 7425662.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12682719.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 977358.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10243202.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 31946609.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 860149.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 677029.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1980574.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 67967.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1543550.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 6874626.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 125152.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1036769.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2276745.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 8251237.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 243483.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2441602.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 488628.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 4509106.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6405264.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 20044080.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 34388481.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12868855.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10351633.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 983970.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 861823.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2797734.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 65492.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 617168.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1257448.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 122739.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 5291322.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1506993.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2918378.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 258070.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2008876.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 9746588.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 19033240.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6085268.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 5380387.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 495832.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12909020.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 978119.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 42893489.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 15436441.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2909952.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 74108.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 1199010.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 920753.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 131164.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1432775.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1239475.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 5615955.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2658414.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 9651231.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2757669.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 256607.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 19017021.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 491494.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 5936982.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 5284068.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10535636.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 44832636.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 989200.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 13223034.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 893101.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 61965.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 518374.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2178222.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1313103.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3791131.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1434448.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 125063.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7632656.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 261607.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2910593.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 1863596.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 4458122.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 503947.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 15745045.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6589887.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12230498.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 976757.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10145560.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 29296530.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 817961.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1935170.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 665688.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 62156.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1462270.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 122408.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3702697.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 992556.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7674274.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 243793.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2280161.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2359689.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 5446771.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 5224117.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 494430.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 14991053.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10171398.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 30132004.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12740968.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 984611.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 859359.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2720129.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 63398.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 543120.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3883393.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 124803.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1199781.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1242200.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 244945.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2258220.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2352135.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7464303.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 4549972.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6561785.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 14411585.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 486425.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 13351543.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 29439846.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 979722.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10225419.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1943996.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 63018.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 723345.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 661671.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1427275.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 993307.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 122869.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3650430.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2324723.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2975906.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7459073.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 244194.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 14430190.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 491434.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 5518484.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 6029895.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 9961658.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 29564138.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 984271.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12744674.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 830375.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 513786.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 64530.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1919029.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3797113.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1514987.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 977638.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 122388.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2897639.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7476816.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 256748.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 1889664.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 5346764.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 15375046.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 494269.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6398130.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 996323.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10036698.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 13211563.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 31788515.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 893151.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 669516.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2024336.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 62757.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1471066.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 122558.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3734606.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1109865.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2602330.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7582453.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 245246.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2443976.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6248492.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 5142645.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 494410.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 15344329.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10230878.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 28846954.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12444025.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 978730.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1085770.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1970766.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 63037.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 528873.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1196806.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3841134.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 127667.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1226561.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2755455.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 1863336.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 258722.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7331867.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 14676117.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 5870228.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 5191616.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 496964.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 28827217.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 984441.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 13327889.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10040124.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1990582.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 63268.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 708167.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 641673.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1426704.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 982707.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 134780.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3726331.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2963281.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7341515.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2384776.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 243783.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 5472118.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 14815266.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 510189.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 5306761.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10221551.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 979411.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 29245776.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12812049.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 859148.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 62816.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 533663.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1946841.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3947612.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1516801.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 984561.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 123179.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2824093.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 254203.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7177520.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 1919901.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 4431493.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 15037428.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 489971.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6593955.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12447762.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10912997.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 985272.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 29830834.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 1945639.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 926944.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 532811.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 62797.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1460496.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3659296.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 123951.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 973321.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2277185.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7216423.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 245146.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2400164.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 500420.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 4764672.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6747760.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 14779980.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 29238672.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12650049.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 11127477.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 982417.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 854138.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 62286.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2159737.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 531769.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 3733935.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 123941.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1191456.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1259523.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 253932.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2237862.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 2386368.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 7558628.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 4525086.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6496323.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 15096949.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 501713.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12947571.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 38660937.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 987967.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10778919.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 754984.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2582062.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 65903.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 788377.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1509117.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 123129.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 993117.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 5204871.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 9872142.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 3310066.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 1897199.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 244264.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 5733574.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 502655.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 20108361.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 5742621.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10242250.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 988819.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 29910491.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 12719708.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 852114.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 100,
+      "bridge_calls": 1,
+      "elapsed_ns": 515318.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 62176.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 100,
+      "bridge_calls": 102,
+      "elapsed_ns": 2832168.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 200,
+      "bridge_calls": 1,
+      "elapsed_ns": 1207175.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 4125814.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 1274811.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 200,
+      "bridge_calls": 202,
+      "elapsed_ns": 122538.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 3312962.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 10268278.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 400,
+      "bridge_calls": 402,
+      "elapsed_ns": 257409.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 400,
+      "bridge_calls": 1,
+      "elapsed_ns": 2010760.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 800,
+      "bridge_calls": 1,
+      "elapsed_ns": 4454596.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 495752.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 15171999.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 800,
+      "bridge_calls": 802,
+      "elapsed_ns": 6632937.0
+    },
+    {
+      "arm": "ready_control",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 986395.0
+    },
+    {
+      "arm": "single_entry",
+      "rows": 1600,
+      "bridge_calls": 1,
+      "elapsed_ns": 10152002.0
+    },
+    {
+      "arm": "per_op_bridge",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 13062565.0
+    },
+    {
+      "arm": "worker_facade",
+      "rows": 1600,
+      "bridge_calls": 1602,
+      "elapsed_ns": 30027409.0
+    }
+  ]
+}

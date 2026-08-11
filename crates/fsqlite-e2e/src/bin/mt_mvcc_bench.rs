@@ -13,7 +13,7 @@
 //!   - FrankenSQLite file-backed database, one Connection per thread,
 //!     `PRAGMA fsqlite.concurrent_mode=ON` + `BEGIN CONCURRENT`.
 //!   - C SQLite (rusqlite) file-backed WAL, one Connection per thread,
-//!     `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`.
+//!     `journal_mode=WAL`, matched `synchronous=NORMAL|FULL`, `busy_timeout=5000`.
 //!
 //! By default, each thread inserts `--rows-per-thread` rows into the shared
 //! table `bench(id INTEGER PRIMARY KEY, payload TEXT)` using disjoint rowid
@@ -37,6 +37,7 @@
 //!
 //! ```text
 //! mt-mvcc-bench [--rows-per-thread=1000] [--threads=1,2,4,8,16,32,64,128] [--iters=21]
+//! [--synchronous=normal|full]
 //! [--json-output=PATH] [--summary-md=PATH]
 //! [--separate-tables] [--one-row-per-transaction]
 //! ```
@@ -135,6 +136,28 @@ const RETRY_BUDGET_FLOOR_WPS: u64 = 5_000;
 enum TransactionGranularity {
     Bulk,
     OneRow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SynchronousMode {
+    Normal,
+    Full,
+}
+
+impl SynchronousMode {
+    const fn pragma_value(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::Full => "FULL",
+        }
+    }
+
+    const fn receipt_value(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Full => "full",
+        }
+    }
 }
 
 /// Wall-clock retry budget for one transaction attempt loop, scaled with the
@@ -1502,6 +1525,7 @@ struct Options {
     apples_to_apples: bool,
     separate_tables: bool,
     transaction_granularity: TransactionGranularity,
+    synchronous: SynchronousMode,
     /// Fixed retry deadline override in seconds; one-row mode shares this
     /// deadline across every transaction attempted by a worker. When unset,
     /// the budget scales with threads x rows (bd-caa6u).
@@ -1521,6 +1545,7 @@ impl Default for Options {
             apples_to_apples: false,
             separate_tables: false,
             transaction_granularity: TransactionGranularity::Bulk,
+            synchronous: SynchronousMode::Normal,
             retry_timeout_secs: None,
         }
     }
@@ -1531,7 +1556,8 @@ fn print_usage_and_exit(code: i32) -> ! {
         "usage: mt-mvcc-bench [--rows-per-thread=N] [--threads=N,N,...] [--iters=N] \\\n\
          [--json-output=PATH] [--json-stdout] [--summary-md=PATH] [--history-json=PATH] \\\n\
          [--apples-to-apples] \\\n\
-         [--separate-tables] [--one-row-per-transaction] [--retry-timeout-secs=N]\n\
+         [--separate-tables] [--one-row-per-transaction] [--retry-timeout-secs=N] \\\n\
+         [--synchronous=normal|full]\n\
          \n\
          defaults: --rows-per-thread={DEFAULT_ROWS_PER_THREAD} \
          --threads=1,2,4,8,16,32,64,128 --iters={DEFAULT_ITERS}\n\
@@ -1634,6 +1660,17 @@ where
                 if opts.iters == 0 {
                     return Err(ParseArgsError::Message("--iters must be >= 1".to_owned()));
                 }
+            }
+            "--synchronous" => {
+                opts.synchronous = match val.trim().to_ascii_lowercase().as_str() {
+                    "normal" => SynchronousMode::Normal,
+                    "full" => SynchronousMode::Full,
+                    _ => {
+                        return Err(ParseArgsError::Message(format!(
+                            "invalid --synchronous: {val}; expected normal or full"
+                        )));
+                    }
+                };
             }
             "--json-output" => {
                 opts.json_output = Some(PathBuf::from(val));
@@ -3578,11 +3615,12 @@ where
 fn expected_effective_settings(
     concurrent_mode: &str,
     wal_autocheckpoint_pages: i64,
+    synchronous: SynchronousMode,
 ) -> EffectiveSettings {
     EffectiveSettings {
         page_size_bytes: 4_096,
         journal_mode: "wal".to_owned(),
-        synchronous: "normal".to_owned(),
+        synchronous: synchronous.receipt_value().to_owned(),
         cache_size: -64_000,
         busy_timeout_ms: 5_000,
         wal_autocheckpoint_pages,
@@ -3595,8 +3633,10 @@ fn verify_effective_settings(
     observed: EffectiveSettings,
     concurrent_mode: &str,
     wal_autocheckpoint_pages: i64,
+    synchronous: SynchronousMode,
 ) -> Result<EffectiveSettings, String> {
-    let expected = expected_effective_settings(concurrent_mode, wal_autocheckpoint_pages);
+    let expected =
+        expected_effective_settings(concurrent_mode, wal_autocheckpoint_pages, synchronous);
     if observed != expected {
         return Err(format!(
             "{engine} effective settings mismatch: expected {expected:?}, observed {observed:?}"
@@ -3632,6 +3672,7 @@ fn bench_wal_autocheckpoint_pages() -> Result<(i64, bool), String> {
 fn configure_fsqlite_connection(
     conn: &fsqlite::Connection,
     wal_autocheckpoint_pages: i64,
+    synchronous: SynchronousMode,
 ) -> Result<EffectiveSettings, String> {
     if !conn.is_concurrent_mode_default() {
         return Err(
@@ -3642,7 +3683,7 @@ fn configure_fsqlite_connection(
     for pragma in [
         "PRAGMA page_size=4096;".to_owned(),
         "PRAGMA journal_mode=WAL;".to_owned(),
-        "PRAGMA synchronous=NORMAL;".to_owned(),
+        format!("PRAGMA synchronous={};", synchronous.pragma_value()),
         "PRAGMA cache_size=-64000;".to_owned(),
         "PRAGMA busy_timeout=5000;".to_owned(),
         format!("PRAGMA wal_autocheckpoint={wal_autocheckpoint_pages};"),
@@ -3670,20 +3711,23 @@ fn configure_fsqlite_connection(
         observed,
         "fsqlite_mvcc_on",
         wal_autocheckpoint_pages,
+        synchronous,
     )
 }
 
 fn configure_rusqlite_connection(
     conn: &rusqlite::Connection,
     wal_autocheckpoint_pages: i64,
+    synchronous: SynchronousMode,
 ) -> Result<EffectiveSettings, String> {
     conn.execute_batch(&format!(
         "PRAGMA page_size=4096;\
          PRAGMA journal_mode=WAL;\
-         PRAGMA synchronous=NORMAL;\
+         PRAGMA synchronous={};\
          PRAGMA cache_size=-64000;\
          PRAGMA busy_timeout=5000;\
-         PRAGMA wal_autocheckpoint={wal_autocheckpoint_pages};"
+         PRAGMA wal_autocheckpoint={wal_autocheckpoint_pages};",
+        synchronous.pragma_value()
     ))
     .map_err(|error| format!("C SQLite performance PRAGMAs failed: {error}"))?;
     let observed = parse_effective_settings(
@@ -3695,6 +3739,7 @@ fn configure_rusqlite_connection(
         observed,
         "sqlite_wal_single_writer",
         wal_autocheckpoint_pages,
+        synchronous,
     )
 }
 
@@ -3703,10 +3748,11 @@ fn prepare_fsqlite_schema(
     threads: usize,
     separate_tables: bool,
     wal_autocheckpoint_pages: i64,
+    synchronous: SynchronousMode,
 ) -> Result<EffectiveSettings, String> {
     let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (init): {error}"))?;
-    let settings = configure_fsqlite_connection(&conn, wal_autocheckpoint_pages)?;
+    let settings = configure_fsqlite_connection(&conn, wal_autocheckpoint_pages, synchronous)?;
     for tid in 0..worker_table_count(threads, separate_tables) {
         let table_name = worker_table_name(tid, separate_tables);
         let create_sql = create_table_sql(&table_name);
@@ -4390,10 +4436,11 @@ fn run_rusqlite_one_row_transactions(
 fn open_fsqlite_worker(
     path: &str,
     wal_autocheckpoint_pages: i64,
+    synchronous: SynchronousMode,
 ) -> Result<(fsqlite::Connection, EffectiveSettings), String> {
     let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (worker): {error}"))?;
-    let settings = configure_fsqlite_connection(&conn, wal_autocheckpoint_pages)?;
+    let settings = configure_fsqlite_connection(&conn, wal_autocheckpoint_pages, synchronous)?;
     Ok((conn, settings))
 }
 
@@ -4404,6 +4451,7 @@ fn run_fsqlite(
     transaction_granularity: TransactionGranularity,
     retry_timeout: Duration,
     wal_autocheckpoint_pages: i64,
+    synchronous: SynchronousMode,
 ) -> Result<RunResult, String> {
     let tmp = tempfile::NamedTempFile::new()
         .map_err(|error| format!("FrankenSQLite tempfile creation failed: {error}"))?;
@@ -4413,8 +4461,13 @@ fn run_fsqlite(
         .ok_or_else(|| "FrankenSQLite tempfile path is not UTF-8".to_owned())?
         .to_owned();
 
-    let init_settings =
-        prepare_fsqlite_schema(&path, threads, separate_tables, wal_autocheckpoint_pages)?;
+    let init_settings = prepare_fsqlite_schema(
+        &path,
+        threads,
+        separate_tables,
+        wal_autocheckpoint_pages,
+        synchronous,
+    )?;
 
     let path = Arc::new(path);
     let startup_gate = Arc::new((Mutex::new(StartupGateState::default()), Condvar::new()));
@@ -4429,7 +4482,7 @@ fn run_fsqlite(
         let handle = thread::spawn(move || -> Result<WorkerWork, String> {
             // Each thread owns its own Connection (Connection: !Send + !Sync).
             let (conn, settings) =
-                match open_fsqlite_worker(path.as_str(), wal_autocheckpoint_pages) {
+                match open_fsqlite_worker(path.as_str(), wal_autocheckpoint_pages, synchronous) {
                     Ok(worker) => {
                         let _ = startup_tx.send(StartupOutcome {
                             tid,
@@ -4706,6 +4759,7 @@ fn run_rusqlite(
     transaction_granularity: TransactionGranularity,
     retry_timeout: Duration,
     wal_autocheckpoint_pages: i64,
+    synchronous: SynchronousMode,
 ) -> Result<RunResult, String> {
     let tmp = tempfile::NamedTempFile::new()
         .map_err(|error| format!("C SQLite tempfile creation failed: {error}"))?;
@@ -4718,7 +4772,8 @@ fn run_rusqlite(
     let init_settings = {
         let conn = rusqlite::Connection::open(&path)
             .map_err(|error| format!("C SQLite init open failed: {error}"))?;
-        let settings = configure_rusqlite_connection(&conn, wal_autocheckpoint_pages)?;
+        let settings =
+            configure_rusqlite_connection(&conn, wal_autocheckpoint_pages, synchronous)?;
         conn.execute_batch(&create_tables_sql(threads, separate_tables))
             .map_err(|error| format!("C SQLite init schema failed: {error}"))?;
         settings
@@ -4742,8 +4797,9 @@ fn run_rusqlite(
             let setup = (|| {
                 let conn = rusqlite::Connection::open_with_flags(path.as_str(), flags)
                     .map_err(|error| format!("C SQLite worker {tid} open failed: {error}"))?;
-                let settings = configure_rusqlite_connection(&conn, wal_autocheckpoint_pages)
-                    .map_err(|error| format!("C SQLite worker {tid} setup failed: {error}"))?;
+                let settings =
+                    configure_rusqlite_connection(&conn, wal_autocheckpoint_pages, synchronous)
+                        .map_err(|error| format!("C SQLite worker {tid} setup failed: {error}"))?;
                 Ok::<_, String>((conn, settings))
             })();
             let (conn, settings) = match setup {
@@ -5017,11 +5073,12 @@ fn run(opts: Options) -> Result<(), String> {
         .map(|value| value.get());
 
     eprintln!(
-        "mt-mvcc-bench: rows_per_thread={} threads={:?} paired_rounds={} bootstrap_reps={} synchronous=NORMAL wal_autocheckpoint={} available_parallelism={available_parallelism:?} apples_to_apples={} separate_tables={} transaction_granularity={}",
+        "mt-mvcc-bench: rows_per_thread={} threads={:?} paired_rounds={} bootstrap_reps={} synchronous={} wal_autocheckpoint={} available_parallelism={available_parallelism:?} apples_to_apples={} separate_tables={} transaction_granularity={}",
         opts.rows_per_thread,
         opts.threads,
         opts.iters,
         CONTRACT_BOOTSTRAP_REPS,
+        opts.synchronous.pragma_value(),
         wal_autocheckpoint_pages,
         opts.apples_to_apples,
         opts.separate_tables,
@@ -5094,6 +5151,7 @@ fn run(opts: Options) -> Result<(), String> {
                     opts.transaction_granularity,
                     retry_timeout,
                     wal_autocheckpoint_pages,
+                    opts.synchronous,
                 )
             },
             || {
@@ -5104,6 +5162,7 @@ fn run(opts: Options) -> Result<(), String> {
                     opts.transaction_granularity,
                     retry_timeout,
                     wal_autocheckpoint_pages,
+                    opts.synchronous,
                 )
             },
             || {
@@ -5114,6 +5173,7 @@ fn run(opts: Options) -> Result<(), String> {
                     opts.transaction_granularity,
                     retry_timeout,
                     wal_autocheckpoint_pages,
+                    opts.synchronous,
                 )
             },
             || {
@@ -5130,6 +5190,7 @@ fn run(opts: Options) -> Result<(), String> {
                     opts.transaction_granularity,
                     retry_timeout,
                     wal_autocheckpoint_pages,
+                    opts.synchronous,
                 );
                 let m = fsqlite_mvcc::registry_commit_lock_metrics();
                 if m.holds_total > 0 {
@@ -5189,8 +5250,9 @@ fn run(opts: Options) -> Result<(), String> {
         );
         human_output!(
             opts.json_stdout,
-            "case={} threads={n} synchronous=NORMAL null_c_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} cv_gate=never null_a_offered={} null_a_attempted={} null_a_committed={} null_a_retried={} null_a_failed={} null_b_offered={} null_b_attempted={} null_b_committed={} null_b_retried={} null_b_failed={}",
+            "case={} threads={n} synchronous={} null_c_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} cv_gate=never null_a_offered={} null_a_attempted={} null_a_committed={} null_a_retried={} null_a_failed={} null_b_offered={} null_b_attempted={} null_b_committed={} null_b_retried={} null_b_failed={}",
             workload_shape(opts.separate_tables),
+            opts.synchronous.pragma_value(),
             contract.null_ratio_median,
             contract.null_ratio_ci95_low,
             contract.null_ratio_ci95_high,
@@ -5209,8 +5271,9 @@ fn run(opts: Options) -> Result<(), String> {
         );
         human_output!(
             opts.json_stdout,
-            "case={} threads={n} synchronous=NORMAL claim_f_over_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} fsqlite_p50_wps={:.3} sqlite_p50_wps={:.3} fsqlite_offered={} fsqlite_attempted={} fsqlite_committed={} fsqlite_retried={} fsqlite_failed={} sqlite_offered={} sqlite_attempted={} sqlite_committed={} sqlite_retried={} sqlite_failed={}",
+            "case={} threads={n} synchronous={} claim_f_over_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} fsqlite_p50_wps={:.3} sqlite_p50_wps={:.3} fsqlite_offered={} fsqlite_attempted={} fsqlite_committed={} fsqlite_retried={} fsqlite_failed={} sqlite_offered={} sqlite_attempted={} sqlite_committed={} sqlite_retried={} sqlite_failed={}",
             workload_shape(opts.separate_tables),
+            opts.synchronous.pragma_value(),
             contract.claim_ratio_median,
             contract.claim_ratio_ci95_low,
             contract.claim_ratio_ci95_high,
@@ -5961,6 +6024,22 @@ mod tests {
         assert!(matches!(
             parse_args_from(["--json-stdout=true"]),
             Err(ParseArgsError::Message(message)) if message.contains("unknown argument")
+        ));
+    }
+
+    #[test]
+    fn synchronous_mode_is_explicit_and_rejects_unmatched_values() {
+        let defaults = parse_args_from(std::iter::empty::<&str>())
+            .expect("default benchmark arguments must parse");
+        assert_eq!(defaults.synchronous, SynchronousMode::Normal);
+
+        let full = parse_args_from(["--synchronous=full"])
+            .expect("matched FULL durability must be selectable");
+        assert_eq!(full.synchronous, SynchronousMode::Full);
+
+        assert!(matches!(
+            parse_args_from(["--synchronous=extra"]),
+            Err(ParseArgsError::Message(message)) if message.contains("expected normal or full")
         ));
     }
 
@@ -7450,6 +7529,7 @@ mod tests {
             TransactionGranularity::OneRow,
             retry_timeout,
             DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            SynchronousMode::Normal,
         )
         .expect("C SQLite one-row workload must complete");
         let fsqlite = run_fsqlite(
@@ -7459,6 +7539,7 @@ mod tests {
             TransactionGranularity::OneRow,
             retry_timeout,
             DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            SynchronousMode::Normal,
         )
         .expect("FrankenSQLite one-row workload must complete");
 

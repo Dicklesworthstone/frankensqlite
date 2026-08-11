@@ -7931,7 +7931,11 @@ impl PreparedStatement<'_> {
         if self.dml_dispatch.is_some() {
             return self.conn.execute_prepared(self).await;
         }
-        Ok(self.query().await?.len())
+        // bd-uzq54: box the query fallback so the hot prepared-DML execute
+        // future does not carry the ~17.7KB query state machine for a branch
+        // a DML statement can never take. The allocation lands only on the
+        // rare execute-a-SELECT path.
+        Ok(Box::pin(self.query()).await?.len())
     }
 
     /// Execute with bound SQL parameters and return affected/output row count.
@@ -7944,7 +7948,9 @@ impl PreparedStatement<'_> {
         if self.dml_dispatch.is_some() {
             return self.conn.execute_prepared_with_params(self, params).await;
         }
-        Ok(self.query_with_params(params).await?.len())
+        // bd-uzq54: box the query fallback (see `execute`); keeps the hot
+        // prepared-INSERT future at the size of the DML branch alone.
+        Ok(Box::pin(self.query_with_params(params)).await?.len())
     }
 
     /// Return an EXPLAIN-style disassembly for the compiled program.
@@ -19299,9 +19305,14 @@ impl Connection {
                         if hot_path_profile_enabled() {
                             FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
                         }
-                        let rows = self
-                            .execute_statement_impl_after_background_status(dml, p, None, false)
-                            .await?;
+                        // bd-uzq54: boxed — slow-path generic dispatch must
+                        // not inflate the hot precompiled-DML generator.
+                        let rows = Box::pin(
+                            self.execute_statement_impl_after_background_status(
+                                dml, p, None, false,
+                            ),
+                        )
+                        .await?;
                         self.note_connection_statement_execution_count(1);
                         return Ok(
                             if matches!(
@@ -19357,14 +19368,14 @@ impl Connection {
                         reason = "deferred_dml",
                     );
                 }
-                let rows = self
-                    .execute_statement_impl_after_background_status(
-                        dml,
-                        p,
-                        stmt.dispatch_precompiled_program(),
-                        false,
-                    )
-                    .await?;
+                // bd-uzq54: boxed — see the fast-path comment above.
+                let rows = Box::pin(self.execute_statement_impl_after_background_status(
+                    dml,
+                    p,
+                    stmt.dispatch_precompiled_program(),
+                    false,
+                ))
+                .await?;
                 self.note_connection_statement_execution_count(1);
                 let is_dml = matches!(
                     dml,
@@ -19376,10 +19387,13 @@ impl Connection {
                     rows.len()
                 })
             } else {
-                Ok(self
-                    .query_prepared_with_params_after_background_status(stmt, params)
-                    .await?
-                    .len())
+                // bd-uzq54: boxed — a DML execute can never take the query
+                // branch; keep its state machine out of the hot allocation.
+                Ok(Box::pin(
+                    self.query_prepared_with_params_after_background_status(stmt, params),
+                )
+                .await?
+                .len())
             }
         })
     }
@@ -124059,16 +124073,29 @@ mod tests {
                 "ambient capture must not fork per-database shared MVCC state"
             );
 
-            conn1
+            // Functional receipt: writes work under ambient capture and the
+            // commit clock stays SHARED across the two default connections
+            // (same idiom as test_cross_connection_commit_seq_shared_file_
+            // backed). A cross-connection `query` of a table created after
+            // both opens fails with NoSuchTable in BOTH directions even
+            // WITHOUT ambient capture — probed outside any runtime on
+            // 2026-08-11, tracked as pre-existing bug bd-bhp83 — so this
+            // test deliberately avoids that broken path.
+            let conn1_seq_before = conn1.current_global_commit_seq();
+            conn2
                 .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")
                 .await
                 .expect("create table");
-            conn1
+            conn2
                 .execute("INSERT INTO t(b) VALUES ('ambient');")
                 .await
                 .expect("insert");
             let rows = conn2.query("SELECT b FROM t;").await.expect("select");
             assert_eq!(rows.len(), 1);
+            assert!(
+                conn1.current_global_commit_seq() > conn1_seq_before,
+                "conn1 must observe conn2's commits through the shared clock"
+            );
         });
     }
 
@@ -186918,13 +186945,16 @@ fts5(title, body, content=docs, content_rowid=id)'
                 status.get("pager_backend_kind").map(String::as_str),
                 Some("iouring")
             );
+            // 3d1dc5c9d (shared-dispatcher vfs) renamed the backend identifier
+            // from "asupersync" to "asupersync-shared-uring"; assert the
+            // canonical name the vfs's own tests use (uring.rs).
             assert_eq!(
                 status.get("io_uring_backend").map(String::as_str),
-                Some("asupersync")
+                Some("asupersync-shared-uring")
             );
             assert_eq!(
                 status.get("initial_status").map(String::as_str),
-                Some("available:asupersync")
+                Some("available:asupersync-shared-uring")
             );
 
             match status.get("disabled").map(String::as_str) {
@@ -186932,7 +186962,7 @@ fts5(title, body, content=docs, content_rowid=id)'
                     assert_eq!(status.get("available").map(String::as_str), Some("1"));
                     assert_eq!(
                         status.get("status").map(String::as_str),
-                        Some("available:asupersync")
+                        Some("available:asupersync-shared-uring")
                     );
                     assert_eq!(
                         status.get("disable_reason").map(String::as_str),
@@ -186941,11 +186971,9 @@ fts5(title, body, content=docs, content_rowid=id)'
                 }
                 Some("1") => {
                     assert_eq!(status.get("available").map(String::as_str), Some("0"));
-                    assert!(
-                        status
-                            .get("status")
-                            .is_some_and(|value| value.starts_with("disabled:asupersync:"))
-                    );
+                    assert!(status.get("status").is_some_and(
+                        |value| value.starts_with("disabled:asupersync-shared-uring:")
+                    ));
                     assert_ne!(
                         status.get("disable_reason").map(String::as_str),
                         Some("NULL")
