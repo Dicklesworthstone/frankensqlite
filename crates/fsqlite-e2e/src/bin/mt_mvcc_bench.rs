@@ -2980,9 +2980,18 @@ fn valid_truth_settings(
     let null_c_b = uniform_effective_settings(&truth.null_c_b_samples, offered_writes_per_sample)?;
     let sqlite = uniform_effective_settings(&truth.sqlite_samples, offered_writes_per_sample)?;
     let fsqlite = uniform_effective_settings(&truth.fsqlite_samples, offered_writes_per_sample)?;
-    let expected_sqlite =
-        expected_effective_settings("sqlite_wal_single_writer", wal_autocheckpoint_pages);
-    let expected_fsqlite = expected_effective_settings("fsqlite_mvcc_on", wal_autocheckpoint_pages);
+    let synchronous = match sqlite.synchronous.as_str() {
+        "NORMAL" => SynchronousMode::Normal,
+        "FULL" => SynchronousMode::Full,
+        _ => return None,
+    };
+    let expected_sqlite = expected_effective_settings(
+        "sqlite_wal_single_writer",
+        wal_autocheckpoint_pages,
+        synchronous,
+    );
+    let expected_fsqlite =
+        expected_effective_settings("fsqlite_mvcc_on", wal_autocheckpoint_pages, synchronous);
     if null_c_a != expected_sqlite
         || null_c_b != expected_sqlite
         || sqlite != expected_sqlite
@@ -4772,8 +4781,7 @@ fn run_rusqlite(
     let init_settings = {
         let conn = rusqlite::Connection::open(&path)
             .map_err(|error| format!("C SQLite init open failed: {error}"))?;
-        let settings =
-            configure_rusqlite_connection(&conn, wal_autocheckpoint_pages, synchronous)?;
+        let settings = configure_rusqlite_connection(&conn, wal_autocheckpoint_pages, synchronous)?;
         conn.execute_batch(&create_tables_sql(threads, separate_tables))
             .map_err(|error| format!("C SQLite init schema failed: {error}"))?;
         settings
