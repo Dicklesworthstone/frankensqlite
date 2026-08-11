@@ -73,6 +73,8 @@ const TURSO_OPTIONAL_DECISIONS: [&str; 7] = [
 
 const MAX_CAMPAIGN_SUMMARY_LANES: usize = 16;
 const MAX_CAMPAIGN_SUMMARY_LANE_ID_BYTES: usize = 96;
+const MAX_PRESUBMIT_SEEDS_PER_PROFILE: u64 = 100;
+const MAX_OPTIONAL_RATIONALE_BYTES: usize = 1_024;
 
 /// Resource tier represented by a campaign receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -459,11 +461,12 @@ fn campaign_diagnostic(
     });
 }
 
-fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+fn is_nonzero_lower_hex(value: &str, expected_len: usize) -> bool {
     value.len() == expected_len
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value.bytes().any(|byte| byte != b'0')
 }
 
 fn bounded_utf8_prefix(value: &str, maximum_bytes: usize) -> &str {
@@ -618,7 +621,7 @@ fn validate_campaign_run(run: &CampaignRunEvidence, diagnostics: &mut Vec<Campai
         );
     }
     for artifact in &run.artifacts {
-        if artifact.path.trim().is_empty() || !is_lower_hex(&artifact.sha256, 64) {
+        if artifact.path.trim().is_empty() || !is_nonzero_lower_hex(&artifact.sha256, 64) {
             campaign_diagnostic(
                 diagnostics,
                 "artifact_provenance_invalid",
@@ -760,6 +763,16 @@ fn validate_seed_group(
 
     let expected_seed_count = first.expected_seed_count;
     let shard_count = first.shard.count;
+    if tier == CampaignTier::Presubmit && expected_seed_count > MAX_PRESUBMIT_SEEDS_PER_PROFILE {
+        campaign_diagnostic(
+            diagnostics,
+            "presubmit_seed_budget_exceeded",
+            Some(lane_id),
+            format!(
+                "expected_seed_count={expected_seed_count} maximum={MAX_PRESUBMIT_SEEDS_PER_PROFILE}"
+            ),
+        );
+    }
     let mut ordered = runs.to_vec();
     ordered.sort_by_key(|run| (run.shard.start_seed, run.shard.index));
     let Some(first_ordered) = ordered.first() else {
@@ -865,7 +878,7 @@ pub fn evaluate_turso_campaign_gate(input: &TursoCampaignGateInput) -> TursoCamp
             );
         }
     }
-    if !is_lower_hex(&input.engine_sha, 40) {
+    if !is_nonzero_lower_hex(&input.engine_sha, 40) {
         campaign_diagnostic(
             &mut diagnostics,
             "engine_sha_invalid",
@@ -885,7 +898,7 @@ pub fn evaluate_turso_campaign_gate(input: &TursoCampaignGateInput) -> TursoCamp
         ("contract_hash", input.contract_hash.as_str()),
         ("profile_hash", input.profile_hash.as_str()),
     ] {
-        if !is_lower_hex(value, 64) {
+        if !is_nonzero_lower_hex(value, 64) {
             campaign_diagnostic(
                 &mut diagnostics,
                 "provenance_hash_invalid",
@@ -920,7 +933,7 @@ pub fn evaluate_turso_campaign_gate(input: &TursoCampaignGateInput) -> TursoCamp
         }
         if receipt.command.trim().is_empty()
             || receipt.artifact.path.trim().is_empty()
-            || !is_lower_hex(&receipt.artifact.sha256, 64)
+            || !is_nonzero_lower_hex(&receipt.artifact.sha256, 64)
         {
             campaign_diagnostic(
                 &mut diagnostics,
@@ -980,6 +993,16 @@ pub fn evaluate_turso_campaign_gate(input: &TursoCampaignGateInput) -> TursoCamp
                 Some(&decision.bead_id),
                 "every disposition requires a bounded rationale",
             );
+        } else if decision.rationale.len() > MAX_OPTIONAL_RATIONALE_BYTES {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "optional_decision_rationale_too_long",
+                Some(&decision.bead_id),
+                format!(
+                    "rationale_bytes={} maximum={MAX_OPTIONAL_RATIONALE_BYTES}",
+                    decision.rationale.len()
+                ),
+            );
         }
         let admission_is_consistent = match decision.disposition {
             CampaignDisposition::Adopted => decision.admitted,
@@ -1033,6 +1056,17 @@ pub fn evaluate_turso_campaign_gate(input: &TursoCampaignGateInput) -> TursoCamp
         BTreeMap::<String, (usize, CampaignOutcomeCounts, usize, usize)>::new();
 
     for run in &sorted_runs {
+        if !input.promotion_stage.required_tiers().contains(&run.tier) {
+            campaign_diagnostic(
+                &mut diagnostics,
+                "unexpected_tier_receipt",
+                Some(&run.lane_id),
+                format!(
+                    "stage={:?} does not admit tier={:?}",
+                    input.promotion_stage, run.tier
+                ),
+            );
+        }
         if !gating_lanes.contains(&run.lane_id) {
             campaign_diagnostic(
                 &mut diagnostics,
@@ -2167,6 +2201,41 @@ mod tests {
     }
 
     #[test]
+    fn turso_scorecard_enforces_presubmit_seed_budget() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        input.runs[0].expected_seed_count = MAX_PRESUBMIT_SEEDS_PER_PROFILE + 1;
+        input.runs[0].shard.end_seed_exclusive = MAX_PRESUBMIT_SEEDS_PER_PROFILE + 1;
+        input.runs[0].outcomes.generated = MAX_PRESUBMIT_SEEDS_PER_PROFILE + 1;
+        input.runs[0].outcomes.executed = MAX_PRESUBMIT_SEEDS_PER_PROFILE + 1;
+
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        assert_eq!(scorecard.outcome, CampaignPromotionOutcome::Hold);
+        assert!(campaign_diagnostic_codes(&scorecard).contains(&"presubmit_seed_budget_exceeded"));
+    }
+
+    #[test]
+    fn turso_scorecard_rejects_placeholder_hashes_and_future_tiers() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        input.engine_sha = "0".repeat(40);
+        input.contract_hash = "0".repeat(64);
+        input.runs[0].artifacts[0].sha256 = "0".repeat(64);
+        input.global_gate_receipts[0].artifact.sha256 = "0".repeat(64);
+        input.runs.push(campaign_run(
+            "bd-turso-test-adaptation-zu081.5",
+            CampaignTier::Nightly,
+        ));
+
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        let codes = campaign_diagnostic_codes(&scorecard);
+        assert_eq!(scorecard.outcome, CampaignPromotionOutcome::Hold);
+        assert!(codes.contains(&"engine_sha_invalid"));
+        assert!(codes.contains(&"provenance_hash_invalid"));
+        assert!(codes.contains(&"artifact_provenance_invalid"));
+        assert!(codes.contains(&"global_gate_provenance_invalid"));
+        assert!(codes.contains(&"unexpected_tier_receipt"));
+    }
+
+    #[test]
     fn turso_scorecard_requires_linked_decision_for_skip_drift() {
         let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
         input.runs[0].outcomes.executed = 98;
@@ -2213,6 +2282,18 @@ mod tests {
         assert!(
             campaign_diagnostic_codes(&adopted_without_evidence)
                 .contains(&"required_lane_tier_missing")
+        );
+    }
+
+    #[test]
+    fn turso_scorecard_bounds_optional_decision_rationales() {
+        let mut input = passing_campaign_input(CampaignPromotionStage::Presubmit);
+        input.optional_decisions[0].rationale = "x".repeat(MAX_OPTIONAL_RATIONALE_BYTES + 1);
+
+        let scorecard = evaluate_turso_campaign_gate(&input);
+        assert_eq!(scorecard.outcome, CampaignPromotionOutcome::Hold);
+        assert!(
+            campaign_diagnostic_codes(&scorecard).contains(&"optional_decision_rationale_too_long")
         );
     }
 
