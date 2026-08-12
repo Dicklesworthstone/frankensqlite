@@ -1301,6 +1301,19 @@ struct GroupCommitQueue {
     /// process-root registry mutex is touched only while exceptional
     /// finalization work actually exists.
     rooted_finalization_attempts: AtomicUsize,
+    /// bd-b4mwn rework: settle's claim-contention retry budget in
+    /// milliseconds, tracking the largest busy_timeout any connection on
+    /// this path has published (default: the engine's 5000ms default). The
+    /// fixed 250ms envelope was timing-dependent — green on a 64-core host,
+    /// red on a 16-core one where resolution bursts run longer.
+    settle_budget_ms: AtomicU64,
+    /// bd-b4mwn rework #2: logical cleanups currently CLAIMED and being
+    /// resolved by a settler. `pending_logical_cleanups` excludes claimed
+    /// entries, so "queue empty + root armed" is ambiguous between a true
+    /// wedge and live resolution in progress — on slow-fsync hosts a peer's
+    /// resolve holds its claim for seconds and every other settler
+    /// misdiagnosed that window as a wedge and refused BusyRecovery.
+    claimed_logical_cleanups: AtomicUsize,
     /// The consolidator managing FILLING→FLUSHING→COMPLETE phases.
     consolidator: Mutex<GroupCommitConsolidator>,
     /// Condvar for waiters to park on until flush completes.
@@ -1778,6 +1791,8 @@ impl GroupCommitQueue {
             queue_id: next_process_root_finalization_id(&NEXT_GROUP_COMMIT_QUEUE_ID),
             finalization_binding: Mutex::new(GroupCommitFinalizationBinding::default()),
             rooted_finalization_attempts: AtomicUsize::new(0),
+            settle_budget_ms: AtomicU64::new(5000),
+            claimed_logical_cleanups: AtomicUsize::new(0),
             consolidator: Mutex::new(GroupCommitConsolidator::new(config)),
             flush_complete: Condvar::new(),
             completed_epoch: AtomicU64::new(0),
@@ -2336,6 +2351,11 @@ impl GroupCommitQueue {
         let cleanup = pending_logical_cleanups
             .remove(position)
             .expect("selected cleanup must remain present while its queue lock is held");
+        // bd-b4mwn rework #2: count the claim while the queue lock is still
+        // held so no observer can see the entry vanish from the pending
+        // queue before it appears in the claimed count.
+        self.claimed_logical_cleanups
+            .fetch_add(1, AtomicOrdering::AcqRel);
         drop(pending_logical_cleanups);
         Some(PendingGroupCommitLogicalCleanupClaim {
             queue: Arc::clone(self),
@@ -2358,6 +2378,12 @@ impl GroupCommitQueue {
         }
         let mut cleanup = claim.finish();
         cleanup.release_root_after_terminal();
+        // bd-b4mwn rework #2 (ordering): the success-path claimed decrement
+        // happens only after the root is released, so no observer can see
+        // pending==0 && claimed==0 with the root still armed (the false-wedge
+        // window the trj holder receipt caught).
+        self.claimed_logical_cleanups
+            .fetch_sub(1, AtomicOrdering::AcqRel);
         Ok(true)
     }
 
@@ -2378,6 +2404,12 @@ impl GroupCommitQueue {
         }
         let mut cleanup = claim.finish();
         cleanup.release_root_after_terminal();
+        // bd-b4mwn rework #2 (ordering): the success-path claimed decrement
+        // happens only after the root is released, so no observer can see
+        // pending==0 && claimed==0 with the root still armed (the false-wedge
+        // window the trj holder receipt caught).
+        self.claimed_logical_cleanups
+            .fetch_sub(1, AtomicOrdering::AcqRel);
         Ok(true)
     }
 
@@ -5839,6 +5871,19 @@ impl PagerMaintenanceGate {
             .lock()
             .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
         if self.rollback_recovery_owner() != expected_recovery_owner {
+            // bd-b4mwn round 5: name the silent refusal — an armed
+            // rollback-recovery owner no live pager can satisfy previously
+            // surfaced only as an anonymous BusyRecovery at every
+            // transaction admission on the path.
+            tracing::warn!(
+                target: "fsqlite.pager.maintenance_gate",
+                armed_owner = ?self.rollback_recovery_owner().map(RollbackRecoveryOwnerId::get),
+                expected_owner = ?expected_recovery_owner.map(RollbackRecoveryOwnerId::get),
+                active_openers = state.active_openers,
+                active_transactions = state.active_transactions,
+                orphan_retained = state.orphaned_rollback_recovery.is_some(),
+                "transaction admission refused: rollback-recovery owner mismatch"
+            );
             return Err(FrankenError::BusyRecovery);
         }
         if state.maintenance_active {
@@ -5889,6 +5934,14 @@ impl PagerMaintenanceLease {
             .lock()
             .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
         if self.gate.rollback_recovery_owner() != expected_recovery_owner {
+            // bd-b4mwn round 6: name the silent refusal (see the sibling
+            // gate receipts).
+            tracing::warn!(
+                target: "fsqlite.pager.maintenance_gate",
+                armed_owner = ?self.gate.rollback_recovery_owner().map(RollbackRecoveryOwnerId::get),
+                expected_owner = ?expected_recovery_owner.map(RollbackRecoveryOwnerId::get),
+                "exclusive upgrade refused: rollback-recovery owner mismatch"
+            );
             return Err(FrankenError::BusyRecovery);
         }
         if matches!(self.kind, PagerMaintenanceLeaseKind::Exclusive) {
@@ -5905,6 +5958,10 @@ impl PagerMaintenanceLease {
                 .unwrap_or(PagerMaintenanceLeaseKind::Exclusive));
         }
         if state.maintenance_active {
+            tracing::warn!(
+                target: "fsqlite.pager.maintenance_gate",
+                "exclusive upgrade refused: maintenance already active"
+            );
             return Err(FrankenError::BusyRecovery);
         }
         let prior = self.kind;
@@ -5918,6 +5975,16 @@ impl PagerMaintenanceLease {
             PagerMaintenanceLeaseKind::Exclusive => return Ok(prior),
         };
         if !sole_owner {
+            // bd-b4mwn round 5: name the silent refusal — recovery-requiring
+            // work (e.g. a leftover hot journal from a dropped peer) demands
+            // sole ownership that a churning multi-writer path never grants.
+            tracing::warn!(
+                target: "fsqlite.pager.maintenance_gate",
+                lease_kind = ?prior,
+                active_openers = state.active_openers,
+                active_transactions = state.active_transactions,
+                "exclusive upgrade refused: not sole owner"
+            );
             return Err(FrankenError::BusyRecovery);
         }
 
@@ -6199,13 +6266,94 @@ fn identity_bound_group_commit_queue<V: Vfs>(
     )
 }
 
+/// bd-b4mwn rounds 7+rework: in-settle retries when the armed root has live,
+/// claimable cleanup work (another settler holds the per-handle exit claim,
+/// or a resolve round simply lost the claim race). Bursts of concurrent
+/// settlers previously made every non-winning settler refuse BusyRecovery
+/// despite active progress. The original fixed ~250ms ceiling was
+/// timing-dependent (green on a 64-core host, red on 16 cores where
+/// resolution bursts run longer); the envelope now scales with the largest
+/// busy_timeout any connection on the path has published
+/// (`GroupCommitQueue::settle_budget_ms`, default 5000ms). True wedges still
+/// surface promptly: the loop exits as soon as no claimable work remains.
+const SETTLE_CLAIM_CONTENTION_BACKOFF: Duration = Duration::from_millis(10);
+
 async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -> Result<()> {
+    if !queue.has_process_root_finalization_attempt() {
+        return Ok(());
+    }
+    let budget = Duration::from_millis(queue.settle_budget_ms.load(AtomicOrdering::Acquire).max(1));
+    let started = Instant::now();
+    let mut rounds: u32 = 0;
+    let mut cleanups_resolved_total: usize = 0;
+    loop {
+        rounds = rounds.saturating_add(1);
+        let before = queue.pending_logical_cleanup_count();
+        match settle_pending_group_commit_finalization_round(queue).await {
+            Ok(()) => {
+                if !queue.has_process_root_finalization_attempt() {
+                    return Ok(());
+                }
+            }
+            // A refused round is retryable exactly while claimable cleanup
+            // work remains; any other error is terminal.
+            Err(FrankenError::BusyRecovery) => {}
+            Err(error) => return Err(error),
+        }
+        let after = queue.pending_logical_cleanup_count();
+        cleanups_resolved_total =
+            cleanups_resolved_total.saturating_add(before.saturating_sub(after));
+        let claimed_in_flight = queue.claimed_logical_cleanups.load(AtomicOrdering::Acquire);
+        if after == 0 && claimed_in_flight == 0 {
+            // No claimable work remains AND nothing is being resolved by a
+            // peer — the residual root is a true wedge; fall through to the
+            // final round's fail-closed verdict. (A nonzero claimed count is
+            // LIVE progress: a peer settler is resolving right now — on
+            // slow-fsync hosts that resolve can hold its claim for seconds,
+            // which every other settler previously misdiagnosed as a wedge.)
+            break;
+        }
+        if started.elapsed() >= budget {
+            // bd-b4mwn rework #2: the PROGRESS LEDGER — when the budget burns
+            // out, say exactly what recovery was (not) progressing on so a
+            // multi-second "recovery in progress" window on any host names
+            // its own starvation, instead of tuning waits blind.
+            tracing::warn!(
+                target: "fsqlite.pager.group_commit",
+                rounds,
+                cleanups_resolved_total,
+                pending_cleanups_remaining = after,
+                pending_or_claimed_external_unlock =
+                    queue.has_pending_or_claimed_external_unlock(),
+                unresolved_in_doubt_epoch = queue.has_unresolved_in_doubt_epoch(),
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "settle budget exhausted with cleanup work still pending"
+            );
+            break;
+        }
+        // Live cleanups remain (claimed by a peer settler or lost claim
+        // races): yield briefly and retry instead of refusing.
+        std::thread::sleep(SETTLE_CLAIM_CONTENTION_BACKOFF);
+    }
+    settle_pending_group_commit_finalization_round(queue).await
+}
+
+async fn settle_pending_group_commit_finalization_round(queue: &GroupCommitQueueRef) -> Result<()> {
     if !queue.has_process_root_finalization_attempt() {
         return Ok(());
     }
     while queue.resolve_one_pending_external_unlock().await? {}
     queue.resolve_pending_epoch_resolutions()?;
     if queue.has_pending_or_claimed_external_unlock() || queue.has_unresolved_in_doubt_epoch() {
+        // bd-b4mwn: fail-closed refusals must name themselves — a token a
+        // dead connection can no longer resolve otherwise surfaces only as
+        // an anonymous BusyRecovery at some later caller.
+        tracing::warn!(
+            target: "fsqlite.pager.group_commit",
+            pending_or_claimed_external_unlock = queue.has_pending_or_claimed_external_unlock(),
+            unresolved_in_doubt_epoch = queue.has_unresolved_in_doubt_epoch(),
+            "settle refused: unresolved external unlock or in-doubt epoch"
+        );
         return Err(FrankenError::BusyRecovery);
     }
     let logical_cleanup_count = queue.pending_logical_cleanup_count();
@@ -6220,7 +6368,47 @@ async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -
     if let Some(error) = first_logical_cleanup_error {
         return Err(error);
     }
-    if queue.has_unresolved_in_doubt_epoch() || queue.has_process_root_finalization_attempt() {
+    // bd-b4mwn (terminal): the residual refusal previously keyed on ANY
+    // armed root (has_process_root_finalization_attempt) — but exact-handle
+    // roots are normal, short-lived receipts of some OTHER connection's
+    // in-flight operation, individually milliseconds wide and collectively
+    // near-continuous under 8-writer churn. The generic settle refusing on a
+    // FOREIGN handle's root manufactured the multi-second 'recovery in
+    // progress' relay (trj registry receipts: distinct attempt ids, always
+    // ExactHandle, always zero pending/claimed). Exact-handle roots keep
+    // gating their OWN handle's settles via has_relevant_process_root in the
+    // per-handle settle; the generic settle refuses only on state that
+    // genuinely blocks everyone: an in-doubt epoch or an IDENTITY-WIDE root.
+    if queue.has_unresolved_in_doubt_epoch() || queue.has_identity_wide_process_root() {
+        // Ground truth on the holder — enumerate the registry's live
+        // attempts for this queue instead of inferring from queue-side
+        // counters.
+        let live_attempts: Vec<String> = {
+            let registry = process_root_finalization_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry
+                .by_queue
+                .get(&queue.queue_id)
+                .map_or_else(Vec::new, |rooted| {
+                    rooted
+                        .attempts
+                        .iter()
+                        .map(|(attempt_id, scope)| format!("{attempt_id}:{scope:?}"))
+                        .collect()
+                })
+        };
+        tracing::warn!(
+            target: "fsqlite.pager.group_commit",
+            unresolved_in_doubt_epoch = queue.has_unresolved_in_doubt_epoch(),
+            process_root_finalization_attempt = queue.has_process_root_finalization_attempt(),
+            live_attempts = ?live_attempts,
+            pending_cleanups = queue.pending_logical_cleanup_count(),
+            claimed_cleanups = queue
+                .claimed_logical_cleanups
+                .load(AtomicOrdering::Acquire),
+            "settle refused: residual in-doubt epoch or process-root attempt after cleanup"
+        );
         return Err(FrankenError::BusyRecovery);
     }
     Ok(())
@@ -6245,6 +6433,15 @@ async fn settle_identity_wide_group_commit_finalization(queue: &GroupCommitQueue
         || queue.has_unresolved_in_doubt_epoch()
         || queue.has_identity_wide_process_root()
     {
+        // bd-b4mwn round 4: name the refusal (see the sibling settle fn).
+        tracing::warn!(
+            target: "fsqlite.pager.group_commit",
+            pending_or_claimed_identity_wide_unlock =
+                queue.has_pending_or_claimed_identity_wide_external_unlock(),
+            unresolved_in_doubt_epoch = queue.has_unresolved_in_doubt_epoch(),
+            identity_wide_process_root = queue.has_identity_wide_process_root(),
+            "identity-wide settle refused"
+        );
         return Err(FrankenError::BusyRecovery);
     }
     Ok(())
@@ -6283,6 +6480,13 @@ async fn settle_pending_group_commit_finalization_for_handle(
         return Err(error);
     }
     if queue.has_identity_wide_process_root() || queue.has_relevant_process_root(handle_key) {
+        // bd-b4mwn round 4: name the refusal (see the sibling settle fns).
+        tracing::warn!(
+            target: "fsqlite.pager.group_commit",
+            identity_wide_process_root = queue.has_identity_wide_process_root(),
+            relevant_process_root = queue.has_relevant_process_root(handle_key),
+            "per-handle settle refused"
+        );
         return Err(FrankenError::BusyRecovery);
     }
     Ok(())
@@ -7361,6 +7565,12 @@ trait PendingGroupCommitLogicalCleanupOperation: Send {
     ) -> LocalPagerFuture<'a, bool>;
 }
 
+/// bd-b4mwn round 4: settles observed with the attempt still `Pending` and
+/// its epoch absent from BOTH the persisted and failed maps before the epoch
+/// is declared abandoned and force-failed. Multiple observations tolerate an
+/// in-flight leader that has simply not landed the certificate yet.
+const ABANDONED_EPOCH_SETTLE_OBSERVATIONS: u32 = 3;
+
 struct DetachedPendingGroupCommitTxnCleanup<F: VfsFile + 'static> {
     attempt: Arc<PendingGroupCommitTxnAttempt<F>>,
     maintenance_lease: Option<PagerMaintenanceLease>,
@@ -7368,6 +7578,9 @@ struct DetachedPendingGroupCommitTxnCleanup<F: VfsFile + 'static> {
     allocated_from_eof: Vec<PageNumber>,
     page_lease: Vec<PageNumber>,
     allocation_cleanup_applied: bool,
+    /// bd-b4mwn round 4: count of settle passes that found this detached
+    /// attempt `Pending` with a pre-persistence (abandonable) epoch.
+    stale_pending_observations: u32,
 }
 
 impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
@@ -7383,7 +7596,84 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
     ) -> LocalPagerFuture<'a, bool> {
         Box::pin(async move {
             match self.attempt.reconcile_global_from_queue()? {
-                PendingGroupCommitTxnResolution::Pending => return Ok(false),
+                PendingGroupCommitTxnResolution::Pending => {
+                    // bd-b4mwn round 4: a worker dropped mid-commit leaves
+                    // its epoch non-terminal, and this detached cleanup
+                    // previously re-queued forever with its process-root
+                    // token armed — refusing every settle on the path with
+                    // BusyRecovery. Distinguish the two Pending flavors:
+                    //
+                    // * POST-persistence (certificate durable, page plane
+                    //   unpublished): force-failing would un-commit durable
+                    //   data — stay conservative and warn; recovery or the
+                    //   publication owner must finish it.
+                    // * PRE-persistence (epoch in NEITHER the persisted nor
+                    //   the failed map): no durable certificate exists, so
+                    //   NotCommitted is the correct verdict. After several
+                    //   settle observations (tolerating an in-flight leader
+                    //   that has not landed the certificate yet), declare
+                    //   the epoch abandoned and publish it failed; the next
+                    //   settle's reconcile then reaches the NotCommitted
+                    //   arm, completes the cleanup, and releases the root.
+                    if let Some(queue) = self.attempt.queue.upgrade()
+                        && let Some((epoch, batch_id)) = self.attempt.evidence_key()
+                    {
+                        if queue.persisted_epoch_for(epoch).is_some() {
+                            tracing::warn!(
+                                target: "fsqlite.pager.group_commit",
+                                epoch,
+                                batch_id,
+                                "detached commit attempt awaits page-plane \
+                                 publication of a durable epoch; retaining \
+                                 fail-closed root"
+                            );
+                        } else if !queue
+                            .failed_epochs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains_key(&epoch)
+                        {
+                            self.stale_pending_observations =
+                                self.stale_pending_observations.saturating_add(1);
+                            if self.stale_pending_observations
+                                >= ABANDONED_EPOCH_SETTLE_OBSERVATIONS
+                            {
+                                tracing::warn!(
+                                    target: "fsqlite.pager.group_commit",
+                                    epoch,
+                                    batch_id,
+                                    observations = self.stale_pending_observations,
+                                    "declaring pre-persistence group-commit \
+                                     epoch abandoned by its dropped owner; \
+                                     aborting the flush so the detached \
+                                     cleanup can reach NotCommitted"
+                                );
+                                // Production fail path: only aborts the epoch
+                                // if it is the ACTIVE FLUSHING one (the
+                                // dead-mid-flush leader shape); any other
+                                // phase errors closed — log and stay pending
+                                // rather than force state we cannot prove.
+                                if let Err(abort_error) = queue.abort_flushing_epoch_as_failed(
+                                    epoch,
+                                    &FrankenError::internal(
+                                        "group-commit epoch abandoned by dropped owner \
+                                         before certificate persistence",
+                                    ),
+                                ) {
+                                    tracing::warn!(
+                                        target: "fsqlite.pager.group_commit",
+                                        epoch,
+                                        batch_id,
+                                        %abort_error,
+                                        "abandoned-epoch abort refused; \
+                                         retaining fail-closed root"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return Ok(false);
+                }
                 PendingGroupCommitTxnResolution::Authorized(_) => {
                     if !self.allocation_cleanup_applied {
                         self.allocated_from_freelist.clear();
@@ -7689,6 +7979,17 @@ impl Drop for PendingGroupCommitLogicalCleanupClaim {
     fn drop(&mut self) {
         if let Some(cleanup) = self.cleanup.take() {
             self.queue.requeue_pending_logical_cleanup(cleanup);
+            // bd-b4mwn rework #2 (ordering): decrement claimed only AFTER the
+            // requeue re-inserted the entry, and only on the requeue path —
+            // the success path decrements after release_root_after_terminal
+            // in the resolve fns. Decrementing here on the success path
+            // opened a window (claimed already 0, pending 0, root still
+            // armed until release ran) that the wedge test sampled as a
+            // false wedge -> spurious BusyRecovery refusal (the trj
+            // exact-handle holder receipt).
+            self.queue
+                .claimed_logical_cleanups
+                .fetch_sub(1, AtomicOrdering::AcqRel);
         }
         // Requeue by stable lane sequence before releasing the exact-handle
         // claim so a second settler cannot overtake a cancelled operation.
@@ -12312,6 +12613,14 @@ where
     /// that `posix_lock` retries with backoff instead of returning BUSY
     /// immediately on cross-process contention.
     pub async fn set_vfs_busy_timeout_ms(&self, cx: &Cx, ms: u64) {
+        // bd-b4mwn rework: publish the connection's busy budget to the shared
+        // group-commit queue so settle's claim-contention retry envelope
+        // scales with the caller's patience instead of a fixed ceiling. Keep
+        // the largest published value: settle serves every connection on the
+        // path and must not be starved by one impatient peer.
+        self.group_commit_queue
+            .settle_budget_ms
+            .fetch_max(ms.max(1), AtomicOrdering::AcqRel);
         let db_file = self
             .inner
             .lock()
@@ -22434,6 +22743,7 @@ where
                 allocated_from_eof: std::mem::take(&mut self.allocated_from_eof),
                 page_lease: std::mem::take(&mut self.page_lease),
                 allocation_cleanup_applied: false,
+                stale_pending_observations: 0,
             };
             self.group_commit_queue.enqueue_pending_logical_cleanup(
                 PendingGroupCommitLogicalCleanup::new(drop_root_attempt.take(), Box::new(cleanup)),

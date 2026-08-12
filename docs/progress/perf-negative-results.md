@@ -48,6 +48,39 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-12 - REJECTED: multi-SQE io_uring submission for `write_page_batch` (bd-q8501.1)
+
+- Target workload: one file-backed `IoUringFile::write_page_batch` operation
+  over 16 disjoint 4096-byte pages, without durability sync. Control
+  `08434a552` forwards the batch through one Unix blocking-pool hop and 16
+  sequential `pwrite` calls; candidate `442fc8f84` allocates/enqueues 16
+  io_uring requests before one shared-driver activation. Touched surface:
+  `crates/fsqlite-vfs/src/uring.rs`.
+- Evidence: `/home/ubuntu/fsqlite-perf-results/bd-q8501-20260812T0455Z/`.
+  One byte-identical, self-identifying harness; sequential release-perf builds
+  with `RUSTFLAGS=-C target-cpu=native`; Threadripper CPU 96 pinned with
+  `nice -n 10`; four unscored warm-up blocks then ten scored symmetric blocks
+  interleaving A/A and A/B. Denominator is 20 samples/arm, 128 measured
+  batches/sample, 16 in-process warm-ups/sample. A/A paired median was 1.0012x
+  with 95% bootstrap interval 0.9930–1.0441x.
+- Result: REJECT. Control median was 75.083 us/batch (p95 85.178 us);
+  candidate median was 145.281 us/batch (p95 159.055 us), a 1.9349x latency
+  ratio / +93.49%. Candidate lost 20/20 adjacent pairs; paired median was
+  1.9542x with 95% bootstrap interval 1.8995–2.0239x. An independent ABBA
+  pilot agreed at 1.8555x. Exact contents, 65,536-byte final size, affinity,
+  and io_uring availability held for 80/80 scored samples; candidate batch
+  counter was exactly 144 in 20/20 candidate samples.
+- Reason: the intended win did not reproduce. The first implementation trades
+  the Unix one-hop batch for per-page owned-buffer copies, completion channels,
+  cancellation guards, queue bookkeeping, and CQE dispatch; one driver start
+  does not offset those costs on this 16-page submission/completion workload.
+  This microbench does not measure durability or end-to-end SQL commits.
+- Retry only after profile evidence attributes the extra cost and a revised
+  lifetime-safe design removes per-page ownership/completion overhead (for
+  example registered/borrowed buffers plus batch-level completion). Require the
+  same self-identifying A/A + A/B matrix; do not keep multi-SQE submission based
+  only on reduced driver-start counts.
+
 ## 2026-08-11 - REJECTED: boxing cold branches out of the prepared-statement hot futures (bd-uzq54 levers 1+2)
 
 - Target workload: `comprehensive_bench --quick --filter insert`, 10K-row

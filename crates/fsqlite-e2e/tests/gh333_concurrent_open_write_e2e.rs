@@ -173,6 +173,64 @@ fn gh333_concurrent_same_file_open_update_from_two_threads_100_iters() {
     );
 }
 
+/// An acknowledged autocommit write must already be visible when a peer opens
+/// afterward.  Opening the peer before the write is not an equivalent canary:
+/// the retained-autocommit optimization can see that already-open peer and
+/// choose to publish, while a write parked when the writer was alone remains
+/// invisible to a peer that joins after the acknowledgement.
+#[test]
+fn acknowledged_write_is_visible_to_peer_opened_afterward() {
+    let _serial = gh333_test_serializer();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("peer-after-ack.db");
+    let path = path.to_string_lossy().into_owned();
+    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+
+    let writer = runtime
+        .block_on(fsqlite::Connection::open(path.clone()))
+        .expect("writer open");
+    runtime
+        .block_on(writer.execute("PRAGMA fsqlite.concurrent_mode = OFF;"))
+        .expect("serialized autocommit mode");
+    runtime
+        .block_on(writer.execute(
+            "CREATE TABLE acknowledged_write (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+        ))
+        .expect("create table");
+
+    runtime
+        .block_on(writer.execute("INSERT INTO acknowledged_write VALUES (1, 'visible-after-ack');"))
+        .expect("writer must acknowledge the autocommit INSERT");
+
+    // This ordering is the regression boundary: the peer did not exist when
+    // execute() returned success for the writer.
+    let peer = runtime
+        .block_on(fsqlite::Connection::open(path))
+        .expect("peer open after writer acknowledgement");
+    let rows = runtime
+        .block_on(peer.query("SELECT id, value FROM acknowledged_write ORDER BY id;"))
+        .expect("peer query after writer acknowledgement");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "a peer opened after execute() returned must observe that acknowledged autocommit write"
+    );
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(1))
+    );
+    assert_eq!(
+        rows[0].get(1),
+        Some(&fsqlite_types::SqliteValue::Text(
+            "visible-after-ack".into()
+        ))
+    );
+
+    runtime.block_on(peer.close()).expect("peer close");
+    runtime.block_on(writer.close()).expect("writer close");
+}
+
 /// bd-tc8u7: the MVCC truth matrix opens 8/16 connections to one file and
 /// applies the matched durability PRAGMAs before synchronizing the workload.
 /// Before the PRAGMA-boundary retry, `journal_mode=WAL` leaked BusyRecovery
@@ -221,10 +279,14 @@ fn concurrent_open_journal_mode_wal_never_escapes_busy_recovery() {
                             .build()
                             .map_err(|error| format!("runtime[{worker}]: {error}"));
                         open_barrier.wait();
-                        let connection = runtime.as_ref().map_err(|error| error.clone()).and_then(|rt| {
-                            rt.block_on(fsqlite::Connection::open(path))
-                                .map_err(|error| format!("open[{worker}]: {error:?}"))
-                        });
+                        let connection =
+                            runtime
+                                .as_ref()
+                                .map_err(|error| error.clone())
+                                .and_then(|rt| {
+                                    rt.block_on(fsqlite::Connection::open(path))
+                                        .map_err(|error| format!("open[{worker}]: {error:?}"))
+                                });
                         // Every worker reaches the PRAGMA barrier even if its
                         // open failed, so a red keeper remains bounded rather
                         // than stranding peers inside `Barrier::wait`.

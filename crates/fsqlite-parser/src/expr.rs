@@ -2251,12 +2251,16 @@ impl<'a> ParseMachine<'a> {
             end: start,
         };
         if self.parser.eat_kind(&TokenKind::Star) {
-            if !build.name.eq_ignore_ascii_case("count") {
-                return Err(self
-                    .parser
-                    .err_here("'*' can only be used with count() function"));
-            }
-            build.args = FunctionArgs::Star;
+            // bd-2fong parity: stock SQLite parses `f(*)` for ANY function.
+            // Only count keeps star semantics; every other function treats
+            // the star as a zero-argument call, so arity validation later
+            // yields stock's exact behavior — `random(*)` evaluates,
+            // `abs(*)` / `max(*)` fail with "wrong number of arguments".
+            build.args = if build.name.eq_ignore_ascii_case("count") {
+                FunctionArgs::Star
+            } else {
+                FunctionArgs::List(Vec::new())
+            };
             self.controls.push(ParseControl::FunctionClose {
                 outer_min_bp,
                 build,
@@ -4733,11 +4737,14 @@ impl Parser {
         self.expect_kind(&TokenKind::LeftParen)?;
 
         let (args, distinct, height) = if matches!(self.peek_kind(), TokenKind::Star) {
-            if !name.eq_ignore_ascii_case("count") {
-                return Err(self.err_here("'*' can only be used with count() function"));
-            }
             self.advance_token();
-            (FunctionArgs::Star, false, 0)
+            // Mirrors start_function: `f(*)` parses for any function; only
+            // count keeps star semantics, others become zero-arg calls.
+            if name.eq_ignore_ascii_case("count") {
+                (FunctionArgs::Star, false, 0)
+            } else {
+                (FunctionArgs::List(Vec::new()), false, 0)
+            }
         } else {
             let distinct = self.eat_kind(&TokenKind::KwDistinct);
             let (args, height) = if matches!(self.peek_kind(), TokenKind::RightParen) {

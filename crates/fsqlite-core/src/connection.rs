@@ -407,12 +407,12 @@ const fn autocommit_statement_conflict_is_retryable(error: &FrankenError) -> boo
     error.is_transient()
 }
 
-/// Test-only PRAGMA dispatch fault injection for the bd-tc8u7 retry boundary.
-///
-/// The injected error is consumed before any PRAGMA state changes. Keeping the
-/// hook at statement dispatch (rather than inside the pager) lets the
-/// counterkeeper prove that the boundary retries only transient errors and
-/// propagates every non-transient error unchanged.
+// Test-only PRAGMA dispatch fault injection for the bd-tc8u7 retry boundary.
+//
+// The injected error is consumed before any PRAGMA state changes. Keeping the
+// hook at statement dispatch (rather than inside the pager) lets the
+// counterkeeper prove that the boundary retries only transient errors and
+// propagates every non-transient error unchanged.
 #[cfg(test)]
 std::thread_local! {
     static FSQLITE_PRAGMA_DISPATCH_ERROR_ONCE: RefCell<Option<FrankenError>> = const { RefCell::new(None) };
@@ -1010,6 +1010,7 @@ impl RecursiveCteDirectSumConsumerHits {
 const FSQLITE_RECURSIVE_CTE_DIRECT_SUM_CONSUMER_HITS: RecursiveCteDirectSumConsumerHits =
     RecursiveCteDirectSumConsumerHits;
 static FSQLITE_DIRECT_INDEXED_EQUALITY_QUERY_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_DIRECT_ROWID_RANGE_QUERY_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_DIRECT_COUNT_STAR_QUERY_ROW_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_ROW_HITS: AtomicU64 = AtomicU64::new(0);
@@ -1230,6 +1231,12 @@ pub struct HotPathProfileSnapshot {
     pub autoincrement_sequence_fast_path_updates: u64,
     pub autoincrement_sequence_scan_refreshes: u64,
     pub direct_indexed_equality_query_hits: u64,
+    /// Multi-row `query`/`query_with_params` hits on the rowid-lookup lane.
+    ///
+    /// bd-lcz7b: `record_query_hit` historically ignored `SimpleRowidLookup`,
+    /// so the lane was invisible on the query path even when engaged — the
+    /// bd-dqdoe read attribution misread that blind spot as a missed lane.
+    pub direct_rowid_lookup_query_hits: u64,
     pub direct_rowid_range_query_hits: u64,
     pub direct_count_star_query_row_hits: u64,
     pub direct_rowid_lookup_query_row_hits: u64,
@@ -1659,6 +1666,7 @@ pub fn reset_hot_path_profile() {
     FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_DIRECT_INDEXED_EQUALITY_QUERY_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_DIRECT_ROWID_RANGE_QUERY_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_DIRECT_COUNT_STAR_QUERY_ROW_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_ROW_HITS.store(0, AtomicOrdering::Relaxed);
@@ -1925,6 +1933,8 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         autoincrement_sequence_scan_refreshes: FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES
             .load(AtomicOrdering::Relaxed),
         direct_indexed_equality_query_hits: FSQLITE_DIRECT_INDEXED_EQUALITY_QUERY_HITS
+            .load(AtomicOrdering::Relaxed),
+        direct_rowid_lookup_query_hits: FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_HITS
             .load(AtomicOrdering::Relaxed),
         direct_rowid_range_query_hits: FSQLITE_DIRECT_ROWID_RANGE_QUERY_HITS
             .load(AtomicOrdering::Relaxed),
@@ -5865,6 +5875,12 @@ impl PreparedQueryFastPath {
         match self {
             Self::SimpleIndexedEqualityLookup { .. } => {
                 FSQLITE_DIRECT_INDEXED_EQUALITY_QUERY_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            // bd-lcz7b: the rowid-lookup lane was silently uncounted on the
+            // multi-row query path, leaving attribution blind to whether the
+            // placeholder point-read shape engages it.
+            Self::SimpleRowidLookup { .. } | Self::SimpleProjectedRowidLookup { .. } => {
+                FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             }
             Self::SimpleRowidRangeScan { .. } => {
                 FSQLITE_DIRECT_ROWID_RANGE_QUERY_HITS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -12036,7 +12052,9 @@ impl Connection {
             })
             .await?
         };
-        let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
+        let file_identity = pager.file_identity(&bootstrap_cx).await?;
+        let shared_mvcc_state =
+            shared_mvcc_state_for_path(&path, file_identity, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
         shared_mvcc_state.align_commit_clock_floor(initial_visible_commit_seq);
         let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
@@ -12510,7 +12528,14 @@ impl Connection {
     ) -> Result<Self> {
         let attach_env = env.clone();
         let pager_is_memory = pager.is_memory();
-        let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
+        let file_identity = if pager_is_memory {
+            None
+        } else {
+            let identity_cx = env.runtime().root_cx.create_child();
+            pager.file_identity(&identity_cx).await?
+        };
+        let shared_mvcc_state =
+            shared_mvcc_state_for_path(&path, file_identity, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
         shared_mvcc_state.align_commit_clock_floor(initial_visible_commit_seq);
         let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
@@ -29425,6 +29450,12 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
+                    if limit_clause
+                        .as_ref()
+                        .is_some_and(bound_limit_clause_is_constant_zero)
+                    {
+                        return Ok(Vec::new());
+                    }
                     let mut rows = self.execute_join_select(&bound, None).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
@@ -29461,6 +29492,12 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
+                    if limit_clause
+                        .as_ref()
+                        .is_some_and(bound_limit_clause_is_constant_zero)
+                    {
+                        return Ok(Vec::new());
+                    }
                     let started = Instant::now();
                     let mut rows = self.execute_join_select(&bound, None).await?;
                     if native_join_dispatch {
@@ -29478,6 +29515,12 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
+                    if limit_clause
+                        .as_ref()
+                        .is_some_and(bound_limit_clause_is_constant_zero)
+                    {
+                        return Ok(Vec::new());
+                    }
                     let mut rows = self.execute_join_select(&bound, None).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
@@ -29493,6 +29536,12 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
+                    if limit_clause
+                        .as_ref()
+                        .is_some_and(bound_limit_clause_is_constant_zero)
+                    {
+                        return Ok(Vec::new());
+                    }
                     let mut rows = self.execute_join_select(&bound, None).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
@@ -30617,7 +30666,8 @@ impl Connection {
                 Ok(Cow::Borrowed(statement))
             }
             Statement::Select(select)
-                if is_expression_only_select(select) && expression_only_has_core_subquery(select) =>
+                if is_expression_only_select(select)
+                    && expression_only_has_core_subquery(select) =>
             {
                 // Expression-only SELECTs with scalar subqueries in result
                 // columns are handled by execute_expression_only_with_subqueries
@@ -37368,6 +37418,16 @@ impl Connection {
 
         let schemas = self.schema.borrow();
         let explicit_collations = in_rhs_donor_explicit_collations(subquery, &schemas);
+        // bd-2fong red 2: the IN-RHS donor metadata models table-backed
+        // donors only; the scalar comparison shapes (no-FROM CAST
+        // projections, star projections, compound final cores, VALUES
+        // coroutine donor rows, derived outer columns) come back with no
+        // affinity and the comparison ran affinity-less — losing the donor
+        // SQLite applies ((SELECT CAST(1 AS INTEGER)) = '1' is 1, not 0).
+        // For the single-column case, fall back to the broader
+        // scalar_subquery_result_affinity donor model.
+        let scalar_fallback_affinity =
+            (expected == 1).then(|| scalar_subquery_result_affinity(subquery, &schemas));
         drop(schemas);
         let mut fields = Vec::with_capacity(expected);
         for (index, value) in values.into_iter().enumerate() {
@@ -37385,7 +37445,8 @@ impl Connection {
                 affinity: donor_metadata
                     .columns
                     .get(index)
-                    .and_then(|column| column.affinity),
+                    .and_then(|column| column.affinity)
+                    .or(scalar_fallback_affinity),
                 span,
             };
             if expected > 1
@@ -42859,6 +42920,18 @@ impl Connection {
         let profile_flush = hot_path_profile_enabled();
         if profile_flush {
             FSQLITE_DIRECT_WRITE_FLUSH_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        // bd-qcgn2 candidate (a): every read statement pays this call, and on
+        // read workloads no direct-write run is ever pending — profile showed
+        // the three-stage flush setup at ~8% of the engaged PK point-lookup
+        // samples. Return before constructing the staged flush future when
+        // all three pending slots are empty. Call counting above is kept so
+        // profile counters retain their meaning (a call is a call).
+        if self.pending_direct_update_leaf_patch_run.borrow().is_none()
+            && self.pending_direct_delete_leaf_run.borrow().is_none()
+            && self.pending_direct_insert_page_run.borrow().is_none()
+        {
+            return Ok(());
         }
         let flush_start = profile_flush.then(Instant::now);
         let result = async {
@@ -54781,10 +54854,48 @@ impl Connection {
             // release writer locks. After this, the pager reflects the
             // pre-transaction committed state.
             let mut active_txn = self.active_txn.borrow_mut().take();
-            let rollback_result = if let Some(txn) = active_txn.as_mut() {
-                txn.rollback(cx).await
-            } else {
-                Ok(())
+            // bd-b4mwn: pager rollback can lose a transient race — a peer
+            // holding the recovery fence during the post-rollback reload
+            // yields Busy/BusyRecovery even though this worker's locks are
+            // already releasable. The old contract surfaced the error with
+            // the transaction restored so the CALLER could retry ROLLBACK;
+            // under 8 concurrent writers that cascaded into aborted bench
+            // samples. Absorb the transient wait here instead (the 4884b6a99
+            // autocommit-retry pattern): bounded re-attempts within
+            // busy_timeout. Non-transient rollback errors still propagate
+            // immediately, and budget exhaustion restores the transaction
+            // exactly as before — FCW semantics are untouched (this retries
+            // only the rollback of an already-doomed transaction).
+            let rollback_result = {
+                let mut result = if let Some(txn) = active_txn.as_mut() {
+                    txn.rollback(cx).await
+                } else {
+                    Ok(())
+                };
+                if matches!(
+                    &result,
+                    Err(FrankenError::Busy | FrankenError::BusyRecovery)
+                ) {
+                    let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+                    let deadline = Duration::from_millis(busy_timeout_ms);
+                    let started = Instant::now();
+                    let mut handoff = BeginBusyRetryHandoff::default();
+                    while matches!(
+                        &result,
+                        Err(FrankenError::Busy | FrankenError::BusyRecovery)
+                    ) {
+                        let Some(wait) = handoff.next_wait(started, deadline) else {
+                            break;
+                        };
+                        perform_begin_busy_retry_handoff(wait).await;
+                        result = if let Some(txn) = active_txn.as_mut() {
+                            txn.rollback(cx).await
+                        } else {
+                            Ok(())
+                        };
+                    }
+                }
+                result
             };
             if let Err(error) = &rollback_result
                 && self.restore_retryable_rollback_transaction(&mut active_txn, error)
@@ -63728,6 +63839,63 @@ impl Connection {
                         }
                         return Ok(acc);
                     }
+                    // bd-2fong red 2: eval_join_binary_op derives operand
+                    // metadata from the static exprs, and its connection-less
+                    // lookup maps Expr::Subquery to BLOB affinity — losing the
+                    // donor SQLite applies ((SELECT CAST(1 AS INTEGER)) = '1'
+                    // is 1, not 0). Materialize subquery operands into
+                    // BoundOuterValue (value + donor affinity/collation) via
+                    // the same helper the IN-operand path uses, so the
+                    // comparison sees the donor. Vector subqueries stay legal
+                    // exactly when the opposite operand is a row value or
+                    // another subquery.
+                    let subquery_operand = matches!(left.as_ref(), Expr::Subquery(..))
+                        || matches!(right.as_ref(), Expr::Subquery(..));
+                    if subquery_operand {
+                        let allow_vector_left =
+                            matches!(right.as_ref(), Expr::RowValue(..) | Expr::Subquery(..));
+                        let allow_vector_right =
+                            matches!(left.as_ref(), Expr::RowValue(..) | Expr::Subquery(..));
+                        let left_materialized;
+                        let left_ref: &Expr = if matches!(left.as_ref(), Expr::Subquery(..)) {
+                            left_materialized = self
+                                .inline_in_comparison_operand(
+                                    left,
+                                    row,
+                                    col_map,
+                                    None,
+                                    allow_vector_left,
+                                )
+                                .await?;
+                            &left_materialized
+                        } else {
+                            left
+                        };
+                        let right_materialized;
+                        let right_ref: &Expr = if matches!(right.as_ref(), Expr::Subquery(..)) {
+                            right_materialized = self
+                                .inline_in_comparison_operand(
+                                    right,
+                                    row,
+                                    col_map,
+                                    None,
+                                    allow_vector_right,
+                                )
+                                .await?;
+                            &right_materialized
+                        } else {
+                            right
+                        };
+                        let l = self
+                            .eval_expr_with_subqueries(left_ref, row, col_map, params)
+                            .await?;
+                        let r = self
+                            .eval_expr_with_subqueries(right_ref, row, col_map, params)
+                            .await?;
+                        return Ok(eval_join_binary_op(
+                            left_ref, &l, *op, right_ref, &r, col_map,
+                        ));
+                    }
                     let l = self
                         .eval_expr_with_subqueries(left, row, col_map, params)
                         .await?;
@@ -71557,6 +71725,14 @@ impl Connection {
                     if !is_correlated_subquery_with_schema(sub, &self.schema.borrow()) {
                         self.validate_select_column_references(sub)?;
                         self.validate_scalar_subquery_column_count(sub)?;
+                        // bd-2fong red 2: this pre-resolver serves the
+                        // expression-only (fromless) lane, so the fold must
+                        // carry the subquery's donor affinity exactly like
+                        // rewrite_in_expr's fold — a bare Literal loses the
+                        // donor and `(SELECT CAST(1 AS INTEGER)) = '1'`
+                        // compares affinity-less (0 instead of SQLite's 1).
+                        let folded_affinity =
+                            scalar_subquery_result_affinity(sub, &self.schema.borrow());
                         let rows = self
                             .execute_statement(&Statement::Select((**sub).clone()), params)
                             .await?;
@@ -71565,7 +71741,16 @@ impl Connection {
                             .next()
                             .and_then(|r| r.values.into_iter().next())
                             .unwrap_or(SqliteValue::Null);
-                        Ok(Expr::Literal(sqlite_value_to_literal(&val), *span))
+                        if folded_affinity == TypeAffinity::Blob {
+                            Ok(Expr::Literal(sqlite_value_to_literal(&val), *span))
+                        } else {
+                            Ok(Expr::BoundOuterValue {
+                                value: val,
+                                collation: BoundCollation::Unspecified,
+                                affinity: Some(folded_affinity),
+                                span: *span,
+                            })
+                        }
                     } else {
                         Ok(expr.clone())
                     }
@@ -73016,7 +73201,34 @@ impl Connection {
                 };
                 if let Some(directive) = directive {
                     let verified = match directive.access_kind {
-                        PlannerSelectAccessKind::FullTableScan => true,
+                        PlannerSelectAccessKind::FullTableScan => {
+                            // bd-2fong red 3 (bd-jyyae family): a FullTableScan
+                            // directive was trusted unconditionally, but the
+                            // native IN-probe lane (bd-2dgf5) upgrades
+                            // `ipk IN (SELECT ...)` to rowid seeks at codegen —
+                            // EQP printed `SCAN t` for a program whose first
+                            // act is SeekGE. Verify scan directives against the
+                            // program like every other access kind and report
+                            // the path the program actually performs (stock:
+                            // `SEARCH t USING INTEGER PRIMARY KEY (rowid=?)`).
+                            if let Ok(program) = self.compile_table_select(select).await
+                                && crate::explain::program_seeks_rowid_on_table(
+                                    &program,
+                                    &directive.table_name,
+                                )
+                            {
+                                return vec![to_row(
+                                    2,
+                                    0,
+                                    0,
+                                    format!(
+                                        "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                                        directive.table_name
+                                    ),
+                                )];
+                            }
+                            true
+                        }
                         PlannerSelectAccessKind::RowidLookup => {
                             match self.compile_table_select(select).await {
                                 Ok(program) => crate::explain::program_seeks_rowid_on_table(
@@ -75722,6 +75934,26 @@ impl Drop for Connection {
             // shared state so future opens start a fresh generation. Tasks
             // exit at their next checkpoint under their own power; nothing
             // here waits for them.
+            // bd-b4mwn: a dropped connection's live concurrent session kept
+            // its page locks in the SHARED per-path lock table with nothing
+            // left to release them — successors parked on page_lock_busy for
+            // the full busy_timeout and the 8-writer bench cascaded into
+            // aborted samples (write_busy_timeout -> transient INSERT error
+            // -> rollback BusyRecovery -> more drops). Aborting the session
+            // is synchronous (Mutex-guarded registry + lock table), so it is
+            // legal here even though pager rollback is not: the uncommitted
+            // pager state stays deferred to WAL recovery as documented
+            // above, but the locks and the registry slot are reclaimed NOW
+            // so siblings never inherit a dead session's contention.
+            if let Some(session_id) = self.concurrent_session_id.get_mut().take() {
+                let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                if let Some(mut handle) = registry.get_mut(session_id) {
+                    concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+                }
+                self.clear_cached_concurrent_handle();
+                registry.remove_and_recycle(session_id);
+            }
+
             self._shared_mvcc_state
                 .release_connection_on_drop(self.runtime_region);
 
@@ -79391,6 +79623,16 @@ fn validate_limit_offset_lossless(select: &SelectStatement) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// bd-2fong: SQLite's VDBE evaluates LIMIT first and jumps straight to the
+/// end when it is zero — before the row source is opened or any row
+/// expression runs (oracle sqlite3 3.46.1: a derived VALUES row with an
+/// erroring expression under LIMIT 0 yields zero rows, no error). Fallback
+/// executors materialize before applying LIMIT, so they must short-circuit a
+/// bound constant-zero limit before materialization.
+fn bound_limit_clause_is_constant_zero(limit: &fsqlite_ast::LimitClause) -> bool {
+    eval_constant_limit_integer(&limit.limit) == Some(0)
 }
 
 fn check_limit_value_lossless(expr: &Expr) -> Result<()> {
@@ -87296,16 +87538,22 @@ enum WriteCoordinatorServiceReservation {
     Reserved(WriteCoordinatorServiceStart),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct SharedMvccKey {
     path_key: String,
+    file_identity: Option<FileIdentity>,
     runtime_id: u64,
 }
 
 impl SharedMvccKey {
-    fn new(path_key: String, runtime: &RuntimeContext) -> Self {
+    fn new(
+        path_key: String,
+        file_identity: Option<FileIdentity>,
+        runtime: &RuntimeContext,
+    ) -> Self {
         Self {
             path_key,
+            file_identity,
             runtime_id: runtime.runtime_id(),
         }
     }
@@ -87954,9 +88202,15 @@ impl SharedMvccState {
 
 static SHARED_MVCC_STATE_BY_PATH: OnceLock<Mutex<HashMap<SharedMvccKey, Weak<SharedMvccState>>>> =
     OnceLock::new();
-static SHARED_MVCC_COORDINATION_BY_PATH: OnceLock<
-    Mutex<HashMap<String, Weak<SharedMvccCoordinationState>>>,
+static SHARED_MVCC_COORDINATION: OnceLock<
+    Mutex<HashMap<SharedMvccCoordinationKey, Weak<SharedMvccCoordinationState>>>,
 > = OnceLock::new();
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum SharedMvccCoordinationKey {
+    File(FileIdentity),
+    Path(String),
+}
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -88018,34 +88272,41 @@ fn mvcc_state_path_key(path: &str) -> String {
         .into_owned()
 }
 
-fn shared_mvcc_coordination_for_path(path_key: &str) -> Arc<SharedMvccCoordinationState> {
-    let coordination_map =
-        SHARED_MVCC_COORDINATION_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()));
+fn shared_mvcc_coordination_for_file(
+    path_key: &str,
+    file_identity: Option<FileIdentity>,
+) -> Arc<SharedMvccCoordinationState> {
+    let key = file_identity.map_or_else(
+        || SharedMvccCoordinationKey::Path(path_key.to_owned()),
+        SharedMvccCoordinationKey::File,
+    );
+    let coordination_map = SHARED_MVCC_COORDINATION.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = lock_unpoisoned(coordination_map);
-    if let Some(existing) = map.get(path_key).and_then(Weak::upgrade) {
+    if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
         return existing;
     }
     let coordination = Arc::new(SharedMvccCoordinationState::new());
-    map.insert(path_key.to_owned(), Arc::downgrade(&coordination));
+    map.insert(key, Arc::downgrade(&coordination));
     coordination
 }
 
 fn shared_mvcc_state_for_path(
     path: &str,
+    file_identity: Option<FileIdentity>,
     runtime: Arc<RuntimeContext>,
 ) -> Result<Arc<SharedMvccState>> {
     if path == ":memory:" {
         let coordination = Arc::new(SharedMvccCoordinationState::new());
         return Ok(Arc::new(SharedMvccState::new(
-            SharedMvccKey::new(path.to_owned(), &runtime),
+            SharedMvccKey::new(path.to_owned(), None, &runtime),
             runtime,
             coordination,
         )?));
     }
 
     let path_key = mvcc_state_path_key(path);
-    let coordination = shared_mvcc_coordination_for_path(&path_key);
-    let key = SharedMvccKey::new(path_key, &runtime);
+    let coordination = shared_mvcc_coordination_for_file(&path_key, file_identity);
+    let key = SharedMvccKey::new(path_key, file_identity, &runtime);
     let state_map = SHARED_MVCC_STATE_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = lock_unpoisoned(state_map);
 
@@ -88253,6 +88514,40 @@ fn select_statement_has_external_column_ref(
             .compounds
             .iter()
             .any(|(_, core)| select_core_has_external_column_ref(core, ancestor_tables))
+        // bd-2fong red 4: statement-level ORDER BY and LIMIT resolve in the
+        // primary core's scope and can carry correlated outer references
+        // (`... ORDER BY abs(y - outer.x) LIMIT 1`). Skipping them made the
+        // correlation detector misjudge such subqueries as non-correlated, so
+        // the compiled IN-probe lane admitted a shape whose codegen cannot
+        // resolve the outer name (NoSuchColumn at prepare). Mirror the
+        // substitution walker's statement-level extension.
+        || {
+            let inner_tables =
+                protected_tables_for_core(&select.body.select, ancestor_tables);
+            // ORDER BY resolves output aliases before any outer scope
+            // (`SELECT 1 AS x ORDER BY x` is fully local), so aliases join
+            // the local set unconditionally here.
+            let output_aliases = collect_select_core_result_aliases(&select.body.select);
+            select.order_by.iter().any(|term| {
+                expr_has_external_column_ref_with_locals(
+                    &term.expr,
+                    &inner_tables,
+                    &output_aliases,
+                )
+            }) || select.limit.as_ref().is_some_and(|limit| {
+                expr_has_external_column_ref_with_locals(
+                    &limit.limit,
+                    &inner_tables,
+                    &output_aliases,
+                ) || limit.offset.as_ref().is_some_and(|offset| {
+                    expr_has_external_column_ref_with_locals(
+                        offset,
+                        &inner_tables,
+                        &output_aliases,
+                    )
+                })
+            })
+        }
 }
 
 fn select_core_has_external_column_ref(core: &SelectCore, ancestor_tables: &[String]) -> bool {
@@ -90049,6 +90344,57 @@ fn substitute_outer_refs_in_select_scoped(
             &visible_cte_names,
         );
     }
+    // bd-2fong: statement-level ORDER BY and LIMIT resolve in the primary
+    // core's scope, so correlated outer references there must substitute
+    // exactly like WHERE/HAVING do. Previously only the cores were walked and
+    // `... ORDER BY abs(y - outer.x) LIMIT 1` failed with NoSuchColumn on the
+    // outer-qualified name. Output aliases stay local (not substituted),
+    // matching WHERE/HAVING alias handling.
+    if !select.order_by.is_empty() || select.limit.is_some() {
+        let (protected_tables, protected_unqualified_columns, local_output_names) = {
+            let core = &select.body.select;
+            (
+                protected_tables_for_core(core, ancestor_tables),
+                protected_unqualified_columns_for_core(
+                    core,
+                    lookup,
+                    &visible_cte_names,
+                    ancestor_unqualified_columns,
+                ),
+                collect_select_core_result_aliases(core),
+            )
+        };
+        for term in &mut select.order_by {
+            term.expr = substitute_outer_refs_in_expr(
+                &term.expr,
+                lookup,
+                &protected_tables,
+                protected_unqualified_columns.as_ref(),
+                &local_output_names,
+                &visible_cte_names,
+            );
+        }
+        if let Some(limit) = &mut select.limit {
+            limit.limit = substitute_outer_refs_in_expr(
+                &limit.limit,
+                lookup,
+                &protected_tables,
+                protected_unqualified_columns.as_ref(),
+                &local_output_names,
+                &visible_cte_names,
+            );
+            if let Some(offset) = &mut limit.offset {
+                *offset = substitute_outer_refs_in_expr(
+                    offset,
+                    lookup,
+                    &protected_tables,
+                    protected_unqualified_columns.as_ref(),
+                    &local_output_names,
+                    &visible_cte_names,
+                );
+            }
+        }
+    }
 }
 
 fn substitute_outer_refs_in_select_core(
@@ -90960,6 +91306,14 @@ fn rewrite_in_expr<'a>(
                         "sub-select returns {column_count} columns - expected 1"
                     )));
                 }
+                // bd-2fong red 2: a scalar subquery donates its result
+                // expression's affinity to enclosing comparisons — SQLite
+                // evaluates `(SELECT CAST(1 AS INTEGER)) = '1'` as 1. Folding
+                // to a bare literal dropped that donor, so comparisons ran
+                // with no affinity. Fold to BoundOuterValue (value +
+                // affinity) whenever the subquery has a derivable affinity;
+                // resolve_operand_affinity already reads it back first.
+                let folded_affinity = scalar_subquery_result_affinity(sub, &conn.schema.borrow());
                 let rows = conn
                     .execute_statement(&Statement::Select(*sub.clone()), params)
                     .await?;
@@ -90968,16 +91322,25 @@ fn rewrite_in_expr<'a>(
                     .next()
                     .and_then(|row| row.values.into_iter().next())
                     .unwrap_or(SqliteValue::Null);
-                *expr = Expr::Literal(
-                    match val {
-                        SqliteValue::Integer(i) => Literal::Integer(i),
-                        SqliteValue::Float(f) => Literal::Float(f),
-                        SqliteValue::Text(s) => Literal::String(s.to_string()),
-                        SqliteValue::Blob(b) => Literal::Blob(b.to_vec()),
-                        SqliteValue::Null => Literal::Null,
-                    },
-                    *span,
-                );
+                *expr = if folded_affinity == TypeAffinity::Blob {
+                    Expr::Literal(
+                        match val {
+                            SqliteValue::Integer(i) => Literal::Integer(i),
+                            SqliteValue::Float(f) => Literal::Float(f),
+                            SqliteValue::Text(s) => Literal::String(s.to_string()),
+                            SqliteValue::Blob(b) => Literal::Blob(b.to_vec()),
+                            SqliteValue::Null => Literal::Null,
+                        },
+                        *span,
+                    )
+                } else {
+                    Expr::BoundOuterValue {
+                        value: val,
+                        collation: BoundCollation::Unspecified,
+                        affinity: Some(folded_affinity),
+                        span: *span,
+                    }
+                };
             }
             Expr::BinaryOp { left, right, .. } => {
                 // bd-2fong: a comparison operand faces a row value when the
@@ -102136,9 +102499,16 @@ fn scalar_subquery_result_affinity(
 ) -> TypeAffinity {
     let core = in_rhs_donor_core(select);
     match core {
+        // bd-di4he: the project oracle (bundled SQLite 3.53.2 via rusqlite)
+        // donates VALUES affinity from the coroutine's donor row — the LAST
+        // row when no donor has been frozen: `(VALUES(1),(random() AND 0),
+        // (CAST(1 AS NUMERIC))) = '1'` is 1 there. (System sqlite3 3.46.1
+        // predates that donor model and answers 0; the bundled reference is
+        // authoritative for keepers.)
         SelectCore::Values(rows) => rows
             .donor_row()
-            .and_then(|row| row.first())
+            .or_else(|| rows.rows().last().map(Vec::as_slice))
+            .and_then(<[Expr]>::first)
             .map_or(TypeAffinity::Blob, |expr| {
                 resolve_operand_affinity(expr, schemas)
             }),
@@ -105560,11 +105930,13 @@ fn values_row_is_constant_without_affinity(
 /// invoking application code. Slow-changing built-ins are query-constant;
 /// volatile application replacements are not.
 fn values_expr_is_query_constant(expr: &Expr, function_registry: &FunctionRegistry) -> bool {
-    if expr_folds_to_integer_zero_via_and(expr)
-        || matches!(expr, Expr::In { set: InSet::List(values), .. } if values.is_empty())
-    {
-        return true;
-    }
+    // bd-di4he: NO semantic short-circuits here. sqlite3ExprIsConstant() is
+    // purely syntactic — `random() AND 0`, `0 AND random()`, and
+    // `random() IN ()` are all NON-constant to stock SQLite, which forces
+    // such VALUES rows into UNION ALL cores and moves the coroutine donor to
+    // the rightmost core. Folding them to constants here froze donor row 0
+    // and dropped the CAST donor affinity the bundled-3.53.2 oracle requires
+    // ((VALUES(1),(random() AND 0),(CAST(1 AS NUMERIC))) = '1' is 1).
     match expr {
         Expr::Literal(_, _) | Expr::Placeholder(_, _) => true,
         Expr::BinaryOp { left, right, .. } => {
@@ -110627,6 +110999,41 @@ impl<'a> SelectStructureResolver<'a> {
         });
         let using_skip = using_skip.as_ref().filter(|indices| !indices.is_empty());
         let output_aliases = collect_select_core_result_aliases(&select.body.select);
+
+        // bd-2fong: SQLite rejects an aggregate in ORDER BY unless the SELECT
+        // itself is an aggregate query ('misuse of aggregate: max()') — the
+        // fromless lane already enforces this; the from-full lane silently
+        // ordered by the aggregate's scalar value.
+        let is_aggregate_query = match &select.body.select {
+            SelectCore::Select {
+                columns,
+                group_by,
+                having,
+                ..
+            } => {
+                !group_by.is_empty()
+                    || having.is_some()
+                    || columns.iter().any(|column| match column {
+                        ResultColumn::Expr { expr, .. } => {
+                            self.connection.expr_contains_aggregate_with_registry(expr)
+                        }
+                        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+                    })
+            }
+            SelectCore::Values(_) => false,
+        };
+        if !is_aggregate_query {
+            for term in &select.order_by {
+                if self
+                    .connection
+                    .expr_contains_aggregate_with_registry(&term.expr)
+                {
+                    return Err(FrankenError::FunctionError(
+                        "misuse of aggregate: ".to_owned(),
+                    ));
+                }
+            }
+        }
 
         for (index, term) in select.order_by.iter().enumerate() {
             if self.order_term_records_ordinal(term, index, output_width)? {
@@ -115777,7 +116184,25 @@ fn bind_placeholders_in_select_statement(
     }
 
     for ordering in &mut select.order_by {
+        let was_bare_placeholder = matches!(ordering.expr, Expr::Placeholder(_, _));
         bind_placeholders_in_expr(&mut ordering.expr, bind_state, params)?;
+        // bd-2fong parity: stock SQLite resolves ORDER BY ordinals
+        // SYNTACTICALLY at parse time, so a BOUND parameter is always a
+        // constant expression, never a column ordinal (oracle 3.46.1:
+        // `... ORDER BY ?` bound to 2 preserves row order while a literal
+        // `ORDER BY 2` reorders). Binding just replaced a bare top-level
+        // placeholder with a literal; keep an integer result in expression
+        // form so the fallback sorters' ordinal classification cannot fire.
+        if was_bare_placeholder && let Expr::Literal(Literal::Integer(value), span) = &ordering.expr
+        {
+            let (value, span) = (*value, *span);
+            ordering.expr = Expr::BinaryOp {
+                left: Box::new(Expr::Literal(Literal::Integer(0), span)),
+                op: BinaryOp::Add,
+                right: Box::new(Expr::Literal(Literal::Integer(value), span)),
+                span,
+            };
+        }
     }
     if let Some(limit_clause) = &mut select.limit {
         bind_placeholders_in_expr(&mut limit_clause.limit, bind_state, params)?;
@@ -119576,7 +120001,26 @@ fn compare_join_expr_values(
     let collation = join_comparison_collation(left_expr, right_expr, col_map);
     with_current_join_eval_collation_context(|context| {
         context.map_or_else(
-            || cmp_sqlite_values(left_value, right_value),
+            || {
+                // bd-2fong red 2: the no-context fallback compared raw
+                // storage classes, so every comparison evaluated through the
+                // dynamic expression-only lane (any fromless statement
+                // containing a subquery routes here — the compiled control
+                // shapes never do) ran affinity-blind and
+                // `(SELECT CAST(1 AS INTEGER)) = '1'` returned 0 where
+                // SQLite's donor rules give 1. Derive operand affinity
+                // connection-lessly (BoundOuterValue folds, CAST, COLLATE
+                // wrappers) and coerce exactly like the context path; text
+                // collation stays BINARY here as before (no registry).
+                let left_affinity = resolve_operand_affinity(left_expr, &[]);
+                let right_affinity = resolve_operand_affinity(right_expr, &[]);
+                let (left_coerced, right_coerced) = coerce_values_for_comparison_affinity(
+                    left_value,
+                    right_value,
+                    TypeAffinity::comparison_affinity(left_affinity, right_affinity),
+                );
+                cmp_sqlite_values(&left_coerced, &right_coerced)
+            },
             |context| {
                 let left_affinity = join_expr_affinity(left_expr, col_map, context);
                 let right_affinity = join_expr_affinity(right_expr, col_map, context);
@@ -122547,11 +122991,11 @@ mod tests {
     use fsqlite_types::{LockLevel, Region, TypeAffinity};
     use fsqlite_types::{PageNumber, PageSize};
     use fsqlite_vdbe::ProgramBuilder;
-    use fsqlite_vfs::MemoryVfs;
     use fsqlite_vfs::ShmRegion;
     #[cfg(unix)]
     use fsqlite_vfs::UnixVfs;
     use fsqlite_vfs::traits::{Vfs, VfsFile};
+    use fsqlite_vfs::{FileIdentity, MemoryVfs};
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -125165,7 +125609,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("write-coordinator-stuck-starting.db");
         let db_path = db_path.to_string_lossy().into_owned();
-        let shared = super::shared_mvcc_state_for_path(&db_path, runtime).expect("shared state");
+        let shared =
+            super::shared_mvcc_state_for_path(&db_path, None, runtime).expect("shared state");
 
         {
             let mut state = lock_unpoisoned(&shared.runtime_state);
@@ -125343,6 +125788,50 @@ mod tests {
             conn_a.close().await.unwrap();
             conn_b.close().await.unwrap();
         });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_shared_mvcc_registry_rebinds_when_same_path_file_identity_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_a = std::fs::File::create(dir.path().join("identity-a.db")).unwrap();
+        let file_b = std::fs::File::create(dir.path().join("identity-b.db")).unwrap();
+        let identity_a = FileIdentity::from_file(&file_a).unwrap().unwrap();
+        let identity_b = FileIdentity::from_file(&file_b).unwrap().unwrap();
+        assert_ne!(identity_a, identity_b);
+
+        let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Blocking,
+        }));
+        let logical_path = dir.path().join("same-logical-path.db");
+        let logical_path = logical_path.to_string_lossy().into_owned();
+
+        let incarnation_a = super::shared_mvcc_state_for_path(
+            &logical_path,
+            Some(identity_a),
+            Arc::clone(&runtime),
+        )
+        .unwrap();
+        let incarnation_a_again = super::shared_mvcc_state_for_path(
+            &logical_path,
+            Some(identity_a),
+            Arc::clone(&runtime),
+        )
+        .unwrap();
+        let incarnation_b =
+            super::shared_mvcc_state_for_path(&logical_path, Some(identity_b), runtime).unwrap();
+
+        assert!(Arc::ptr_eq(&incarnation_a, &incarnation_a_again));
+        assert!(Arc::ptr_eq(
+            &incarnation_a._coordination,
+            &incarnation_a_again._coordination,
+        ));
+        assert!(!Arc::ptr_eq(&incarnation_a, &incarnation_b));
+        assert!(!Arc::ptr_eq(
+            &incarnation_a._coordination,
+            &incarnation_b._coordination,
+        ));
     }
 
     #[test]
@@ -129540,7 +130029,10 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             let rows = conn
-                .query("VALUES (3, 'c'), (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 2;")
+                .query(
+                    "SELECT * FROM (VALUES (3, 'c'), (1, 'a'), (2, 'b')) \
+                     ORDER BY 1 LIMIT 2;",
+                )
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 2);
@@ -129552,6 +130044,14 @@ mod tests {
                 row_values(&rows[1]),
                 vec![SqliteValue::Integer(2), SqliteValue::Text("b".into())]
             );
+
+            let bare = conn
+                .query("VALUES (3, 'c'), (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 2;")
+                .await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
+            );
         });
     }
 
@@ -129560,11 +130060,22 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             let rows = conn
-                .query("VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 1 OFFSET 1;")
+                .query(
+                    "SELECT * FROM (VALUES (3), (1), (2)) \
+                     ORDER BY 1 DESC LIMIT 1 OFFSET 1;",
+                )
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(2)]);
+
+            let bare = conn
+                .query("VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 1 OFFSET 1;")
+                .await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
+            );
         });
     }
 
@@ -129583,7 +130094,10 @@ mod tests {
             let conn = Connection::open(":memory:").await.unwrap();
             for sql in [
                 "SELECT 42 LIMIT 0 OFFSET NULL;",
-                "VALUES (42) LIMIT 0 OFFSET NULL;",
+                // bd-2fong parity: a bare `VALUES ... LIMIT` is a stock
+                // parse error (pinned below); the derived form carries the
+                // VALUES-shaped receipt.
+                "SELECT * FROM (VALUES (42)) LIMIT 0 OFFSET NULL;",
             ] {
                 let rows = conn
                     .query(sql)
@@ -129591,6 +130105,11 @@ mod tests {
                     .expect("LIMIT zero must bypass OFFSET evaluation");
                 assert!(rows.is_empty(), "unexpected rows for `{sql}`");
             }
+            let bare = conn.query("VALUES (42) LIMIT 0 OFFSET NULL;").await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite (3.46.1 oracle) rejects LIMIT after a bare VALUES term: {bare:?}"
+            );
         });
     }
 
@@ -129621,9 +130140,13 @@ mod tests {
                 &[SqliteValue::Integer(11), SqliteValue::Integer(12)]
             );
 
+            // bd-2fong parity: bare `VALUES ... ORDER BY/LIMIT` is a stock
+            // parse error; the derived form preserves the statement-global
+            // bind-order receipt (oracle: [3,1] sorted -> LIMIT 1 OFFSET 1
+            // -> 3).
             let values_rows = conn
                 .query_with_params(
-                    "VALUES (?), (?) ORDER BY 1 LIMIT ? OFFSET ?;",
+                    "SELECT * FROM (VALUES (?), (?)) ORDER BY 1 LIMIT ? OFFSET ?;",
                     &[
                         SqliteValue::Integer(3),
                         SqliteValue::Integer(1),
@@ -129634,6 +130157,21 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(values_rows[0].values(), &[SqliteValue::Integer(3)]);
+            let bare = conn
+                .query_with_params(
+                    "VALUES (?), (?) ORDER BY 1 LIMIT ? OFFSET ?;",
+                    &[
+                        SqliteValue::Integer(3),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(1),
+                    ],
+                )
+                .await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite (3.46.1 oracle) rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
+            );
 
             let literal_text = conn.query("SELECT 42 LIMIT '1' OFFSET '0';").await.unwrap();
             assert_eq!(literal_text[0].values(), &[SqliteValue::Integer(42)]);
@@ -129721,7 +130259,11 @@ mod tests {
 
             for sql in [
                 "SELECT fail_if_invoked() LIMIT ?;",
-                "VALUES (fail_if_invoked()) LIMIT ?;",
+                // bd-2fong parity: bare `VALUES ... LIMIT` is a stock parse
+                // error; the derived form still short-circuits row
+                // evaluation under LIMIT 0 (oracle: derived VALUES with an
+                // overflowing expression returns zero rows, no error).
+                "SELECT * FROM (VALUES (fail_if_invoked())) LIMIT ?;",
             ] {
                 let rows = conn
                     .query_with_params(sql, &[SqliteValue::Integer(0)])
@@ -129822,14 +130364,31 @@ mod tests {
                     .expect_err("LIMIT zero must not suppress static SELECT validation");
             }
 
-            let invalid_order = conn
-                .prepare("SELECT (SELECT 1) ORDER BY 2 LIMIT ?;")
-                .await
-                .unwrap();
-            invalid_order
-                .query_with_params(&[SqliteValue::Integer(0)])
-                .await
-                .expect_err("prepared LIMIT zero must not suppress ORDER BY shape validation");
+            // bd-2fong parity: stock SQLite rejects the out-of-range ORDER BY
+            // ordinal at PREPARE time (oracle 3.46.1: '1st ORDER BY term out
+            // of range - should be between 1 and 1', and a literal LIMIT 0
+            // does not suppress it). The old arm expected prepare to succeed
+            // with the error deferred to execution; the intent — LIMIT zero
+            // must never suppress ORDER BY shape validation — is preserved by
+            // asserting the error surfaces no later than prepare.
+            let invalid_order = conn.prepare("SELECT (SELECT 1) ORDER BY 2 LIMIT ?;").await;
+            match invalid_order {
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("ORDER BY term out of range"),
+                        "prepare-time rejection must be the stock out-of-range error: {message}"
+                    );
+                }
+                Ok(prepared) => {
+                    prepared
+                        .query_with_params(&[SqliteValue::Integer(0)])
+                        .await
+                        .expect_err(
+                            "prepared LIMIT zero must not suppress ORDER BY shape validation",
+                        );
+                }
+            }
         });
     }
 
@@ -130092,7 +130651,12 @@ mod tests {
     fn test_expression_only_order_by_placeholder_is_constant_not_ordinal() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            let sql = "VALUES (1, 2), (2, 1) ORDER BY ? LIMIT ?;";
+            // bd-2fong parity: bare `VALUES ... ORDER BY` is a stock parse
+            // error (pinned below); the derived form carries the receipt.
+            // Oracle (C-SQLite 3.46.1): a BOUND placeholder in ORDER BY is a
+            // constant (original row order preserved), while the literal `2`
+            // is a column ordinal (rows reordered).
+            let sql = "SELECT * FROM (VALUES (1, 2), (2, 1)) ORDER BY ? LIMIT ?;";
             let params = [SqliteValue::Integer(2), SqliteValue::Integer(2)];
             let expected = vec![
                 vec![SqliteValue::Integer(1), SqliteValue::Integer(2)],
@@ -130110,7 +130674,7 @@ mod tests {
             );
 
             let syntactic_ordinal = conn
-                .query("VALUES (1, 2), (2, 1) ORDER BY 2;")
+                .query("SELECT * FROM (VALUES (1, 2), (2, 1)) ORDER BY 2;")
                 .await
                 .unwrap();
             assert_eq!(
@@ -130119,6 +130683,14 @@ mod tests {
                     vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
                     vec![SqliteValue::Integer(1), SqliteValue::Integer(2)],
                 ]
+            );
+
+            let bare = conn
+                .query_with_params("VALUES (1, 2), (2, 1) ORDER BY ? LIMIT ?;", &params)
+                .await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite (3.46.1 oracle) rejects ORDER BY after a bare VALUES term: {bare:?}"
             );
         });
     }
@@ -136529,6 +137101,79 @@ mod tests {
                 stmt.prepared_query_fast_path.as_ref(),
                 Some(&super::PreparedQueryFastPath::SimpleProjectedRowidLookup { .. })
             ));
+        });
+    }
+
+    #[test]
+    fn test_prepared_primary_key_lookup_query_with_params_records_direct_lane_hit() {
+        asupersync::test_utils::run_test(|| async {
+            // bd-lcz7b keeper: the bench point-read shape — placeholder PK
+            // lookup driven through the multi-row `query_with_params` path —
+            // must ENGAGE the rowid-lookup fast lane and now RECORD it on the
+            // previously uncounted query path, with oracle-parity results.
+            let _profile_guard =
+                super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE prep_pk_query_lane (id INTEGER PRIMARY KEY, val TEXT);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO prep_pk_query_lane VALUES (1, 'alpha'), (2, 'beta');")
+                .await
+                .unwrap();
+
+            let stmt = conn
+                .prepare("SELECT * FROM prep_pk_query_lane WHERE id = ?1;")
+                .await
+                .unwrap();
+            assert!(matches!(
+                stmt.prepared_query_fast_path.as_ref(),
+                Some(&super::PreparedQueryFastPath::SimpleRowidLookup { .. })
+            ));
+
+            super::reset_hot_path_profile();
+            let rows = stmt
+                .query_with_params(&[SqliteValue::Integer(2)])
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into())]
+            );
+            let profile = super::hot_path_profile_snapshot();
+            assert_eq!(
+                profile.direct_rowid_lookup_query_hits, 1,
+                "placeholder PK lookup via query_with_params must record the \
+                 rowid-lookup lane on the query path: {profile:?}"
+            );
+
+            // Missing rowid still engages the lane and returns zero rows.
+            super::reset_hot_path_profile();
+            let rows = stmt
+                .query_with_params(&[SqliteValue::Integer(99)])
+                .await
+                .unwrap();
+            assert!(rows.is_empty());
+            let profile = super::hot_path_profile_snapshot();
+            assert_eq!(profile.direct_rowid_lookup_query_hits, 1);
+
+            // Countermetric: a non-rowid predicate on the same table must NOT
+            // fire the rowid-lookup lane.
+            let non_rowid = conn
+                .prepare("SELECT * FROM prep_pk_query_lane WHERE val = ?1;")
+                .await
+                .unwrap();
+            super::reset_hot_path_profile();
+            let rows = non_rowid
+                .query_with_params(&[SqliteValue::Text("alpha".into())])
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            let profile = super::hot_path_profile_snapshot();
+            assert_eq!(
+                profile.direct_rowid_lookup_query_hits, 0,
+                "non-rowid predicate must not report the rowid-lookup lane: {profile:?}"
+            );
         });
     }
 
@@ -159594,6 +160239,10 @@ mod tests {
                 matches!(
                     rewritten.order_by[0].expr,
                     fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(2), _)
+                        | fsqlite_ast::Expr::BoundOuterValue {
+                            value: SqliteValue::Integer(2),
+                            ..
+                        }
                 ),
                 "top-level ORDER BY scalar subquery should be eagerly rewritten"
             );
@@ -159619,6 +160268,10 @@ mod tests {
                 matches!(
                     limit.limit,
                     fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(3), _)
+                        | fsqlite_ast::Expr::BoundOuterValue {
+                            value: SqliteValue::Integer(3),
+                            ..
+                        }
                 ),
                 "top-level LIMIT scalar subquery should be eagerly rewritten"
             );
@@ -159647,6 +160300,10 @@ mod tests {
                 matches!(
                     rewritten.order_by[0].expr,
                     fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(2), _)
+                        | fsqlite_ast::Expr::BoundOuterValue {
+                            value: SqliteValue::Integer(2),
+                            ..
+                        }
                 ),
                 "statement-level rewrite should not skip top-level ORDER BY scalar subqueries"
             );
@@ -159675,6 +160332,10 @@ mod tests {
                 matches!(
                     limit.limit,
                     fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(3), _)
+                        | fsqlite_ast::Expr::BoundOuterValue {
+                            value: SqliteValue::Integer(3),
+                            ..
+                        }
                 ),
                 "statement-level rewrite should not skip top-level LIMIT scalar subqueries"
             );
@@ -160065,19 +160726,23 @@ mod tests {
                 );
             }
 
+            // bd-2fong red 4: stock SQLite 3.46.1 REJECTS a correlated outer
+            // reference inside an IN-set subquery's statement-level ORDER BY
+            // ('Error: in prepare, no such column: outer_semantics.x' —
+            // oracle-verified 2026-08-12), while projection/CASE/HAVING
+            // correlation is accepted. The previous shape here encoded
+            // anti-parity acceptance of the ORDER BY form; it now asserts
+            // stock's rejection explicitly below instead.
             let correlated_sql = "SELECT x, \
                        x IN (SELECT outer_semantics.x FROM rhs_semantics LIMIT 1), \
                        x IN (SELECT x FROM rhs_semantics LIMIT 1), \
                        x IN (SELECT CASE WHEN y > 0 THEN outer_semantics.x ELSE y END \
                              FROM rhs_semantics LIMIT 1), \
-                       x IN (SELECT y FROM rhs_semantics \
-                             ORDER BY abs(y - outer_semantics.x) LIMIT 1), \
                        x IN (SELECT max(y) FROM rhs_semantics \
                              HAVING max(y) = outer_semantics.x) \
                    FROM outer_semantics ORDER BY x;";
             let expected = vec![
                 vec![
-                    SqliteValue::Integer(1),
                     SqliteValue::Integer(1),
                     SqliteValue::Integer(1),
                     SqliteValue::Integer(1),
@@ -160090,9 +160755,28 @@ mod tests {
                     SqliteValue::Integer(1),
                     SqliteValue::Integer(1),
                     SqliteValue::Integer(1),
-                    SqliteValue::Integer(1),
                 ],
             ];
+            let order_by_correlated_err = conn
+                .query(
+                    "SELECT x IN (SELECT y FROM rhs_semantics \
+                     ORDER BY abs(y - outer_semantics.x) LIMIT 1) \
+                     FROM outer_semantics ORDER BY x;",
+                )
+                .await
+                .expect_err(
+                    "stock SQLite rejects a correlated outer reference in an \
+                     IN-set subquery's ORDER BY at prepare; parity requires \
+                     the same rejection",
+                );
+            assert!(
+                matches!(
+                    &order_by_correlated_err,
+                    FrankenError::NoSuchColumn { name } if name == "outer_semantics.x"
+                ),
+                "expected stock-parity NoSuchColumn(outer_semantics.x), got \
+                 {order_by_correlated_err:?}"
+            );
             let direct = conn.query(correlated_sql).await.unwrap();
             assert_eq!(direct.iter().map(row_values).collect::<Vec<_>>(), expected);
             let prepared = conn.prepare(correlated_sql).await.unwrap();
@@ -160353,38 +161037,6 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
             assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        });
-    }
-
-    #[test]
-    fn temp_probe_bd2fong_invalid_scalar_shapes() {
-        asupersync::test_utils::run_test(|| async {
-            let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE scalar_outer (x INTEGER NOT NULL);")
-                .await
-                .unwrap();
-            conn.execute("INSERT INTO scalar_outer VALUES (1), (2);")
-                .await
-                .unwrap();
-            conn.execute("CREATE TABLE scalar_inner (a INTEGER, b INTEGER);")
-                .await
-                .unwrap();
-            for (tag, sql) in [
-                ("star", "SELECT (SELECT * FROM scalar_inner) FROM scalar_outer;"),
-                (
-                    "table_star",
-                    "SELECT (SELECT scalar_inner.* FROM scalar_inner) FROM scalar_outer;",
-                ),
-                ("bare_nope", "SELECT (SELECT nope FROM scalar_inner) FROM scalar_outer;"),
-                (
-                    "qual_nope",
-                    "SELECT (SELECT bad.nope FROM scalar_inner) FROM scalar_outer;",
-                ),
-            ] {
-                let outcome = conn.query(sql).await;
-                eprintln!("PROBE {tag}: {outcome:?}");
-            }
-            panic!("probe complete");
         });
     }
 
@@ -166028,7 +166680,10 @@ mod tests {
                 .query("PRAGMA journal_mode;")
                 .await
                 .expect("autocommit PRAGMA must absorb one transient recovery race");
-            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("memory".into())]);
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![SqliteValue::Text("memory".into())]
+            );
             assert_eq!(
                 super::pragma_dispatch_attempts(),
                 2,
@@ -178130,6 +178785,41 @@ mod autocommit_txn_tests {
             Box::pin(async move { self.inner.begin_transaction(cx).await })
         }
 
+        fn published_snapshot(&self) -> Option<fsqlite_pager::traits::WalPublicationSnapshot> {
+            self.inner.published_snapshot()
+        }
+
+        fn pinned_read_snapshot(&self) -> Option<fsqlite_pager::traits::WalPublicationSnapshot> {
+            self.inner.pinned_read_snapshot()
+        }
+
+        fn pinned_logical_read_snapshot<'a>(
+            &'a self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            Option<fsqlite_pager::traits::WalLogicalReadSnapshot>,
+        > {
+            Box::pin(async move { self.inner.pinned_logical_read_snapshot(cx).await })
+        }
+
+        fn refresh_published_snapshot<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            Option<fsqlite_pager::traits::WalPublicationSnapshot>,
+        > {
+            Box::pin(async move { self.inner.refresh_published_snapshot(cx).await })
+        }
+
+        fn publish_authorized_deferred_commit<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.publish_authorized_deferred_commit(cx).await })
+        }
+
         fn append_frame<'a>(
             &'a mut self,
             cx: &'a Cx,
@@ -178175,6 +178865,63 @@ mod autocommit_txn_tests {
             Box::pin(async move { self.inner.append_prepared_frames(cx, prepared).await })
         }
 
+        fn persist_parallel_wal_commit_certificate<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            certificate: &'a fsqlite_wal::ParallelWalCommitCertificate,
+            wal_frame_start: u64,
+            wal_frame_end: u64,
+            sync: bool,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.inner
+                    .persist_parallel_wal_commit_certificate(
+                        cx,
+                        certificate,
+                        wal_frame_start,
+                        wal_frame_end,
+                        sync,
+                    )
+                    .await
+            })
+        }
+
+        fn reconcile_parallel_wal_commit<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            certificate: &'a fsqlite_wal::ParallelWalCommitCertificate,
+            wal_frame_start: u64,
+            wal_frame_end: u64,
+            sync: bool,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            fsqlite_pager::traits::ParallelWalCommitReconciliation,
+        > {
+            Box::pin(async move {
+                self.inner
+                    .reconcile_parallel_wal_commit(
+                        cx,
+                        certificate,
+                        wal_frame_start,
+                        wal_frame_end,
+                        sync,
+                    )
+                    .await
+            })
+        }
+
+        fn latest_authorized_parallel_wal_commit_certificate<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<fsqlite_wal::ParallelWalCommitCertificate>>
+        {
+            Box::pin(async move {
+                self.inner
+                    .latest_authorized_parallel_wal_commit_certificate(cx)
+                    .await
+            })
+        }
+
         fn read_page<'a>(
             &'a mut self,
             cx: &'a Cx,
@@ -178201,6 +178948,20 @@ mod autocommit_txn_tests {
             page_number: u32,
         ) -> fsqlite_pager::traits::WalFuture<'a, u64> {
             Box::pin(async move { self.inner.committed_txns_since_page(cx, page_number).await })
+        }
+
+        fn conflicting_pages_since_snapshot<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            snapshot: fsqlite_wal::TransactionConflictSnapshot,
+            page_numbers: &'a [u32],
+            page_baselines: &'a [fsqlite_wal::TransactionConflictPageBaseline],
+        ) -> fsqlite_pager::traits::WalFuture<'a, Vec<u32>> {
+            Box::pin(async move {
+                self.inner
+                    .conflicting_pages_since_snapshot(cx, snapshot, page_numbers, page_baselines)
+                    .await
+            })
         }
 
         fn committed_txn_count<'a>(
@@ -178291,7 +179052,7 @@ mod autocommit_txn_tests {
 
     async fn install_checkpoint_failing_retained_flush_wal_backend_with_vfs<V>(
         pager: &Arc<SimplePager<V>>,
-        vfs: &V,
+        vfs: V,
         cx: &Cx,
         wal_path: &Path,
         failure: RetainedFlushCheckpointFailure,
@@ -178311,7 +179072,16 @@ mod autocommit_txn_tests {
             .expect("reopen existing WAL for checkpoint-failure injection");
         pager
             .set_wal_backend(Box::new(CheckpointFailingWalBackend::new(
-                WalBackendAdapter::new(wal),
+                PathRefreshingWalBackend::new(
+                    vfs,
+                    pager.db_path(),
+                    wal_path,
+                    pager.page_size().get(),
+                    wal,
+                    false,
+                    #[cfg(all(feature = "native", any(unix, windows)))]
+                    pager.namespace_binding(),
+                ),
                 failure,
             )))
             .expect("install checkpoint-failing WAL backend");
@@ -178328,7 +179098,7 @@ mod autocommit_txn_tests {
                 let vfs = p.vfs_handle();
                 install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
                     p,
-                    vfs.as_ref(),
+                    (*vfs).clone(),
                     &cx,
                     &wal_path,
                     failure,
@@ -178339,7 +179109,7 @@ mod autocommit_txn_tests {
             PagerBackend::IoUring(p) => {
                 let vfs = IoUringVfs::new();
                 install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
-                    p, &vfs, &cx, &wal_path, failure,
+                    p, vfs, &cx, &wal_path, failure,
                 )
                 .await;
             }
@@ -178347,7 +179117,7 @@ mod autocommit_txn_tests {
             PagerBackend::Unix(p) => {
                 let vfs = UnixVfs::new();
                 install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
-                    p, &vfs, &cx, &wal_path, failure,
+                    p, vfs, &cx, &wal_path, failure,
                 )
                 .await;
             }
@@ -178355,7 +179125,7 @@ mod autocommit_txn_tests {
             PagerBackend::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
-                    p, &vfs, &cx, &wal_path, failure,
+                    p, vfs, &cx, &wal_path, failure,
                 )
                 .await;
             }
@@ -225390,6 +226160,32 @@ mod pager_routing_tests {
             let nonunique_reference = "SELECT COUNT(*)
             FROM events AS e
             INNER JOIN allowed_buckets AS b ON b.rowid = e.bucket_id";
+            assert_eq!(
+                scalar_count(
+                    &nonunique,
+                    "SELECT COUNT(*)
+                     FROM events INDEXED BY idx_events_bucket_position
+                     WHERE bucket_id IN (
+                         SELECT rowid FROM allowed_buckets WHERE rowid = 1
+                     )",
+                )
+                .await,
+                2,
+                "the first composite-key run should contain both bucket 1 rows"
+            );
+            assert_eq!(
+                scalar_count(
+                    &nonunique,
+                    "SELECT COUNT(*)
+                     FROM events INDEXED BY idx_events_bucket_position
+                     WHERE bucket_id IN (
+                         SELECT rowid FROM allowed_buckets WHERE rowid = 3
+                     )",
+                )
+                .await,
+                2,
+                "the second composite-key run should contain both bucket 3 rows"
+            );
             assert_eq!(scalar_count(&nonunique, nonunique_sql).await, 4);
             assert_eq!(
                 scalar_count(&nonunique, nonunique_sql).await,

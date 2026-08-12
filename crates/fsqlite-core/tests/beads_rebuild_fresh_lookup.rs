@@ -221,7 +221,7 @@ fn reopen_after_same_path_file_replacement_reads_new_incarnation() {
             conn.close().await.unwrap();
             identity
         };
-        assert!(old_identity != replacement_identity);
+        assert_ne!(old_identity, replacement_identity);
 
         // A database-family replacement discards recovery artifacts belonging
         // to the old inode. Move them aside instead of letting an old WAL
@@ -246,7 +246,10 @@ fn reopen_after_same_path_file_replacement_reads_new_incarnation() {
         let reopened = Connection::open(db_path.to_string_lossy().into_owned())
             .await
             .unwrap();
-        assert!(reopened.file_identity().await.unwrap().unwrap() == replacement_identity);
+        assert_eq!(
+            reopened.file_identity().await.unwrap().unwrap(),
+            replacement_identity
+        );
         let rows = reopened
             .query("SELECT value FROM marker ORDER BY rowid")
             .await
