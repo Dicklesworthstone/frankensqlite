@@ -5902,6 +5902,14 @@ impl PagerMaintenanceLease {
             .lock()
             .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
         if self.gate.rollback_recovery_owner() != expected_recovery_owner {
+            // bd-b4mwn round 6: name the silent refusal (see the sibling
+            // gate receipts).
+            tracing::warn!(
+                target: "fsqlite.pager.maintenance_gate",
+                armed_owner = ?self.gate.rollback_recovery_owner().map(RollbackRecoveryOwnerId::get),
+                expected_owner = ?expected_recovery_owner.map(RollbackRecoveryOwnerId::get),
+                "exclusive upgrade refused: rollback-recovery owner mismatch"
+            );
             return Err(FrankenError::BusyRecovery);
         }
         if matches!(self.kind, PagerMaintenanceLeaseKind::Exclusive) {
@@ -5918,6 +5926,10 @@ impl PagerMaintenanceLease {
                 .unwrap_or(PagerMaintenanceLeaseKind::Exclusive));
         }
         if state.maintenance_active {
+            tracing::warn!(
+                target: "fsqlite.pager.maintenance_gate",
+                "exclusive upgrade refused: maintenance already active"
+            );
             return Err(FrankenError::BusyRecovery);
         }
         let prior = self.kind;
