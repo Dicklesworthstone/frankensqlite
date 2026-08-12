@@ -6206,6 +6206,15 @@ async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -
     while queue.resolve_one_pending_external_unlock().await? {}
     queue.resolve_pending_epoch_resolutions()?;
     if queue.has_pending_or_claimed_external_unlock() || queue.has_unresolved_in_doubt_epoch() {
+        // bd-b4mwn: fail-closed refusals must name themselves — a token a
+        // dead connection can no longer resolve otherwise surfaces only as
+        // an anonymous BusyRecovery at some later caller.
+        tracing::warn!(
+            target: "fsqlite.pager.group_commit",
+            pending_or_claimed_external_unlock = queue.has_pending_or_claimed_external_unlock(),
+            unresolved_in_doubt_epoch = queue.has_unresolved_in_doubt_epoch(),
+            "settle refused: unresolved external unlock or in-doubt epoch"
+        );
         return Err(FrankenError::BusyRecovery);
     }
     let logical_cleanup_count = queue.pending_logical_cleanup_count();
@@ -6221,6 +6230,12 @@ async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -
         return Err(error);
     }
     if queue.has_unresolved_in_doubt_epoch() || queue.has_process_root_finalization_attempt() {
+        tracing::warn!(
+            target: "fsqlite.pager.group_commit",
+            unresolved_in_doubt_epoch = queue.has_unresolved_in_doubt_epoch(),
+            process_root_finalization_attempt = queue.has_process_root_finalization_attempt(),
+            "settle refused: residual in-doubt epoch or process-root attempt after cleanup"
+        );
         return Err(FrankenError::BusyRecovery);
     }
     Ok(())
