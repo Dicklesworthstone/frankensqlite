@@ -132683,8 +132683,19 @@ mod tests {
     fn test_prepared_statement_values_order_by_limit() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
+            // bd-phboe: stock SQLite (oracle-verified on 3.46.1) REJECTS
+            // ORDER BY / LIMIT after a bare VALUES term with a syntax error;
+            // the historical assertion that this parses encoded anti-parity
+            // behavior. Parity means rejecting it too.
+            let bare = conn.prepare("VALUES (2), (1), (3) ORDER BY 1 LIMIT 2;").await;
+            assert!(
+                bare.is_err(),
+                "bare VALUES ... ORDER BY must be rejected for C-SQLite parity"
+            );
+            // The parity-accepted equivalent shape must work end to end
+            // through the prepared path.
             let stmt = conn
-                .prepare("VALUES (2), (1), (3) ORDER BY 1 LIMIT 2;")
+                .prepare("SELECT * FROM (VALUES (2), (1), (3)) ORDER BY 1 LIMIT 2;")
                 .await
                 .unwrap();
             let rows = stmt.query().await.unwrap();
