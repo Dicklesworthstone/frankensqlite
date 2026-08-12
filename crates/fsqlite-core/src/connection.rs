@@ -54842,10 +54842,49 @@ impl Connection {
             // release writer locks. After this, the pager reflects the
             // pre-transaction committed state.
             let mut active_txn = self.active_txn.borrow_mut().take();
-            let rollback_result = if let Some(txn) = active_txn.as_mut() {
-                txn.rollback(cx).await
-            } else {
-                Ok(())
+            // bd-b4mwn: pager rollback can lose a transient race — a peer
+            // holding the recovery fence during the post-rollback reload
+            // yields Busy/BusyRecovery even though this worker's locks are
+            // already releasable. The old contract surfaced the error with
+            // the transaction restored so the CALLER could retry ROLLBACK;
+            // under 8 concurrent writers that cascaded into aborted bench
+            // samples. Absorb the transient wait here instead (the 4884b6a99
+            // autocommit-retry pattern): bounded re-attempts within
+            // busy_timeout. Non-transient rollback errors still propagate
+            // immediately, and budget exhaustion restores the transaction
+            // exactly as before — FCW semantics are untouched (this retries
+            // only the rollback of an already-doomed transaction).
+            let rollback_result = {
+                let mut result = if let Some(txn) = active_txn.as_mut() {
+                    txn.rollback(cx).await
+                } else {
+                    Ok(())
+                };
+                if matches!(
+                    &result,
+                    Err(FrankenError::Busy | FrankenError::BusyRecovery)
+                ) {
+                    let busy_timeout_ms =
+                        self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+                    let deadline = Duration::from_millis(busy_timeout_ms);
+                    let started = Instant::now();
+                    let mut handoff = BeginBusyRetryHandoff::default();
+                    while matches!(
+                        &result,
+                        Err(FrankenError::Busy | FrankenError::BusyRecovery)
+                    ) {
+                        let Some(wait) = handoff.next_wait(started, deadline) else {
+                            break;
+                        };
+                        perform_begin_busy_retry_handoff(wait).await;
+                        result = if let Some(txn) = active_txn.as_mut() {
+                            txn.rollback(cx).await
+                        } else {
+                            Ok(())
+                        };
+                    }
+                }
+                result
             };
             if let Err(error) = &rollback_result
                 && self.restore_retryable_rollback_transaction(&mut active_txn, error)
@@ -160524,6 +160563,37 @@ mod tests {
     }
 
     #[test]
+    fn temp_probe_bd2fong_unsupported_in_shapes() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE rhs_semantics (y INTEGER, z INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO rhs_semantics VALUES (1, 30), (3, 10), (2, 20);")
+                .await
+                .unwrap();
+            for sql in [
+                "SELECT 1 IN (SELECT y FROM rhs_semantics ORDER BY max(y));",
+                "SELECT 1 IN (SELECT * FROM rhs_semantics);",
+                "SELECT 1 IN (SELECT rhs_semantics.* FROM rhs_semantics);",
+                "SELECT 1 IN (SELECT (y, z) FROM rhs_semantics);",
+                "SELECT 1 IN (SELECT nope FROM rhs_semantics);",
+                "SELECT 1 IN (SELECT y FROM rhs_semantics WHERE nope);",
+                "SELECT 1 IN (SELECT y FROM rhs_semantics ORDER BY nope);",
+                "SELECT 1 IN (SELECT y FROM rhs_semantics ORDER BY -1 LIMIT 1);",
+                "SELECT 1 IN (SELECT y FROM rhs_semantics ORDER BY +2 LIMIT 1);",
+                "SELECT 1 IN (SELECT abs(y) FILTER (WHERE y > 0) FROM rhs_semantics);",
+            ] {
+                match conn.query(sql).await {
+                    Ok(rows) => eprintln!("INSHAPE OK(!): {sql} => {:?}", rows[0].values()),
+                    Err(error) => eprintln!("INSHAPE err: {sql} => {error:?}"),
+                }
+            }
+            panic!("probe complete");
+        });
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn test_in_subquery_semantic_fallback_preserves_complete_select_semantics() {
         asupersync::test_utils::run_test(|| async {
@@ -160612,19 +160682,23 @@ mod tests {
                 );
             }
 
+            // bd-2fong red 4: stock SQLite 3.46.1 REJECTS a correlated outer
+            // reference inside an IN-set subquery's statement-level ORDER BY
+            // ('Error: in prepare, no such column: outer_semantics.x' —
+            // oracle-verified 2026-08-12), while projection/CASE/HAVING
+            // correlation is accepted. The previous shape here encoded
+            // anti-parity acceptance of the ORDER BY form; it now asserts
+            // stock's rejection explicitly below instead.
             let correlated_sql = "SELECT x, \
                        x IN (SELECT outer_semantics.x FROM rhs_semantics LIMIT 1), \
                        x IN (SELECT x FROM rhs_semantics LIMIT 1), \
                        x IN (SELECT CASE WHEN y > 0 THEN outer_semantics.x ELSE y END \
                              FROM rhs_semantics LIMIT 1), \
-                       x IN (SELECT y FROM rhs_semantics \
-                             ORDER BY abs(y - outer_semantics.x) LIMIT 1), \
                        x IN (SELECT max(y) FROM rhs_semantics \
                              HAVING max(y) = outer_semantics.x) \
                    FROM outer_semantics ORDER BY x;";
             let expected = vec![
                 vec![
-                    SqliteValue::Integer(1),
                     SqliteValue::Integer(1),
                     SqliteValue::Integer(1),
                     SqliteValue::Integer(1),
@@ -160637,9 +160711,28 @@ mod tests {
                     SqliteValue::Integer(1),
                     SqliteValue::Integer(1),
                     SqliteValue::Integer(1),
-                    SqliteValue::Integer(1),
                 ],
             ];
+            let order_by_correlated_err = conn
+                .query(
+                    "SELECT x IN (SELECT y FROM rhs_semantics \
+                     ORDER BY abs(y - outer_semantics.x) LIMIT 1) \
+                     FROM outer_semantics ORDER BY x;",
+                )
+                .await
+                .expect_err(
+                    "stock SQLite rejects a correlated outer reference in an \
+                     IN-set subquery's ORDER BY at prepare; parity requires \
+                     the same rejection",
+                );
+            assert!(
+                matches!(
+                    &order_by_correlated_err,
+                    FrankenError::NoSuchColumn { name } if name == "outer_semantics.x"
+                ),
+                "expected stock-parity NoSuchColumn(outer_semantics.x), got \
+                 {order_by_correlated_err:?}"
+            );
             let direct = conn.query(correlated_sql).await.unwrap();
             assert_eq!(direct.iter().map(row_values).collect::<Vec<_>>(), expected);
             let prepared = conn.prepare(correlated_sql).await.unwrap();
