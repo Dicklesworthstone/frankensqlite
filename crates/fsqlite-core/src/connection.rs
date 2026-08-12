@@ -160357,38 +160357,6 @@ mod tests {
     }
 
     #[test]
-    fn temp_probe_bd2fong_invalid_scalar_shapes() {
-        asupersync::test_utils::run_test(|| async {
-            let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE scalar_outer (x INTEGER NOT NULL);")
-                .await
-                .unwrap();
-            conn.execute("INSERT INTO scalar_outer VALUES (1), (2);")
-                .await
-                .unwrap();
-            conn.execute("CREATE TABLE scalar_inner (a INTEGER, b INTEGER);")
-                .await
-                .unwrap();
-            for (tag, sql) in [
-                ("star", "SELECT (SELECT * FROM scalar_inner) FROM scalar_outer;"),
-                (
-                    "table_star",
-                    "SELECT (SELECT scalar_inner.* FROM scalar_inner) FROM scalar_outer;",
-                ),
-                ("bare_nope", "SELECT (SELECT nope FROM scalar_inner) FROM scalar_outer;"),
-                (
-                    "qual_nope",
-                    "SELECT (SELECT bad.nope FROM scalar_inner) FROM scalar_outer;",
-                ),
-            ] {
-                let outcome = conn.query(sql).await;
-                eprintln!("PROBE {tag}: {outcome:?}");
-            }
-            panic!("probe complete");
-        });
-    }
-
-    #[test]
     fn test_correlated_scalar_subquery_routes_unsupported_shapes_to_complete_evaluator() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
