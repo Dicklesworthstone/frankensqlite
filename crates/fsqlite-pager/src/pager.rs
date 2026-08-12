@@ -6234,7 +6234,45 @@ fn identity_bound_group_commit_queue<V: Vfs>(
     )
 }
 
+/// bd-b4mwn round 7: bounded in-settle retries when the armed root has live,
+/// claimable cleanup work (another settler holds the per-handle exit claim,
+/// or a resolve round simply lost the claim race). Bursts of concurrent
+/// settlers previously made every non-winning settler refuse BusyRecovery
+/// despite active progress; those refusals stacked into multi-second bursts
+/// that starved callers' busy windows. The retry budget stays well under a
+/// caller's busy_timeout so true wedges still surface promptly.
+const SETTLE_CLAIM_CONTENTION_RETRIES: u32 = 24;
+const SETTLE_CLAIM_CONTENTION_BACKOFF: Duration = Duration::from_millis(10);
+
 async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -> Result<()> {
+    if !queue.has_process_root_finalization_attempt() {
+        return Ok(());
+    }
+    for _ in 0..SETTLE_CLAIM_CONTENTION_RETRIES {
+        match settle_pending_group_commit_finalization_round(queue).await {
+            Ok(()) => {
+                if !queue.has_process_root_finalization_attempt() {
+                    return Ok(());
+                }
+            }
+            // A refused round is retryable exactly while claimable cleanup
+            // work remains; any other error is terminal.
+            Err(FrankenError::BusyRecovery) => {}
+            Err(error) => return Err(error),
+        }
+        if queue.pending_logical_cleanup_count() == 0 {
+            // No claimable work remains; the residual root is a true wedge —
+            // fall through to the final round's fail-closed verdict.
+            break;
+        }
+        // Live cleanups remain (claimed by a peer settler or lost claim
+        // races): yield briefly and retry instead of refusing.
+        std::thread::sleep(SETTLE_CLAIM_CONTENTION_BACKOFF);
+    }
+    settle_pending_group_commit_finalization_round(queue).await
+}
+
+async fn settle_pending_group_commit_finalization_round(queue: &GroupCommitQueueRef) -> Result<()> {
     if !queue.has_process_root_finalization_attempt() {
         return Ok(());
     }
