@@ -407,6 +407,35 @@ const fn autocommit_statement_conflict_is_retryable(error: &FrankenError) -> boo
     error.is_transient()
 }
 
+/// Test-only PRAGMA dispatch fault injection for the bd-tc8u7 retry boundary.
+///
+/// The injected error is consumed before any PRAGMA state changes. Keeping the
+/// hook at statement dispatch (rather than inside the pager) lets the
+/// counterkeeper prove that the boundary retries only transient errors and
+/// propagates every non-transient error unchanged.
+#[cfg(test)]
+std::thread_local! {
+    static FSQLITE_PRAGMA_DISPATCH_ERROR_ONCE: RefCell<Option<FrankenError>> = const { RefCell::new(None) };
+    static FSQLITE_PRAGMA_DISPATCH_ATTEMPTS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn arm_pragma_dispatch_error_once(error: FrankenError) {
+    FSQLITE_PRAGMA_DISPATCH_ATTEMPTS.set(0);
+    FSQLITE_PRAGMA_DISPATCH_ERROR_ONCE.with_borrow_mut(|slot| *slot = Some(error));
+}
+
+#[cfg(test)]
+fn take_pragma_dispatch_error_once() -> Option<FrankenError> {
+    FSQLITE_PRAGMA_DISPATCH_ATTEMPTS.set(FSQLITE_PRAGMA_DISPATCH_ATTEMPTS.get() + 1);
+    FSQLITE_PRAGMA_DISPATCH_ERROR_ONCE.with_borrow_mut(Option::take)
+}
+
+#[cfg(test)]
+fn pragma_dispatch_attempts() -> u64 {
+    FSQLITE_PRAGMA_DISPATCH_ATTEMPTS.get()
+}
+
 /// Maximum trigger recursion depth (F-PGM.11).
 ///
 /// SQLite defines `SQLITE_MAX_TRIGGER_DEPTH = 1000`, but each Rust recursion
@@ -28337,8 +28366,65 @@ impl Connection {
         params: Option<&'a [SqliteValue]>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
         Box::pin(async move {
+            let autocommit_pragma_entry = matches!(statement, Statement::Pragma(_))
+                && self.autocommit_conflict_retry_boundary();
+            let mut result = self
+                .execute_statement_once_after_background_status(statement, params)
+                .await;
+            if !autocommit_pragma_entry
+                || !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error))
+            {
+                return result;
+            }
+
+            // bd-tc8u7: concurrent connection setup can race WAL recovery while
+            // applying `PRAGMA journal_mode=WAL`. At an autocommit boundary the
+            // failed dispatch has restored its prior PRAGMA state, so retry the
+            // whole statement on the same busy-timeout handoff used by GH #333.
+            // Explicit transactions remain outside this boundary, and a
+            // non-transient error returns above without a second attempt.
+            let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+            let deadline = Duration::from_millis(busy_timeout_ms);
+            let started = Instant::now();
+            let mut handoff = BeginBusyRetryHandoff::default();
+            while let Some(wait) = handoff.next_wait(started, deadline) {
+                if !self
+                    .conformal_retry_budget
+                    .borrow()
+                    .retry_allowed(started.elapsed())
+                {
+                    break;
+                }
+                perform_begin_busy_retry_handoff(wait).await;
+                if !self.autocommit_conflict_retry_boundary() {
+                    break;
+                }
+                result = self
+                    .execute_statement_once_after_background_status(statement, params)
+                    .await;
+                if !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error))
+                {
+                    break;
+                }
+            }
+            result
+        })
+    }
+
+    fn execute_statement_once_after_background_status<'a>(
+        &'a self,
+        statement: &'a Statement,
+        params: Option<&'a [SqliteValue]>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
+        Box::pin(async move {
             #[cfg(test)]
             record_trigger_stack_probe(trigger_probe_site::AFTER_BACKGROUND_STATUS);
+            #[cfg(test)]
+            if matches!(statement, Statement::Pragma(_))
+                && let Some(error) = take_pragma_dispatch_error_once()
+            {
+                return Err(error);
+            }
             self.refresh_select_schema_before_relation_validation(statement)
                 .await?;
             for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
@@ -165708,6 +165794,51 @@ mod tests {
 
             conn.execute("PRAGMA concurrent_mode=0;").await.unwrap();
             assert!(!conn.is_concurrent_mode_default());
+        });
+    }
+
+    #[test]
+    fn test_autocommit_pragma_retries_injected_busy_recovery_once() {
+        let _serial = super::fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            super::arm_pragma_dispatch_error_once(FrankenError::BusyRecovery);
+
+            let rows = conn
+                .query("PRAGMA journal_mode;")
+                .await
+                .expect("autocommit PRAGMA must absorb one transient recovery race");
+            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("memory".into())]);
+            assert_eq!(
+                super::pragma_dispatch_attempts(),
+                2,
+                "one injected transient failure must produce exactly one retry"
+            );
+        });
+    }
+
+    #[test]
+    fn test_autocommit_pragma_propagates_injected_nontransient_error() {
+        let _serial = super::fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            super::arm_pragma_dispatch_error_once(FrankenError::Internal(
+                "injected non-transient PRAGMA failure".to_owned(),
+            ));
+
+            let error = conn
+                .query("PRAGMA journal_mode;")
+                .await
+                .expect_err("non-transient PRAGMA error must propagate");
+            assert!(
+                matches!(error, FrankenError::Internal(ref message) if message == "injected non-transient PRAGMA failure"),
+                "injected error must propagate unchanged, got {error:?}"
+            );
+            assert_eq!(
+                super::pragma_dispatch_attempts(),
+                1,
+                "non-transient failure must not be retried"
+            );
         });
     }
 

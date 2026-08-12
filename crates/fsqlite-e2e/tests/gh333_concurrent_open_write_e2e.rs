@@ -173,6 +173,111 @@ fn gh333_concurrent_same_file_open_update_from_two_threads_100_iters() {
     );
 }
 
+/// bd-tc8u7: the MVCC truth matrix opens 8/16 connections to one file and
+/// applies the matched durability PRAGMAs before synchronizing the workload.
+/// Before the PRAGMA-boundary retry, `journal_mode=WAL` leaked BusyRecovery
+/// from that setup in every retained T8/T16 attempt. Two barriers pin the
+/// race: all workers open together, then all dispatch the mode transition
+/// together. Every worker must complete the PRAGMA and prove WAL readback.
+const JOURNAL_MODE_WORKERS: usize = 16;
+const JOURNAL_MODE_ITERATIONS: u32 = 10;
+
+#[test]
+fn concurrent_open_journal_mode_wal_never_escapes_busy_recovery() {
+    let _serial = gh333_test_serializer();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut failures = Vec::new();
+
+    for iteration in 0..JOURNAL_MODE_ITERATIONS {
+        let path = dir
+            .path()
+            .join(format!("journal-mode-race-{iteration}.db"))
+            .to_string_lossy()
+            .into_owned();
+        {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("seed runtime");
+            let conn = rt
+                .block_on(fsqlite::Connection::open(path.clone()))
+                .expect("seed open");
+            rt.block_on(conn.execute("CREATE TABLE seed (id INTEGER PRIMARY KEY);"))
+                .expect("seed table");
+            rt.block_on(conn.close()).expect("seed close");
+        }
+
+        let open_barrier = Arc::new(Barrier::new(JOURNAL_MODE_WORKERS));
+        let pragma_barrier = Arc::new(Barrier::new(JOURNAL_MODE_WORKERS));
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        let handles: Vec<_> = (0..JOURNAL_MODE_WORKERS)
+            .map(|worker| {
+                let path = path.clone();
+                let open_barrier = Arc::clone(&open_barrier);
+                let pragma_barrier = Arc::clone(&pragma_barrier);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let outcome = (|| -> Result<(), String> {
+                        let runtime = RuntimeBuilder::current_thread()
+                            .build()
+                            .map_err(|error| format!("runtime[{worker}]: {error}"));
+                        open_barrier.wait();
+                        let connection = runtime.as_ref().map_err(|error| error.clone()).and_then(|rt| {
+                            rt.block_on(fsqlite::Connection::open(path))
+                                .map_err(|error| format!("open[{worker}]: {error:?}"))
+                        });
+                        // Every worker reaches the PRAGMA barrier even if its
+                        // open failed, so a red keeper remains bounded rather
+                        // than stranding peers inside `Barrier::wait`.
+                        pragma_barrier.wait();
+                        let rt = runtime?;
+                        let conn = connection?;
+                        rt.block_on(conn.execute("PRAGMA journal_mode=WAL;"))
+                            .map_err(|error| format!("journal_mode[{worker}]: {error:?}"))?;
+                        let rows = rt
+                            .block_on(conn.query("PRAGMA journal_mode;"))
+                            .map_err(|error| format!("readback[{worker}]: {error:?}"))?;
+                        let mode = rows
+                            .first()
+                            .and_then(|row| row.values().first())
+                            .ok_or_else(|| format!("readback[{worker}]: missing mode row"))?;
+                        if mode != &fsqlite_types::SqliteValue::Text("wal".into()) {
+                            return Err(format!("readback[{worker}]: expected wal, got {mode:?}"));
+                        }
+                        rt.block_on(conn.close())
+                            .map_err(|error| format!("close[{worker}]: {error:?}"))
+                    })();
+                    let _ = tx.send(outcome);
+                })
+            })
+            .collect();
+        drop(tx);
+
+        for _ in 0..JOURNAL_MODE_WORKERS {
+            match rx.recv_timeout(ITERATION_TIMEOUT) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(format!("iter {iteration}: {error}")),
+                Err(error) => {
+                    failures.push(format!(
+                        "iter {iteration}: {error:?} waiting for {JOURNAL_MODE_WORKERS} workers"
+                    ));
+                    break;
+                }
+            }
+        }
+        for handle in handles {
+            handle.join().expect("journal-mode worker must not panic");
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "bd-tc8u7: concurrent journal_mode=WAL failures={}/{} worker-attempts\n{}",
+        failures.len(),
+        JOURNAL_MODE_WORKERS * JOURNAL_MODE_ITERATIONS as usize,
+        failures.join("\n")
+    );
+}
+
 /// GH #333 stall-shape receipt: a worker that panics mid-workload (after
 /// `Connection::open`, its handle abandoned to unwind) must not wedge or fail
 /// the sibling. The issue's worst arm was an indefinite hang where one worker
