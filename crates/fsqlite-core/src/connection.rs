@@ -28325,6 +28325,8 @@ impl Connection {
         Box::pin(async move {
             #[cfg(test)]
             record_trigger_stack_probe(trigger_probe_site::AFTER_BACKGROUND_STATUS);
+            self.refresh_select_schema_before_relation_validation(statement)
+                .await?;
             for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
                 let snapshot_generation = self.function_registry_generation();
                 let statement_snapshot = self.freeze_statement_values_snapshot(statement);
@@ -28380,6 +28382,36 @@ impl Connection {
 
             unreachable!("registry-stability loop always returns")
         })
+    }
+
+    async fn refresh_select_schema_before_relation_validation(
+        &self,
+        statement: &Statement,
+    ) -> Result<()> {
+        if !Self::statement_validates_select_relations(statement)
+            || !self.committed_pager_refresh_allowed()
+        {
+            return Ok(());
+        }
+
+        let op_cx = self.op_cx_after_background_status();
+        self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
+        let _ = self
+            .refresh_memdb_if_stale_with_publication(&op_cx, "autocommit_begin")
+            .await?;
+        Ok(())
+    }
+
+    fn statement_validates_select_relations(statement: &Statement) -> bool {
+        match statement {
+            Statement::Select(_) => true,
+            Statement::Insert(insert) => matches!(&insert.source, InsertSource::Select(_)),
+            Statement::CreateTable(create) => {
+                matches!(&create.body, CreateTableBody::AsSelect(_))
+            }
+            Statement::Explain { stmt, .. } => Self::statement_validates_select_relations(stmt),
+            _ => false,
+        }
     }
 
     #[allow(clippy::too_many_lines)]
