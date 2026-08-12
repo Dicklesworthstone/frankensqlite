@@ -3198,22 +3198,45 @@ where
                     return Ok(Some(record));
                 }
 
-                unauthorized_records = unauthorized_records.saturating_add(1);
-                if unauthorized_records > MAX_ORPHAN_CERTIFICATE_LOOKBACK {
-                    return Err(FrankenError::WalCorrupt {
-                        detail: format!(
-                            "parallel WAL certificate sidecar exceeded bounded orphan lookback {MAX_ORPHAN_CERTIFICATE_LOOKBACK}"
-                        ),
-                    });
+                // A current-generation record whose committed boundary lies
+                // beyond this reader's frame snapshot is not an orphan:
+                // concurrent committers keep appending certificates while the
+                // walk runs, so records newer than the snapshot are expected
+                // under write load and must not consume the bounded orphan
+                // budget (bd-e0ghc: three writers racing a concurrent BEGIN
+                // exhausted the 64-record lookback on a healthy database).
+                // Genuine orphans — records inside the snapshot that fail the
+                // commit-marker or digest checks — still count, so real
+                // sidecar corruption trips the bound exactly as before. The
+                // walk itself stays terminating either way: record_start is
+                // strictly decreasing and stops at zero.
+                if record.wal_frame_end > valid_frame_count {
+                    tracing::debug!(
+                        target: "fsqlite::wal::durability_combiner",
+                        future_certificate_epoch = record.certificate.certificate_epoch,
+                        future_commit_seq_hi = record.certificate.commit_seq_hi.get(),
+                        future_wal_frame_end = record.wal_frame_end,
+                        valid_frame_count,
+                        "skipped parallel WAL certificate newer than reader frame snapshot"
+                    );
+                } else {
+                    unauthorized_records = unauthorized_records.saturating_add(1);
+                    if unauthorized_records > MAX_ORPHAN_CERTIFICATE_LOOKBACK {
+                        return Err(FrankenError::WalCorrupt {
+                            detail: format!(
+                                "parallel WAL certificate sidecar exceeded bounded orphan lookback {MAX_ORPHAN_CERTIFICATE_LOOKBACK}"
+                            ),
+                        });
+                    }
+                    tracing::debug!(
+                        target: "fsqlite::wal::durability_combiner",
+                        orphan_certificate_epoch = record.certificate.certificate_epoch,
+                        orphan_commit_seq_hi = record.certificate.commit_seq_hi.get(),
+                        orphan_wal_frame_end = record.wal_frame_end,
+                        lookback = unauthorized_records,
+                        "ignored unauthorized parallel WAL certificate tail"
+                    );
                 }
-                tracing::debug!(
-                    target: "fsqlite::wal::durability_combiner",
-                    orphan_certificate_epoch = record.certificate.certificate_epoch,
-                    orphan_commit_seq_hi = record.certificate.commit_seq_hi.get(),
-                    orphan_wal_frame_end = record.wal_frame_end,
-                    lookback = unauthorized_records,
-                    "ignored unauthorized parallel WAL certificate tail"
-                );
                 if record_start == 0 {
                     return Ok(None);
                 }
