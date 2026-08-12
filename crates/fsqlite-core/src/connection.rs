@@ -395,16 +395,16 @@ where
 /// autocommit statement has fully rolled back before its error surfaces, so
 /// re-running it is always safe; `BusySnapshot` in particular can never be
 /// resolved by re-committing (the writes were validated against a stale
-/// snapshot) — only by re-executing the statement.
+/// snapshot) — only by re-executing the statement. The full transient class
+/// is covered: concurrent-mode losers surface `WriteConflict` /
+/// `SerializationFailure` (SSI pivot aborts) and `DatabaseLocked` under some
+/// interleavings, not only the `Busy*` family.
 ///
 /// Explicit transactions are deliberately excluded by the callers: a
 /// `BusySnapshot` on explicit `COMMIT` is the documented first-committer-wins
 /// contract (see the GH #327 receipt) and must surface to the application.
 const fn autocommit_statement_conflict_is_retryable(error: &FrankenError) -> bool {
-    matches!(
-        error,
-        FrankenError::Busy | FrankenError::BusyRecovery | FrankenError::BusySnapshot { .. }
-    )
+    error.is_transient()
 }
 
 /// Maximum trigger recursion depth (F-PGM.11).

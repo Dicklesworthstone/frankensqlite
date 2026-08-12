@@ -19,11 +19,33 @@
 //! before its Barrier and the sibling waits forever) fails the test with a
 //! diagnosis instead of stalling CI.
 
+//! LOAD CAVEAT: the two workers absorb contention through the connection
+//! `busy_timeout` budget (default 5 s per statement). Under heavy host load
+//! (parallel test binaries, concurrent cargo builds) a retry window can
+//! legitimately exhaust, which reads as a keeper failure without being an
+//! engine regression — a 2026-08-11 batch-verify red reproduced GREEN when
+//! rerun on a quieter host. The tests below therefore serialize against each
+//! other via [`gh333_test_serializer`]; before treating a red run as a
+//! regression, rerun this test file standalone on an unloaded host.
+
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::time::Duration;
 
 use asupersync::runtime::RuntimeBuilder;
+
+/// Process-wide serializer so this file's tests never run concurrently with
+/// each other (libtest runs them on parallel threads by default): the
+/// 100-iteration race keeper and the panic-injection receipt each spawn
+/// worker threads, and overlapping them doubles contention and eats into the
+/// workers' `busy_timeout` retry budgets. Mirrors the `engine_test_serializer`
+/// pattern from bd-pzjg8. Poisoning is ignored: a panicked predecessor must
+/// not cascade into unrelated failures.
+fn gh333_test_serializer() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The issue matrix showed 14/100 on the 0.2 line; keep the full 100
 /// iterations so the keeper has the statistical power to catch a partial
@@ -39,6 +61,7 @@ const WORKERS: usize = 2;
 
 #[test]
 fn gh333_concurrent_same_file_open_update_from_two_threads_100_iters() {
+    let _serial = gh333_test_serializer();
     let dir = tempfile::tempdir().expect("tempdir");
     let mut failures: Vec<String> = Vec::new();
 
@@ -137,7 +160,8 @@ fn gh333_concurrent_same_file_open_update_from_two_threads_100_iters() {
             break;
         }
         for h in handles {
-            h.join().expect("worker thread already reported via channel");
+            h.join()
+                .expect("worker thread already reported via channel");
         }
     }
 
@@ -160,6 +184,7 @@ const PANIC_ITERATIONS: u32 = 25;
 
 #[test]
 fn gh333_worker_panic_after_open_does_not_wedge_or_fail_sibling() {
+    let _serial = gh333_test_serializer();
     let dir = tempfile::tempdir().expect("tempdir");
     let mut failures: Vec<String> = Vec::new();
 
