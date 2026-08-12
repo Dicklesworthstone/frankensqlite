@@ -1010,6 +1010,7 @@ impl RecursiveCteDirectSumConsumerHits {
 const FSQLITE_RECURSIVE_CTE_DIRECT_SUM_CONSUMER_HITS: RecursiveCteDirectSumConsumerHits =
     RecursiveCteDirectSumConsumerHits;
 static FSQLITE_DIRECT_INDEXED_EQUALITY_QUERY_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_DIRECT_ROWID_RANGE_QUERY_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_DIRECT_COUNT_STAR_QUERY_ROW_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_ROW_HITS: AtomicU64 = AtomicU64::new(0);
@@ -1230,6 +1231,12 @@ pub struct HotPathProfileSnapshot {
     pub autoincrement_sequence_fast_path_updates: u64,
     pub autoincrement_sequence_scan_refreshes: u64,
     pub direct_indexed_equality_query_hits: u64,
+    /// Multi-row `query`/`query_with_params` hits on the rowid-lookup lane.
+    ///
+    /// bd-lcz7b: `record_query_hit` historically ignored `SimpleRowidLookup`,
+    /// so the lane was invisible on the query path even when engaged — the
+    /// bd-dqdoe read attribution misread that blind spot as a missed lane.
+    pub direct_rowid_lookup_query_hits: u64,
     pub direct_rowid_range_query_hits: u64,
     pub direct_count_star_query_row_hits: u64,
     pub direct_rowid_lookup_query_row_hits: u64,
@@ -1659,6 +1666,7 @@ pub fn reset_hot_path_profile() {
     FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_DIRECT_INDEXED_EQUALITY_QUERY_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_DIRECT_ROWID_RANGE_QUERY_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_DIRECT_COUNT_STAR_QUERY_ROW_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_ROW_HITS.store(0, AtomicOrdering::Relaxed);
@@ -1925,6 +1933,8 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         autoincrement_sequence_scan_refreshes: FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES
             .load(AtomicOrdering::Relaxed),
         direct_indexed_equality_query_hits: FSQLITE_DIRECT_INDEXED_EQUALITY_QUERY_HITS
+            .load(AtomicOrdering::Relaxed),
+        direct_rowid_lookup_query_hits: FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_HITS
             .load(AtomicOrdering::Relaxed),
         direct_rowid_range_query_hits: FSQLITE_DIRECT_ROWID_RANGE_QUERY_HITS
             .load(AtomicOrdering::Relaxed),
@@ -5865,6 +5875,12 @@ impl PreparedQueryFastPath {
         match self {
             Self::SimpleIndexedEqualityLookup { .. } => {
                 FSQLITE_DIRECT_INDEXED_EQUALITY_QUERY_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            // bd-lcz7b: the rowid-lookup lane was silently uncounted on the
+            // multi-row query path, leaving attribution blind to whether the
+            // placeholder point-read shape engages it.
+            Self::SimpleRowidLookup { .. } | Self::SimpleProjectedRowidLookup { .. } => {
+                FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             }
             Self::SimpleRowidRangeScan { .. } => {
                 FSQLITE_DIRECT_ROWID_RANGE_QUERY_HITS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -136716,6 +136732,79 @@ mod tests {
                 stmt.prepared_query_fast_path.as_ref(),
                 Some(&super::PreparedQueryFastPath::SimpleProjectedRowidLookup { .. })
             ));
+        });
+    }
+
+    #[test]
+    fn test_prepared_primary_key_lookup_query_with_params_records_direct_lane_hit() {
+        asupersync::test_utils::run_test(|| async {
+            // bd-lcz7b keeper: the bench point-read shape — placeholder PK
+            // lookup driven through the multi-row `query_with_params` path —
+            // must ENGAGE the rowid-lookup fast lane and now RECORD it on the
+            // previously uncounted query path, with oracle-parity results.
+            let _profile_guard =
+                super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE prep_pk_query_lane (id INTEGER PRIMARY KEY, val TEXT);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO prep_pk_query_lane VALUES (1, 'alpha'), (2, 'beta');")
+                .await
+                .unwrap();
+
+            let stmt = conn
+                .prepare("SELECT * FROM prep_pk_query_lane WHERE id = ?1;")
+                .await
+                .unwrap();
+            assert!(matches!(
+                stmt.prepared_query_fast_path.as_ref(),
+                Some(&super::PreparedQueryFastPath::SimpleRowidLookup { .. })
+            ));
+
+            super::reset_hot_path_profile();
+            let rows = stmt
+                .query_with_params(&[SqliteValue::Integer(2)])
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into())]
+            );
+            let profile = super::hot_path_profile_snapshot();
+            assert_eq!(
+                profile.direct_rowid_lookup_query_hits, 1,
+                "placeholder PK lookup via query_with_params must record the \
+                 rowid-lookup lane on the query path: {profile:?}"
+            );
+
+            // Missing rowid still engages the lane and returns zero rows.
+            super::reset_hot_path_profile();
+            let rows = stmt
+                .query_with_params(&[SqliteValue::Integer(99)])
+                .await
+                .unwrap();
+            assert!(rows.is_empty());
+            let profile = super::hot_path_profile_snapshot();
+            assert_eq!(profile.direct_rowid_lookup_query_hits, 1);
+
+            // Countermetric: a non-rowid predicate on the same table must NOT
+            // fire the rowid-lookup lane.
+            let non_rowid = conn
+                .prepare("SELECT * FROM prep_pk_query_lane WHERE val = ?1;")
+                .await
+                .unwrap();
+            super::reset_hot_path_profile();
+            let rows = non_rowid
+                .query_with_params(&[SqliteValue::Text("alpha".into())])
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            let profile = super::hot_path_profile_snapshot();
+            assert_eq!(
+                profile.direct_rowid_lookup_query_hits, 0,
+                "non-rowid predicate must not report the rowid-lookup lane: {profile:?}"
+            );
         });
     }
 
