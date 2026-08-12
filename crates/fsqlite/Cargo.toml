@@ -25,7 +25,7 @@ tracing = { workspace = true }
 
 [features]
 default = ["native", "linux-asupersync-uring", "json", "fts5", "rtree"]
-native = ["fsqlite-types/native", "fsqlite-core/native", "fsqlite-vfs/native"]
+native = ["dep:asupersync", "fsqlite-types/native", "fsqlite-core/native", "fsqlite-vfs/native"]
 wasm = ["fsqlite-types/wasm", "fsqlite-core/wasm", "fsqlite-vfs/wasm"]
 linux-asupersync-uring = ["native", "fsqlite-core/linux-asupersync-uring", "fsqlite-vfs/linux-asupersync-uring"]
 json = ["dep:fsqlite-ext-json"]
