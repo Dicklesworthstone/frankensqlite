@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use fsqlite_types::{PageNumber, sync_primitives::Instant};
 use serde::{Deserialize, Serialize};
@@ -268,18 +268,137 @@ const ADAPTIVE_FILL_FACTOR_MAX_EXTRA_SHIFT_BPS: usize = 1_500;
 const ADAPTIVE_FILL_FACTOR_LEFT_FLOOR_BPS: usize = 1_500;
 const ADAPTIVE_FILL_FACTOR_RIGHT_CEIL_BPS: usize = 9_000;
 
-// Non-baseline modes currently retain process-global, page-number-keyed state.
-// Keep them operator-opt-in until that state is owned by an individual database:
-// enabling them by default would let independent databases serialize here and
-// influence one another's split advice for the same page number.
+// bd-1dp9.6.7.13.2: conflict-topology state is instance-owned by
+// `ConflictTopologyDomain` so each database can hold its own heat map and
+// policy mode (the 2026-08-03 ledger REJECT was precisely that this state was
+// process-global and page-number-keyed, letting independent databases
+// serialize on one lock and steer one another's split advice). The
+// process-default domain below preserves the legacy free-function surface
+// during the ownership-plumbing rollout; it is a transition vehicle, not the
+// end state, and the default mode stays Baseline (both lock paths bypassed).
 const CONFLICT_TOPOLOGY_POLICY_DEFAULT_RAW: u64 = 0;
-static CONFLICT_TOPOLOGY_POLICY_MODE: AtomicU64 =
-    AtomicU64::new(CONFLICT_TOPOLOGY_POLICY_DEFAULT_RAW);
-static CONFLICT_TOPOLOGY_POLICY_ENV_APPLIED: AtomicBool = AtomicBool::new(false);
-static ADAPTIVE_FILL_FACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
-static ADAPTIVE_FILL_FACTOR_ENV_APPLIED: AtomicBool = AtomicBool::new(false);
-static CONFLICT_TOPOLOGY_STATE: LazyLock<Mutex<ConflictTopologyState>> =
-    LazyLock::new(|| Mutex::new(ConflictTopologyState::default()));
+static PROCESS_DEFAULT_CONFLICT_TOPOLOGY_DOMAIN: LazyLock<Arc<ConflictTopologyDomain>> =
+    LazyLock::new(|| Arc::new(ConflictTopologyDomain::new()));
+
+/// Process-default conflict-topology domain behind the legacy free functions.
+///
+/// Database-owned domains (held by the per-database MVCC coordination state)
+/// should be preferred wherever a database identity is available.
+#[must_use]
+pub fn process_default_conflict_topology_domain() -> Arc<ConflictTopologyDomain> {
+    Arc::clone(&PROCESS_DEFAULT_CONFLICT_TOPOLOGY_DOMAIN)
+}
+
+/// Database-ownable conflict-topology policy state.
+///
+/// Holds the heat map, rollout mode, and adaptive fill-factor switch with the
+/// same semantics the process-global statics used to provide. One instance per
+/// database gives lifecycle-bound isolation; the environment overrides are
+/// applied at most once per instance.
+#[derive(Debug)]
+pub struct ConflictTopologyDomain {
+    policy_mode: AtomicU64,
+    policy_env_applied: AtomicBool,
+    adaptive_fill_enabled: AtomicBool,
+    adaptive_fill_env_applied: AtomicBool,
+    state: Mutex<ConflictTopologyState>,
+}
+
+impl Default for ConflictTopologyDomain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConflictTopologyDomain {
+    /// New domain at the Baseline default with no accumulated heat.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            policy_mode: AtomicU64::new(CONFLICT_TOPOLOGY_POLICY_DEFAULT_RAW),
+            policy_env_applied: AtomicBool::new(false),
+            adaptive_fill_enabled: AtomicBool::new(false),
+            adaptive_fill_env_applied: AtomicBool::new(false),
+            state: Mutex::new(ConflictTopologyState::default()),
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ConflictTopologyState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn apply_policy_env_once(&self) {
+        if self
+            .policy_env_applied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Ok(raw) = std::env::var(CONFLICT_TOPOLOGY_POLICY_ENV) else {
+            return;
+        };
+        if let Some(mode) = parse_conflict_topology_policy_mode(raw.as_str()) {
+            self.policy_mode.store(mode.to_raw(), Ordering::Relaxed);
+        }
+    }
+
+    fn apply_adaptive_fill_env_once(&self) {
+        if self
+            .adaptive_fill_env_applied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Ok(raw) = std::env::var(ADAPTIVE_FILL_FACTOR_ENV) else {
+            return;
+        };
+        if let Some(enabled) = parse_adaptive_fill_factor_flag(raw.as_str()) {
+            self.adaptive_fill_enabled.store(enabled, Ordering::Relaxed);
+        }
+    }
+
+    /// Set this domain's rollout mode (suppresses the env override).
+    pub fn set_policy_mode(&self, mode: ConflictTopologyPolicyMode) {
+        self.policy_env_applied.store(true, Ordering::Release);
+        self.policy_mode.store(mode.to_raw(), Ordering::Relaxed);
+    }
+
+    /// Current rollout mode (Baseline unless overridden).
+    #[must_use]
+    pub fn policy_mode(&self) -> ConflictTopologyPolicyMode {
+        self.apply_policy_env_once();
+        ConflictTopologyPolicyMode::from_raw(self.policy_mode.load(Ordering::Relaxed))
+    }
+
+    /// Whether MVCC should feed conflict heat into this domain.
+    #[must_use]
+    pub fn policy_enabled(&self) -> bool {
+        self.policy_mode() != ConflictTopologyPolicyMode::Baseline
+    }
+
+    /// Set the adaptive fill-factor switch (reversible kill switch).
+    pub fn set_adaptive_fill_factor_enabled(&self, enabled: bool) {
+        self.adaptive_fill_env_applied
+            .store(true, Ordering::Release);
+        self.adaptive_fill_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether adaptive fill-factor control is enabled (default: disabled).
+    #[must_use]
+    pub fn adaptive_fill_factor_enabled(&self) -> bool {
+        self.apply_adaptive_fill_env_once();
+        self.adaptive_fill_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Clear accumulated conflict-topology heat.
+    pub fn reset_state(&self) {
+        *self.lock_state() = ConflictTopologyState::default();
+    }
+}
 
 /// Rollout mode for conflict-topology placement/split policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,10 +591,11 @@ impl ConflictTopologySplitAdvice {
     }
 }
 
-/// Set the process-local rollout mode for conflict-topology split policy.
+/// Set the process-default domain's rollout mode for conflict-topology split
+/// policy (legacy surface; database-owned domains use
+/// [`ConflictTopologyDomain::set_policy_mode`]).
 pub fn set_conflict_topology_policy_mode(mode: ConflictTopologyPolicyMode) {
-    CONFLICT_TOPOLOGY_POLICY_ENV_APPLIED.store(true, Ordering::Release);
-    CONFLICT_TOPOLOGY_POLICY_MODE.store(mode.to_raw(), Ordering::Relaxed);
+    PROCESS_DEFAULT_CONFLICT_TOPOLOGY_DOMAIN.set_policy_mode(mode);
 }
 
 /// Current rollout mode for conflict-topology split policy.
@@ -485,35 +605,19 @@ pub fn set_conflict_topology_policy_mode(mode: ConflictTopologyPolicyMode) {
 /// state is scoped to a single database rather than the whole process.
 #[must_use]
 pub fn conflict_topology_policy_mode() -> ConflictTopologyPolicyMode {
-    apply_conflict_topology_policy_env_once();
-    ConflictTopologyPolicyMode::from_raw(CONFLICT_TOPOLOGY_POLICY_MODE.load(Ordering::Relaxed))
+    PROCESS_DEFAULT_CONFLICT_TOPOLOGY_DOMAIN.policy_mode()
 }
 
 /// Whether MVCC should feed conflict heat into the B-tree policy cache.
 #[must_use]
 pub fn conflict_topology_policy_enabled() -> bool {
-    conflict_topology_policy_mode() != ConflictTopologyPolicyMode::Baseline
+    PROCESS_DEFAULT_CONFLICT_TOPOLOGY_DOMAIN.policy_enabled()
 }
 
 /// Stable policy identifier for adaptive fill-factor control.
 #[must_use]
 pub const fn adaptive_fill_factor_policy_id() -> &'static str {
     ADAPTIVE_FILL_FACTOR_POLICY_ID
-}
-
-fn apply_adaptive_fill_factor_env_once() {
-    if ADAPTIVE_FILL_FACTOR_ENV_APPLIED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    let Ok(raw) = std::env::var(ADAPTIVE_FILL_FACTOR_ENV) else {
-        return;
-    };
-    if let Some(enabled) = parse_adaptive_fill_factor_flag(raw.as_str()) {
-        ADAPTIVE_FILL_FACTOR_ENABLED.store(enabled, Ordering::Relaxed);
-    }
 }
 
 fn parse_adaptive_fill_factor_flag(raw: &str) -> Option<bool> {
@@ -535,19 +639,18 @@ fn parse_adaptive_fill_factor_flag(raw: &str) -> Option<bool> {
     }
 }
 
-/// Whether adaptive fill-factor control is enabled (default: disabled).
-///
-/// Honors the `FSQLITE_ADAPTIVE_FILL_FACTOR` operator override once per process.
+/// Whether adaptive fill-factor control is enabled on the process-default
+/// domain (default: disabled). Honors `FSQLITE_ADAPTIVE_FILL_FACTOR` once per
+/// domain instance.
 #[must_use]
 pub fn adaptive_fill_factor_enabled() -> bool {
-    apply_adaptive_fill_factor_env_once();
-    ADAPTIVE_FILL_FACTOR_ENABLED.load(Ordering::Relaxed)
+    PROCESS_DEFAULT_CONFLICT_TOPOLOGY_DOMAIN.adaptive_fill_factor_enabled()
 }
 
-/// Set the process-local adaptive fill-factor enable flag (reversible kill switch).
+/// Set the process-default domain's adaptive fill-factor flag (reversible
+/// kill switch).
 pub fn set_adaptive_fill_factor_enabled(enabled: bool) {
-    ADAPTIVE_FILL_FACTOR_ENV_APPLIED.store(true, Ordering::Release);
-    ADAPTIVE_FILL_FACTOR_ENABLED.store(enabled, Ordering::Relaxed);
+    PROCESS_DEFAULT_CONFLICT_TOPOLOGY_DOMAIN.set_adaptive_fill_factor_enabled(enabled);
 }
 
 /// Additional fill-factor shift (basis points) the adaptive ramp adds for a
@@ -602,11 +705,9 @@ pub fn adaptive_fill_factor_target(
     }
 }
 
-/// Clear accumulated conflict-topology heat.
+/// Clear the process-default domain's accumulated conflict-topology heat.
 pub fn reset_conflict_topology_policy_state() {
-    *CONFLICT_TOPOLOGY_STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = ConflictTopologyState::default();
+    PROCESS_DEFAULT_CONFLICT_TOPOLOGY_DOMAIN.reset_state();
 }
 
 /// Feed one MVCC conflict-heat observation into the B-tree split policy cache.
@@ -631,30 +732,48 @@ pub fn record_conflict_topology_heat_batch(
     conflict_heat: u64,
     writer_overlap_estimate: u32,
 ) -> usize {
-    if !conflict_topology_policy_enabled() {
-        return 0;
-    }
-    let mut state = CONFLICT_TOPOLOGY_STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let conflict_heat = conflict_heat.max(1);
-    let mut updated = 0usize;
-    for page in pages {
-        let page_state = state.pages.entry(page).or_default();
-        page_state.heat = page_state.heat.saturating_add(conflict_heat);
-        page_state.max_writer_overlap_estimate = page_state
-            .max_writer_overlap_estimate
-            .max(writer_overlap_estimate);
-        if !page_state.deflection_armed
-            && page_state.heat >= HOT_PAGE_DEFLECTION_HEAT_THRESHOLD
-            && page_state.max_writer_overlap_estimate >= HOT_PAGE_DEFLECTION_OVERLAP_THRESHOLD
-        {
-            page_state.deflection_armed = true;
-            page_state.deflection_credits_remaining = HOT_PAGE_DEFLECTION_BUDGET_PAGES;
+    PROCESS_DEFAULT_CONFLICT_TOPOLOGY_DOMAIN.record_heat_batch(
+        pages,
+        conflict_heat,
+        writer_overlap_estimate,
+    )
+}
+
+impl ConflictTopologyDomain {
+    /// Feed several MVCC conflict-heat observations under one policy lock.
+    ///
+    /// Returns the number of pages updated (zero at Baseline, which never
+    /// takes the lock).
+    #[must_use]
+    pub fn record_heat_batch(
+        &self,
+        pages: impl IntoIterator<Item = PageNumber>,
+        conflict_heat: u64,
+        writer_overlap_estimate: u32,
+    ) -> usize {
+        if !self.policy_enabled() {
+            return 0;
         }
-        updated += 1;
+        let mut state = self.lock_state();
+        let conflict_heat = conflict_heat.max(1);
+        let mut updated = 0usize;
+        for page in pages {
+            let page_state = state.pages.entry(page).or_default();
+            page_state.heat = page_state.heat.saturating_add(conflict_heat);
+            page_state.max_writer_overlap_estimate = page_state
+                .max_writer_overlap_estimate
+                .max(writer_overlap_estimate);
+            if !page_state.deflection_armed
+                && page_state.heat >= HOT_PAGE_DEFLECTION_HEAT_THRESHOLD
+                && page_state.max_writer_overlap_estimate >= HOT_PAGE_DEFLECTION_OVERLAP_THRESHOLD
+            {
+                page_state.deflection_armed = true;
+                page_state.deflection_credits_remaining = HOT_PAGE_DEFLECTION_BUDGET_PAGES;
+            }
+            updated += 1;
+        }
+        updated
     }
-    updated
 }
 
 /// Return split advice for a page about to split.
@@ -664,7 +783,39 @@ pub fn conflict_topology_split_advice(
     predicted_hot_side: &str,
     baseline_target_left_basis_points: usize,
 ) -> ConflictTopologySplitAdvice {
-    let mode = conflict_topology_policy_mode();
+    split_advice_in(
+        &PROCESS_DEFAULT_CONFLICT_TOPOLOGY_DOMAIN,
+        page,
+        predicted_hot_side,
+        baseline_target_left_basis_points,
+    )
+}
+
+impl ConflictTopologyDomain {
+    /// Return split advice for a page about to split in this domain.
+    #[must_use]
+    pub fn split_advice(
+        &self,
+        page: PageNumber,
+        predicted_hot_side: &str,
+        baseline_target_left_basis_points: usize,
+    ) -> ConflictTopologySplitAdvice {
+        split_advice_in(
+            self,
+            page,
+            predicted_hot_side,
+            baseline_target_left_basis_points,
+        )
+    }
+}
+
+fn split_advice_in(
+    domain: &ConflictTopologyDomain,
+    page: PageNumber,
+    predicted_hot_side: &str,
+    baseline_target_left_basis_points: usize,
+) -> ConflictTopologySplitAdvice {
+    let mode = domain.policy_mode();
     let mut deflection_credits_before = 0;
     let mut deflection_credits_after = 0;
     let mut deflection_applied = false;
@@ -672,9 +823,7 @@ pub fn conflict_topology_split_advice(
     let page_state = if mode == ConflictTopologyPolicyMode::Baseline {
         ConflictTopologyPageState::default()
     } else {
-        let mut state = CONFLICT_TOPOLOGY_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = domain.lock_state();
         let Some(page_state) = state.pages.get_mut(&page) else {
             return baseline_conflict_topology_split_advice(
                 page,
@@ -915,21 +1064,6 @@ fn hot_page_deflection_rollback_reason(
         "advisory_only"
     } else {
         "no_hotspot"
-    }
-}
-
-fn apply_conflict_topology_policy_env_once() {
-    if CONFLICT_TOPOLOGY_POLICY_ENV_APPLIED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    let Ok(raw) = std::env::var(CONFLICT_TOPOLOGY_POLICY_ENV) else {
-        return;
-    };
-    if let Some(mode) = parse_conflict_topology_policy_mode(raw.as_str()) {
-        CONFLICT_TOPOLOGY_POLICY_MODE.store(mode.to_raw(), Ordering::Relaxed);
     }
 }
 
