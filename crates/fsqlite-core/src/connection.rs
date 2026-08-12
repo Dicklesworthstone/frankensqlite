@@ -42921,6 +42921,18 @@ impl Connection {
         if profile_flush {
             FSQLITE_DIRECT_WRITE_FLUSH_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
         }
+        // bd-qcgn2 candidate (a): every read statement pays this call, and on
+        // read workloads no direct-write run is ever pending — profile showed
+        // the three-stage flush setup at ~8% of the engaged PK point-lookup
+        // samples. Return before constructing the staged flush future when
+        // all three pending slots are empty. Call counting above is kept so
+        // profile counters retain their meaning (a call is a call).
+        if self.pending_direct_update_leaf_patch_run.borrow().is_none()
+            && self.pending_direct_delete_leaf_run.borrow().is_none()
+            && self.pending_direct_insert_page_run.borrow().is_none()
+        {
+            return Ok(());
+        }
         let flush_start = profile_flush.then(Instant::now);
         let result = async {
             self.flush_pending_direct_update_leaf_patch_run(cx).await?;
@@ -102485,6 +102497,18 @@ fn scalar_subquery_result_affinity(
     select: &SelectStatement,
     schemas: &[TableSchema],
 ) -> TypeAffinity {
+    // TEMP bd-di4he probe — remove before commit.
+    if std::env::var_os("FSQLITE_DI4HE_PROBE").is_some() {
+        eprintln!(
+            "bd-di4he ssra entry: core_kind={} schemas={}",
+            match in_rhs_donor_core(select) {
+                SelectCore::Values(_) => "values",
+                SelectCore::Select { from: None, .. } => "select_no_from",
+                SelectCore::Select { .. } => "select_from",
+            },
+            schemas.len()
+        );
+    }
     let core = in_rhs_donor_core(select);
     match core {
         // bd-di4he: the project oracle (bundled SQLite 3.53.2 via rusqlite)
@@ -102493,13 +102517,24 @@ fn scalar_subquery_result_affinity(
         // (CAST(1 AS NUMERIC))) = '1'` is 1 there. (System sqlite3 3.46.1
         // predates that donor model and answers 0; the bundled reference is
         // authoritative for keepers.)
-        SelectCore::Values(rows) => rows
-            .donor_row()
-            .or_else(|| rows.rows().last().map(Vec::as_slice))
-            .and_then(<[Expr]>::first)
-            .map_or(TypeAffinity::Blob, |expr| {
-                resolve_operand_affinity(expr, schemas)
-            }),
+        SelectCore::Values(rows) => {
+            let resolved = rows
+                .donor_row()
+                .or_else(|| rows.rows().last().map(Vec::as_slice))
+                .and_then(<[Expr]>::first)
+                .map_or(TypeAffinity::Blob, |expr| {
+                    resolve_operand_affinity(expr, schemas)
+                });
+            // TEMP bd-di4he probe — remove before commit.
+            if std::env::var_os("FSQLITE_DI4HE_PROBE").is_some() {
+                eprintln!(
+                    "bd-di4he values arm: frozen_donor={:?} rows={} resolved={resolved:?}",
+                    rows.donor_row_index(),
+                    rows.rows().len()
+                );
+            }
+            resolved
+        }
         SelectCore::Select {
             columns,
             from: None,
@@ -115381,11 +115416,14 @@ fn extract_collation(expr: &Expr) -> Option<&str> {
 
 fn fromless_comparison_metadata(left: &Expr, right: &Expr) -> (P4, u16) {
     let collation = join_comparison_collation(left, right, &[]).map_or(P4::None, P4::Collation);
-    let affinity = TypeAffinity::comparison_affinity(
-        resolve_operand_affinity(left, &[]),
-        resolve_operand_affinity(right, &[]),
-    )
-    .map_or(0, |affinity| u16::from(affinity as u8));
+    let left_affinity = resolve_operand_affinity(left, &[]);
+    let right_affinity = resolve_operand_affinity(right, &[]);
+    // TEMP bd-di4he probe — remove before commit.
+    if std::env::var_os("FSQLITE_DI4HE_PROBE").is_some() {
+        eprintln!("bd-di4he fromless cmp: left={left_affinity:?} right={right_affinity:?}");
+    }
+    let affinity = TypeAffinity::comparison_affinity(left_affinity, right_affinity)
+        .map_or(0, |affinity| u16::from(affinity as u8));
     (collation, affinity)
 }
 
