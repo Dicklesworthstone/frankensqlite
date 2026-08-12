@@ -12141,7 +12141,12 @@ impl Connection {
             triggers_by_name: RefCell::new(HashMap::new()),
             trigger_frame_stack: RefCell::new(Vec::new()),
             func_registry: RefCell::new(default_function_registry(&collation_registry)),
-            scalar_function_overridden: Cell::new(false),
+            // bd-asupersync-043 release triage: with ext-icu the default
+            // registry already differs from the shared base (connection-local
+            // icu_load_collation), so context-free fallback evaluators must
+            // project it — the false fast path made the ICU function
+            // unresolvable on every with_fallback_function_registry route.
+            scalar_function_overridden: Cell::new(cfg!(feature = "ext-icu")),
             custom_aggregate_registered: Cell::new(false),
             custom_aggregate_keys: RefCell::new(Arc::new(HashMap::new())),
             custom_window_functions: RefCell::new(HashMap::new()),
@@ -12625,7 +12630,12 @@ impl Connection {
             triggers_by_name: RefCell::new(HashMap::new()),
             trigger_frame_stack: RefCell::new(Vec::new()),
             func_registry: RefCell::new(default_function_registry(&collation_registry)),
-            scalar_function_overridden: Cell::new(false),
+            // bd-asupersync-043 release triage: with ext-icu the default
+            // registry already differs from the shared base (connection-local
+            // icu_load_collation), so context-free fallback evaluators must
+            // project it — the false fast path made the ICU function
+            // unresolvable on every with_fallback_function_registry route.
+            scalar_function_overridden: Cell::new(cfg!(feature = "ext-icu")),
             custom_aggregate_registered: Cell::new(false),
             custom_aggregate_keys: RefCell::new(Arc::new(HashMap::new())),
             custom_window_functions: RefCell::new(HashMap::new()),
