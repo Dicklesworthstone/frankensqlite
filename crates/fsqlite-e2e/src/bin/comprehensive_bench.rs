@@ -11736,6 +11736,17 @@ mod tests {
 
 // ─── Section 5: Read-after-write performance ───────────────────────────
 
+/// bd-1qjsy: queries per timed sample for the tiny Section 5 read cells
+/// (point lookup, COUNT(*), secondary-index lookup). Each sample used to run
+/// ONE query wrapped in its own `fsqlite_e2e::block_on`, so the ~333 ns
+/// runtime-entry cost (bd-zavyn) was a large fraction of a
+/// sub-microsecond sample while the rusqlite arm paid nothing. Both arms now
+/// run this many identical queries per sample and the FrankenSQLite arm
+/// enters the runtime ONCE around the loop, amortizing entry to ~5 ns/query.
+/// The heavy cells (full scan, range, GROUP BY) keep one query per sample —
+/// entry cost is already negligible against their multi-row work.
+const TINY_READ_QUERIES_PER_SAMPLE: usize = 64;
+
 fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
     let section = report.add_section(
         "Read-After-Write Query Performance",
@@ -11833,16 +11844,24 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
         let (cs, fs) = measure_paired(
             &format!("cs_pk_{count}"),
             &format!("fs_pk_{count}"),
-            1,
+            TINY_READ_QUERIES_PER_SAMPLE,
             || {
-                let _rows =
-                    collect_rusqlite_rows(&mut cs_stmt, rusqlite::params![target_id]).unwrap();
+                for _ in 0..TINY_READ_QUERIES_PER_SAMPLE {
+                    let _rows =
+                        collect_rusqlite_rows(&mut cs_stmt, rusqlite::params![target_id]).unwrap();
+                }
             },
             || {
-                let _row = fsqlite_e2e::block_on(
-                    fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(target_id)]),
-                )
-                .unwrap();
+                // bd-1qjsy: one runtime entry around the whole timed loop
+                // (bd-zavyn hoist); both arms run identical statements.
+                fsqlite_e2e::block_on(async {
+                    for _ in 0..TINY_READ_QUERIES_PER_SAMPLE {
+                        let _row = fs_stmt
+                            .query_row_with_params(&[fsqlite::SqliteValue::Integer(target_id)])
+                            .await
+                            .unwrap();
+                    }
+                });
             },
         );
         drop(cs_stmt);
@@ -11905,12 +11924,20 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
         let (cs, fs) = measure_paired(
             &format!("cs_count_{count}"),
             &format!("fs_count_{count}"),
-            1,
+            TINY_READ_QUERIES_PER_SAMPLE,
             || {
-                let _: i64 = cs_stmt.query_row([], |r| r.get(0)).unwrap();
+                for _ in 0..TINY_READ_QUERIES_PER_SAMPLE {
+                    let _: i64 = cs_stmt.query_row([], |r| r.get(0)).unwrap();
+                }
             },
             || {
-                let _row = fsqlite_e2e::block_on(fs_stmt.query_row()).unwrap();
+                // bd-1qjsy: one runtime entry around the whole timed loop
+                // (bd-zavyn hoist); both arms run identical statements.
+                fsqlite_e2e::block_on(async {
+                    for _ in 0..TINY_READ_QUERIES_PER_SAMPLE {
+                        let _row = fs_stmt.query_row().await.unwrap();
+                    }
+                });
             },
         );
         drop(cs_stmt);
@@ -11977,15 +12004,25 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
         let (cs, fs) = measure_paired(
             &format!("cs_idx_{count}"),
             &format!("fs_idx_{count}"),
-            1,
+            TINY_READ_QUERIES_PER_SAMPLE,
             || {
-                let _rows =
-                    collect_rusqlite_rows(&mut cs_stmt, rusqlite::params![target_name.clone()])
-                        .unwrap();
+                for _ in 0..TINY_READ_QUERIES_PER_SAMPLE {
+                    let _rows =
+                        collect_rusqlite_rows(&mut cs_stmt, rusqlite::params![target_name.clone()])
+                            .unwrap();
+                }
             },
             || {
-                let _rows =
-                    fsqlite_e2e::block_on(fs_stmt.query_with_params(&target_name_param)).unwrap();
+                // bd-1qjsy: one runtime entry around the whole timed loop
+                // (bd-zavyn hoist); both arms run identical statements.
+                fsqlite_e2e::block_on(async {
+                    for _ in 0..TINY_READ_QUERIES_PER_SAMPLE {
+                        let _rows = fs_stmt
+                            .query_with_params(&target_name_param)
+                            .await
+                            .unwrap();
+                    }
+                });
             },
         );
         drop(cs_stmt);
