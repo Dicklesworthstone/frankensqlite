@@ -1307,6 +1307,13 @@ struct GroupCommitQueue {
     /// fixed 250ms envelope was timing-dependent — green on a 64-core host,
     /// red on a 16-core one where resolution bursts run longer.
     settle_budget_ms: AtomicU64,
+    /// bd-b4mwn rework #2: logical cleanups currently CLAIMED and being
+    /// resolved by a settler. `pending_logical_cleanups` excludes claimed
+    /// entries, so "queue empty + root armed" is ambiguous between a true
+    /// wedge and live resolution in progress — on slow-fsync hosts a peer's
+    /// resolve holds its claim for seconds and every other settler
+    /// misdiagnosed that window as a wedge and refused BusyRecovery.
+    claimed_logical_cleanups: AtomicUsize,
     /// The consolidator managing FILLING→FLUSHING→COMPLETE phases.
     consolidator: Mutex<GroupCommitConsolidator>,
     /// Condvar for waiters to park on until flush completes.
@@ -1785,6 +1792,7 @@ impl GroupCommitQueue {
             finalization_binding: Mutex::new(GroupCommitFinalizationBinding::default()),
             rooted_finalization_attempts: AtomicUsize::new(0),
             settle_budget_ms: AtomicU64::new(5000),
+            claimed_logical_cleanups: AtomicUsize::new(0),
             consolidator: Mutex::new(GroupCommitConsolidator::new(config)),
             flush_complete: Condvar::new(),
             completed_epoch: AtomicU64::new(0),
@@ -2343,6 +2351,11 @@ impl GroupCommitQueue {
         let cleanup = pending_logical_cleanups
             .remove(position)
             .expect("selected cleanup must remain present while its queue lock is held");
+        // bd-b4mwn rework #2: count the claim while the queue lock is still
+        // held so no observer can see the entry vanish from the pending
+        // queue before it appears in the claimed count.
+        self.claimed_logical_cleanups
+            .fetch_add(1, AtomicOrdering::AcqRel);
         drop(pending_logical_cleanups);
         Some(PendingGroupCommitLogicalCleanupClaim {
             queue: Arc::clone(self),
@@ -6283,9 +6296,16 @@ async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -
         let after = queue.pending_logical_cleanup_count();
         cleanups_resolved_total =
             cleanups_resolved_total.saturating_add(before.saturating_sub(after));
-        if after == 0 {
-            // No claimable work remains; the residual root is a true wedge —
-            // fall through to the final round's fail-closed verdict.
+        let claimed_in_flight = queue
+            .claimed_logical_cleanups
+            .load(AtomicOrdering::Acquire);
+        if after == 0 && claimed_in_flight == 0 {
+            // No claimable work remains AND nothing is being resolved by a
+            // peer — the residual root is a true wedge; fall through to the
+            // final round's fail-closed verdict. (A nonzero claimed count is
+            // LIVE progress: a peer settler is resolving right now — on
+            // slow-fsync hosts that resolve can hold its claim for seconds,
+            // which every other settler previously misdiagnosed as a wedge.)
             break;
         }
         if started.elapsed() >= budget {
@@ -7924,6 +7944,11 @@ impl Drop for PendingGroupCommitLogicalCleanupClaim {
         // Requeue by stable lane sequence before releasing the exact-handle
         // claim so a second settler cannot overtake a cancelled operation.
         self.logical_exit_claim.take();
+        // bd-b4mwn rework #2: the claim is terminal exactly once per
+        // successful claim (finish() consumes self and lands here too).
+        self.queue
+            .claimed_logical_cleanups
+            .fetch_sub(1, AtomicOrdering::AcqRel);
     }
 }
 
