@@ -10344,7 +10344,7 @@ mod tests {
             ))
         );
         assert_eq!(defaults.presets, default_bench_presets());
-        assert_eq!(defaults.concurrency, vec![1, 4, 8]);
+        assert_eq!(defaults.concurrency, vec![1, 4, 8, 16]);
     }
 
     #[test]
