@@ -132687,7 +132687,9 @@ mod tests {
             // ORDER BY / LIMIT after a bare VALUES term with a syntax error;
             // the historical assertion that this parses encoded anti-parity
             // behavior. Parity means rejecting it too.
-            let bare = conn.prepare("VALUES (2), (1), (3) ORDER BY 1 LIMIT 2;").await;
+            let bare = conn
+                .prepare("VALUES (2), (1), (3) ORDER BY 1 LIMIT 2;")
+                .await;
             assert!(
                 bare.is_err(),
                 "bare VALUES ... ORDER BY must be rejected for C-SQLite parity"
@@ -189029,6 +189031,40 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             assert_eq!(rows2.len(), 2, "stale detection must trigger memdb refresh");
+        });
+    }
+
+    /// bd-bhp83: an already-open file-backed connection must refresh its
+    /// connection-local schema image before validating an ad-hoc query.
+    #[test]
+    fn test_query_refreshes_schema_created_after_reader_open() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("query_schema_refresh.db");
+            let path_str = db_path.to_str().unwrap();
+
+            let writer = Connection::open(path_str).await.unwrap();
+            let reader = Connection::open(path_str).await.unwrap();
+
+            writer
+                .execute("CREATE TABLE post_open (id INTEGER PRIMARY KEY, val TEXT);")
+                .await
+                .unwrap();
+            writer
+                .execute("INSERT INTO post_open VALUES (1, 'visible');")
+                .await
+                .unwrap();
+
+            let query_result = reader.query("SELECT val FROM post_open;").await;
+            let _prepared = reader
+                .prepare("SELECT val FROM post_open;")
+                .await
+                .expect("prepare is the known-good cross-connection schema-refresh countermetric");
+            let rows = query_result
+                .expect("query must refresh schema committed after this connection opened");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Text("visible".into()));
         });
     }
 
