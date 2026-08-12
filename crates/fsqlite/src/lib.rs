@@ -71,6 +71,11 @@ mod tests {
 
     const CONCURRENT_STRESS_CHILD_ENV: &str = "FSQLITE_CONCURRENT_STRESS_CHILD";
     const CONCURRENT_STRESS_RECEIPT_ENV: &str = "FSQLITE_CONCURRENT_STRESS_RECEIPT";
+    // bd-gmqxy: the receipt travels through a temp file whose path is passed
+    // via this env var, not through the child's stdout — libtest's output
+    // capture machinery in the parent broke the stdout channel, failing the
+    // supervised child under plain `cargo test` while `--nocapture` passed.
+    const CONCURRENT_STRESS_RECEIPT_PATH_ENV: &str = "FSQLITE_CONCURRENT_STRESS_RECEIPT_PATH";
     const CONCURRENT_STRESS_RECEIPT_PREFIX: &str = "FSQLITE_CONCURRENT_STRESS_COMPLETE:";
     const CONCURRENT_STRESS_TEST_NAME: &str = "tests::concurrent_writers_stress_conservation";
     const CONCURRENT_STRESS_CHILD_TIMEOUT: Duration = Duration::from_secs(90);
@@ -237,6 +242,9 @@ mod tests {
                 .as_nanos()
         );
         let expected_receipt = format!("{CONCURRENT_STRESS_RECEIPT_PREFIX}{receipt_token}");
+        let receipt_dir =
+            tempfile::tempdir().expect("create concurrent-writer stress receipt directory");
+        let receipt_path = receipt_dir.path().join("receipt");
         let mut child =
             Command::new(std::env::current_exe().expect("resolve current fsqlite test executable"))
                 .args([
@@ -247,6 +255,7 @@ mod tests {
                 ])
                 .env(CONCURRENT_STRESS_CHILD_ENV, &receipt_token)
                 .env(CONCURRENT_STRESS_RECEIPT_ENV, &receipt_token)
+                .env(CONCURRENT_STRESS_RECEIPT_PATH_ENV, &receipt_path)
                 .stdout(Stdio::piped())
                 .spawn()
                 .expect("spawn supervised concurrent-writer stress child");
@@ -254,14 +263,13 @@ mod tests {
             .stdout
             .take()
             .expect("capture concurrent-writer stress child stdout");
+        // Drain the pipe so the child can never block on a full stdout buffer;
+        // the receipt itself arrives through the temp file, immune to libtest
+        // capture on either side of the process boundary.
         let mut receipt_reader = Some(std::thread::spawn(move || {
-            let mut receipt_found = false;
             for line in BufReader::new(child_stdout).lines() {
-                if line.expect("read concurrent-writer stress child stdout") == expected_receipt {
-                    receipt_found = true;
-                }
+                drop(line.expect("read concurrent-writer stress child stdout"));
             }
-            receipt_found
         }));
         let deadline = Instant::now() + CONCURRENT_STRESS_CHILD_TIMEOUT;
 
@@ -271,7 +279,7 @@ mod tests {
                 .expect("poll supervised concurrent-writer stress child")
             {
                 Some(status) => {
-                    let receipt_found = receipt_reader
+                    receipt_reader
                         .take()
                         .expect("receipt reader must be present")
                         .join()
@@ -280,9 +288,12 @@ mod tests {
                         status.success(),
                         "supervised concurrent-writer stress child failed with {status}"
                     );
-                    assert!(
-                        receipt_found,
-                        "supervised concurrent-writer stress child exited without its completion receipt"
+                    let receipt_contents = std::fs::read_to_string(&receipt_path)
+                        .expect("supervised concurrent-writer stress child exited without writing its completion receipt file");
+                    assert_eq!(
+                        receipt_contents.trim_end(),
+                        expected_receipt,
+                        "supervised concurrent-writer stress child wrote a mismatched completion receipt"
                     );
                     return true;
                 }
@@ -7590,7 +7601,12 @@ mod tests {
 
         let receipt_token = std::env::var(CONCURRENT_STRESS_RECEIPT_ENV)
             .expect("supervised child must inherit its receipt token");
-        println!("{CONCURRENT_STRESS_RECEIPT_PREFIX}{receipt_token}");
+        let receipt = format!("{CONCURRENT_STRESS_RECEIPT_PREFIX}{receipt_token}");
+        let receipt_path = std::env::var_os(CONCURRENT_STRESS_RECEIPT_PATH_ENV)
+            .expect("supervised child must inherit its receipt file path");
+        std::fs::write(&receipt_path, &receipt)
+            .expect("supervised child must write its completion receipt file");
+        println!("{receipt}");
     }
 
     #[test]
