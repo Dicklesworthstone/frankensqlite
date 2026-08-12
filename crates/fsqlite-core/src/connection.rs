@@ -2623,9 +2623,7 @@ pub fn init_global_runtime(config: RuntimeConfig) -> Arc<RuntimeContext> {
 ///
 /// [`RuntimeHandle`]: asupersync::runtime::RuntimeHandle
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-async fn capture_ambient_io_native_cx(
-    root_cx: &Cx,
-) -> Option<asupersync::runtime::RuntimeHandle> {
+async fn capture_ambient_io_native_cx(root_cx: &Cx) -> Option<asupersync::runtime::RuntimeHandle> {
     if root_cx.attached_native_cx().is_some() {
         return None;
     }
@@ -19307,12 +19305,11 @@ impl Connection {
                         }
                         // bd-uzq54: boxed — slow-path generic dispatch must
                         // not inflate the hot precompiled-DML generator.
-                        let rows = Box::pin(
-                            self.execute_statement_impl_after_background_status(
+                        let rows =
+                            Box::pin(self.execute_statement_impl_after_background_status(
                                 dml, p, None, false,
-                            ),
-                        )
-                        .await?;
+                            ))
+                            .await?;
                         self.note_connection_statement_execution_count(1);
                         return Ok(
                             if matches!(
@@ -19389,11 +19386,11 @@ impl Connection {
             } else {
                 // bd-uzq54: boxed — a DML execute can never take the query
                 // branch; keep its state machine out of the hot allocation.
-                Ok(Box::pin(
-                    self.query_prepared_with_params_after_background_status(stmt, params),
+                Ok(
+                    Box::pin(self.query_prepared_with_params_after_background_status(stmt, params))
+                        .await?
+                        .len(),
                 )
-                .await?
-                .len())
             }
         })
     }
@@ -124059,7 +124056,10 @@ mod tests {
                 "every default open inside the runtime captures independently"
             );
             assert!(
-                RuntimeContext::global().root_cx.attached_native_cx().is_none(),
+                RuntimeContext::global()
+                    .root_cx
+                    .attached_native_cx()
+                    .is_none(),
                 "per-connection capture must not attach anything to the \
                  process-global context"
             );
@@ -124204,8 +124204,7 @@ mod tests {
                 "default open inside consumer runtime must satisfy the uring gate"
             );
 
-            let status =
-                pragma_value_map(&conn.query("PRAGMA io_uring_status;").await.unwrap());
+            let status = pragma_value_map(&conn.query("PRAGMA io_uring_status;").await.unwrap());
             assert_eq!(
                 status.get("pager_backend_kind").map(String::as_str),
                 Some("iouring"),
@@ -186971,9 +186970,9 @@ fts5(title, body, content=docs, content_rowid=id)'
                 }
                 Some("1") => {
                     assert_eq!(status.get("available").map(String::as_str), Some("0"));
-                    assert!(status.get("status").is_some_and(
-                        |value| value.starts_with("disabled:asupersync-shared-uring:")
-                    ));
+                    assert!(status.get("status").is_some_and(|value| {
+                        value.starts_with("disabled:asupersync-shared-uring:")
+                    }));
                     assert_ne!(
                         status.get("disable_reason").map(String::as_str),
                         Some("NULL")

@@ -137,7 +137,8 @@ fn gh333_concurrent_same_file_open_update_from_two_threads_100_iters() {
             break;
         }
         for h in handles {
-            h.join().expect("worker thread already reported via channel");
+            h.join()
+                .expect("worker thread already reported via channel");
         }
     }
 

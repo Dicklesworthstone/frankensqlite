@@ -245,8 +245,9 @@ fn run_fsqlite(n_threads: usize, rows: i64, reads_per_thread: usize) -> EngineMe
     {
         let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.clone()))
             .expect("fsqlite open seed");
-        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"))
-            .expect("seed connection must enable concurrent mode (bd-fd1ra: no discarded PRAGMA results)");
+        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")).expect(
+            "seed connection must enable concurrent mode (bd-fd1ra: no discarded PRAGMA results)",
+        );
         fsqlite_e2e::block_on(
             conn.execute("CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, payload TEXT)"),
         )
