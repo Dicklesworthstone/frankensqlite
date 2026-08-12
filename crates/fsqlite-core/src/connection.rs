@@ -42929,6 +42929,7 @@ impl Connection {
         // profile counters retain their meaning (a call is a call).
         if self.pending_direct_update_leaf_patch_run.borrow().is_none()
             && self.pending_direct_delete_leaf_run.borrow().is_none()
+            && self.pending_direct_delete_leaf_runs.borrow().is_empty()
             && self.pending_direct_insert_page_run.borrow().is_none()
         {
             return Ok(());
@@ -73929,23 +73930,40 @@ impl Connection {
     #[allow(clippy::too_many_lines)]
     async fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
-        let bound_publication = self.bind_pager_publication(cx, "memdb_reload").await?;
+        // bd-dk9ra: an external writer (e.g. a C SQLite connection running its
+        // checkpoint-on-close against the same file) can legitimately reset
+        // the WAL between our publication bind and the reload transaction, so
+        // an older observed sequence gets a bounded re-bind from current pager
+        // state instead of an immediate refusal. A regression that persists
+        // across fresh binds is a real monotonicity fault and still fails
+        // closed with the original error.
+        const RELOAD_BIND_REGRESSION_RETRIES: usize = 3;
+        let mut bind_attempts = 0;
+        let (mut txn, txn_visible_commit_seq) = loop {
+            bind_attempts += 1;
+            let bound_publication = self.bind_pager_publication(cx, "memdb_reload").await?;
 
-        // Open a read transaction to see the committed state.
-        let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
-        let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
-            let _ = txn.rollback(cx).await;
-            return Err(FrankenError::Internal(
-                "pager reload transaction did not expose its bound visibility sequence".to_owned(),
-            ));
+            // Open a read transaction to see the committed state.
+            let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
+            let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
+                let _ = txn.rollback(cx).await;
+                return Err(FrankenError::Internal(
+                    "pager reload transaction did not expose its bound visibility sequence"
+                        .to_owned(),
+                ));
+            };
+            if txn_visible_commit_seq < bound_publication.snapshot.visible_commit_seq {
+                let _ = txn.rollback(cx).await;
+                if bind_attempts > RELOAD_BIND_REGRESSION_RETRIES {
+                    return Err(FrankenError::Internal(
+                        "pager reload transaction observed an older visibility sequence than its prior publication bind"
+                            .to_owned(),
+                    ));
+                }
+                continue;
+            }
+            break (txn, txn_visible_commit_seq);
         };
-        if txn_visible_commit_seq < bound_publication.snapshot.visible_commit_seq {
-            let _ = txn.rollback(cx).await;
-            return Err(FrankenError::Internal(
-                "pager reload transaction observed an older visibility sequence than its prior publication bind"
-                    .to_owned(),
-            ));
-        }
         self.reload_memdb_from_txn_with_mode(
             cx,
             &mut txn,
@@ -109438,9 +109456,10 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                 if let Some(width) = rows.first().map(Vec::len)
                     && rows.iter().any(|row| row.len() != width)
                 {
-                    return Err(FrankenError::FunctionError(
-                        "all VALUES must have the same number of terms".to_owned(),
-                    ));
+                    return Err(FrankenError::ParseError {
+                        offset: 0,
+                        detail: "all VALUES must have the same number of terms".to_owned(),
+                    });
                 }
             }
             SelectCore::Select { columns, from, .. } => {
@@ -110162,9 +110181,10 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             SelectCore::Values(rows) => {
                 let width = rows.first().map_or(0, Vec::len);
                 if rows.iter().any(|row| row.len() != width) {
-                    return Err(FrankenError::FunctionError(
-                        "all VALUES must have the same number of terms".to_owned(),
-                    ));
+                    return Err(FrankenError::ParseError {
+                        offset: 0,
+                        detail: "all VALUES must have the same number of terms".to_owned(),
+                    });
                 }
                 Ok(SelectResultColumnMetadata {
                     names: (1..=width)
@@ -110890,9 +110910,10 @@ impl<'a> SelectStructureResolver<'a> {
             && let Some(width) = rows.first().map(Vec::len)
             && rows.iter().any(|row| row.len() != width)
         {
-            return Err(FrankenError::FunctionError(
-                "all VALUES must have the same number of terms".to_owned(),
-            ));
+            return Err(FrankenError::ParseError {
+                offset: 0,
+                detail: "all VALUES must have the same number of terms".to_owned(),
+            });
         }
         Ok(())
     }
@@ -110907,9 +110928,10 @@ impl<'a> SelectStructureResolver<'a> {
                 if let Some(width) = rows.first().map(Vec::len)
                     && rows.iter().any(|row| row.len() != width)
                 {
-                    return Err(FrankenError::FunctionError(
-                        "all VALUES must have the same number of terms".to_owned(),
-                    ));
+                    return Err(FrankenError::ParseError {
+                        offset: 0,
+                        detail: "all VALUES must have the same number of terms".to_owned(),
+                    });
                 }
                 for row in rows.iter().rev() {
                     for expr in row {
@@ -127483,7 +127505,14 @@ mod tests {
                 .query("SELECT a FROM t;")
                 .await
                 .expect_err("SELECT from nonexistent table should fail");
-            assert!(matches!(error, FrankenError::Internal(_)));
+            // Schema resolution now returns the typed `NoSuchTable` variant
+            // (was a stringly-typed `Internal` at the b612eb7b5 anchor). Assert
+            // the semantic contract by message so the test tracks the meaning,
+            // not the specific error variant.
+            assert!(
+                error.to_string().contains("no such table"),
+                "expected a no-such-table error, got: {error}"
+            );
         });
     }
 
@@ -140578,7 +140607,12 @@ mod tests {
                 .query("SELECT x FROM t_drop;")
                 .await
                 .expect_err("dropped table should no longer be queryable");
-            assert!(matches!(err, FrankenError::Internal(msg) if msg.contains("no such table")));
+            // Post-drop lookup now returns the typed `NoSuchTable` variant
+            // (was `Internal` at the b612eb7b5 anchor); assert by message.
+            assert!(
+                err.to_string().contains("no such table"),
+                "dropped table lookup should report no such table, got: {err}"
+            );
 
             // Re-creating with the same name should succeed after DROP.
             conn.execute("CREATE TABLE t_drop (x INTEGER);")
@@ -178738,6 +178772,44 @@ mod autocommit_txn_tests {
             Box::pin(async move { self.inner.committed_txn_count(cx).await })
         }
 
+        // bd-dk9ra: the durable-certificate publication path calls these on
+        // every retained flush; without delegation the trait default's
+        // Unsupported masks the specific failure this mock exists to inject.
+        fn persist_parallel_wal_commit_certificate<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            certificate: &'a fsqlite_wal::ParallelWalCommitCertificate,
+            wal_frame_start: u64,
+            wal_frame_end: u64,
+            sync: bool,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.inner
+                    .persist_parallel_wal_commit_certificate(
+                        cx,
+                        certificate,
+                        wal_frame_start,
+                        wal_frame_end,
+                        sync,
+                    )
+                    .await
+            })
+        }
+
+        fn latest_authorized_parallel_wal_commit_certificate<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            Option<fsqlite_wal::ParallelWalCommitCertificate>,
+        > {
+            Box::pin(async move {
+                self.inner
+                    .latest_authorized_parallel_wal_commit_certificate(cx)
+                    .await
+            })
+        }
+
         fn sync(&mut self, cx: &Cx) -> Result<()> {
             self.inner.sync(cx)
         }
@@ -179956,13 +180028,19 @@ mod autocommit_txn_tests {
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
                 .await
                 .unwrap();
+            // bd-dk9ra triage: install the failing backend BEFORE the write
+            // parks a retained txn — the durable-certificate publication
+            // stack's set_wal_backend needs the exclusive maintenance lease
+            // that a parked retained txn holds. Parking appends nothing to
+            // the WAL (the checkpoint-failure sibling proves the pattern),
+            // so every assertion below is unchanged.
+            install_failing_retained_flush_wal_backend(&conn).await;
+
             conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
             assert!(
                 conn.retained_autocommit_txn.borrow().is_some(),
                 "first file-backed autocommit write should park a retained txn"
             );
-
-            install_failing_retained_flush_wal_backend(&conn).await;
 
             let error = conn
                 .execute("INSERT INTO t VALUES (1)")
@@ -180015,13 +180093,16 @@ mod autocommit_txn_tests {
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
                 .await
                 .unwrap();
+            // bd-dk9ra triage: install before parking — see the
+            // statement-error sibling for why (maintenance-lease conflict
+            // with the durable-certificate publication stack).
+            install_failing_retained_flush_wal_backend(&conn).await;
+
             conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
             assert!(
                 conn.retained_autocommit_txn.borrow().is_some(),
                 "first file-backed autocommit write should park a retained txn"
             );
-
-            install_failing_retained_flush_wal_backend(&conn).await;
 
             let cx = conn.op_cx().unwrap();
             let error = conn
