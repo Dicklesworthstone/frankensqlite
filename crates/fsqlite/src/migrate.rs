@@ -25,7 +25,6 @@
 
 use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::Connection;
@@ -147,27 +146,60 @@ impl MigrationRunner {
 
     /// Reads `MAX(version)` from `_schema_migrations`, returning 0 if empty.
     async fn read_current_version(conn: &Connection) -> Result<i64, FrankenError> {
-        let rows = conn
-            .query("SELECT MAX(version) FROM _schema_migrations;")
-            .await?;
-        if let Some(row) = rows.first() {
-            match row.get(0) {
-                Some(SqliteValue::Integer(v)) => Ok(*v),
-                _ => Ok(0),
+        let started = Instant::now();
+        loop {
+            match conn
+                .query("SELECT MAX(version) FROM _schema_migrations;")
+                .await
+            {
+                Ok(rows) => {
+                    return if let Some(row) = rows.first() {
+                        match row.get(0) {
+                            Some(SqliteValue::Integer(v)) => Ok(*v),
+                            _ => Ok(0),
+                        }
+                    } else {
+                        Ok(0)
+                    };
+                }
+                Err(error) if Self::should_retry_busy(conn, &error, started) => {
+                    Self::busy_retry_backoff().await;
+                }
+                Err(error) => return Err(error),
             }
-        } else {
-            Ok(0)
         }
     }
 
     async fn version_is_applied(conn: &Connection, version: i64) -> Result<bool, FrankenError> {
-        let rows = conn
-            .query_with_params(
-                "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
-                &[SqliteValue::Integer(version)],
+        let started = Instant::now();
+        loop {
+            match conn
+                .query_with_params(
+                    "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
+                    &[SqliteValue::Integer(version)],
+                )
+                .await
+            {
+                Ok(rows) => return Ok(!rows.is_empty()),
+                Err(error) if Self::should_retry_busy(conn, &error, started) => {
+                    Self::busy_retry_backoff().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn should_retry_busy(conn: &Connection, error: &FrankenError, started: Instant) -> bool {
+        !conn.in_transaction()
+            && started.elapsed() < MIGRATION_BUSY_RETRY_TIMEOUT
+            && matches!(
+                error,
+                FrankenError::Busy | FrankenError::BusyRecovery | FrankenError::BusySnapshot { .. }
             )
-            .await?;
-        Ok(!rows.is_empty())
+    }
+
+    async fn busy_retry_backoff() {
+        asupersync::time::sleep(asupersync::time::wall_now(), MIGRATION_BUSY_RETRY_BACKOFF).await;
     }
 
     /// Applies a single migration inside a BEGIN IMMEDIATE/COMMIT transaction.
@@ -179,8 +211,12 @@ impl MigrationRunner {
         let started = Instant::now();
         loop {
             match Self::apply_one_once(conn, migration).await {
-                Err(FrankenError::Busy) if started.elapsed() < MIGRATION_BUSY_RETRY_TIMEOUT => {
-                    thread::sleep(MIGRATION_BUSY_RETRY_BACKOFF);
+                Err(error) if Self::should_retry_busy(conn, &error, started) => {
+                    // BusySnapshot invalidates the transaction's publication
+                    // image. `apply_one_once` has rolled the whole transaction
+                    // back, so retry from BEGIN rather than replaying a
+                    // statement inside the stale transaction.
+                    Self::busy_retry_backoff().await;
                 }
                 other => return other,
             }
@@ -191,7 +227,9 @@ impl MigrationRunner {
         conn: &Connection,
         migration: &Migration,
     ) -> Result<bool, FrankenError> {
-        conn.execute("BEGIN IMMEDIATE;").await?;
+        if let Err(error) = conn.execute("BEGIN IMMEDIATE;").await {
+            return Err(Self::rollback_failed_attempt(conn, error).await);
+        }
         let result: Result<bool, FrankenError> = async {
             if Self::version_is_applied(conn, migration.version).await? {
                 conn.execute("COMMIT;").await?;
@@ -206,12 +244,31 @@ impl MigrationRunner {
 
         match result {
             Ok(applied) => Ok(applied),
-            Err(err) => {
-                // Best-effort rollback; ignore rollback errors since
-                // the original error is more informative.
-                let _ = conn.execute("ROLLBACK;").await;
-                Err(err)
+            Err(error) => Err(Self::rollback_failed_attempt(conn, error).await),
+        }
+    }
+
+    /// End a failed migration attempt before the caller decides whether the
+    /// whole transaction can be retried. `BEGIN IMMEDIATE` can fail after the
+    /// connection has entered explicit-transaction state, and a rollback can
+    /// report `BusyRecovery` after it has nevertheless cleared that state.
+    async fn rollback_failed_attempt(
+        conn: &Connection,
+        primary_error: FrankenError,
+    ) -> FrankenError {
+        if !conn.in_transaction() {
+            return primary_error;
+        }
+
+        match conn.execute("ROLLBACK;").await {
+            Ok(_) => primary_error,
+            Err(rollback_error)
+                if matches!(rollback_error, FrankenError::BusyRecovery)
+                    && !conn.in_transaction() =>
+            {
+                primary_error
             }
+            Err(rollback_error) => rollback_error,
         }
     }
 
@@ -484,6 +541,7 @@ mod tests {
             )
             .await
             .unwrap();
+            conn.close().await.unwrap();
         });
 
         let barrier = Arc::new(Barrier::new(2));
@@ -504,7 +562,15 @@ mod tests {
                             0
                         );
                         barrier.wait();
-                        applied = MigrationRunner::apply_one(&conn, &migration).await.unwrap();
+                        let apply_result = MigrationRunner::apply_one(&conn, &migration).await;
+                        let in_transaction_after_apply = conn.in_transaction();
+                        conn.close().await.unwrap();
+                        applied = apply_result.unwrap_or_else(|error| {
+                            panic!(
+                                "concurrent migration failed: {error:?}; \
+                                 in_transaction_after_apply={in_transaction_after_apply}"
+                            )
+                        });
                     });
                     applied
                 })
@@ -536,6 +602,7 @@ mod tests {
                 rows[0].get(1),
                 Some(&SqliteValue::Text("create_items".into()))
             );
+            conn.close().await.unwrap();
         });
     }
 
