@@ -54864,8 +54864,7 @@ impl Connection {
                     &result,
                     Err(FrankenError::Busy | FrankenError::BusyRecovery)
                 ) {
-                    let busy_timeout_ms =
-                        self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+                    let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
                     let deadline = Duration::from_millis(busy_timeout_ms);
                     let started = Instant::now();
                     let mut handoff = BeginBusyRetryHandoff::default();
@@ -75923,6 +75922,26 @@ impl Drop for Connection {
             // shared state so future opens start a fresh generation. Tasks
             // exit at their next checkpoint under their own power; nothing
             // here waits for them.
+            // bd-b4mwn: a dropped connection's live concurrent session kept
+            // its page locks in the SHARED per-path lock table with nothing
+            // left to release them — successors parked on page_lock_busy for
+            // the full busy_timeout and the 8-writer bench cascaded into
+            // aborted samples (write_busy_timeout -> transient INSERT error
+            // -> rollback BusyRecovery -> more drops). Aborting the session
+            // is synchronous (Mutex-guarded registry + lock table), so it is
+            // legal here even though pager rollback is not: the uncommitted
+            // pager state stays deferred to WAL recovery as documented
+            // above, but the locks and the registry slot are reclaimed NOW
+            // so siblings never inherit a dead session's contention.
+            if let Some(session_id) = self.concurrent_session_id.get_mut().take() {
+                let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                if let Some(mut handle) = registry.get_mut(session_id) {
+                    concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+                }
+                self.clear_cached_concurrent_handle();
+                registry.remove_and_recycle(session_id);
+            }
+
             self._shared_mvcc_state
                 .release_connection_on_drop(self.runtime_region);
 
@@ -110959,6 +110978,41 @@ impl<'a> SelectStructureResolver<'a> {
         });
         let using_skip = using_skip.as_ref().filter(|indices| !indices.is_empty());
         let output_aliases = collect_select_core_result_aliases(&select.body.select);
+
+        // bd-2fong: SQLite rejects an aggregate in ORDER BY unless the SELECT
+        // itself is an aggregate query ('misuse of aggregate: max()') — the
+        // fromless lane already enforces this; the from-full lane silently
+        // ordered by the aggregate's scalar value.
+        let is_aggregate_query = match &select.body.select {
+            SelectCore::Select {
+                columns,
+                group_by,
+                having,
+                ..
+            } => {
+                !group_by.is_empty()
+                    || having.is_some()
+                    || columns.iter().any(|column| match column {
+                        ResultColumn::Expr { expr, .. } => self
+                            .connection
+                            .expr_contains_aggregate_with_registry(expr),
+                        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+                    })
+            }
+            SelectCore::Values(_) => false,
+        };
+        if !is_aggregate_query {
+            for term in &select.order_by {
+                if self
+                    .connection
+                    .expr_contains_aggregate_with_registry(&term.expr)
+                {
+                    return Err(FrankenError::FunctionError(
+                        "misuse of aggregate: ".to_owned(),
+                    ));
+                }
+            }
+        }
 
         for (index, term) in select.order_by.iter().enumerate() {
             if self.order_term_records_ordinal(term, index, output_width)? {
@@ -230917,7 +230971,6 @@ mod pager_routing_tests {
             );
         });
     }
-
 
     #[test]
     fn test_scalar_subquery_affinity_matches_sqlite_scope_and_direct_donor() {

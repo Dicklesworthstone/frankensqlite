@@ -12017,10 +12017,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 // (bd-zavyn hoist); both arms run identical statements.
                 fsqlite_e2e::block_on(async {
                     for _ in 0..TINY_READ_QUERIES_PER_SAMPLE {
-                        let _rows = fs_stmt
-                            .query_with_params(&target_name_param)
-                            .await
-                            .unwrap();
+                        let _rows = fs_stmt.query_with_params(&target_name_param).await.unwrap();
                     }
                 });
             },
@@ -16968,6 +16965,18 @@ fn print_json_report<T: Serialize>(report: &T) {
 }
 
 fn main() {
+    // bd-b4mwn: opt-in engine-warning capture for contention diagnosis. The
+    // bench deliberately runs subscriber-free for timing (RUST_LOG has no
+    // effect); FSQLITE_BENCH_TRACE_WARN=1 installs a global WARN-level fmt
+    // subscriber so recovery-fence budget exhaustion, settle refusals, and
+    // runtime drop_close warnings name their origin sites during a repro.
+    // Diagnostic runs only — timing from such runs is not comparable.
+    if bench_env_flag("FSQLITE_BENCH_TRACE_WARN") {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_usage();
