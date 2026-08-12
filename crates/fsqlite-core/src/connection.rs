@@ -102497,18 +102497,6 @@ fn scalar_subquery_result_affinity(
     select: &SelectStatement,
     schemas: &[TableSchema],
 ) -> TypeAffinity {
-    // TEMP bd-di4he probe — remove before commit.
-    if std::env::var_os("FSQLITE_DI4HE_PROBE").is_some() {
-        eprintln!(
-            "bd-di4he ssra entry: core_kind={} schemas={}",
-            match in_rhs_donor_core(select) {
-                SelectCore::Values(_) => "values",
-                SelectCore::Select { from: None, .. } => "select_no_from",
-                SelectCore::Select { .. } => "select_from",
-            },
-            schemas.len()
-        );
-    }
     let core = in_rhs_donor_core(select);
     match core {
         // bd-di4he: the project oracle (bundled SQLite 3.53.2 via rusqlite)
@@ -102517,24 +102505,13 @@ fn scalar_subquery_result_affinity(
         // (CAST(1 AS NUMERIC))) = '1'` is 1 there. (System sqlite3 3.46.1
         // predates that donor model and answers 0; the bundled reference is
         // authoritative for keepers.)
-        SelectCore::Values(rows) => {
-            let resolved = rows
-                .donor_row()
-                .or_else(|| rows.rows().last().map(Vec::as_slice))
-                .and_then(<[Expr]>::first)
-                .map_or(TypeAffinity::Blob, |expr| {
-                    resolve_operand_affinity(expr, schemas)
-                });
-            // TEMP bd-di4he probe — remove before commit.
-            if std::env::var_os("FSQLITE_DI4HE_PROBE").is_some() {
-                eprintln!(
-                    "bd-di4he values arm: frozen_donor={:?} rows={} resolved={resolved:?}",
-                    rows.donor_row_index(),
-                    rows.rows().len()
-                );
-            }
-            resolved
-        }
+        SelectCore::Values(rows) => rows
+            .donor_row()
+            .or_else(|| rows.rows().last().map(Vec::as_slice))
+            .and_then(<[Expr]>::first)
+            .map_or(TypeAffinity::Blob, |expr| {
+                resolve_operand_affinity(expr, schemas)
+            }),
         SelectCore::Select {
             columns,
             from: None,
@@ -102543,24 +102520,10 @@ fn scalar_subquery_result_affinity(
             Some(ResultColumn::Expr { expr, .. }) => resolve_operand_affinity(expr, schemas),
             Some(ResultColumn::Star | ResultColumn::TableStar(_)) | None => TypeAffinity::Blob,
         },
-        SelectCore::Select { columns, .. } => {
-            let resolved = select_core_result_affinities(core, schemas)
-                .first()
-                .copied()
-                .unwrap_or(TypeAffinity::Blob);
-            // bd-di4he class A (outer-column fallback): a correlated
-            // single-column projection whose bare column resolves OUTSIDE
-            // the subquery's FROM yields Blob from the local lookup, but
-            // stock donates the outer column's affinity ((SELECT i FROM
-            // inner_without_i) = '1' is 1 when outer i is INTEGER). Fall
-            // back to the schema-wide resolver the no-FROM arm already uses.
-            if resolved == TypeAffinity::Blob
-                && let Some(ResultColumn::Expr { expr, .. }) = columns.first()
-            {
-                return resolve_operand_affinity(expr, schemas);
-            }
-            resolved
-        }
+        SelectCore::Select { .. } => select_core_result_affinities(core, schemas)
+            .first()
+            .copied()
+            .unwrap_or(TypeAffinity::Blob),
     }
 }
 
@@ -111051,9 +111014,9 @@ impl<'a> SelectStructureResolver<'a> {
                 !group_by.is_empty()
                     || having.is_some()
                     || columns.iter().any(|column| match column {
-                        ResultColumn::Expr { expr, .. } => self
-                            .connection
-                            .expr_contains_aggregate_with_registry(expr),
+                        ResultColumn::Expr { expr, .. } => {
+                            self.connection.expr_contains_aggregate_with_registry(expr)
+                        }
                         ResultColumn::Star | ResultColumn::TableStar(_) => false,
                     })
             }
@@ -115418,14 +115381,11 @@ fn extract_collation(expr: &Expr) -> Option<&str> {
 
 fn fromless_comparison_metadata(left: &Expr, right: &Expr) -> (P4, u16) {
     let collation = join_comparison_collation(left, right, &[]).map_or(P4::None, P4::Collation);
-    let left_affinity = resolve_operand_affinity(left, &[]);
-    let right_affinity = resolve_operand_affinity(right, &[]);
-    // TEMP bd-di4he probe — remove before commit.
-    if std::env::var_os("FSQLITE_DI4HE_PROBE").is_some() {
-        eprintln!("bd-di4he fromless cmp: left={left_affinity:?} right={right_affinity:?}");
-    }
-    let affinity = TypeAffinity::comparison_affinity(left_affinity, right_affinity)
-        .map_or(0, |affinity| u16::from(affinity as u8));
+    let affinity = TypeAffinity::comparison_affinity(
+        resolve_operand_affinity(left, &[]),
+        resolve_operand_affinity(right, &[]),
+    )
+    .map_or(0, |affinity| u16::from(affinity as u8));
     (collation, affinity)
 }
 
@@ -160676,7 +160636,6 @@ mod tests {
             assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
         });
     }
-
 
     #[test]
     #[allow(clippy::too_many_lines)]
