@@ -7607,14 +7607,7 @@ fn codegen_select_count_star_indexed_in_scan(
             let r_seek_base = b.alloc_regs(2);
             let r_probe_record = b.alloc_reg();
             b.emit_op(Opcode::SCopy, r_probe_value, r_seek_base, 0, P4::None, 0);
-            b.emit_op(
-                Opcode::Int64,
-                0,
-                r_seek_base + 1,
-                0,
-                P4::Int64(i64::MIN),
-                0,
-            );
+            b.emit_op(Opcode::Int64, 0, r_seek_base + 1, 0, P4::Int64(i64::MIN), 0);
             b.emit_op(
                 Opcode::MakeRecord,
                 r_seek_base,

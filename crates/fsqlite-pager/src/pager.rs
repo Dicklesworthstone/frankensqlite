@@ -6282,12 +6282,7 @@ async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -
     if !queue.has_process_root_finalization_attempt() {
         return Ok(());
     }
-    let budget = Duration::from_millis(
-        queue
-            .settle_budget_ms
-            .load(AtomicOrdering::Acquire)
-            .max(1),
-    );
+    let budget = Duration::from_millis(queue.settle_budget_ms.load(AtomicOrdering::Acquire).max(1));
     let started = Instant::now();
     let mut rounds: u32 = 0;
     let mut cleanups_resolved_total: usize = 0;
@@ -6308,9 +6303,7 @@ async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -
         let after = queue.pending_logical_cleanup_count();
         cleanups_resolved_total =
             cleanups_resolved_total.saturating_add(before.saturating_sub(after));
-        let claimed_in_flight = queue
-            .claimed_logical_cleanups
-            .load(AtomicOrdering::Acquire);
+        let claimed_in_flight = queue.claimed_logical_cleanups.load(AtomicOrdering::Acquire);
         if after == 0 && claimed_in_flight == 0 {
             // No claimable work remains AND nothing is being resolved by a
             // peer — the residual root is a true wedge; fall through to the
@@ -6394,13 +6387,16 @@ async fn settle_pending_group_commit_finalization_round(queue: &GroupCommitQueue
             let registry = process_root_finalization_registry()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry.by_queue.get(&queue.queue_id).map_or_else(Vec::new, |rooted| {
-                rooted
-                    .attempts
-                    .iter()
-                    .map(|(attempt_id, scope)| format!("{attempt_id}:{scope:?}"))
-                    .collect()
-            })
+            registry
+                .by_queue
+                .get(&queue.queue_id)
+                .map_or_else(Vec::new, |rooted| {
+                    rooted
+                        .attempts
+                        .iter()
+                        .map(|(attempt_id, scope)| format!("{attempt_id}:{scope:?}"))
+                        .collect()
+                })
         };
         tracing::warn!(
             target: "fsqlite.pager.group_commit",
