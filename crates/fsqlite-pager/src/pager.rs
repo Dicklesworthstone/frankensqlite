@@ -2378,6 +2378,12 @@ impl GroupCommitQueue {
         }
         let mut cleanup = claim.finish();
         cleanup.release_root_after_terminal();
+        // bd-b4mwn rework #2 (ordering): the success-path claimed decrement
+        // happens only after the root is released, so no observer can see
+        // pending==0 && claimed==0 with the root still armed (the false-wedge
+        // window the trj holder receipt caught).
+        self.claimed_logical_cleanups
+            .fetch_sub(1, AtomicOrdering::AcqRel);
         Ok(true)
     }
 
@@ -2398,6 +2404,12 @@ impl GroupCommitQueue {
         }
         let mut cleanup = claim.finish();
         cleanup.release_root_after_terminal();
+        // bd-b4mwn rework #2 (ordering): the success-path claimed decrement
+        // happens only after the root is released, so no observer can see
+        // pending==0 && claimed==0 with the root still armed (the false-wedge
+        // window the trj holder receipt caught).
+        self.claimed_logical_cleanups
+            .fetch_sub(1, AtomicOrdering::AcqRel);
         Ok(true)
     }
 
@@ -7961,15 +7973,21 @@ impl Drop for PendingGroupCommitLogicalCleanupClaim {
     fn drop(&mut self) {
         if let Some(cleanup) = self.cleanup.take() {
             self.queue.requeue_pending_logical_cleanup(cleanup);
+            // bd-b4mwn rework #2 (ordering): decrement claimed only AFTER the
+            // requeue re-inserted the entry, and only on the requeue path —
+            // the success path decrements after release_root_after_terminal
+            // in the resolve fns. Decrementing here on the success path
+            // opened a window (claimed already 0, pending 0, root still
+            // armed until release ran) that the wedge test sampled as a
+            // false wedge -> spurious BusyRecovery refusal (the trj
+            // exact-handle holder receipt).
+            self.queue
+                .claimed_logical_cleanups
+                .fetch_sub(1, AtomicOrdering::AcqRel);
         }
         // Requeue by stable lane sequence before releasing the exact-handle
         // claim so a second settler cannot overtake a cancelled operation.
         self.logical_exit_claim.take();
-        // bd-b4mwn rework #2: the claim is terminal exactly once per
-        // successful claim (finish() consumes self and lands here too).
-        self.queue
-            .claimed_logical_cleanups
-            .fetch_sub(1, AtomicOrdering::AcqRel);
     }
 }
 
