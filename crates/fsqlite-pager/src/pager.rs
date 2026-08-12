@@ -5839,6 +5839,19 @@ impl PagerMaintenanceGate {
             .lock()
             .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
         if self.rollback_recovery_owner() != expected_recovery_owner {
+            // bd-b4mwn round 5: name the silent refusal — an armed
+            // rollback-recovery owner no live pager can satisfy previously
+            // surfaced only as an anonymous BusyRecovery at every
+            // transaction admission on the path.
+            tracing::warn!(
+                target: "fsqlite.pager.maintenance_gate",
+                armed_owner = ?self.rollback_recovery_owner().map(RollbackRecoveryOwnerId::get),
+                expected_owner = ?expected_recovery_owner.map(RollbackRecoveryOwnerId::get),
+                active_openers = state.active_openers,
+                active_transactions = state.active_transactions,
+                orphan_retained = state.orphaned_rollback_recovery.is_some(),
+                "transaction admission refused: rollback-recovery owner mismatch"
+            );
             return Err(FrankenError::BusyRecovery);
         }
         if state.maintenance_active {
@@ -5918,6 +5931,16 @@ impl PagerMaintenanceLease {
             PagerMaintenanceLeaseKind::Exclusive => return Ok(prior),
         };
         if !sole_owner {
+            // bd-b4mwn round 5: name the silent refusal — recovery-requiring
+            // work (e.g. a leftover hot journal from a dropped peer) demands
+            // sole ownership that a churning multi-writer path never grants.
+            tracing::warn!(
+                target: "fsqlite.pager.maintenance_gate",
+                lease_kind = ?prior,
+                active_openers = state.active_openers,
+                active_transactions = state.active_transactions,
+                "exclusive upgrade refused: not sole owner"
+            );
             return Err(FrankenError::BusyRecovery);
         }
 
