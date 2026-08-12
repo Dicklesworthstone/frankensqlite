@@ -11037,10 +11037,17 @@ fn exact_database_page_count(file_size: u64, page_size: PageSize) -> Result<u32>
     })
 }
 
-async fn database_image_receipt_for_open_file<F: VfsFile>(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseImageExtentPolicy {
+    Exact,
+    AllowTrailingPages,
+}
+
+async fn database_image_receipt_for_open_file_with_extent<F: VfsFile>(
     cx: &Cx,
     file: &F,
     expected_page_size: Option<PageSize>,
+    extent_policy: DatabaseImageExtentPolicy,
 ) -> Result<DatabaseImageReceipt> {
     let identity = file.file_identity()?.ok_or_else(|| {
         FrankenError::internal("database image VFS did not provide a stable file identity")
@@ -11071,7 +11078,11 @@ async fn database_image_receipt_for_open_file<F: VfsFile>(
         });
     }
     let page_count = exact_database_page_count(file_size, header.page_size)?;
-    if header.page_count != page_count {
+    let invalid_page_count = match extent_policy {
+        DatabaseImageExtentPolicy::Exact => header.page_count != page_count,
+        DatabaseImageExtentPolicy::AllowTrailingPages => header.page_count > page_count,
+    };
+    if invalid_page_count {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
                 "database image header page count {} does not match file length page count {page_count}",
@@ -11109,6 +11120,34 @@ async fn database_image_receipt_for_open_file<F: VfsFile>(
         header,
         logical_hash: *hasher.finalize().as_bytes(),
     })
+}
+
+async fn database_image_receipt_for_open_file<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    expected_page_size: Option<PageSize>,
+) -> Result<DatabaseImageReceipt> {
+    database_image_receipt_for_open_file_with_extent(
+        cx,
+        file,
+        expected_page_size,
+        DatabaseImageExtentPolicy::Exact,
+    )
+    .await
+}
+
+async fn vacuum_source_receipt_for_open_file<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    expected_page_size: PageSize,
+) -> Result<DatabaseImageReceipt> {
+    database_image_receipt_for_open_file_with_extent(
+        cx,
+        file,
+        Some(expected_page_size),
+        DatabaseImageExtentPolicy::AllowTrailingPages,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12523,14 +12562,16 @@ where
         }
     }
 
-    /// Capture the exact post-checkpoint source image used to build VACUUM's
-    /// candidate. Publication later recomputes this logical digest under the
-    /// same exclusive maintenance protocol and aborts if any page changed.
+    /// Capture the post-checkpoint source image used to build VACUUM's
+    /// candidate. The header defines the logical page extent, while any
+    /// whole-page trailing slack remains covered by the receipt digest and
+    /// file size. Publication later recomputes the same receipt under the
+    /// exclusive maintenance protocol and aborts if any byte changed.
     pub async fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
         self.with_exclusive_maintenance(cx, &mut (), |_, cx, inner, ()| {
             Box::pin(async move {
                 let db_file = shared_db_file_read(&inner.db_file, cx).await?;
-                database_image_receipt_for_open_file(cx, &*db_file, Some(inner.page_size)).await
+                vacuum_source_receipt_for_open_file(cx, &*db_file, inner.page_size).await
             })
         })
         .await
@@ -12607,12 +12648,8 @@ where
             pager.ensure_vacuum_candidate_is_self_contained(cx, image_full_path)?;
             let shared_db_file = Arc::clone(&inner.db_file);
             let mut db_file = shared_db_file_write(&shared_db_file, cx).await?;
-            let current_source = database_image_receipt_for_open_file(
-                cx,
-                &*db_file,
-                Some(inner.page_size),
-            )
-            .await?;
+            let current_source =
+                vacuum_source_receipt_for_open_file(cx, &*db_file, inner.page_size).await?;
             if current_source != *source {
                 return Err(FrankenError::BusySnapshot {
                     conflicting_pages: "VACUUM source image changed while rebuilding".to_owned(),
