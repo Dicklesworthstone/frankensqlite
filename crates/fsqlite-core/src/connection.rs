@@ -41971,7 +41971,15 @@ impl Connection {
         // Advance commit clock if commit succeeded.
         if commit_result.is_ok() {
             if !self.pager.is_memory() && self.pager.journal_mode() == JournalMode::Wal {
-                self.pager.checkpoint(cx, CheckpointMode::Passive).await?;
+                match self.pager.checkpoint(cx, CheckpointMode::Passive).await {
+                    Ok(_) => {}
+                    Err(error) if error.is_transient() => tracing::debug!(
+                        target: "fsqlite.retained_autocommit",
+                        %error,
+                        "skipping retained-autocommit passive checkpoint under transient contention; the durable WAL commit remains authoritative"
+                    ),
+                    Err(error) => return Err(error),
+                }
             }
             let committed_seq = if self.pager.is_memory() {
                 let committed_seq = self.advance_commit_clock_without_memdb_visibility();
@@ -178944,10 +178952,9 @@ mod autocommit_txn_tests {
             )
             .await;
 
-            let rows = conn
-                .query("SELECT id FROM t ORDER BY id")
-                .await
-                .expect("durable commit must not become a statement error when passive checkpoint is busy");
+            let rows = conn.query("SELECT id FROM t ORDER BY id").await.expect(
+                "durable commit must not become a statement error when passive checkpoint is busy",
+            );
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
             assert!(conn.retained_autocommit_txn.borrow().is_none());
@@ -178967,7 +178974,9 @@ mod autocommit_txn_tests {
     fn test_retained_autocommit_flush_propagates_nontransient_post_commit_checkpoint_failure() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_checkpoint_internal.db");
+            let db_path = dir
+                .path()
+                .join("retained_autocommit_checkpoint_internal.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
