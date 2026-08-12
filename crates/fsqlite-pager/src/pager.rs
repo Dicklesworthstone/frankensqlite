@@ -6375,11 +6375,21 @@ async fn settle_pending_group_commit_finalization_round(queue: &GroupCommitQueue
     if let Some(error) = first_logical_cleanup_error {
         return Err(error);
     }
-    if queue.has_unresolved_in_doubt_epoch() || queue.has_process_root_finalization_attempt() {
-        // bd-b4mwn rework #2: ground truth on the holder — enumerate the
-        // registry's live attempts for this queue instead of inferring from
-        // queue-side counters (pending/claimed/unlocks/epochs all read zero
-        // at refusal time on trj while the count stayed armed).
+    // bd-b4mwn (terminal): the residual refusal previously keyed on ANY
+    // armed root (has_process_root_finalization_attempt) — but exact-handle
+    // roots are normal, short-lived receipts of some OTHER connection's
+    // in-flight operation, individually milliseconds wide and collectively
+    // near-continuous under 8-writer churn. The generic settle refusing on a
+    // FOREIGN handle's root manufactured the multi-second 'recovery in
+    // progress' relay (trj registry receipts: distinct attempt ids, always
+    // ExactHandle, always zero pending/claimed). Exact-handle roots keep
+    // gating their OWN handle's settles via has_relevant_process_root in the
+    // per-handle settle; the generic settle refuses only on state that
+    // genuinely blocks everyone: an in-doubt epoch or an IDENTITY-WIDE root.
+    if queue.has_unresolved_in_doubt_epoch() || queue.has_identity_wide_process_root() {
+        // Ground truth on the holder — enumerate the registry's live
+        // attempts for this queue instead of inferring from queue-side
+        // counters.
         let live_attempts: Vec<String> = {
             let registry = process_root_finalization_registry()
                 .lock()
