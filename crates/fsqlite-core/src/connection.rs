@@ -7953,11 +7953,7 @@ impl PreparedStatement<'_> {
         if self.dml_dispatch.is_some() {
             return self.conn.execute_prepared(self).await;
         }
-        // bd-uzq54: box the query fallback so the hot prepared-DML execute
-        // future does not carry the ~17.7KB query state machine for a branch
-        // a DML statement can never take. The allocation lands only on the
-        // rare execute-a-SELECT path.
-        Ok(Box::pin(self.query()).await?.len())
+        Ok(self.query().await?.len())
     }
 
     /// Execute with bound SQL parameters and return affected/output row count.
@@ -7970,9 +7966,7 @@ impl PreparedStatement<'_> {
         if self.dml_dispatch.is_some() {
             return self.conn.execute_prepared_with_params(self, params).await;
         }
-        // bd-uzq54: box the query fallback (see `execute`); keeps the hot
-        // prepared-INSERT future at the size of the DML branch alone.
-        Ok(Box::pin(self.query_with_params(params)).await?.len())
+        Ok(self.query_with_params(params).await?.len())
     }
 
     /// Return an EXPLAIN-style disassembly for the compiled program.
@@ -19412,12 +19406,8 @@ impl Connection {
                         if hot_path_profile_enabled() {
                             FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
                         }
-                        // bd-uzq54: boxed — slow-path generic dispatch must
-                        // not inflate the hot precompiled-DML generator.
-                        let rows =
-                            Box::pin(self.execute_statement_impl_after_background_status(
-                                dml, p, None, false,
-                            ))
+                        let rows = self
+                            .execute_statement_impl_after_background_status(dml, p, None, false)
                             .await?;
                         self.note_connection_statement_execution_count(1);
                         return Ok(
@@ -19474,14 +19464,14 @@ impl Connection {
                         reason = "deferred_dml",
                     );
                 }
-                // bd-uzq54: boxed — see the fast-path comment above.
-                let rows = Box::pin(self.execute_statement_impl_after_background_status(
-                    dml,
-                    p,
-                    stmt.dispatch_precompiled_program(),
-                    false,
-                ))
-                .await?;
+                let rows = self
+                    .execute_statement_impl_after_background_status(
+                        dml,
+                        p,
+                        stmt.dispatch_precompiled_program(),
+                        false,
+                    )
+                    .await?;
                 self.note_connection_statement_execution_count(1);
                 let is_dml = matches!(
                     dml,
@@ -19493,13 +19483,10 @@ impl Connection {
                     rows.len()
                 })
             } else {
-                // bd-uzq54: boxed — a DML execute can never take the query
-                // branch; keep its state machine out of the hot allocation.
-                Ok(
-                    Box::pin(self.query_prepared_with_params_after_background_status(stmt, params))
-                        .await?
-                        .len(),
-                )
+                Ok(self
+                    .query_prepared_with_params_after_background_status(stmt, params)
+                    .await?
+                    .len())
             }
         })
     }
