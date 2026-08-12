@@ -85676,7 +85676,10 @@ fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
                 return false;
             };
             let table_label = alias.as_deref().unwrap_or(&name.name);
-            if scalar_expr_has_invalid_local_binding(expr, table, table_label) {
+            // bd-phboe mechanism (a): the projection and WHERE checks admit
+            // correlated outer-qualified refs — the gate's job here is only
+            // to prove the INNER bindings from the single-table schema.
+            if scalar_expr_has_invalid_local_binding_allowing_outer_refs(expr, table, table_label) {
                 return false;
             }
             if where_clause.as_deref().is_some_and(|where_expr| {
@@ -85686,7 +85689,11 @@ fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
                 return false;
             }
             !where_clause.as_deref().is_some_and(|where_expr| {
-                scalar_expr_has_invalid_local_binding(where_expr, table, table_label)
+                scalar_expr_has_invalid_local_binding_allowing_outer_refs(
+                    where_expr,
+                    table,
+                    table_label,
+                )
             })
         }
         SelectCore::Values(_) => false,
@@ -85706,12 +85713,46 @@ fn scalar_expr_has_invalid_local_binding(
     table: &TableSchema,
     table_label: &str,
 ) -> bool {
+    scalar_expr_has_invalid_binding(expr, table, table_label, false)
+}
+
+/// bd-phboe mechanism (a): variant for the correlated-scalar compile gate.
+///
+/// A column qualified with a label OTHER than the inner scan's is a valid
+/// correlated-outer candidate (`c.id = p.category_id`), not an invalid
+/// binding — this restores the pre-0e4333cd1 (b612eb7b lineage) admission
+/// that kept single-table correlated scalar subqueries on the compiled
+/// path. Inner-labeled columns that do not resolve, the conservative
+/// bare-name routing, and RowValue/RAISE rejection keep their strict
+/// semantics, and every other caller (the EXISTS/IN gates, whose
+/// correlated-term rejections guard a real VDBE mishandling) keeps the
+/// strict variant above.
+fn scalar_expr_has_invalid_local_binding_allowing_outer_refs(
+    expr: &Expr,
+    table: &TableSchema,
+    table_label: &str,
+) -> bool {
+    scalar_expr_has_invalid_binding(expr, table, table_label, true)
+}
+
+fn scalar_expr_has_invalid_binding(
+    expr: &Expr,
+    table: &TableSchema,
+    table_label: &str,
+    allow_outer_qualifier: bool,
+) -> bool {
+    let recurse =
+        |expr: &Expr| scalar_expr_has_invalid_binding(expr, table, table_label, allow_outer_qualifier);
     match expr {
         Expr::Column(column, _) => {
             if let Some(qualifier) = column.table.as_deref() {
-                return !qualifier.eq_ignore_ascii_case(table_label)
-                    || (table.column_index(&column.column).is_none()
-                        && !table_exposes_hidden_rowid_alias(table, &column.column));
+                if !qualifier.eq_ignore_ascii_case(table_label) {
+                    // Foreign qualifier: a correlated-outer candidate for
+                    // the scalar gate, an invalid binding for strict callers.
+                    return !allow_outer_qualifier;
+                }
+                return table.column_index(&column.column).is_none()
+                    && !table_exposes_hidden_rowid_alias(table, &column.column);
             }
             table.column_index(&column.column).is_none()
                 && !table_exposes_hidden_rowid_alias(table, &column.column)
@@ -85720,33 +85761,19 @@ fn scalar_expr_has_invalid_local_binding(
             // binding map. Route it conservatively: the connection evaluator
             // can distinguish those cases from `no such column`.
         }
-        Expr::BinaryOp { left, right, .. } => {
-            scalar_expr_has_invalid_local_binding(left, table, table_label)
-                || scalar_expr_has_invalid_local_binding(right, table, table_label)
-        }
+        Expr::BinaryOp { left, right, .. } => recurse(left) || recurse(right),
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
-        | Expr::Collate { expr, .. } => {
-            scalar_expr_has_invalid_local_binding(expr, table, table_label)
-        }
+        | Expr::Collate { expr, .. } => recurse(expr),
         Expr::Between {
             expr, low, high, ..
-        } => {
-            scalar_expr_has_invalid_local_binding(expr, table, table_label)
-                || scalar_expr_has_invalid_local_binding(low, table, table_label)
-                || scalar_expr_has_invalid_local_binding(high, table, table_label)
-        }
+        } => recurse(expr) || recurse(low) || recurse(high),
         Expr::In { expr, set, .. } => {
-            scalar_expr_has_invalid_local_binding(expr, table, table_label)
+            recurse(expr)
                 || matches!(
                     set,
-                    InSet::List(values)
-                        if values.iter().any(|value| scalar_expr_has_invalid_local_binding(
-                            value,
-                            table,
-                            table_label,
-                        ))
+                    InSet::List(values) if values.iter().any(|value| recurse(value))
                 )
         }
         Expr::Like {
@@ -85755,11 +85782,9 @@ fn scalar_expr_has_invalid_local_binding(
             escape,
             ..
         } => {
-            scalar_expr_has_invalid_local_binding(expr, table, table_label)
-                || scalar_expr_has_invalid_local_binding(pattern, table, table_label)
-                || escape.as_deref().is_some_and(|escape| {
-                    scalar_expr_has_invalid_local_binding(escape, table, table_label)
-                })
+            recurse(expr)
+                || recurse(pattern)
+                || escape.as_deref().is_some_and(|escape| recurse(escape))
         }
         Expr::Case {
             operand,
@@ -85767,14 +85792,11 @@ fn scalar_expr_has_invalid_local_binding(
             else_expr,
             ..
         } => {
-            operand.as_deref().is_some_and(|operand| {
-                scalar_expr_has_invalid_local_binding(operand, table, table_label)
-            }) || whens.iter().any(|(when_expr, then_expr)| {
-                scalar_expr_has_invalid_local_binding(when_expr, table, table_label)
-                    || scalar_expr_has_invalid_local_binding(then_expr, table, table_label)
-            }) || else_expr.as_deref().is_some_and(|else_expr| {
-                scalar_expr_has_invalid_local_binding(else_expr, table, table_label)
-            })
+            operand.as_deref().is_some_and(|operand| recurse(operand))
+                || whens
+                    .iter()
+                    .any(|(when_expr, then_expr)| recurse(when_expr) || recurse(then_expr))
+                || else_expr.as_deref().is_some_and(|else_expr| recurse(else_expr))
         }
         Expr::FunctionCall {
             args,
@@ -85784,23 +85806,11 @@ fn scalar_expr_has_invalid_local_binding(
         } => {
             matches!(
                 args,
-                FunctionArgs::List(args)
-                    if args.iter().any(|arg| scalar_expr_has_invalid_local_binding(
-                        arg,
-                        table,
-                        table_label,
-                    ))
-            ) || order_by
-                .iter()
-                .any(|term| scalar_expr_has_invalid_local_binding(&term.expr, table, table_label))
-                || filter.as_deref().is_some_and(|filter| {
-                    scalar_expr_has_invalid_local_binding(filter, table, table_label)
-                })
+                FunctionArgs::List(args) if args.iter().any(|arg| recurse(arg))
+            ) || order_by.iter().any(|term| recurse(&term.expr))
+                || filter.as_deref().is_some_and(|filter| recurse(filter))
         }
-        Expr::JsonAccess { expr, path, .. } => {
-            scalar_expr_has_invalid_local_binding(expr, table, table_label)
-                || scalar_expr_has_invalid_local_binding(path, table, table_label)
-        }
+        Expr::JsonAccess { expr, path, .. } => recurse(expr) || recurse(path),
         Expr::RowValue(_, _) | Expr::Raise { .. } => true,
         Expr::BoundOuterValue { .. }
         | Expr::Exists { .. }
