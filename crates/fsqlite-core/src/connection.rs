@@ -105967,11 +105967,13 @@ fn values_row_is_constant_without_affinity(
 /// invoking application code. Slow-changing built-ins are query-constant;
 /// volatile application replacements are not.
 fn values_expr_is_query_constant(expr: &Expr, function_registry: &FunctionRegistry) -> bool {
-    if expr_folds_to_integer_zero_via_and(expr)
-        || matches!(expr, Expr::In { set: InSet::List(values), .. } if values.is_empty())
-    {
-        return true;
-    }
+    // bd-di4he: NO semantic short-circuits here. sqlite3ExprIsConstant() is
+    // purely syntactic — `random() AND 0`, `0 AND random()`, and
+    // `random() IN ()` are all NON-constant to stock SQLite, which forces
+    // such VALUES rows into UNION ALL cores and moves the coroutine donor to
+    // the rightmost core. Folding them to constants here froze donor row 0
+    // and dropped the CAST donor affinity the bundled-3.53.2 oracle requires
+    // ((VALUES(1),(random() AND 0),(CAST(1 AS NUMERIC))) = '1' is 1).
     match expr {
         Expr::Literal(_, _) | Expr::Placeholder(_, _) => true,
         Expr::BinaryOp { left, right, .. } => {
