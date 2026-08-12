@@ -326,6 +326,8 @@ struct IoUringRuntime {
     submitted_cancellations: AtomicU64,
     #[cfg(feature = "linux-asupersync-uring")]
     largest_submission_batch: AtomicU64,
+    #[cfg(feature = "linux-asupersync-uring")]
+    write_page_batch_submissions: AtomicU64,
     initial_status: String,
     disabled: AtomicBool,
     disable_reason: OnceLock<&'static str>,
@@ -339,6 +341,8 @@ pub struct IoUringRuntimeStatus {
     pub initial_status: String,
     pub status: String,
     pub disable_reason: Option<&'static str>,
+    /// Logical `write_page_batch` operations submitted through the shared ring.
+    pub write_page_batch_submissions_total: u64,
 }
 
 impl fmt::Debug for IoUringRuntime {
@@ -388,6 +392,7 @@ impl IoUringRuntime {
                 submitted_requests: AtomicU64::new(0),
                 submitted_cancellations: AtomicU64::new(0),
                 largest_submission_batch: AtomicU64::new(0),
+                write_page_batch_submissions: AtomicU64::new(0),
                 initial_status,
                 disabled: AtomicBool::new(forced_failure),
                 disable_reason,
@@ -441,6 +446,9 @@ impl IoUringRuntime {
             initial_status: self.initial_status.clone(),
             status: self.status(),
             disable_reason: self.disable_reason(),
+            write_page_batch_submissions_total: self
+                .write_page_batch_submissions
+                .load(Ordering::Acquire),
         }
     }
 
@@ -1050,19 +1058,16 @@ impl VfsFile for IoUringFile {
         self.inner.shm_map(cx, region, size, extend)
     }
 
-    // bd-trfah/bd-bjm5d: forward the batch write to the wrapped UnixFile.
-    // Without this, the trait default loops `self.write`, which falls back
-    // per page through the uring gate — one blocking-pool hop per page —
-    // and the UnixFile single-hop batch override (4.9x on group-16 batches)
-    // is unreachable on Linux, where IoUringFile wraps every file-backed
-    // database. The uring data path has no batch submission today; when it
-    // grows one, this forward becomes the fallback arm.
+    // Submit independent pager writes together when the attached runtime can
+    // drive the shared ring. The Unix single-hop implementation remains the
+    // fallback for unavailable runtimes, oversized buffers, and overlapping
+    // ranges whose input ordering must be preserved.
     fn write_page_batch<'a>(
         &'a self,
         cx: &'a Cx,
         writes: &'a [(u64, &'a [u8])],
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        self.inner.write_page_batch(cx, writes)
+        self.write_page_batch_data_path(cx, writes)
     }
 
     fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
@@ -1342,6 +1347,138 @@ impl IoUringFile {
                 snapshot.write_conformal_upper_bound_us,
                 IO_URING_WRITE_CONFORMAL_BREACH_MSG,
             );
+        }
+        Ok(())
+    }
+
+    async fn write_page_batch_data_path(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        if writes.is_empty() || writes.iter().all(|(_, data)| data.is_empty()) {
+            return Ok(());
+        }
+        if !self.runtime.is_available() {
+            record_io_uring_write_unix_fallback();
+            return self.inner.write_page_batch(cx, writes).await;
+        }
+        let Some(native_cx) = cx.attached_native_cx() else {
+            record_io_uring_write_unix_fallback();
+            return self.inner.write_page_batch(cx, writes).await;
+        };
+
+        for (index, (offset, data)) in writes.iter().enumerate() {
+            let Some(end) = u64::try_from(data.len())
+                .ok()
+                .and_then(|len| offset.checked_add(len))
+            else {
+                return Err(FrankenError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "offset overflow during async io_uring page batch write",
+                )));
+            };
+            if data.len() > IO_URING_MAX_RW_CHUNK_BYTES {
+                record_io_uring_write_unix_fallback();
+                return self.inner.write_page_batch(cx, writes).await;
+            }
+            if data.is_empty() {
+                continue;
+            }
+            for (other_offset, other_data) in &writes[..index] {
+                if other_data.is_empty() {
+                    continue;
+                }
+                let other_end = other_offset
+                    .checked_add(u64::try_from(other_data.len()).expect("length fits u64"))
+                    .expect("all earlier ranges were validated");
+                if *offset < other_end && *other_offset < end {
+                    record_io_uring_write_unix_fallback();
+                    return self.inner.write_page_batch(cx, writes).await;
+                }
+            }
+        }
+
+        #[cfg(test)]
+        if FORCE_ASUPERSYNC_WRITE_ABORT.load(Ordering::Acquire) {
+            return Err(FrankenError::Abort);
+        }
+
+        #[cfg(test)]
+        if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
+            self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
+            record_io_uring_write_unix_fallback();
+            return self.inner.write_page_batch(cx, writes).await;
+        }
+
+        let file = self.inner.canonical_file()?;
+        let mut requests = Vec::with_capacity(writes.len());
+        for (offset, data) in writes.iter().filter(|(_, data)| !data.is_empty()) {
+            checkpoint_or_abort(cx)?;
+            let (request_id, receiver) = self.runtime.enqueue_write(
+                cx,
+                &native_cx,
+                Arc::clone(&file),
+                data.to_vec(),
+                *offset,
+                None,
+            )?;
+            requests.push((
+                *offset,
+                *data,
+                receiver,
+                RequestCancellationGuard::new(Arc::clone(&self.runtime), request_id),
+            ));
+        }
+
+        asupersync::runtime::yield_now().await;
+        if let Err(error) = self.runtime.ensure_driver(&native_cx) {
+            drop(requests);
+            warn!(
+                error = %error,
+                "shared io_uring batch driver unavailable for this context; using Unix async I/O"
+            );
+            record_io_uring_write_unix_fallback();
+            return self.inner.write_page_batch(cx, writes).await;
+        }
+        self.runtime
+            .write_page_batch_submissions
+            .fetch_add(1, Ordering::Relaxed);
+
+        for (offset, data, mut receiver, mut cancel_guard) in requests {
+            let completion = receiver
+                .recv(&native_cx)
+                .await
+                .map_err(|error| match error {
+                    oneshot::RecvError::Cancelled => FrankenError::Abort,
+                    oneshot::RecvError::Closed | oneshot::RecvError::PolledAfterCompletion => {
+                        FrankenError::Io(io::Error::other(format!(
+                            "shared io_uring page batch response channel failed: {error}"
+                        )))
+                    }
+                })?;
+            cancel_guard.disarm();
+            match completion {
+                DriverCompletion::Write { bytes_written } if bytes_written == data.len() => {}
+                DriverCompletion::Write { bytes_written } if bytes_written > 0 => {
+                    let remaining_offset = offset
+                        .checked_add(u64::try_from(bytes_written).expect("write length fits u64"))
+                        .expect("validated write range cannot overflow");
+                    self.write_data_path(cx, &data[bytes_written..], remaining_offset)
+                        .await?;
+                }
+                DriverCompletion::Write { .. } => {
+                    return Err(FrankenError::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "async io_uring page batch write advanced by 0 bytes",
+                    )));
+                }
+                DriverCompletion::Cancelled => return Err(FrankenError::Abort),
+                DriverCompletion::Failed(error) => return Err(FrankenError::Io(error)),
+                DriverCompletion::Read { .. } => {
+                    return Err(FrankenError::Io(io::Error::other(
+                        "shared io_uring returned a read completion for a page batch write",
+                    )));
+                }
+            }
+            checkpoint_or_abort(cx)?;
         }
         Ok(())
     }
@@ -1939,6 +2076,85 @@ mod tests {
             );
             trace_writer.flush_to_stderr();
         }
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_write_page_batch_submits_all_pages_with_one_driver_activation() {
+        const WRITE_COUNT: usize = 16;
+        const PAGE_SIZE: usize = 4096;
+
+        let _guard = io_uring_test_guard();
+        test_runtime().block_on(async {
+            let native_cx = NativeCx::current().expect("runtime block_on should install Cx");
+            let cx = Cx::new();
+            cx.set_native_cx(native_cx);
+            let vfs = IoUringVfs::new();
+            assert!(
+                vfs.is_available(),
+                "strict write batch proof requires io_uring: {}",
+                vfs.status()
+            );
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("shared_ring_16_writes.db");
+            let (file, _) = vfs
+                .open(&cx, Some(&path), open_flags_create_unlocked())
+                .expect("open should succeed");
+            let pages = (0..WRITE_COUNT)
+                .map(|page_index| {
+                    vec![u8::try_from(page_index + 1).expect("page pattern fits u8"); PAGE_SIZE]
+                })
+                .collect::<Vec<_>>();
+            let writes = pages
+                .iter()
+                .enumerate()
+                .map(|(page_index, page)| {
+                    (
+                        u64::try_from(page_index * PAGE_SIZE).expect("page offset fits u64"),
+                        page.as_slice(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let starts_before = file.runtime.driver_starts.load(Ordering::Relaxed);
+            let submitted_before = file.runtime.submitted_requests.load(Ordering::Relaxed);
+            let batches_before = vfs.status_snapshot().write_page_batch_submissions_total;
+            file.write_page_batch(&cx, &writes)
+                .await
+                .expect("page batch write should succeed");
+
+            assert_eq!(
+                vfs.status_snapshot().write_page_batch_submissions_total - batches_before,
+                1,
+                "one logical page batch must be observable"
+            );
+            assert_eq!(
+                file.runtime.submitted_requests.load(Ordering::Relaxed) - submitted_before,
+                u64::try_from(WRITE_COUNT).expect("write count fits u64"),
+                "each page write must produce exactly one SQE"
+            );
+            assert_eq!(
+                file.runtime.driver_starts.load(Ordering::Relaxed) - starts_before,
+                1,
+                "all page writes must share one driver activation"
+            );
+            assert!(
+                file.runtime
+                    .largest_submission_batch
+                    .load(Ordering::Relaxed)
+                    >= u64::try_from(WRITE_COUNT).expect("write count fits u64"),
+                "all page writes must reach one submission queue batch"
+            );
+
+            let written = std::fs::read(&path).expect("written file should be readable");
+            assert_eq!(written.len(), WRITE_COUNT * PAGE_SIZE);
+            for (page_index, page) in written.as_chunks::<PAGE_SIZE>().0.iter().enumerate() {
+                assert!(page.iter().all(|byte| {
+                    *byte == u8::try_from(page_index + 1).expect("page pattern fits u8")
+                }));
+            }
+        });
     }
 
     const ASYNC_VFS_TRACE_ENV: &str = "FSQLITE_ASYNC_VFS_TRACE";
