@@ -85676,10 +85676,10 @@ fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
                 return false;
             };
             let table_label = alias.as_deref().unwrap_or(&name.name);
-            // bd-phboe mechanism (a): the projection and WHERE checks admit
-            // correlated outer-qualified refs — the gate's job here is only
-            // to prove the INNER bindings from the single-table schema.
-            if scalar_expr_has_invalid_local_binding_allowing_outer_refs(expr, table, table_label) {
+            // The projection must bind strictly to the inner table: outer
+            // refs in the SELECT list keep routing to the connection
+            // evaluator (affinity/rewrite receipts depend on that).
+            if scalar_expr_has_invalid_local_binding(expr, table, table_label) {
                 return false;
             }
             if where_clause.as_deref().is_some_and(|where_expr| {
@@ -85688,13 +85688,19 @@ fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
             }) {
                 return false;
             }
-            !where_clause.as_deref().is_some_and(|where_expr| {
-                scalar_expr_has_invalid_local_binding_allowing_outer_refs(
-                    where_expr,
-                    table,
-                    table_label,
-                )
-            })
+            if !where_clause.as_deref().is_some_and(|where_expr| {
+                scalar_expr_has_invalid_local_binding(where_expr, table, table_label)
+            }) {
+                return true;
+            }
+            // bd-phboe mechanism (a): the strict WHERE check rejected the
+            // clause — admit exactly the one correlated shape the VDBE
+            // compiles correctly (the b612eb7b-lineage keeper shape): a
+            // single correlated equality probe `inner.col = outer.col` with
+            // at most one inner-only residual, per the same recognizer the
+            // correlated-EXISTS count-semijoin carve-out uses. Every other
+            // correlated shape keeps routing to the connection evaluator.
+            correlated_exists_matches_count_semijoin_shape(sub, &conn.schema.borrow())
         }
         SelectCore::Values(_) => false,
     }
@@ -85713,46 +85719,12 @@ fn scalar_expr_has_invalid_local_binding(
     table: &TableSchema,
     table_label: &str,
 ) -> bool {
-    scalar_expr_has_invalid_binding(expr, table, table_label, false)
-}
-
-/// bd-phboe mechanism (a): variant for the correlated-scalar compile gate.
-///
-/// A column qualified with a label OTHER than the inner scan's is a valid
-/// correlated-outer candidate (`c.id = p.category_id`), not an invalid
-/// binding — this restores the pre-0e4333cd1 (b612eb7b lineage) admission
-/// that kept single-table correlated scalar subqueries on the compiled
-/// path. Inner-labeled columns that do not resolve, the conservative
-/// bare-name routing, and RowValue/RAISE rejection keep their strict
-/// semantics, and every other caller (the EXISTS/IN gates, whose
-/// correlated-term rejections guard a real VDBE mishandling) keeps the
-/// strict variant above.
-fn scalar_expr_has_invalid_local_binding_allowing_outer_refs(
-    expr: &Expr,
-    table: &TableSchema,
-    table_label: &str,
-) -> bool {
-    scalar_expr_has_invalid_binding(expr, table, table_label, true)
-}
-
-fn scalar_expr_has_invalid_binding(
-    expr: &Expr,
-    table: &TableSchema,
-    table_label: &str,
-    allow_outer_qualifier: bool,
-) -> bool {
-    let recurse =
-        |expr: &Expr| scalar_expr_has_invalid_binding(expr, table, table_label, allow_outer_qualifier);
     match expr {
         Expr::Column(column, _) => {
             if let Some(qualifier) = column.table.as_deref() {
-                if !qualifier.eq_ignore_ascii_case(table_label) {
-                    // Foreign qualifier: a correlated-outer candidate for
-                    // the scalar gate, an invalid binding for strict callers.
-                    return !allow_outer_qualifier;
-                }
-                return table.column_index(&column.column).is_none()
-                    && !table_exposes_hidden_rowid_alias(table, &column.column);
+                return !qualifier.eq_ignore_ascii_case(table_label)
+                    || (table.column_index(&column.column).is_none()
+                        && !table_exposes_hidden_rowid_alias(table, &column.column));
             }
             table.column_index(&column.column).is_none()
                 && !table_exposes_hidden_rowid_alias(table, &column.column)
@@ -85761,19 +85733,33 @@ fn scalar_expr_has_invalid_binding(
             // binding map. Route it conservatively: the connection evaluator
             // can distinguish those cases from `no such column`.
         }
-        Expr::BinaryOp { left, right, .. } => recurse(left) || recurse(right),
+        Expr::BinaryOp { left, right, .. } => {
+            scalar_expr_has_invalid_local_binding(left, table, table_label)
+                || scalar_expr_has_invalid_local_binding(right, table, table_label)
+        }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
-        | Expr::Collate { expr, .. } => recurse(expr),
+        | Expr::Collate { expr, .. } => {
+            scalar_expr_has_invalid_local_binding(expr, table, table_label)
+        }
         Expr::Between {
             expr, low, high, ..
-        } => recurse(expr) || recurse(low) || recurse(high),
+        } => {
+            scalar_expr_has_invalid_local_binding(expr, table, table_label)
+                || scalar_expr_has_invalid_local_binding(low, table, table_label)
+                || scalar_expr_has_invalid_local_binding(high, table, table_label)
+        }
         Expr::In { expr, set, .. } => {
-            recurse(expr)
+            scalar_expr_has_invalid_local_binding(expr, table, table_label)
                 || matches!(
                     set,
-                    InSet::List(values) if values.iter().any(|value| recurse(value))
+                    InSet::List(values)
+                        if values.iter().any(|value| scalar_expr_has_invalid_local_binding(
+                            value,
+                            table,
+                            table_label,
+                        ))
                 )
         }
         Expr::Like {
@@ -85782,9 +85768,11 @@ fn scalar_expr_has_invalid_binding(
             escape,
             ..
         } => {
-            recurse(expr)
-                || recurse(pattern)
-                || escape.as_deref().is_some_and(|escape| recurse(escape))
+            scalar_expr_has_invalid_local_binding(expr, table, table_label)
+                || scalar_expr_has_invalid_local_binding(pattern, table, table_label)
+                || escape.as_deref().is_some_and(|escape| {
+                    scalar_expr_has_invalid_local_binding(escape, table, table_label)
+                })
         }
         Expr::Case {
             operand,
@@ -85792,11 +85780,14 @@ fn scalar_expr_has_invalid_binding(
             else_expr,
             ..
         } => {
-            operand.as_deref().is_some_and(|operand| recurse(operand))
-                || whens
-                    .iter()
-                    .any(|(when_expr, then_expr)| recurse(when_expr) || recurse(then_expr))
-                || else_expr.as_deref().is_some_and(|else_expr| recurse(else_expr))
+            operand.as_deref().is_some_and(|operand| {
+                scalar_expr_has_invalid_local_binding(operand, table, table_label)
+            }) || whens.iter().any(|(when_expr, then_expr)| {
+                scalar_expr_has_invalid_local_binding(when_expr, table, table_label)
+                    || scalar_expr_has_invalid_local_binding(then_expr, table, table_label)
+            }) || else_expr.as_deref().is_some_and(|else_expr| {
+                scalar_expr_has_invalid_local_binding(else_expr, table, table_label)
+            })
         }
         Expr::FunctionCall {
             args,
@@ -85806,11 +85797,23 @@ fn scalar_expr_has_invalid_binding(
         } => {
             matches!(
                 args,
-                FunctionArgs::List(args) if args.iter().any(|arg| recurse(arg))
-            ) || order_by.iter().any(|term| recurse(&term.expr))
-                || filter.as_deref().is_some_and(|filter| recurse(filter))
+                FunctionArgs::List(args)
+                    if args.iter().any(|arg| scalar_expr_has_invalid_local_binding(
+                        arg,
+                        table,
+                        table_label,
+                    ))
+            ) || order_by
+                .iter()
+                .any(|term| scalar_expr_has_invalid_local_binding(&term.expr, table, table_label))
+                || filter.as_deref().is_some_and(|filter| {
+                    scalar_expr_has_invalid_local_binding(filter, table, table_label)
+                })
         }
-        Expr::JsonAccess { expr, path, .. } => recurse(expr) || recurse(path),
+        Expr::JsonAccess { expr, path, .. } => {
+            scalar_expr_has_invalid_local_binding(expr, table, table_label)
+                || scalar_expr_has_invalid_local_binding(path, table, table_label)
+        }
         Expr::RowValue(_, _) | Expr::Raise { .. } => true,
         Expr::BoundOuterValue { .. }
         | Expr::Exists { .. }
@@ -177580,6 +177583,23 @@ mod autocommit_txn_tests {
         FrankenError::internal("forced retained autocommit flush failure")
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum RetainedFlushCheckpointFailure {
+        Busy,
+        Internal,
+    }
+
+    impl RetainedFlushCheckpointFailure {
+        fn error(self) -> FrankenError {
+            match self {
+                Self::Busy => FrankenError::Busy,
+                Self::Internal => {
+                    FrankenError::internal("forced retained autocommit checkpoint failure")
+                }
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct AppendFailingWalBackend<B> {
         inner: B,
@@ -177702,6 +177722,130 @@ mod autocommit_txn_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CheckpointFailingWalBackend<B> {
+        inner: B,
+        failure: RetainedFlushCheckpointFailure,
+    }
+
+    impl<B> CheckpointFailingWalBackend<B> {
+        const fn new(inner: B, failure: RetainedFlushCheckpointFailure) -> Self {
+            Self { inner, failure }
+        }
+    }
+
+    impl<B> fsqlite_pager::traits::WalBackend for CheckpointFailingWalBackend<B>
+    where
+        B: fsqlite_pager::traits::WalBackend,
+    {
+        fn begin_transaction<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.begin_transaction(cx).await })
+        }
+
+        fn append_frame<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+            page_data: &'a [u8],
+            db_size_if_commit: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.inner
+                    .append_frame(cx, page_number, page_data, db_size_if_commit)
+                    .await
+            })
+        }
+
+        fn append_frames<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            frames: &'a [fsqlite_pager::traits::WalFrameRef<'a>],
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.append_frames(cx, frames).await })
+        }
+
+        fn prepare_append_frames(
+            &self,
+            frames: &[fsqlite_pager::traits::WalFrameRef<'_>],
+        ) -> Result<Option<fsqlite_pager::traits::PreparedWalFrameBatch>> {
+            self.inner.prepare_append_frames(frames)
+        }
+
+        fn finalize_prepared_frames(
+            &self,
+            cx: &Cx,
+            prepared: &mut fsqlite_pager::traits::PreparedWalFrameBatch,
+        ) -> Result<()> {
+            self.inner.finalize_prepared_frames(cx, prepared)
+        }
+
+        fn append_prepared_frames<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            prepared: &'a mut fsqlite_pager::traits::PreparedWalFrameBatch,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.append_prepared_frames(cx, prepared).await })
+        }
+
+        fn read_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move { self.inner.read_page(cx, page_number).await })
+        }
+
+        fn read_page_pinned<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move { self.inner.read_page_pinned(cx, page_number).await })
+        }
+
+        fn supports_pinned_reads(&self) -> bool {
+            self.inner.supports_pinned_reads()
+        }
+
+        fn committed_txns_since_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, u64> {
+            Box::pin(async move { self.inner.committed_txns_since_page(cx, page_number).await })
+        }
+
+        fn committed_txn_count<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, u64> {
+            Box::pin(async move { self.inner.committed_txn_count(cx).await })
+        }
+
+        fn sync(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)
+        }
+
+        fn frame_count(&self) -> usize {
+            self.inner.frame_count()
+        }
+
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _mode: fsqlite_pager::traits::CheckpointMode,
+            _writer: &'a mut dyn fsqlite_pager::traits::CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> fsqlite_pager::traits::WalFuture<'a, fsqlite_pager::traits::CheckpointResult> {
+            let error = self.failure.error();
+            Box::pin(async move { Err(error) })
+        }
+    }
+
     async fn install_failing_retained_flush_wal_backend_with_vfs<V>(
         pager: &Arc<SimplePager<V>>,
         vfs: &V,
@@ -177756,6 +177900,79 @@ mod autocommit_txn_tests {
             PagerBackend::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 install_failing_retained_flush_wal_backend_with_vfs(p, &vfs, &cx, &wal_path).await;
+            }
+        }
+    }
+
+    async fn install_checkpoint_failing_retained_flush_wal_backend_with_vfs<V>(
+        pager: &Arc<SimplePager<V>>,
+        vfs: &V,
+        cx: &Cx,
+        wal_path: &Path,
+        failure: RetainedFlushCheckpointFailure,
+    ) where
+        V: Vfs + Send + Sync + 'static,
+        V::File: Send + Sync + 'static,
+    {
+        let (file, _) = vfs
+            .open(
+                cx,
+                Some(wal_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+            )
+            .expect("open existing WAL for checkpoint-failure injection");
+        let wal = WalFile::open(cx, file)
+            .await
+            .expect("reopen existing WAL for checkpoint-failure injection");
+        pager
+            .set_wal_backend(Box::new(CheckpointFailingWalBackend::new(
+                WalBackendAdapter::new(wal),
+                failure,
+            )))
+            .expect("install checkpoint-failing WAL backend");
+    }
+
+    async fn install_checkpoint_failing_retained_flush_wal_backend(
+        conn: &Connection,
+        failure: RetainedFlushCheckpointFailure,
+    ) {
+        let cx = conn.op_cx().unwrap();
+        let wal_path = wal_path_for_db_path(&conn.path);
+        match &conn.pager {
+            PagerBackend::Memory(p) => {
+                let vfs = p.vfs_handle();
+                install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
+                    p,
+                    vfs.as_ref(),
+                    &cx,
+                    &wal_path,
+                    failure,
+                )
+                .await;
+            }
+            #[cfg(target_os = "linux")]
+            PagerBackend::IoUring(p) => {
+                let vfs = IoUringVfs::new();
+                install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
+                    p, &vfs, &cx, &wal_path, failure,
+                )
+                .await;
+            }
+            #[cfg(unix)]
+            PagerBackend::Unix(p) => {
+                let vfs = UnixVfs::new();
+                install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
+                    p, &vfs, &cx, &wal_path, failure,
+                )
+                .await;
+            }
+            #[cfg(target_os = "windows")]
+            PagerBackend::Windows(p) => {
+                let vfs = fsqlite_vfs::WindowsVfs::new();
+                install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
+                    p, &vfs, &cx, &wal_path, failure,
+                )
+                .await;
             }
         }
     }
@@ -178682,6 +178899,98 @@ mod autocommit_txn_tests {
             assert!(
                 rows_after_failure.is_empty(),
                 "failed retained flush must not publish the parked batch"
+            );
+        });
+    }
+
+    #[test]
+    fn test_retained_autocommit_flush_ignores_transient_post_commit_checkpoint_failure() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("retained_autocommit_checkpoint_busy.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&db_str).await.unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+                .await
+                .unwrap();
+            conn.execute("PRAGMA journal_mode = 'wal';").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            assert!(
+                conn.retained_autocommit_txn.borrow().is_some(),
+                "the write must be parked before the read boundary flush"
+            );
+
+            install_checkpoint_failing_retained_flush_wal_backend(
+                &conn,
+                RetainedFlushCheckpointFailure::Busy,
+            )
+            .await;
+
+            let rows = conn
+                .query("SELECT id FROM t ORDER BY id")
+                .await
+                .expect("durable commit must not become a statement error when passive checkpoint is busy");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
+
+            let oracle = rusqlite::Connection::open(&db_path).unwrap();
+            let durable_count: i64 = oracle
+                .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                durable_count, 1,
+                "the swallowed checkpoint Busy must follow a durable WAL commit"
+            );
+        });
+    }
+
+    #[test]
+    fn test_retained_autocommit_flush_propagates_nontransient_post_commit_checkpoint_failure() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("retained_autocommit_checkpoint_internal.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&db_str).await.unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+                .await
+                .unwrap();
+            conn.execute("PRAGMA journal_mode = 'wal';").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+
+            install_checkpoint_failing_retained_flush_wal_backend(
+                &conn,
+                RetainedFlushCheckpointFailure::Internal,
+            )
+            .await;
+
+            let error = conn
+                .query("SELECT id FROM t ORDER BY id")
+                .await
+                .expect_err("non-transient checkpoint failure must remain visible");
+            assert!(
+                error
+                    .to_string()
+                    .contains("forced retained autocommit checkpoint failure"),
+                "expected injected non-transient checkpoint failure, got {error}"
+            );
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
+
+            let oracle = rusqlite::Connection::open(&db_path).unwrap();
+            let durable_count: i64 = oracle
+                .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                durable_count, 1,
+                "the propagated checkpoint failure must still follow a durable WAL commit"
             );
         });
     }
