@@ -10942,6 +10942,12 @@ pub struct Connection {
     /// Temporary escape hatch for execution paths whose compiled programs must
     /// not be cached globally, such as CTE temp-table runs with dynamic root pages.
     bypass_compiled_cache: Cell<bool>,
+    /// bd-2fong: true while the subquery rewrite pass descends into a position
+    /// that legitimately accepts a row value (row-value comparison operand,
+    /// vector-IN left-hand side). Outside such positions a multi-column
+    /// subquery in an expression is an error ("sub-select returns N columns -
+    /// expected 1"), never a silent NULL.
+    scalar_subquery_row_value_context: Cell<bool>,
     /// Connection-local prepared statement template cache keyed by raw SQL.
     /// Avoids rebuilding the prepared wrapper for repeated `prepare()` calls.
     prepared_cache: RefCell<LruCache<u64, Arc<PreparedCacheEntry>>>,
@@ -12236,6 +12242,7 @@ impl Connection {
             parse_cache_cookie: RefCell::new(0),
             compiled_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             bypass_compiled_cache: Cell::new(false),
+            scalar_subquery_row_value_context: Cell::new(false),
             prepared_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             statement_reuse_trace: RefCell::new(StatementReuseTraceState::default()),
             planner_directive_cache: RefCell::new(
@@ -12723,6 +12730,7 @@ impl Connection {
             // Compiled bytecode cache (bd-1dp9.6.7.2.2)
             compiled_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             bypass_compiled_cache: Cell::new(false),
+            scalar_subquery_row_value_context: Cell::new(false),
             prepared_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             statement_reuse_trace: RefCell::new(StatementReuseTraceState::default()),
             planner_directive_cache: RefCell::new(
@@ -30609,7 +30617,7 @@ impl Connection {
                 Ok(Cow::Borrowed(statement))
             }
             Statement::Select(select)
-                if is_expression_only_select(select) && expression_only_has_subquery(select) =>
+                if is_expression_only_select(select) && expression_only_has_core_subquery(select) =>
             {
                 // Expression-only SELECTs with scalar subqueries in result
                 // columns are handled by execute_expression_only_with_subqueries
@@ -30617,6 +30625,9 @@ impl Connection {
                 // subquery via execute_statement would create nested autocommit
                 // transactions that can trigger reload_memdb_from_pager,
                 // destroying CTE temp tables between subquery evaluations.
+                // bd-2fong: the narrow (core-only) predicate keeps top-level
+                // ORDER BY / LIMIT scalar subqueries eligible for the eager
+                // fold below — that evaluator does not handle those positions.
                 Ok(Cow::Borrowed(statement))
             }
             Statement::Select(select) => {
@@ -75787,6 +75798,43 @@ fn expression_only_has_subquery(select: &SelectStatement) -> bool {
         })
 }
 
+/// bd-2fong: narrow variant for the eager-rewrite skip in
+/// [`Connection::rewrite_subquery_statement`]. That skip exists because
+/// `execute_expression_only_with_subqueries` evaluates result-column
+/// subqueries itself (and eager evaluation there would nest autocommit
+/// transactions). It covers exactly what that evaluator handles — subqueries
+/// in the SELECT core. Top-level ORDER BY / LIMIT / OFFSET scalar subqueries
+/// are NOT handled there and must still be eagerly folded to literals by the
+/// statement rewrite, as they were before [`expression_only_has_subquery`]
+/// was widened for the dispatch gates; skipping them leaves `SELECT 1 ORDER
+/// BY (SELECT ...)` with an unevaluated subquery in a position the
+/// expression VDBE cannot lower.
+fn expression_only_has_core_subquery(select: &SelectStatement) -> bool {
+    match &select.body.select {
+        SelectCore::Values(rows) => rows.iter().flatten().any(expr_has_any_subquery),
+        SelectCore::Select {
+            columns,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            columns.iter().any(|column| {
+                matches!(
+                    column,
+                    ResultColumn::Expr { expr, .. } if expr_has_any_subquery(expr)
+                )
+            }) || where_clause.as_deref().is_some_and(expr_has_any_subquery)
+                || group_by.iter().any(expr_has_any_subquery)
+                || having.as_deref().is_some_and(expr_has_any_subquery)
+                || windows
+                    .iter()
+                    .any(|window| window_spec_contains_subquery_match(&window.spec, &mut |_| true))
+        }
+    }
+}
+
 /// Check if a SELECT statement uses DISTINCT.
 fn is_distinct_select(select: &SelectStatement) -> bool {
     match &select.body.select {
@@ -88056,6 +88104,94 @@ fn is_correlated_subquery_with_schema(subquery: &SelectStatement, schema: &[Tabl
     probed != *subquery
 }
 
+/// bd-2fong: derive a view's output column names for correlation probing.
+///
+/// Prefers the explicit `CREATE VIEW v (cols...)` list; otherwise reads the
+/// stored definition's projection, accepting aliased expressions and plain
+/// column references. Star/complex unaliased projections return `None` and
+/// the view stays opaque (conservatively correlated) for the probe.
+fn view_output_column_names(view: &ViewDef) -> Option<Vec<String>> {
+    if !view.columns.is_empty() {
+        return Some(view.columns.clone());
+    }
+    let SelectCore::Select { columns, .. } = &view.query.body.select else {
+        return None;
+    };
+    let mut names = Vec::with_capacity(columns.len());
+    for column in columns {
+        match column {
+            ResultColumn::Expr {
+                alias: Some(alias), ..
+            } => names.push(alias.clone()),
+            ResultColumn::Expr {
+                expr: Expr::Column(column_ref, _),
+                ..
+            } => names.push(column_ref.column.to_string()),
+            ResultColumn::Expr { .. } | ResultColumn::Star | ResultColumn::TableStar(_) => {
+                return None;
+            }
+        }
+    }
+    Some(names)
+}
+
+/// bd-2fong: correlation verdict for the eager subquery-rewrite decision.
+///
+/// The schema-aware probe treats bare columns in scopes whose FROM relation
+/// is absent from the base-table schema as potential outer references —
+/// which classified every view- or sqlite_schema-sourced nested probe as
+/// correlated and starved the eager IN-rewrite that keeps
+/// `... IN (SELECT ... WHERE x IN (SELECT ... FROM view_or_sqlite_schema))`
+/// on the compiled path. When (and only when) the subquery tree references
+/// such a relation, probe against a schema augmented with synthetic
+/// inventories: the fixed sqlite_schema/sqlite_master columns and each
+/// view's derivable output columns. Views whose output cannot be derived
+/// stay opaque and keep the conservative correlated verdict.
+fn rewrite_probe_is_correlated(conn: &Connection, sub: &SelectStatement) -> bool {
+    let schema = conn.schema.borrow();
+    let views = conn.views.borrow();
+    let references_synthetic_relation = select_contains_relation_reference(sub, &mut |name| {
+        name.schema.is_none()
+            && (is_sqlite_schema_name(&name.name)
+                || views
+                    .iter()
+                    .any(|view| view.name.eq_ignore_ascii_case(&name.name)))
+    });
+    if !references_synthetic_relation {
+        return is_correlated_subquery_with_schema(sub, &schema);
+    }
+    let synthetic_table = |name: &str, columns: Vec<String>| TableSchema {
+        name: name.to_owned(),
+        root_page: 1,
+        columns: columns
+            .into_iter()
+            .map(|column| ColumnInfo::basic(column, 'A', false))
+            .collect(),
+        indexes: Vec::new(),
+        strict: false,
+        without_rowid: false,
+        primary_key_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
+        check_constraints: Vec::new(),
+    };
+    let mut augmented = schema.clone();
+    for builtin in ["sqlite_schema", "sqlite_master"] {
+        augmented.push(synthetic_table(
+            builtin,
+            ["type", "name", "tbl_name", "rootpage", "sql"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        ));
+    }
+    for view in views.iter() {
+        if let Some(columns) = view_output_column_names(view) {
+            augmented.push(synthetic_table(&view.name, columns));
+        }
+    }
+    is_correlated_subquery_with_schema(sub, &augmented)
+}
+
 fn expr_has_external_column_ref_with_schema_in_core(
     expr: &Expr,
     core: &SelectCore,
@@ -90691,8 +90827,7 @@ fn rewrite_in_expr<'a>(
                     // Correlated IN subqueries reference outer table columns and
                     // must be evaluated per-row; skip eager rewrite.
                     let vdbe_supported = in_subquery_supported_by_vdbe(sub, conn);
-                    let is_correlated =
-                        is_correlated_subquery_with_schema(sub, &conn.schema.borrow());
+                    let is_correlated = rewrite_probe_is_correlated(conn, sub);
                     let should_eager_rewrite = !is_correlated
                         && (!vdbe_supported
                             || (rewrite_in_subqueries
@@ -90751,6 +90886,14 @@ fn rewrite_in_expr<'a>(
                     }
                 }
                 if !preserve_native_scalar_operand {
+                    // bd-2fong: a vector-IN left-hand side legitimately carries
+                    // a multi-column subquery; its width is validated against
+                    // the RHS downstream (validate_in_list_lhs_shape /
+                    // materialization), not by the scalar arity rule.
+                    let _row_value_guard = BoolCellRestoreGuard::new(
+                        &conn.scalar_subquery_row_value_context,
+                        matches!(inner.as_ref(), Expr::Subquery(_, _) | Expr::RowValue(..)),
+                    );
                     rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
                 }
                 // Keep vector IN intact. The connection evaluator compares a
@@ -90767,7 +90910,7 @@ fn rewrite_in_expr<'a>(
                 // Correlated EXISTS subqueries reference outer table columns and
                 // must be evaluated per-row; skip the eager rewrite so they survive
                 // into the row-level filter evaluation (eval_join_expr).
-                if is_correlated_subquery_with_schema(subquery, &conn.schema.borrow()) {
+                if rewrite_probe_is_correlated(conn, subquery) {
                     return Ok(());
                 }
                 // frankensim-kl17o: a placeholder-bearing subquery is
@@ -90789,7 +90932,7 @@ fn rewrite_in_expr<'a>(
                 // Correlated scalar subqueries reference outer table columns and
                 // must be evaluated per-row; skip the eager rewrite so they survive
                 // into the VDBE codegen which handles them via emit_scalar_subquery.
-                if is_correlated_subquery_with_schema(sub, &conn.schema.borrow()) {
+                if rewrite_probe_is_correlated(conn, sub) {
                     return Ok(());
                 }
                 // frankensim-kl17o: parameter-dependent subqueries must not be
@@ -90802,9 +90945,20 @@ fn rewrite_in_expr<'a>(
                 // `SET (a, b) = (SELECT a, b FROM ...)` — must survive to codegen,
                 // which binds each output column to its target. Folding it here takes
                 // only the first row's first value and would silently drop the rest.
-                // bd-6utze.
-                if conn.select_result_column_count(sub, &[], &mut Vec::new()) != 1 {
-                    return Ok(());
+                // bd-6utze. bd-2fong: outside a row-value-accepting position that
+                // survival is an error, not a silent NULL — stock SQLite rejects
+                // `SELECT (SELECT * FROM two_col_table)` at prepare with
+                // "sub-select returns 2 columns - expected 1", while our codegen's
+                // emit_scalar_subquery_result_value has no lowering for the shape
+                // and would leave the register NULL.
+                let column_count = conn.select_result_column_count(sub, &[], &mut Vec::new());
+                if column_count != 1 {
+                    if conn.scalar_subquery_row_value_context.get() {
+                        return Ok(());
+                    }
+                    return Err(FrankenError::FunctionError(format!(
+                        "sub-select returns {column_count} columns - expected 1"
+                    )));
                 }
                 let rows = conn
                     .execute_statement(&Statement::Select(*sub.clone()), params)
@@ -90826,8 +90980,42 @@ fn rewrite_in_expr<'a>(
                 );
             }
             Expr::BinaryOp { left, right, .. } => {
-                rewrite_in_expr(left, conn, rewrite_in_subqueries, params).await?;
-                rewrite_in_expr(right, conn, rewrite_in_subqueries, params).await?;
+                // bd-2fong: a comparison operand faces a row value when the
+                // OTHER side is a row value (explicit tuple or a multi-column
+                // subquery); only then may a multi-column subquery survive the
+                // rewrite for codegen's vector comparison. `x = (SELECT a, b)`
+                // stays an arity error.
+                let operand_width = |expr: &Expr| -> usize {
+                    match expr {
+                        Expr::RowValue(values, _) => values.len(),
+                        Expr::Subquery(sub, _) => {
+                            conn.select_result_column_count(sub, &[], &mut Vec::new())
+                        }
+                        _ => 1,
+                    }
+                };
+                // Grant the exemption only when the operand IS the subquery:
+                // if it merely contains one deeper down (CASE arm, function
+                // argument), that inner position is scalar and must keep the
+                // arity error.
+                let left_faces_row_value =
+                    matches!(left.as_ref(), Expr::Subquery(_, _)) && operand_width(right) > 1;
+                let right_faces_row_value =
+                    matches!(right.as_ref(), Expr::Subquery(_, _)) && operand_width(left) > 1;
+                {
+                    let _row_value_guard = BoolCellRestoreGuard::new(
+                        &conn.scalar_subquery_row_value_context,
+                        left_faces_row_value,
+                    );
+                    rewrite_in_expr(left, conn, rewrite_in_subqueries, params).await?;
+                }
+                {
+                    let _row_value_guard = BoolCellRestoreGuard::new(
+                        &conn.scalar_subquery_row_value_context,
+                        right_faces_row_value,
+                    );
+                    rewrite_in_expr(right, conn, rewrite_in_subqueries, params).await?;
+                }
             }
             Expr::UnaryOp { expr: inner, .. }
             | Expr::IsNull { expr: inner, .. }
@@ -160169,6 +160357,38 @@ mod tests {
     }
 
     #[test]
+    fn temp_probe_bd2fong_invalid_scalar_shapes() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE scalar_outer (x INTEGER NOT NULL);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO scalar_outer VALUES (1), (2);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE scalar_inner (a INTEGER, b INTEGER);")
+                .await
+                .unwrap();
+            for (tag, sql) in [
+                ("star", "SELECT (SELECT * FROM scalar_inner) FROM scalar_outer;"),
+                (
+                    "table_star",
+                    "SELECT (SELECT scalar_inner.* FROM scalar_inner) FROM scalar_outer;",
+                ),
+                ("bare_nope", "SELECT (SELECT nope FROM scalar_inner) FROM scalar_outer;"),
+                (
+                    "qual_nope",
+                    "SELECT (SELECT bad.nope FROM scalar_inner) FROM scalar_outer;",
+                ),
+            ] {
+                let outcome = conn.query(sql).await;
+                eprintln!("PROBE {tag}: {outcome:?}");
+            }
+            panic!("probe complete");
+        });
+    }
+
+    #[test]
     fn test_correlated_scalar_subquery_routes_unsupported_shapes_to_complete_evaluator() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -179083,17 +179303,17 @@ mod autocommit_txn_tests {
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "the write must be parked before the read boundary flush"
-            );
-
             install_checkpoint_failing_retained_flush_wal_backend(
                 &conn,
                 RetainedFlushCheckpointFailure::Busy,
             )
             .await;
+
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            assert!(
+                conn.retained_autocommit_txn.borrow().is_some(),
+                "the write must be parked before the read boundary flush"
+            );
 
             let rows = conn.query("SELECT id FROM t ORDER BY id").await.expect(
                 "durable commit must not become a statement error when passive checkpoint is busy",
@@ -179130,13 +179350,17 @@ mod autocommit_txn_tests {
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
-
             install_checkpoint_failing_retained_flush_wal_backend(
                 &conn,
                 RetainedFlushCheckpointFailure::Internal,
             )
             .await;
+
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            assert!(
+                conn.retained_autocommit_txn.borrow().is_some(),
+                "the write must be parked before the read boundary flush"
+            );
 
             let error = conn
                 .query("SELECT id FROM t ORDER BY id")
