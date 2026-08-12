@@ -90049,6 +90049,57 @@ fn substitute_outer_refs_in_select_scoped(
             &visible_cte_names,
         );
     }
+    // bd-2fong: statement-level ORDER BY and LIMIT resolve in the primary
+    // core's scope, so correlated outer references there must substitute
+    // exactly like WHERE/HAVING do. Previously only the cores were walked and
+    // `... ORDER BY abs(y - outer.x) LIMIT 1` failed with NoSuchColumn on the
+    // outer-qualified name. Output aliases stay local (not substituted),
+    // matching WHERE/HAVING alias handling.
+    if !select.order_by.is_empty() || select.limit.is_some() {
+        let (protected_tables, protected_unqualified_columns, local_output_names) = {
+            let core = &select.body.select;
+            (
+                protected_tables_for_core(core, ancestor_tables),
+                protected_unqualified_columns_for_core(
+                    core,
+                    lookup,
+                    &visible_cte_names,
+                    ancestor_unqualified_columns,
+                ),
+                collect_select_core_result_aliases(core),
+            )
+        };
+        for term in &mut select.order_by {
+            term.expr = substitute_outer_refs_in_expr(
+                &term.expr,
+                lookup,
+                &protected_tables,
+                protected_unqualified_columns.as_ref(),
+                &local_output_names,
+                &visible_cte_names,
+            );
+        }
+        if let Some(limit) = &mut select.limit {
+            limit.limit = substitute_outer_refs_in_expr(
+                &limit.limit,
+                lookup,
+                &protected_tables,
+                protected_unqualified_columns.as_ref(),
+                &local_output_names,
+                &visible_cte_names,
+            );
+            if let Some(offset) = &mut limit.offset {
+                *offset = substitute_outer_refs_in_expr(
+                    offset,
+                    lookup,
+                    &protected_tables,
+                    protected_unqualified_columns.as_ref(),
+                    &local_output_names,
+                    &visible_cte_names,
+                );
+            }
+        }
+    }
 }
 
 fn substitute_outer_refs_in_select_core(
@@ -90960,6 +91011,15 @@ fn rewrite_in_expr<'a>(
                         "sub-select returns {column_count} columns - expected 1"
                     )));
                 }
+                // bd-2fong red 2: a scalar subquery donates its result
+                // expression's affinity to enclosing comparisons — SQLite
+                // evaluates `(SELECT CAST(1 AS INTEGER)) = '1'` as 1. Folding
+                // to a bare literal dropped that donor, so comparisons ran
+                // with no affinity. Fold to BoundOuterValue (value +
+                // affinity) whenever the subquery has a derivable affinity;
+                // resolve_operand_affinity already reads it back first.
+                let folded_affinity =
+                    scalar_subquery_result_affinity(sub, &conn.schema.borrow());
                 let rows = conn
                     .execute_statement(&Statement::Select(*sub.clone()), params)
                     .await?;
@@ -90968,16 +91028,25 @@ fn rewrite_in_expr<'a>(
                     .next()
                     .and_then(|row| row.values.into_iter().next())
                     .unwrap_or(SqliteValue::Null);
-                *expr = Expr::Literal(
-                    match val {
-                        SqliteValue::Integer(i) => Literal::Integer(i),
-                        SqliteValue::Float(f) => Literal::Float(f),
-                        SqliteValue::Text(s) => Literal::String(s.to_string()),
-                        SqliteValue::Blob(b) => Literal::Blob(b.to_vec()),
-                        SqliteValue::Null => Literal::Null,
-                    },
-                    *span,
-                );
+                *expr = if folded_affinity == TypeAffinity::Blob {
+                    Expr::Literal(
+                        match val {
+                            SqliteValue::Integer(i) => Literal::Integer(i),
+                            SqliteValue::Float(f) => Literal::Float(f),
+                            SqliteValue::Text(s) => Literal::String(s.to_string()),
+                            SqliteValue::Blob(b) => Literal::Blob(b.to_vec()),
+                            SqliteValue::Null => Literal::Null,
+                        },
+                        *span,
+                    )
+                } else {
+                    Expr::BoundOuterValue {
+                        value: val,
+                        collation: BoundCollation::Unspecified,
+                        affinity: Some(folded_affinity),
+                        span: *span,
+                    }
+                };
             }
             Expr::BinaryOp { left, right, .. } => {
                 // bd-2fong: a comparison operand faces a row value when the
@@ -129583,7 +129652,10 @@ mod tests {
             let conn = Connection::open(":memory:").await.unwrap();
             for sql in [
                 "SELECT 42 LIMIT 0 OFFSET NULL;",
-                "VALUES (42) LIMIT 0 OFFSET NULL;",
+                // bd-2fong parity: a bare `VALUES ... LIMIT` is a stock
+                // parse error (pinned below); the derived form carries the
+                // VALUES-shaped receipt.
+                "SELECT * FROM (VALUES (42)) LIMIT 0 OFFSET NULL;",
             ] {
                 let rows = conn
                     .query(sql)
@@ -129591,6 +129663,11 @@ mod tests {
                     .expect("LIMIT zero must bypass OFFSET evaluation");
                 assert!(rows.is_empty(), "unexpected rows for `{sql}`");
             }
+            let bare = conn.query("VALUES (42) LIMIT 0 OFFSET NULL;").await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite (3.46.1 oracle) rejects LIMIT after a bare VALUES term: {bare:?}"
+            );
         });
     }
 
@@ -129621,9 +129698,13 @@ mod tests {
                 &[SqliteValue::Integer(11), SqliteValue::Integer(12)]
             );
 
+            // bd-2fong parity: bare `VALUES ... ORDER BY/LIMIT` is a stock
+            // parse error; the derived form preserves the statement-global
+            // bind-order receipt (oracle: [3,1] sorted -> LIMIT 1 OFFSET 1
+            // -> 3).
             let values_rows = conn
                 .query_with_params(
-                    "VALUES (?), (?) ORDER BY 1 LIMIT ? OFFSET ?;",
+                    "SELECT * FROM (VALUES (?), (?)) ORDER BY 1 LIMIT ? OFFSET ?;",
                     &[
                         SqliteValue::Integer(3),
                         SqliteValue::Integer(1),
@@ -129634,6 +129715,21 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(values_rows[0].values(), &[SqliteValue::Integer(3)]);
+            let bare = conn
+                .query_with_params(
+                    "VALUES (?), (?) ORDER BY 1 LIMIT ? OFFSET ?;",
+                    &[
+                        SqliteValue::Integer(3),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(1),
+                    ],
+                )
+                .await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite (3.46.1 oracle) rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
+            );
 
             let literal_text = conn.query("SELECT 42 LIMIT '1' OFFSET '0';").await.unwrap();
             assert_eq!(literal_text[0].values(), &[SqliteValue::Integer(42)]);
@@ -129721,7 +129817,11 @@ mod tests {
 
             for sql in [
                 "SELECT fail_if_invoked() LIMIT ?;",
-                "VALUES (fail_if_invoked()) LIMIT ?;",
+                // bd-2fong parity: bare `VALUES ... LIMIT` is a stock parse
+                // error; the derived form still short-circuits row
+                // evaluation under LIMIT 0 (oracle: derived VALUES with an
+                // overflowing expression returns zero rows, no error).
+                "SELECT * FROM (VALUES (fail_if_invoked())) LIMIT ?;",
             ] {
                 let rows = conn
                     .query_with_params(sql, &[SqliteValue::Integer(0)])
@@ -130092,7 +130192,12 @@ mod tests {
     fn test_expression_only_order_by_placeholder_is_constant_not_ordinal() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            let sql = "VALUES (1, 2), (2, 1) ORDER BY ? LIMIT ?;";
+            // bd-2fong parity: bare `VALUES ... ORDER BY` is a stock parse
+            // error (pinned below); the derived form carries the receipt.
+            // Oracle (C-SQLite 3.46.1): a BOUND placeholder in ORDER BY is a
+            // constant (original row order preserved), while the literal `2`
+            // is a column ordinal (rows reordered).
+            let sql = "SELECT * FROM (VALUES (1, 2), (2, 1)) ORDER BY ? LIMIT ?;";
             let params = [SqliteValue::Integer(2), SqliteValue::Integer(2)];
             let expected = vec![
                 vec![SqliteValue::Integer(1), SqliteValue::Integer(2)],
@@ -130110,7 +130215,7 @@ mod tests {
             );
 
             let syntactic_ordinal = conn
-                .query("VALUES (1, 2), (2, 1) ORDER BY 2;")
+                .query("SELECT * FROM (VALUES (1, 2), (2, 1)) ORDER BY 2;")
                 .await
                 .unwrap();
             assert_eq!(
@@ -130119,6 +130224,14 @@ mod tests {
                     vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
                     vec![SqliteValue::Integer(1), SqliteValue::Integer(2)],
                 ]
+            );
+
+            let bare = conn
+                .query_with_params("VALUES (1, 2), (2, 1) ORDER BY ? LIMIT ?;", &params)
+                .await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite (3.46.1 oracle) rejects ORDER BY after a bare VALUES term: {bare:?}"
             );
         });
     }
@@ -159594,6 +159707,10 @@ mod tests {
                 matches!(
                     rewritten.order_by[0].expr,
                     fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(2), _)
+                        | fsqlite_ast::Expr::BoundOuterValue {
+                            value: SqliteValue::Integer(2),
+                            ..
+                        }
                 ),
                 "top-level ORDER BY scalar subquery should be eagerly rewritten"
             );
@@ -159619,6 +159736,10 @@ mod tests {
                 matches!(
                     limit.limit,
                     fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(3), _)
+                        | fsqlite_ast::Expr::BoundOuterValue {
+                            value: SqliteValue::Integer(3),
+                            ..
+                        }
                 ),
                 "top-level LIMIT scalar subquery should be eagerly rewritten"
             );
@@ -159647,6 +159768,10 @@ mod tests {
                 matches!(
                     rewritten.order_by[0].expr,
                     fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(2), _)
+                        | fsqlite_ast::Expr::BoundOuterValue {
+                            value: SqliteValue::Integer(2),
+                            ..
+                        }
                 ),
                 "statement-level rewrite should not skip top-level ORDER BY scalar subqueries"
             );
@@ -159675,6 +159800,10 @@ mod tests {
                 matches!(
                     limit.limit,
                     fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(3), _)
+                        | fsqlite_ast::Expr::BoundOuterValue {
+                            value: SqliteValue::Integer(3),
+                            ..
+                        }
                 ),
                 "statement-level rewrite should not skip top-level LIMIT scalar subqueries"
             );
@@ -178098,6 +178227,41 @@ mod autocommit_txn_tests {
             Box::pin(async move { self.inner.begin_transaction(cx).await })
         }
 
+        fn published_snapshot(&self) -> Option<fsqlite_pager::traits::WalPublicationSnapshot> {
+            self.inner.published_snapshot()
+        }
+
+        fn pinned_read_snapshot(&self) -> Option<fsqlite_pager::traits::WalPublicationSnapshot> {
+            self.inner.pinned_read_snapshot()
+        }
+
+        fn pinned_logical_read_snapshot<'a>(
+            &'a self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            Option<fsqlite_pager::traits::WalLogicalReadSnapshot>,
+        > {
+            Box::pin(async move { self.inner.pinned_logical_read_snapshot(cx).await })
+        }
+
+        fn refresh_published_snapshot<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            Option<fsqlite_pager::traits::WalPublicationSnapshot>,
+        > {
+            Box::pin(async move { self.inner.refresh_published_snapshot(cx).await })
+        }
+
+        fn publish_authorized_deferred_commit<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.publish_authorized_deferred_commit(cx).await })
+        }
+
         fn append_frame<'a>(
             &'a mut self,
             cx: &'a Cx,
@@ -178143,6 +178307,65 @@ mod autocommit_txn_tests {
             Box::pin(async move { self.inner.append_prepared_frames(cx, prepared).await })
         }
 
+        fn persist_parallel_wal_commit_certificate<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            certificate: &'a fsqlite_wal::ParallelWalCommitCertificate,
+            wal_frame_start: u64,
+            wal_frame_end: u64,
+            sync: bool,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.inner
+                    .persist_parallel_wal_commit_certificate(
+                        cx,
+                        certificate,
+                        wal_frame_start,
+                        wal_frame_end,
+                        sync,
+                    )
+                    .await
+            })
+        }
+
+        fn reconcile_parallel_wal_commit<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            certificate: &'a fsqlite_wal::ParallelWalCommitCertificate,
+            wal_frame_start: u64,
+            wal_frame_end: u64,
+            sync: bool,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            fsqlite_pager::traits::ParallelWalCommitReconciliation,
+        > {
+            Box::pin(async move {
+                self.inner
+                    .reconcile_parallel_wal_commit(
+                        cx,
+                        certificate,
+                        wal_frame_start,
+                        wal_frame_end,
+                        sync,
+                    )
+                    .await
+            })
+        }
+
+        fn latest_authorized_parallel_wal_commit_certificate<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            Option<fsqlite_wal::ParallelWalCommitCertificate>,
+        > {
+            Box::pin(async move {
+                self.inner
+                    .latest_authorized_parallel_wal_commit_certificate(cx)
+                    .await
+            })
+        }
+
         fn read_page<'a>(
             &'a mut self,
             cx: &'a Cx,
@@ -178169,6 +178392,25 @@ mod autocommit_txn_tests {
             page_number: u32,
         ) -> fsqlite_pager::traits::WalFuture<'a, u64> {
             Box::pin(async move { self.inner.committed_txns_since_page(cx, page_number).await })
+        }
+
+        fn conflicting_pages_since_snapshot<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            snapshot: fsqlite_wal::TransactionConflictSnapshot,
+            page_numbers: &'a [u32],
+            page_baselines: &'a [fsqlite_wal::TransactionConflictPageBaseline],
+        ) -> fsqlite_pager::traits::WalFuture<'a, Vec<u32>> {
+            Box::pin(async move {
+                self.inner
+                    .conflicting_pages_since_snapshot(
+                        cx,
+                        snapshot,
+                        page_numbers,
+                        page_baselines,
+                    )
+                    .await
+            })
         }
 
         fn committed_txn_count<'a>(
