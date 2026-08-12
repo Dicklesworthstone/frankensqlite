@@ -1,0 +1,30 @@
+
+=== read: 20 ctrl + 20 rc invocations, 21 shared cells ===
+cell                                                           n  F/C@ctrl  F/C@rc     DiD  C_drift
+100-rows-count                                             20/20     0.203   0.338   1.666   49.257 unit-chg REGRESS
+100-rows-full-table-scan                                   20/20     0.240   0.356   1.486    1.020 REGRESS
+100-rows-indexed-lookup-secondary                          20/20     0.161   0.164   1.017   56.238 unit-chg
+100-rows-order-by-limit-20                                 20/20     0.256   0.350   1.369    0.979 REGRESS
+100-rows-point-lookup-pk                                   20/20     0.182   0.227   1.247   53.181 unit-chg REGRESS
+100-rows-range-scan-10-rows                                20/20     0.262   0.702   2.683    0.985 REGRESS
+100-rows-sum-group-by-10-groups                            20/20     0.657   2.216   3.372    1.100 REGRESS
+1000-rows-count                                            20/20     0.161   0.247   1.531   51.998 unit-chg REGRESS
+1000-rows-full-table-scan                                  20/20     0.249   0.304   1.221    1.040 REGRESS
+1000-rows-indexed-lookup-secondary                         20/20     0.147   0.150   1.017   56.114 unit-chg
+1000-rows-order-by-limit-20                                20/20     0.266   0.314   1.180    0.983 REGRESS
+1000-rows-point-lookup-pk                                  20/20     0.174   0.216   1.240   52.659 unit-chg REGRESS
+1000-rows-range-scan-100-rows                              20/20     0.240   0.345   1.439    1.012 REGRESS
+1000-rows-sum-group-by-10-groups                           20/20     0.113   0.340   3.007    0.965 REGRESS
+10000-rows-count                                           20/20     0.058   0.077   1.337   57.127 unit-chg REGRESS
+10000-rows-full-table-scan                                 20/20     0.233   0.258   1.109    0.973 REGRESS
+10000-rows-indexed-lookup-secondary                        20/20     0.145   0.146   1.006   56.795 unit-chg
+10000-rows-order-by-limit-20                               20/20     0.274   0.313   1.142    0.984 REGRESS
+10000-rows-point-lookup-pk                                 20/20     0.168   0.213   1.266   52.787 unit-chg REGRESS
+10000-rows-range-scan-1000-rows                            20/20     0.222   0.286   1.287    0.959 REGRESS
+10000-rows-sum-group-by-10-groups                          20/20     0.051   0.077   1.519    0.939 REGRESS
+
+=== conc: 20 ctrl + 20 rc invocations, 3 shared cells ===
+cell                                                           n  F/C@ctrl  F/C@rc     DiD  C_drift
+2-writers-x-1000-rows                                      20/20     0.551   1.437   2.607    0.220 unit-chg REGRESS
+4-writers-x-1000-rows                                      20/20     0.637   1.036   1.626    0.494 unit-chg REGRESS
+8-writers-x-1000-rows                                      20/20     0.553   0.730   1.321    0.775 REGRESS
