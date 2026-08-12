@@ -29450,6 +29450,12 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
+                    if limit_clause
+                        .as_ref()
+                        .is_some_and(bound_limit_clause_is_constant_zero)
+                    {
+                        return Ok(Vec::new());
+                    }
                     let mut rows = self.execute_join_select(&bound, None).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
@@ -29486,6 +29492,12 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
+                    if limit_clause
+                        .as_ref()
+                        .is_some_and(bound_limit_clause_is_constant_zero)
+                    {
+                        return Ok(Vec::new());
+                    }
                     let started = Instant::now();
                     let mut rows = self.execute_join_select(&bound, None).await?;
                     if native_join_dispatch {
@@ -29503,6 +29515,12 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
+                    if limit_clause
+                        .as_ref()
+                        .is_some_and(bound_limit_clause_is_constant_zero)
+                    {
+                        return Ok(Vec::new());
+                    }
                     let mut rows = self.execute_join_select(&bound, None).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
@@ -29518,6 +29536,12 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
+                    if limit_clause
+                        .as_ref()
+                        .is_some_and(bound_limit_clause_is_constant_zero)
+                    {
+                        return Ok(Vec::new());
+                    }
                     let mut rows = self.execute_join_select(&bound, None).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
@@ -63754,6 +63778,67 @@ impl Connection {
                         }
                         return Ok(acc);
                     }
+                    // bd-2fong red 2: eval_join_binary_op derives operand
+                    // metadata from the static exprs, and its connection-less
+                    // lookup maps Expr::Subquery to BLOB affinity — losing the
+                    // donor SQLite applies ((SELECT CAST(1 AS INTEGER)) = '1'
+                    // is 1, not 0). Materialize subquery operands into
+                    // BoundOuterValue (value + donor affinity/collation) via
+                    // the same helper the IN-operand path uses, so the
+                    // comparison sees the donor. Vector subqueries stay legal
+                    // exactly when the opposite operand is a row value or
+                    // another subquery.
+                    let subquery_operand = matches!(left.as_ref(), Expr::Subquery(..))
+                        || matches!(right.as_ref(), Expr::Subquery(..));
+                    if subquery_operand {
+                        let allow_vector_left = matches!(
+                            right.as_ref(),
+                            Expr::RowValue(..) | Expr::Subquery(..)
+                        );
+                        let allow_vector_right = matches!(
+                            left.as_ref(),
+                            Expr::RowValue(..) | Expr::Subquery(..)
+                        );
+                        let left_materialized;
+                        let left_ref: &Expr = if matches!(left.as_ref(), Expr::Subquery(..)) {
+                            left_materialized = self
+                                .inline_in_comparison_operand(
+                                    left,
+                                    row,
+                                    col_map,
+                                    None,
+                                    allow_vector_left,
+                                )
+                                .await?;
+                            &left_materialized
+                        } else {
+                            left
+                        };
+                        let right_materialized;
+                        let right_ref: &Expr = if matches!(right.as_ref(), Expr::Subquery(..)) {
+                            right_materialized = self
+                                .inline_in_comparison_operand(
+                                    right,
+                                    row,
+                                    col_map,
+                                    None,
+                                    allow_vector_right,
+                                )
+                                .await?;
+                            &right_materialized
+                        } else {
+                            right
+                        };
+                        let l = self
+                            .eval_expr_with_subqueries(left_ref, row, col_map, params)
+                            .await?;
+                        let r = self
+                            .eval_expr_with_subqueries(right_ref, row, col_map, params)
+                            .await?;
+                        return Ok(eval_join_binary_op(
+                            left_ref, &l, *op, right_ref, &r, col_map,
+                        ));
+                    }
                     let l = self
                         .eval_expr_with_subqueries(left, row, col_map, params)
                         .await?;
@@ -71583,6 +71668,14 @@ impl Connection {
                     if !is_correlated_subquery_with_schema(sub, &self.schema.borrow()) {
                         self.validate_select_column_references(sub)?;
                         self.validate_scalar_subquery_column_count(sub)?;
+                        // bd-2fong red 2: this pre-resolver serves the
+                        // expression-only (fromless) lane, so the fold must
+                        // carry the subquery's donor affinity exactly like
+                        // rewrite_in_expr's fold — a bare Literal loses the
+                        // donor and `(SELECT CAST(1 AS INTEGER)) = '1'`
+                        // compares affinity-less (0 instead of SQLite's 1).
+                        let folded_affinity =
+                            scalar_subquery_result_affinity(sub, &self.schema.borrow());
                         let rows = self
                             .execute_statement(&Statement::Select((**sub).clone()), params)
                             .await?;
@@ -71591,7 +71684,16 @@ impl Connection {
                             .next()
                             .and_then(|r| r.values.into_iter().next())
                             .unwrap_or(SqliteValue::Null);
-                        Ok(Expr::Literal(sqlite_value_to_literal(&val), *span))
+                        if folded_affinity == TypeAffinity::Blob {
+                            Ok(Expr::Literal(sqlite_value_to_literal(&val), *span))
+                        } else {
+                            Ok(Expr::BoundOuterValue {
+                                value: val,
+                                collation: BoundCollation::Unspecified,
+                                affinity: Some(folded_affinity),
+                                span: *span,
+                            })
+                        }
                     } else {
                         Ok(expr.clone())
                     }
@@ -79417,6 +79519,16 @@ fn validate_limit_offset_lossless(select: &SelectStatement) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// bd-2fong: SQLite's VDBE evaluates LIMIT first and jumps straight to the
+/// end when it is zero — before the row source is opened or any row
+/// expression runs (oracle sqlite3 3.46.1: a derived VALUES row with an
+/// erroring expression under LIMIT 0 yields zero rows, no error). Fallback
+/// executors materialize before applying LIMIT, so they must short-circuit a
+/// bound constant-zero limit before materialization.
+fn bound_limit_clause_is_constant_zero(limit: &fsqlite_ast::LimitClause) -> bool {
+    eval_constant_limit_integer(&limit.limit) == Some(0)
 }
 
 fn check_limit_value_lossless(expr: &Expr) -> Result<()> {
@@ -115891,7 +116003,26 @@ fn bind_placeholders_in_select_statement(
     }
 
     for ordering in &mut select.order_by {
+        let was_bare_placeholder = matches!(ordering.expr, Expr::Placeholder(_, _));
         bind_placeholders_in_expr(&mut ordering.expr, bind_state, params)?;
+        // bd-2fong parity: stock SQLite resolves ORDER BY ordinals
+        // SYNTACTICALLY at parse time, so a BOUND parameter is always a
+        // constant expression, never a column ordinal (oracle 3.46.1:
+        // `... ORDER BY ?` bound to 2 preserves row order while a literal
+        // `ORDER BY 2` reorders). Binding just replaced a bare top-level
+        // placeholder with a literal; keep an integer result in expression
+        // form so the fallback sorters' ordinal classification cannot fire.
+        if was_bare_placeholder
+            && let Expr::Literal(Literal::Integer(value), span) = &ordering.expr
+        {
+            let (value, span) = (*value, *span);
+            ordering.expr = Expr::BinaryOp {
+                left: Box::new(Expr::Literal(Literal::Integer(0), span)),
+                op: BinaryOp::Add,
+                right: Box::new(Expr::Literal(Literal::Integer(value), span)),
+                span,
+            };
+        }
     }
     if let Some(limit_clause) = &mut select.limit {
         bind_placeholders_in_expr(&mut limit_clause.limit, bind_state, params)?;
@@ -129699,7 +129830,10 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             let rows = conn
-                .query("VALUES (3, 'c'), (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 2;")
+                .query(
+                    "SELECT * FROM (VALUES (3, 'c'), (1, 'a'), (2, 'b')) \
+                     ORDER BY 1 LIMIT 2;",
+                )
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 2);
@@ -129711,6 +129845,14 @@ mod tests {
                 row_values(&rows[1]),
                 vec![SqliteValue::Integer(2), SqliteValue::Text("b".into())]
             );
+
+            let bare = conn
+                .query("VALUES (3, 'c'), (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 2;")
+                .await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
+            );
         });
     }
 
@@ -129719,11 +129861,22 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             let rows = conn
-                .query("VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 1 OFFSET 1;")
+                .query(
+                    "SELECT * FROM (VALUES (3), (1), (2)) \
+                     ORDER BY 1 DESC LIMIT 1 OFFSET 1;",
+                )
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(2)]);
+
+            let bare = conn
+                .query("VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 1 OFFSET 1;")
+                .await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
+            );
         });
     }
 
@@ -230548,6 +230701,40 @@ mod pager_routing_tests {
                     .all(|row| row.values()[0] == SqliteValue::Integer(1)),
                 "schema reload must freeze the trigger with the stored-schema donor"
             );
+        });
+    }
+
+    #[test]
+    fn temp_probe_bd2fong_affinity_lanes() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE probe_t (i INTEGER);").await.unwrap();
+            conn.execute("INSERT INTO probe_t VALUES (1);").await.unwrap();
+            for (tag, sql) in [
+                ("bare_literal", "SELECT 1 = '1'"),
+                ("cast_direct", "SELECT CAST(1 AS INTEGER) = '1'"),
+                ("subq_cast", "SELECT (SELECT CAST(1 AS INTEGER)) = '1'"),
+                ("subq_plain", "SELECT (SELECT 1) = '1'"),
+                ("subq_cast_from", "SELECT (SELECT CAST(1 AS INTEGER)) = '1' FROM probe_t"),
+            ] {
+                let rows = conn.query(sql).await.unwrap();
+                eprintln!("AFFPROBE {tag}: {:?}", rows[0].values());
+                let explain = conn.query(&format!("EXPLAIN {sql}")).await;
+                match explain {
+                    Ok(rows) => {
+                        let ops: Vec<String> = rows
+                            .iter()
+                            .map(|r| match &r.values[1] {
+                                SqliteValue::Text(op) => op.to_string(),
+                                other => format!("{other:?}"),
+                            })
+                            .collect();
+                        eprintln!("AFFPROBE-EXPLAIN {tag}: {}", ops.join(","));
+                    }
+                    Err(error) => eprintln!("AFFPROBE-EXPLAIN {tag}: ERR {error:?}"),
+                }
+            }
+            panic!("probe complete");
         });
     }
 
