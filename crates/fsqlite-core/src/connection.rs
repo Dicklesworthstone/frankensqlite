@@ -73151,7 +73151,34 @@ impl Connection {
                 };
                 if let Some(directive) = directive {
                     let verified = match directive.access_kind {
-                        PlannerSelectAccessKind::FullTableScan => true,
+                        PlannerSelectAccessKind::FullTableScan => {
+                            // bd-2fong red 3 (bd-jyyae family): a FullTableScan
+                            // directive was trusted unconditionally, but the
+                            // native IN-probe lane (bd-2dgf5) upgrades
+                            // `ipk IN (SELECT ...)` to rowid seeks at codegen —
+                            // EQP printed `SCAN t` for a program whose first
+                            // act is SeekGE. Verify scan directives against the
+                            // program like every other access kind and report
+                            // the path the program actually performs (stock:
+                            // `SEARCH t USING INTEGER PRIMARY KEY (rowid=?)`).
+                            if let Ok(program) = self.compile_table_select(select).await
+                                && crate::explain::program_seeks_rowid_on_table(
+                                    &program,
+                                    &directive.table_name,
+                                )
+                            {
+                                return vec![to_row(
+                                    2,
+                                    0,
+                                    0,
+                                    format!(
+                                        "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                                        directive.table_name
+                                    ),
+                                )];
+                            }
+                            true
+                        }
                         PlannerSelectAccessKind::RowidLookup => {
                             match self.compile_table_select(select).await {
                                 Ok(program) => crate::explain::program_seeks_rowid_on_table(
@@ -88427,16 +88454,29 @@ fn select_statement_has_external_column_ref(
         || {
             let inner_tables =
                 protected_tables_for_core(&select.body.select, ancestor_tables);
-            select
-                .order_by
-                .iter()
-                .any(|term| expr_has_external_column_ref(&term.expr, &inner_tables))
-                || select.limit.as_ref().is_some_and(|limit| {
-                    expr_has_external_column_ref(&limit.limit, &inner_tables)
-                        || limit.offset.as_ref().is_some_and(|offset| {
-                            expr_has_external_column_ref(offset, &inner_tables)
-                        })
+            // ORDER BY resolves output aliases before any outer scope
+            // (`SELECT 1 AS x ORDER BY x` is fully local), so aliases join
+            // the local set unconditionally here.
+            let output_aliases = collect_select_core_result_aliases(&select.body.select);
+            select.order_by.iter().any(|term| {
+                expr_has_external_column_ref_with_locals(
+                    &term.expr,
+                    &inner_tables,
+                    &output_aliases,
+                )
+            }) || select.limit.as_ref().is_some_and(|limit| {
+                expr_has_external_column_ref_with_locals(
+                    &limit.limit,
+                    &inner_tables,
+                    &output_aliases,
+                ) || limit.offset.as_ref().is_some_and(|offset| {
+                    expr_has_external_column_ref_with_locals(
+                        offset,
+                        &inner_tables,
+                        &output_aliases,
+                    )
                 })
+            })
         }
 }
 
@@ -119847,7 +119887,26 @@ fn compare_join_expr_values(
     let collation = join_comparison_collation(left_expr, right_expr, col_map);
     with_current_join_eval_collation_context(|context| {
         context.map_or_else(
-            || cmp_sqlite_values(left_value, right_value),
+            || {
+                // bd-2fong red 2: the no-context fallback compared raw
+                // storage classes, so every comparison evaluated through the
+                // dynamic expression-only lane (any fromless statement
+                // containing a subquery routes here — the compiled control
+                // shapes never do) ran affinity-blind and
+                // `(SELECT CAST(1 AS INTEGER)) = '1'` returned 0 where
+                // SQLite's donor rules give 1. Derive operand affinity
+                // connection-lessly (BoundOuterValue folds, CAST, COLLATE
+                // wrappers) and coerce exactly like the context path; text
+                // collation stays BINARY here as before (no registry).
+                let left_affinity = resolve_operand_affinity(left_expr, &[]);
+                let right_affinity = resolve_operand_affinity(right_expr, &[]);
+                let (left_coerced, right_coerced) = coerce_values_for_comparison_affinity(
+                    left_value,
+                    right_value,
+                    TypeAffinity::comparison_affinity(left_affinity, right_affinity),
+                );
+                cmp_sqlite_values(&left_coerced, &right_coerced)
+            },
             |context| {
                 let left_affinity = join_expr_affinity(left_expr, col_map, context);
                 let right_affinity = join_expr_affinity(right_expr, col_map, context);
@@ -230763,6 +230822,41 @@ mod pager_routing_tests {
                     .all(|row| row.values()[0] == SqliteValue::Integer(1)),
                 "schema reload must freeze the trigger with the stored-schema donor"
             );
+        });
+    }
+
+    #[test]
+    fn temp_probe_bd2fong_program_dump() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE probe_t (i INTEGER);").await.unwrap();
+            conn.execute("INSERT INTO probe_t VALUES (1);").await.unwrap();
+            for (tag, sql) in [
+                ("subq_cast_fromless", "SELECT (SELECT CAST(1 AS INTEGER)) = '1'"),
+                ("cast_fromless", "SELECT CAST(1 AS INTEGER) = '1'"),
+                (
+                    "subq_cast_from",
+                    "SELECT (SELECT CAST(1 AS INTEGER)) = '1' FROM probe_t",
+                ),
+            ] {
+                match conn.prepare(sql).await {
+                    Ok(prepared) => {
+                        eprintln!("PGDUMP {tag}: BEGIN");
+                        for (index, op) in prepared.program.ops().iter().enumerate() {
+                            eprintln!("PGDUMP {tag} [{index}]: {op:?}");
+                        }
+                        match prepared.query().await {
+                            Ok(rows) => eprintln!(
+                                "PGDUMP {tag}: RESULT {:?}",
+                                rows.first().map(|row| row.values())
+                            ),
+                            Err(error) => eprintln!("PGDUMP {tag}: RESULT ERR {error:?}"),
+                        }
+                    }
+                    Err(error) => eprintln!("PGDUMP {tag}: PREPARE ERR {error:?}"),
+                }
+            }
+            panic!("probe complete");
         });
     }
 
