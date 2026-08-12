@@ -48,6 +48,41 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-11 - REJECTED: boxing cold branches out of the prepared-statement hot futures (bd-uzq54 levers 1+2)
+
+- Target workload: `comprehensive_bench --quick --filter insert`, 10K-row
+  single-transaction record-size comparison, `tiny_1col` (target of the
+  ~700ns/row attribution) and `large_10col` (explicit non-regression
+  guardrail). Touched surface: `crates/fsqlite-core/src/connection.rs` —
+  `PreparedStatement::{execute,execute_with_params}` query-fallback boxing
+  plus three cold-branch `Box::pin` sites inside
+  `execute_prepared_with_params_after_background_status` (candidate commit
+  `8e529600`; control is its parent `65ab05b92`, identical otherwise).
+- Evidence: 8 process-level runs on the campaign box, order-balanced
+  ctrl,cand,cand,ctrl + cand,ctrl,ctrl,cand, `taskset -c 48-55` (cpuset
+  claimed on bd-dqdoe), release-perf, `FSQLITE_BENCH_PROFILE_INSERT=1`,
+  harness at the bd-fd1ra state (paired AB/BA arms, WARMUP 5 / MIN 20 /
+  MAX 40). Binary sha256s: ctrl `e7a6b225…33b1ef`, cand `2b779499…e1bbba`.
+  Raw outputs: session scratchpad `uzq54-runs/run{1..8}-*.{stdout,stderr}`;
+  numbers reproduced in the bd-uzq54 comment of the same date.
+- Result: REJECT. `tiny_1col` F medians ctrl {4.25,4.12,4.11,4.08} vs cand
+  {4.07,4.58,4.12,4.08} — no improvement (effect inside A/A spread).
+  `large_10col` F medians ctrl {19.05,19.07,19.14,19.34} vs cand
+  {19.60,19.94,19.46,19.51} — candidate min exceeds control max
+  (non-overlapping ranges, ~+2.4% median), violating the KEEP gate's
+  large-row non-regression clause. The 17.7KB future-size reduction did not
+  translate into wall-time on the narrow-row path, and the layout change
+  measurably hurt the wide-row path.
+- Revert candidate: `8e529600` (coordinate the revert around bd-e26jr's
+  active connection.rs lane; the five sites are disjoint from its regions).
+- Retry condition: only with allocation-count + CPU-sample evidence that
+  the per-call allocation or generator size is actually on the measured
+  hot path (heaptrack/samply per bd-dqdoe step 4), and with a layout probe
+  (e.g. `std::mem::size_of` of the generated futures asserted in a test)
+  proving the boxing shrinks the hot generator without moving hot fields
+  across cache lines. Blind size-reduction via cold-branch boxing is not a
+  keep on its own.
+
 ## 2026-08-03 - REJECTED DEFAULT: conflict-topology split policy uses process-global, cross-database state
 
 - Target workload: `mt-mvcc-bench` `shared_table`, 300 rows per thread, at 2,
