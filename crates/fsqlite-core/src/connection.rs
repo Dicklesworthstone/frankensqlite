@@ -12036,7 +12036,9 @@ impl Connection {
             })
             .await?
         };
-        let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
+        let file_identity = pager.file_identity(&bootstrap_cx).await?;
+        let shared_mvcc_state =
+            shared_mvcc_state_for_path(&path, file_identity, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
         shared_mvcc_state.align_commit_clock_floor(initial_visible_commit_seq);
         let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
@@ -12510,7 +12512,14 @@ impl Connection {
     ) -> Result<Self> {
         let attach_env = env.clone();
         let pager_is_memory = pager.is_memory();
-        let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
+        let file_identity = if pager_is_memory {
+            None
+        } else {
+            let identity_cx = env.runtime().root_cx.create_child();
+            pager.file_identity(&identity_cx).await?
+        };
+        let shared_mvcc_state =
+            shared_mvcc_state_for_path(&path, file_identity, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
         shared_mvcc_state.align_commit_clock_floor(initial_visible_commit_seq);
         let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
@@ -87296,16 +87305,22 @@ enum WriteCoordinatorServiceReservation {
     Reserved(WriteCoordinatorServiceStart),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct SharedMvccKey {
     path_key: String,
+    file_identity: Option<FileIdentity>,
     runtime_id: u64,
 }
 
 impl SharedMvccKey {
-    fn new(path_key: String, runtime: &RuntimeContext) -> Self {
+    fn new(
+        path_key: String,
+        file_identity: Option<FileIdentity>,
+        runtime: &RuntimeContext,
+    ) -> Self {
         Self {
             path_key,
+            file_identity,
             runtime_id: runtime.runtime_id(),
         }
     }
@@ -87954,9 +87969,15 @@ impl SharedMvccState {
 
 static SHARED_MVCC_STATE_BY_PATH: OnceLock<Mutex<HashMap<SharedMvccKey, Weak<SharedMvccState>>>> =
     OnceLock::new();
-static SHARED_MVCC_COORDINATION_BY_PATH: OnceLock<
-    Mutex<HashMap<String, Weak<SharedMvccCoordinationState>>>,
+static SHARED_MVCC_COORDINATION: OnceLock<
+    Mutex<HashMap<SharedMvccCoordinationKey, Weak<SharedMvccCoordinationState>>>,
 > = OnceLock::new();
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum SharedMvccCoordinationKey {
+    File(FileIdentity),
+    Path(String),
+}
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -88018,34 +88039,41 @@ fn mvcc_state_path_key(path: &str) -> String {
         .into_owned()
 }
 
-fn shared_mvcc_coordination_for_path(path_key: &str) -> Arc<SharedMvccCoordinationState> {
-    let coordination_map =
-        SHARED_MVCC_COORDINATION_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()));
+fn shared_mvcc_coordination_for_file(
+    path_key: &str,
+    file_identity: Option<FileIdentity>,
+) -> Arc<SharedMvccCoordinationState> {
+    let key = file_identity.map_or_else(
+        || SharedMvccCoordinationKey::Path(path_key.to_owned()),
+        SharedMvccCoordinationKey::File,
+    );
+    let coordination_map = SHARED_MVCC_COORDINATION.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = lock_unpoisoned(coordination_map);
-    if let Some(existing) = map.get(path_key).and_then(Weak::upgrade) {
+    if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
         return existing;
     }
     let coordination = Arc::new(SharedMvccCoordinationState::new());
-    map.insert(path_key.to_owned(), Arc::downgrade(&coordination));
+    map.insert(key, Arc::downgrade(&coordination));
     coordination
 }
 
 fn shared_mvcc_state_for_path(
     path: &str,
+    file_identity: Option<FileIdentity>,
     runtime: Arc<RuntimeContext>,
 ) -> Result<Arc<SharedMvccState>> {
     if path == ":memory:" {
         let coordination = Arc::new(SharedMvccCoordinationState::new());
         return Ok(Arc::new(SharedMvccState::new(
-            SharedMvccKey::new(path.to_owned(), &runtime),
+            SharedMvccKey::new(path.to_owned(), None, &runtime),
             runtime,
             coordination,
         )?));
     }
 
     let path_key = mvcc_state_path_key(path);
-    let coordination = shared_mvcc_coordination_for_path(&path_key);
-    let key = SharedMvccKey::new(path_key, &runtime);
+    let coordination = shared_mvcc_coordination_for_file(&path_key, file_identity);
+    let key = SharedMvccKey::new(path_key, file_identity, &runtime);
     let state_map = SHARED_MVCC_STATE_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = lock_unpoisoned(state_map);
 
@@ -122616,7 +122644,7 @@ mod tests {
     use fsqlite_types::{LockLevel, Region, TypeAffinity};
     use fsqlite_types::{PageNumber, PageSize};
     use fsqlite_vdbe::ProgramBuilder;
-    use fsqlite_vfs::MemoryVfs;
+    use fsqlite_vfs::{FileIdentity, MemoryVfs};
     use fsqlite_vfs::ShmRegion;
     #[cfg(unix)]
     use fsqlite_vfs::UnixVfs;
@@ -125234,7 +125262,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("write-coordinator-stuck-starting.db");
         let db_path = db_path.to_string_lossy().into_owned();
-        let shared = super::shared_mvcc_state_for_path(&db_path, runtime).expect("shared state");
+        let shared =
+            super::shared_mvcc_state_for_path(&db_path, None, runtime).expect("shared state");
 
         {
             let mut state = lock_unpoisoned(&shared.runtime_state);
@@ -125412,6 +125441,50 @@ mod tests {
             conn_a.close().await.unwrap();
             conn_b.close().await.unwrap();
         });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_shared_mvcc_registry_rebinds_when_same_path_file_identity_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_a = std::fs::File::create(dir.path().join("identity-a.db")).unwrap();
+        let file_b = std::fs::File::create(dir.path().join("identity-b.db")).unwrap();
+        let identity_a = FileIdentity::from_file(&file_a).unwrap().unwrap();
+        let identity_b = FileIdentity::from_file(&file_b).unwrap().unwrap();
+        assert!(identity_a != identity_b);
+
+        let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Blocking,
+        }));
+        let logical_path = dir.path().join("same-logical-path.db");
+        let logical_path = logical_path.to_string_lossy().into_owned();
+
+        let incarnation_a = super::shared_mvcc_state_for_path(
+            &logical_path,
+            Some(identity_a),
+            Arc::clone(&runtime),
+        )
+        .unwrap();
+        let incarnation_a_again = super::shared_mvcc_state_for_path(
+            &logical_path,
+            Some(identity_a),
+            Arc::clone(&runtime),
+        )
+        .unwrap();
+        let incarnation_b =
+            super::shared_mvcc_state_for_path(&logical_path, Some(identity_b), runtime).unwrap();
+
+        assert!(Arc::ptr_eq(&incarnation_a, &incarnation_a_again));
+        assert!(Arc::ptr_eq(
+            &incarnation_a._coordination,
+            &incarnation_a_again._coordination,
+        ));
+        assert!(!Arc::ptr_eq(&incarnation_a, &incarnation_b));
+        assert!(!Arc::ptr_eq(
+            &incarnation_a._coordination,
+            &incarnation_b._coordination,
+        ));
     }
 
     #[test]
