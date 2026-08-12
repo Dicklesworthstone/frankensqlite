@@ -125798,7 +125798,7 @@ mod tests {
         let file_b = std::fs::File::create(dir.path().join("identity-b.db")).unwrap();
         let identity_a = FileIdentity::from_file(&file_a).unwrap().unwrap();
         let identity_b = FileIdentity::from_file(&file_b).unwrap().unwrap();
-        assert!(identity_a != identity_b);
+        assert_ne!(identity_a, identity_b);
 
         let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
             worker_threads: 1,
