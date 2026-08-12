@@ -53,7 +53,8 @@
 //! }
 //! ```
 
-use crate::{Connection, ConnectionEnv, FrankenError, Row, SqliteValue};
+use crate::compat::{OpenFlags, open_with_flags};
+use crate::{Connection, ConnectionEnv, FileIdentity, FrankenError, Row, SqliteValue};
 use asupersync::channel::{mpsc as async_mpsc, oneshot};
 use asupersync::cx::{Cx as NativeCx, cap as native_cap};
 use asupersync::runtime::Runtime;
@@ -252,6 +253,8 @@ struct WorkerState {
     #[cfg(test)]
     cleanup_calls: AtomicUsize,
     #[cfg(test)]
+    cleanup_skipped_checkpoint: AtomicBool,
+    #[cfg(test)]
     panic_on_cleanup: AtomicBool,
     #[cfg(test)]
     hold_before_open_response: AtomicBool,
@@ -275,6 +278,8 @@ impl WorkerState {
             phase: AtomicU8::new(WorkerPhase::Idle as u8),
             #[cfg(test)]
             cleanup_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            cleanup_skipped_checkpoint: AtomicBool::new(false),
             #[cfg(test)]
             panic_on_cleanup: AtomicBool::new(false),
             #[cfg(test)]
@@ -469,7 +474,9 @@ enum Command {
     LastInsertRowid {
         tx: Responder<i64>,
     },
-    Close,
+    Close {
+        checkpoint: bool,
+    },
     Shutdown,
     #[cfg(test)]
     BlockForTest {
@@ -1133,7 +1140,7 @@ fn recv_worker_response<T>(rx: mpsc::Receiver<Result<T, FrankenError>>) -> Resul
 // ---------------------------------------------------------------------------
 
 enum WorkerStop {
-    ExplicitClose,
+    ExplicitClose { checkpoint: bool },
     Shutdown,
     CommandChannelDisconnected,
 }
@@ -1274,8 +1281,8 @@ fn worker_loop(conn: &Connection, rx: &mut CommandReceiver, state: &WorkerState)
             Command::LastInsertRowid { tx } => {
                 run_operation_and_respond(conn, state, tx, || Ok(conn.last_insert_rowid()));
             }
-            Command::Close => {
-                return WorkerStop::ExplicitClose;
+            Command::Close { checkpoint } => {
+                return WorkerStop::ExplicitClose { checkpoint };
             }
             Command::Shutdown => {
                 return WorkerStop::Shutdown;
@@ -1316,16 +1323,31 @@ fn run_worker_to_terminal(
     // be able to skip the worker's sole connection-cleanup path.
     let receiver_drop_result = catch_unwind(AssertUnwindSafe(|| drop(rx)));
 
+    // An explicit no-checkpoint close is the only stop reason that skips the
+    // close-time WAL checkpoint. Shutdown, disconnection, and loop panics keep
+    // the checkpointing default, so implicit teardown behavior is unchanged.
+    let checkpoint_on_close = !matches!(
+        &loop_result,
+        Ok(WorkerStop::ExplicitClose { checkpoint: false })
+    );
+
     state.publish_phase(WorkerPhase::Closing);
     let cleanup_result = catch_unwind(AssertUnwindSafe(|| {
         #[cfg(test)]
         {
             state.cleanup_calls.fetch_add(1, Ordering::AcqRel);
+            state
+                .cleanup_skipped_checkpoint
+                .store(!checkpoint_on_close, Ordering::Release);
             if state.panic_on_cleanup.swap(false, Ordering::AcqRel) {
                 test_panic("async worker cleanup panic sentinel");
             }
         }
-        future::block_on(conn.close_in_place())
+        if checkpoint_on_close {
+            future::block_on(conn.close_in_place())
+        } else {
+            future::block_on(conn.close_without_checkpoint_in_place())
+        }
     }));
     state.publish_phase(WorkerPhase::Terminal);
 
@@ -1589,9 +1611,86 @@ impl Drop for PendingOpen {
     }
 }
 
+/// How the dedicated worker thread opens its raw [`Connection`].
+///
+/// Every variant maps to exactly one raw constructor and runs on the worker's
+/// [`WORKER_STACK_BYTES`] stack, so no consumer drives the deeply composed
+/// engine open/recovery/migration futures on its own stack. Identity-bound
+/// variants carry the caller's [`FileIdentity`] by value; the caller keeps its
+/// reservation or identity file handle open across the blocking open
+/// response, which preserves the raw API's handle-liveness contract.
+enum WorkerOpenRequest {
+    WithEnv {
+        path: String,
+        env: ConnectionEnv,
+    },
+    WithPageSize {
+        path: String,
+        page_size_bytes: u32,
+    },
+    Existing {
+        path: String,
+    },
+    SchemaOnly {
+        path: String,
+    },
+    WithFlags {
+        path: String,
+        flags: OpenFlags,
+    },
+    ReservedWithExpectedIdentityAndEnv {
+        path: String,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    },
+    ExistingWithExpectedIdentityAndEnv {
+        path: String,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    },
+}
+
+impl WorkerOpenRequest {
+    async fn open(self) -> Result<Connection, FrankenError> {
+        match self {
+            Self::WithEnv { path, env } => Connection::open_with_env(path, env).await,
+            Self::WithPageSize {
+                path,
+                page_size_bytes,
+            } => Connection::open_with_page_size(path, page_size_bytes).await,
+            Self::Existing { path } => Connection::open_existing(path).await,
+            Self::SchemaOnly { path } => Connection::open_schema_only(path).await,
+            Self::WithFlags { path, flags } => open_with_flags(&path, flags).await,
+            Self::ReservedWithExpectedIdentityAndEnv {
+                path,
+                expected_identity,
+                env,
+            } => {
+                Connection::open_reserved_with_expected_identity_and_env(
+                    path,
+                    expected_identity,
+                    env,
+                )
+                .await
+            }
+            Self::ExistingWithExpectedIdentityAndEnv {
+                path,
+                expected_identity,
+                env,
+            } => {
+                Connection::open_existing_with_expected_identity_and_env(
+                    path,
+                    expected_identity,
+                    env,
+                )
+                .await
+            }
+        }
+    }
+}
+
 fn spawn_worker_thread(
-    path: String,
-    env: ConnectionEnv,
+    request: WorkerOpenRequest,
     cmd_rx: CommandReceiver,
     open_tx: Responder<OpenHandshake>,
     state: Arc<WorkerState>,
@@ -1606,10 +1705,10 @@ fn spawn_worker_thread(
                 #[cfg(test)]
                 let open_result = match state.take_forced_open_error() {
                     Some(error) => Err(error),
-                    None => future::block_on(Connection::open_with_env(path, env)),
+                    None => future::block_on(request.open()),
                 };
                 #[cfg(not(test))]
-                let open_result = future::block_on(Connection::open_with_env(path, env));
+                let open_result = future::block_on(request.open());
 
                 match open_result {
                     Ok(conn) => {
@@ -1798,11 +1897,108 @@ impl AsyncConnection {
         path: impl Into<String>,
         env: ConnectionEnv,
     ) -> Result<Self, FrankenError> {
-        let path = path.into();
+        Self::open_sync_with_request(WorkerOpenRequest::WithEnv {
+            path: path.into(),
+            env,
+        })
+    }
+
+    /// Open a database connection without a capability context while
+    /// requesting a specific page size for newly created databases.
+    ///
+    /// Routes to [`Connection::open_with_page_size`] on the dedicated
+    /// large-stack worker thread.
+    pub fn open_with_page_size_sync(
+        path: impl Into<String>,
+        page_size_bytes: u32,
+    ) -> Result<Self, FrankenError> {
+        Self::open_sync_with_request(WorkerOpenRequest::WithPageSize {
+            path: path.into(),
+            page_size_bytes,
+        })
+    }
+
+    /// Open an existing database without creating or rewriting anything.
+    ///
+    /// Routes to [`Connection::open_existing`] on the dedicated large-stack
+    /// worker thread: it joins an existing generation without creating or
+    /// rewriting namespace records and fails closed when the target is absent
+    /// or malformed. Use this wherever "query only" is part of the contract.
+    pub fn open_existing_sync(path: impl Into<String>) -> Result<Self, FrankenError> {
+        Self::open_sync_with_request(WorkerOpenRequest::Existing { path: path.into() })
+    }
+
+    /// Open a database in schema-only read mode.
+    ///
+    /// Routes to [`Connection::open_schema_only`] on the dedicated large-stack
+    /// worker thread. Appropriate for read-only inspection paths that must
+    /// avoid introducing writer semantics such as close-time checkpoints.
+    pub fn open_schema_only_sync(path: impl Into<String>) -> Result<Self, FrankenError> {
+        Self::open_sync_with_request(WorkerOpenRequest::SchemaOnly { path: path.into() })
+    }
+
+    /// Open a database with explicit SQLite-compatible [`OpenFlags`].
+    ///
+    /// Routes to [`open_with_flags`] on the dedicated large-stack worker
+    /// thread. The primary consumer contract is
+    /// [`OpenFlags::SQLITE_OPEN_READ_ONLY`], which refuses writes for the
+    /// lifetime of the connection.
+    pub fn open_with_flags_sync(
+        path: impl Into<String>,
+        flags: OpenFlags,
+    ) -> Result<Self, FrankenError> {
+        Self::open_sync_with_request(WorkerOpenRequest::WithFlags {
+            path: path.into(),
+            flags,
+        })
+    }
+
+    /// Initialize an identity-bound caller-reserved empty file with an
+    /// explicit runtime environment.
+    ///
+    /// Routes to [`Connection::open_reserved_with_expected_identity_and_env`]
+    /// on the dedicated large-stack worker thread. The caller must keep the
+    /// reservation file handle that produced `expected_identity` open until
+    /// this constructor returns; because the call blocks on the worker's open
+    /// response, a caller-held handle on the calling frame satisfies that
+    /// contract unchanged.
+    pub fn open_reserved_with_expected_identity_and_env_sync(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    ) -> Result<Self, FrankenError> {
+        Self::open_sync_with_request(WorkerOpenRequest::ReservedWithExpectedIdentityAndEnv {
+            path: path.into(),
+            expected_identity,
+            env,
+        })
+    }
+
+    /// Open an existing database only if it matches the expected filesystem
+    /// identity, with an explicit runtime environment.
+    ///
+    /// Routes to [`Connection::open_existing_with_expected_identity_and_env`]
+    /// on the dedicated large-stack worker thread. The caller must keep the
+    /// identity file handle that produced `expected_identity` open until this
+    /// constructor returns; the blocking open response preserves that
+    /// handle-liveness contract on the calling frame.
+    pub fn open_existing_with_expected_identity_and_env_sync(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    ) -> Result<Self, FrankenError> {
+        Self::open_sync_with_request(WorkerOpenRequest::ExistingWithExpectedIdentityAndEnv {
+            path: path.into(),
+            expected_identity,
+            env,
+        })
+    }
+
+    fn open_sync_with_request(request: WorkerOpenRequest) -> Result<Self, FrankenError> {
         let (open_tx, open_rx) = sync_response_channel();
         let (cmd_tx, cmd_rx) = command_channel(COMMAND_MAILBOX_CAPACITY);
         let state = Arc::new(WorkerState::new());
-        let worker = spawn_worker_thread(path, env, cmd_rx, open_tx, Arc::clone(&state))?;
+        let worker = spawn_worker_thread(request, cmd_rx, open_tx, Arc::clone(&state))?;
 
         match wait_for_worker_open(open_rx) {
             Ok(OpenHandshake::Opened) => Ok(Self {
@@ -1883,7 +2079,12 @@ impl AsyncConnection {
         let (cmd_tx, cmd_rx) = command_channel(COMMAND_MAILBOX_CAPACITY);
         let state = Arc::new(WorkerState::new());
         preflight.check_cancellation()?;
-        let worker = spawn_worker_thread(path, env, cmd_rx, open_tx, Arc::clone(&state))?;
+        let worker = spawn_worker_thread(
+            WorkerOpenRequest::WithEnv { path, env },
+            cmd_rx,
+            open_tx,
+            Arc::clone(&state),
+        )?;
         let pending = PendingOpen::new(cmd_tx, worker);
 
         // PendingOpen is the cancellation and arbitrary-Future-drop fence.
@@ -2435,7 +2636,7 @@ impl AsyncConnection {
         // Acquire the lifecycle-specific join capability before changing a
         // running connection into Closing. A zero-blocking runtime therefore
         // leaves the connection fully usable.
-        self.begin_close(Command::Close);
+        self.begin_close(Command::Close { checkpoint: true });
         if let Some(pool) = &join_pool {
             self.ensure_join_scheduled(pool).map_err(Arc::new)?;
         }
@@ -2482,10 +2683,26 @@ impl AsyncConnection {
     /// A terminal failure is memoized and replayed as the same
     /// `Arc<FrankenError>` on every later close attempt.
     pub fn close_sync(&mut self) -> Result<(), Arc<FrankenError>> {
+        self.close_sync_with_checkpoint(true)
+    }
+
+    /// Explicitly close a synchronously used connection without forcing the
+    /// close-time WAL checkpoint, then join its worker.
+    ///
+    /// Committed state already published to the WAL stays in the WAL and the
+    /// next open recovers it normally. Everything else matches
+    /// [`close_sync`](Self::close_sync): the worker is joined before this
+    /// returns and a terminal result is memoized and replayed as the same
+    /// `Arc<FrankenError>` on every later close attempt of either mode.
+    pub fn close_without_checkpoint_sync(&mut self) -> Result<(), Arc<FrankenError>> {
+        self.close_sync_with_checkpoint(false)
+    }
+
+    fn close_sync_with_checkpoint(&mut self, checkpoint: bool) -> Result<(), Arc<FrankenError>> {
         if let WorkerLifecycle::Terminal(memo) = &self.lifecycle {
             return memo.replay();
         }
-        self.begin_close(Command::Close);
+        self.begin_close(Command::Close { checkpoint });
         let lifecycle = std::mem::replace(
             &mut self.lifecycle,
             WorkerLifecycle::Terminal(CloseMemo::Success),
@@ -2640,8 +2857,10 @@ mod tests {
         let (open_tx, open_rx) = async_response_channel();
         let (cmd_tx, cmd_rx) = command_channel(COMMAND_MAILBOX_CAPACITY);
         let worker = spawn_worker_thread(
-            ":memory:".to_owned(),
-            ConnectionEnv::default(),
+            WorkerOpenRequest::WithEnv {
+                path: ":memory:".to_owned(),
+                env: ConnectionEnv::default(),
+            },
             cmd_rx,
             open_tx,
             Arc::clone(&state),
@@ -2864,7 +3083,7 @@ mod tests {
         let release_tx = stall_worker(&conn);
         let state = Arc::clone(&conn.state);
         state.panic_on_cleanup.store(true, Ordering::Release);
-        conn.begin_close(Command::Close);
+        conn.begin_close(Command::Close { checkpoint: true });
         conn.ensure_join_scheduled(&pool)
             .expect("join observation should be admitted");
         drop(conn);
@@ -3333,8 +3552,10 @@ mod tests {
         let (open_tx, open_rx) = async_response_channel();
         let (cmd_tx, cmd_rx) = command_channel(COMMAND_MAILBOX_CAPACITY);
         let worker = spawn_worker_thread(
-            ":memory:".to_owned(),
-            ConnectionEnv::default(),
+            WorkerOpenRequest::WithEnv {
+                path: ":memory:".to_owned(),
+                env: ConnectionEnv::default(),
+            },
             cmd_rx,
             open_tx,
             Arc::clone(&state),
@@ -4054,7 +4275,7 @@ mod tests {
 
         let mut conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
         let state = Arc::clone(&conn.state);
-        conn.begin_close(Command::Close);
+        conn.begin_close(Command::Close { checkpoint: true });
         let error = conn
             .ensure_join_scheduled(&rejected_pool)
             .expect_err("shut-down pool must reject the join");
@@ -4091,7 +4312,7 @@ mod tests {
             responses.push(rx);
         }
 
-        conn.begin_close(Command::Close);
+        conn.begin_close(Command::Close { checkpoint: true });
         assert!(
             matches!(
                 &conn.lifecycle,
@@ -5927,5 +6148,318 @@ mod tests {
             let result = conn.query(&cx, "SELECT 1").await;
             assert!(result.is_err(), "query after close should fail");
         });
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn native_wal_path(database: &std::path::Path) -> std::path::PathBuf {
+        let mut os = database.as_os_str().to_os_string();
+        os.push("-wal");
+        os.into()
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn seeded_database(dir: &tempfile::TempDir, name: &str) -> String {
+        let path = dir.path().join(name).to_string_lossy().into_owned();
+        let mut conn = AsyncConnection::open_sync(&path).expect("seed open should succeed");
+        conn.execute_sync("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("seed schema should apply");
+        conn.execute_sync("INSERT INTO t VALUES (1, 'seeded')")
+            .expect("seed row should insert");
+        conn.close_sync().expect("seed close should succeed");
+        path
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn open_with_page_size_sync_applies_requested_page_size() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir
+            .path()
+            .join("page-size.db")
+            .to_string_lossy()
+            .into_owned();
+        let mut conn = AsyncConnection::open_with_page_size_sync(&path, 16_384)
+            .expect("page-size open should succeed");
+        conn.execute_sync("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("schema should apply");
+        let rows = conn
+            .query_sync("PRAGMA page_size")
+            .expect("page_size pragma should answer");
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Integer(16_384)),
+            "the requested page size must be applied to the new database"
+        );
+        conn.close_sync().expect("close should succeed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn open_existing_sync_refuses_missing_path_without_creating() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let missing = dir.path().join("missing-existing.db");
+        let error = AsyncConnection::open_existing_sync(missing.to_string_lossy().into_owned())
+            .expect_err("a query-only open must refuse a missing database");
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert!(
+            !missing.exists(),
+            "a refused query-only open must not create the missing path"
+        );
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn open_existing_sync_opens_previously_created_database() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = seeded_database(&dir, "existing.db");
+        let mut conn =
+            AsyncConnection::open_existing_sync(&path).expect("existing open should succeed");
+        let rows = conn
+            .query_sync("SELECT name FROM t WHERE id = 1")
+            .expect("seeded row should be readable");
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Text("seeded".into())),
+            "the query-only open must observe previously committed rows"
+        );
+        conn.close_sync().expect("close should succeed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn open_schema_only_sync_reads_schema() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = seeded_database(&dir, "schema-only.db");
+        let mut conn =
+            AsyncConnection::open_schema_only_sync(&path).expect("schema-only open should succeed");
+        let rows = conn
+            .query_sync("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 't'")
+            .expect("schema inspection should answer");
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Text("t".into())),
+            "schema-only mode must expose the persisted table definition"
+        );
+        conn.close_sync().expect("close should succeed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn open_with_flags_sync_read_only_refuses_writes() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = seeded_database(&dir, "read-only.db");
+        let mut conn =
+            AsyncConnection::open_with_flags_sync(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("read-only open should succeed");
+        let rows = conn
+            .query_sync("SELECT COUNT(*) FROM t")
+            .expect("read-only query should answer");
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Integer(1)),
+            "read-only mode must observe committed rows"
+        );
+        conn.execute_sync("INSERT INTO t VALUES (2, 'refused')")
+            .expect_err("read-only mode must refuse writes");
+        conn.close_sync().expect("close should succeed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn open_reserved_with_expected_identity_and_env_sync_binds_reserved_path() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let database_path = dir.path().join("reserved-identity.db");
+        let reservation =
+            fsqlite_vfs::host_fs::reserve_new_file(&database_path).expect("reserve database path");
+        let expected_identity = FileIdentity::from_file(&reservation)
+            .expect("query reservation identity")
+            .expect("native filesystem identity must be available");
+        let mut conn = AsyncConnection::open_reserved_with_expected_identity_and_env_sync(
+            database_path.to_string_lossy().into_owned(),
+            expected_identity,
+            ConnectionEnv::default(),
+        )
+        .expect("identity-bound reserved open should succeed");
+        drop(reservation);
+        conn.execute_sync("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("schema should apply");
+        conn.execute_sync("INSERT INTO t VALUES (7)")
+            .expect("row should insert");
+        let rows = conn
+            .query_sync("SELECT id FROM t")
+            .expect("inserted row should be readable");
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Integer(7))
+        );
+        conn.close_sync().expect("close should succeed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn open_existing_with_expected_identity_and_env_sync_refuses_identity_mismatch() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = seeded_database(&dir, "identity-bound.db");
+        let unrelated_path = dir.path().join("unrelated-identity");
+        drop(std::fs::File::create(&unrelated_path).expect("create unrelated identity source"));
+        let unrelated_file =
+            std::fs::File::open(&unrelated_path).expect("open unrelated identity source");
+        let mismatched_identity = FileIdentity::from_file(&unrelated_file)
+            .expect("query unrelated identity")
+            .expect("native filesystem identity must be available");
+        AsyncConnection::open_existing_with_expected_identity_and_env_sync(
+            path.clone(),
+            mismatched_identity,
+            ConnectionEnv::default(),
+        )
+        .expect_err("an identity mismatch must refuse the open");
+
+        let identity_guard =
+            fsqlite_vfs::host_fs::open_existing_regular_file_no_follow(std::path::Path::new(&path))
+                .expect("open identity guard");
+        let expected_identity = FileIdentity::from_file(&identity_guard)
+            .expect("query database identity")
+            .expect("native filesystem identity must be available");
+        let mut conn = AsyncConnection::open_existing_with_expected_identity_and_env_sync(
+            path,
+            expected_identity,
+            ConnectionEnv::default(),
+        )
+        .expect("the matching identity must open");
+        drop(identity_guard);
+        let rows = conn
+            .query_sync("SELECT COUNT(*) FROM t")
+            .expect("identity-bound open should read committed rows");
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Integer(1))
+        );
+        conn.close_sync().expect("close should succeed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn close_without_checkpoint_sync_preserves_wal_and_memoizes() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir
+            .path()
+            .join("no-checkpoint.db")
+            .to_string_lossy()
+            .into_owned();
+        let mut conn = AsyncConnection::open_sync(&path).expect("open should succeed");
+        conn.execute_sync("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("schema should apply");
+        conn.execute_sync("INSERT INTO t VALUES (1, 'wal-resident')")
+            .expect("row should insert");
+        let wal_path = native_wal_path(std::path::Path::new(&path));
+        let wal_bytes_before_close = std::fs::metadata(&wal_path)
+            .expect("committed writes must leave a WAL file")
+            .len();
+        assert!(
+            wal_bytes_before_close > 0,
+            "the WAL must hold frames before the no-checkpoint close"
+        );
+
+        conn.close_without_checkpoint_sync()
+            .expect("no-checkpoint close should succeed");
+        assert!(
+            conn.state
+                .cleanup_skipped_checkpoint
+                .load(Ordering::Acquire),
+            "the worker cleanup must run the no-checkpoint close path"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal_path)
+                .expect("WAL must survive")
+                .len(),
+            wal_bytes_before_close,
+            "skipping the close-time checkpoint must leave the WAL bytes untouched"
+        );
+        conn.close_without_checkpoint_sync()
+            .expect("a terminal close must replay its memoized success");
+        conn.execute_sync("SELECT 1")
+            .expect_err("operations after close must fail");
+
+        let mut reopened = AsyncConnection::open_sync(&path).expect("reopen should recover WAL");
+        let rows = reopened
+            .query_sync("SELECT name FROM t WHERE id = 1")
+            .expect("recovered row should be readable");
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Text("wal-resident".into())),
+            "the next open must recover and publish the preserved WAL contents"
+        );
+        reopened.close_sync().expect("reopen close should succeed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn close_sync_runs_checkpointing_cleanup() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir
+            .path()
+            .join("checkpointing.db")
+            .to_string_lossy()
+            .into_owned();
+        let mut conn = AsyncConnection::open_sync(&path).expect("open should succeed");
+        conn.execute_sync("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("schema should apply");
+        conn.execute_sync("INSERT INTO t VALUES (1)")
+            .expect("row should insert");
+        conn.close_sync().expect("close should succeed");
+        assert!(
+            !conn
+                .state
+                .cleanup_skipped_checkpoint
+                .load(Ordering::Acquire),
+            "an ordinary explicit close must keep the checkpointing cleanup path"
+        );
+
+        let mut reopened = AsyncConnection::open_sync(&path).expect("reopen should succeed");
+        let rows = reopened
+            .query_sync("SELECT COUNT(*) FROM t")
+            .expect("checkpointed row should be durable");
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Integer(1))
+        );
+        reopened.close_sync().expect("reopen close should succeed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn small_stack_consumer_thread_completes_open_schema_and_writes() {
+        // Regression for the sqlmodel-frankensqlite caller-stack overflow
+        // class: a consumer thread far below any engine-future depth must be
+        // able to open, migrate schema, write, and close because every deep
+        // future runs on the dedicated WORKER_STACK_BYTES worker thread.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir
+            .path()
+            .join("small-stack.db")
+            .to_string_lossy()
+            .into_owned();
+        thread::Builder::new()
+            .name("small-stack-consumer".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut conn =
+                    AsyncConnection::open_sync(&path).expect("small-stack open should succeed");
+                conn.execute_sync("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+                    .expect("small-stack schema should apply");
+                conn.execute_sync("INSERT INTO t VALUES (1, 'stack-safe')")
+                    .expect("small-stack insert should apply");
+                let rows = conn
+                    .query_sync("SELECT name FROM t WHERE id = 1")
+                    .expect("small-stack query should answer");
+                assert_eq!(
+                    rows.first().and_then(|row| row.get(0)),
+                    Some(&SqliteValue::Text("stack-safe".into()))
+                );
+                conn.close_sync().expect("small-stack close should succeed");
+            })
+            .expect("small-stack thread should spawn")
+            .join()
+            .expect("small-stack consumer must complete without overflowing");
     }
 }
