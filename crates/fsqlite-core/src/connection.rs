@@ -462,6 +462,16 @@ static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 /// profile. Deep mode is for wide/large rows where ~360 ns/row amortizes; its
 /// component attribution is not trustworthy for rows under ~2 us.
 static FSQLITE_DML_PROFILE_DEEP_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Test-only override for [`dml_profile_deep_enabled`]. The env-derived
+/// `OnceLock` above is cached process-wide on first read, so tests that
+/// assert the deep per-column preserialize timers (bd-phboe mechanism (b))
+/// cannot arm them via the environment; they set this instead, scoped under
+/// the process-global profile-guard serializer so parallel tests never
+/// observe a foreign override.
+#[cfg(test)]
+static FSQLITE_DML_PROFILE_DEEP_TEST_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 thread_local! {
     // Thread-local override for hot-path profiling. When `Some(true)`, profiling
@@ -1404,6 +1414,10 @@ fn prepared_direct_update_lazy_scratch_for_bench_enabled() -> bool {
 /// exists to keep cheap.
 #[inline]
 fn dml_profile_deep_enabled() -> bool {
+    #[cfg(test)]
+    if FSQLITE_DML_PROFILE_DEEP_TEST_OVERRIDE.load(AtomicOrdering::Relaxed) {
+        return true;
+    }
     *FSQLITE_DML_PROFILE_DEEP_ENABLED.get_or_init(|| {
         std::env::var("FSQLITE_DML_PROFILE_DEEP")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -205354,10 +205368,15 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             // The prepared statement is testing publication reuse after external
-            // DML, not live writer contention. Release any retained single-writer
-            // state parked on the seeding connection before running the assertion
-            // path on conn1.
-            drop(conn2);
+            // DML, not live writer contention. bd-phboe mechanism (c): `drop`
+            // cannot await, so it CANNOT flush the retained single-writer
+            // autocommit batch — conn2's INSERT stays parked uncommitted and
+            // the shared commit clock never advances, which turns conn1's
+            // refresh into a Noop. `close()` is the release path that commits
+            // the retained batch and publishes the visibility floor
+            // (close_internal). The parked-write-across-drop hazard itself is
+            // tracked separately (see the bead filed with this fix).
+            conn2.close().await.unwrap();
 
             reset_hot_path_profile();
             let affected = stmt
@@ -209034,11 +209053,26 @@ mod pager_routing_tests {
         _trace_guard: tracing::dispatcher::DefaultGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
         previous_enabled: bool,
+        deep_dml_override_armed: bool,
     }
 
     #[cfg(test)]
     impl StatementReuseHotPathProfileGuard {
         pub(super) fn new() -> Self {
+            Self::new_with_deep_dml_profile_choice(false)
+        }
+
+        /// bd-phboe mechanism (b): the per-column INSERT preserialize
+        /// sub-timers are deep-gated (bd-he3ua) and the env knob is cached in
+        /// a process-wide `OnceLock` before tests can set it. Keepers that
+        /// assert those timers arm this test-only override instead; it is
+        /// scoped inside the process-global serializer this guard holds, so
+        /// no parallel test can observe it.
+        pub(super) fn new_with_deep_dml_profile() -> Self {
+            Self::new_with_deep_dml_profile_choice(true)
+        }
+
+        fn new_with_deep_dml_profile_choice(deep_dml_profile: bool) -> Self {
             // Use the process-global test serializer so that profile tests
             // never overlap with ANY other test that touches shared state.
             let guard = super::fsqlite_core_test_serializer();
@@ -209047,10 +209081,15 @@ mod pager_routing_tests {
             let previous_enabled = hot_path_profile_enabled();
             reset_hot_path_profile();
             set_hot_path_profile_enabled(true);
+            if deep_dml_profile {
+                super::FSQLITE_DML_PROFILE_DEEP_TEST_OVERRIDE
+                    .store(true, super::AtomicOrdering::Relaxed);
+            }
             Self {
                 _trace_guard: trace_guard,
                 _lock: guard,
                 previous_enabled,
+                deep_dml_override_armed: deep_dml_profile,
             }
         }
     }
@@ -209058,6 +209097,10 @@ mod pager_routing_tests {
     #[cfg(test)]
     impl Drop for StatementReuseHotPathProfileGuard {
         fn drop(&mut self) {
+            if self.deep_dml_override_armed {
+                super::FSQLITE_DML_PROFILE_DEEP_TEST_OVERRIDE
+                    .store(false, super::AtomicOrdering::Relaxed);
+            }
             reset_hot_path_profile();
             set_hot_path_profile_enabled(self.previous_enabled);
         }
@@ -247014,7 +247057,9 @@ mod pager_routing_tests {
     #[test]
     fn test_prepared_direct_simple_insert_large_profile_breakdown() {
         asupersync::test_utils::run_test(|| async {
-            let _profile_guard = StatementReuseHotPathProfileGuard::new();
+            // The per-column preserialize attribution asserted below is
+            // deep-gated (bd-he3ua); arm the test-only deep override.
+            let _profile_guard = StatementReuseHotPathProfileGuard::new_with_deep_dml_profile();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
                 "CREATE TABLE t(\
@@ -247144,7 +247189,9 @@ mod pager_routing_tests {
     #[test]
     fn test_prepared_direct_insert_preserialize_fallback_does_not_publish_child_profile() {
         asupersync::test_utils::run_test(|| async {
-            let _profile_guard = StatementReuseHotPathProfileGuard::new();
+            // The preserialize-family attribution asserted below is
+            // deep-gated (bd-he3ua); arm the test-only deep override.
+            let _profile_guard = StatementReuseHotPathProfileGuard::new_with_deep_dml_profile();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, score INTEGER);")
                 .await
