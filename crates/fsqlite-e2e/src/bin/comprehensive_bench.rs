@@ -653,15 +653,13 @@ where
             config.warmup_iters
         );
         let mut run_csqlite = |index| {
-            let outcome = csqlite_sample("warmup", index).unwrap_or_else(|error| {
-                panic!("{csqlite_label} warmup {index} failed: {error}")
-            });
+            let outcome = csqlite_sample("warmup", index)
+                .unwrap_or_else(|error| panic!("{csqlite_label} warmup {index} failed: {error}"));
             csqlite_readiness.push(outcome.readiness);
         };
         let mut run_fsqlite = |index| {
-            let outcome = fsqlite_sample("warmup", index).unwrap_or_else(|error| {
-                panic!("{fsqlite_label} warmup {index} failed: {error}")
-            });
+            let outcome = fsqlite_sample("warmup", index)
+                .unwrap_or_else(|error| panic!("{fsqlite_label} warmup {index} failed: {error}"));
             fsqlite_readiness.push(outcome.readiness);
         };
         if warmup_index.is_multiple_of(2) {
@@ -9137,7 +9135,8 @@ mod tests {
     /// panicked predecessor must not cascade into unrelated failures.
     fn engine_test_serializer() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn sample_measurement(label: &str, row_count: usize, durations_ms: &[u64]) -> Measurement {
@@ -12531,128 +12530,46 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
     eprint!("  Benchmarking mixed OLTP (paired arms)... ");
 
     // bd-fd1ra: paired ABBA interleaving between arms.
-    let (cs, fs) = measure_paired("cs_oltp", "fs_oltp", ops, || {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        apply_pragmas_csqlite(&conn);
-        conn.execute_batch(
-            "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
-        )
-        .unwrap();
-        conn.execute_batch("BEGIN").unwrap();
-        {
-            let mut stmt = conn
-                .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
-                .unwrap();
-            #[allow(clippy::cast_possible_wrap)]
-            for i in 1..=seed_rows as i64 {
-                stmt.execute(rusqlite::params![i]).unwrap();
-            }
-        }
-        conn.execute_batch("COMMIT").unwrap();
-
-        let mut rng = Rng64::new(42);
-        #[allow(clippy::cast_possible_wrap)]
-        let mut next_id = seed_rows as i64 + 1;
-        let mut select_pt = conn.prepare("SELECT * FROM bench WHERE id = ?1").unwrap();
-        let mut select_range = conn
-            .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
+    let (cs, fs) = measure_paired(
+        "cs_oltp",
+        "fs_oltp",
+        ops,
+        || {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            apply_pragmas_csqlite(&conn);
+            conn.execute_batch(
+                "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
+            )
             .unwrap();
-        let mut select_agg = conn
-            .prepare("SELECT COUNT(*), SUM(score) FROM bench")
-            .unwrap();
-        let mut insert = conn
-            .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
-            .unwrap();
-        let mut update = conn
-            .prepare("UPDATE bench SET score = ?2 WHERE id = ?1")
-            .unwrap();
-        let mut delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
-
-        #[allow(clippy::cast_possible_wrap)]
-        for _ in 0..ops {
-            let roll = rng.next_usize(100);
-            if roll < 40 {
-                let id = (rng.next_usize(seed_rows) + 1) as i64;
-                std::hint::black_box(
-                    collect_rusqlite_rows(&mut select_pt, rusqlite::params![id]).unwrap(),
-                );
-            } else if roll < 60 {
-                let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
-                let count: i64 = select_range
-                    .query_row(rusqlite::params![start, start + 50], |r| r.get(0))
+            conn.execute_batch("BEGIN").unwrap();
+            {
+                let mut stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
                     .unwrap();
-                std::hint::black_box(count);
-            } else if roll < 80 {
-                let aggregate: (i64, i64) = select_agg
-                    .query_row([], |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())))
-                    .unwrap();
-                std::hint::black_box(aggregate);
-            } else if roll < 95 {
-                std::hint::black_box(insert.execute(rusqlite::params![next_id]).unwrap());
-                next_id += 1;
-            } else if roll < 98 {
-                let id = (rng.next_usize(seed_rows) + 1) as i64;
-                std::hint::black_box(update.execute(rusqlite::params![id, id * 99]).unwrap());
-            } else {
-                let id = (rng.next_usize(seed_rows) + 1) as i64;
-                std::hint::black_box(delete.execute(rusqlite::params![id]).unwrap());
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 1..=seed_rows as i64 {
+                    stmt.execute(rusqlite::params![i]).unwrap();
+                }
             }
-        }
-        let final_state: (i64, i64) = conn
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench",
-                [],
-                |row| Ok((row.get(0).unwrap(), row.get(1).unwrap())),
-            )
-            .unwrap();
-        std::hint::black_box(final_state);
-    }, || {
-        // bd-zavyn: one runtime entry per timed sample. This body previously
-        // re-entered the runtime once per seed row and once per operation
-        // (~10k entries per sample) — the largest single instrument
-        // distortion in the whole matrix.
-        fsqlite_e2e::block_on(async {
-            let conn = open_fsqlite_memory_connection_for_benchmark_async().await;
-            apply_pragmas_fsqlite_async(&conn).await;
-            fs_execute_async(
-                &conn,
-                "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
-            )
-            .await;
-            let seed_insert = fs_prepare_async(
-                &conn,
-                "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))",
-            )
-            .await;
-            fs_execute_async(&conn, "BEGIN").await;
-            #[allow(clippy::cast_possible_wrap)]
-            for i in 1..=seed_rows as i64 {
-                fs_stmt_execute_with_params_async(
-                    &seed_insert,
-                    &[fsqlite::SqliteValue::Integer(i)],
-                )
-                .await;
-            }
-            fs_execute_async(&conn, "COMMIT").await;
+            conn.execute_batch("COMMIT").unwrap();
 
             let mut rng = Rng64::new(42);
             #[allow(clippy::cast_possible_wrap)]
             let mut next_id = seed_rows as i64 + 1;
-            let select_pt = fs_prepare_async(&conn, "SELECT * FROM bench WHERE id = ?1").await;
-            let select_range = fs_prepare_async(
-                &conn,
-                "SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2",
-            )
-            .await;
-            let select_agg =
-                fs_prepare_async(&conn, "SELECT COUNT(*), SUM(score) FROM bench").await;
-            let insert = fs_prepare_async(
-                &conn,
-                "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))",
-            )
-            .await;
-            let update = fs_prepare_async(&conn, "UPDATE bench SET score = ?2 WHERE id = ?1").await;
-            let delete = fs_prepare_async(&conn, "DELETE FROM bench WHERE id = ?1").await;
+            let mut select_pt = conn.prepare("SELECT * FROM bench WHERE id = ?1").unwrap();
+            let mut select_range = conn
+                .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
+                .unwrap();
+            let mut select_agg = conn
+                .prepare("SELECT COUNT(*), SUM(score) FROM bench")
+                .unwrap();
+            let mut insert = conn
+                .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
+                .unwrap();
+            let mut update = conn
+                .prepare("UPDATE bench SET score = ?2 WHERE id = ?1")
+                .unwrap();
+            let mut delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
 
             #[allow(clippy::cast_possible_wrap)]
             for _ in 0..ops {
@@ -12660,62 +12577,151 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
                 if roll < 40 {
                     let id = (rng.next_usize(seed_rows) + 1) as i64;
                     std::hint::black_box(
-                        select_pt
-                            .query_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                            .await
-                            .unwrap(),
+                        collect_rusqlite_rows(&mut select_pt, rusqlite::params![id]).unwrap(),
                     );
                 } else if roll < 60 {
                     let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
-                    std::hint::black_box(
-                        select_range
-                            .query_row_with_params(&[
-                                fsqlite::SqliteValue::Integer(start),
-                                fsqlite::SqliteValue::Integer(start + 50),
-                            ])
-                            .await
-                            .unwrap(),
-                    );
+                    let count: i64 = select_range
+                        .query_row(rusqlite::params![start, start + 50], |r| r.get(0))
+                        .unwrap();
+                    std::hint::black_box(count);
                 } else if roll < 80 {
-                    std::hint::black_box(select_agg.query_row().await.unwrap());
+                    let aggregate: (i64, i64) = select_agg
+                        .query_row([], |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())))
+                        .unwrap();
+                    std::hint::black_box(aggregate);
                 } else if roll < 95 {
-                    std::hint::black_box(
-                        insert
-                            .execute_with_params(&[fsqlite::SqliteValue::Integer(next_id)])
-                            .await
-                            .unwrap(),
-                    );
+                    std::hint::black_box(insert.execute(rusqlite::params![next_id]).unwrap());
                     next_id += 1;
                 } else if roll < 98 {
                     let id = (rng.next_usize(seed_rows) + 1) as i64;
-                    std::hint::black_box(
-                        update
-                            .execute_with_params(&[
-                                fsqlite::SqliteValue::Integer(id),
-                                fsqlite::SqliteValue::Integer(id * 99),
-                            ])
-                            .await
-                            .unwrap(),
-                    );
+                    std::hint::black_box(update.execute(rusqlite::params![id, id * 99]).unwrap());
                 } else {
                     let id = (rng.next_usize(seed_rows) + 1) as i64;
-                    std::hint::black_box(
-                        delete
-                            .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                            .await
-                            .unwrap(),
-                    );
+                    std::hint::black_box(delete.execute(rusqlite::params![id]).unwrap());
                 }
             }
-            let final_state =
-                fs_prepare_async(&conn, "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench")
-                    .await
-                    .query_row()
-                    .await
-                    .unwrap();
+            let final_state: (i64, i64) = conn
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench",
+                    [],
+                    |row| Ok((row.get(0).unwrap(), row.get(1).unwrap())),
+                )
+                .unwrap();
             std::hint::black_box(final_state);
-        });
-    });
+        },
+        || {
+            // bd-zavyn: one runtime entry per timed sample. This body previously
+            // re-entered the runtime once per seed row and once per operation
+            // (~10k entries per sample) — the largest single instrument
+            // distortion in the whole matrix.
+            fsqlite_e2e::block_on(async {
+                let conn = open_fsqlite_memory_connection_for_benchmark_async().await;
+                apply_pragmas_fsqlite_async(&conn).await;
+                fs_execute_async(
+                    &conn,
+                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+                )
+                .await;
+                let seed_insert = fs_prepare_async(
+                    &conn,
+                    "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))",
+                )
+                .await;
+                fs_execute_async(&conn, "BEGIN").await;
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 1..=seed_rows as i64 {
+                    fs_stmt_execute_with_params_async(
+                        &seed_insert,
+                        &[fsqlite::SqliteValue::Integer(i)],
+                    )
+                    .await;
+                }
+                fs_execute_async(&conn, "COMMIT").await;
+
+                let mut rng = Rng64::new(42);
+                #[allow(clippy::cast_possible_wrap)]
+                let mut next_id = seed_rows as i64 + 1;
+                let select_pt = fs_prepare_async(&conn, "SELECT * FROM bench WHERE id = ?1").await;
+                let select_range = fs_prepare_async(
+                    &conn,
+                    "SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2",
+                )
+                .await;
+                let select_agg =
+                    fs_prepare_async(&conn, "SELECT COUNT(*), SUM(score) FROM bench").await;
+                let insert = fs_prepare_async(
+                    &conn,
+                    "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))",
+                )
+                .await;
+                let update =
+                    fs_prepare_async(&conn, "UPDATE bench SET score = ?2 WHERE id = ?1").await;
+                let delete = fs_prepare_async(&conn, "DELETE FROM bench WHERE id = ?1").await;
+
+                #[allow(clippy::cast_possible_wrap)]
+                for _ in 0..ops {
+                    let roll = rng.next_usize(100);
+                    if roll < 40 {
+                        let id = (rng.next_usize(seed_rows) + 1) as i64;
+                        std::hint::black_box(
+                            select_pt
+                                .query_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                                .await
+                                .unwrap(),
+                        );
+                    } else if roll < 60 {
+                        let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
+                        std::hint::black_box(
+                            select_range
+                                .query_row_with_params(&[
+                                    fsqlite::SqliteValue::Integer(start),
+                                    fsqlite::SqliteValue::Integer(start + 50),
+                                ])
+                                .await
+                                .unwrap(),
+                        );
+                    } else if roll < 80 {
+                        std::hint::black_box(select_agg.query_row().await.unwrap());
+                    } else if roll < 95 {
+                        std::hint::black_box(
+                            insert
+                                .execute_with_params(&[fsqlite::SqliteValue::Integer(next_id)])
+                                .await
+                                .unwrap(),
+                        );
+                        next_id += 1;
+                    } else if roll < 98 {
+                        let id = (rng.next_usize(seed_rows) + 1) as i64;
+                        std::hint::black_box(
+                            update
+                                .execute_with_params(&[
+                                    fsqlite::SqliteValue::Integer(id),
+                                    fsqlite::SqliteValue::Integer(id * 99),
+                                ])
+                                .await
+                                .unwrap(),
+                        );
+                    } else {
+                        let id = (rng.next_usize(seed_rows) + 1) as i64;
+                        std::hint::black_box(
+                            delete
+                                .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                }
+                let final_state =
+                    fs_prepare_async(&conn, "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench")
+                        .await
+                        .query_row()
+                        .await
+                        .unwrap();
+                std::hint::black_box(final_state);
+            });
+        },
+    );
 
     eprintln!(
         "C={} F={}",
