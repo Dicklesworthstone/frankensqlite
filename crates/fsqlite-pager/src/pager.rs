@@ -6364,10 +6364,31 @@ async fn settle_pending_group_commit_finalization_round(queue: &GroupCommitQueue
         return Err(error);
     }
     if queue.has_unresolved_in_doubt_epoch() || queue.has_process_root_finalization_attempt() {
+        // bd-b4mwn rework #2: ground truth on the holder — enumerate the
+        // registry's live attempts for this queue instead of inferring from
+        // queue-side counters (pending/claimed/unlocks/epochs all read zero
+        // at refusal time on trj while the count stayed armed).
+        let live_attempts: Vec<String> = {
+            let registry = process_root_finalization_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.by_queue.get(&queue.queue_id).map_or_else(Vec::new, |rooted| {
+                rooted
+                    .attempts
+                    .iter()
+                    .map(|(attempt_id, scope)| format!("{attempt_id}:{scope:?}"))
+                    .collect()
+            })
+        };
         tracing::warn!(
             target: "fsqlite.pager.group_commit",
             unresolved_in_doubt_epoch = queue.has_unresolved_in_doubt_epoch(),
             process_root_finalization_attempt = queue.has_process_root_finalization_attempt(),
+            live_attempts = ?live_attempts,
+            pending_cleanups = queue.pending_logical_cleanup_count(),
+            claimed_cleanups = queue
+                .claimed_logical_cleanups
+                .load(AtomicOrdering::Acquire),
             "settle refused: residual in-doubt epoch or process-root attempt after cleanup"
         );
         return Err(FrankenError::BusyRecovery);
