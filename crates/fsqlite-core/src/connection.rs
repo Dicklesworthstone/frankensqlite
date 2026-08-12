@@ -130165,14 +130165,31 @@ mod tests {
                     .expect_err("LIMIT zero must not suppress static SELECT validation");
             }
 
-            let invalid_order = conn
-                .prepare("SELECT (SELECT 1) ORDER BY 2 LIMIT ?;")
-                .await
-                .unwrap();
-            invalid_order
-                .query_with_params(&[SqliteValue::Integer(0)])
-                .await
-                .expect_err("prepared LIMIT zero must not suppress ORDER BY shape validation");
+            // bd-2fong parity: stock SQLite rejects the out-of-range ORDER BY
+            // ordinal at PREPARE time (oracle 3.46.1: '1st ORDER BY term out
+            // of range - should be between 1 and 1', and a literal LIMIT 0
+            // does not suppress it). The old arm expected prepare to succeed
+            // with the error deferred to execution; the intent — LIMIT zero
+            // must never suppress ORDER BY shape validation — is preserved by
+            // asserting the error surfaces no later than prepare.
+            let invalid_order = conn.prepare("SELECT (SELECT 1) ORDER BY 2 LIMIT ?;").await;
+            match invalid_order {
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("ORDER BY term out of range"),
+                        "prepare-time rejection must be the stock out-of-range error: {message}"
+                    );
+                }
+                Ok(prepared) => {
+                    prepared
+                        .query_with_params(&[SqliteValue::Integer(0)])
+                        .await
+                        .expect_err(
+                            "prepared LIMIT zero must not suppress ORDER BY shape validation",
+                        );
+                }
+            }
         });
     }
 
