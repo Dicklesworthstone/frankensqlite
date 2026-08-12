@@ -1301,6 +1301,12 @@ struct GroupCommitQueue {
     /// process-root registry mutex is touched only while exceptional
     /// finalization work actually exists.
     rooted_finalization_attempts: AtomicUsize,
+    /// bd-b4mwn rework: settle's claim-contention retry budget in
+    /// milliseconds, tracking the largest busy_timeout any connection on
+    /// this path has published (default: the engine's 5000ms default). The
+    /// fixed 250ms envelope was timing-dependent — green on a 64-core host,
+    /// red on a 16-core one where resolution bursts run longer.
+    settle_budget_ms: AtomicU64,
     /// The consolidator managing FILLING→FLUSHING→COMPLETE phases.
     consolidator: Mutex<GroupCommitConsolidator>,
     /// Condvar for waiters to park on until flush completes.
@@ -1778,6 +1784,7 @@ impl GroupCommitQueue {
             queue_id: next_process_root_finalization_id(&NEXT_GROUP_COMMIT_QUEUE_ID),
             finalization_binding: Mutex::new(GroupCommitFinalizationBinding::default()),
             rooted_finalization_attempts: AtomicUsize::new(0),
+            settle_budget_ms: AtomicU64::new(5000),
             consolidator: Mutex::new(GroupCommitConsolidator::new(config)),
             flush_complete: Condvar::new(),
             completed_epoch: AtomicU64::new(0),
@@ -6234,21 +6241,30 @@ fn identity_bound_group_commit_queue<V: Vfs>(
     )
 }
 
-/// bd-b4mwn round 7: bounded in-settle retries when the armed root has live,
+/// bd-b4mwn rounds 7+rework: in-settle retries when the armed root has live,
 /// claimable cleanup work (another settler holds the per-handle exit claim,
 /// or a resolve round simply lost the claim race). Bursts of concurrent
 /// settlers previously made every non-winning settler refuse BusyRecovery
-/// despite active progress; those refusals stacked into multi-second bursts
-/// that starved callers' busy windows. The retry budget stays well under a
-/// caller's busy_timeout so true wedges still surface promptly.
-const SETTLE_CLAIM_CONTENTION_RETRIES: u32 = 24;
+/// despite active progress. The original fixed ~250ms ceiling was
+/// timing-dependent (green on a 64-core host, red on 16 cores where
+/// resolution bursts run longer); the envelope now scales with the largest
+/// busy_timeout any connection on the path has published
+/// (`GroupCommitQueue::settle_budget_ms`, default 5000ms). True wedges still
+/// surface promptly: the loop exits as soon as no claimable work remains.
 const SETTLE_CLAIM_CONTENTION_BACKOFF: Duration = Duration::from_millis(10);
 
 async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -> Result<()> {
     if !queue.has_process_root_finalization_attempt() {
         return Ok(());
     }
-    for _ in 0..SETTLE_CLAIM_CONTENTION_RETRIES {
+    let budget = Duration::from_millis(
+        queue
+            .settle_budget_ms
+            .load(AtomicOrdering::Acquire)
+            .max(1),
+    );
+    let started = Instant::now();
+    loop {
         match settle_pending_group_commit_finalization_round(queue).await {
             Ok(()) => {
                 if !queue.has_process_root_finalization_attempt() {
@@ -6263,6 +6279,9 @@ async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -
         if queue.pending_logical_cleanup_count() == 0 {
             // No claimable work remains; the residual root is a true wedge —
             // fall through to the final round's fail-closed verdict.
+            break;
+        }
+        if started.elapsed() >= budget {
             break;
         }
         // Live cleanups remain (claimed by a peer settler or lost claim
@@ -12502,6 +12521,14 @@ where
     /// that `posix_lock` retries with backoff instead of returning BUSY
     /// immediately on cross-process contention.
     pub async fn set_vfs_busy_timeout_ms(&self, cx: &Cx, ms: u64) {
+        // bd-b4mwn rework: publish the connection's busy budget to the shared
+        // group-commit queue so settle's claim-contention retry envelope
+        // scales with the caller's patience instead of a fixed ceiling. Keep
+        // the largest published value: settle serves every connection on the
+        // path and must not be starved by one impatient peer.
+        self.group_commit_queue
+            .settle_budget_ms
+            .fetch_max(ms.max(1), AtomicOrdering::AcqRel);
         let db_file = self
             .inner
             .lock()
