@@ -407,12 +407,12 @@ const fn autocommit_statement_conflict_is_retryable(error: &FrankenError) -> boo
     error.is_transient()
 }
 
-/// Test-only PRAGMA dispatch fault injection for the bd-tc8u7 retry boundary.
-///
-/// The injected error is consumed before any PRAGMA state changes. Keeping the
-/// hook at statement dispatch (rather than inside the pager) lets the
-/// counterkeeper prove that the boundary retries only transient errors and
-/// propagates every non-transient error unchanged.
+// Test-only PRAGMA dispatch fault injection for the bd-tc8u7 retry boundary.
+//
+// The injected error is consumed before any PRAGMA state changes. Keeping the
+// hook at statement dispatch (rather than inside the pager) lets the
+// counterkeeper prove that the boundary retries only transient errors and
+// propagates every non-transient error unchanged.
 #[cfg(test)]
 std::thread_local! {
     static FSQLITE_PRAGMA_DISPATCH_ERROR_ONCE: RefCell<Option<FrankenError>> = const { RefCell::new(None) };
@@ -30626,7 +30626,8 @@ impl Connection {
                 Ok(Cow::Borrowed(statement))
             }
             Statement::Select(select)
-                if is_expression_only_select(select) && expression_only_has_core_subquery(select) =>
+                if is_expression_only_select(select)
+                    && expression_only_has_core_subquery(select) =>
             {
                 // Expression-only SELECTs with scalar subqueries in result
                 // columns are handled by execute_expression_only_with_subqueries
@@ -166198,7 +166199,10 @@ mod tests {
                 .query("PRAGMA journal_mode;")
                 .await
                 .expect("autocommit PRAGMA must absorb one transient recovery race");
-            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("memory".into())]);
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![SqliteValue::Text("memory".into())]
+            );
             assert_eq!(
                 super::pragma_dispatch_attempts(),
                 2,
