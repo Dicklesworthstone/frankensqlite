@@ -102487,9 +102487,16 @@ fn scalar_subquery_result_affinity(
 ) -> TypeAffinity {
     let core = in_rhs_donor_core(select);
     match core {
+        // bd-di4he: the project oracle (bundled SQLite 3.53.2 via rusqlite)
+        // donates VALUES affinity from the coroutine's donor row — the LAST
+        // row when no donor has been frozen: `(VALUES(1),(random() AND 0),
+        // (CAST(1 AS NUMERIC))) = '1'` is 1 there. (System sqlite3 3.46.1
+        // predates that donor model and answers 0; the bundled reference is
+        // authoritative for keepers.)
         SelectCore::Values(rows) => rows
             .donor_row()
-            .and_then(|row| row.first())
+            .or_else(|| rows.rows().last().map(Vec::as_slice))
+            .and_then(<[Expr]>::first)
             .map_or(TypeAffinity::Blob, |expr| {
                 resolve_operand_affinity(expr, schemas)
             }),
@@ -102501,10 +102508,24 @@ fn scalar_subquery_result_affinity(
             Some(ResultColumn::Expr { expr, .. }) => resolve_operand_affinity(expr, schemas),
             Some(ResultColumn::Star | ResultColumn::TableStar(_)) | None => TypeAffinity::Blob,
         },
-        SelectCore::Select { .. } => select_core_result_affinities(core, schemas)
-            .first()
-            .copied()
-            .unwrap_or(TypeAffinity::Blob),
+        SelectCore::Select { columns, .. } => {
+            let resolved = select_core_result_affinities(core, schemas)
+                .first()
+                .copied()
+                .unwrap_or(TypeAffinity::Blob);
+            // bd-di4he class A (outer-column fallback): a correlated
+            // single-column projection whose bare column resolves OUTSIDE
+            // the subquery's FROM yields Blob from the local lookup, but
+            // stock donates the outer column's affinity ((SELECT i FROM
+            // inner_without_i) = '1' is 1 when outer i is INTEGER). Fall
+            // back to the schema-wide resolver the no-FROM arm already uses.
+            if resolved == TypeAffinity::Blob
+                && let Some(ResultColumn::Expr { expr, .. }) = columns.first()
+            {
+                return resolve_operand_affinity(expr, schemas);
+            }
+            resolved
+        }
     }
 }
 
@@ -160616,36 +160637,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn temp_probe_bd2fong_unsupported_in_shapes() {
-        asupersync::test_utils::run_test(|| async {
-            let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE rhs_semantics (y INTEGER, z INTEGER);")
-                .await
-                .unwrap();
-            conn.execute("INSERT INTO rhs_semantics VALUES (1, 30), (3, 10), (2, 20);")
-                .await
-                .unwrap();
-            for sql in [
-                "SELECT 1 IN (SELECT y FROM rhs_semantics ORDER BY max(y));",
-                "SELECT 1 IN (SELECT * FROM rhs_semantics);",
-                "SELECT 1 IN (SELECT rhs_semantics.* FROM rhs_semantics);",
-                "SELECT 1 IN (SELECT (y, z) FROM rhs_semantics);",
-                "SELECT 1 IN (SELECT nope FROM rhs_semantics);",
-                "SELECT 1 IN (SELECT y FROM rhs_semantics WHERE nope);",
-                "SELECT 1 IN (SELECT y FROM rhs_semantics ORDER BY nope);",
-                "SELECT 1 IN (SELECT y FROM rhs_semantics ORDER BY -1 LIMIT 1);",
-                "SELECT 1 IN (SELECT y FROM rhs_semantics ORDER BY +2 LIMIT 1);",
-                "SELECT 1 IN (SELECT abs(y) FILTER (WHERE y > 0) FROM rhs_semantics);",
-            ] {
-                match conn.query(sql).await {
-                    Ok(rows) => eprintln!("INSHAPE OK(!): {sql} => {:?}", rows[0].values()),
-                    Err(error) => eprintln!("INSHAPE err: {sql} => {error:?}"),
-                }
-            }
-            panic!("probe complete");
-        });
-    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
