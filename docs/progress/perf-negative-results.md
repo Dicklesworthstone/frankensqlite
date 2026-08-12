@@ -48,6 +48,74 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-12 - REJECTED: multi-SQE io_uring submission for `write_page_batch` (bd-q8501.1)
+
+- Target workload: one file-backed `IoUringFile::write_page_batch` operation
+  over 16 disjoint 4096-byte pages, without durability sync. Control
+  `08434a552` forwards the batch through one Unix blocking-pool hop and 16
+  sequential `pwrite` calls; candidate `442fc8f84` allocates/enqueues 16
+  io_uring requests before one shared-driver activation. Touched surface:
+  `crates/fsqlite-vfs/src/uring.rs`.
+- Evidence: `/home/ubuntu/fsqlite-perf-results/bd-q8501-20260812T0455Z/`.
+  One byte-identical, self-identifying harness; sequential release-perf builds
+  with `RUSTFLAGS=-C target-cpu=native`; Threadripper CPU 96 pinned with
+  `nice -n 10`; four unscored warm-up blocks then ten scored symmetric blocks
+  interleaving A/A and A/B. Denominator is 20 samples/arm, 128 measured
+  batches/sample, 16 in-process warm-ups/sample. A/A paired median was 1.0012x
+  with 95% bootstrap interval 0.9930–1.0441x.
+- Result: REJECT. Control median was 75.083 us/batch (p95 85.178 us);
+  candidate median was 145.281 us/batch (p95 159.055 us), a 1.9349x latency
+  ratio / +93.49%. Candidate lost 20/20 adjacent pairs; paired median was
+  1.9542x with 95% bootstrap interval 1.8995–2.0239x. An independent ABBA
+  pilot agreed at 1.8555x. Exact contents, 65,536-byte final size, affinity,
+  and io_uring availability held for 80/80 scored samples; candidate batch
+  counter was exactly 144 in 20/20 candidate samples.
+- Reason: the intended win did not reproduce. The first implementation trades
+  the Unix one-hop batch for per-page owned-buffer copies, completion channels,
+  cancellation guards, queue bookkeeping, and CQE dispatch; one driver start
+  does not offset those costs on this 16-page submission/completion workload.
+  This microbench does not measure durability or end-to-end SQL commits.
+- Retry only after profile evidence attributes the extra cost and a revised
+  lifetime-safe design removes per-page ownership/completion overhead (for
+  example registered/borrowed buffers plus batch-level completion). Require the
+  same self-identifying A/A + A/B matrix; do not keep multi-SQE submission based
+  only on reduced driver-start counts.
+
+## 2026-08-11 - REJECTED: boxing cold branches out of the prepared-statement hot futures (bd-uzq54 levers 1+2)
+
+- Target workload: `comprehensive_bench --quick --filter insert`, 10K-row
+  single-transaction record-size comparison, `tiny_1col` (target of the
+  ~700ns/row attribution) and `large_10col` (explicit non-regression
+  guardrail). Touched surface: `crates/fsqlite-core/src/connection.rs` —
+  `PreparedStatement::{execute,execute_with_params}` query-fallback boxing
+  plus three cold-branch `Box::pin` sites inside
+  `execute_prepared_with_params_after_background_status` (candidate commit
+  `8e529600`; control is its parent `65ab05b92`, identical otherwise).
+- Evidence: 8 process-level runs on the campaign box, order-balanced
+  ctrl,cand,cand,ctrl + cand,ctrl,ctrl,cand, `taskset -c 48-55` (cpuset
+  claimed on bd-dqdoe), release-perf, `FSQLITE_BENCH_PROFILE_INSERT=1`,
+  harness at the bd-fd1ra state (paired AB/BA arms, WARMUP 5 / MIN 20 /
+  MAX 40). Binary sha256s: ctrl `e7a6b225…33b1ef`, cand `2b779499…e1bbba`.
+  Raw outputs: session scratchpad `uzq54-runs/run{1..8}-*.{stdout,stderr}`;
+  numbers reproduced in the bd-uzq54 comment of the same date.
+- Result: REJECT. `tiny_1col` F medians ctrl {4.25,4.12,4.11,4.08} vs cand
+  {4.07,4.58,4.12,4.08} — no improvement (effect inside A/A spread).
+  `large_10col` F medians ctrl {19.05,19.07,19.14,19.34} vs cand
+  {19.60,19.94,19.46,19.51} — candidate min exceeds control max
+  (non-overlapping ranges, ~+2.4% median), violating the KEEP gate's
+  large-row non-regression clause. The 17.7KB future-size reduction did not
+  translate into wall-time on the narrow-row path, and the layout change
+  measurably hurt the wide-row path.
+- Revert candidate: `8e529600` (coordinate the revert around bd-e26jr's
+  active connection.rs lane; the five sites are disjoint from its regions).
+- Retry condition: only with allocation-count + CPU-sample evidence that
+  the per-call allocation or generator size is actually on the measured
+  hot path (heaptrack/samply per bd-dqdoe step 4), and with a layout probe
+  (e.g. `std::mem::size_of` of the generated futures asserted in a test)
+  proving the boxing shrinks the hot generator without moving hot fields
+  across cache lines. Blind size-reduction via cold-branch boxing is not a
+  keep on its own.
+
 ## 2026-08-03 - REJECTED DEFAULT: conflict-topology split policy uses process-global, cross-database state
 
 - Target workload: `mt-mvcc-bench` `shared_table`, 300 rows per thread, at 2,

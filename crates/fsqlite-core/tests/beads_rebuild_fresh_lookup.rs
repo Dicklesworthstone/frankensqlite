@@ -189,24 +189,25 @@ fn reopen_after_same_path_file_replacement_reads_new_incarnation() {
         let db_path = dir.path().join("replace-reopen.db");
         let replacement_path = dir.path().join("replacement.db");
 
-        {
-            let conn = Connection::open(db_path.to_string_lossy().into_owned())
-                .await
-                .unwrap();
-            conn.execute("CREATE TABLE marker(value TEXT NOT NULL);")
-                .await
-                .unwrap();
-            for value in ["old-1", "old-2", "old-3"] {
-                conn.execute_with_params(
+        let old_conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        old_conn
+            .execute("CREATE TABLE marker(value TEXT NOT NULL);")
+            .await
+            .unwrap();
+        for value in ["old-1", "old-2", "old-3"] {
+            old_conn
+                .execute_with_params(
                     "INSERT INTO marker(value) VALUES (?)",
                     &[SqliteValue::Text(value.into())],
                 )
                 .await
                 .unwrap();
-            }
         }
+        let old_identity = old_conn.file_identity().await.unwrap().unwrap();
 
-        {
+        let replacement_identity = {
             let conn = Connection::open(replacement_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -216,13 +217,39 @@ fn reopen_after_same_path_file_replacement_reads_new_incarnation() {
             conn.execute("INSERT INTO marker(value) VALUES ('new-incarnation');")
                 .await
                 .unwrap();
+            let identity = conn.file_identity().await.unwrap().unwrap();
+            conn.close().await.unwrap();
+            identity
+        };
+        assert_ne!(old_identity, replacement_identity);
+
+        // A database-family replacement discards recovery artifacts belonging
+        // to the old inode. Move them aside instead of letting an old WAL
+        // legitimately replay old rows over the replacement image.
+        for suffix in ["-journal", "-wal", "-shm", "-wal-fec"] {
+            let mut sidecar = db_path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let sidecar = std::path::PathBuf::from(sidecar);
+            if sidecar.exists() {
+                let mut displaced = db_path.as_os_str().to_owned();
+                displaced.push(format!(".pre-replacement{suffix}"));
+                std::fs::rename(sidecar, std::path::PathBuf::from(displaced)).unwrap();
+            }
         }
 
+        // Match the downstream replacement flow: release the application
+        // handle immediately before the atomic swap, leaving no time for a
+        // path-keyed process registry to age out before the reopen.
+        drop(old_conn);
         std::fs::rename(&replacement_path, &db_path).unwrap();
 
         let reopened = Connection::open(db_path.to_string_lossy().into_owned())
             .await
             .unwrap();
+        assert_eq!(
+            reopened.file_identity().await.unwrap().unwrap(),
+            replacement_identity
+        );
         let rows = reopened
             .query("SELECT value FROM marker ORDER BY rowid")
             .await
@@ -233,6 +260,7 @@ fn reopen_after_same_path_file_replacement_reads_new_incarnation() {
             "same-path reopen must read the replacement inode"
         );
         assert_eq!(rows.len(), 1);
+        reopened.close().await.unwrap();
     });
 }
 
@@ -248,16 +276,23 @@ fn vacuum_into_compacts_database_with_trailing_whole_page_slack() {
         let db_str = db_path.to_string_lossy().into_owned();
 
         {
-            let conn = Connection::open(db_str.clone()).await.unwrap();
-            conn.execute("CREATE TABLE marker(value TEXT NOT NULL);")
-                .await
-                .unwrap();
-            conn.execute("INSERT INTO marker(value) VALUES ('survives');")
-                .await
-                .unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 CREATE TABLE marker(value TEXT NOT NULL);
+                 INSERT INTO marker(value) VALUES ('survives');",
+            )
+            .unwrap();
         }
 
         let logical_len = std::fs::metadata(&db_path).unwrap().len();
+        let logical_bytes = std::fs::read(&db_path).unwrap();
+        let header_pages_before = u32::from_be_bytes([
+            logical_bytes[28],
+            logical_bytes[29],
+            logical_bytes[30],
+            logical_bytes[31],
+        ]);
         let mut db_file = std::fs::OpenOptions::new()
             .append(true)
             .open(&db_path)
@@ -267,7 +302,18 @@ fn vacuum_into_compacts_database_with_trailing_whole_page_slack() {
             .unwrap();
         db_file.flush().unwrap();
         drop(db_file);
-        assert!(std::fs::metadata(&db_path).unwrap().len() > logical_len);
+        let bloated_len = std::fs::metadata(&db_path).unwrap().len();
+        assert!(bloated_len > logical_len);
+        assert_eq!(
+            u64::from(header_pages_before) * PAGE_SIZE as u64,
+            logical_len,
+            "fixture must start with an exact logical extent"
+        );
+        assert_eq!(
+            bloated_len,
+            logical_len + (PAGE_SIZE * APPENDED_PAGES) as u64,
+            "fixture must add whole-page trailing slack without changing the header"
+        );
 
         let conn = Connection::open(db_str).await.unwrap();
         conn.execute_with_params(
@@ -287,10 +333,20 @@ fn vacuum_into_compacts_database_with_trailing_whole_page_slack() {
 
         let bytes = std::fs::read(&compacted_path).unwrap();
         let header_pages = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+        assert!(
+            bytes.len() < bloated_len as usize,
+            "VACUUM INTO must discard, not adopt, trailing slack"
+        );
+        assert!(
+            header_pages < header_pages_before + APPENDED_PAGES as u32,
+            "VACUUM INTO must not turn appended slack into logical pages"
+        );
         assert_eq!(
             u64::from(header_pages) * PAGE_SIZE as u64,
             bytes.len() as u64,
             "VACUUM INTO output must omit source trailing slack"
         );
+        compacted.close().await.unwrap();
+        conn.close().await.unwrap();
     });
 }

@@ -19,15 +19,14 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.3.0] -- unreleased (Asupersync 0.4.3 compatibility)
+## [0.3.0] -- unreleased (Asupersync 0.4.3 compatibility + bug-fix and performance wave)
 
-Lockstep `0.2.1 -> 0.3.0` bump of all 27 workspace members. No hand-authored
-change to FrankenSQLite's engine or package-runtime source: the source-level
-edits are dependency constraints and version numbers, so no feature work, no
-bug fixes, and **no performance claim** -- nothing here was measured, and the
-release-gate performance matrix remains out of scope. Release *infrastructure*
-did change: the release workflows and the release-architecture note were
-edited to remove the GitHub Actions publish paths, as described under
+Lockstep `0.2.1 -> 0.3.0` bump of all 27 workspace members, carrying the
+Asupersync `0.4.3` runtime migration **plus a large verified bug-fix wave and
+a measured performance restoration** (see **Fixed** and **Performance**
+below). Release *infrastructure* also changed: the release workflows and the
+release-architecture note were edited to remove the GitHub Actions publish
+paths, as described under
 **Changed**.
 
 **This is not a behavior-free release.** The async runtime underneath
@@ -49,6 +48,57 @@ FrankenSQLite changed. Read **Breaking changes** before upgrading.
 > sufficient: callers must also revalidate cancellation and runtime behavior
 > against the new runtime. That is why this is a `0.3.0` family and not a
 > `0.2.2` patch.
+
+### Fixed
+
+- **GH#333**: concurrent same-file open + write from multiple threads could
+  fail with transient `BusyRecovery`/close-checkpoint errors; autocommit
+  boundaries now retry transient recovery states (explicit-transaction
+  first-committer-wins semantics unchanged).
+- **GH#334**: reopen after file replacement now re-derives per-path
+  pager/MVCC registry state from `FileIdentity(dev, inode)`; `VACUUM INTO`
+  accepts whole-page trailing slack on VACUUM source receipts only.
+- **8-writer rollback cascade**: `BusyRecovery` from ROLLBACK-after-failed-
+  INSERT under 8 concurrent writers eliminated via a seven-fix stack
+  (transient rollback absorption, Drop-time session reclamation,
+  abandoned-epoch escape, busy-budget-scaled settle envelope, cleanup-root
+  release ordering, exact-handle relay classification), verified green on two
+  hosts with zero aborts in 80/80 formal-gate invocations.
+- **Cross-connection query visibility**: a `SELECT` on one connection now
+  observes tables committed by another connection after reader open
+  (publication refresh reordered ahead of relation validation).
+- **Acknowledged-write visibility**: file-backed autocommit writes are
+  published before `execute` returns whenever a peer connection is open
+  (retained batching now applies only to sole-connection usage).
+- **PRAGMA under concurrent open**: transient `BusyRecovery` from
+  `PRAGMA journal_mode=WAL` during concurrent connection open is retried
+  within the busy-timeout budget (160-attempt keeper, zero escapes).
+- **Read fast-lane routing**: five deterministic prepared-statement routing
+  regressions fixed (correlated-scalar compile gate, preserialize profiling,
+  publication reuse, `VALUES ... ORDER BY` parse parity).
+- **SQL conformance**: subquery-family conformance improved from 139/148 to
+  147/148 passing (deferred-evaluator comparison affinity, `LIMIT 0`
+  short-circuit, `ORDER BY` placeholder ordinals, composite semijoin merge
+  ordering, EQP `FullTableScan` verification, `f(*)` parse parity, VALUES
+  donor constancy); the remaining case is tracked in `bd-di4he`.
+- **Retained-flush checkpoint classification**: transient post-commit
+  checkpoint failures no longer convert durable ordinary statements into
+  errors.
+
+### Performance
+
+Measured at the release-gate boundary rerun (control `b612eb7b5` vs release
+candidate, artifact
+`tests/artifacts/perf/rc-boundary-d3448770-20260812T1330Z-superserver`,
+2026-08-12, clean-clone canonical release builds, 20 paired ABBA
+invocations/arm): FrankenSQLite is faster than bundled C SQLite 3.53.2 in
+20 of 21 read cells (F/C 0.08-0.70) and 1.4x faster at 8 concurrent writers
+(F/C 0.73), with zero aborted samples. Named residuals: point-read row
+materialization (`bd-qcgn2`, partially improved in this release) and a
+small-N `SUM+GROUP BY` cell (`bd-z22mq`). The post-async-migration read
+regression investigated in `bd-dqdoe` was attributed largely to benchmark
+instrument overhead (per-query runtime entry, now amortized in the bench
+harness) plus the routing fixes above.
 
 ### Breaking changes
 

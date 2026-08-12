@@ -1,0 +1,35 @@
+provenance: {"bead":"bd-rp4rt","parent_bead":"bd-dqdoe","build_git_sha":"079207c9f32df6f1dd2b2337af8b3525cc301177","build_git_branch":"main","build_git_dirty":"true","build_profile":"release","build_opt_level":"3","elf_sha256":"399b21585178cbe30636c3b2127cb4329dc05ad2399384ba6ba9fa15fe9772af","elf_bytes":22568392,"exe_path":"/data/tmp/cargo-target/release-perf/bridge-overhead-bench","hostname":"superserver","cpus_allowed_list":"56-63","loadavg_start":"14.97 13.66 11.47 7/10206 3043119","levels":[100,200,400,800,1600],"rounds":20,"warmup_rounds":2,"lcg_seed":"0x5deece66d1ceb00c","bootstrap_resamples":2000,"bridge_api":"fsqlite_e2e::block_on (thread-local reused asupersync Runtime) / AsyncConnection *_sync facade"}
+round=1 complete loadavg=14.97 13.66 11.47 6/10178 3043206
+round=2 complete loadavg=14.97 13.66 11.47 11/10174 3043293
+round=3 complete loadavg=14.97 13.66 11.47 6/10178 3043337
+round=4 complete loadavg=14.41 13.57 11.45 9/10173 3043383
+round=5 complete loadavg=14.41 13.57 11.45 5/10178 3043413
+round=6 complete loadavg=14.41 13.57 11.45 6/10176 3043429
+round=7 complete loadavg=14.41 13.57 11.45 7/10178 3043472
+round=8 complete loadavg=14.41 13.57 11.45 8/10177 3043493
+round=9 complete loadavg=14.41 13.57 11.45 6/10178 3043556
+round=10 complete loadavg=14.41 13.57 11.45 8/10201 3043620
+round=11 complete loadavg=14.41 13.57 11.45 8/10187 3043706
+round=12 complete loadavg=14.41 13.57 11.45 9/10181 3043723
+round=13 complete loadavg=14.41 13.57 11.45 8/10181 3043740
+round=14 complete loadavg=14.41 13.57 11.45 9/10181 3043755
+round=15 complete loadavg=14.41 13.57 11.45 7/10180 3043771
+round=16 complete loadavg=14.41 13.57 11.45 6/10179 3043805
+round=17 complete loadavg=14.41 13.57 11.45 5/10176 3043821
+round=18 complete loadavg=14.41 13.57 11.45 6/10175 3043836
+round=19 complete loadavg=14.41 13.57 11.45 3/10175 3043877
+round=20 complete loadavg=14.41 13.57 11.45 7/10167 3043892
+arm=single_entry regressor=rows slope_ns=6680.3 ci95=[6483.0,6990.1] intercept_ns=-224750.9 r2=0.97979 n=100
+arm=per_op_bridge regressor=bridge_calls slope_ns=8341.9 ci95=[8160.9,8533.4] intercept_ns=-333900.4 r2=0.98734 n=100
+arm=worker_facade regressor=bridge_calls slope_ns=23229.6 ci95=[22323.8,24149.0] intercept_ns=211842.2 r2=0.98484 n=100
+arm=ready_control regressor=bridge_calls slope_ns=617.5 ci95=[612.0,626.0] intercept_ns=559.7 r2=0.99842 n=100
+arm=worker_facade_params regressor=bridge_calls slope_ns=17206.0 ci95=[16131.1,18203.3] intercept_ns=198411.9 r2=0.96578 n=100
+arm=worker_batched regressor=rows slope_ns=1096.4 ci95=[1059.8,1142.8] intercept_ns=144208.3 r2=0.97931 n=100
+overhead per_op_bridge-minus-single_entry: slope_ns_per_extra_bridge_call=1661.6 ci95=[1329.7,1943.7] intercept_ns=-94127.4 r2=0.63174 pairs=100
+overhead worker_facade-minus-single_entry: slope_ns_per_extra_bridge_call=16549.3 ci95=[15666.8,17434.8] intercept_ns=466502.9 r2=0.96959 pairs=100
+overhead ready_control-minus-single_entry: slope_ns_per_extra_bridge_call=-6062.8 ci95=[-6369.1,-5863.4] intercept_ns=232608.4 r2=0.97647 pairs=100
+overhead worker_facade_params-minus-single_entry: slope_ns_per_extra_bridge_call=10525.7 ci95=[9305.2,11601.0] intercept_ns=447049.0 r2=0.89641 pairs=100
+contrast worker_facade_params_minus_worker_batched: slope_ns_per_row=16109.6 ci95=[15109.5,17038.3] intercept_ns=88615.5 r2=0.96102 pairs=100
+contrast worker_batched_minus_single_entry: slope_ns_per_row=-5583.9 ci95=[-5908.0,-5375.3] intercept_ns=368959.2 r2=0.97143 pairs=100
+artifact_written=tests/artifacts/perf/bridge-overhead-079207c9-20260811T2314Z-superserver/bridge-overhead.json
+interpretation: ready_control slope = pure runtime-entry cost per bridge call; per_op_bridge-minus-single_entry slope = marginal cost of moving one statement's execution from inside one runtime entry to its own entry (entry + scheduler/future interaction); worker_facade-minus-single_entry additionally carries SQL cloning, channel transit, and worker scheduling. Coefficients only — no engine attribution.

@@ -7567,16 +7567,16 @@ fn codegen_select_count_star_indexed_in_scan(
             b.emit_jump_to_label(Opcode::IsNull, r_current_key, 0, advance_outer, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::Lt,
-                r_current_key,
                 r_probe_value,
+                r_current_key,
                 advance_outer,
                 count_key_collation.clone(),
                 0,
             );
             b.emit_jump_to_label(
                 Opcode::Gt,
-                r_current_key,
                 r_probe_value,
+                r_current_key,
                 next_probe,
                 count_key_collation.clone(),
                 0,
@@ -7597,12 +7597,20 @@ fn codegen_select_count_star_indexed_in_scan(
             b.emit_jump_to_label(Opcode::Next, idx_cursor, 0, align_outer, P4::None, 0);
             b.emit_jump_to_label(Opcode::Goto, 0, 0, probe_done, P4::None, 0);
         } else {
-            let r_min_rowid = b.alloc_reg();
+            // bd-2fong (latent, found during the red-5 DESC-seek trace):
+            // MakeRecord packs CONSECUTIVE registers, but r_probe_value was
+            // allocated far earlier with r_current_key adjacent to it — so
+            // `MakeRecord(r_probe_value, 2, ..)` packed [probe, stale index
+            // key] while the i64::MIN floor below was written to a register
+            // nothing read. Build the (key, i64::MIN) seek record from a
+            // fresh adjacent pair instead.
+            let r_seek_base = b.alloc_regs(2);
             let r_probe_record = b.alloc_reg();
-            b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+            b.emit_op(Opcode::SCopy, r_probe_value, r_seek_base, 0, P4::None, 0);
+            b.emit_op(Opcode::Int64, 0, r_seek_base + 1, 0, P4::Int64(i64::MIN), 0);
             b.emit_op(
                 Opcode::MakeRecord,
-                r_probe_value,
+                r_seek_base,
                 2,
                 r_probe_record,
                 P4::None,
@@ -7839,16 +7847,16 @@ fn codegen_select_count_star_indexed_in_scan(
         b.emit_jump_to_label(Opcode::IsNull, r_current_key, 0, advance_outer, P4::None, 0);
         b.emit_jump_to_label(
             Opcode::Lt,
-            r_current_key,
             r_probe_value,
+            r_current_key,
             advance_outer,
             count_key_collation.clone(),
             0,
         );
         b.emit_jump_to_label(
             Opcode::Gt,
-            r_current_key,
             r_probe_value,
+            r_current_key,
             next_probe,
             count_key_collation.clone(),
             0,

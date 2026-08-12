@@ -4969,6 +4969,7 @@ mod tests {
             direct_rowid_range_query_hits: 0,
             direct_count_star_query_row_hits: 0,
             direct_rowid_lookup_query_row_hits: 0,
+            direct_rowid_lookup_query_hits: 0,
             direct_count_star_rowid_range_query_row_hits: 0,
             direct_count_indexed_rowid_probe_query_row_hits: 0,
             prepared_direct_insert_executions: 0,
