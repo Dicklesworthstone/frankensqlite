@@ -41554,6 +41554,16 @@ impl Connection {
             .set(Some(self.schema_generation()));
     }
 
+    #[inline]
+    fn retained_autocommit_peer_visibility_safe(&self) -> bool {
+        self.pager.is_memory()
+            || self
+                ._shared_mvcc_state
+                .open_connection_count
+                .load(AtomicOrdering::Acquire)
+                <= 1
+    }
+
     /// Ensure a pager transaction is active.  If the connection is NOT
     /// inside an explicit `BEGIN`, an implicit (autocommit) transaction is
     /// created.  Returns `true` when an implicit transaction was started
@@ -41648,6 +41658,7 @@ impl Connection {
         // keeps writes UNCOMMITTED across multiple autocommit statements.
         if mode != TransactionMode::ReadOnly
             && self.autocommit_retain_enabled.get()
+            && self.retained_autocommit_peer_visibility_safe()
             && self.retained_autocommit_txn.borrow().is_some()
         {
             // Invalidate any stale read snapshot first.
@@ -43823,6 +43834,7 @@ impl Connection {
                 && concurrent_plan.is_none()
                 && !force_immediate_autocommit_commit
                 && self.autocommit_retain_enabled.get()
+                && self.retained_autocommit_peer_visibility_safe()
                 && self.live_vtab_transactions.borrow().is_empty();
             let can_retain_private_memory_batch = self.pager.is_memory()
                 && !force_immediate_autocommit_commit
@@ -179065,6 +179077,82 @@ mod autocommit_txn_tests {
                 profile.retained_autocommit_parks, 100,
                 "each successful write should re-park the retained batch: {profile:?}"
             );
+        });
+    }
+
+    #[test]
+    fn test_filebacked_autocommit_write_is_visible_to_open_peer_without_close() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("retained_autocommit_peer_visibility.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+
+            let writer = Connection::open(&db_str).await.unwrap();
+            writer
+                .execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+                .await
+                .unwrap();
+            writer
+                .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+                .await
+                .unwrap();
+            let peer = Connection::open(&db_str).await.unwrap();
+
+            writer
+                .execute("INSERT INTO t VALUES (1, 'acknowledged')")
+                .await
+                .expect("autocommit INSERT should succeed");
+            assert!(
+                writer.retained_autocommit_txn.borrow().is_none(),
+                "a file-backed writer must not park acknowledged writes while a peer is open"
+            );
+
+            let rows = peer
+                .query("SELECT id, value FROM t ORDER BY id")
+                .await
+                .expect("the open peer should observe the acknowledged autocommit write");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+            assert_eq!(
+                rows[0].get(1),
+                Some(&SqliteValue::Text("acknowledged".into()))
+            );
+
+            peer.close().await.unwrap();
+            writer.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_filebacked_single_connection_preserves_retained_autocommit_fast_path() {
+        asupersync::test_utils::run_test(|| async {
+            let _profile_guard = StatementReuseHotPathProfileGuard::new();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("retained_autocommit_single_connection.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&db_str).await.unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+
+            reset_hot_path_profile();
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            let profile = hot_path_profile_snapshot();
+
+            assert!(
+                conn.retained_autocommit_txn.borrow().is_some(),
+                "one file-backed connection should keep the retained-autocommit fast path"
+            );
+            assert_eq!(conn.retained_autocommit_stmt_count.get(), 1);
+            assert_eq!(profile.retained_autocommit_parks, 1, "{profile:?}");
+            assert_eq!(profile.retained_autocommit_flushes, 0, "{profile:?}");
+
+            conn.close().await.unwrap();
         });
     }
 
