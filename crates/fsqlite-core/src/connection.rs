@@ -178574,7 +178574,7 @@ mod autocommit_txn_tests {
 
     async fn install_checkpoint_failing_retained_flush_wal_backend_with_vfs<V>(
         pager: &Arc<SimplePager<V>>,
-        vfs: &V,
+        vfs: V,
         cx: &Cx,
         wal_path: &Path,
         failure: RetainedFlushCheckpointFailure,
@@ -178594,7 +178594,16 @@ mod autocommit_txn_tests {
             .expect("reopen existing WAL for checkpoint-failure injection");
         pager
             .set_wal_backend(Box::new(CheckpointFailingWalBackend::new(
-                WalBackendAdapter::new(wal),
+                PathRefreshingWalBackend::new(
+                    vfs,
+                    pager.db_path(),
+                    wal_path,
+                    pager.page_size().get(),
+                    wal,
+                    false,
+                    #[cfg(all(feature = "native", any(unix, windows)))]
+                    pager.namespace_binding(),
+                ),
                 failure,
             )))
             .expect("install checkpoint-failing WAL backend");
@@ -178611,7 +178620,7 @@ mod autocommit_txn_tests {
                 let vfs = p.vfs_handle();
                 install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
                     p,
-                    vfs.as_ref(),
+                    (*vfs).clone(),
                     &cx,
                     &wal_path,
                     failure,
@@ -178622,7 +178631,7 @@ mod autocommit_txn_tests {
             PagerBackend::IoUring(p) => {
                 let vfs = IoUringVfs::new();
                 install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
-                    p, &vfs, &cx, &wal_path, failure,
+                    p, vfs, &cx, &wal_path, failure,
                 )
                 .await;
             }
@@ -178630,7 +178639,7 @@ mod autocommit_txn_tests {
             PagerBackend::Unix(p) => {
                 let vfs = UnixVfs::new();
                 install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
-                    p, &vfs, &cx, &wal_path, failure,
+                    p, vfs, &cx, &wal_path, failure,
                 )
                 .await;
             }
@@ -178638,7 +178647,7 @@ mod autocommit_txn_tests {
             PagerBackend::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 install_checkpoint_failing_retained_flush_wal_backend_with_vfs(
-                    p, &vfs, &cx, &wal_path, failure,
+                    p, vfs, &cx, &wal_path, failure,
                 )
                 .await;
             }
