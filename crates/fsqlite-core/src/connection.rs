@@ -37418,6 +37418,16 @@ impl Connection {
 
         let schemas = self.schema.borrow();
         let explicit_collations = in_rhs_donor_explicit_collations(subquery, &schemas);
+        // bd-2fong red 2: the IN-RHS donor metadata models table-backed
+        // donors only; the scalar comparison shapes (no-FROM CAST
+        // projections, star projections, compound final cores, VALUES
+        // coroutine donor rows, derived outer columns) come back with no
+        // affinity and the comparison ran affinity-less — losing the donor
+        // SQLite applies ((SELECT CAST(1 AS INTEGER)) = '1' is 1, not 0).
+        // For the single-column case, fall back to the broader
+        // scalar_subquery_result_affinity donor model.
+        let scalar_fallback_affinity =
+            (expected == 1).then(|| scalar_subquery_result_affinity(subquery, &schemas));
         drop(schemas);
         let mut fields = Vec::with_capacity(expected);
         for (index, value) in values.into_iter().enumerate() {
@@ -37435,7 +37445,8 @@ impl Connection {
                 affinity: donor_metadata
                     .columns
                     .get(index)
-                    .and_then(|column| column.affinity),
+                    .and_then(|column| column.affinity)
+                    .or(scalar_fallback_affinity),
                 span,
             };
             if expected > 1
@@ -63791,14 +63802,10 @@ impl Connection {
                     let subquery_operand = matches!(left.as_ref(), Expr::Subquery(..))
                         || matches!(right.as_ref(), Expr::Subquery(..));
                     if subquery_operand {
-                        let allow_vector_left = matches!(
-                            right.as_ref(),
-                            Expr::RowValue(..) | Expr::Subquery(..)
-                        );
-                        let allow_vector_right = matches!(
-                            left.as_ref(),
-                            Expr::RowValue(..) | Expr::Subquery(..)
-                        );
+                        let allow_vector_left =
+                            matches!(right.as_ref(), Expr::RowValue(..) | Expr::Subquery(..));
+                        let allow_vector_right =
+                            matches!(left.as_ref(), Expr::RowValue(..) | Expr::Subquery(..));
                         let left_materialized;
                         let left_ref: &Expr = if matches!(left.as_ref(), Expr::Subquery(..)) {
                             left_materialized = self
@@ -88410,6 +88417,27 @@ fn select_statement_has_external_column_ref(
             .compounds
             .iter()
             .any(|(_, core)| select_core_has_external_column_ref(core, ancestor_tables))
+        // bd-2fong red 4: statement-level ORDER BY and LIMIT resolve in the
+        // primary core's scope and can carry correlated outer references
+        // (`... ORDER BY abs(y - outer.x) LIMIT 1`). Skipping them made the
+        // correlation detector misjudge such subqueries as non-correlated, so
+        // the compiled IN-probe lane admitted a shape whose codegen cannot
+        // resolve the outer name (NoSuchColumn at prepare). Mirror the
+        // substitution walker's statement-level extension.
+        || {
+            let inner_tables =
+                protected_tables_for_core(&select.body.select, ancestor_tables);
+            select
+                .order_by
+                .iter()
+                .any(|term| expr_has_external_column_ref(&term.expr, &inner_tables))
+                || select.limit.as_ref().is_some_and(|limit| {
+                    expr_has_external_column_ref(&limit.limit, &inner_tables)
+                        || limit.offset.as_ref().is_some_and(|offset| {
+                            expr_has_external_column_ref(offset, &inner_tables)
+                        })
+                })
+        }
 }
 
 fn select_core_has_external_column_ref(core: &SelectCore, ancestor_tables: &[String]) -> bool {
@@ -91175,8 +91203,7 @@ fn rewrite_in_expr<'a>(
                 // with no affinity. Fold to BoundOuterValue (value +
                 // affinity) whenever the subquery has a derivable affinity;
                 // resolve_operand_affinity already reads it back first.
-                let folded_affinity =
-                    scalar_subquery_result_affinity(sub, &conn.schema.borrow());
+                let folded_affinity = scalar_subquery_result_affinity(sub, &conn.schema.borrow());
                 let rows = conn
                     .execute_statement(&Statement::Select(*sub.clone()), params)
                     .await?;
@@ -116012,8 +116039,7 @@ fn bind_placeholders_in_select_statement(
         // `ORDER BY 2` reorders). Binding just replaced a bare top-level
         // placeholder with a literal; keep an integer result in expression
         // form so the fallback sorters' ordinal classification cannot fire.
-        if was_bare_placeholder
-            && let Expr::Literal(Literal::Integer(value), span) = &ordering.expr
+        if was_bare_placeholder && let Expr::Literal(Literal::Integer(value), span) = &ordering.expr
         {
             let (value, span) = (*value, *span);
             ordering.expr = Expr::BinaryOp {
@@ -122792,11 +122818,11 @@ mod tests {
     use fsqlite_types::{LockLevel, Region, TypeAffinity};
     use fsqlite_types::{PageNumber, PageSize};
     use fsqlite_vdbe::ProgramBuilder;
-    use fsqlite_vfs::{FileIdentity, MemoryVfs};
     use fsqlite_vfs::ShmRegion;
     #[cfg(unix)]
     use fsqlite_vfs::UnixVfs;
     use fsqlite_vfs::traits::{Vfs, VfsFile};
+    use fsqlite_vfs::{FileIdentity, MemoryVfs};
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -178691,10 +178717,8 @@ mod autocommit_txn_tests {
         fn latest_authorized_parallel_wal_commit_certificate<'a>(
             &'a mut self,
             cx: &'a Cx,
-        ) -> fsqlite_pager::traits::WalFuture<
-            'a,
-            Option<fsqlite_wal::ParallelWalCommitCertificate>,
-        > {
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<fsqlite_wal::ParallelWalCommitCertificate>>
+        {
             Box::pin(async move {
                 self.inner
                     .latest_authorized_parallel_wal_commit_certificate(cx)
@@ -178739,12 +178763,7 @@ mod autocommit_txn_tests {
         ) -> fsqlite_pager::traits::WalFuture<'a, Vec<u32>> {
             Box::pin(async move {
                 self.inner
-                    .conflicting_pages_since_snapshot(
-                        cx,
-                        snapshot,
-                        page_numbers,
-                        page_baselines,
-                    )
+                    .conflicting_pages_since_snapshot(cx, snapshot, page_numbers, page_baselines)
                     .await
             })
         }
@@ -230751,30 +230770,76 @@ mod pager_routing_tests {
     fn temp_probe_bd2fong_affinity_lanes() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE probe_t (i INTEGER);").await.unwrap();
-            conn.execute("INSERT INTO probe_t VALUES (1);").await.unwrap();
+            conn.execute("CREATE TABLE rhs_semantics (y INTEGER, z INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO rhs_semantics VALUES (1, 30), (3, 10), (2, 20);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE outer_semantics (x INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO outer_semantics VALUES (1), (3);")
+                .await
+                .unwrap();
             for (tag, sql) in [
-                ("bare_literal", "SELECT 1 = '1'"),
-                ("cast_direct", "SELECT CAST(1 AS INTEGER) = '1'"),
-                ("subq_cast", "SELECT (SELECT CAST(1 AS INTEGER)) = '1'"),
-                ("subq_plain", "SELECT (SELECT 1) = '1'"),
-                ("subq_cast_from", "SELECT (SELECT CAST(1 AS INTEGER)) = '1' FROM probe_t"),
+                (
+                    "col2_proj_outer",
+                    "SELECT x IN (SELECT outer_semantics.x FROM rhs_semantics LIMIT 1) \
+                     FROM outer_semantics ORDER BY x",
+                ),
+                (
+                    "col3_plain",
+                    "SELECT x IN (SELECT x FROM rhs_semantics LIMIT 1) \
+                     FROM outer_semantics ORDER BY x",
+                ),
+                (
+                    "col4_case_outer",
+                    "SELECT x IN (SELECT CASE WHEN y > 0 THEN outer_semantics.x ELSE y END \
+                     FROM rhs_semantics LIMIT 1) FROM outer_semantics ORDER BY x",
+                ),
+                (
+                    "col5_orderby_outer",
+                    "SELECT x IN (SELECT y FROM rhs_semantics \
+                     ORDER BY abs(y - outer_semantics.x) LIMIT 1) \
+                     FROM outer_semantics ORDER BY x",
+                ),
+                (
+                    "col6_having_outer",
+                    "SELECT x IN (SELECT max(y) FROM rhs_semantics \
+                     HAVING max(y) = outer_semantics.x) FROM outer_semantics ORDER BY x",
+                ),
+                (
+                    "col5_unqualified",
+                    "SELECT x IN (SELECT y FROM rhs_semantics \
+                     ORDER BY abs(y - x) LIMIT 1) \
+                     FROM outer_semantics ORDER BY x",
+                ),
+                (
+                    "col5_no_limit",
+                    "SELECT x IN (SELECT y FROM rhs_semantics \
+                     ORDER BY abs(y - outer_semantics.x)) \
+                     FROM outer_semantics ORDER BY x",
+                ),
+                (
+                    "col5_where_not_order",
+                    "SELECT x IN (SELECT y FROM rhs_semantics \
+                     WHERE y = outer_semantics.x) \
+                     FROM outer_semantics ORDER BY x",
+                ),
             ] {
-                let rows = conn.query(sql).await.unwrap();
-                eprintln!("AFFPROBE {tag}: {:?}", rows[0].values());
-                let explain = conn.query(&format!("EXPLAIN {sql}")).await;
-                match explain {
-                    Ok(rows) => {
-                        let ops: Vec<String> = rows
-                            .iter()
-                            .map(|r| match &r.values[1] {
-                                SqliteValue::Text(op) => op.to_string(),
-                                other => format!("{other:?}"),
-                            })
-                            .collect();
-                        eprintln!("AFFPROBE-EXPLAIN {tag}: {}", ops.join(","));
-                    }
-                    Err(error) => eprintln!("AFFPROBE-EXPLAIN {tag}: ERR {error:?}"),
+                match conn.query(sql).await {
+                    Ok(rows) => eprintln!(
+                        "R4PROBE {tag}: {:?}",
+                        rows.iter()
+                            .map(|r| r.values()[0].clone())
+                            .collect::<Vec<_>>()
+                    ),
+                    Err(error) => eprintln!("R4PROBE {tag}: ERR {error:?}"),
+                }
+                match conn.query(&format!("EXPLAIN {sql}")).await {
+                    Ok(rows) => eprintln!("R4PROBE-EXPLAIN {tag}: {} opcodes", rows.len()),
+                    Err(error) => eprintln!("R4PROBE-EXPLAIN {tag}: ERR {error:?}"),
                 }
             }
             panic!("probe complete");
