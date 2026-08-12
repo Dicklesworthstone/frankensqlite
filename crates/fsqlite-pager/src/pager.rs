@@ -6260,6 +6260,15 @@ async fn settle_identity_wide_group_commit_finalization(queue: &GroupCommitQueue
         || queue.has_unresolved_in_doubt_epoch()
         || queue.has_identity_wide_process_root()
     {
+        // bd-b4mwn round 4: name the refusal (see the sibling settle fn).
+        tracing::warn!(
+            target: "fsqlite.pager.group_commit",
+            pending_or_claimed_identity_wide_unlock =
+                queue.has_pending_or_claimed_identity_wide_external_unlock(),
+            unresolved_in_doubt_epoch = queue.has_unresolved_in_doubt_epoch(),
+            identity_wide_process_root = queue.has_identity_wide_process_root(),
+            "identity-wide settle refused"
+        );
         return Err(FrankenError::BusyRecovery);
     }
     Ok(())
@@ -6298,6 +6307,13 @@ async fn settle_pending_group_commit_finalization_for_handle(
         return Err(error);
     }
     if queue.has_identity_wide_process_root() || queue.has_relevant_process_root(handle_key) {
+        // bd-b4mwn round 4: name the refusal (see the sibling settle fns).
+        tracing::warn!(
+            target: "fsqlite.pager.group_commit",
+            identity_wide_process_root = queue.has_identity_wide_process_root(),
+            relevant_process_root = queue.has_relevant_process_root(handle_key),
+            "per-handle settle refused"
+        );
         return Err(FrankenError::BusyRecovery);
     }
     Ok(())
@@ -7376,6 +7392,12 @@ trait PendingGroupCommitLogicalCleanupOperation: Send {
     ) -> LocalPagerFuture<'a, bool>;
 }
 
+/// bd-b4mwn round 4: settles observed with the attempt still `Pending` and
+/// its epoch absent from BOTH the persisted and failed maps before the epoch
+/// is declared abandoned and force-failed. Multiple observations tolerate an
+/// in-flight leader that has simply not landed the certificate yet.
+const ABANDONED_EPOCH_SETTLE_OBSERVATIONS: u32 = 3;
+
 struct DetachedPendingGroupCommitTxnCleanup<F: VfsFile + 'static> {
     attempt: Arc<PendingGroupCommitTxnAttempt<F>>,
     maintenance_lease: Option<PagerMaintenanceLease>,
@@ -7383,6 +7405,9 @@ struct DetachedPendingGroupCommitTxnCleanup<F: VfsFile + 'static> {
     allocated_from_eof: Vec<PageNumber>,
     page_lease: Vec<PageNumber>,
     allocation_cleanup_applied: bool,
+    /// bd-b4mwn round 4: count of settle passes that found this detached
+    /// attempt `Pending` with a pre-persistence (abandonable) epoch.
+    stale_pending_observations: u32,
 }
 
 impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
@@ -7398,7 +7423,84 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
     ) -> LocalPagerFuture<'a, bool> {
         Box::pin(async move {
             match self.attempt.reconcile_global_from_queue()? {
-                PendingGroupCommitTxnResolution::Pending => return Ok(false),
+                PendingGroupCommitTxnResolution::Pending => {
+                    // bd-b4mwn round 4: a worker dropped mid-commit leaves
+                    // its epoch non-terminal, and this detached cleanup
+                    // previously re-queued forever with its process-root
+                    // token armed — refusing every settle on the path with
+                    // BusyRecovery. Distinguish the two Pending flavors:
+                    //
+                    // * POST-persistence (certificate durable, page plane
+                    //   unpublished): force-failing would un-commit durable
+                    //   data — stay conservative and warn; recovery or the
+                    //   publication owner must finish it.
+                    // * PRE-persistence (epoch in NEITHER the persisted nor
+                    //   the failed map): no durable certificate exists, so
+                    //   NotCommitted is the correct verdict. After several
+                    //   settle observations (tolerating an in-flight leader
+                    //   that has not landed the certificate yet), declare
+                    //   the epoch abandoned and publish it failed; the next
+                    //   settle's reconcile then reaches the NotCommitted
+                    //   arm, completes the cleanup, and releases the root.
+                    if let Some(queue) = self.attempt.queue.upgrade()
+                        && let Some((epoch, batch_id)) = self.attempt.evidence_key()
+                    {
+                        if queue.persisted_epoch_for(epoch).is_some() {
+                            tracing::warn!(
+                                target: "fsqlite.pager.group_commit",
+                                epoch,
+                                batch_id,
+                                "detached commit attempt awaits page-plane \
+                                 publication of a durable epoch; retaining \
+                                 fail-closed root"
+                            );
+                        } else if !queue
+                            .failed_epochs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains_key(&epoch)
+                        {
+                            self.stale_pending_observations =
+                                self.stale_pending_observations.saturating_add(1);
+                            if self.stale_pending_observations
+                                >= ABANDONED_EPOCH_SETTLE_OBSERVATIONS
+                            {
+                                tracing::warn!(
+                                    target: "fsqlite.pager.group_commit",
+                                    epoch,
+                                    batch_id,
+                                    observations = self.stale_pending_observations,
+                                    "declaring pre-persistence group-commit \
+                                     epoch abandoned by its dropped owner; \
+                                     aborting the flush so the detached \
+                                     cleanup can reach NotCommitted"
+                                );
+                                // Production fail path: only aborts the epoch
+                                // if it is the ACTIVE FLUSHING one (the
+                                // dead-mid-flush leader shape); any other
+                                // phase errors closed — log and stay pending
+                                // rather than force state we cannot prove.
+                                if let Err(abort_error) = queue.abort_flushing_epoch_as_failed(
+                                    epoch,
+                                    &FrankenError::internal(
+                                        "group-commit epoch abandoned by dropped owner \
+                                         before certificate persistence",
+                                    ),
+                                ) {
+                                    tracing::warn!(
+                                        target: "fsqlite.pager.group_commit",
+                                        epoch,
+                                        batch_id,
+                                        %abort_error,
+                                        "abandoned-epoch abort refused; \
+                                         retaining fail-closed root"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return Ok(false);
+                }
                 PendingGroupCommitTxnResolution::Authorized(_) => {
                     if !self.allocation_cleanup_applied {
                         self.allocated_from_freelist.clear();
@@ -22449,6 +22551,7 @@ where
                 allocated_from_eof: std::mem::take(&mut self.allocated_from_eof),
                 page_lease: std::mem::take(&mut self.page_lease),
                 allocation_cleanup_applied: false,
+                stale_pending_observations: 0,
             };
             self.group_commit_queue.enqueue_pending_logical_cleanup(
                 PendingGroupCommitLogicalCleanup::new(drop_root_attempt.take(), Box::new(cleanup)),
