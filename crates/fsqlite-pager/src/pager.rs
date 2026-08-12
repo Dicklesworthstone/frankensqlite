@@ -6264,7 +6264,11 @@ async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -
             .max(1),
     );
     let started = Instant::now();
+    let mut rounds: u32 = 0;
+    let mut cleanups_resolved_total: usize = 0;
     loop {
+        rounds = rounds.saturating_add(1);
+        let before = queue.pending_logical_cleanup_count();
         match settle_pending_group_commit_finalization_round(queue).await {
             Ok(()) => {
                 if !queue.has_process_root_finalization_attempt() {
@@ -6276,12 +6280,30 @@ async fn settle_pending_group_commit_finalization(queue: &GroupCommitQueueRef) -
             Err(FrankenError::BusyRecovery) => {}
             Err(error) => return Err(error),
         }
-        if queue.pending_logical_cleanup_count() == 0 {
+        let after = queue.pending_logical_cleanup_count();
+        cleanups_resolved_total =
+            cleanups_resolved_total.saturating_add(before.saturating_sub(after));
+        if after == 0 {
             // No claimable work remains; the residual root is a true wedge —
             // fall through to the final round's fail-closed verdict.
             break;
         }
         if started.elapsed() >= budget {
+            // bd-b4mwn rework #2: the PROGRESS LEDGER — when the budget burns
+            // out, say exactly what recovery was (not) progressing on so a
+            // multi-second "recovery in progress" window on any host names
+            // its own starvation, instead of tuning waits blind.
+            tracing::warn!(
+                target: "fsqlite.pager.group_commit",
+                rounds,
+                cleanups_resolved_total,
+                pending_cleanups_remaining = after,
+                pending_or_claimed_external_unlock =
+                    queue.has_pending_or_claimed_external_unlock(),
+                unresolved_in_doubt_epoch = queue.has_unresolved_in_doubt_epoch(),
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "settle budget exhausted with cleanup work still pending"
+            );
             break;
         }
         // Live cleanups remain (claimed by a peer settler or lost claim
