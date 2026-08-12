@@ -233,11 +233,12 @@ fn async_operation_response_channel<T>() -> (
 
 const COMMAND_MAILBOX_CAPACITY: usize = 32;
 // Raw engine futures are deeply composed enough to overflow both Rust's
-// default spawned-thread stack and an 8 MiB test-thread stack under the
-// fs-ledger schema-migration workload. Each connection owns exactly one engine
-// worker, so reserving a larger stack here is bounded per connection and keeps
-// that implementation detail off both synchronous and asynchronous callers.
-const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+// default spawned-thread stack and a 16 MiB worker stack under a full
+// application schema-migration workload. Each connection owns exactly one
+// engine worker, so reserving a larger stack here is bounded per connection
+// and keeps that implementation detail off both synchronous and asynchronous
+// callers.
+const WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
