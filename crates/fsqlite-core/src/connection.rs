@@ -225945,6 +225945,32 @@ mod pager_routing_tests {
             let nonunique_reference = "SELECT COUNT(*)
             FROM events AS e
             INNER JOIN allowed_buckets AS b ON b.rowid = e.bucket_id";
+            assert_eq!(
+                scalar_count(
+                    &nonunique,
+                    "SELECT COUNT(*)
+                     FROM events INDEXED BY idx_events_bucket_position
+                     WHERE bucket_id IN (
+                         SELECT rowid FROM allowed_buckets WHERE rowid = 1
+                     )",
+                )
+                .await,
+                2,
+                "the first composite-key run should contain both bucket 1 rows"
+            );
+            assert_eq!(
+                scalar_count(
+                    &nonunique,
+                    "SELECT COUNT(*)
+                     FROM events INDEXED BY idx_events_bucket_position
+                     WHERE bucket_id IN (
+                         SELECT rowid FROM allowed_buckets WHERE rowid = 3
+                     )",
+                )
+                .await,
+                2,
+                "the second composite-key run should contain both bucket 3 rows"
+            );
             assert_eq!(scalar_count(&nonunique, nonunique_sql).await, 4);
             assert_eq!(
                 scalar_count(&nonunique, nonunique_sql).await,

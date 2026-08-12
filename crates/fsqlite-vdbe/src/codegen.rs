@@ -7567,16 +7567,16 @@ fn codegen_select_count_star_indexed_in_scan(
             b.emit_jump_to_label(Opcode::IsNull, r_current_key, 0, advance_outer, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::Lt,
-                r_current_key,
                 r_probe_value,
+                r_current_key,
                 advance_outer,
                 count_key_collation.clone(),
                 0,
             );
             b.emit_jump_to_label(
                 Opcode::Gt,
-                r_current_key,
                 r_probe_value,
+                r_current_key,
                 next_probe,
                 count_key_collation.clone(),
                 0,
@@ -7839,16 +7839,16 @@ fn codegen_select_count_star_indexed_in_scan(
         b.emit_jump_to_label(Opcode::IsNull, r_current_key, 0, advance_outer, P4::None, 0);
         b.emit_jump_to_label(
             Opcode::Lt,
-            r_current_key,
             r_probe_value,
+            r_current_key,
             advance_outer,
             count_key_collation.clone(),
             0,
         );
         b.emit_jump_to_label(
             Opcode::Gt,
-            r_current_key,
             r_probe_value,
+            r_current_key,
             next_probe,
             count_key_collation.clone(),
             0,
