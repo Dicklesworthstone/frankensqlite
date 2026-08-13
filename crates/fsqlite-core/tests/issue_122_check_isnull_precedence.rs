@@ -77,15 +77,6 @@ fn wide_check_fixture() -> (String, String) {
         .map(|index| format!("v{index} INTEGER NOT NULL"))
         .collect::<Vec<_>>()
         .join(", ");
-    let flat_all_one = (0..WIDE_CHECK_TERMS)
-        .map(|index| format!("v{index} = 1"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let flat_any_zero = (0..WIDE_CHECK_TERMS)
-        .map(|index| format!("v{index} = 0"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-
     let mut right_nested_all_one = format!("v{} = 1", WIDE_CHECK_TERMS - 1);
     let mut right_nested_any_zero = format!("v{} = 0", WIDE_CHECK_TERMS - 1);
     for index in (0..WIDE_CHECK_TERMS - 1).rev() {
@@ -93,7 +84,13 @@ fn wide_check_fixture() -> (String, String) {
         right_nested_any_zero = format!("v{index} = 0 OR ({right_nested_any_zero})");
     }
 
-    let expected_check = format!("{flat_all_one} OR ({flat_any_zero}) AND guard = 0");
+    // bd-67tdh oracle-reconciliation: stock sqlite3 3.46.1 stores the CHECK
+    // expression byte-for-byte as written -- it does NOT flatten the associative
+    // AND/OR chains -- and ALTER TABLE ADD COLUMN splices new columns in ahead of
+    // the CHECK without touching it. So the stored / reopened / post-ADD-COLUMN
+    // schema must contain the *verbatim* nested CHECK, not a flattened form.
+    let expected_check =
+        format!("({right_nested_all_one}) OR (({right_nested_any_zero}) AND guard = 0)");
     let create_sql = format!(
         "CREATE TABLE logic (\
          id INTEGER PRIMARY KEY, {columns}, guard INTEGER NOT NULL, \
@@ -221,8 +218,8 @@ fn test_wide_boolean_check_alter_reopen_keeps_schema_bounded_and_semantic() {
             let stored_sql = stored_logic_schema_sql(&conn).await;
             assert!(
                 stored_sql.contains(&expected_check),
-                "CREATE must flatten only the associative AND/OR chains while preserving \
-                 mixed-precedence grouping: {stored_sql}"
+                "CREATE must store the verbatim CHECK expression (sqlite3 does not \
+                 flatten it): {stored_sql}"
             );
             assert_wide_check_semantics(&conn, 1).await;
             stored_sql
@@ -247,7 +244,7 @@ fn test_wide_boolean_check_alter_reopen_keeps_schema_bounded_and_semantic() {
             let altered_sql = stored_logic_schema_sql(&conn).await;
             assert!(
                 altered_sql.contains(&expected_check),
-                "ALTER cycle {cycle} changed the canonical CHECK expression: {altered_sql}"
+                "ALTER cycle {cycle} changed the verbatim CHECK expression: {altered_sql}"
             );
             assert_eq!(
                 altered_sql.matches('(').count(),
