@@ -3489,7 +3489,24 @@ impl GroupCommitQueue {
                     if let Some(error) = self.observe_failed_epoch(target_epoch) {
                         return Err(error);
                     }
-                    return Err(settlement_error);
+                    // bd-0shxy exactly-once: this waiter's batch is ALREADY
+                    // QUEUED in target_epoch. Surfacing a transient settlement
+                    // error here ejects the waiter with pager state
+                    // NotCommitted while the flusher later commits the
+                    // abandoned batch — the caller retries the statement and
+                    // the row lands twice (extreme_index_punishment
+                    // over-count; GH#213 divergence). Settlement congestion is
+                    // not an epoch verdict: keep waiting for the authoritative
+                    // outcome. Cancellation still exits via cx.checkpoint.
+                    tracing::debug!(
+                        target: "fsqlite.pager.group_commit",
+                        target_epoch,
+                        %settlement_error,
+                        "waiter riding out identity-wide settlement congestion; batch remains queued (bd-0shxy ruling)"
+                    );
+                    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                    perform_flush_busy_retry_handoff(flush_busy_retry_wait(1));
+                    continue;
                 }
             }
             let slot = self.epoch_waiters.slot(target_epoch);
@@ -3517,7 +3534,20 @@ impl GroupCommitQueue {
                     if let Some(error) = pending_wake.observe_failure() {
                         return Err(error);
                     }
-                    return Err(settlement_error);
+                    // bd-0shxy exactly-once: same ruling as the pre-wait arm —
+                    // a queued-batch waiter never surfaces settlement
+                    // congestion as its own (transient) verdict; only epoch
+                    // outcomes eject it. See the comment above.
+                    tracing::debug!(
+                        target: "fsqlite.pager.group_commit",
+                        target_epoch,
+                        %settlement_error,
+                        "woken waiter riding out identity-wide settlement congestion; batch remains queued (bd-0shxy ruling)"
+                    );
+                    drop(pending_wake);
+                    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                    perform_flush_busy_retry_handoff(flush_busy_retry_wait(1));
+                    continue;
                 }
             }
             let outcome = {
@@ -8215,6 +8245,12 @@ impl<F: VfsFile> PagerInner<F> {
             // (bd-dk9ra counter-stats ruling, option a). Metrics-only: bytes
             // returned unchanged.
             cache.record_external_read();
+            if std::env::var_os("DK9RA_O81OV").is_some()
+                && page_no.get() > 1
+                && data.iter().all(|&b| b == 0)
+            {
+                eprintln!("DK9RA_O81OV RCPC_WAL_ZERO page={}", page_no.get());
+            }
             return Ok(data);
         }
 
@@ -8223,6 +8259,14 @@ impl<F: VfsFile> PagerInner<F> {
         let db_file = shared_db_file_read(&self.db_file, cx).await?;
         let file_size = db_file.file_size(cx)?;
         if offset >= file_size {
+            if std::env::var_os("DK9RA_O81OV").is_some() && page_no.get() > 1 {
+                eprintln!(
+                    "DK9RA_O81OV RCPC_SHORT_MAINDB page={} offset={} file_size={}",
+                    page_no.get(),
+                    offset,
+                    file_size
+                );
+            }
             return Ok(vec![0_u8; page_size]);
         }
 
@@ -8798,6 +8842,11 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
     if first_trunk == 0 || freelist_count == 0 {
         return Ok(Vec::new());
     }
+    if std::env::var_os("DK9RA_O81OV").is_some() {
+        eprintln!(
+            "DK9RA_O81OV FREELIST_LOAD first_trunk={first_trunk} count={freelist_count} db_size={db_size}"
+        );
+    }
 
     let ps = inner.page_size.as_usize();
     let mut visited: HashSet<u32> = HashSet::new();
@@ -8836,6 +8885,12 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
 
         let next_trunk = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let leaf_count = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        if std::env::var_os("DK9RA_O81OV").is_some() {
+            let all_zero = buf.iter().all(|&b| b == 0);
+            eprintln!(
+                "DK9RA_O81OV FREELIST_TRUNK trunk={trunk} next={next_trunk} leaf_count={leaf_count} all_zero={all_zero}"
+            );
+        }
         let max_leaf_entries = (ps / 4).saturating_sub(2);
         if leaf_count > max_leaf_entries {
             return Err(FrankenError::DatabaseCorrupt {
@@ -9148,11 +9203,13 @@ fn build_group_commit_batch<S: std::hash::BuildHasher>(
 
 fn transaction_conflict_snapshot_from_wal(
     snapshot: traits::WalPublicationSnapshot,
+    snapshot_db_size: u32,
 ) -> TransactionConflictSnapshot {
     TransactionConflictSnapshot {
         generation: snapshot.generation,
         last_commit_frame: snapshot.last_commit_frame,
         commit_count: snapshot.commit_count,
+        snapshot_db_size,
     }
 }
 
@@ -9161,12 +9218,14 @@ fn attach_group_commit_conflict_metadata(
     conflict_pages: &[PageNumber],
     conflict_snapshot: Option<traits::WalPublicationSnapshot>,
     conflict_page_baselines: &[TransactionConflictPageBaseline],
+    snapshot_db_size: u32,
 ) -> TransactionFrameBatch {
     let conflict_pages = conflict_pages
         .iter()
         .map(|page| page.get())
         .collect::<Vec<_>>();
-    let conflict_snapshot = conflict_snapshot.map(transaction_conflict_snapshot_from_wal);
+    let conflict_snapshot = conflict_snapshot
+        .map(|snapshot| transaction_conflict_snapshot_from_wal(snapshot, snapshot_db_size));
     batch = batch.with_conflict_snapshot(conflict_pages, conflict_snapshot);
     batch = batch.with_conflict_page_baselines(conflict_page_baselines.to_vec());
     batch
@@ -18789,6 +18848,7 @@ where
             conflict_pages,
             conflict_snapshot,
             conflict_page_baselines,
+            current_db_size,
         );
         let conflict_snapshot_us = elapsed_profile_us(t_conflict_snapshot_start);
 
@@ -20553,21 +20613,7 @@ where
                 .published
                 .snapshot_for_page_plane(self.published_visible_commit_seq.get())
             {
-                // bd-o81ov: only resolve to zeros for a page BEYOND the
-                // transaction's FIXED snapshot bound (`published_db_size`, captured
-                // at begin as max(published.db_size, inner.db_size)). The LIVE
-                // page-plane snapshot's db_size can transiently lag that fixed bound
-                // under concurrent publishes (the seed's larger db_size is known via
-                // inner but not yet re-advertised on the page plane), and
-                // zero-filling a page that the fixed snapshot legitimately contains
-                // drops committed rows — a whole leaf reads empty and BEGIN
-                // CONCURRENT returns "0 rows". A page within the fixed bound but
-                // beyond the live page-plane db_size falls through to the committed
-                // WAL/db read below, which serves its real image. Pages truly beyond
-                // the fixed bound (e.g. a writer's own freshly allocated page) still
-                // zero-fill here.
-                if page_no.get() > snapshot.db_size && page_no.get() > self.published_db_size.get()
-                {
+                if page_no.get() > snapshot.db_size {
                     if self.published.current_sequence_gen() == snapshot.snapshot_gen {
                         tracing::trace!(
                             target: "fsqlite.snapshot_publication",
@@ -20656,6 +20702,12 @@ where
                 && let Some(data) =
                     read_page_from_wal_backend(&self.wal_backend, cx, page_no).await?
             {
+                if std::env::var_os("DK9RA_O81OV").is_some()
+                    && page_no.get() > 1
+                    && data.iter().all(|&b| b == 0)
+                {
+                    eprintln!("DK9RA_O81OV GETPAGE_WAL_ZERO page={}", page_no.get());
+                }
                 let page = PageData::from_vec(data);
                 self.ensure_uncached_snapshot_sequence(
                     page_no,
@@ -21001,12 +21053,22 @@ where
                     }
                 }
             }
+            let dbg_alloc_db_size = inner.db_size;
             drop(inner);
 
             let page = first_page.ok_or_else(|| FrankenError::OutOfRange {
                 what: "allocated page number".to_owned(),
                 value: "0".to_owned(),
             })?;
+            if std::env::var_os("DK9RA_O81OV").is_some() {
+                eprintln!(
+                    "DK9RA_O81OV ALLOC_EOF thread={:?} mode={:?} page={} db_size={}",
+                    std::thread::current().id(),
+                    self.mode,
+                    page.get(),
+                    dbg_alloc_db_size
+                );
+            }
             self.allocated_from_eof.push(page);
             Ok(page)
         }
