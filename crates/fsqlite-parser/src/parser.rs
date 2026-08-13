@@ -2102,6 +2102,11 @@ impl Parser {
             self.expect_token(&TokenKind::LeftParen)?;
             let expr = self.parse_expr()?;
             self.expect_token(&TokenKind::RightParen)?;
+            // A table CHECK constraint may carry a trailing conflict clause
+            // (`CHECK(expr) ON CONFLICT <action>`), accepted by stock sqlite3.
+            // Consume it for parse parity so a stock-created schema stays
+            // loadable on reopen (mirrors PRIMARY KEY / UNIQUE above).
+            let _conflict = self.parse_on_conflict()?;
             TableConstraintKind::Check(expr)
         } else if self.eat_kw(&TokenKind::KwForeign) {
             self.expect_kw(&TokenKind::KwKey)?;
