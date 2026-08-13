@@ -8186,6 +8186,7 @@ impl<F: VfsFile> PagerInner<F> {
     async fn read_committed_page_copy(
         &self,
         cx: &Cx,
+        cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
         page_no: PageNumber,
     ) -> Result<Vec<u8>> {
@@ -8193,6 +8194,11 @@ impl<F: VfsFile> PagerInner<F> {
         if self.journal_mode == JournalMode::Wal
             && let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no).await?
         {
+            // Committed-refresh serve bypasses the ARC buffer pool by design;
+            // count it as a cache miss so PRAGMA cache_stats reflects the read
+            // (bd-dk9ra counter-stats ruling, option a). Metrics-only: bytes
+            // returned unchanged.
+            cache.record_external_read();
             return Ok(data);
         }
 
@@ -8482,7 +8488,7 @@ impl<F: VfsFile> PagerInner<F> {
         // accepted to the next transaction.
         let full_refresh_result = (async {
             let page1 = self
-                .read_committed_page_copy(cx, wal_backend, PageNumber::ONE)
+                .read_committed_page_copy(cx, cache, wal_backend, PageNumber::ONE)
                 .await?;
             if page1.len() < DATABASE_HEADER_SIZE {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -8531,6 +8537,7 @@ impl<F: VfsFile> PagerInner<F> {
                 load_freelist_from_committed_state(
                     cx,
                     self,
+                    cache,
                     wal_backend,
                     db_size,
                     header.freelist_trunk,
@@ -8752,6 +8759,7 @@ async fn load_freelist_from_disk<F: VfsFile>(
 async fn load_freelist_from_committed_state<F: VfsFile>(
     cx: &Cx,
     inner: &PagerInner<F>,
+    cache: &ShardedPageCache,
     wal_backend: &SharedWalBackend,
     db_size: u32,
     first_trunk: u32,
@@ -8785,7 +8793,7 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
         out.push(trunk_page);
 
         let buf = inner
-            .read_committed_page_copy(cx, wal_backend, trunk_page)
+            .read_committed_page_copy(cx, cache, wal_backend, trunk_page)
             .await?;
         if buf.len() < ps {
             return Err(FrankenError::DatabaseCorrupt {
@@ -44613,7 +44621,7 @@ mod tests {
             );
 
             let page1 = inner
-                .read_committed_page_copy(&cx, &pager.wal_backend, PageNumber::ONE)
+                .read_committed_page_copy(&cx, &pager.cache, &pager.wal_backend, PageNumber::ONE)
                 .await
                 .unwrap();
             let header_bytes: [u8; DATABASE_HEADER_SIZE] =
@@ -44622,6 +44630,7 @@ mod tests {
             let durable_freelist = load_freelist_from_committed_state(
                 &cx,
                 &inner,
+                &pager.cache,
                 &pager.wal_backend,
                 header.page_count,
                 header.freelist_trunk,
@@ -44812,11 +44821,11 @@ mod tests {
                 page_b.get()
             );
             let persisted_a = inner
-                .read_committed_page_copy(&cx, &pager.wal_backend, page_a)
+                .read_committed_page_copy(&cx, &pager.cache, &pager.wal_backend, page_a)
                 .await
                 .unwrap();
             let persisted_b = inner
-                .read_committed_page_copy(&cx, &pager.wal_backend, page_b)
+                .read_committed_page_copy(&cx, &pager.cache, &pager.wal_backend, page_b)
                 .await
                 .unwrap();
             assert_eq!(
