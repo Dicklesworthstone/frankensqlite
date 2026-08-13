@@ -19085,12 +19085,10 @@ impl Connection {
         *self.pending_ddl_source.borrow_mut() = (statements.len() == 1
             && matches!(statements[0].as_ref(), Statement::CreateTable(_)))
         .then(|| {
-            let trimmed = strip_leading_sql_comments(sql).trim_end();
-            trimmed
-                .strip_suffix(';')
-                .unwrap_or(trimmed)
-                .trim_end()
-                .to_owned()
+            // Both boundaries mirror stock sqlite3's stored text: begin at the
+            // statement's first token, end at its last (no terminator, no
+            // trailing comment) — bd-lgolw.
+            strip_trailing_sql_comments_and_terminator(strip_leading_sql_comments(sql)).to_owned()
         });
         let mut last_count = 0;
         for statement in statements {
@@ -83364,6 +83362,78 @@ fn strip_leading_sql_comments(mut text: &str) -> &str {
             return trimmed;
         }
     }
+}
+
+/// Byte offset just past the last real SQL token in `text`, skipping trailing
+/// whitespace and comments. A single forward scan tracks string literals
+/// (`'...'`), quoted identifiers (`"..."`, `` `...` ``, `[...]`), `-- ...`
+/// line comments, and `/* ... */` block comments, so a `--` inside a literal
+/// never truncates the statement (bd-lgolw tail parity: stock sqlite3 stores
+/// CREATE text up to its last token, excluding the terminator and any
+/// trailing comment).
+fn sql_text_end_before_trailing_comments(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut last_token_end = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        if bytes.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                last_token_end = i;
+            }
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                i = (i + 1).min(bytes.len());
+                last_token_end = i;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            c if c.is_ascii_whitespace() => {
+                i += 1;
+            }
+            _ => {
+                i += 1;
+                last_token_end = i;
+            }
+        }
+    }
+    last_token_end
+}
+
+/// Strip trailing whitespace, comments, and the statement terminator from a
+/// captured verbatim CREATE, mirroring stock sqlite3's sqlite_master text
+/// (which ends at the statement's final token). Alternating comment/`;`
+/// strips handle tails like `); -- done` and `) /* x */ ;`.
+fn strip_trailing_sql_comments_and_terminator(text: &str) -> &str {
+    let mut text = &text[..sql_text_end_before_trailing_comments(text)];
+    while let Some(without_semi) = text.trim_end().strip_suffix(';') {
+        text = &without_semi[..sql_text_end_before_trailing_comments(without_semi)];
+    }
+    text
 }
 
 /// bd-67tdh Phase 2: stock sqlite3 3.46.1 (oracle) implements ALTER TABLE ADD
