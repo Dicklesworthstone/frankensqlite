@@ -83596,7 +83596,8 @@ mod splice_added_column_tests {
     fn test_splice_ignores_unbalanced_open_paren_inside_comment() {
         // An unbalanced '(' in a comment must not inflate depth: the real ')'
         // still ends the list and the splice lands before it.
-        let original = "CREATE TABLE t (\n    id INTEGER PRIMARY KEY, -- (see docs\n    note TEXT\n)";
+        let original =
+            "CREATE TABLE t (\n    id INTEGER PRIMARY KEY, -- (see docs\n    note TEXT\n)";
         let spliced = splice_added_column_into_create_sql(original, "extra INTEGER")
             .expect("unbalanced comment paren must not break the splice");
         assert_eq!(
@@ -83607,8 +83608,7 @@ mod splice_added_column_tests {
 
     #[test]
     fn test_splice_ignores_block_comment_and_bracket_identifier() {
-        let original =
-            "CREATE TABLE t (\n    [weird(col] TEXT /* opener ( */,\n    note TEXT\n)";
+        let original = "CREATE TABLE t (\n    [weird(col] TEXT /* opener ( */,\n    note TEXT\n)";
         let spliced = splice_added_column_into_create_sql(original, "extra INTEGER")
             .expect("bracket identifiers and block comments must be skipped");
         assert_eq!(
