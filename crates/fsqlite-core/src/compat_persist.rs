@@ -1541,7 +1541,15 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
 pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
     let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreCompatPersist);
     let vfs = PlatformVfs::new();
-    let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE).await?;
+    let pager = Arc::new(SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE).await?);
+    // bd-asupersync-043 release triage: a database whose writer left live WAL
+    // frames (HEAD `close()` no longer guarantees a truncating checkpoint)
+    // must be read THROUGH the WAL, exactly like stock SQLite's reader path.
+    // Without a backend, page reads on a WAL-mode header die with
+    // "WAL mode active but no WAL backend installed".
+    let wal_path = crate::connection::wal_path_for_db_path(&path.to_string_lossy());
+    crate::connection::install_wal_backend_with_vfs(&pager, PlatformVfs::new(), cx, &wal_path)
+        .await?;
     let mut txn = pager.begin(cx, TransactionMode::ReadOnly).await?;
     let max_root_page = txn.snapshot_db_size();
     let page1 = txn.get_page(cx, PageNumber::ONE).await?;

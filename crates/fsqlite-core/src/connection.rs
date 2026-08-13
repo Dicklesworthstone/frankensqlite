@@ -3836,7 +3836,7 @@ impl PagerBackend {
     }
 }
 
-fn wal_path_for_db_path(path: &str) -> PathBuf {
+pub(crate) fn wal_path_for_db_path(path: &str) -> PathBuf {
     let mut db_path = if path == ":memory:" {
         PathBuf::from("/:memory:")
     } else {
@@ -3940,7 +3940,7 @@ async fn wal_sidecar_treated_as_empty<F: VfsFile>(cx: &Cx, file: &F) -> Result<b
     Ok(fsqlite_wal::wal_header_treated_as_empty(&header_buf))
 }
 
-async fn install_wal_backend_with_vfs<V>(
+pub(crate) async fn install_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
     vfs: V,
     cx: &Cx,
