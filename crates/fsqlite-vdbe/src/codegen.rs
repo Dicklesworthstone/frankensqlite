@@ -35855,6 +35855,41 @@ mod tests {
         }]
     }
 
+    /// Like [`test_schema_with_index`] but column `b` has TEXT affinity (`'B'`)
+    /// with the default BINARY collation. A case-stable LIKE/GLOB prefix
+    /// (`'123%'`) only lowers to an index range seek when the derived TEXT
+    /// bounds compare byte-exactly against the index — i.e. a TEXT-affinity,
+    /// BINARY-collated column. On the NUMERIC-affinity `test_schema_with_index`
+    /// the text bounds would be coerced to numbers and the range seek would
+    /// silently skip lexical matches, so `index_range_fast_path_is_safe`
+    /// correctly declines it there (matching stock sqlite3, which SCANs).
+    fn test_schema_with_text_index() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'd', false),
+                ColumnInfo::basic("b", 'B', false),
+            ],
+            indexes: vec![IndexSchema {
+                name: "idx_t_b".to_owned(),
+                root_page: 3,
+                columns: vec!["b".to_owned()],
+                key_expressions: vec!["b".to_owned()],
+                key_sort_directions: vec![],
+                where_clause: None,
+                is_unique: false,
+                key_collations: vec![],
+                conflict_action: None,
+            }],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
     fn test_schema_with_expression_index() -> Vec<TableSchema> {
         vec![TableSchema {
             name: "t".to_owned(),
@@ -41537,30 +41572,28 @@ mod tests {
             seek_ge.p3, make_record.p3,
             "SeekGE must read the composite probe key from MakeRecord"
         );
+        // DESC-safety (bd-2fong seek-record rework): a COMPOSITE index is
+        // positioned with a TRUE one-field prefix record — just the leading
+        // `conversation_id` term — NOT the leading term NULL-padded across the
+        // trailing indexed columns plus a rowid floor. Padding trailing terms
+        // with NULL is not a valid block floor when any trailing term is DESC:
+        // SeekGE would start in the trailing-NULL region and silently skip
+        // preceding non-NULL entries. The equality-prefix duplicate run is
+        // instead bounded by the IdxGT recheck (see the sibling ordered-scan
+        // test), so the one-field prefix probe is exact.
         assert_eq!(
-            make_record.p2, 3,
-            "probe key should include conversation_id, trailing idx filler, and rowid suffix"
+            make_record.p2, 1,
+            "composite prefix probe must be a single leading-term record, not a NULL-padded full key"
         );
-
-        let null_fill = ops
-            .iter()
-            .find(|op| op.opcode == Opcode::Null)
-            .expect("composite probe should fill trailing indexed terms with NULL");
-        assert_eq!(
-            null_fill.p2,
-            make_record.p1 + 1,
-            "the filler NULL should target the second indexed key column register"
+        assert!(
+            !ops.iter()
+                .any(|op| op.opcode == Opcode::Null && op.p2 == make_record.p1 + 1),
+            "composite prefix probe must not NULL-pad the trailing indexed term"
         );
-
-        let int64 = ops
-            .iter()
-            .find(|op| op.opcode == Opcode::Int64)
-            .expect("composite probe should still append rowid lower bound");
-        assert_eq!(int64.p4, P4::Int64(i64::MIN));
-        assert_eq!(
-            int64.p2,
-            make_record.p1 + 2,
-            "rowid lower bound should be written after all indexed key terms"
+        assert!(
+            !ops.iter()
+                .any(|op| op.opcode == Opcode::Int64 && op.p4 == P4::Int64(i64::MIN)),
+            "single-key probes append a rowid floor; a composite prefix probe must not"
         );
     }
 
@@ -41736,7 +41769,8 @@ mod tests {
                 span: Span::ZERO,
             })),
         );
-        let schema = test_schema_with_index();
+        // TEXT+BINARY column: the case-stable prefix range is byte-exact here.
+        let schema = test_schema_with_text_index();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
@@ -41787,7 +41821,8 @@ mod tests {
                 span: Span::ZERO,
             })),
         );
-        let schema = test_schema_with_index();
+        // TEXT+BINARY column: the case-stable escaped prefix range is byte-exact here.
+        let schema = test_schema_with_text_index();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
@@ -41841,7 +41876,8 @@ mod tests {
                 span: Span::ZERO,
             })),
         );
-        let schema = test_schema_with_index();
+        // TEXT+BINARY column: the case-stable escaped prefix range is byte-exact here.
+        let schema = test_schema_with_text_index();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
