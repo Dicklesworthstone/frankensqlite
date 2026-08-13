@@ -48682,9 +48682,35 @@ mod tests {
         }
     }
 
+    /// Oracle reconciliation (sqlite3 3.46.1): a comparison `A = B` takes its
+    /// collation from the LEFT operand, so a declared-NOCASE column on the
+    /// RIGHT of a join predicate does NOT drive NOCASE index selection —
+    /// SQLite uses the left column's (BINARY) collation and rejects a NOCASE
+    /// sibling index (verified via `EXPLAIN QUERY PLAN`). Commit 6133ccd4a
+    /// correctly switched codegen to that left-operand rule; these fixtures put
+    /// the NOCASE column on the right, so swap the ON operands to make the
+    /// declared-NOCASE column the dominant (left) side while preserving the
+    /// plain `Column = Column` join shape the grouped/join fast paths match.
+    fn make_join_predicate_nocase_dominant(stmt: &mut SelectStatement, join_index: usize) {
+        let SelectCore::Select {
+            from: Some(from_clause),
+            ..
+        } = &mut stmt.body.select
+        else {
+            unreachable!("fixture should include a FROM clause");
+        };
+        let Some(fsqlite_ast::JoinConstraint::On(Expr::BinaryOp { left, right, .. })) =
+            from_clause.joins[join_index].constraint.as_mut()
+        else {
+            unreachable!("fixture join should carry an ON equality");
+        };
+        std::mem::swap(left, right);
+    }
+
     #[test]
     fn test_codegen_multi_join_prefers_collation_matching_unique_lookup() {
-        let stmt = collation_matching_unique_single_column_lookup_multi_join_stmt();
+        let mut stmt = collation_matching_unique_single_column_lookup_multi_join_stmt();
+        make_join_predicate_nocase_dominant(&mut stmt, 1);
         let schema = test_schema_multi_join_prefers_collation_matching_unique_lookup();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
@@ -48870,7 +48896,8 @@ mod tests {
 
     #[test]
     fn test_codegen_multi_join_unique_lookup_threads_nocase_collation() {
-        let stmt = nocase_unique_single_column_lookup_multi_join_stmt();
+        let mut stmt = nocase_unique_single_column_lookup_multi_join_stmt();
+        make_join_predicate_nocase_dominant(&mut stmt, 1);
         let schema = test_schema_multi_join_prefers_nocase_unique_lookup();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
@@ -49039,7 +49066,8 @@ mod tests {
 
     #[test]
     fn test_codegen_single_join_prefers_collation_matching_lookup_index() {
-        let stmt = collation_matching_single_join_lookup_stmt();
+        let mut stmt = collation_matching_single_join_lookup_stmt();
+        make_join_predicate_nocase_dominant(&mut stmt, 0);
         let schema = test_schema_single_join_prefers_collation_matching_lookup();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
@@ -49124,7 +49152,8 @@ mod tests {
 
     #[test]
     fn test_codegen_grouped_join_prefers_collation_matching_lookup_index() {
-        let stmt = collation_matching_grouped_join_lookup_stmt();
+        let mut stmt = collation_matching_grouped_join_lookup_stmt();
+        make_join_predicate_nocase_dominant(&mut stmt, 0);
         let schema = test_schema_single_join_prefers_collation_matching_lookup();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
