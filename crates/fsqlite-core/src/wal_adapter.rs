@@ -5468,6 +5468,15 @@ mod tests {
             .append_frame(&cx, 2, &page2, 2)
             .expect("append commit");
 
+        // Durable-certificate contract: staged frames are unpublished until
+        // sync; the backend read path serves only the published horizon.
+        assert_eq!(
+            adapter.read_page(&cx, 1).expect("read staged page 1"),
+            None,
+            "staged frames must stay invisible before publication"
+        );
+        adapter.sync(&cx).expect("publish staged frames");
+
         let result = adapter.read_page(&cx, 1).expect("read page 1");
         assert_eq!(result, Some(page1));
 
@@ -5505,6 +5514,9 @@ mod tests {
         adapter
             .append_frame(&cx, 5, &new_data, 1)
             .expect("append new (commit)");
+
+        // Durable-certificate contract: publication (sync) gates visibility.
+        adapter.sync(&cx).expect("publish staged frames");
 
         let result = adapter.read_page(&cx, 5).expect("read page 5");
         assert_eq!(
@@ -6122,6 +6134,9 @@ mod tests {
         adapter
             .append_frame(&cx, 7, &committed, 7)
             .expect("append committed frame");
+        // Publish the committed frame; the tail frame appended after the
+        // publication stays staged AND uncommitted.
+        adapter.sync(&cx).expect("publish committed frame");
         adapter
             .append_frame(&cx, 7, &uncommitted, 0)
             .expect("append uncommitted frame");
@@ -7514,6 +7529,9 @@ mod tests {
         adapter.append_frame(&cx, 2, &p2, 2).expect("commit tx1");
         adapter.append_frame(&cx, 3, &p3, 0).expect("append p3");
         adapter.append_frame(&cx, 2, &p2, 3).expect("commit tx2");
+        // Durable-certificate contract: the visible frame horizon advances
+        // only at publication; count txns against the published horizon.
+        adapter.sync(&cx).expect("publish staged commits");
 
         assert_eq!(
             adapter
