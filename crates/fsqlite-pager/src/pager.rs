@@ -8116,6 +8116,10 @@ impl<F: VfsFile> PagerInner<F> {
         if self.journal_mode == JournalMode::Wal
             && let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no).await?
         {
+            // Served from the WAL, bypassing the ARC buffer pool: count it as a
+            // cache miss so PRAGMA cache_stats reflects the read (bd-dk9ra
+            // counter-stats ruling, option a). Byte-identical serve.
+            cache.record_external_read();
             return Ok(data);
         }
 

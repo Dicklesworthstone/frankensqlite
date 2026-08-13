@@ -4148,6 +4148,24 @@ impl ShardedPageCache {
         result
     }
 
+    /// Record a page read SERVED from outside the buffer pool — a WAL /
+    /// committed-refresh serve that bypasses the ARC cache. The page was not
+    /// resident, so it counts as a MISS for `PRAGMA cache_stats` (total_accesses
+    /// = hits + misses). Metrics-only: the caller returns the bytes unchanged.
+    /// Increments the active representation's miss counter so both fast-path and
+    /// sharded snapshots see it; `reset_metrics` zeroes it like any miss.
+    /// (bd-dk9ra counter-stats ruling, option a.)
+    pub fn record_external_read(&self) {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let mut arr = fast.lock();
+            arr.misses = arr.misses.saturating_add(1);
+            return;
+        }
+        self.flat_slots.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// bd-perf (V1.2): Return a shared `PageData` (Arc) instead of copying
     /// the page bytes. Each cache entry materializes at most one immutable
     /// shared snapshot, then hot reads clone that snapshot until a mutation
