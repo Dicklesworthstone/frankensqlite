@@ -4004,6 +4004,17 @@ where
         return Ok(false);
     }
 
+    // A read-only install (schema-only / existing-only open) can run right
+    // after this same connection's bootstrap header/schema probe left a
+    // deferred SHARED-snapshot release rooted as a pending group-commit
+    // finalization (see `BeginAdmission::drop`). Resolve it before installing
+    // the WAL backend so `set_wal_backend_owned`'s process-root-finalization
+    // guard does not spuriously refuse this benign self-inflicted state with
+    // BusyRecovery. Writable installs settle through the later set_journal_mode.
+    if allow_readonly {
+        pager.quiesce_pending_group_commit_finalization().await?;
+    }
+
     // bd-zna34 fix: Always open the WAL file READWRITE. Opening READONLY
     // first would install a read-only canonical fd in the global InodeInfo
     // table (unix.rs). All subsequent connections that clone this fd via the

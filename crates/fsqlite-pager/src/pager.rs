@@ -12645,6 +12645,19 @@ where
         }
     }
 
+    /// Resolve any group-commit finalization a prior transaction admission on
+    /// this pager rooted but deferred — for example the SHARED-snapshot
+    /// restore that `BeginAdmission::drop` queues when a read admission (such
+    /// as the schema/header probe during a read-only open) is torn down
+    /// without a synchronous unlock. Read-only WAL installs call this first so
+    /// a benign self-inflicted pending external unlock does not make
+    /// `set_wal_backend_owned` refuse with `BusyRecovery`, mirroring the
+    /// settle `set_journal_mode` already performs before mutating journal
+    /// state.
+    pub async fn quiesce_pending_group_commit_finalization(&self) -> Result<()> {
+        settle_pending_group_commit_finalization(&self.group_commit_queue).await
+    }
+
     /// Install a concrete WAL backend while preserving ownership on failure.
     ///
     /// This lets callers explicitly close any underlying VFS resources when
