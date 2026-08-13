@@ -147094,7 +147094,24 @@ mod tests {
                     let content_hash =
                         format!("w{worker_id:02}-tx{txn_idx:03}-bd-{issue_idx:03}");
 
+                    // Bounded backoff between transient retries of this row's
+                    // transaction. Under the parallel RC census (--test-threads=8)
+                    // four workers hammer the same content-hash index pages; a
+                    // tight immediate-retry loop can exhaust the transient-retry
+                    // budget through conflict thrash before any writer commits.
+                    // Backing off (capped at 20ms) de-synchronizes the writers so
+                    // the round always terminates in bounded time.
+                    let mut txn_attempt: u32 = 0;
                     loop {
+                        if txn_attempt > 0 {
+                            let backoff_ms = u64::from(txn_attempt.min(10)) * 2;
+                            asupersync::time::sleep(
+                                asupersync::time::wall_now(),
+                                std::time::Duration::from_millis(backoff_ms),
+                            )
+                            .await;
+                        }
+                        txn_attempt += 1;
                         // BEGIN CONCURRENT can return a transient BusySnapshot
                         // ("pager publication advanced between metadata bind and
                         // reload transaction") when a peer commits between this
