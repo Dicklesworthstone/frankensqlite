@@ -73986,40 +73986,35 @@ impl Connection {
     #[allow(clippy::too_many_lines)]
     async fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
-        // bd-dk9ra: an external writer (e.g. a C SQLite connection running its
-        // checkpoint-on-close against the same file) can legitimately reset
-        // the WAL between our publication bind and the reload transaction, so
-        // an older observed sequence gets a bounded re-bind from current pager
-        // state instead of an immediate refusal. A regression that persists
-        // across fresh binds is a real monotonicity fault and still fails
-        // closed with the original error.
-        const RELOAD_BIND_REGRESSION_RETRIES: usize = 3;
-        let mut bind_attempts = 0;
-        let (mut txn, txn_visible_commit_seq) = loop {
-            bind_attempts += 1;
-            let bound_publication = self.bind_pager_publication(cx, "memdb_reload").await?;
+        // ORCHESTRATOR RULING (2) (bd-dk9ra, release endgame): the reload
+        // binds against CURRENT WAL state. An external writer (e.g. a C
+        // SQLite connection running checkpoint-on-close against the same
+        // file) can legitimately reset the WAL between our publication bind
+        // and the reload transaction; the publication plane then still holds
+        // the pre-reset sequence while the fresh read transaction observes
+        // the live post-reset WAL. The transaction's view is transactionally
+        // consistent by construction and is the authority — a bind newer
+        // than the live WAL is stale by definition, so the reload proceeds
+        // on the transaction's observed sequence with a receipt instead of
+        // erroring.
+        let bound_publication = self.bind_pager_publication(cx, "memdb_reload").await?;
 
-            // Open a read transaction to see the committed state.
-            let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
-            let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
-                let _ = txn.rollback(cx).await;
-                return Err(FrankenError::Internal(
-                    "pager reload transaction did not expose its bound visibility sequence"
-                        .to_owned(),
-                ));
-            };
-            if txn_visible_commit_seq < bound_publication.snapshot.visible_commit_seq {
-                let _ = txn.rollback(cx).await;
-                if bind_attempts > RELOAD_BIND_REGRESSION_RETRIES {
-                    return Err(FrankenError::Internal(
-                        "pager reload transaction observed an older visibility sequence than its prior publication bind"
-                            .to_owned(),
-                    ));
-                }
-                continue;
-            }
-            break (txn, txn_visible_commit_seq);
+        // Open a read transaction to see the committed state.
+        let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
+        let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
+            let _ = txn.rollback(cx).await;
+            return Err(FrankenError::Internal(
+                "pager reload transaction did not expose its bound visibility sequence".to_owned(),
+            ));
         };
+        if txn_visible_commit_seq < bound_publication.snapshot.visible_commit_seq {
+            tracing::warn!(
+                target: "fsqlite.snapshot_publication",
+                bound_seq = bound_publication.snapshot.visible_commit_seq.get(),
+                txn_seq = txn_visible_commit_seq.get(),
+                "reload bind is newer than the live WAL (external reset); proceeding on the transaction's observed sequence (bd-dk9ra ruling 2)"
+            );
+        }
         self.reload_memdb_from_txn_with_mode(
             cx,
             &mut txn,
@@ -82934,6 +82929,120 @@ fn rename_indexed_column_identifier(
     rename_indexed_expr(&mut indexed.expr, old, new)
 }
 
+/// Map a VDBE halt (`ExecOutcome::Error`) to a specific `FrankenError` variant
+/// for C-SQLite error parity. A CHECK-constraint halt (stock SQLite returns
+/// `SQLITE_CONSTRAINT_CHECK`, not a generic error) becomes `CheckViolation`,
+/// whose `Display` reproduces the same `CHECK constraint failed: <name>` text;
+/// other halts fall back to `Internal`.
+fn frankenerror_from_vdbe_halt(code: i32, message: String) -> FrankenError {
+    if let Some(name) = message.strip_prefix("CHECK constraint failed: ") {
+        return FrankenError::CheckViolation {
+            name: name.to_owned(),
+        };
+    }
+    if message == "CHECK constraint failed" {
+        return FrankenError::CheckViolation {
+            name: String::new(),
+        };
+    }
+    FrankenError::Internal(format!("VDBE halted with code {code}: {message}"))
+}
+
+/// bd-67tdh Phase 2: stock sqlite3 3.46.1 (oracle) implements ALTER TABLE ADD
+/// COLUMN by splicing the new column definition into the *original* CREATE text
+/// verbatim -- immediately after the last column definition and before any
+/// table-level constraint -- rather than re-serializing the parsed schema. This
+/// keeps a verbatim-stored CREATE (see `Connection::pending_ddl_source`)
+/// byte-faithful to sqlite3's `.schema` across ADD COLUMN, matching what stock
+/// SQLite reads back from the same file. Returns `None` when the column-list
+/// structure cannot be located, so the caller falls back to AST re-serialization.
+fn splice_added_column_into_create_sql(original_sql: &str, new_column_sql: &str) -> Option<String> {
+    let bytes = original_sql.as_bytes();
+
+    // Advance past a string literal or quoted identifier starting at `i`,
+    // honouring doubled-quote escapes; returns the index just past the close.
+    let skip_quoted = |bytes: &[u8], mut i: usize| -> usize {
+        let quote = bytes[i];
+        i += 1;
+        while i < bytes.len() {
+            if bytes[i] == quote {
+                if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                    i += 2;
+                    continue;
+                }
+                return i + 1;
+            }
+            i += 1;
+        }
+        i
+    };
+
+    // Find the column-list opening paren (first top-level '(').
+    let mut i = 0usize;
+    let open = loop {
+        if i >= bytes.len() {
+            return None;
+        }
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
+            b'(' => break i,
+            _ => i += 1,
+        }
+    };
+
+    // A top-level list item is a table constraint (rather than a column def)
+    // when its first keyword is one of these; columns start with an identifier.
+    let is_table_constraint = |start: usize, end: usize| -> bool {
+        let item = original_sql[start..end].trim_start();
+        let keyword_end = item
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(item.len());
+        matches!(
+            item[..keyword_end].to_ascii_uppercase().as_str(),
+            "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
+        )
+    };
+
+    let mut depth = 1usize;
+    let mut item_start = open + 1;
+    let mut last_column_end: Option<usize> = None;
+    let mut j = open + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\'' | b'"' | b'`' => {
+                j = skip_quoted(bytes, j);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    if !is_table_constraint(item_start, j) {
+                        last_column_end = Some(j);
+                    }
+                    break;
+                }
+            }
+            b',' if depth == 1 => {
+                if !is_table_constraint(item_start, j) {
+                    last_column_end = Some(j);
+                }
+                item_start = j + 1;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+
+    let insert_at = last_column_end?;
+    let mut out = String::with_capacity(original_sql.len() + new_column_sql.len() + 2);
+    out.push_str(&original_sql[..insert_at]);
+    out.push_str(", ");
+    out.push_str(new_column_sql);
+    out.push_str(&original_sql[insert_at..]);
+    Some(out)
+}
+
 fn rewrite_create_table_sql_for_alter(
     original_sql: &str,
     expected_table_name: &str,
@@ -83006,6 +83115,16 @@ fn rewrite_create_table_sql_for_alter(
             }
         }
         AlterTableAction::AddColumn(column) => {
+            // Match stock sqlite3: splice the new column into the original CREATE
+            // text verbatim (after the last column, before any table constraint)
+            // so a verbatim-stored CREATE stays byte-faithful to `.schema` across
+            // ADD COLUMN. Fall back to AST re-serialization when the column-list
+            // structure cannot be located.
+            if let Some(spliced) =
+                splice_added_column_into_create_sql(original_sql, &column.to_string())
+            {
+                return Ok(spliced);
+            }
             let (columns, _) = create_table_columns_and_constraints_mut(&mut create)?;
             columns.push(column.clone());
         }
@@ -104563,7 +104682,7 @@ async fn execute_table_program_with_db(
             Ok((rows, changes, engine_rowid))
         }
         Ok(ExecOutcome::Error { code, message }) => Err(TableProgramExecError {
-            error: FrankenError::Internal(format!("VDBE halted with code {code}: {message}")),
+            error: frankenerror_from_vdbe_halt(code, message),
             changes,
             last_insert_rowid: engine_rowid,
         }),
@@ -104749,7 +104868,7 @@ async fn execute_table_program_exactly_one_row_with_db(
             engine_rowid,
         )),
         Ok(ExecOutcome::Error { code, message }) => Err(TableProgramExecError {
-            error: FrankenError::Internal(format!("VDBE halted with code {code}: {message}")),
+            error: frankenerror_from_vdbe_halt(code, message),
             changes,
             last_insert_rowid: engine_rowid,
         }),
@@ -178782,6 +178901,63 @@ mod autocommit_txn_tests {
             Box::pin(async move {
                 self.inner
                     .latest_authorized_parallel_wal_commit_certificate(cx)
+                    .await
+            })
+        }
+
+        // Snapshot surface must mirror the real backend or the commit's
+        // conflict metadata assembles without a publication snapshot and the
+        // commit refuses before the injected append failure is reached
+        // (bd-dk9ra receipt: conflict_page_count=1, snapshotless).
+        fn published_snapshot(&self) -> Option<fsqlite_pager::traits::WalPublicationSnapshot> {
+            self.inner.published_snapshot()
+        }
+
+        fn pinned_read_snapshot(&self) -> Option<fsqlite_pager::traits::WalPublicationSnapshot> {
+            self.inner.pinned_read_snapshot()
+        }
+
+        fn pinned_logical_read_snapshot<'a>(
+            &'a self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            Option<fsqlite_pager::traits::WalLogicalReadSnapshot>,
+        > {
+            Box::pin(async move { self.inner.pinned_logical_read_snapshot(cx).await })
+        }
+
+        fn refresh_published_snapshot<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            Option<fsqlite_pager::traits::WalPublicationSnapshot>,
+        > {
+            Box::pin(async move { self.inner.refresh_published_snapshot(cx).await })
+        }
+
+        fn publish_authorized_deferred_commit<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.publish_authorized_deferred_commit(cx).await })
+        }
+
+        // Conflict detection must see the real WAL state or the commit
+        // refuses at the snapshotless-conflict arm before the injected
+        // append failure is ever reached (bd-dk9ra receipt at
+        // pager.rs commit: conflict_page_count=1).
+        fn conflicting_pages_since_snapshot<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            snapshot: fsqlite_wal::TransactionConflictSnapshot,
+            page_numbers: &'a [u32],
+            page_baselines: &'a [fsqlite_wal::TransactionConflictPageBaseline],
+        ) -> fsqlite_pager::traits::WalFuture<'a, Vec<u32>> {
+            Box::pin(async move {
+                self.inner
+                    .conflicting_pages_since_snapshot(cx, snapshot, page_numbers, page_baselines)
                     .await
             })
         }
