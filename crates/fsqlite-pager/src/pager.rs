@@ -18634,6 +18634,11 @@ where
             if let Some(attempt) = txn_attempt {
                 attempt.complete_not_committed_global()?;
             }
+            tracing::warn!(
+                target: "fsqlite.pager.commit",
+                conflict_page_count = conflict_pages.len(),
+                "commit refused: conflict pages present without a conflict snapshot (bd-dk9ra receipt)"
+            );
             return Err(FrankenError::Unsupported);
         }
 
