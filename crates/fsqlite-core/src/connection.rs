@@ -36882,9 +36882,43 @@ impl Connection {
         self.validate_statement_select_semantics(statement)
     }
 
+    /// Fail closed (bd-dk9ra): a table that is virtual per its schema DDL, still
+    /// owns a scannable backing btree (`root_page > 0`), and has no live vtab
+    /// instance is in a fail-open state — a raw VDBE btree scan would leak its
+    /// storage. This happens when a custom module's instance is invalidated by a
+    /// failed post-durable xCommit (or an unhydratable module survives a schema
+    /// reload). Pure vtabs (fts5/rtree) carry `root_page == 0` and are served by
+    /// their module or lazy readers even with no eager instance, so they are
+    /// excluded by construction.
+    fn ensure_referenced_vtabs_available(&self, select: &SelectStatement) -> Result<()> {
+        let ddl = self.original_ddl_sql.borrow();
+        let schema = self.schema.borrow();
+        for table in Self::extract_table_names_from_select(select) {
+            let is_virtual = ddl
+                .get(&table.to_ascii_lowercase())
+                .is_some_and(|sql| is_virtual_table_sql(sql));
+            if !is_virtual {
+                continue;
+            }
+            let has_backing_btree = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&table))
+                .is_some_and(|t| t.root_page > 0);
+            if has_backing_btree && !self.has_live_vtab_instance(&table) {
+                return Err(FrankenError::Internal(format!(
+                    "virtual table {table} has no live instance and cannot be queried"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_statement_select_relations(&self, statement: &Statement) -> Result<()> {
         match statement {
-            Statement::Select(select) => SelectRelationResolver::new(self).validate_select(select),
+            Statement::Select(select) => {
+                self.ensure_referenced_vtabs_available(select)?;
+                SelectRelationResolver::new(self).validate_select(select)
+            }
             Statement::Insert(insert) => {
                 if let InsertSource::Select(select) = &insert.source {
                     let scoped_select = insert_source_select_for_validation(insert, select);
@@ -72614,6 +72648,56 @@ impl Connection {
                     right,
                     span,
                 } => {
+                    // A scalar-subquery comparison operand donates its result
+                    // column's affinity/collation in SQLite. Inlining it to a
+                    // bare literal strips that donor, so `(SELECT i FROM t) =
+                    // '1'` compared affinity-less. Materialize comparison
+                    // operands through the same BoundOuterValue helper the
+                    // subquery-evaluator BinaryOp arm uses; other operators
+                    // keep the literal path (no affinity flows through them).
+                    let comparison_op = matches!(
+                        op,
+                        BinaryOp::Eq
+                            | BinaryOp::Ne
+                            | BinaryOp::Lt
+                            | BinaryOp::Le
+                            | BinaryOp::Gt
+                            | BinaryOp::Ge
+                            | BinaryOp::Is
+                            | BinaryOp::IsNot
+                    );
+                    let subquery_operand = matches!(left.as_ref(), Expr::Subquery(..))
+                        || matches!(right.as_ref(), Expr::Subquery(..));
+                    if comparison_op && subquery_operand {
+                        let allow_vector_left =
+                            matches!(right.as_ref(), Expr::RowValue(..) | Expr::Subquery(..));
+                        let allow_vector_right =
+                            matches!(left.as_ref(), Expr::RowValue(..) | Expr::Subquery(..));
+                        let l = self
+                            .inline_in_comparison_operand(
+                                left,
+                                row,
+                                outer_col_map,
+                                using_skip,
+                                allow_vector_left,
+                            )
+                            .await?;
+                        let r = self
+                            .inline_in_comparison_operand(
+                                right,
+                                row,
+                                outer_col_map,
+                                using_skip,
+                                allow_vector_right,
+                            )
+                            .await?;
+                        return Ok(Expr::BinaryOp {
+                            left: Box::new(l),
+                            op: *op,
+                            right: Box::new(r),
+                            span: *span,
+                        });
+                    }
                     let l = self
                         .inline_subqueries_in_expr_with_using(left, row, outer_col_map, using_skip)
                         .await?;
@@ -93272,7 +93356,9 @@ fn eval_group_agg_join_expr(
                     saw_null = true;
                     continue;
                 }
-                let singleton_list_expr = singleton_constant.then_some(list_expr);
+                let singleton_list_expr = (singleton_constant
+                    || in_list_expr_is_bound_donor(list_expr))
+                .then_some(list_expr);
                 let ordering = compare_join_in_values(expr, &val, singleton_list_expr, lv, col_map);
                 if ordering == std::cmp::Ordering::Equal {
                     found = true;
@@ -101484,7 +101570,8 @@ fn evaluate_having_value(
                             saw_null = true;
                             continue;
                         }
-                        let singleton_list_expr = singleton_constant.then_some(e);
+                        let singleton_list_expr =
+                            (singleton_constant || in_list_expr_is_bound_donor(e)).then_some(e);
                         let ordering = compare_join_in_values(
                             inner,
                             &val,
@@ -120453,6 +120540,18 @@ fn compare_join_expr_values(
     })
 }
 
+/// A materialized `IN (SELECT ...)` row keeps its donor column's comparison
+/// metadata as a `BoundOuterValue` (optionally under the donor's explicit
+/// COLLATE). Syntactic RHS list expressions never donate — SQLite treats them
+/// as affinity-less — so only these bound shapes may contribute RHS metadata.
+fn in_list_expr_is_bound_donor(expr: &Expr) -> bool {
+    match expr {
+        Expr::BoundOuterValue { .. } => true,
+        Expr::Collate { expr, .. } => matches!(expr.as_ref(), Expr::BoundOuterValue { .. }),
+        _ => false,
+    }
+}
+
 fn compare_join_in_values(
     operand_expr: &Expr,
     operand_value: &SqliteValue,
@@ -120468,8 +120567,18 @@ fn compare_join_in_values(
         context.map_or_else(
             || cmp_sqlite_values(operand_value, list_value),
             |context| {
-                let affinity = join_expr_affinity(operand_expr, col_map, context);
-                let affinity = (affinity != TypeAffinity::Blob).then_some(affinity);
+                let lhs_affinity = join_expr_affinity(operand_expr, col_map, context);
+                // An `x IN (SELECT y)` RHS donates y's affinity to the
+                // comparison; the materialized rows carry it as
+                // BoundOuterValue metadata (bd-di4he class C).
+                let donor_affinity = singleton_list_expr
+                    .filter(|list_expr| in_list_expr_is_bound_donor(list_expr))
+                    .map(|list_expr| join_expr_affinity(list_expr, col_map, context))
+                    .filter(|affinity| *affinity != TypeAffinity::Blob);
+                let affinity = donor_affinity.map_or_else(
+                    || (lhs_affinity != TypeAffinity::Blob).then_some(lhs_affinity),
+                    |donor| TypeAffinity::comparison_affinity(lhs_affinity, donor),
+                );
                 let (operand_value, list_value) =
                     coerce_values_for_comparison_affinity(operand_value, list_value, affinity);
                 if let (
@@ -121048,7 +121157,8 @@ pub(crate) fn eval_join_expr(
                             saw_null = true;
                             continue;
                         }
-                        let singleton_list_expr = singleton_comparison.then_some(e);
+                        let singleton_list_expr =
+                            (singleton_comparison || in_list_expr_is_bound_donor(e)).then_some(e);
                         let ordering = compare_join_in_values(
                             inner,
                             &val,
