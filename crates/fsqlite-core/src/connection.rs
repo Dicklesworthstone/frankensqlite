@@ -50925,10 +50925,7 @@ impl Connection {
             // txn-current state after the same staleness refresh
             // fk_validation_query performs; a direct pager btree seek is
             // ruled out — it can lag uncommitted in-txn parent writes.
-            let engaged = FSQLITE_FK_PROBE_ENGAGED.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-            if engaged == 1 {
-                eprintln!("[fk-probe] first engagement (bd-dk9ra attribution)");
-            }
+            FSQLITE_FK_PROBE_ENGAGED.fetch_add(1, AtomicOrdering::Relaxed);
             if let Some(parent_present) = self
                 .fk_parent_rowid_fast_lookup(&fk.parent_table, &parent_cols, &fk_values)
                 .await?
@@ -50971,13 +50968,13 @@ impl Connection {
             // (bypassing the prepared-statement ad-hoc reuse path and
             // explicitly refreshing stale memdb state before execution).
             let fallbacks = FSQLITE_FK_SELECT_FALLBACK.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-            if fallbacks == 1 || fallbacks.is_multiple_of(4096) {
-                eprintln!(
-                    "[fk-probe] select fallback #{fallbacks} (engaged={} answered={})",
-                    FSQLITE_FK_PROBE_ENGAGED.load(AtomicOrdering::Relaxed),
-                    FSQLITE_FK_PROBE_ANSWERED.load(AtomicOrdering::Relaxed)
-                );
-            }
+            tracing::debug!(
+                target: "fsqlite.fk_probe",
+                fallbacks,
+                engaged = FSQLITE_FK_PROBE_ENGAGED.load(AtomicOrdering::Relaxed),
+                answered = FSQLITE_FK_PROBE_ANSWERED.load(AtomicOrdering::Relaxed),
+                "fk validation fell back to the ad-hoc SELECT"
+            );
             let rows = self.fk_validation_query(&sql, &params).await?;
             if rows.is_empty() {
                 if self.fk_should_defer(fk) {
