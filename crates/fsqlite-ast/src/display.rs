@@ -2193,7 +2193,10 @@ impl fmt::Display for ForeignKeyClause {
         f.write_str("REFERENCES ")?;
         write_ident(f, &self.table)?;
         if !self.columns.is_empty() {
-            f.write_str(" (")?;
+            // No space before the column-list paren: stock sqlite3 stores
+            // `REFERENCES <table>(<cols>)` (verbatim, oracle-verified), and the
+            // ALTER rewrite path relies on this to stay .schema-faithful.
+            f.write_str("(")?;
             comma_list_fn(f, &self.columns, |col, f| write_ident(f, col))?;
             f.write_str(")")?;
         }

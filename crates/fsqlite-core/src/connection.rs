@@ -16839,6 +16839,13 @@ impl Connection {
     fn op_cx(&self) -> Result<Cx> {
         if hot_path_profile_enabled() {
             FSQLITE_OP_CX_BACKGROUND_GATES.fetch_add(1, AtomicOrdering::Relaxed);
+            // TEMP bd-asupersync-043 op_cx probe — remove before commit.
+            if std::env::var_os("FSQLITE_OPCX_PROBE").is_some() {
+                eprintln!(
+                    "op_cx gate backtrace:\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
         }
         self.background_status()?;
         Ok(self.op_cx_after_background_status())
@@ -17889,15 +17896,18 @@ impl Connection {
             }
             if retained_commit_succeeded {
                 // This is a real ordinary write commit performed outside the
-                // normal autocommit finalizer. Publish its visibility floor and
-                // invalidate any live-vtab receipt that predates it before a
-                // later close step can fail and return the handle for retry.
+                // normal autocommit finalizer. Publish its visibility floor
+                // before a later close step can fail and return the handle for
+                // retry.
                 self.sync_filebacked_post_commit_visibility_floor();
-            } else {
-                // A memory rollback or ignored best-effort failure is teardown,
-                // never a reason to keep a one-shot preservation capability.
-                self.clear_pending_local_live_vtab_preservation();
             }
+            // The retained ordinary commit (or a teardown rollback) supersedes
+            // any live-vtab preservation receipt armed before it; clear the
+            // one-shot receipt unconditionally so it is never carried into the
+            // closed (or reopened) handle. Previously only the rollback branch
+            // cleared it, so a successful file-backed retained commit leaked the
+            // stale receipt past close.
+            self.clear_pending_local_live_vtab_preservation();
             self.retained_autocommit_stmt_count.set(0);
             self.retained_autocommit_dirty_tables.get_mut().clear();
             self.retained_autocommit_count_sum_cache.get_mut().take();
@@ -41201,9 +41211,13 @@ impl Connection {
             u64::try_from(raw).unwrap_or(u64::MAX)
         };
         #[allow(clippy::cast_possible_truncation)]
-        let wal_frames_estimate = match self.op_cx() {
-            Ok(cx) => self.pager.wal_frame_count(&cx).await as u64,
-            Err(_) => 0,
+        // bd-asupersync-043 release triage: this is an advisory metrics read
+        // on paths that already passed the background-status gate (commit,
+        // checkpoint scheduling); minting a fresh gated op_cx here charged an
+        // extra op_cx_background_gates entry to the direct commit API.
+        let wal_frames_estimate = {
+            let cx = self.op_cx_after_background_status();
+            self.pager.wal_frame_count(&cx).await as u64
         };
 
         let now = Instant::now();
@@ -44119,6 +44133,12 @@ impl Connection {
                             hot_path_profile_enabled().then(Instant::now);
                         let committed_seq = self.current_memory_autocommit_commit_seq(&txn);
                         self.sync_memory_autocommit_commit_seq(committed_seq);
+                        // This fast path runs only for ordinary writes (guarded
+                        // above by an empty live_vtab_transactions set). The
+                        // committed ordinary write supersedes any prior one-shot
+                        // live-vtab preservation receipt, so clear it here -- the
+                        // same invariant the retained-autocommit close path holds.
+                        self.clear_pending_local_live_vtab_preservation();
                         record_hot_path_duration(
                             &FSQLITE_COMMIT_FINALIZE_SEQ_TIME_NS,
                             commit_finalize_seq_start,
@@ -50867,6 +50887,36 @@ impl Connection {
                 continue;
             }
 
+            // bd-dk9ra fk-scaling: a single-column FK targeting the parent's
+            // rowid alias (INTEGER PRIMARY KEY) resolves as an O(log N)
+            // memdb rowid point lookup instead of compiling and scanning an
+            // ad-hoc SELECT per child insert (the O(rows) path behind the
+            // 7x/8k super-linear insert curve). The memdb mirror reflects
+            // txn-current state after the same staleness refresh
+            // fk_validation_query performs; a direct pager btree seek is
+            // ruled out — it can lag uncommitted in-txn parent writes.
+            if let Some(parent_present) = self
+                .fk_parent_rowid_fast_lookup(&fk.parent_table, &parent_cols, &fk_values)
+                .await?
+            {
+                if parent_present {
+                    if let Some(cache_key) = cache_key {
+                        self.fk_parent_validation_cache_insert(cache_key);
+                    }
+                    continue;
+                }
+                if self.fk_should_defer(fk) {
+                    if !deferred_recorded {
+                        self.deferred_fk_checks
+                            .borrow_mut()
+                            .push((table_name.to_owned(), row_values.to_vec()));
+                        deferred_recorded = true;
+                    }
+                    continue;
+                }
+                return Err(FrankenError::ForeignKeyViolation);
+            }
+
             // Build WHERE clause: parent_col1 = ?1 AND parent_col2 = ?2 ...
             let where_parts: Vec<String> = parent_cols
                 .iter()
@@ -51078,6 +51128,69 @@ impl Connection {
     ///    prior operations. This eliminates any possibility of stale
     ///    cursor state from a previous prepared-statement execution
     ///    interfering with the FK validation read.
+    /// bd-dk9ra fk-scaling: O(log N) parent-existence probe for the dominant
+    /// FK shape — a single child column referencing the parent's rowid alias
+    /// (INTEGER PRIMARY KEY). Returns `Ok(None)` when the shape does not
+    /// apply (composite keys, non-IPK parent columns, non-integer values,
+    /// WITHOUT ROWID parents, unknown tables) so the caller falls back to
+    /// the general validation SELECT.
+    ///
+    /// Correctness contract: the probe consults the memdb mirror AFTER the
+    /// exact staleness refresh `fk_validation_query` performs, so it sees
+    /// uncommitted in-transaction parent state. A direct pager btree seek is
+    /// deliberately NOT used here — the btree can lag in-txn writes.
+    async fn fk_parent_rowid_fast_lookup(
+        &self,
+        parent_table: &str,
+        parent_cols: &[String],
+        fk_values: &[&SqliteValue],
+    ) -> Result<Option<bool>> {
+        if parent_cols.len() != 1 || fk_values.len() != 1 {
+            return Ok(None);
+        }
+        let SqliteValue::Integer(rowid) = fk_values[0] else {
+            return Ok(None);
+        };
+        let rowid = *rowid;
+        let root_page = {
+            let schema = self.schema.borrow();
+            let Some(parent) = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(parent_table))
+            else {
+                return Ok(None);
+            };
+            if parent.without_rowid || parent.root_page <= 0 {
+                return Ok(None);
+            }
+            let Some(column) = parent
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&parent_cols[0]))
+            else {
+                return Ok(None);
+            };
+            if !column.is_ipk {
+                return Ok(None);
+            }
+            parent.root_page
+        };
+
+        // Identical txn-current staleness refresh to fk_validation_query.
+        if self.memdb_requires_active_txn_reload.get()
+            || !self.pending_memdb_direct_upserts.borrow().is_empty()
+        {
+            let cx = self.op_cx_after_background_status();
+            self.refresh_memdb_from_active_txn_if_dirty(&cx).await?;
+        }
+
+        let db = self.db.borrow();
+        let Some(table) = db.get_table(root_page) else {
+            return Ok(None);
+        };
+        Ok(Some(table.find_by_rowid(rowid).is_some()))
+    }
+
     async fn fk_validation_query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
         // Force any pending memdb writes to be visible before the FK check.
         // This is critical after DML operations (INSERT/UPDATE/DELETE) that
@@ -140584,7 +140697,11 @@ mod tests {
                         primary_key_first,
                         "dependent table constraint order changed: {sql}"
                     );
-                    assert!(sql.contains("REFERENCES parent (new_id)"), "{sql}");
+                    // Oracle (sqlite3 3.46.1): a renamed FK parent column keeps
+                    // the verbatim `REFERENCES parent(new_id)` form (no space
+                    // before the paren) -- reconciled from the old reconstructed
+                    // spacing to the .schema form.
+                    assert!(sql.contains("REFERENCES parent(new_id)"), "{sql}");
                 }
                 conn.close().await.unwrap();
             }
