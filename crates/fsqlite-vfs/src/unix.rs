@@ -402,6 +402,113 @@ fn sqlite_wal_shm_header_is_valid(buf: &[u8]) -> Result<bool> {
 // POSIX fcntl helpers
 // ---------------------------------------------------------------------------
 
+// Darwin exposes open-file-description (OFD) lock commands since macOS 10.12,
+// but older `libc` releases do not name them. They are a stable part of the
+// Darwin kernel ABI (`<sys/fcntl.h>`): F_OFD_SETLK = 90, F_OFD_GETLK = 92.
+#[cfg(target_os = "macos")]
+const DARWIN_F_OFD_SETLK: libc::c_int = 90;
+#[cfg(target_os = "macos")]
+const DARWIN_F_OFD_GETLK: libc::c_int = 92;
+
+/// Issue an `F_SETLK`-family request for `flock` on `file`.
+///
+/// Linux keeps its proven classic per-process `F_SETLK` path (via `nix`), so
+/// its concurrency behavior is byte-for-byte unchanged. Darwin (>= 10.12) uses
+/// `F_OFD_SETLK` (open-file-description locks, fcntl cmd 90) so the lock is
+/// owned by the open file description rather than the whole process: it is not
+/// silently dropped when an unrelated descriptor for the same inode is closed —
+/// the per-process footgun the classic path must otherwise work around. All
+/// locking here funnels through the single shared canonical descriptor per
+/// inode, so one OFD is authoritative. Other Unix keep classic byte-range
+/// `F_SETLK`. Only when the filesystem itself rejects byte-range / OFD fcntl
+/// locks (EINVAL/ENOTSUP — e.g. AFP/SMB network mounts, pre-10.12 kernels) do
+/// we drop to coarse whole-file `flock(2)` (C SQLite's flock locking style):
+/// correct, but it collapses the per-byte SHARED/RESERVED/PENDING/EXCLUSIVE
+/// regions to one whole-file lock, forfeiting byte-range writer concurrency.
+fn fcntl_setlk(file: &impl AsFd, flock: &libc::flock) -> nix::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_SETLK(flock)).map(|_| ())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        #[cfg(target_os = "macos")]
+        let cmd = DARWIN_F_OFD_SETLK;
+        #[cfg(not(target_os = "macos"))]
+        let cmd = libc::F_SETLK;
+        // SAFETY: `cmd` is a valid fcntl lock command that takes a
+        // `struct flock *`, and `flock` is a fully-initialized `libc::flock`
+        // that outlives the call.
+        let ret = unsafe { libc::fcntl(file.as_fd().as_raw_fd(), cmd, std::ptr::from_ref(flock)) };
+        if ret != -1 {
+            return Ok(());
+        }
+        let err = nix::errno::Errno::last();
+        // Some Darwin filesystems (AFP/SMB and other network mounts) and
+        // pre-10.12 kernels reject OFD / byte-range fcntl locks with
+        // EINVAL/ENOTSUP. Fall back to coarse whole-file flock(2) there — the
+        // degraded locking style C SQLite uses (SQLITE_ENABLE_LOCKING_STYLE).
+        // Contention still surfaces as EAGAIN, so posix_lock reports Ok(false).
+        if matches!(err, nix::errno::Errno::EINVAL | nix::errno::Errno::ENOTSUP) {
+            return flock_whole_file_fallback(file, flock.l_type);
+        }
+        Err(err)
+    }
+}
+
+/// `F_GETLK`-family probe, mirroring [`fcntl_setlk`]'s platform split so a
+/// query observes the same OFD lock space it will later contend for.
+fn fcntl_getlk(file: &impl AsFd, flock: &mut libc::flock) -> nix::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_GETLK(flock)).map(|_| ())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        #[cfg(target_os = "macos")]
+        let cmd = DARWIN_F_OFD_GETLK;
+        #[cfg(not(target_os = "macos"))]
+        let cmd = libc::F_GETLK;
+        // SAFETY: as in `fcntl_setlk`; the kernel fills `flock` in place.
+        let ret = unsafe { libc::fcntl(file.as_fd().as_raw_fd(), cmd, std::ptr::from_mut(flock)) };
+        if ret == -1 {
+            Err(nix::errno::Errno::last())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Coarse whole-file lock via `flock(2)`, the last-resort fallback used only
+/// when the filesystem cannot honor byte-range / OFD fcntl locks
+/// (EINVAL/ENOTSUP — AFP, SMB, and other network mounts on Darwin; pre-10.12
+/// kernels). Mirrors C SQLite's flock locking style: every SQLite lock byte
+/// collapses to a single whole-file `LOCK_SH`/`LOCK_EX`, so it stays correct
+/// but forfeits byte-range writer concurrency. Contention returns `EAGAIN`,
+/// matching the fcntl path so `posix_lock` still reports "would block".
+///
+/// LIMITATION: `flock(2)` has no non-destructive query, so lock-conflict probes
+/// (`posix_getlk` / `check_reserved_lock`) keep issuing fcntl `GETLK`, which is
+/// best-effort on a flock-only mount. Tracked for follow-up (bd-3u63s).
+#[cfg(not(target_os = "linux"))]
+fn flock_whole_file_fallback(file: &impl AsFd, l_type: libc::c_short) -> nix::Result<()> {
+    let l_type = i32::from(l_type);
+    let operation = if l_type == libc::F_UNLCK as i32 {
+        libc::LOCK_UN
+    } else if l_type == libc::F_WRLCK as i32 {
+        libc::LOCK_EX | libc::LOCK_NB
+    } else {
+        libc::LOCK_SH | libc::LOCK_NB
+    };
+    // SAFETY: `flock` receives a live descriptor and a valid operation flag.
+    let ret = unsafe { libc::flock(file.as_fd().as_raw_fd(), operation) };
+    if ret == -1 {
+        Err(nix::errno::Errno::last())
+    } else {
+        Ok(())
+    }
+}
+
 /// Attempt a non-blocking POSIX advisory lock via `fcntl(F_SETLK)`.
 ///
 /// Uses the `nix` crate for safe syscall wrapping (no `unsafe` needed).
@@ -433,8 +540,8 @@ fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64)
     };
 
     loop {
-        match nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_SETLK(&flock)) {
-            Ok(_) => return Ok(true),
+        match fcntl_setlk(file, &flock) {
+            Ok(()) => return Ok(true),
             Err(nix::errno::Errno::EINTR) => {}
             Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => return Ok(false),
             Err(e) => return Err(FrankenError::Io(e.into())),
@@ -524,8 +631,7 @@ fn posix_getlk(
         l_sysid: 0,
     };
 
-    nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_GETLK(&mut flock))
-        .map_err(|e| FrankenError::Io(e.into()))?;
+    fcntl_getlk(file, &mut flock).map_err(|e| FrankenError::Io(e.into()))?;
 
     Ok(flock)
 }
