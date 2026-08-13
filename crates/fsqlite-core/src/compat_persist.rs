@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use std::path::Path;
+use std::sync::Arc;
 
 use fsqlite_ast::{
     ColumnConstraintKind, CreateTableBody, CreateTableStatement, DefaultValue, Expr,
