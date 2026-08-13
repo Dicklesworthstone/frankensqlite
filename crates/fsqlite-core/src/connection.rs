@@ -223122,6 +223122,128 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_pragma_integrity_check_honors_collate_in_partial_index_predicate() {
+        // bd-integrity-partial-collate-puctc oracle (sqlite3 3.46.1): the row
+        // ('FiRe') satisfies `label COLLATE NOCASE = 'fire'`, is admitted to
+        // the partial index at INSERT time, and integrity_check reports `ok`.
+        // The integrity evaluator must re-evaluate the persisted predicate
+        // with the same explicit-COLLATE semantics as the DML membership path.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER NOT NULL, label TEXT NOT NULL);",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE INDEX idx_t_live ON t(value) WHERE value >= 0 AND label COLLATE NOCASE = 'fire';",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO t(id,value,label) VALUES(1,1000,'FiRe');")
+                .await
+                .unwrap();
+
+            let rows = conn.query("PRAGMA integrity_check;").await.unwrap();
+            assert_eq!(
+                rows[0].values()[0],
+                SqliteValue::Text("ok".into()),
+                "COLLATE NOCASE partial-index membership must match the oracle: {rows:?}"
+            );
+
+            // The bead's exact shape is file-backed: the persisted predicate
+            // must survive sqlite_schema reload with its COLLATE intact.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join("partial_collate.db")
+                .to_string_lossy()
+                .into_owned();
+            let seed = Connection::open(path.clone()).await.unwrap();
+            seed.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER NOT NULL, label TEXT NOT NULL);",
+            )
+            .await
+            .unwrap();
+            seed.execute(
+                "CREATE INDEX idx_t_live ON t(value) WHERE value >= 0 AND label COLLATE NOCASE = 'fire';",
+            )
+            .await
+            .unwrap();
+            seed.execute("INSERT INTO t(id,value,label) VALUES(1,1000,'FiRe');")
+                .await
+                .unwrap();
+            seed.close().await.unwrap();
+
+            let reopened = Connection::open(path).await.unwrap();
+            let rows = reopened.query("PRAGMA integrity_check;").await.unwrap();
+            assert_eq!(
+                rows[0].values()[0],
+                SqliteValue::Text("ok".into()),
+                "reloaded persisted COLLATE predicate must still match the oracle: {rows:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_foreign_key_check_without_rowid_child_reports_null_locator() {
+        // bd-y18u1 oracle (sqlite3 3.46.1): a violating WITHOUT ROWID child
+        // yields a diagnostic row whose child-row-locator column is NULL
+        // (`guarded_wor||parent|0`), while a rowid child reports its integer
+        // rowid (`child_rowid|7|parent|0`).
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE parent(pk INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE guarded_wor(a TEXT, b INTEGER REFERENCES parent(pk), PRIMARY KEY(a)) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO guarded_wor VALUES('x', 99);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE child_rowid(id INTEGER PRIMARY KEY, r INTEGER REFERENCES parent(pk));",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO child_rowid VALUES(7, 88);")
+                .await
+                .unwrap();
+
+            let mut rows = conn
+                .query("PRAGMA foreign_key_check;")
+                .await
+                .expect("foreign_key_check must not abort on WITHOUT ROWID children")
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            assert_eq!(rows.len(), 2, "both violations must be reported: {rows:?}");
+            assert_eq!(
+                rows[0],
+                vec![
+                    SqliteValue::Text("child_rowid".into()),
+                    SqliteValue::Integer(7),
+                    SqliteValue::Text("parent".into()),
+                    SqliteValue::Integer(0),
+                ],
+            );
+            assert_eq!(
+                rows[1],
+                vec![
+                    SqliteValue::Text("guarded_wor".into()),
+                    SqliteValue::Null,
+                    SqliteValue::Text("parent".into()),
+                    SqliteValue::Integer(0),
+                ],
+            );
+        });
+    }
+
+    #[test]
     fn test_pragma_integrity_check_evaluates_expression_and_mixed_index_keys() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
