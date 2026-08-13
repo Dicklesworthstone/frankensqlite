@@ -11364,6 +11364,23 @@ fn exact_database_page_count(file_size: u64, page_size: PageSize) -> Result<u32>
     })
 }
 
+/// Whole-page count of a database image that may carry a partial-page tail
+/// (GH#334 trailing slack): the tail is excluded from the count, matching
+/// stock SQLite's header-authoritative extent model.
+fn floored_database_page_count(file_size: u64, page_size: PageSize) -> Result<u32> {
+    let page_size_bytes = u64::from(page_size.get());
+    if file_size == 0 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "database image length 0 holds no pages".to_owned(),
+        });
+    }
+    let page_count = file_size / page_size_bytes;
+    u32::try_from(page_count).map_err(|_| FrankenError::OutOfRange {
+        what: "database image page count".to_owned(),
+        value: page_count.to_string(),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseImageExtentPolicy {
     Exact,
@@ -11404,7 +11421,19 @@ async fn database_image_receipt_for_open_file_with_extent<F: VfsFile>(
             ),
         });
     }
-    let page_count = exact_database_page_count(file_size, header.page_size)?;
+    // GH#334 / bd-e26jr sig-2: stock SQLite treats the header page count as
+    // authoritative and ignores trailing bytes beyond the last whole page, so
+    // a VACUUM source may carry an unaligned partial-page tail. The tail is
+    // excluded from the page loop but still covered by the receipt: its bytes
+    // are hashed below and `file_size` is bound into the digest, so the
+    // publish-time CAS detects any slack mutation. Candidate/self-contained
+    // images stay on the exact policy.
+    let page_count = match extent_policy {
+        DatabaseImageExtentPolicy::Exact => exact_database_page_count(file_size, header.page_size)?,
+        DatabaseImageExtentPolicy::AllowTrailingPages => {
+            floored_database_page_count(file_size, header.page_size)?
+        }
+    };
     let invalid_page_count = match extent_policy {
         DatabaseImageExtentPolicy::Exact => header.page_count != page_count,
         DatabaseImageExtentPolicy::AllowTrailingPages => header.page_count > page_count,
@@ -11440,6 +11469,25 @@ async fn database_image_receipt_for_open_file_with_extent<F: VfsFile>(
         }
         hasher.update(&page_no.to_be_bytes());
         hasher.update(&page);
+    }
+    let whole_pages_len = u64::from(page_count) * u64::from(header.page_size.get());
+    if file_size > whole_pages_len {
+        // Unaligned trailing slack (AllowTrailingPages only — the exact
+        // policy has already rejected it). Hash the tail so publish-time
+        // receipt recomputation detects content mutation, not just length.
+        let tail_len = usize::try_from(file_size - whole_pages_len)
+            .map_err(|_| FrankenError::internal("trailing slack length exceeds usize"))?;
+        let mut tail = vec![0_u8; tail_len];
+        let bytes_read = file.read(cx, &mut tail, whole_pages_len).await?;
+        if bytes_read != tail_len {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short trailing slack while hashing image: got {bytes_read} of {tail_len}"
+                ),
+            });
+        }
+        hasher.update(b"tail\0");
+        hasher.update(&tail);
     }
     Ok(DatabaseImageReceipt {
         identity,
@@ -15284,14 +15332,11 @@ where
         };
 
         let page_size_u64 = page_size.as_usize() as u64;
-        if file_size % page_size_u64 != 0 {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "database file size {file_size} is not aligned to page size {}",
-                    page_size.get()
-                ),
-            });
-        }
+        // GH#334 / bd-e26jr sig-2: stock SQLite ignores trailing bytes beyond
+        // the last whole page (header page count is authoritative), and
+        // doctor-repair flows depend on opening such slack-bearing files. A
+        // partial-page tail is therefore slack, not corruption: floor to
+        // whole pages exactly like the aligned-slack case already does.
         let db_pages = file_size
             .checked_div(page_size_u64)
             .ok_or_else(|| FrankenError::internal("page size must be non-zero"))?;
@@ -15756,14 +15801,8 @@ where
         };
 
         let page_size_u64 = page_size.as_usize() as u64;
-        if file_size % page_size_u64 != 0 {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "database file size {file_size} is not aligned to page size {}",
-                    page_size.get()
-                ),
-            });
-        }
+        // GH#334 / bd-e26jr sig-2: a partial-page tail is slack, not
+        // corruption — floor to whole pages (see the read-write open above).
         let db_pages = file_size
             .checked_div(page_size_u64)
             .ok_or_else(|| FrankenError::internal("page size must be non-zero"))?;
@@ -18670,15 +18709,44 @@ where
         let batch_build_us = elapsed_profile_us(t_batch_build_start);
 
         if !conflict_pages.is_empty() && conflict_snapshot.is_none() {
-            if let Some(attempt) = txn_attempt {
-                attempt.complete_not_committed_global()?;
+            // bd-dk9ra / def2ed8c5 reconciliation: the fail-closed refusal
+            // protects bd-1fc2c's coherent-snapshot
+            // invariant: a commit must never skip page validation because
+            // its snapshot went missing ON A BACKEND THAT HAS SNAPSHOTS. On
+            // snapshot-less backends (raw-pager harnesses, plain adapters:
+            // pinned AND published snapshots both None) validation is
+            // impossible by construction — def2ed8c5's eager begin-side
+            // capture records conflict pages that nothing can ever validate,
+            // and refusing killed every Immediate commit there (self_alloc
+            // reds + the publish-window suite wedge). Tradeoff, stated:
+            // snapshot-less backends commit WITHOUT page-conflict validation
+            // (exactly their pre-D1 semantics; the write lock serializes
+            // their writers); snapshot-capable backends keep the full
+            // fail-closed refusal, preserving what def2ed8c5 protects.
+            let backend_has_snapshot_facility =
+                with_wal_backend_read(wal_backend, cx, |wal, _| {
+                    Box::pin(async move {
+                        Ok(wal.published_snapshot().is_some()
+                            || wal.pinned_read_snapshot().is_some())
+                    })
+                })
+                .await?;
+            if backend_has_snapshot_facility {
+                if let Some(attempt) = txn_attempt {
+                    attempt.complete_not_committed_global()?;
+                }
+                tracing::warn!(
+                    target: "fsqlite.pager.commit",
+                    conflict_page_count = conflict_pages.len(),
+                    "commit refused: conflict pages present without a conflict snapshot on a snapshot-capable backend (bd-dk9ra receipt)"
+                );
+                return Err(FrankenError::Unsupported);
             }
-            tracing::warn!(
+            tracing::debug!(
                 target: "fsqlite.pager.commit",
                 conflict_page_count = conflict_pages.len(),
-                "commit refused: conflict pages present without a conflict snapshot (bd-dk9ra receipt)"
+                "immediate-mode commit proceeds without conflict snapshot: write lock serializes writers (bd-dk9ra ruling)"
             );
-            return Err(FrankenError::Unsupported);
         }
 
         let t_conflict_snapshot_start = detailed_metrics.then(Instant::now);
@@ -19413,11 +19481,25 @@ where
                                     .await
                                 {
                                     Ok(()) => {}
-                                    #[cfg(test)]
                                     Err(FrankenError::Unsupported) => {
-                                        // Process-local unit backends have no
-                                        // sidecar namespace. Their successful
-                                        // in-process path remains test-only.
+                                        // Unsupported is the backend DECLARING
+                                        // it has no certificate-sidecar
+                                        // facility (plain adapters, process-
+                                        // local harness backends) — a backend
+                                        // property, not a test-build property.
+                                        // The former #[cfg(test)] gate on this
+                                        // arm made every integration-test
+                                        // (non-cfg(test)) Immediate commit on
+                                        // such backends fail outright once the
+                                        // D1 stack landed (bd-dk9ra: self_alloc
+                                        // reds + publish-window suite wedge).
+                                        // Such backends simply operate with
+                                        // pre-D1 durability semantics — no
+                                        // parallel-WAL certificate — exactly as
+                                        // they did before the stack. Real
+                                        // production backends implement
+                                        // persist; their genuine failures
+                                        // still fail closed below.
                                         certificate_completion.complete_success();
                                     }
                                     Err(error) => return Err(error),
@@ -26445,27 +26527,32 @@ mod tests {
     }
 
     #[test]
-    fn test_open_existing_database_rejects_non_page_aligned_size() {
+    fn test_open_existing_database_treats_non_page_aligned_tail_as_slack() {
+        // GH#334 / bd-e26jr sig-2: stock SQLite treats the header page count
+        // as authoritative and ignores trailing bytes beyond the last whole
+        // page, so a partial-page tail must not fail the open. The tail is
+        // slack: the whole-page extent stays what it was before the append.
         asupersync::test_utils::run_test(|| async {
             let vfs = MemoryVfs::new();
             let path = PathBuf::from("/misaligned.db");
             let cx = Cx::new();
-            let _pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
+            drop(pager);
 
             let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
             let (db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
             let file_size = db_file.file_size(&cx).unwrap();
             db_file.write(&cx, &[0xAB], file_size).await.unwrap();
 
-            let Err(err) = SimplePager::open(vfs, &path, PageSize::DEFAULT).await else {
-                panic!("expected non-page-aligned file size error");
-            };
-            assert!(
-                matches!(err, FrankenError::DatabaseCorrupt { .. }),
-                "bead_id={BEAD_ID} case=reject_non_page_aligned_file_size"
+            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+                .await
+                .expect("open must tolerate a partial-page trailing tail");
+            let txn = pager.begin(&cx, TransactionMode::ReadOnly).await.expect(
+                "slack-bearing database must stay readable after open",
             );
+            drop(txn);
         });
     }
 
