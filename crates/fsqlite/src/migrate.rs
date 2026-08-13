@@ -198,8 +198,20 @@ impl MigrationRunner {
             )
     }
 
+    // `asupersync` is an optional dependency (enabled by `native` / `async-api`).
+    // Under `--no-default-features` it is not linked, so fall back to a blocking
+    // sleep — the same std backoff this path used before it became async. The
+    // migration busy-retry path is cold and the backoff is ~2ms, so briefly
+    // blocking is acceptable and keeps the crate building without a runtime.
+    #[cfg_attr(
+        not(any(feature = "native", feature = "async-api")),
+        allow(clippy::unused_async)
+    )]
     async fn busy_retry_backoff() {
+        #[cfg(any(feature = "native", feature = "async-api"))]
         asupersync::time::sleep(asupersync::time::wall_now(), MIGRATION_BUSY_RETRY_BACKOFF).await;
+        #[cfg(not(any(feature = "native", feature = "async-api")))]
+        std::thread::sleep(MIGRATION_BUSY_RETRY_BACKOFF);
     }
 
     /// Applies a single migration inside a BEGIN IMMEDIATE/COMMIT transaction.
