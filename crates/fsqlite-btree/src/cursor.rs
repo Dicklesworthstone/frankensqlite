@@ -4716,7 +4716,16 @@ impl<P: PageReader> BtCursor<P> {
 
         let mut lo = 0u16;
         let mut hi = count;
-        let parsed_target = parse_record(target);
+        // bd-dk9ra: the hoisted once-per-seek target parse is btree work and
+        // must charge the BtreeCursor profile bucket; outside this guard it
+        // bled into the caller's ambient scope (VdbeEngine), breaking the
+        // storage-cursor scratch countermetric (one phantom full parse per
+        // probe) without any real scratch regression.
+        let parsed_target = {
+            let _record_profile_scope =
+                enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            parse_record(target)
+        };
 
         while lo < hi {
             observe_cursor_cancellation(cx)?;
@@ -4769,7 +4778,16 @@ impl<P: PageReader> BtCursor<P> {
 
         let mut lo = 0u16;
         let mut hi = count;
-        let parsed_target = parse_record(target);
+        // bd-dk9ra: the hoisted once-per-seek target parse is btree work and
+        // must charge the BtreeCursor profile bucket; outside this guard it
+        // bled into the caller's ambient scope (VdbeEngine), breaking the
+        // storage-cursor scratch countermetric (one phantom full parse per
+        // probe) without any real scratch regression.
+        let parsed_target = {
+            let _record_profile_scope =
+                enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            parse_record(target)
+        };
 
         while lo < hi {
             observe_cursor_cancellation(cx)?;
