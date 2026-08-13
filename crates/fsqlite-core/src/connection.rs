@@ -75726,29 +75726,6 @@ impl Connection {
                 } else {
                     HashSet::new()
                 };
-                // bd-dk9ra: a live-vtab enlisted in the current transaction owns
-                // in-flight state (fail_sync flags, hook logs, uncommitted rows)
-                // that a pager reconnect would silently drop. Preserve its exact
-                // instance across the reload so xSync/xRollback run against the
-                // enlisted object (matching the transactional BEGIN path that
-                // short-circuits the reload entirely).
-                for enlisted_key in self
-                    .active_live_vtab_names()
-                    .into_iter()
-                    .map(|name| name.to_ascii_uppercase())
-                {
-                    if existing_live_vtabs.contains_key(&enlisted_key) {
-                        preserved_live_vtab_keys.insert(enlisted_key);
-                    }
-                }
-                eprintln!(
-                    "DK9RA_TRACE reload_else enlisted={:?} eligible={:?} existing={:?} preserved={:?} is_mem={}",
-                    self.active_live_vtab_names(),
-                    &eligible_preserved_live_vtab_keys,
-                    existing_live_vtabs.keys().collect::<Vec<_>>(),
-                    &preserved_live_vtab_keys,
-                    self.pager.is_memory()
-                );
                 drop(existing_live_vtabs);
                 let mut reloaded = self
                     .rebuild_materialized_live_vtab_instances_from_reload(
