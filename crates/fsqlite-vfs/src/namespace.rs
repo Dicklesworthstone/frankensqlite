@@ -106,6 +106,13 @@ enum PendingLease {
         gate: File,
         use_file: File,
     },
+    /// GH#140 / bd-daqmp: read-only admission of a database that no
+    /// FrankenSQLite ever admitted (no namespace sidecars exist, e.g. a stock
+    /// SQLite file). Nothing is created, opened, or locked — the reader
+    /// behaves like an external stock process. A namespace created by a peer
+    /// AFTER this admission cannot coordinate with it, which is identical to
+    /// the peer's exposure to any non-FrankenSQLite reader.
+    ReadOnlyUnadmitted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,9 +136,30 @@ impl PendingNamespaceOpen {
     pub fn begin(stable_path: &Path, intent: NamespaceOpenIntent) -> Result<Self> {
         validate_stable_path(stable_path)?;
         let (gate, mut use_file) = if intent == NamespaceOpenIntent::ReadOnlyExisting {
+            // GH#140 / bd-daqmp: a read-only open must be byte-neutral for the
+            // whole file family. When the namespace sidecars do not exist (a
+            // database never admitted by FrankenSQLite), creating them here
+            // would make a read-only open side-effecting, so admit
+            // sidecar-less instead. Absence is checked explicitly; any OTHER
+            // sidecar-open failure (malformed, permissions) still fails
+            // closed through `open_existing_secure_lock_file` below.
+            let gate_path = sidecar_path(stable_path, GATE_SUFFIX);
+            let use_path = sidecar_path(stable_path, USE_SUFFIX);
+            let sidecar_missing = |path: &Path| {
+                matches!(
+                    std::fs::metadata(path),
+                    Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            };
+            if sidecar_missing(&gate_path) || sidecar_missing(&use_path) {
+                return Ok(Self {
+                    stable_path: stable_path.to_owned(),
+                    lease: Some(PendingLease::ReadOnlyUnadmitted),
+                });
+            }
             (
-                open_existing_secure_lock_file(&sidecar_path(stable_path, GATE_SUFFIX))?,
-                open_existing_secure_lock_file(&sidecar_path(stable_path, USE_SUFFIX))?,
+                open_existing_secure_lock_file(&gate_path)?,
+                open_existing_secure_lock_file(&use_path)?,
             )
         } else {
             (
@@ -350,6 +378,12 @@ impl PendingNamespaceOpen {
                 }
                 BindingLease::BootstrapExclusive { gate, use_file }
             }
+            PendingLease::ReadOnlyUnadmitted => {
+                if bind_mode == NamespaceBindMode::ReplaceQuiescentRecord {
+                    return Err(cannot_open(&self.stable_path));
+                }
+                BindingLease::ReadOnlyUnadmitted
+            }
         };
 
         Ok(Arc::new(DatabaseNamespaceBinding {
@@ -369,6 +403,8 @@ impl Drop for PendingNamespaceOpen {
             PendingLease::NewShared { gate, use_file }
             | PendingLease::JoinShared { gate, use_file, .. }
             | PendingLease::BootstrapExclusive { gate, use_file } => (gate, use_file),
+            // Sidecar-less admission holds no files and no locks.
+            PendingLease::ReadOnlyUnadmitted => return,
         };
         let _ = AdvisoryFileLock::unlock(&use_file);
         let _ = AdvisoryFileLock::unlock(&gate);
@@ -377,10 +413,20 @@ impl Drop for PendingNamespaceOpen {
 
 #[derive(Debug)]
 enum BindingLease {
-    Shared { use_file: File },
-    BootstrapExclusive { gate: File, use_file: File },
-    BootstrapUseShared { gate: File, use_file: File },
+    Shared {
+        use_file: File,
+    },
+    BootstrapExclusive {
+        gate: File,
+        use_file: File,
+    },
+    BootstrapUseShared {
+        gate: File,
+        use_file: File,
+    },
     Transitioning,
+    /// GH#140 / bd-daqmp sidecar-less read-only binding: no files, no locks.
+    ReadOnlyUnadmitted,
 }
 
 /// Lifetime lease binding all path-derived companions to one main-file
@@ -473,7 +519,10 @@ impl DatabaseNamespaceBinding {
             .lease
             .lock()
             .map_err(|_| FrankenError::internal("namespace lease mutex poisoned"))?;
-        if matches!(*lease, BindingLease::Shared { .. }) {
+        if matches!(
+            *lease,
+            BindingLease::Shared { .. } | BindingLease::ReadOnlyUnadmitted
+        ) {
             return Ok(());
         }
         let old = std::mem::replace(&mut *lease, BindingLease::Transitioning);
@@ -533,7 +582,7 @@ impl Drop for DatabaseNamespaceBinding {
                 let _ = AdvisoryFileLock::unlock(use_file);
                 let _ = AdvisoryFileLock::unlock(gate);
             }
-            BindingLease::Transitioning => {}
+            BindingLease::Transitioning | BindingLease::ReadOnlyUnadmitted => {}
         }
     }
 }
@@ -1956,6 +2005,54 @@ mod tests {
     }
 
     #[test]
+    fn readonly_admission_of_never_admitted_database_creates_no_sidecars() {
+        // GH#140 / bd-daqmp: a read-only open of a database that no
+        // FrankenSQLite ever admitted (e.g. a stock SQLite file) must be
+        // byte-neutral for the whole family — no sidecar creation, no locks.
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("never-admitted.db");
+        let identity = create_database(&database, b"stock-like database");
+        let gate_path = sidecar_path(&database, GATE_SUFFIX);
+        let use_path = sidecar_path(&database, USE_SUFFIX);
+        assert!(!gate_path.exists() && !use_path.exists());
+
+        let pending = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting)
+            .expect("sidecar-less read-only admission must succeed");
+        assert_eq!(pending.expected_identity(), None);
+        assert!(
+            !pending
+                .has_quiescent_record_bytes()
+                .expect("sidecar-less admission has no record")
+        );
+        let binding = pending
+            .bind(identity)
+            .expect("bind sidecar-less read-only admission");
+        assert!(!binding.bootstrap_is_exclusive());
+        binding
+            .finish_bootstrap()
+            .expect("sidecar-less binding has no bootstrap transition");
+        drop(binding);
+
+        assert!(
+            !gate_path.exists(),
+            "read-only admission must not create the gate sidecar"
+        );
+        assert!(
+            !use_path.exists(),
+            "read-only admission must not create the identity sidecar"
+        );
+
+        // A later writable admission still creates the namespace normally.
+        let writer = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("subsequent shared admission")
+            .bind(identity)
+            .expect("bind shared generation");
+        writer.finish_bootstrap().expect("publish generation");
+        drop(writer);
+        assert!(gate_path.exists() && use_path.exists());
+    }
+
+    #[test]
     fn readonly_admission_blocks_generation_transition_then_holds_use_lease() {
         let dir = tempdir().expect("tempdir");
         let database = dir.path().join("readonly-transition.db");
@@ -2015,7 +2112,11 @@ mod tests {
     }
 
     #[test]
-    fn readonly_existing_generation_refuses_missing_records_without_creating_them() {
+    fn readonly_existing_generation_admits_missing_records_without_creating_them() {
+        // GH#140 / bd-daqmp contract update: missing records no longer fail
+        // closed — a database never admitted by FrankenSQLite admits
+        // SIDECAR-LESS. The unchanged core of this keeper is the second half:
+        // the directory must stay byte-for-byte pristine either way.
         let dir = tempdir().expect("tempdir");
         let database = dir.path().join("readonly-missing-records.db");
         create_database(&database, b"external database");
@@ -2024,13 +2125,13 @@ mod tests {
             .map(|entry| entry.expect("namespace entry").file_name())
             .collect::<std::collections::BTreeSet<_>>();
 
-        assert!(matches!(
-            PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting),
-            Err(FrankenError::CannotOpen { .. })
-        ));
+        let pending = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting)
+            .expect("missing records admit sidecar-less (GH#140)");
+        assert_eq!(pending.expected_identity(), None);
+        drop(pending);
 
         let entries_after = fs::read_dir(dir.path())
-            .expect("list refused namespace")
+            .expect("list namespace after sidecar-less admission")
             .map(|entry| entry.expect("namespace entry").file_name())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(entries_after, entries_before);

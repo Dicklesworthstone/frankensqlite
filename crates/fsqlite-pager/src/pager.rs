@@ -15621,11 +15621,11 @@ where
         } else {
             // GH #140: prefer strictly read-only admission — join the
             // existing namespace generation without creating or rewriting
-            // any sidecar record. Only when no admissible records exist
-            // (a database never opened by FrankenSQLite, e.g. a stock
-            // SQLite file) fall back to the writable Shared admission so
-            // the database still opens read-only on writable media; the
-            // zero-mutation clean-database case remains tracked in #140.
+            // any sidecar record. When no sidecars exist at all (a database
+            // never opened by FrankenSQLite, e.g. a stock SQLite file),
+            // ReadOnlyExisting now succeeds SIDECAR-LESS (bd-daqmp: the
+            // zero-mutation clean-database case), so the Shared fallback
+            // below only fires for present-but-unopenable sidecar records.
             // Busy is NOT a fallback trigger: it means a live generation
             // transition is in flight and must stay retryable.
             match PendingNamespaceOpen::begin(&db_path, NamespaceOpenIntent::ReadOnlyExisting) {
