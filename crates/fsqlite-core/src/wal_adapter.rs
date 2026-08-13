@@ -4475,6 +4475,10 @@ mod tests {
         backend
             .append_frame(cx, 2, &page_two, 2)
             .expect("append original commit");
+        // Durable-certificate contract: staged frames are unpublished until
+        // sync; pin the read snapshot AFTER publication so the fixture pins
+        // the original generation's committed horizon as intended.
+        backend.sync(cx).expect("publish original commit");
         backend
             .begin_transaction(cx)
             .expect("pin original WAL generation");
@@ -4950,14 +4954,20 @@ mod tests {
         let vfs = MemoryVfs::new();
         let (mut backend, authorized) = make_authorized_certificate_backend(&vfs, &cx);
         let mut sidecar = read_certificate_sidecar(&vfs, &cx);
+        // bd-e0ghc contract: only IN-SNAPSHOT invalid records consume the
+        // bounded orphan budget; records whose frame boundary lies beyond the
+        // published frame count are futures under concurrent load and are
+        // skipped budget-free. Exercise the budget with in-snapshot orphans
+        // (boundary 1,1 — within the published horizon — but content that
+        // fails authorization against the real commit marker).
         for orphan_index in 0..MAX_ORPHAN_CERTIFICATE_LOOKBACK {
             let epoch = u64::try_from(orphan_index).expect("orphan index fits u64") + 2;
             let orphan = sample_certificate(epoch, epoch, vec![1]);
             sidecar.extend_from_slice(
                 &ParallelWalDurableCertificateRecord::new(
                     backend.inner.inner().generation_identity(),
-                    2,
-                    2,
+                    1,
+                    1,
                     orphan,
                 )
                 .expect("construct bounded orphan")
@@ -4995,6 +5005,48 @@ mod tests {
                 .latest_authorized_parallel_wal_commit_certificate(&cx)
                 .wait(),
             "65 unauthorized records",
+        );
+
+        // Contract-positive twin: FUTURE-boundary records (beyond the
+        // published frame count) are budget-exempt — 65 of them plus the
+        // torn tail must still resolve the authorized predecessor.
+        let mut future_sidecar = read_certificate_sidecar(&vfs, &cx);
+        future_sidecar.truncate(
+            future_sidecar.len()
+                - (MAX_ORPHAN_CERTIFICATE_LOOKBACK + 1)
+                    * ParallelWalDurableCertificateRecord::new(
+                        backend.inner.inner().generation_identity(),
+                        1,
+                        1,
+                        sample_certificate(2, 2, vec![1]),
+                    )
+                    .expect("sizing record")
+                    .to_bytes()
+                    .len(),
+        );
+        for future_index in 0..=MAX_ORPHAN_CERTIFICATE_LOOKBACK {
+            let epoch = u64::try_from(future_index).expect("future index fits u64") + 2;
+            let future = sample_certificate(epoch, epoch, vec![1]);
+            future_sidecar.extend_from_slice(
+                &ParallelWalDurableCertificateRecord::new(
+                    backend.inner.inner().generation_identity(),
+                    2,
+                    2,
+                    future,
+                )
+                .expect("construct future record")
+                .to_bytes(),
+            );
+        }
+        future_sidecar.push(0xA5);
+        replace_certificate_sidecar(&vfs, &cx, &future_sidecar);
+        assert_eq!(
+            backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .wait()
+                .expect("future-boundary records are budget-exempt")
+                .expect("authorized predecessor is found beneath futures"),
+            authorized
         );
     }
 
