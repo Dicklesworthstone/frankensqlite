@@ -41201,9 +41201,13 @@ impl Connection {
             u64::try_from(raw).unwrap_or(u64::MAX)
         };
         #[allow(clippy::cast_possible_truncation)]
-        let wal_frames_estimate = match self.op_cx() {
-            Ok(cx) => self.pager.wal_frame_count(&cx).await as u64,
-            Err(_) => 0,
+        // bd-asupersync-043 release triage: this is an advisory metrics read
+        // on paths that already passed the background-status gate (commit,
+        // checkpoint scheduling); minting a fresh gated op_cx here charged an
+        // extra op_cx_background_gates entry to the direct commit API.
+        let wal_frames_estimate = {
+            let cx = self.op_cx_after_background_status();
+            self.pager.wal_frame_count(&cx).await as u64
         };
 
         let now = Instant::now();
