@@ -18998,10 +18998,16 @@ impl Connection {
         // parentheses. Guarded to CreateTable only so an internal ALTER->CREATE
         // rewrite can never mistake an ALTER's text for a table definition;
         // multi-statement batches fall back to AST serialization.
+        //
+        // bd-lgolw: the captured text must begin at the statement's first
+        // token. Stock sqlite3 stores the CREATE from its first keyword; a
+        // leading `-- comment` (which parses as part of a one-statement
+        // script) persisted into sqlite_master makes canonical SQLite fail
+        // the whole schema load with "malformed database schema (<table>)".
         *self.pending_ddl_source.borrow_mut() = (statements.len() == 1
             && matches!(statements[0].as_ref(), Statement::CreateTable(_)))
         .then(|| {
-            let trimmed = sql.trim();
+            let trimmed = strip_leading_sql_comments(sql).trim_end();
             trimmed
                 .strip_suffix(';')
                 .unwrap_or(trimmed)
@@ -83059,6 +83065,31 @@ fn frankenerror_from_vdbe_halt(code: i32, message: String) -> FrankenError {
         };
     }
     FrankenError::Internal(format!("VDBE halted with code {code}: {message}"))
+}
+
+/// Strip leading whitespace and SQL comments (`-- ...` line comments and
+/// `/* ... */` block comments) so a captured verbatim statement text begins
+/// at its first real token, the way stock sqlite3 stores CREATE text in
+/// sqlite_master. A leading comment persisted into the schema makes
+/// canonical SQLite fail the whole schema load with
+/// "malformed database schema (<name>)" (bd-lgolw).
+fn strip_leading_sql_comments(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            match rest.find('\n') {
+                Some(idx) => text = &rest[idx + 1..],
+                None => return "",
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(idx) => text = &rest[idx + 2..],
+                None => return "",
+            }
+        } else {
+            return trimmed;
+        }
+    }
 }
 
 /// bd-67tdh Phase 2: stock sqlite3 3.46.1 (oracle) implements ALTER TABLE ADD
