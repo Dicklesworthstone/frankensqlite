@@ -10518,7 +10518,23 @@ pub struct Connection {
     /// context-free expression walker. All function kinds share one SQL
     /// namespace, so an aggregate or window registration can also displace a
     /// scalar built-in at the same key.
+    ///
+    /// This flag also disables the semantic fast paths (memdb GROUP BY scans,
+    /// planner expression-index admission, min/max shortcuts) that assume
+    /// built-in scalar semantics, so it must stay `false` until a built-in is
+    /// actually displaced — see `connection_registry_differs_from_base` for
+    /// the weaker "projection needed" condition (bd-z22mq).
     scalar_function_overridden: Cell<bool>,
+    /// Whether the connection-local function registry differs from the shared
+    /// base registry even though no built-in scalar semantics changed. With
+    /// `ext-icu` this is true from construction: `icu_load_collation` is
+    /// registered connection-locally at open (it captures the connection's
+    /// collation registry), so context-free fallback evaluators must project
+    /// the connection registry or the ICU function is unresolvable. Unlike
+    /// `scalar_function_overridden`, this must NOT disable semantic fast
+    /// paths — conflating the two silently shut off every memdb GROUP BY fast
+    /// path under the default feature set (bd-z22mq, 6-90x regression).
+    connection_registry_differs_from_base: Cell<bool>,
     /// Whether this connection currently has an aggregate-callable
     /// application registration.
     ///
@@ -12181,12 +12197,13 @@ impl Connection {
             triggers_by_name: RefCell::new(HashMap::new()),
             trigger_frame_stack: RefCell::new(Vec::new()),
             func_registry: RefCell::new(default_function_registry(&collation_registry)),
-            // bd-asupersync-043 release triage: with ext-icu the default
-            // registry already differs from the shared base (connection-local
-            // icu_load_collation), so context-free fallback evaluators must
-            // project it — the false fast path made the ICU function
-            // unresolvable on every with_fallback_function_registry route.
-            scalar_function_overridden: Cell::new(cfg!(feature = "ext-icu")),
+            scalar_function_overridden: Cell::new(false),
+            // With ext-icu the default registry already differs from the
+            // shared base (connection-local icu_load_collation), so
+            // context-free fallback evaluators must project it. Kept separate
+            // from `scalar_function_overridden` so registry projection does
+            // not disable the semantic fast paths (bd-z22mq).
+            connection_registry_differs_from_base: Cell::new(cfg!(feature = "ext-icu")),
             custom_aggregate_registered: Cell::new(false),
             custom_aggregate_keys: RefCell::new(Arc::new(HashMap::new())),
             custom_window_functions: RefCell::new(HashMap::new()),
@@ -12672,12 +12689,13 @@ impl Connection {
             triggers_by_name: RefCell::new(HashMap::new()),
             trigger_frame_stack: RefCell::new(Vec::new()),
             func_registry: RefCell::new(default_function_registry(&collation_registry)),
-            // bd-asupersync-043 release triage: with ext-icu the default
-            // registry already differs from the shared base (connection-local
-            // icu_load_collation), so context-free fallback evaluators must
-            // project it — the false fast path made the ICU function
-            // unresolvable on every with_fallback_function_registry route.
-            scalar_function_overridden: Cell::new(cfg!(feature = "ext-icu")),
+            scalar_function_overridden: Cell::new(false),
+            // With ext-icu the default registry already differs from the
+            // shared base (connection-local icu_load_collation), so
+            // context-free fallback evaluators must project it. Kept separate
+            // from `scalar_function_overridden` so registry projection does
+            // not disable the semantic fast paths (bd-z22mq).
+            connection_registry_differs_from_base: Cell::new(cfg!(feature = "ext-icu")),
             custom_aggregate_registered: Cell::new(false),
             custom_aggregate_keys: RefCell::new(Arc::new(HashMap::new())),
             custom_window_functions: RefCell::new(HashMap::new()),
@@ -18430,7 +18448,10 @@ impl Connection {
     /// The common case has no application registration and avoids both the
     /// `Arc` clone and thread-local stack traffic.
     fn with_fallback_function_registry<T>(&self, evaluate: impl FnOnce() -> T) -> T {
-        if !self.scalar_function_overridden.get() && !self.custom_aggregate_registered.get() {
+        if !self.scalar_function_overridden.get()
+            && !self.custom_aggregate_registered.get()
+            && !self.connection_registry_differs_from_base.get()
+        {
             return evaluate();
         }
         let registry = Arc::clone(&self.func_registry.borrow());
@@ -67106,7 +67127,8 @@ impl Connection {
         // available to the context-free window argument/frame helpers without
         // carrying thread-local connection state across an `.await`.
         let _function_registry_guard = (self.scalar_function_overridden.get()
-            || self.custom_aggregate_registered.get())
+            || self.custom_aggregate_registered.get()
+            || self.connection_registry_differs_from_base.get())
         .then(|| {
             let registry = Arc::clone(&self.func_registry.borrow());
             let custom_aggregate_keys = Arc::clone(&self.custom_aggregate_keys.borrow());
@@ -68033,7 +68055,8 @@ impl Connection {
         // expressions through `eval_join_expr`, so expose the immutable
         // registry snapshot for that synchronous region only.
         let _function_registry_guard = (self.scalar_function_overridden.get()
-            || self.custom_aggregate_registered.get())
+            || self.custom_aggregate_registered.get()
+            || self.connection_registry_differs_from_base.get())
         .then(|| {
             let registry = Arc::clone(&self.func_registry.borrow());
             let custom_aggregate_keys = Arc::clone(&self.custom_aggregate_keys.borrow());
