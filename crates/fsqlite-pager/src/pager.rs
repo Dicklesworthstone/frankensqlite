@@ -9239,8 +9239,24 @@ async fn conflicting_pages_since_batch_snapshots(
     let mut conflicts = Vec::<u32>::new();
     for batch in batches {
         let Some(snapshot) = batch.conflict_snapshot else {
+            if std::env::var_os("DK9RA_O81OV").is_some() {
+                let maxp = batch.frames.iter().map(|f| f.page_number).max().unwrap_or(0);
+                eprintln!(
+                    "DK9RA_O81OV CPBS_SKIP no_snapshot n_conflict_pages={} max_frame_page={maxp}",
+                    batch.conflict_pages.len()
+                );
+            }
             continue;
         };
+        if std::env::var_os("DK9RA_O81OV").is_some() {
+            let maxc = batch.conflict_pages.iter().copied().max().unwrap_or(0);
+            let maxf = batch.frames.iter().map(|f| f.page_number).max().unwrap_or(0);
+            eprintln!(
+                "DK9RA_O81OV CPBS snap_db={} n_conflict_pages={} max_conflict={maxc} max_frame={maxf}",
+                snapshot.snapshot_db_size,
+                batch.conflict_pages.len()
+            );
+        }
         let batch_conflicts = wal
             .conflicting_pages_since_snapshot(
                 cx,
@@ -18731,6 +18747,7 @@ where
             inner_arc,
             None,
             current_db_size,
+            0,
             sync_policy,
             write_set,
             write_pages_sorted,
@@ -18752,6 +18769,11 @@ where
         inner_arc: &Arc<Mutex<PagerInner<V::File>>>,
         published: Option<Arc<PublishedPagerState>>,
         current_db_size: u32,
+        // bd-0shxy: the allocator's BEGIN-TIME committed base. The peer-claimed
+        // range guard (snapshot_db_size in TransactionConflictSnapshot) needs
+        // the size this transaction's EOF allocations assumed; current_db_size
+        // already includes our own growth, which silenced the guard entirely.
+        allocation_base_db_size: u32,
         sync_policy: WalCommitSyncPolicy,
         write_set: &HashMap<PageNumber, StagedPage, S>,
         write_pages_sorted: &[PageNumber],
@@ -18848,7 +18870,7 @@ where
             conflict_pages,
             conflict_snapshot,
             conflict_page_baselines,
-            current_db_size,
+            allocation_base_db_size,
         );
         let conflict_snapshot_us = elapsed_profile_us(t_conflict_snapshot_start);
 
@@ -19119,6 +19141,23 @@ where
 
                 let t_flush_frame_prep_start = detailed_metrics.then(Instant::now);
                 let conflicting_pages = conflicting_pages_across_group_commit_batches(&batches);
+                if std::env::var_os("DK9RA_O81OV").is_some() && batches.len() > 0 {
+                    let per_batch: Vec<(u32, u32)> = batches
+                        .iter()
+                        .map(|b| {
+                            let maxf = b.frames.iter().map(|f| f.page_number).max().unwrap_or(0);
+                            let snap = b.conflict_snapshot.map_or(0, |s| s.snapshot_db_size);
+                            (snap, maxf)
+                        })
+                        .collect();
+                    let has_fresh = per_batch.iter().any(|(s, f)| *f > *s && *s > 0);
+                    if has_fresh {
+                        eprintln!(
+                            "DK9RA_O81OV EPOCH n_batches={} per_batch(snap,maxframe)={per_batch:?} xbatch_conflicts={conflicting_pages:?}",
+                            batches.len()
+                        );
+                    }
+                }
                 if !conflicting_pages.is_empty() {
                     let flush_batch_membership = physical_writer_batch_membership(&batches);
                     let flush_batch_id = physical_writer_primary_batch_id(&batches);
@@ -21534,6 +21573,7 @@ where
                     &self.inner,
                     Some(Arc::clone(&self.published)),
                     wal_current_db_size,
+                    self.original_db_size,
                     wal_sync_policy,
                     &self.write_set,
                     &self.write_pages_sorted,
@@ -22229,6 +22269,7 @@ where
                         &self.inner,
                         Some(Arc::clone(&self.published)),
                         wal_current_db_size,
+                        self.original_db_size,
                         wal_sync_policy,
                         &self.write_set,
                         &self.write_pages_sorted,
