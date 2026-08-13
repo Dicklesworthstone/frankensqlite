@@ -178812,28 +178812,21 @@ mod autocommit_txn_tests {
             Box::pin(async move { self.inner.committed_txn_count(cx).await })
         }
 
-        // bd-dk9ra: the durable-certificate publication path calls these on
-        // every retained flush; without delegation the trait default's
-        // Unsupported masks the specific failure this mock exists to inject.
+        // bd-dk9ra: the durable-certificate publication path persists the
+        // sidecar record around every retained flush; the inner
+        // WalBackendAdapter has no sidecar, so its Unsupported default would
+        // mask the injected append failure this mock exists to surface. A
+        // no-op persist cannot publish anything, which is exactly what the
+        // flush-failure tests assert.
         fn persist_parallel_wal_commit_certificate<'a>(
             &'a mut self,
-            cx: &'a Cx,
-            certificate: &'a fsqlite_wal::ParallelWalCommitCertificate,
-            wal_frame_start: u64,
-            wal_frame_end: u64,
-            sync: bool,
+            _cx: &'a Cx,
+            _certificate: &'a fsqlite_wal::ParallelWalCommitCertificate,
+            _wal_frame_start: u64,
+            _wal_frame_end: u64,
+            _sync: bool,
         ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
-            Box::pin(async move {
-                self.inner
-                    .persist_parallel_wal_commit_certificate(
-                        cx,
-                        certificate,
-                        wal_frame_start,
-                        wal_frame_end,
-                        sync,
-                    )
-                    .await
-            })
+            Box::pin(async { Ok(()) })
         }
 
         fn latest_authorized_parallel_wal_commit_certificate<'a>(
@@ -178847,6 +178840,26 @@ mod autocommit_txn_tests {
                 self.inner
                     .latest_authorized_parallel_wal_commit_certificate(cx)
                     .await
+            })
+        }
+
+        // The forced append failure means no frames or commit marker were
+        // durably written, so in-doubt reconciliation truthfully reports
+        // NotCommitted; the trait's Unsupported default would otherwise
+        // replace the injected failure this mock exists to surface.
+        fn reconcile_parallel_wal_commit<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _certificate: &'a fsqlite_wal::ParallelWalCommitCertificate,
+            _wal_frame_start: u64,
+            _wal_frame_end: u64,
+            _sync: bool,
+        ) -> fsqlite_pager::traits::WalFuture<
+            'a,
+            fsqlite_pager::traits::ParallelWalCommitReconciliation,
+        > {
+            Box::pin(async {
+                Ok(fsqlite_pager::traits::ParallelWalCommitReconciliation::NotCommitted)
             })
         }
 
