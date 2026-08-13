@@ -41881,13 +41881,23 @@ impl Connection {
     }
 
     #[inline]
-    fn retained_autocommit_peer_visibility_safe(&self) -> bool {
+    /// Whether parking an acknowledged autocommit write UNCOMMITTED (retained
+    /// batching) is contract-safe. Only `:memory:` qualifies: a memory database
+    /// has no crash-durability contract and no cross-process peers, so a parked
+    /// write can be neither lost nor hidden.
+    ///
+    /// A file-backed database must NEVER retain. Stock SQLite commits an
+    /// autocommit statement when it returns, so the write has to be durable (WAL
+    /// frames on disk, surviving `Drop`/process exit without an awaited `close`)
+    /// and visible to any peer — present OR future — the instant `execute`
+    /// returns (bd-792q5). The earlier `open_connection_count <= 1` gate only
+    /// covered present-peer visibility; it still parked single-connection
+    /// file-backed writes, which are then lost on `Drop` (which cannot await to
+    /// flush) and invisible to a peer opened after acknowledgement — no WAL
+    /// frames exist for the parked txn. `:memory:` retention (and its measured
+    /// fast path) is retained unchanged.
+    fn retained_autocommit_retention_safe(&self) -> bool {
         self.pager.is_memory()
-            || self
-                ._shared_mvcc_state
-                .open_connection_count
-                .load(AtomicOrdering::Acquire)
-                <= 1
     }
 
     /// Ensure a pager transaction is active.  If the connection is NOT
@@ -41984,7 +41994,7 @@ impl Connection {
         // keeps writes UNCOMMITTED across multiple autocommit statements.
         if mode != TransactionMode::ReadOnly
             && self.autocommit_retain_enabled.get()
-            && self.retained_autocommit_peer_visibility_safe()
+            && self.retained_autocommit_retention_safe()
             && self.retained_autocommit_txn.borrow().is_some()
         {
             // Invalidate any stale read snapshot first.
@@ -44186,7 +44196,7 @@ impl Connection {
                 && concurrent_plan.is_none()
                 && !force_immediate_autocommit_commit
                 && self.autocommit_retain_enabled.get()
-                && self.retained_autocommit_peer_visibility_safe()
+                && self.retained_autocommit_retention_safe()
                 && self.live_vtab_transactions.borrow().is_empty();
             let can_retain_private_memory_batch = self.pager.is_memory()
                 && !force_immediate_autocommit_commit
@@ -139621,17 +139631,18 @@ mod tests {
                 vec![
                     vec![SqliteValue::Integer(1), SqliteValue::Text("beta".into())],
                     vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into())],
-                ]
+                ],
+                "prepared query_for_each must observe the same-connection committed write"
             );
 
-            let profile = super::hot_path_profile_snapshot();
+            // bd-792q5: file-backed autocommit writes commit before execute
+            // returns, so there is no parked retained batch to flush before this
+            // read — the prepared query simply observes the durable committed
+            // write. (The retained overlay / read-after-write flush is now a
+            // `:memory:`-only mechanism.)
             assert!(
-                profile.retained_autocommit_read_after_write_flushes >= 1,
-                "expected read-after-write flush on file-backed prepared query, got {profile:?}"
-            );
-            assert!(
-                profile.retained_autocommit_overlay_misses >= 1,
-                "unsupported prepared read shape should register an overlay miss before flushing: {profile:?}"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit write must commit before returning, never park"
             );
         });
     }
@@ -139709,9 +139720,12 @@ mod tests {
             );
 
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_read_after_write_flushes >= 1,
-                "fallback prepared query_for_each should flush retained writes before reading: {profile:?}"
+            // bd-792q5: file-backed autocommit writes commit immediately, so the
+            // fallback prepared query_for_each observes the committed insert with
+            // no retained-batch flush (the row assertion above is the coverage).
+            assert_eq!(
+                profile.retained_autocommit_read_after_write_flushes, 0,
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
         });
     }
@@ -139752,15 +139766,15 @@ mod tests {
             )
             .await
             .unwrap();
+            // bd-792q5: file-backed autocommit writes commit immediately and never
+            // park, so no retained dirty-table set is populated.
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "expected file-backed INSERT to park a retained autocommit transaction",
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit write must commit before returning, never park",
             );
             assert!(
-                conn.retained_autocommit_dirty_tables
-                    .borrow()
-                    .contains("messages"),
-                "expected retained autocommit dirty set to include messages",
+                conn.retained_autocommit_dirty_tables.borrow().is_empty(),
+                "committed file-backed writes leave no retained dirty-table state",
             );
 
             super::reset_hot_path_profile();
@@ -139770,9 +139784,11 @@ mod tests {
                 )
                 .await;
             let profile_after_literal = super::hot_path_profile_snapshot();
-            assert!(
-                profile_after_literal.retained_autocommit_read_after_write_flushes >= 1,
-                "expected literal SELECT to trigger read-after-write flush, got {profile_after_literal:?}",
+            // bd-792q5: no parked batch to flush; the literal SELECT observes the
+            // committed write directly.
+            assert_eq!(
+                profile_after_literal.retained_autocommit_read_after_write_flushes, 0,
+                "file-backed reads never flush a retained batch (none is parked): {profile_after_literal:?}",
             );
             let literal_rows = literal_rows.unwrap();
             assert_eq!(
@@ -139789,8 +139805,8 @@ mod tests {
             .await
             .unwrap();
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "expected second INSERT to park a retained autocommit transaction before parameterized read",
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "second file-backed INSERT also commits immediately, never parks",
             );
 
             super::reset_hot_path_profile();
@@ -139802,9 +139818,9 @@ mod tests {
                 .await
                 .unwrap();
             let profile_after_param = super::hot_path_profile_snapshot();
-            assert!(
-                profile_after_param.retained_autocommit_read_after_write_flushes >= 1,
-                "expected parameterized SELECT to trigger read-after-write flush, got {profile_after_param:?}",
+            assert_eq!(
+                profile_after_param.retained_autocommit_read_after_write_flushes, 0,
+                "file-backed reads never flush a retained batch (none is parked): {profile_after_param:?}",
             );
             assert_eq!(
                 parameterized_rows.len(),
@@ -139838,9 +139854,10 @@ mod tests {
             conn.execute("INSERT INTO nested_messages VALUES (1, 'derived');")
                 .await
                 .unwrap();
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "expected file-backed INSERT to park a retained autocommit transaction",
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit write must commit before returning, never park",
             );
 
             super::reset_hot_path_profile();
@@ -139853,13 +139870,15 @@ mod tests {
                 .await
                 .unwrap();
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_read_after_write_flushes >= 1,
-                "derived-table SELECT should trigger a retained-batch flush: {profile:?}",
+            // bd-792q5: no parked batch; the derived-table SELECT observes the
+            // committed write directly with no read-after-write flush.
+            assert_eq!(
+                profile.retained_autocommit_read_after_write_flushes, 0,
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}",
             );
             assert!(
                 conn.retained_autocommit_txn.borrow().is_none(),
-                "derived-table read should flush the retained autocommit batch",
+                "file-backed read observes committed data; no retained txn is parked",
             );
             assert_eq!(
                 rows.iter().map(row_values).collect::<Vec<_>>(),
@@ -139906,9 +139925,10 @@ mod tests {
             conn.execute("INSERT INTO cte_messages VALUES (1, 'cte');")
                 .await
                 .unwrap();
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "expected file-backed INSERT to park a retained autocommit transaction",
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit write must commit before returning, never park",
             );
 
             super::reset_hot_path_profile();
@@ -139917,17 +139937,15 @@ mod tests {
                 .await
                 .unwrap();
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_read_after_write_flushes >= 1,
-                "prepared CTE SELECT should trigger a retained-batch flush: {profile:?}",
-            );
-            assert!(
-                profile.retained_autocommit_overlay_misses >= 1,
-                "prepared CTE SELECT should register an unsupported overlay miss before flushing: {profile:?}",
+            // bd-792q5: no parked batch and no retained overlay on file-backed now;
+            // the prepared CTE SELECT observes the committed write directly.
+            assert_eq!(
+                profile.retained_autocommit_read_after_write_flushes, 0,
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}",
             );
             assert!(
                 conn.retained_autocommit_txn.borrow().is_none(),
-                "prepared CTE read should flush the retained autocommit batch",
+                "file-backed read observes committed data; no retained txn is parked",
             );
             assert_eq!(
                 row.values(),
@@ -139963,7 +139981,8 @@ mod tests {
             conn.execute("INSERT INTO overlay_lookup VALUES (1, 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             super::reset_hot_path_profile();
             let row = stmt
@@ -139976,17 +139995,16 @@ mod tests {
             );
 
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for point lookup: {profile:?}"
-            );
+            // bd-792q5: the retained overlay is a `:memory:`-only optimization now.
+            // File-backed reads observe durable committed data directly, so no
+            // retained batch is parked and none is flushed on read.
             assert_eq!(
                 profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay read should keep the retained autocommit transaction parked"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed read observes committed data; no retained txn is parked"
             );
         });
     }
@@ -140019,7 +140037,8 @@ mod tests {
             conn.execute("INSERT INTO overlay_projected_lookup VALUES (1, 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             super::reset_hot_path_profile();
             let row = stmt
@@ -140029,17 +140048,15 @@ mod tests {
             assert_eq!(row.values(), &[SqliteValue::Integer(11)]);
 
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for projected point lookup: {profile:?}"
-            );
+            // bd-792q5: retained overlay is `:memory:`-only now; file-backed reads
+            // observe durable committed data with no parked batch to flush.
             assert_eq!(
                 profile.retained_autocommit_read_after_write_flushes, 0,
-                "projected overlay hit should avoid read-after-write flush: {profile:?}"
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "projected overlay read should keep the retained autocommit transaction parked"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed read observes committed data; no retained txn is parked"
             );
         });
     }
@@ -140354,7 +140371,8 @@ mod tests {
             conn.execute("INSERT INTO overlay_projected_indexed VALUES (1, 'beta', 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             super::reset_hot_path_profile();
             let row = stmt
@@ -140364,17 +140382,15 @@ mod tests {
             assert_eq!(row.values(), &[SqliteValue::Integer(11)]);
 
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for projected indexed equality: {profile:?}"
-            );
+            // bd-792q5: retained overlay is `:memory:`-only now; file-backed reads
+            // observe durable committed data with no parked batch to flush.
             assert_eq!(
                 profile.retained_autocommit_read_after_write_flushes, 0,
-                "projected indexed equality overlay hit should avoid read-after-write flush: {profile:?}"
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "projected indexed equality overlay read should keep the retained autocommit transaction parked"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed read observes committed data; no retained txn is parked"
             );
         });
     }
@@ -140414,7 +140430,8 @@ mod tests {
             conn.execute("INSERT INTO overlay_indexed_cache VALUES (1, 'beta', 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             let beta_param = [SqliteValue::Text("beta".into())];
             let rows = stmt.query_with_params(&beta_param).await.unwrap();
@@ -140427,11 +140444,14 @@ mod tests {
                     SqliteValue::Integer(11),
                 ]
             );
+            // bd-792q5: the retained indexed-equality overlay cache is a
+            // `:memory:`-only optimization now; on file-backed the read observes
+            // durable committed data directly and seeds no overlay cache.
             assert!(
                 conn.retained_autocommit_indexed_equality_cache
                     .borrow()
-                    .is_some(),
-                "first retained indexed-equality read should seed the exact-shape cache"
+                    .is_none(),
+                "file-backed indexed-equality read seeds no retained overlay cache"
             );
 
             let cached_rows = stmt.query_with_params(&beta_param).await.unwrap();
@@ -140444,7 +140464,7 @@ mod tests {
                 conn.retained_autocommit_indexed_equality_cache
                     .borrow()
                     .is_none(),
-                "a retained write must clear indexed-equality cache rows before they can go stale"
+                "no retained overlay cache exists on file-backed to invalidate"
             );
 
             let gamma_rows = stmt
@@ -140453,9 +140473,11 @@ mod tests {
                 .unwrap();
             assert_eq!(gamma_rows.len(), 1);
             assert_eq!(gamma_rows[0].values()[0], SqliteValue::Integer(2));
+            // The second read across an intervening write still returns correct
+            // committed data — the essential read-after-write coverage.
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "cached overlay reads and invalidating writes should keep the retained batch parked"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed reads and writes never park a retained txn"
             );
         });
     }
@@ -140493,7 +140515,8 @@ mod tests {
             conn.execute("INSERT INTO overlay_indexed_null VALUES (1, NULL, 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             super::reset_hot_path_profile();
             let error = stmt
@@ -140503,17 +140526,16 @@ mod tests {
             assert!(matches!(error, FrankenError::QueryReturnedNoRows));
 
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for NULL indexed equality: {profile:?}"
-            );
+            // bd-792q5: retained overlay is `:memory:`-only now; file-backed reads
+            // observe durable committed data with no parked batch to flush. NULL
+            // equality still matches nothing (asserted above).
             assert_eq!(
                 profile.retained_autocommit_read_after_write_flushes, 0,
-                "NULL equality overlay result should avoid read-after-write flush: {profile:?}"
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "NULL equality overlay read should keep the retained autocommit transaction parked"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed read observes committed data; no retained txn is parked"
             );
         });
     }
@@ -140548,7 +140570,8 @@ mod tests {
             conn.execute("INSERT INTO overlay_range VALUES (3, 'c');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             super::reset_hot_path_profile();
             let rows = stmt
@@ -140565,17 +140588,15 @@ mod tests {
             );
 
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for rowid range scan: {profile:?}"
-            );
+            // bd-792q5: retained overlay is `:memory:`-only now; file-backed reads
+            // observe durable committed data with no parked batch to flush.
             assert_eq!(
                 profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay scan should keep the retained autocommit transaction parked"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed read observes committed data; no retained txn is parked"
             );
         });
     }
@@ -140612,7 +140633,8 @@ mod tests {
             conn.execute("INSERT INTO overlay_count_range VALUES (3, 'c');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             super::reset_hot_path_profile();
             let row = stmt
@@ -140622,17 +140644,15 @@ mod tests {
             assert_eq!(row.get(0), Some(&SqliteValue::Integer(2)));
 
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for count range query: {profile:?}"
-            );
+            // bd-792q5: retained overlay is `:memory:`-only now; file-backed reads
+            // observe durable committed data with no parked batch to flush.
             assert_eq!(
                 profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay count query should keep the retained autocommit transaction parked"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed read observes committed data; no retained txn is parked"
             );
         });
     }
@@ -140669,24 +140689,23 @@ mod tests {
             conn.execute("INSERT INTO overlay_count_star VALUES (3, 'c');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             super::reset_hot_path_profile();
             let row = stmt.query_row().await.unwrap();
             assert_eq!(row.get(0), Some(&SqliteValue::Integer(3)));
 
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for count(*) query: {profile:?}"
-            );
+            // bd-792q5: retained overlay is `:memory:`-only now; file-backed reads
+            // observe durable committed data with no parked batch to flush.
             assert_eq!(
                 profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay count(*) query should keep the retained autocommit transaction parked"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed read observes committed data; no retained txn is parked"
             );
         });
     }
@@ -140726,7 +140745,8 @@ mod tests {
             conn.execute("UPDATE overlay_sum SET score = 25 WHERE id = 2;")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             super::reset_hot_path_profile();
             let row = stmt.query_row().await.unwrap();
@@ -140736,17 +140756,15 @@ mod tests {
             );
 
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for count+sum aggregate: {profile:?}"
-            );
+            // bd-792q5: retained overlay is `:memory:`-only now; file-backed reads
+            // observe durable committed data with no parked batch to flush.
             assert_eq!(
                 profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay aggregate query should keep the retained autocommit transaction parked"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed read observes committed data; no retained txn is parked"
             );
         });
     }
@@ -140783,33 +140801,34 @@ mod tests {
             conn.execute("INSERT INTO overlay_sum_mixed VALUES (3, 20);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             super::reset_hot_path_profile();
-            let overlay_row = stmt.query_row().await.unwrap();
+            let committed_row = stmt.query_row().await.unwrap();
 
             let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for count+sum fallback query: {profile:?}"
-            );
+            // bd-792q5: retained overlay is `:memory:`-only now; on file-backed the
+            // count+sum read observes durable committed data with no parked batch.
             assert_eq!(
                 profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
 
+            // The read-for-read flush is a no-op with nothing parked, and a second
+            // read returns the same committed count+sum result.
             let cx = conn.op_cx().unwrap();
             conn.flush_retained_autocommit_txn_for_read(&cx)
                 .await
                 .unwrap();
 
-            let flushed_row = stmt.query_row().await.unwrap();
+            let reread_row = stmt.query_row().await.unwrap();
             assert_eq!(
-                overlay_row.values(),
-                flushed_row.values(),
-                "overlay count+sum fallback must match the flushed statement result"
+                committed_row.values(),
+                reread_row.values(),
+                "committed count+sum result must be stable across re-reads"
             );
-            assert_eq!(overlay_row.get(0), Some(&SqliteValue::Integer(3)));
+            assert_eq!(committed_row.get(0), Some(&SqliteValue::Integer(3)));
         });
     }
 
@@ -167666,9 +167685,11 @@ mod tests {
             conn.execute("INSERT INTO pragma_retain_toggle VALUES (1, 'alpha');")
                 .await
                 .unwrap();
+            // bd-792q5: file-backed autocommit writes commit immediately regardless
+            // of the retain toggle, so no retained txn is parked before the toggle.
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "file-backed write should park retained autocommit before toggle"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit write commits before returning, never parks"
             );
 
             conn.execute("PRAGMA fsqlite.autocommit_retain = OFF;")
@@ -167677,7 +167698,7 @@ mod tests {
             assert!(!conn.autocommit_retain_enabled.get());
             assert!(
                 conn.retained_autocommit_txn.borrow().is_none(),
-                "disabling retain should flush any parked retained autocommit txn"
+                "disabling retain leaves no parked retained autocommit txn"
             );
 
             let rows = conn
@@ -180847,11 +180868,13 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
             conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            // bd-792q5: a file-backed autocommit write is committed before
+            // execute returns — never parked — so it is already durable here.
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "first file-backed autocommit write should park a retained txn"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit must commit before returning, never park"
             );
-            assert_eq!(conn.retained_autocommit_stmt_count.get(), 1);
+            assert_eq!(conn.retained_autocommit_stmt_count.get(), 0);
 
             let err = conn
                 .execute("INSERT INTO t VALUES (1)")
@@ -180904,40 +180927,29 @@ mod autocommit_txn_tests {
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
                 .await
                 .unwrap();
-            // bd-dk9ra triage: install the failing backend BEFORE the write
-            // parks a retained txn — the durable-certificate publication
-            // stack's set_wal_backend needs the exclusive maintenance lease
-            // that a parked retained txn holds. Parking appends nothing to
-            // the WAL (the checkpoint-failure sibling proves the pattern),
-            // so every assertion below is unchanged.
+            // bd-792q5: a file-backed autocommit write commits before execute
+            // returns and is never parked, so the injected WAL append failure
+            // now fails the write's IMMEDIATE commit — there is no deferred
+            // retained-batch flush to fail. Install the failing backend after
+            // CREATE TABLE (whose frames the real backend durably committed) and
+            // before the failing write.
             install_failing_retained_flush_wal_backend(&conn).await;
-
-            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "first file-backed autocommit write should park a retained txn"
-            );
 
             let error = conn
                 .execute("INSERT INTO t VALUES (1)")
                 .await
-                .expect_err("flush failure must override the primary statement error");
+                .expect_err("failing WAL append must fail the immediate autocommit commit");
             assert!(
                 error
                     .to_string()
                     .contains("forced retained autocommit flush failure"),
-                "expected retained flush failure to surface, got {error}"
+                "expected the injected append failure to surface, got {error}"
             );
             assert!(
                 conn.retained_autocommit_txn.borrow().is_none(),
-                "failed retained flush must clear the parked batch"
+                "a failed immediate commit leaves no parked retained batch"
             );
             assert!(conn.active_txn.borrow().is_none());
-            let same_connection_rows = conn.query("SELECT id FROM t ORDER BY id").await.unwrap();
-            assert!(
-                same_connection_rows.is_empty(),
-                "failed retained flush must also restore the current connection's execution image"
-            );
 
             let reopened = Connection::open(&db_str).await.unwrap();
             let rows = reopened
@@ -180946,7 +180958,7 @@ mod autocommit_txn_tests {
                 .unwrap();
             assert!(
                 rows.is_empty(),
-                "forced append failure must not publish the retained batch"
+                "the forced append failure must not publish the write"
             );
         });
     }
@@ -180969,39 +180981,30 @@ mod autocommit_txn_tests {
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
                 .await
                 .unwrap();
-            // bd-dk9ra triage: install before parking — see the
-            // statement-error sibling for why (maintenance-lease conflict
-            // with the durable-certificate publication stack).
+            // bd-792q5: this test previously drove the flush failure through a
+            // read-only mode-change boundary that flushed a parked retained
+            // batch. File-backed autocommit writes now commit before execute
+            // returns and never park, so the injected WAL append failure fails
+            // the write's IMMEDIATE commit instead. Install after CREATE TABLE,
+            // before the failing write.
             install_failing_retained_flush_wal_backend(&conn).await;
 
-            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "first file-backed autocommit write should park a retained txn"
-            );
-
-            let cx = conn.op_cx().unwrap();
             let error = conn
-                .ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, &cx, None)
+                .execute("INSERT INTO t VALUES (1)")
                 .await
-                .expect_err("mode change should fail if the retained batch cannot flush");
+                .expect_err("failing WAL append must fail the immediate autocommit commit");
             assert!(
                 error
                     .to_string()
                     .contains("forced retained autocommit flush failure"),
-                "expected retained flush failure to surface, got {error}"
+                "expected the injected append failure to surface, got {error}"
             );
             assert!(
                 conn.retained_autocommit_txn.borrow().is_none(),
-                "failed retained flush must clear the parked batch"
+                "a failed immediate commit leaves no parked retained batch"
             );
             assert!(conn.active_txn.borrow().is_none());
             assert!(conn.cached_read_snapshot.borrow().is_none());
-            let same_connection_rows = conn.query("SELECT id FROM t ORDER BY id").await.unwrap();
-            assert!(
-                same_connection_rows.is_empty(),
-                "failed retained flush must also restore the current connection's execution image"
-            );
 
             let reopened = Connection::open(&db_str).await.unwrap();
             let rows_after_failure = reopened
@@ -181010,7 +181013,7 @@ mod autocommit_txn_tests {
                 .unwrap();
             assert!(
                 rows_after_failure.is_empty(),
-                "failed retained flush must not publish the parked batch"
+                "the forced append failure must not publish the write"
             );
         });
     }
@@ -181036,18 +181039,27 @@ mod autocommit_txn_tests {
             )
             .await;
 
-            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            // bd-792q5: the write commits immediately — only checkpoints fail on
+            // this backend, so its append succeeds and the row is durable before
+            // any checkpoint runs. There is no parked retained batch.
+            conn.execute("INSERT INTO t VALUES (1)")
+                .await
+                .expect("immediate autocommit commit must succeed; only checkpoints fail");
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "the write must be parked before the read boundary flush"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit write must commit before returning, never park"
             );
 
-            let rows = conn.query("SELECT id FROM t ORDER BY id").await.expect(
-                "durable commit must not become a statement error when passive checkpoint is busy",
-            );
+            let rows = conn.query("SELECT id FROM t ORDER BY id").await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
-            assert!(conn.retained_autocommit_txn.borrow().is_none());
+
+            // The post-commit passive checkpoint now runs at close(). A transient
+            // (Busy) checkpoint failure is swallowed — the durable WAL commit
+            // remains authoritative and close() itself still succeeds.
+            conn.close()
+                .await
+                .expect("transient close-time checkpoint failure must not fail close");
 
             let oracle = rusqlite::Connection::open(&db_path).unwrap();
             let durable_count: i64 = oracle
@@ -181083,47 +181095,53 @@ mod autocommit_txn_tests {
             )
             .await;
 
-            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            // bd-792q5: the write commits immediately (its append succeeds) and is
+            // durable before any checkpoint runs; nothing is parked.
+            conn.execute("INSERT INTO t VALUES (1)")
+                .await
+                .expect("immediate autocommit commit must succeed; only checkpoints fail");
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "the write must be parked before the read boundary flush"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit write must commit before returning, never park"
             );
 
+            // The write is durable before the post-commit checkpoint runs.
+            {
+                let oracle = rusqlite::Connection::open(&db_path).unwrap();
+                let durable_count: i64 = oracle
+                    .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    durable_count, 1,
+                    "the propagated checkpoint failure must still follow a durable WAL commit"
+                );
+            }
+
+            // The post-commit passive checkpoint now runs at close(). A
+            // non-transient (Internal) checkpoint failure propagates as an error
+            // rather than being swallowed.
             let error = conn
-                .query("SELECT id FROM t ORDER BY id")
+                .close()
                 .await
-                .expect_err("non-transient checkpoint failure must remain visible");
+                .expect_err("non-transient close-time checkpoint failure must surface");
             assert!(
                 error
                     .to_string()
                     .contains("forced retained autocommit checkpoint failure"),
                 "expected injected non-transient checkpoint failure, got {error}"
             );
-            assert!(conn.retained_autocommit_txn.borrow().is_none());
-
-            let oracle = rusqlite::Connection::open(&db_path).unwrap();
-            let durable_count: i64 = oracle
-                .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(
-                durable_count, 1,
-                "the propagated checkpoint failure must still follow a durable WAL commit"
-            );
         });
     }
 
     #[test]
-    fn test_retained_autocommit_basic_100_pure_writes_reuse_single_batch() {
+    fn test_memory_retained_autocommit_basic_100_pure_writes_reuse_single_batch() {
         asupersync::test_utils::run_test(|| async {
+            // bd-792q5: retained-autocommit batching is now a `:memory:`-only
+            // mechanism — file-backed autocommit writes commit immediately and
+            // never park. This exercises the park/reuse batching machinery on
+            // the only backend where retention is contract-safe.
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_batch_reuse.db");
-            let db_str = db_path.to_string_lossy().into_owned();
-
-            let conn = Connection::open(&db_str).await.unwrap();
-            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
-                .await
-                .unwrap();
+            let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE batch_reuse (id INTEGER PRIMARY KEY, val TEXT NOT NULL);")
                 .await
                 .unwrap();
@@ -181207,34 +181225,69 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_filebacked_single_connection_preserves_retained_autocommit_fast_path() {
+    fn test_filebacked_single_connection_autocommit_is_durable_and_visible_to_future_peer() {
         asupersync::test_utils::run_test(|| async {
-            let _profile_guard = StatementReuseHotPathProfileGuard::new();
+            let _serial = super::fsqlite_core_test_serializer();
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("retained_autocommit_single_connection.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
-            let conn = Connection::open(&db_str).await.unwrap();
-            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+            let writer = Connection::open(&db_str).await.unwrap();
+            writer
+                .execute("PRAGMA fsqlite.concurrent_mode = OFF;")
                 .await
                 .unwrap();
-            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            writer
+                .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
                 .await
                 .unwrap();
 
-            reset_hot_path_profile();
-            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
-            let profile = hot_path_profile_snapshot();
+            // A lone file-backed connection, no peer open at write time.
+            writer
+                .execute("INSERT INTO t VALUES (1, 'acknowledged')")
+                .await
+                .expect("autocommit INSERT should succeed");
 
+            // Contract (bd-792q5): a file-backed autocommit statement is
+            // committed before execute returns — it must NOT be parked
+            // uncommitted, even for a single connection. A parked write is lost
+            // on Drop (which cannot await to flush) and hidden from a peer opened
+            // after acknowledgement (no WAL frames exist for it).
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "one file-backed connection should keep the retained-autocommit fast path"
+                writer.retained_autocommit_txn.borrow().is_none(),
+                "a file-backed autocommit write must be committed before execute returns, never parked"
             );
-            assert_eq!(conn.retained_autocommit_stmt_count.get(), 1);
-            assert_eq!(profile.retained_autocommit_parks, 1, "{profile:?}");
-            assert_eq!(profile.retained_autocommit_flushes, 0, "{profile:?}");
 
-            conn.close().await.unwrap();
+            // Visible to a peer opened AFTER acknowledgement, with no further
+            // action or close on the writer (criterion 1: future-peer).
+            let future_peer = Connection::open(&db_str).await.unwrap();
+            let rows = future_peer
+                .query("SELECT id, value FROM t ORDER BY id")
+                .await
+                .expect("a peer opened after the write should observe it");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+            assert_eq!(
+                rows[0].get(1),
+                Some(&SqliteValue::Text("acknowledged".into()))
+            );
+            future_peer.close().await.unwrap();
+
+            // Durable across writer Drop WITHOUT an awaited close, then reopen
+            // (criterion 3: close is not a hidden durability precondition).
+            drop(writer);
+            let reopened = Connection::open(&db_str).await.unwrap();
+            let rows = reopened
+                .query("SELECT id, value FROM t ORDER BY id")
+                .await
+                .expect("the acknowledged write must survive Drop + reopen without close");
+            assert_eq!(
+                rows.len(),
+                1,
+                "acknowledged file-backed autocommit write lost after Drop + reopen"
+            );
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+            reopened.close().await.unwrap();
         });
     }
 
@@ -181291,9 +181344,11 @@ mod autocommit_txn_tests {
                     SqliteValue::Text(o_insert_row.1.into())
                 ]
             );
+            // bd-792q5: the file-backed INSERT committed before execute returned,
+            // so the point lookup reads durable committed state — nothing parked.
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "point lookup after INSERT should not flush away the retained batch"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit write must commit before returning, never park"
             );
 
             conn.execute("UPDATE rw SET val = 'beta' WHERE id = 1;")
@@ -181320,8 +181375,8 @@ mod autocommit_txn_tests {
                 ]
             );
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "point lookup after UPDATE should keep the retained batch parked"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit UPDATE must commit before returning, never park"
             );
 
             conn.execute("DELETE FROM rw WHERE id = 1;").await.unwrap();
@@ -181338,18 +181393,19 @@ mod autocommit_txn_tests {
                 .unwrap();
             assert_eq!(i64::try_from(f_delete_rows.len()).unwrap(), o_delete_count);
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "prepared rowid lookup after DELETE should continue reading from the retained batch"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit DELETE must commit before returning, never park"
             );
 
             let profile = hot_path_profile_snapshot();
+            // bd-792q5: file-backed autocommit writes commit immediately, so no
+            // retained batch is ever parked and none is flushed on read. The
+            // read-after-write overlay is a `:memory:`-only optimization now; the
+            // point of this test is that file-backed read-after-write results
+            // match the rusqlite oracle (asserted above), which they still do.
             assert_eq!(
                 profile.retained_autocommit_read_after_write_flushes, 0,
-                "same-row lookups should stay on the retained overlay path: {profile:?}"
-            );
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 3,
-                "INSERT/UPDATE/DELETE read-after-write sequence should hit the retained overlay for each read: {profile:?}"
+                "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
         });
     }
@@ -181373,9 +181429,12 @@ mod autocommit_txn_tests {
             conn.execute("INSERT INTO begin_flush VALUES (1, 'autocommit');")
                 .await
                 .unwrap();
+            // bd-792q5: a file-backed autocommit write commits before execute
+            // returns — never parked — so it is durable and visible to any peer
+            // immediately, without waiting for the BEGIN boundary.
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "file-backed autocommit write should park a retained txn before BEGIN"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit write must commit before returning, never park"
             );
 
             {
@@ -181384,21 +181443,15 @@ mod autocommit_txn_tests {
                     .query_row("SELECT COUNT(*) FROM begin_flush;", [], |row| row.get(0))
                     .unwrap();
                 assert_eq!(
-                    count_before_begin, 0,
-                    "unflushed retained autocommit writes must stay invisible to external readers"
+                    count_before_begin, 1,
+                    "an acknowledged file-backed autocommit write is visible to external readers immediately"
                 );
             }
 
-            reset_hot_path_profile();
             conn.execute("BEGIN;").await.unwrap();
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_flushes >= 1,
-                "BEGIN should flush the parked retained autocommit batch first: {profile:?}"
-            );
             assert!(
                 conn.retained_autocommit_txn.borrow().is_none(),
-                "explicit BEGIN should consume the parked retained autocommit txn"
+                "explicit BEGIN must not find (or create) a parked retained autocommit txn"
             );
 
             {
@@ -181408,7 +181461,7 @@ mod autocommit_txn_tests {
                     .unwrap();
                 assert_eq!(
                     count_after_begin, 1,
-                    "BEGIN should flush the retained batch so prior writes become durable"
+                    "the prior autocommit write remains durably visible after BEGIN"
                 );
             }
 
@@ -181482,21 +181535,22 @@ mod autocommit_txn_tests {
                     .unwrap();
             }
 
+            // bd-792q5: each file-backed autocommit write committed before its
+            // execute returned, so nothing is parked awaiting the COMMIT boundary.
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "autocommit writes should be parked before the explicit COMMIT boundary"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit writes commit before returning, never park before COMMIT"
             );
             let sqlite_before_commit = rusqlite::Connection::open(&db_path).unwrap();
             let count_before_commit: i64 = sqlite_before_commit
                 .query_row("SELECT COUNT(*) FROM commit_flush;", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(
-                count_before_commit, 0,
-                "parked retained writes stay invisible to external readers until a boundary flush"
+                count_before_commit, 3,
+                "acknowledged file-backed autocommit writes are durably visible to external readers immediately"
             );
             drop(sqlite_before_commit);
 
-            reset_hot_path_profile();
             let fsqlite_commit = conn.execute("COMMIT;").await;
             let sqlite_commit = oracle.execute("COMMIT;", []);
             assert!(sqlite_commit.is_err());
@@ -181509,14 +181563,9 @@ mod autocommit_txn_tests {
                 "expected SQLite-compatible no-active-transaction error, got {error}"
             );
 
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_flushes >= 1,
-                "COMMIT should flush the parked retained-autocommit batch before returning the no-active-transaction error: {profile:?}"
-            );
             assert!(
                 conn.retained_autocommit_txn.borrow().is_none(),
-                "COMMIT boundary should consume the parked retained-autocommit txn"
+                "a bare COMMIT boundary leaves no parked retained-autocommit txn"
             );
 
             let mut oracle_stmt = oracle
@@ -181582,9 +181631,11 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
 
+            // bd-792q5: a file-backed autocommit write commits before execute
+            // returns — never parked — so close() is not a durability precondition.
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "file-backed autocommit write should park a retained txn before close"
+                conn.retained_autocommit_txn.borrow().is_none(),
+                "file-backed autocommit write must commit before returning, never park"
             );
 
             let sqlite_before_close = rusqlite::Connection::open(&db_path).unwrap();
@@ -181592,8 +181643,8 @@ mod autocommit_txn_tests {
                 .query_row("SELECT COUNT(*) FROM close_flush;", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(
-                count_before_close, 0,
-                "pending retained-autocommit writes must stay invisible before close flushes them"
+                count_before_close, 1,
+                "the acknowledged autocommit write is durably visible to external readers before close"
             );
             drop(sqlite_before_close);
 
@@ -181613,16 +181664,12 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_adaptive_flush_pure_writes_stays_high() {
+    fn test_memory_retained_autocommit_adaptive_flush_pure_writes_stays_high() {
         asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_adaptive_pure.db");
-            let db_str = db_path.to_string_lossy().into_owned();
-
-            let conn = Connection::open(&db_str).await.unwrap();
-            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
-                .await
-                .unwrap();
+            // bd-792q5: retained-autocommit batching (and its adaptive flush
+            // threshold) now lives only on `:memory:`; file-backed autocommit
+            // writes commit immediately and never park.
+            let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE adaptive_pure (id INTEGER PRIMARY KEY, val TEXT NOT NULL);")
                 .await
                 .unwrap();
@@ -181646,16 +181693,12 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_adaptive_flush_mixed_workload_drops_to_16() {
+    fn test_memory_retained_autocommit_adaptive_flush_mixed_workload_drops_to_16() {
         asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_adaptive_mixed.db");
-            let db_str = db_path.to_string_lossy().into_owned();
-
-            let conn = Connection::open(&db_str).await.unwrap();
-            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
-                .await
-                .unwrap();
+            // bd-792q5: retained-autocommit batching (and the read-after-write
+            // overlay that drops the adaptive threshold) now lives only on
+            // `:memory:`; file-backed autocommit writes commit immediately.
+            let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
                 "CREATE TABLE adaptive_mixed (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
             )
@@ -181707,7 +181750,8 @@ mod autocommit_txn_tests {
             conn.execute("INSERT INTO savepoint_flush VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: file-backed autocommit writes commit immediately, never park.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             let sqlite_before = rusqlite::Connection::open(&db_path).unwrap();
             let count_before: i64 = sqlite_before
@@ -181715,7 +181759,7 @@ mod autocommit_txn_tests {
                     row.get(0)
                 })
                 .unwrap();
-            assert_eq!(count_before, 0);
+            assert_eq!(count_before, 1);
             drop(sqlite_before);
 
             conn.execute("SAVEPOINT retained_sp;").await.unwrap();
@@ -181751,11 +181795,13 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
 
+            // bd-792q5: the file-backed autocommit write is already committed and
+            // visible to external readers before the PRAGMA boundary.
             let sqlite_before = rusqlite::Connection::open(&db_path).unwrap();
             let count_before: i64 = sqlite_before
                 .query_row("SELECT COUNT(*) FROM pragma_flush;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count_before, 0);
+            assert_eq!(count_before, 1);
             drop(sqlite_before);
 
             let pragma_rows = conn
@@ -181829,13 +181875,15 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
 
+            // bd-792q5: the file-backed autocommit write is already committed and
+            // visible to external readers before the journal-mode PRAGMA boundary.
             let sqlite_before = rusqlite::Connection::open(&db_path).unwrap();
             let count_before: i64 = sqlite_before
                 .query_row("SELECT COUNT(*) FROM pragma_journal_flush;", [], |row| {
                     row.get(0)
                 })
                 .unwrap();
-            assert_eq!(count_before, 0);
+            assert_eq!(count_before, 1);
             drop(sqlite_before);
 
             let rows = conn.query("PRAGMA journal_mode='delete';").await.unwrap();
@@ -181880,11 +181928,13 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
 
+            // bd-792q5: the file-backed autocommit write is already committed and
+            // visible to external readers before the schema-change boundary.
             let sqlite_before = rusqlite::Connection::open(&db_path).unwrap();
             let count_before: i64 = sqlite_before
                 .query_row("SELECT COUNT(*) FROM schema_flush;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count_before, 0);
+            assert_eq!(count_before, 1);
             drop(sqlite_before);
 
             conn.execute(
@@ -181894,7 +181944,7 @@ mod autocommit_txn_tests {
             .unwrap();
             assert!(
                 conn.retained_autocommit_txn.borrow().is_none(),
-                "CREATE TABLE should flush the parked retained autocommit batch first"
+                "the prior autocommit write already committed; the schema change parks nothing"
             );
 
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -181942,11 +181992,13 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
 
+            // bd-792q5: the file-backed autocommit write is committed and visible
+            // to external readers immediately, before the ATTACH boundary.
             let sqlite_before_attach = rusqlite::Connection::open(&db_path).unwrap();
             let count_before_attach: i64 = sqlite_before_attach
                 .query_row("SELECT COUNT(*) FROM attach_flush;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count_before_attach, 0);
+            assert_eq!(count_before_attach, 1);
             drop(sqlite_before_attach);
 
             conn.execute("ATTACH DATABASE ':memory:' AS aux;")
@@ -181964,13 +182016,14 @@ mod autocommit_txn_tests {
             conn.execute("INSERT INTO attach_flush VALUES (2, 'before_detach');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: this second write also commits immediately, never parks.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             let sqlite_before_detach = rusqlite::Connection::open(&db_path).unwrap();
             let count_before_detach: i64 = sqlite_before_detach
                 .query_row("SELECT COUNT(*) FROM attach_flush;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count_before_detach, 1);
+            assert_eq!(count_before_detach, 2);
             drop(sqlite_before_detach);
 
             conn.execute("DETACH DATABASE aux;").await.unwrap();
@@ -182002,11 +182055,13 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
 
+            // bd-792q5: the file-backed autocommit write is already committed and
+            // visible to external readers before the VACUUM boundary.
             let sqlite_before = rusqlite::Connection::open(&db_path).unwrap();
             let count_before: i64 = sqlite_before
                 .query_row("SELECT COUNT(*) FROM vacuum_flush;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count_before, 0);
+            assert_eq!(count_before, 1);
             drop(sqlite_before);
 
             conn.execute("VACUUM;").await.unwrap();
