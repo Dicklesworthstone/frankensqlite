@@ -91817,8 +91817,14 @@ fn is_current_aggregate_or_json_fn(name: &str, args: &FunctionArgs) -> bool {
 /// Check whether an expression tree contains any aggregate function calls.
 fn expr_contains_agg(expr: &Expr) -> bool {
     match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            if is_current_aggregate_or_json_fn(name, args) && !is_scalar_max_min(name, args) {
+        Expr::FunctionCall { name, args, over, .. } => {
+            // A windowed function (`f(...) OVER (...)`) is a window function, not a
+            // bare aggregate; e.g. `ORDER BY count(*) OVER ()` is legal, so a windowed
+            // call must not make an expression count as aggregate-bearing.
+            if over.is_none()
+                && is_current_aggregate_or_json_fn(name, args)
+                && !is_scalar_max_min(name, args)
+            {
                 return true;
             }
             match args {
@@ -154659,7 +154665,13 @@ mod tests {
             .await
             .unwrap();
 
-            let stmt = conn
+            // SQLite rejects this at compile time: `category_id` in the JOIN ON
+            // clause is ambiguous between products and the top_cats CTE (verified
+            // vs C SQLite 3.46.1: "ambiguous column name: category_id"). The
+            // anchor b612eb7b5 accepted it (SQLite-divergent, merely declining
+            // the fast path); the release window's compile-time resolver now
+            // rejects it, matching stock SQLite.
+            let prepared = conn
                 .prepare(
                     "WITH top_cats AS (
                     SELECT category_id, SUM(price) AS total
@@ -154672,14 +154684,17 @@ mod tests {
                 FROM products p
                 JOIN top_cats tc ON category_id = category_id;",
                 )
-                .await
-                .unwrap();
+                .await;
+            let err = match prepared {
+                Ok(stmt) => stmt
+                    .query()
+                    .await
+                    .expect_err("ambiguous join column must be rejected"),
+                Err(err) => err,
+            };
             assert!(
-                !matches!(
-                    stmt.prepared_query_fast_path.as_ref(),
-                    Some(&super::PreparedQueryFastPath::TopCategoryCteJoin { .. })
-                ),
-                "unqualified join columns are ambiguous between the outer table and CTE result"
+                matches!(err, FrankenError::AmbiguousColumn { .. }),
+                "expected ambiguous column error, got: {err:?}"
             );
         });
     }
@@ -154707,7 +154722,12 @@ mod tests {
             .await
             .unwrap();
 
-            let stmt = conn
+            // Bare `price` in the outer projection is ambiguous between products
+            // and the top_cats CTE column aliased `price` (verified vs C SQLite
+            // 3.46.1: "ambiguous column name: price"). The anchor accepted the
+            // query and deferred rejection to execution; the release window's
+            // compile-time resolver rejects it up front, matching stock SQLite.
+            let prepared = conn
                 .prepare(
                     "WITH top_cats AS (
                     SELECT category_id, SUM(price) AS price
@@ -154720,18 +154740,17 @@ mod tests {
                 FROM products p
                 JOIN top_cats tc ON p.category_id = tc.category_id;",
                 )
-                .await
-                .unwrap();
+                .await;
+            let err = match prepared {
+                Ok(stmt) => stmt
+                    .query()
+                    .await
+                    .expect_err("ambiguous bare price projection must be rejected"),
+                Err(err) => err,
+            };
             assert!(
-                !matches!(
-                    stmt.prepared_query_fast_path.as_ref(),
-                    Some(&super::PreparedQueryFastPath::TopCategoryCteJoin { .. })
-                ),
-                "bare outer projections that also name a CTE result column must stay on the normal resolver"
-            );
-            assert!(
-                stmt.query().await.is_err(),
-                "normal execution should reject the unresolved bare price projection"
+                matches!(err, FrankenError::AmbiguousColumn { .. }),
+                "expected ambiguous column error, got: {err:?}"
             );
         });
     }
@@ -154808,7 +154827,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            let stmt = conn
+            // The CTE exports `cat` (SELECT category_id AS cat), so `tc.category_id`
+            // does not exist (verified vs C SQLite 3.46.1: "no such column:
+            // tc.category_id"). The anchor accepted the query and deferred
+            // rejection to execution; the release window's compile-time resolver
+            // rejects it up front, matching stock SQLite.
+            let prepared = conn
                 .prepare(
                     "WITH top_cats AS (
                     SELECT category_id AS cat, SUM(price) AS total
@@ -154821,18 +154845,17 @@ mod tests {
                 FROM products p
                 JOIN top_cats tc ON p.category_id = tc.category_id;",
                 )
-                .await
-                .unwrap();
+                .await;
+            let err = match prepared {
+                Ok(stmt) => stmt
+                    .query()
+                    .await
+                    .expect_err("stale tc.category_id must be rejected"),
+                Err(err) => err,
+            };
             assert!(
-                !matches!(
-                    stmt.prepared_query_fast_path.as_ref(),
-                    Some(&super::PreparedQueryFastPath::TopCategoryCteJoin { .. })
-                ),
-                "the CTE side of the join must use the CTE output name, not the source table column name"
-            );
-            assert!(
-                stmt.query().await.is_err(),
-                "normal execution should reject tc.category_id when the CTE exported cat"
+                matches!(err, FrankenError::NoSuchColumn { .. }),
+                "expected no-such-column error, got: {err:?}"
             );
         });
     }
@@ -170660,7 +170683,14 @@ mod tests {
                 .await
                 .unwrap();
             conn.execute(
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));",
+            // ON DELETE SET NULL: stock SQLite (verified vs C SQLite 3.46.1)
+            // rejects the INSERT OR REPLACE below because it deletes the
+            // referenced parent id=1, orphaning child id=10 ("FOREIGN KEY
+            // constraint failed"). The anchor b612eb7b5 let that REPLACE
+            // succeed (SQLite-divergent); SET NULL keeps the scenario valid
+            // while still exercising parent-cache invalidation on the later
+            // child insert that references the now-deleted id=1.
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL);",
         ).await
         .unwrap();
             conn.execute("INSERT INTO parent VALUES (1, 'a');")
@@ -185093,21 +185123,25 @@ fts5(title, body, content=docs, content_rowid=id)'
                     .unwrap();
             }
 
+            // Oracle-corrected contract (bd-asupersync-043 triage, receipt on
+            // the release bead): stock SQLite preserves invalid-UTF-8 TEXT
+            // bytes through the database file with no rejection — parity
+            // after 84ebdf4b3 means hydration must SUCCEED and serve the raw
+            // byte exactly.
             let conn = Connection::open(&db_str)
                 .await
                 .expect("lazy open should defer table row decoding");
             conn.set_reject_mem_fallback(false);
             let reload_cx = conn.op_cx().unwrap();
-            let err = conn
-                .reload_memdb_from_pager(&reload_cx)
+            conn.reload_memdb_from_pager(&reload_cx)
                 .await
-                .expect_err("invalid table text should fail once rows are hydrated");
-            let message = err.to_string();
-            assert!(
-                message.contains("table `docs`")
-                    || message.contains("valid SQLite record")
-                    || message.contains("payload"),
-                "unexpected reopen error: {message}"
+                .expect("invalid-UTF-8 TEXT must hydrate byte-preserved, matching stock");
+            let rows = conn.query("SELECT hex(title) FROM docs;").await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].get(0),
+                Some(&SqliteValue::Text("FF".into())),
+                "raw TEXT byte must round-trip exactly like stock"
             );
         });
     }
