@@ -363,7 +363,7 @@ fn report_json_markdown_and_csv_reconcile_from_one_model() {
     assert_eq!(decoded, report);
 
     let markdown = render_test_inventory_markdown(&report);
-    assert!(markdown.contains("harness_top_level_integration_files` | 236 | 237 | +1"));
+    assert!(markdown.contains("harness_top_level_integration_files` | 236 | 239 | +3"));
     assert!(markdown.contains("harness_tracker_shaped_files` | 68 | 69 | +1"));
     assert!(markdown.contains("harness_literal_beads_path_files` | 64 | 65 | +1"));
     assert!(markdown.contains("testing/differential-oracle"));

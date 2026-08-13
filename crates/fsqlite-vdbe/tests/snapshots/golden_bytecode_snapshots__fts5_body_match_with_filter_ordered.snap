@@ -24,11 +24,11 @@ addr  opcode           p1    p2    p3    p4                 p5
 9     Column           0     1     4                        0 
 10    Integer          3     7     0                        0 
 11    IsNull           7     19    0                        0 
-12    Ne               7     19    4                        128
-13    Column           0     4     8                        0 
-14    Rowid            0     9     0                        0 
-15    Column           0     2     10                       0 
-16    Column           0     4     11                       0 
+12    Ne               7     19    4                        195
+13    Column           0     4     11                       0 
+14    Copy             11    8     0                        0 
+15    Rowid            0     9     0                        0 
+16    Column           0     2     10                       0 
 17    MakeRecord       8     4     12                       0 
 18    SorterInsert     1     12    0                        0 
 19    Next             0     5     0                        0 

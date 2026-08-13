@@ -12,30 +12,32 @@ requires_version_store: false
 
 addr  opcode           p1    p2    p3    p4                 p5
 ----  ---------------  ----  ----  ----  -----------------  --
-0     Init             0     27    0                        0 
+0     Init             0     29    0                        0 
 1     Transaction      0     0     0                        0 
-2     SorterOpen       1     1     5     (str)+             0 
-3     OpenRead         0     2     0     (tbl)docs          0 
-4     Rewind           0     15    0                        0 
-5     String8          0     4     0     (str)franken sqlite  0 
-6     Column           0     2     5                        0 
-7     PureFunc         0     4     3     (func)MATCH        2 
-8     IfNot            3     14    1                        0 
-9     Column           0     0     6                        0 
-10    Rowid            0     7     0                        0 
-11    Column           0     2     8                        0 
-12    MakeRecord       6     3     9                        0 
-13    SorterInsert     1     9     0                        0 
-14    Next             0     5     0                        0 
-15    Close            0     0     0                        0 
-16    Integer          5     10    0                        0 
-17    IfNot            10    25    1                        0 
-18    SorterSort       1     25    0                        0 
-19    SorterData       1     11    0                        0 
-20    Column           1     1     1                        0 
-21    Column           1     2     2                        0 
-22    ResultRow        1     2     0                        0 
-23    DecrJumpZero     10    25    0                        0 
-24    SorterNext       1     19    0                        0 
-25    Close            1     0     0                        0 
-26    Halt             0     0     0                        0
+2     Integer          5     3     0                        0 
+3     IfNot            3     27    1                        0 
+4     SorterOpen       1     1     3     (str)+             1 
+5     OpenRead         0     2     0     (tbl)docs          0 
+6     Rewind           0     19    0                        0 
+7     String8          0     5     0     (str)franken sqlite  0 
+8     Column           0     2     6                        0 
+9     PureFunc         0     5     4     (func)MATCH        2 
+10    IfNot            4     18    1                        0 
+11    Rowid            0     8     0                        0 
+12    Copy             8     7     0                        0 
+13    MakeRecord       7     1     4                        0 
+14    SorterCompare    1     18    4                        1 
+15    Column           0     2     9                        0 
+16    MakeRecord       7     3     10                       0 
+17    SorterInsert     1     10    0                        0 
+18    Next             0     7     0                        0 
+19    Close            0     0     0                        0 
+20    SorterSort       1     27    0                        0 
+21    SorterData       1     11    0                        0 
+22    Column           1     1     1                        0 
+23    Column           1     2     2                        0 
+24    ResultRow        1     2     0                        0 
+25    DecrJumpZero     3     27    0                        0 
+26    SorterNext       1     21    0                        0 
+27    Close            1     0     0                        0 
+28    Halt             0     0     0                        0

@@ -308,6 +308,18 @@
     },
     {
       "source_path": "crates/fsqlite-e2e/tests/am152_allocator_race_repro.rs",
+      "test_name": "am152_allocator_race_rollback_journal_without_retained_autocommit",
+      "reason": "bd-9inpb discriminator: compare implicit DELETE writers with retained autocommit disabled; run with --ignored",
+      "cfg_condition": null,
+      "kind": "stress",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact opt-in discriminator exits 0 at the release commit; immutable receipt records workload configuration, deadline, platform, toolchain, and assertion summary.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/am152_allocator_race_repro.rs",
       "test_name": "am152_allocator_race_wal",
       "reason": "am#152 / bd-9inpb stress harness: reproduced+fixed; run on demand with --ignored to validate the page-alias fix",
       "cfg_condition": null,
@@ -315,6 +327,78 @@
       "policy": "run_for_release",
       "evidence": {
         "requirement": "Exact opt-in test exits 0 at the release commit; immutable receipt records workload configuration, deadline, platform, toolchain, and assertion summary.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/am152_allocator_race_repro.rs",
+      "test_name": "am152_bounded_rollback_journal_without_retained_autocommit",
+      "reason": "bd-9inpb discriminator: bounded implicit DELETE writers without retained autocommit; run with --ignored",
+      "cfg_condition": null,
+      "kind": "stress",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact opt-in discriminator exits 0 at the release commit; immutable receipt records workload configuration, deadline, platform, toolchain, and assertion summary.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/am152_allocator_race_repro.rs",
+      "test_name": "am152_statement_surface_execute_with_params",
+      "reason": "bd-9inpb discriminator: bounded statement-surface matrix; run with --ignored",
+      "cfg_condition": null,
+      "kind": "stress",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact opt-in discriminator exits 0 at the release commit; immutable receipt records workload configuration, deadline, platform, toolchain, and assertion summary.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/am152_allocator_race_repro.rs",
+      "test_name": "am152_statement_surface_explicit_begin_concurrent",
+      "reason": "bd-9inpb discriminator: bounded statement-surface matrix; run with --ignored",
+      "cfg_condition": null,
+      "kind": "stress",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact opt-in discriminator exits 0 at the release commit; immutable receipt records workload configuration, deadline, platform, toolchain, and assertion summary.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/am152_allocator_race_repro.rs",
+      "test_name": "am152_statement_surface_prepared_execute",
+      "reason": "bd-9inpb discriminator: bounded statement-surface matrix; run with --ignored",
+      "cfg_condition": null,
+      "kind": "stress",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact opt-in discriminator exits 0 at the release commit; immutable receipt records workload configuration, deadline, platform, toolchain, and assertion summary.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/am152_allocator_race_repro.rs",
+      "test_name": "am152_statement_surface_query_with_params",
+      "reason": "bd-9inpb discriminator: bounded statement-surface matrix; run with --ignored",
+      "cfg_condition": null,
+      "kind": "stress",
+      "policy": "run_for_release",
+      "evidence": {
+        "requirement": "Exact opt-in discriminator exits 0 at the release commit; immutable receipt records workload configuration, deadline, platform, toolchain, and assertion summary.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/am152_allocator_race_repro.rs",
+      "test_name": "two_eof_allocators_never_publish_the_same_page",
+      "reason": "bd-9inpb discriminator: red until the shared-page allocation race is fixed; run with --ignored",
+      "cfg_condition": null,
+      "kind": "known_bug",
+      "policy": "block_release",
+      "evidence": {
+        "requirement": "Remove the ignore only after the unchanged exact discriminator passes three consecutive runs at the release commit; content-hash the transcripts with commit and toolchain provenance (bd-9inpb).",
         "receipt": null
       }
     },
@@ -641,18 +725,6 @@
       }
     },
     {
-      "source_path": "crates/fsqlite-e2e/tests/bd_dpjhw_view_\u0074rigger_savepoint.rs",
-      "test_name": "v7_view_join_\u0074rigger_rollback",
-      "reason": "bd-dpjhw: VIEW JOIN shows aborted \u0074rigger state after SAVEPOINT ROLLBACK",
-      "cfg_condition": null,
-      "kind": "known_bug",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Remove the ignore only after the unchanged exact oracle passes three consecutive runs at the release commit; content-hash the transcripts with commit and toolchain provenance.",
-        "receipt": null
-      }
-    },
-    {
       "source_path": "crates/fsqlite-e2e/tests/bd_gieaf_track_r_record_encoding.rs",
       "test_name": "bd_gieaf_track_r_prepared_insert_10k_perf_probe_emits_metrics",
       "reason": "manual perf probe; run via rch when validating Track R throughput",
@@ -821,14 +893,38 @@
       }
     },
     {
-      "source_path": "crates/fsqlite-e2e/tests/exists_semantics_oracle_e2e.rs",
-      "test_name": "relational_division_double_not_exists",
-      "reason": "bd-zvk68: triple-nested correlation (relational division) — inner NOT EXISTS not bound to the middle row",
+      "source_path": "crates/fsqlite-e2e/tests/gh334_vacuum_trailing_slack_e2e.rs",
+      "test_name": "gh334_in_place_vacuum_tolerates_trailing_slack",
+      "reason": "bd-e26jr sig-2 keeper: red by design until the source-receipt fix lands (see bead)",
       "cfg_condition": null,
       "kind": "known_bug",
       "policy": "block_release",
       "evidence": {
-        "requirement": "Remove the ignore only after the unchanged differential oracle passes three consecutive exact runs at the release commit; hash transcripts with commit and toolchain provenance.",
+        "requirement": "Remove the ignore only after the unchanged exact keeper passes three consecutive runs at the release commit; content-hash the transcripts with commit and toolchain provenance (bd-e26jr sig-2: vacuum source-image receipt must tolerate trailing slack).",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/gh334_vacuum_trailing_slack_e2e.rs",
+      "test_name": "gh334_vacuum_into_tolerates_page_aligned_trailing_slack",
+      "reason": "bd-e26jr sig-2 keeper: red by design until the source-receipt fix lands (see bead)",
+      "cfg_condition": null,
+      "kind": "known_bug",
+      "policy": "block_release",
+      "evidence": {
+        "requirement": "Remove the ignore only after the unchanged exact keeper passes three consecutive runs at the release commit; content-hash the transcripts with commit and toolchain provenance (bd-e26jr sig-2; this shape currently passes locally — promote after the stability requirement is met).",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/gh334_vacuum_trailing_slack_e2e.rs",
+      "test_name": "gh334_vacuum_into_tolerates_unaligned_trailing_slack",
+      "reason": "bd-e26jr sig-2 keeper: red by design until the source-receipt fix lands (see bead)",
+      "cfg_condition": null,
+      "kind": "known_bug",
+      "policy": "block_release",
+      "evidence": {
+        "requirement": "Remove the ignore only after the unchanged exact keeper passes three consecutive runs at the release commit; content-hash the transcripts with commit and toolchain provenance (bd-e26jr sig-2: vacuum source-image receipt must tolerate trailing slack).",
         "receipt": null
       }
     },
@@ -1555,6 +1651,24 @@
       "policy": "exempt",
       "evidence": {
         "requirement": "Run this exact ignored benchmark under --profile release-perf --nocapture and retain output with commit, toolchain, host, and RUSTFLAGS before citing a numeric result.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite/tests/concurrent_freelist_churn.rs",
+      "test_name": "external_process_old_snapshot_reader_helper",
+      "reason": "subprocess helper for external-process GH#302 snapshot proof",
+      "cfg_condition": null,
+      "kind": "subprocess_helper",
+      "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite/tests/concurrent_freelist_churn.rs",
+          "test_name": "external_process_old_snapshot_survives_committed_freelist_reuse"
+        }
+      ],
+      "evidence": {
+        "requirement": "Designated parent test exits 0 and validates the child outcome; standalone helper execution is not acceptance evidence.",
         "receipt": null
       }
     },

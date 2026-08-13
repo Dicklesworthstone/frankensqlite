@@ -22,18 +22,18 @@ addr  opcode           p1    p2    p3    p4                 p5
 7     Rewind           2     28    0                        0 
 8     Column           1     1     4                        0 
 9     Column           0     0     5                        0 
-10    Eq               5     3     4                        32
+10    Eq               5     3     4     (coll)BINARY       32
 11    IfNot            3     27    1                        0 
 12    Column           2     1     7                        0 
 13    Column           1     1     8                        0 
-14    Eq               8     6     7                        32
+14    Eq               8     6     7     (coll)BINARY       32
 15    IfNot            6     27    1                        0 
 16    Column           2     2     12                       0 
 17    Integer          10    13    0                        0 
-18    Gt               13    10    12                       32
+18    Gt               13    10    12    (coll)BINARY       99
 19    Column           1     1     14                       0 
 20    Integer          3     15    0                        0 
-21    Eq               15    11    14                       32
+21    Eq               15    11    14    (coll)BINARY       99
 22    And              10    11    9                        0 
 23    IfNot            9     27    1                        0 
 24    Column           0     1     1                        0 

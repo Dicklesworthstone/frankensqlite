@@ -31,12 +31,12 @@ addr  opcode           p1    p2    p3    p4                 p5
 16    Column           0     1     7                        0 
 17    Variable         1     8     0                        0 
 18    IsNull           8     26    0                        0 
-19    Ne               8     26    7                        128
+19    Ne               8     26    7                        195
 20    Column           0     4     7                        0 
 21    Variable         2     8     0                        0 
 22    IsNull           8     26    0                        0 
 23    IsNull           7     26    0                        0 
-24    Ge               8     26    7                        128
+24    Ge               8     26    7                        195
 25    RowSetAdd        1     2     0                        0 
 26    Next             3     12    0                        0 
 27    Close            3     0     0                        0 

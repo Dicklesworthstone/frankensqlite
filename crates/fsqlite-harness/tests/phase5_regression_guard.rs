@@ -79,6 +79,12 @@ const AUDITED_COVERED_PARENT_CONTRACT: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "crates/fsqlite/tests/concurrent_freelist_churn.rs::external_process_old_snapshot_reader_helper",
+        &[
+            "crates/fsqlite/tests/concurrent_freelist_churn.rs::external_process_old_snapshot_survives_committed_freelist_reuse",
+        ],
+    ),
+    (
         "crates/fsqlite-e2e/tests/correctness_mixed_dml.rs::bd_c9pxw_crash_helper_entrypoint",
         &[
             "crates/fsqlite-e2e/tests/correctness_mixed_dml.rs::bd_c9pxw_crash_recovery_discards_unflushed_update_delete_batch",

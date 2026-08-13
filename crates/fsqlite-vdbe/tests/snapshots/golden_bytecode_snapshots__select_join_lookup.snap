@@ -1,6 +1,6 @@
 ---
 source: crates/fsqlite-vdbe/tests/golden_bytecode_snapshots.rs
-expression: "render_bytecode_case(\"join_lookup\",\n\"SELECT docs.id, categories.name \\\n             FROM docs JOIN categories ON docs.category_id = categories.id \\\n             WHERE docs.category_id = 7\")"
+expression: join_lookup
 ---
 case: join_lookup
 sql: SELECT docs.id, categories.name FROM docs JOIN categories ON docs.category_id = categories.id WHERE docs.category_id = 7
@@ -22,7 +22,7 @@ addr  opcode           p1    p2    p3    p4                 p5
 7     SeekRowid        1     15    3                        0 
 8     Column           0     1     5                        0 
 9     Integer          7     6     0                        0 
-10    Eq               6     4     5                        32
+10    Eq               6     4     5     (coll)BINARY       99
 11    IfNot            4     15    1                        0 
 12    Column           0     0     1                        0 
 13    Column           1     1     2                        0 

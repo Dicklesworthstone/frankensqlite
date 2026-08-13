@@ -75,8 +75,8 @@ delta_policy = "Every new SLT file must remain owned by the canonical corpus and
 
 [[baseline_delta_explanation]]
 metric = "harness_top_level_integration_files"
-observed_value = 237
-rationale = "The canonical inventory integration target crates/fsqlite-harness/tests/bd_turso_test_adaptation_zu081_1_inventory.rs was added after the 2026-08-03 research count. It is tracked and therefore raises the top-level harness count from 236 to 237."
+observed_value = 239
+rationale = "Three tracked harness targets were added after the 2026-08-03 research count: the canonical inventory integration target crates/fsqlite-harness/tests/bd_turso_test_adaptation_zu081_1_inventory.rs plus the adaptation deliverables crates/fsqlite-harness/tests/bd_turso_test_adaptation_zu081_8_lab_history.rs and crates/fsqlite-harness/tests/bd_turso_test_adaptation_zu081_19_history_reduction.rs (both 2026-08-06). They raise the top-level harness count from 236 to 239."
 
 [[baseline_delta_explanation]]
 metric = "harness_tracker_shaped_files"
@@ -90,13 +90,8 @@ rationale = "The canonical inventory integration target validates the literal .b
 
 [[baseline_delta_explanation]]
 metric = "e2e_top_level_integration_files"
-observed_value = 268
-rationale = "The 2026-08-03 find-based count included ignored scratch file crates/fsqlite-e2e/tests/zz_scratch_mw_race.rs. The canonical inventory uses tracked Git objects and therefore reports 268."
-
-[[baseline_delta_explanation]]
-metric = "e2e_rusqlite_files"
-observed_value = 213
-rationale = "The ignored scratch file crates/fsqlite-e2e/tests/zz_scratch_mw_race.rs imports rusqlite. Excluding non-versioned scratch state changes the tracked count from 214 to 213."
+observed_value = 272
+rationale = "The 2026-08-03 find-based count included ignored scratch file crates/fsqlite-e2e/tests/zz_scratch_mw_race.rs (excluded by the tracked-Git-object scanner), and four tracked e2e targets were added afterwards: bd_og0dj_issue290_keeper.rs (2026-08-09), gh327_ddl_busy_receipt_e2e.rs (2026-08-10), gh333_concurrent_open_write_e2e.rs and gh334_vacuum_trailing_slack_e2e.rs (both 2026-08-11). Net tracked count is 272."
 
 [[portfolio]]
 source_path = "testing/README.md"
