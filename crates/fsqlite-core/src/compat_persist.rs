@@ -8456,15 +8456,21 @@ PRAGMA integrity_check;
                 .unwrap();
             }
 
+            // Oracle-corrected contract (bd-asupersync-043 triage): after
+            // 84ebdf4b3 the record TEXT itself loads byte-preserved (stock
+            // parity), so the failure moves to where stock also fails — the
+            // schema SQL cannot parse, i.e. the malformed-database-schema
+            // class. Assert that class rather than the retired record-level
+            // UTF-8 rejection.
             let err = load_test_db(&db_path)
                 .await
-                .expect_err("invalid sqlite_master text should fail");
+                .expect_err("unparseable sqlite_master SQL must fail schema load");
+            assert!(matches!(&err, FrankenError::DatabaseCorrupt { .. }));
             let message = err.to_string();
             assert!(
-                message.contains("sqlite_master row")
-                    || message.contains("valid SQLite record")
-                    || message.contains("payload"),
-                "unexpected load error: {message}"
+                message.contains("could not parse CREATE TABLE SQL")
+                    || message.to_ascii_lowercase().contains("malformed"),
+                "unexpected load error class: {message}"
             );
         });
     }
@@ -8472,6 +8478,13 @@ PRAGMA integrity_check;
     #[test]
     fn test_load_from_sqlite_rejects_invalid_utf8_in_table_record() {
         asupersync::test_utils::run_test(|| async {
+            // Oracle-corrected contract (bd-asupersync-043 triage, sqlite3
+            // 3.46.1 receipt on the release bead): stock SQLite PRESERVES
+            // invalid-UTF-8 TEXT bytes through the database file with no
+            // rejection at any stage — `CAST(x'FF' AS TEXT)` round-trips as
+            // one raw byte. The historical rejection assertion was
+            // anti-parity once 84ebdf4b3 (byte-preservation) landed. The
+            // loader must now ACCEPT the record and keep the byte exact.
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("compat_corrupt_table_utf8.db");
 
@@ -8486,16 +8499,26 @@ PRAGMA integrity_check;
                 .unwrap();
             }
 
-            let err = load_test_db(&db_path)
+            let loaded = load_test_db(&db_path)
                 .await
-                .expect_err("invalid table text should fail");
-            let message = err.to_string();
-            assert!(
-                message.contains("table `docs`")
-                    || message.contains("valid SQLite record")
-                    || message.contains("payload"),
-                "unexpected load error: {message}"
-            );
+                .expect("invalid-UTF-8 TEXT must load byte-preserved, matching stock");
+            let table = loaded
+                .db
+                .tables
+                .values()
+                .next()
+                .expect("docs table present");
+            let (_rowid, values) = table.iter_rows().next().expect("docs row present");
+            match values.first() {
+                Some(SqliteValue::Text(text)) => {
+                    assert_eq!(
+                        text.as_bytes_direct(),
+                        &[0xFF],
+                        "raw TEXT byte must round-trip exactly like stock"
+                    );
+                }
+                other => panic!("expected preserved TEXT value, got {other:?}"),
+            }
         });
     }
 }

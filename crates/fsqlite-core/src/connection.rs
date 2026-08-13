@@ -185090,15 +185090,18 @@ fts5(title, body, content=docs, content_rowid=id)'
                     .unwrap();
             }
 
+            // Oracle-corrected contract (bd-asupersync-043 triage): the
+            // record TEXT loads byte-preserved after 84ebdf4b3; the failure
+            // stock also exhibits is the unparseable schema SQL — assert the
+            // malformed-schema class, not record-level UTF-8 rejection.
             let err = Connection::open(&db_str)
                 .await
-                .expect_err("invalid sqlite_master text should fail");
+                .expect_err("unparseable sqlite_master SQL must fail schema load");
             let message = err.to_string();
             assert!(
-                message.contains("sqlite_master row")
-                    || message.contains("valid SQLite record")
-                    || message.contains("payload"),
-                "unexpected reopen error: {message}"
+                message.contains("could not parse CREATE TABLE SQL")
+                    || message.to_ascii_lowercase().contains("malformed"),
+                "unexpected reopen error class: {message}"
             );
         });
     }
