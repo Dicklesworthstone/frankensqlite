@@ -896,6 +896,8 @@ static FSQLITE_RETAINED_AUTOCOMMIT_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_FK_PROBE_ENGAGED: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_FK_PROBE_ANSWERED: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_FK_SELECT_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_FK_CHECK_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_FK_CHECK_CALLS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RETAINED_AUTOCOMMIT_READ_AFTER_WRITE_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -18627,6 +18629,16 @@ impl Connection {
 
     async fn prepare_after_background_status(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         let op_cx = self.op_cx_after_background_status();
+        // bd-dk9ra (close_flush): preparing a statement runs memdb refreshes that
+        // reload from the pager and consume the one-shot live-vtab preservation
+        // receipt. A prepare is not a committing boundary, so an uncommitted/parked
+        // write's prepare must not permanently consume a receipt armed by an earlier
+        // statement. The refreshes still USE the receipt to preserve the live
+        // instance; restore it after they run so a real committing boundary (a
+        // committed write's clear paths, flush, or close) stays the point that
+        // clears it. Explicit reload_memdb_from_pager calls (not this prepare path)
+        // still consume it, so the one-shot reload contract is unchanged.
+        let saved_preservation_receipt = self.pending_local_live_vtab_preservation.borrow().clone();
         self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
             .await?;
         if self.committed_pager_refresh_allowed() {
@@ -18646,6 +18658,11 @@ impl Connection {
             }
         }
         let _ = self.refresh_prepared_schema_state(&op_cx, true).await?;
+        if saved_preservation_receipt.is_some()
+            && self.pending_local_live_vtab_preservation.borrow().is_none()
+        {
+            *self.pending_local_live_vtab_preservation.borrow_mut() = saved_preservation_receipt;
+        }
         let profile_enabled = hot_path_profile_enabled();
         let lookup_start = profile_enabled.then(Instant::now);
         self.refresh_parse_cache_if_needed(sql);
@@ -50859,6 +50876,36 @@ impl Connection {
     /// `row_values` are the column values for the inserted row (in storage
     /// order, matching `TableSchema.columns`).
     async fn check_fk_parent_exists(
+        &self,
+        table_name: &str,
+        row_values: &[SqliteValue],
+    ) -> Result<()> {
+        // bd-dk9ra attribution: per-call latency receipt, visible in
+        // --nocapture keeper runs (no tracing subscriber needed). Average is
+        // printed every 1024 calls; a flat average across N proves the #111
+        // super-linear term lives OUTSIDE this function.
+        let attribution_start = hot_path_profile_enabled().then(Instant::now);
+        let result = self
+            .check_fk_parent_exists_inner(table_name, row_values)
+            .await;
+        if let Some(start) = attribution_start {
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let total_ns = FSQLITE_FK_CHECK_TOTAL_NS.fetch_add(ns, AtomicOrdering::Relaxed) + ns;
+            let calls = FSQLITE_FK_CHECK_CALLS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if calls.is_multiple_of(1024) {
+                eprintln!(
+                    "[fk-check] calls={calls} avg_ns={} (engaged={} answered={} fallbacks={})",
+                    total_ns / calls,
+                    FSQLITE_FK_PROBE_ENGAGED.load(AtomicOrdering::Relaxed),
+                    FSQLITE_FK_PROBE_ANSWERED.load(AtomicOrdering::Relaxed),
+                    FSQLITE_FK_SELECT_FALLBACK.load(AtomicOrdering::Relaxed)
+                );
+            }
+        }
+        result
+    }
+
+    async fn check_fk_parent_exists_inner(
         &self,
         table_name: &str,
         row_values: &[SqliteValue],
