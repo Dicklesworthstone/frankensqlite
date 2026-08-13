@@ -146067,7 +146067,23 @@ mod tests {
                         format!("w{worker_id:02}-tx{txn_idx:03}-bd-{issue_idx:03}");
 
                     loop {
-                        conn.execute("BEGIN CONCURRENT;").await.unwrap();
+                        // BEGIN CONCURRENT can return a transient BusySnapshot
+                        // ("pager publication advanced between metadata bind and
+                        // reload transaction") when a peer commits between this
+                        // begin's metadata bind and its reload transaction — retry
+                        // it exactly like the UPDATE/COMMIT steps below.
+                        match conn.execute("BEGIN CONCURRENT;").await {
+                            Ok(_) => {}
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                drop(conn.execute("ROLLBACK;").await);
+                                continue;
+                            }
+                            Err(err) => panic!(
+                                "non-transient BEGIN CONCURRENT failure \
+                                 (worker={worker_id} txn={txn_idx} issue=bd-{issue_idx:03}): {err}"
+                            ),
+                        }
                         match conn.execute(&format!(
                             "UPDATE issues
                              SET content_hash = '{content_hash}',
@@ -146288,7 +146304,23 @@ mod tests {
                         format!("w{worker_id:02}-tx{txn_idx:03}-bd-{issue_idx:03}");
 
                     loop {
-                        conn.execute("BEGIN CONCURRENT;").await.unwrap();
+                        // BEGIN CONCURRENT can return a transient BusySnapshot
+                        // ("pager publication advanced between metadata bind and
+                        // reload transaction") when a peer commits between this
+                        // begin's metadata bind and its reload transaction — retry
+                        // it exactly like the UPDATE/COMMIT steps below.
+                        match conn.execute("BEGIN CONCURRENT;").await {
+                            Ok(_) => {}
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                drop(conn.execute("ROLLBACK;").await);
+                                continue;
+                            }
+                            Err(err) => panic!(
+                                "non-transient BEGIN CONCURRENT failure \
+                                 (worker={worker_id} txn={txn_idx} issue=bd-{issue_idx:03}): {err}"
+                            ),
+                        }
                         match conn.execute(&format!(
                             "UPDATE issues
                              SET content_hash = '{content_hash}',
@@ -169150,7 +169182,24 @@ mod tests {
                     let amount = i64::try_from((worker_id + txn_index) % 3 + 1).unwrap();
 
                     loop {
-                        conn.execute("BEGIN CONCURRENT;").await.unwrap();
+                        // BEGIN CONCURRENT can legitimately return a transient
+                        // BusySnapshot ("pager publication advanced between metadata
+                        // bind and reload transaction") when a peer commits between
+                        // this begin's metadata bind and its reload transaction — the
+                        // engine surfaces it for the caller to restart from a fresh
+                        // bind (reload_memdb_from_pager_with_prebound_publication).
+                        // Retry it exactly like the UPDATE/COMMIT steps below.
+                        match conn.execute("BEGIN CONCURRENT;").await {
+                            Ok(_) => {}
+                            Err(err) if err.is_transient() => {
+                                transient_retries += 1;
+                                drop(conn.execute("ROLLBACK;").await);
+                                continue;
+                            }
+                            Err(err) => panic!(
+                                "non-transient BEGIN CONCURRENT failure in worker={worker_id} txn={txn_index}: {err}"
+                            ),
+                        }
                         match conn.execute(&format!(
                             "UPDATE accounts SET balance = balance + {amount} WHERE id = {account};"
                         )).await {
