@@ -1869,6 +1869,16 @@ impl Drop for SyncStreamGuard<'_> {
     }
 }
 
+impl std::fmt::Debug for AsyncConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Compact identity only: the worker owns the connection internals and
+        // dumping channel/lifecycle state would race the worker's writes.
+        f.debug_struct("AsyncConnection")
+            .field("in_transaction", &self.in_transaction())
+            .finish_non_exhaustive()
+    }
+}
+
 impl AsyncConnection {
     /// Open a database connection asynchronously with `Cx` integration.
     ///
