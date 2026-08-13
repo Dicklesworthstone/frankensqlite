@@ -42181,15 +42181,16 @@ impl Connection {
                         "retained-flush rollback failed during cleanup; surfacing the original commit error"
                     );
                 }
-                if txn_had_pending_writes && rollback_succeeded {
-                    if let Err(reload_error) = self.reload_memdb_from_pager(cx).await {
-                        tracing::warn!(
-                            target: "fsqlite.retained_autocommit",
-                            %commit_error,
-                            %reload_error,
-                            "retained-flush memdb reload failed during cleanup; surfacing the original commit error"
-                        );
-                    }
+                if txn_had_pending_writes
+                    && rollback_succeeded
+                    && let Err(reload_error) = self.reload_memdb_from_pager(cx).await
+                {
+                    tracing::warn!(
+                        target: "fsqlite.retained_autocommit",
+                        %commit_error,
+                        %reload_error,
+                        "retained-flush memdb reload failed during cleanup; surfacing the original commit error"
+                    );
                 }
                 Err(commit_error)
             }
