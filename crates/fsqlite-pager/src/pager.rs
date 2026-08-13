@@ -1357,6 +1357,25 @@ struct GroupCommitQueue {
     commit_service_mode: AtomicU8,
     /// WAL-owned lane-local staging state for prepared batches.
     parallel_wal_lanes: ParallelWalLaneStager<traits::PreparedWalFrameBatch>,
+    /// bd-o81ov: highest EOF page number ever granted to any connection bound
+    /// to this database identity (0 = none granted yet). Every connection has
+    /// its own pager and therefore its own `inner.next_page`, so without
+    /// cross-connection coordination two connections can hand out the SAME
+    /// fresh EOF page from a stale committed `db_size`, link that one physical
+    /// page into different B-tree positions, and both commit — leaving the
+    /// durable image referencing a single page from multiple parents ("page N
+    /// referenced multiple times", broken point-seeks, duplicated rows). No
+    /// commit-time conflict scan can close that race: the colliding commits
+    /// ride separate concurrent single-batch group-commit epochs, and neither
+    /// is durable/visible when the other validates. File-backed WAL EOF
+    /// allocation therefore reserves page numbers through this shared
+    /// monotonic counter, making a double-grant impossible at the source. The
+    /// counter never rewinds while the identity stays open (matching the
+    /// pager's never-rewind `next_page` semantics: abandoned reservations are
+    /// benign holes above the committed size, reusable through the local
+    /// `> db_size` freelist pool); it resets only when the last connection
+    /// closes and the queue is dropped.
+    eof_allocation_high_water: AtomicU32,
     /// External database-lock restorations whose owning flusher future was
     /// dropped while the shared file handle was contended.
     ///
@@ -1806,6 +1825,7 @@ impl GroupCommitQueue {
             commit_service_control_epoch: AtomicU64::new(0),
             commit_service_mode: AtomicU8::new(CommitServiceMode::Balanced.as_u8()),
             parallel_wal_lanes: ParallelWalLaneStager::new(parallel_wal_control),
+            eof_allocation_high_water: AtomicU32::new(0),
             pending_external_unlocks: Mutex::new(VecDeque::new()),
             external_unlock_claims_in_flight: AtomicUsize::new(0),
             identity_wide_external_unlock_claims_in_flight: AtomicUsize::new(0),
@@ -1822,6 +1842,40 @@ impl GroupCommitQueue {
 
     fn parallel_wal_control(&self) -> &ParallelWalControlSurface {
         self.parallel_wal_lanes.control()
+    }
+
+    /// Reserve one fresh EOF page at or above `local_next_page`, coordinated
+    /// across every connection sharing this database identity (bd-o81ov).
+    ///
+    /// The grant is the successor of the current shared high-water mark or of
+    /// the caller's own allocator position, whichever is higher — so a caller
+    /// whose committed-size view lags a peer's uncommitted growth can never be
+    /// handed a page number that peer already owns, while a caller that
+    /// observed newer durable growth (e.g. a cross-process commit) pulls the
+    /// shared mark forward. `pending_byte_page` is never granted, matching the
+    /// local allocator's skip. Returns `None` once the page-number space is
+    /// exhausted.
+    fn reserve_eof_page(&self, local_next_page: u32, pending_byte_page: u32) -> Option<u32> {
+        let mut current = self.eof_allocation_high_water.load(AtomicOrdering::Acquire);
+        loop {
+            let floor = current.max(local_next_page.saturating_sub(1));
+            let mut candidate = floor.saturating_add(1);
+            if candidate == pending_byte_page {
+                candidate = candidate.saturating_add(1);
+            }
+            if candidate == u32::MAX {
+                return None;
+            }
+            match self.eof_allocation_high_water.compare_exchange_weak(
+                current,
+                candidate,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => return Some(candidate),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     fn next_parallel_wal_batch_id(&self) -> u64 {
@@ -12111,6 +12165,7 @@ where
                     freed_page_bounds: None,
                     allocated_from_freelist: Vec::new(),
                     allocated_from_eof: Vec::new(),
+                    savepoint_quarantined_allocations: Vec::new(),
                     writes_observed: false,
                     mode,
                     is_writer: eager_writer,
@@ -12328,6 +12383,7 @@ where
                 freed_page_bounds: None,
                 allocated_from_freelist: Vec::new(),
                 allocated_from_eof: Vec::new(),
+                savepoint_quarantined_allocations: Vec::new(),
                 writes_observed: false,
                 mode,
                 is_writer: eager_writer,
@@ -16805,6 +16861,16 @@ where
     freed_page_bounds: Option<(PageNumber, PageNumber)>,
     allocated_from_freelist: Vec<PageNumber>,
     allocated_from_eof: Vec<PageNumber>,
+    /// bd-0shxy: page numbers reclaimed from post-savepoint allocations by
+    /// ROLLBACK TO SAVEPOINT. They must NOT reach the shared freelist while
+    /// this transaction is live (the pre-existing freed-page quarantine
+    /// doctrine: mid-transaction return lets one B-tree operation hand a page
+    /// to another tree before old ownership is retired — cross-tree page
+    /// aliasing; page-352 double-reference receipt on the bead). The same
+    /// transaction reuses them first at allocate_page; any remainder goes
+    /// back to the freelist only at transaction end (commit restore/rollback),
+    /// when no live tree reference can persist.
+    savepoint_quarantined_allocations: Vec<PageNumber>,
     /// #70 BUG-A / ghost-commit guard: set true as soon as any write-staging
     /// entry-point (`write_page`, `write_page_data`, `allocate_page`, or
     /// savepoint-driven commit reshuffle) runs on this transaction. Cleared
@@ -18227,7 +18293,17 @@ where
         if self.mode == TransactionMode::Concurrent {
             return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
             return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
+            // bd-0shxy: transaction is ending — quarantined savepoint pages
+            // have no surviving tree references and may rejoin the freelist.
+            return_pages_to_freelist(
+                &mut inner.freelist,
+                self.savepoint_quarantined_allocations.drain(..),
+            );
         } else if inner.active_transactions <= 1 {
+            return_pages_to_freelist(
+                &mut inner.freelist,
+                self.savepoint_quarantined_allocations.drain(..),
+            );
             self.page_lease.clear();
             self.allocated_from_eof.clear();
             inner.db_size = self.original_db_size;
@@ -18256,6 +18332,7 @@ where
             // re-allocates past it.
             self.page_lease.clear();
             self.allocated_from_eof.clear();
+            self.savepoint_quarantined_allocations.clear();
         }
     }
 }
@@ -20971,6 +21048,14 @@ where
                 self.allocated_from_eof.push(page);
                 return Ok(page);
             }
+            // bd-0shxy: reuse savepoint-quarantined page numbers before any
+            // shared-state allocation. These are this transaction's own
+            // rolled-back allocations; handing them back to the same
+            // transaction is the only re-grant that cannot alias.
+            if let Some(page) = self.savepoint_quarantined_allocations.pop() {
+                self.allocated_from_eof.push(page);
+                return Ok(page);
+            }
 
             // Pages freed earlier in the same transaction stay quarantined until
             // commit. Reusing them immediately lets one B-tree operation hand a
@@ -21072,18 +21157,46 @@ where
             };
             let mut first_page: Option<PageNumber> = None;
 
+            // bd-o81ov: file-backed WAL databases must reserve EOF pages
+            // through the identity-shared high-water mark so two connections
+            // (each with its own `inner.next_page`) can never be granted the
+            // same physical page. Private `:memory:` databases stay on the
+            // single-connection bump allocator, and rollback-journal databases
+            // keep the connection-local allocator (their peer-claimed-range
+            // check runs under the exclusive commit lock).
+            let shared_eof_coordination =
+                !self.memory_db_bump_alloc && self.journal_mode == JournalMode::Wal;
+
             for _ in 0..batch {
-                let mut raw = inner.next_page;
-                if raw == pending_byte_page {
-                    raw = raw.saturating_add(1);
-                }
-                let next = raw.saturating_add(1);
-                // Stop the batch if next_page can no longer advance (u32::MAX
-                // saturation).  Continuing would hand out duplicate page numbers.
-                if next == raw {
-                    break;
-                }
-                inner.next_page = next;
+                let raw = if shared_eof_coordination {
+                    let Some(page) = self
+                        .group_commit_queue
+                        .reserve_eof_page(inner.next_page, pending_byte_page)
+                    else {
+                        // Page-number space exhausted; continuing would hand
+                        // out duplicate page numbers.
+                        break;
+                    };
+                    // Keep the local allocator position in sync so local-only
+                    // consumers (freelist bounds, restore arms) observe the
+                    // grant.
+                    inner.next_page = page.saturating_add(1);
+                    page
+                } else {
+                    let mut raw = inner.next_page;
+                    if raw == pending_byte_page {
+                        raw = raw.saturating_add(1);
+                    }
+                    let next = raw.saturating_add(1);
+                    // Stop the batch if next_page can no longer advance
+                    // (u32::MAX saturation). Continuing would hand out
+                    // duplicate page numbers.
+                    if next == raw {
+                        break;
+                    }
+                    inner.next_page = next;
+                    raw
+                };
                 if let Some(page) = PageNumber::new(raw) {
                     if first_page.is_none() {
                         first_page = Some(page);
@@ -22897,22 +23010,28 @@ where
                 // just drop them.
                 self.page_lease.clear();
             } else {
-                // Return unused lease pages to the freelist before
-                // returning post-savepoint EOF/freelist allocations.
-                // These are valid EOF page numbers that next_page has
-                // already advanced past (concurrent mode doesn't roll
-                // back next_page).
-                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-                return_pages_to_freelist(
-                    &mut inner.freelist,
-                    self.allocated_from_eof
-                        .drain(entry.allocated_from_eof_snapshot.len()..),
-                );
-                return_pages_to_freelist(
-                    &mut inner.freelist,
-                    self.allocated_from_freelist
-                        .drain(entry.allocated_from_freelist_snapshot.len()..),
-                );
+                // bd-0shxy: post-savepoint allocations are QUARANTINED
+                // inside this transaction, never returned to the shared
+                // freelist mid-transaction (concurrent mode doesn't roll
+                // back next_page, so these stay valid page numbers). The
+                // former freelist return let this same transaction's next
+                // split re-acquire a page whose discarded parent link could
+                // still re-enter a later commit — one physical page in two
+                // b-trees (integrity_check 'page 352 referenced multiple
+                // times', table+index of one INSERT txn). Quarantined pages
+                // are reused first by allocate_page and reach the freelist
+                // only at transaction end, when no live tree reference can
+                // persist.
+                let _ = &mut inner; // lock still held for sibling arms' symmetry
+                let eof_start = entry.allocated_from_eof_snapshot.len();
+                let freelist_start = entry.allocated_from_freelist_snapshot.len();
+                let lease: Vec<PageNumber> = self.page_lease.drain(..).collect();
+                self.savepoint_quarantined_allocations.extend(lease);
+                let eof: Vec<PageNumber> = self.allocated_from_eof.drain(eof_start..).collect();
+                self.savepoint_quarantined_allocations.extend(eof);
+                let fl: Vec<PageNumber> =
+                    self.allocated_from_freelist.drain(freelist_start..).collect();
+                self.savepoint_quarantined_allocations.extend(fl);
             }
         }
 
