@@ -5011,8 +5011,24 @@ async fn capture_wal_conflict_snapshot_at_begin(
     wal_backend: &SharedWalBackend,
     cx: &Cx,
     snapshot_initialized: bool,
+    other_transactions_active: bool,
 ) -> Result<Option<traits::WalPublicationSnapshot>> {
-    if !snapshot_initialized {
+    // bd-dk9ra reconciliation of two contracts def2ed8c5 collapsed into one
+    // active-count test: (A) every pager begin drives wal.begin_transaction —
+    // a parked WAL begin must be reachable and cancellable with exact
+    // ownership restore; (B) bd-1fc2c — a second begin must not disturb an
+    // earlier transaction's begin snapshot. The true coherence condition for
+    // skipping the WAL begin is an ALREADY-PINNED read lineage while other
+    // transactions are active: re-beginning would re-pin and shift the first
+    // transaction's view. Backends with no pinned lineage (nothing to
+    // disturb) always take the begin, preserving contract (A).
+    let skip_wal_begin = snapshot_initialized
+        || (other_transactions_active
+            && with_wal_backend_read(wal_backend, cx, |wal, _| {
+                Box::pin(async move { Ok(wal.pinned_read_snapshot().is_some()) })
+            })
+            .await?);
+    if !skip_wal_begin {
         with_wal_backend(wal_backend, cx, |wal, cx| wal.begin_transaction(cx)).await?;
     }
     with_wal_backend_read(wal_backend, cx, |wal, _| {
@@ -11957,8 +11973,8 @@ where
                     capture_wal_conflict_snapshot_at_begin(
                         &self.wal_backend,
                         cx,
-                        committed_refresh.wal_snapshot_initialized
-                            || active_transactions_before_begin != 0,
+                        committed_refresh.wal_snapshot_initialized,
+                        active_transactions_before_begin != 0,
                     )
                     .await?
                 } else {
@@ -12178,8 +12194,8 @@ where
                 capture_wal_conflict_snapshot_at_begin(
                     &self.wal_backend,
                     cx,
-                    committed_refresh.wal_snapshot_initialized
-                        || active_transactions_before_begin != 0,
+                    committed_refresh.wal_snapshot_initialized,
+                    active_transactions_before_begin != 0,
                 )
                 .await?
             } else {
