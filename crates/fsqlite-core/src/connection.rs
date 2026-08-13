@@ -891,6 +891,11 @@ static FSQLITE_CACHED_WRITE_TXN_PARKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RETAINED_AUTOCOMMIT_REUSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RETAINED_AUTOCOMMIT_PARKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RETAINED_AUTOCOMMIT_FLUSHES: AtomicU64 = AtomicU64::new(0);
+// bd-dk9ra fk-scaling attribution counters (eprint receipt every 4096
+// fallbacks so a --nocapture keeper run shows which path dominates).
+static FSQLITE_FK_PROBE_ENGAGED: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_FK_PROBE_ANSWERED: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_FK_SELECT_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RETAINED_AUTOCOMMIT_READ_AFTER_WRITE_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -14295,9 +14300,16 @@ impl Connection {
         // SQLite enlists a successfully-created virtual table directly in the
         // current virtual-table transaction without calling xBegin. This is
         // what gives xCreate its matching xSync/xCommit or xRollback hooks.
-        self.live_vtab_transactions
-            .borrow_mut()
-            .insert(table_name, 0);
+        // Only enlist inside an explicit transaction/savepoint scope: a bare
+        // autocommit CREATE writes no vtab rows, so it must not draw an
+        // xSync/xCommit at its statement boundary. Enlisting it there (a
+        // regression from 0e4333cd1a) made autocommit CREATE finalize the live
+        // vtab and broke the sync/commit-failure rollback contract (bd-dk9ra).
+        if self.in_transaction.get() {
+            self.live_vtab_transactions
+                .borrow_mut()
+                .insert(table_name, 0);
+        }
     }
 
     fn stage_dropped_live_vtab(
@@ -50913,10 +50925,15 @@ impl Connection {
             // txn-current state after the same staleness refresh
             // fk_validation_query performs; a direct pager btree seek is
             // ruled out — it can lag uncommitted in-txn parent writes.
+            let engaged = FSQLITE_FK_PROBE_ENGAGED.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if engaged == 1 {
+                eprintln!("[fk-probe] first engagement (bd-dk9ra attribution)");
+            }
             if let Some(parent_present) = self
                 .fk_parent_rowid_fast_lookup(&fk.parent_table, &parent_cols, &fk_values)
                 .await?
             {
+                FSQLITE_FK_PROBE_ANSWERED.fetch_add(1, AtomicOrdering::Relaxed);
                 if parent_present {
                     if let Some(cache_key) = cache_key {
                         self.fk_parent_validation_cache_insert(cache_key);
@@ -50953,6 +50970,14 @@ impl Connection {
             // `fk_validation_query` which forces a fresh execution context
             // (bypassing the prepared-statement ad-hoc reuse path and
             // explicitly refreshing stale memdb state before execution).
+            let fallbacks = FSQLITE_FK_SELECT_FALLBACK.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if fallbacks == 1 || fallbacks.is_multiple_of(4096) {
+                eprintln!(
+                    "[fk-probe] select fallback #{fallbacks} (engaged={} answered={})",
+                    FSQLITE_FK_PROBE_ENGAGED.load(AtomicOrdering::Relaxed),
+                    FSQLITE_FK_PROBE_ANSWERED.load(AtomicOrdering::Relaxed)
+                );
+            }
             let rows = self.fk_validation_query(&sql, &params).await?;
             if rows.is_empty() {
                 if self.fk_should_defer(fk) {
@@ -51194,19 +51219,52 @@ impl Connection {
             parent.root_page
         };
 
-        // Identical txn-current staleness refresh to fk_validation_query.
-        if self.memdb_requires_active_txn_reload.get()
-            || !self.pending_memdb_direct_upserts.borrow().is_empty()
-        {
+        // The #111 super-linear term is the per-insert full memdb staleness
+        // refresh, not the validation SELECT (ABBA receipt on the bead:
+        // bypassing only the SELECT moved nothing). When the mirror is
+        // merely behind by DEFERRED DIRECT UPSERTS — the prepared direct
+        // INSERT lane's steady state — the probe answers from the pending
+        // overlay (keyed by root_page+rowid) plus the mirror, with no
+        // refresh and no engine discard. Only a genuinely stale mirror
+        // (memdb_requires_active_txn_reload: engine-side DML wrote the txn,
+        // including in-txn parent DELETEs the mirror hasn't absorbed) pays
+        // the fk_validation_query-identical refresh + engine discard.
+        if !self.memdb_requires_active_txn_reload.get() {
+            if self
+                .pending_memdb_direct_upserts
+                .borrow()
+                .iter()
+                .any(|upsert| upsert.root_page == root_page && upsert.rowid == rowid)
+            {
+                // A pending in-txn parent insert is txn-visible state.
+                return Ok(Some(true));
+            }
+        } else {
             let cx = self.op_cx_after_background_status();
             self.refresh_memdb_from_active_txn_if_dirty(&cx).await?;
+            *self.cached_vdbe_engine.borrow_mut() = None;
         }
 
-        let db = self.db.borrow();
-        let Some(table) = db.get_table(root_page) else {
-            return Ok(None);
+        let present = {
+            let db = self.db.borrow();
+            let Some(table) = db.get_table(root_page) else {
+                return Ok(None);
+            };
+            table.find_by_rowid(rowid).is_some()
         };
-        Ok(Some(table.find_by_rowid(rowid).is_some()))
+        if present {
+            // A row present in the txn-current mirror is definitive.
+            return Ok(Some(true));
+        }
+        // A miss is definitive only when the mirror is authoritative for
+        // committed rows: the :memory: pager (the memdb IS the database) or a
+        // fully hydrated file-backed mirror. A lazily-hydrated file-backed
+        // mirror can miss rows that exist on disk, so fall back to the
+        // general validation SELECT rather than report a false violation.
+        if self.pager.is_memory() || self.memdb_rows_loaded.get() {
+            return Ok(Some(false));
+        }
+        Ok(None)
     }
 
     async fn fk_validation_query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
@@ -92138,7 +92196,9 @@ fn is_current_aggregate_or_json_fn(name: &str, args: &FunctionArgs) -> bool {
 /// Check whether an expression tree contains any aggregate function calls.
 fn expr_contains_agg(expr: &Expr) -> bool {
     match expr {
-        Expr::FunctionCall { name, args, over, .. } => {
+        Expr::FunctionCall {
+            name, args, over, ..
+        } => {
             // A windowed function (`f(...) OVER (...)`) is a window function, not a
             // bare aggregate; e.g. `ORDER BY count(*) OVER ()` is legal, so a windowed
             // call must not make an expression count as aggregate-bearing.
@@ -175463,6 +175523,11 @@ mod transaction_lifecycle_tests {
     fn test_memory_commit_and_retain_clears_prior_preservation_receipt() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
+            // The commit_and_retain fast path (which parks `cached_write_txn`) is
+            // only reached with retained-autocommit batching disabled; by default a
+            // :memory: ordinary write parks `retained_autocommit_txn` instead — see
+            // test_close_in_place_releases_memory_parked_write_transactions.
+            conn.autocommit_retain_enabled.set(false);
             conn.execute("CREATE VIRTUAL TABLE docs USING fts5(body)")
                 .await
                 .unwrap();
@@ -179054,10 +179119,8 @@ mod autocommit_txn_tests {
         fn latest_authorized_parallel_wal_commit_certificate<'a>(
             &'a mut self,
             cx: &'a Cx,
-        ) -> fsqlite_pager::traits::WalFuture<
-            'a,
-            Option<fsqlite_wal::ParallelWalCommitCertificate>,
-        > {
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<fsqlite_wal::ParallelWalCommitCertificate>>
+        {
             Box::pin(async move {
                 self.inner
                     .latest_authorized_parallel_wal_commit_certificate(cx)
