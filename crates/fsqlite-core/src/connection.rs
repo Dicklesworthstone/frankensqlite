@@ -10636,6 +10636,13 @@ pub struct Connection {
     /// `SELECT sql FROM sqlite_master` returns the text as written by the user,
     /// not a regenerated form with gratuitous identifier quoting.
     original_ddl_sql: RefCell<HashMap<String, String>>,
+    /// Verbatim source text of the single top-level `CREATE` statement currently
+    /// being executed through [`Connection::execute`], captured so DDL persists
+    /// into `sqlite_master` exactly as the user wrote it (matching stock SQLite),
+    /// rather than a re-serialized AST form that can drop semantically necessary
+    /// parentheses. `None` for multi-statement batches and non-CREATE statements;
+    /// consumed (taken) by the CREATE handler.
+    pending_ddl_source: RefCell<Option<String>>,
     /// Set of table names (lowercased) declared as
     /// `INTEGER PRIMARY KEY AUTOINCREMENT`.
     autoincrement_tables: RefCell<HashSet<String>>,
@@ -12178,6 +12185,7 @@ impl Connection {
             differential_registry: DifferentialRegistry::default(),
             rowid_alias_columns: RefCell::new(HashMap::new()),
             original_ddl_sql: RefCell::new(HashMap::new()),
+            pending_ddl_source: RefCell::new(None),
             autoincrement_tables: RefCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
             next_master_rowid: RefCell::new(1),
@@ -12667,6 +12675,7 @@ impl Connection {
             differential_registry: DifferentialRegistry::default(),
             rowid_alias_columns: RefCell::new(HashMap::new()),
             original_ddl_sql: RefCell::new(HashMap::new()),
+            pending_ddl_source: RefCell::new(None),
             autoincrement_tables: RefCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
             next_master_rowid: RefCell::new(1),
@@ -18973,6 +18982,22 @@ impl Connection {
                 .execute_prepared_autocommit_with_conflict_retry(&prepared, &[])
                 .await;
         }
+        // Preserve the verbatim CREATE text for a single top-level CREATE so it
+        // persists into sqlite_master exactly as written (matching stock SQLite),
+        // rather than a re-serialized AST form that can drop semantically necessary
+        // parentheses. Guarded to CreateTable only so an internal ALTER->CREATE
+        // rewrite can never mistake an ALTER's text for a table definition;
+        // multi-statement batches fall back to AST serialization.
+        *self.pending_ddl_source.borrow_mut() = (statements.len() == 1
+            && matches!(statements[0].as_ref(), Statement::CreateTable(_)))
+        .then(|| {
+            let trimmed = sql.trim();
+            trimmed
+                .strip_suffix(';')
+                .unwrap_or(trimmed)
+                .trim_end()
+                .to_owned()
+        });
         let mut last_count = 0;
         for statement in statements {
             let is_dml = matches!(
@@ -42116,25 +42141,37 @@ impl Connection {
         // Commit the accumulated writes. If that fails, match the normal
         // autocommit cleanup path by explicitly rolling the pager txn back and
         // restoring the MemDatabase mirror before we clear connection state.
+        // ORCHESTRATOR RULING (bd-dk9ra, release endgame): failure paths
+        // preserve the ORIGINAL error across in-doubt resolution and backend
+        // teardown — first error wins; cleanup errors are receipted as
+        // context, never returned in its place. Matches stock SQLite errno
+        // discipline: the D1 durable-certificate stack's teardown errors
+        // (e.g. Unsupported from a torn-down WAL backend) were replacing the
+        // actual commit failure and hiding it from callers.
         let commit_result = match txn.commit(cx).await {
             Ok(()) => Ok(()),
             Err(commit_error) => {
                 let rollback_result = txn.rollback(cx).await;
                 let rollback_succeeded = rollback_result.is_ok();
-                match rollback_result {
-                    Ok(()) => {
-                        let reload_result = if txn_had_pending_writes && rollback_succeeded {
-                            self.reload_memdb_from_pager(cx).await
-                        } else {
-                            Ok(())
-                        };
-                        match reload_result {
-                            Ok(()) => Err(commit_error),
-                            Err(reload_error) => Err(reload_error),
-                        }
-                    }
-                    Err(rollback_error) => Err(rollback_error),
+                if let Err(rollback_error) = rollback_result {
+                    tracing::warn!(
+                        target: "fsqlite.retained_autocommit",
+                        %commit_error,
+                        %rollback_error,
+                        "retained-flush rollback failed during cleanup; surfacing the original commit error"
+                    );
                 }
+                if txn_had_pending_writes && rollback_succeeded {
+                    if let Err(reload_error) = self.reload_memdb_from_pager(cx).await {
+                        tracing::warn!(
+                            target: "fsqlite.retained_autocommit",
+                            %commit_error,
+                            %reload_error,
+                            "retained-flush memdb reload failed during cleanup; surfacing the original commit error"
+                        );
+                    }
+                }
+                Err(commit_error)
             }
         };
         // Clear state regardless of commit outcome.
@@ -46906,7 +46943,16 @@ impl Connection {
                     check_constraints: check_defs,
                 };
                 let implicit_indexes_for_master = table_schema.indexes.clone();
-                let create_sql = create.to_string();
+                // Persist the user's verbatim CREATE text when available (a single
+                // top-level CREATE routed through execute()); fall back to AST
+                // serialization for multi-statement batches and internal rewrite
+                // paths. This keeps sqlite_master.sql byte-faithful to the original
+                // statement, matching stock SQLite's .schema output.
+                let create_sql = self
+                    .pending_ddl_source
+                    .borrow_mut()
+                    .take()
+                    .unwrap_or_else(|| create.to_string());
                 let rp = table_schema.root_page;
                 let tbl_name = table_schema.name.clone();
                 if target_is_temp {
@@ -75680,6 +75726,29 @@ impl Connection {
                 } else {
                     HashSet::new()
                 };
+                // bd-dk9ra: a live-vtab enlisted in the current transaction owns
+                // in-flight state (fail_sync flags, hook logs, uncommitted rows)
+                // that a pager reconnect would silently drop. Preserve its exact
+                // instance across the reload so xSync/xRollback run against the
+                // enlisted object (matching the transactional BEGIN path that
+                // short-circuits the reload entirely).
+                for enlisted_key in self
+                    .active_live_vtab_names()
+                    .into_iter()
+                    .map(|name| name.to_ascii_uppercase())
+                {
+                    if existing_live_vtabs.contains_key(&enlisted_key) {
+                        preserved_live_vtab_keys.insert(enlisted_key);
+                    }
+                }
+                eprintln!(
+                    "DK9RA_TRACE reload_else enlisted={:?} eligible={:?} existing={:?} preserved={:?} is_mem={}",
+                    self.active_live_vtab_names(),
+                    &eligible_preserved_live_vtab_keys,
+                    existing_live_vtabs.keys().collect::<Vec<_>>(),
+                    &preserved_live_vtab_keys,
+                    self.pager.is_memory()
+                );
                 drop(existing_live_vtabs);
                 let mut reloaded = self
                     .rebuild_materialized_live_vtab_instances_from_reload(
