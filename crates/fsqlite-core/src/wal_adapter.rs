@@ -6225,6 +6225,8 @@ mod tests {
             .expect("append via dyn");
         assert_eq!(backend.frame_count(), 1);
 
+        // Durable-certificate contract: publication gates dyn reads too.
+        backend.sync(&cx).expect("publish via dyn");
         let page = backend.read_page(&cx, 1).expect("read via dyn");
         assert_eq!(page, Some(sample_page(0x77)));
     }
@@ -7243,14 +7245,17 @@ mod tests {
             .append_frame(&cx, 3, &p3, 3)
             .expect("follower local commit");
 
+        // Durable-certificate contract: the append refreshes the EXTERNAL
+        // published prefix into the follower's snapshot, but the follower's
+        // own commit stays staged until its sync.
         assert_eq!(
             follower.published_snapshot.last_commit_frame,
-            Some(2),
-            "local commit should publish on top of refreshed external WAL state"
+            Some(1),
+            "refresh-before-append must publish the external prefix only"
         );
         assert_eq!(
-            follower.published_snapshot.commit_count, 3,
-            "local commit publication should include refreshed external commits"
+            follower.published_snapshot.commit_count, 2,
+            "the staged local commit must not count until publication"
         );
         assert_eq!(
             follower.published_snapshot.page_index.get(&1),
@@ -7264,8 +7269,21 @@ mod tests {
         );
         assert_eq!(
             follower.published_snapshot.page_index.get(&3),
+            None,
+            "the staged local page must stay out of the published map"
+        );
+
+        follower.sync(&cx).expect("publish follower local commit");
+        assert_eq!(
+            follower.published_snapshot.last_commit_frame,
+            Some(2),
+            "publication must extend the map with the local commit"
+        );
+        assert_eq!(follower.published_snapshot.commit_count, 3);
+        assert_eq!(
+            follower.published_snapshot.page_index.get(&3),
             Some(&2),
-            "local commit should extend the published WAL visibility map"
+            "published local commit extends the WAL visibility map"
         );
         assert_eq!(follower.read_page(&cx, 1).expect("read p1"), Some(p1));
         assert_eq!(follower.read_page(&cx, 2).expect("read p2"), Some(p2));
