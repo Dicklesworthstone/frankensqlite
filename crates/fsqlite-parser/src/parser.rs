@@ -2194,6 +2194,9 @@ impl Parser {
                 Ok(Statement::Select(self.parse_select_stmt(None)?))
             }
             TokenKind::KwWith => {
+                // Stock SQLite (3.46.1, verified) only allows a WITH (CTE) clause
+                // ahead of SELECT/VALUES in a trigger body; `WITH ... INSERT/
+                // UPDATE/DELETE` is a syntax error ("near INSERT"). Keep parity.
                 let with = self.parse_with_clause()?;
                 if matches!(self.peek(), TokenKind::KwSelect | TokenKind::KwValues) {
                     Ok(Statement::Select(self.parse_select_stmt(Some(with))?))

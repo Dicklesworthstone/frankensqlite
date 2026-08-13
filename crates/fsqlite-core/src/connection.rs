@@ -141086,28 +141086,21 @@ mod tests {
             conn.execute("CREATE TABLE source_table (a INTEGER);")
                 .await
                 .unwrap();
-            conn.execute(
-                "CREATE VIEW source_view AS \
+            // sqlite3 3.46.1 (oracle) rejects a persistent MAIN-schema view that
+            // references an attached database, so this view can never be created
+            // and a table rename can never reach it. FrankenSQLite keeps C-SQLite
+            // parity. Orchestrator ruling 2026-08-13 (bd-67tdh): reconcile the
+            // keeper to the oracle; assert the parity rejection.
+            let create = conn
+                .execute(
+                    "CREATE VIEW source_view AS \
              SELECT source_table.a FROM aux.source_table;",
-            )
-            .await
-            .unwrap();
-
-            conn.execute("ALTER TABLE source_table RENAME TO renamed_table;")
-                .await
-                .unwrap();
-
-            let rows = conn
-                .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='source_view';")
-                .await
-                .unwrap();
-            let view_sql = row_values(&rows[0])[0].to_text();
-            let lower_view_sql = view_sql.to_ascii_lowercase();
+                )
+                .await;
             assert!(
-                lower_view_sql.contains("from aux.source_table"),
-                "{view_sql}"
+                create.is_err(),
+                "a main view referencing an attached db must be rejected for C-SQLite parity, got {create:?}"
             );
-            assert!(!lower_view_sql.contains("aux.renamed_table"), "{view_sql}");
         });
     }
 
@@ -141723,9 +141716,17 @@ mod tests {
 
             let schema = conn.schema.borrow();
             let table = schema.iter().find(|table| table.name == "t").unwrap();
+            // sqlite3 3.46.1 (oracle) rewrites only the renamed column reference
+            // and preserves the rest of the partial-index WHERE verbatim -- its
+            // `.schema` shows `WHERE new_col > 0 AND payload <> 'old_col'`, with
+            // NO parentheses added around the AND operands and the string literal
+            // 'old_col' untouched. FrankenSQLite matches that structure (it
+            // renders the `<>` operator as its canonical `!=` synonym).
+            // Orchestrator ruling 2026-08-13 (bd-67tdh): match the sqlite3
+            // .schema form, not the old verbose-parenthesized reconstruction.
             assert_eq!(
                 table.indexes[0].where_clause.as_deref(),
-                Some("(new_col > 0) AND (payload != 'old_col')")
+                Some("new_col > 0 AND payload != 'old_col'")
             );
         });
     }
@@ -142501,27 +142502,19 @@ mod tests {
             conn.execute("CREATE TABLE t (old_col INTEGER);")
                 .await
                 .unwrap();
-            conn.execute("CREATE VIEW v AS SELECT old_col AS seen FROM aux.t;")
-                .await
-                .unwrap();
-
-            conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
-                .await
-                .unwrap();
-
-            let rows = conn
-                .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
-                .await
-                .unwrap();
-            let view_sql = row_values(&rows[0])[0].to_text();
-            let lower_view_sql = view_sql.to_ascii_lowercase();
+            // sqlite3 3.46.1 (oracle) rejects a persistent MAIN-schema view that
+            // references an attached database (`view v cannot reference objects
+            // in database aux`) even when aux is ATTACHed -- a main view may only
+            // reference its own database. FrankenSQLite keeps C-SQLite parity by
+            // rejecting it, so a main-table rename can never reach it.
+            // Orchestrator ruling 2026-08-13 (bd-67tdh): reconcile the keeper to
+            // the oracle; assert the parity rejection.
+            let create = conn
+                .execute("CREATE VIEW v AS SELECT old_col AS seen FROM aux.t;")
+                .await;
             assert!(
-                lower_view_sql.contains("select old_col as seen from aux.t"),
-                "{view_sql}"
-            );
-            assert!(
-                !lower_view_sql.contains("select new_col as seen from aux.t"),
-                "{view_sql}"
+                create.is_err(),
+                "a main view referencing an attached db must be rejected for C-SQLite parity, got {create:?}"
             );
         });
     }
@@ -143134,32 +143127,23 @@ mod tests {
             conn.execute("CREATE TABLE audit_log (seen INTEGER);")
                 .await
                 .unwrap();
-            conn.execute(
-                "CREATE TRIGGER t_ai AFTER INSERT ON t
+            // sqlite3 3.46.1 (oracle) rejects a WITH/CTE clause before DML in a
+            // trigger body; only WITH -> SELECT/VALUES is legal. FrankenSQLite
+            // keeps parity by rejecting it. Orchestrator ruling 2026-08-13
+            // (bd-67tdh): reconcile the keeper to the oracle; assert rejection.
+            let create = conn
+                .execute(
+                    "CREATE TRIGGER t_ai AFTER INSERT ON t
              BEGIN
                 WITH new AS (SELECT NEW.old_col AS seen)
                 INSERT INTO audit_log SELECT seen FROM new;
              END;",
-            )
-            .await
-            .unwrap();
-
-            conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
-                .await
-                .unwrap();
-            conn.execute("INSERT INTO t(new_col) VALUES (37);")
-                .await
-                .unwrap();
-
-            let rows = conn.query("SELECT seen FROM audit_log;").await.unwrap();
-            assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(37));
-            let rows = conn
-                .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
-                .await
-                .unwrap();
-            let trigger_sql = row_values(&rows[0])[0].to_text();
-            assert!(trigger_sql.contains("NEW.new_col"), "{trigger_sql}");
-            assert!(!trigger_sql.contains("NEW.old_col"), "{trigger_sql}");
+                )
+                .await;
+            assert!(
+                create.is_err(),
+                "NEW-shadowing WITH-before-DML in a trigger body must be rejected for C-SQLite parity, got {create:?}"
+            );
         });
     }
 
@@ -143371,51 +143355,26 @@ mod tests {
             conn.execute("CREATE TABLE audit_log (seen INTEGER);")
                 .await
                 .unwrap();
-            conn.execute(
-                "CREATE TRIGGER src_ai AFTER INSERT ON src
+            // sqlite3 3.46.1 (oracle) rejects a WITH/CTE clause before
+            // INSERT/UPDATE/DELETE in a trigger body (`near "INSERT": syntax
+            // error`); only WITH -> SELECT/VALUES is legal there. FrankenSQLite
+            // keeps C-SQLite parity by rejecting it too, so a column rename can
+            // never reach such a trigger. Orchestrator ruling 2026-08-13
+            // (bd-67tdh): reconcile keepers to the sqlite3 oracle rather than
+            // ship an extension stock rejects; this asserts the parity rejection.
+            let create = conn
+                .execute(
+                    "CREATE TRIGGER src_ai AFTER INSERT ON src
              BEGIN
                 WITH c AS (SELECT old_col FROM t)
                 INSERT INTO audit_log SELECT old_col FROM c;
              END;",
-            )
-            .await
-            .unwrap();
-
-            conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
-                .await
-                .unwrap();
-
-            let rows = conn
-                .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
-                .await
-                .unwrap();
-            let trigger_sql = row_values(&rows[0])[0].to_text();
-            let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+                )
+                .await;
             assert!(
-                lower_trigger_sql.contains("select new_col from t"),
-                "{trigger_sql}"
+                create.is_err(),
+                "WITH-before-DML in a trigger body must be rejected for C-SQLite parity, got {create:?}"
             );
-            assert!(
-                lower_trigger_sql.contains("select new_col from c"),
-                "{trigger_sql}"
-            );
-            assert!(
-                !lower_trigger_sql.contains("old_col from t"),
-                "{trigger_sql}"
-            );
-            assert!(
-                !lower_trigger_sql.contains("old_col from c"),
-                "{trigger_sql}"
-            );
-
-            conn.execute("INSERT INTO t(new_col) VALUES (5);")
-                .await
-                .unwrap();
-            conn.execute("INSERT INTO src(seed) VALUES (1);")
-                .await
-                .unwrap();
-            let rows = conn.query("SELECT seen FROM audit_log;").await.unwrap();
-            assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(5));
         });
     }
 
@@ -143432,50 +143391,25 @@ mod tests {
             conn.execute("CREATE TABLE audit_log (seen INTEGER);")
                 .await
                 .unwrap();
-            conn.execute(
-                "CREATE TRIGGER src_ai AFTER INSERT ON src
+            // sqlite3 3.46.1 (oracle) rejects a WITH/CTE clause before DML in a
+            // trigger body; only WITH -> SELECT/VALUES is legal. FrankenSQLite
+            // keeps parity by rejecting it. Orchestrator ruling 2026-08-13
+            // (bd-67tdh): reconcile the keeper to the oracle; assert rejection.
+            let create = conn
+                .execute(
+                    "CREATE TRIGGER src_ai AFTER INSERT ON src
              BEGIN
                 WITH
                     c1 AS (SELECT old_col FROM t),
                     c2 AS (SELECT old_col FROM c1)
                 INSERT INTO audit_log SELECT old_col FROM c2;
              END;",
-            )
-            .await
-            .unwrap();
-
-            conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
-                .await
-                .unwrap();
-
-            let rows = conn
-                .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
-                .await
-                .unwrap();
-            let trigger_sql = row_values(&rows[0])[0].to_text();
-            let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+                )
+                .await;
             assert!(
-                lower_trigger_sql.contains("select new_col from t"),
-                "{trigger_sql}"
+                create.is_err(),
+                "chained WITH-before-DML in a trigger body must be rejected for C-SQLite parity, got {create:?}"
             );
-            assert!(
-                lower_trigger_sql.contains("select new_col from c1"),
-                "{trigger_sql}"
-            );
-            assert!(
-                lower_trigger_sql.contains("select new_col from c2"),
-                "{trigger_sql}"
-            );
-            assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
-
-            conn.execute("INSERT INTO t(new_col) VALUES (8);")
-                .await
-                .unwrap();
-            conn.execute("INSERT INTO src(seed) VALUES (1);")
-                .await
-                .unwrap();
-            let rows = conn.query("SELECT seen FROM audit_log;").await.unwrap();
-            assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(8));
         });
     }
 
@@ -143492,50 +143426,25 @@ mod tests {
             conn.execute("CREATE TABLE audit_log (seen INTEGER);")
                 .await
                 .unwrap();
-            conn.execute(
-                "CREATE TRIGGER src_ai AFTER INSERT ON src
+            // sqlite3 3.46.1 (oracle) rejects a WITH/CTE clause before DML in a
+            // trigger body; only WITH -> SELECT/VALUES is legal. FrankenSQLite
+            // keeps parity by rejecting it. Orchestrator ruling 2026-08-13
+            // (bd-67tdh): reconcile the keeper to the oracle; assert rejection.
+            let create = conn
+                .execute(
+                    "CREATE TRIGGER src_ai AFTER INSERT ON src
              BEGIN
                 WITH
                     c1 AS (SELECT * FROM t),
                     c2 AS (SELECT old_col FROM c1)
                 INSERT INTO audit_log SELECT old_col FROM c2;
              END;",
-            )
-            .await
-            .unwrap();
-
-            conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
-                .await
-                .unwrap();
-
-            let rows = conn
-                .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
-                .await
-                .unwrap();
-            let trigger_sql = row_values(&rows[0])[0].to_text();
-            let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+                )
+                .await;
             assert!(
-                lower_trigger_sql.contains("select * from t"),
-                "{trigger_sql}"
+                create.is_err(),
+                "star-CTE WITH-before-DML in a trigger body must be rejected for C-SQLite parity, got {create:?}"
             );
-            assert!(
-                lower_trigger_sql.contains("select new_col from c1"),
-                "{trigger_sql}"
-            );
-            assert!(
-                lower_trigger_sql.contains("select new_col from c2"),
-                "{trigger_sql}"
-            );
-            assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
-
-            conn.execute("INSERT INTO t(new_col) VALUES (11);")
-                .await
-                .unwrap();
-            conn.execute("INSERT INTO src(seed) VALUES (1);")
-                .await
-                .unwrap();
-            let rows = conn.query("SELECT seen FROM audit_log;").await.unwrap();
-            assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(11));
         });
     }
 
@@ -143696,8 +143605,13 @@ mod tests {
             conn.execute("CREATE TABLE audit_log (seen INTEGER);")
                 .await
                 .unwrap();
-            conn.execute(
-                "CREATE TRIGGER src_ai AFTER INSERT ON src
+            // sqlite3 3.46.1 (oracle) rejects a WITH/CTE clause before DML in a
+            // trigger body; only WITH -> SELECT/VALUES is legal. FrankenSQLite
+            // keeps parity by rejecting it. Orchestrator ruling 2026-08-13
+            // (bd-67tdh): reconcile the keeper to the oracle; assert rejection.
+            let create = conn
+                .execute(
+                    "CREATE TRIGGER src_ai AFTER INSERT ON src
              BEGIN
                 WITH c(y) AS (SELECT 1)
                 INSERT INTO audit_log
@@ -143705,29 +143619,12 @@ mod tests {
                 FROM t
                 WHERE EXISTS (SELECT 1 FROM c WHERE old_col > y);
              END;",
-            )
-            .await
-            .unwrap();
-
-            conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
-                .await
-                .unwrap();
-
-            let rows = conn
-                .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
-                .await
-                .unwrap();
-            let trigger_sql = row_values(&rows[0])[0].to_text();
-            let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+                )
+                .await;
             assert!(
-                lower_trigger_sql.contains("select new_col from t"),
-                "{trigger_sql}"
+                create.is_err(),
+                "correlated WITH-before-DML in a trigger body must be rejected for C-SQLite parity, got {create:?}"
             );
-            assert!(
-                lower_trigger_sql.contains("where new_col > y"),
-                "{trigger_sql}"
-            );
-            assert!(!lower_trigger_sql.contains("old_col > y"), "{trigger_sql}");
         });
     }
 
