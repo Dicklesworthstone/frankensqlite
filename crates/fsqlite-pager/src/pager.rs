@@ -18170,11 +18170,17 @@ where
             // those exact page numbers to the next allocator — one physical
             // page handed to two b-trees (index/table desync, LeafIndex
             // pages reached through table roots, 0x00 page flags: the
-            // fleet corruption-epoch signatures). Return this transaction's
-            // own EOF pages to the freelist instead, exactly like the
-            // concurrent arm above; the high-water mark stays monotonic.
-            return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-            return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
+            // fleet corruption-epoch signatures). DROP this transaction's
+            // own EOF allocations instead: returning them to the shared
+            // freelist is equally unsafe here, because a detached-flushing
+            // peer's pages can reach the freelist while active_transactions
+            // has already been decremented, and the non-concurrent pop arm
+            // would hand them out again. A dropped EOF page above the
+            // committed db_size is a benign hole — it was never durable and
+            // the file never grows to include it unless something later
+            // re-allocates past it.
+            self.page_lease.clear();
+            self.allocated_from_eof.clear();
         }
     }
 }
@@ -20560,8 +20566,7 @@ where
                 // WAL/db read below, which serves its real image. Pages truly beyond
                 // the fixed bound (e.g. a writer's own freshly allocated page) still
                 // zero-fill here.
-                if page_no.get() > snapshot.db_size
-                    && page_no.get() > self.published_db_size.get()
+                if page_no.get() > snapshot.db_size && page_no.get() > self.published_db_size.get()
                 {
                     if self.published.current_sequence_gen() == snapshot.snapshot_gen {
                         tracing::trace!(
