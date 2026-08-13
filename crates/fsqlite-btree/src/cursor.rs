@@ -4722,8 +4722,7 @@ impl<P: PageReader> BtCursor<P> {
         // storage-cursor scratch countermetric (one phantom full parse per
         // probe) without any real scratch regression.
         let parsed_target = {
-            let _record_profile_scope =
-                enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
             parse_record(target)
         };
 
@@ -4784,8 +4783,7 @@ impl<P: PageReader> BtCursor<P> {
         // storage-cursor scratch countermetric (one phantom full parse per
         // probe) without any real scratch regression.
         let parsed_target = {
-            let _record_profile_scope =
-                enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
             parse_record(target)
         };
 

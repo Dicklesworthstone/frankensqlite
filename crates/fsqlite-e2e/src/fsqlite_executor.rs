@@ -4126,8 +4126,7 @@ mod tests {
         // assumed the full Phase-C path this workload no longer takes).
         assert_eq!(
             profile.wal.commit_path.hist_phase_b.count,
-            profile.wal.commit_path.flusher_commits
-                + profile.wal.commit_path.waiter_commits,
+            profile.wal.commit_path.flusher_commits + profile.wal.commit_path.waiter_commits,
             "{profile:?}"
         );
         assert_eq!(
