@@ -4114,8 +4114,20 @@ mod tests {
 
         assert!(report.error.is_none(), "error={:?}", report.error);
         assert!(profile.wal.commit_path.flusher_commits > 0, "{profile:?}");
-        assert!(
-            profile.wal.commit_path.commit_phase_count > 0,
+        // bd-dk9ra reconcile: commit_phase_count is only incremented by
+        // record_commit_phases on the full Phase-C commit path. This profiling
+        // workload commits entirely through the flusher fast path
+        // (flusher_commits > 0, waiter_commits == 0) after the release-window
+        // commit-path changes, so the full-commit scalar counters
+        // (commit_phase_count, commit_phase_*_us_total) stay 0 while the split is
+        // recorded through the per-phase histograms instead. Assert the split IS
+        // captured for every commit: exactly one phase-B histogram sample per
+        // flusher/waiter commit (delta vs the old `commit_phase_count > 0`, which
+        // assumed the full Phase-C path this workload no longer takes).
+        assert_eq!(
+            profile.wal.commit_path.hist_phase_b.count,
+            profile.wal.commit_path.flusher_commits
+                + profile.wal.commit_path.waiter_commits,
             "{profile:?}"
         );
         assert_eq!(
