@@ -18152,7 +18152,7 @@ where
         if self.mode == TransactionMode::Concurrent {
             return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
             return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
-        } else {
+        } else if inner.active_transactions <= 1 {
             self.page_lease.clear();
             self.allocated_from_eof.clear();
             inner.db_size = self.original_db_size;
@@ -18161,6 +18161,20 @@ where
             } else {
                 2
             };
+        } else {
+            // bd-0shxy: NEVER regress the shared EOF high-water mark while
+            // other transactions are live. `next_page` is monotonic across
+            // every transaction on this pager; concurrent peers may hold
+            // EOF allocations and page leases ABOVE this transaction's
+            // original_db_size, and resetting next_page here re-granted
+            // those exact page numbers to the next allocator — one physical
+            // page handed to two b-trees (index/table desync, LeafIndex
+            // pages reached through table roots, 0x00 page flags: the
+            // fleet corruption-epoch signatures). Return this transaction's
+            // own EOF pages to the freelist instead, exactly like the
+            // concurrent arm above; the high-water mark stays monotonic.
+            return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+            return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
         }
     }
 }
@@ -18739,14 +18753,12 @@ where
             // (exactly their pre-D1 semantics; the write lock serializes
             // their writers); snapshot-capable backends keep the full
             // fail-closed refusal, preserving what def2ed8c5 protects.
-            let backend_has_snapshot_facility =
-                with_wal_backend_read(wal_backend, cx, |wal, _| {
-                    Box::pin(async move {
-                        Ok(wal.published_snapshot().is_some()
-                            || wal.pinned_read_snapshot().is_some())
-                    })
+            let backend_has_snapshot_facility = with_wal_backend_read(wal_backend, cx, |wal, _| {
+                Box::pin(async move {
+                    Ok(wal.published_snapshot().is_some() || wal.pinned_read_snapshot().is_some())
                 })
-                .await?;
+            })
+            .await?;
             if backend_has_snapshot_facility {
                 if let Some(attempt) = txn_attempt {
                     attempt.complete_not_committed_global()?;
@@ -20535,7 +20547,22 @@ where
                 .published
                 .snapshot_for_page_plane(self.published_visible_commit_seq.get())
             {
-                if page_no.get() > snapshot.db_size {
+                // bd-o81ov: only resolve to zeros for a page BEYOND the
+                // transaction's FIXED snapshot bound (`published_db_size`, captured
+                // at begin as max(published.db_size, inner.db_size)). The LIVE
+                // page-plane snapshot's db_size can transiently lag that fixed bound
+                // under concurrent publishes (the seed's larger db_size is known via
+                // inner but not yet re-advertised on the page plane), and
+                // zero-filling a page that the fixed snapshot legitimately contains
+                // drops committed rows — a whole leaf reads empty and BEGIN
+                // CONCURRENT returns "0 rows". A page within the fixed bound but
+                // beyond the live page-plane db_size falls through to the committed
+                // WAL/db read below, which serves its real image. Pages truly beyond
+                // the fixed bound (e.g. a writer's own freshly allocated page) still
+                // zero-fill here.
+                if page_no.get() > snapshot.db_size
+                    && page_no.get() > self.published_db_size.get()
+                {
                     if self.published.current_sequence_gen() == snapshot.snapshot_gen {
                         tracing::trace!(
                             target: "fsqlite.snapshot_publication",
@@ -26565,9 +26592,10 @@ mod tests {
             let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
                 .await
                 .expect("open must tolerate a partial-page trailing tail");
-            let txn = pager.begin(&cx, TransactionMode::ReadOnly).await.expect(
-                "slack-bearing database must stay readable after open",
-            );
+            let txn = pager
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .expect("slack-bearing database must stay readable after open");
             drop(txn);
         });
     }
