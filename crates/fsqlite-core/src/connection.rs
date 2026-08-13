@@ -248843,6 +248843,162 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_insert_values_ingest_keeps_memdb_mirror_incrementally_exact() {
+        asupersync::test_utils::run_test(|| async {
+            // bd-vjmae keeper 1: multi-statement INSERT...VALUES ingest on a
+            // file-backed database must maintain the MemDatabase mirror
+            // INCREMENTALLY — no whole-database rematerialization per
+            // statement — and the incremental mirror must be byte-equal to a
+            // full rematerialization (fresh-connection oracle).
+            let _profile_guard = StatementReuseHotPathProfileGuard::new();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("vjmae_ingest.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&db_str).await.unwrap();
+            conn.execute("CREATE TABLE ingest (id INTEGER PRIMARY KEY, a INTEGER, b TEXT);")
+                .await
+                .unwrap();
+            // Hydrate the mirror to an exact state before measuring.
+            let warm = conn.query("SELECT COUNT(*) FROM ingest;").await.unwrap();
+            assert_eq!(warm.len(), 1);
+
+            reset_hot_path_profile();
+            for batch in 0..8i64 {
+                let base = batch * 4;
+                conn.execute(&format!(
+                    "INSERT INTO ingest VALUES \
+                     ({}, {}, 'r{}'), ({}, {}, 'r{}'), ({}, {}, 'r{}'), ({}, {}, 'r{}');",
+                    base + 1,
+                    base,
+                    base + 1,
+                    base + 2,
+                    base,
+                    base + 2,
+                    base + 3,
+                    base,
+                    base + 3,
+                    base + 4,
+                    base,
+                    base + 4,
+                ))
+                .await
+                .unwrap();
+                // The HFDT ingest interleaves read-backs; each one is a read
+                // boundary that forces a whole-db rematerialization whenever
+                // the preceding INSERT abandoned the mirror.
+                let rows = conn.query("SELECT COUNT(*) FROM ingest;").await.unwrap();
+                assert_eq!(
+                    rows[0].get(0),
+                    Some(&SqliteValue::Integer((batch + 1) * 4)),
+                    "read-back after batch {batch}"
+                );
+            }
+            let profile = hot_path_profile_snapshot();
+            assert_eq!(
+                profile.memdb_refresh_count, 0,
+                "8 INSERT...VALUES statements with interleaved read-backs \
+                 must not rematerialize the memdb mirror per statement: {profile:?}"
+            );
+
+            // Byte-equality mirror oracle: a fresh connection's fully
+            // rematerialized mirror must match the incremental one row for
+            // row and value for value.
+            let incremental: Vec<Vec<SqliteValue>> = conn
+                .query("SELECT id, a, b FROM ingest ORDER BY id;")
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect();
+            let oracle_conn = Connection::open(&db_str).await.unwrap();
+            let rematerialized: Vec<Vec<SqliteValue>> = oracle_conn
+                .query("SELECT id, a, b FROM ingest ORDER BY id;")
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect();
+            assert_eq!(incremental.len(), 32);
+            assert_eq!(
+                incremental, rematerialized,
+                "incremental mirror must be value-equal to full rematerialization"
+            );
+        });
+    }
+
+    #[test]
+    fn test_non_values_statements_still_take_full_memdb_path() {
+        asupersync::test_utils::run_test(|| async {
+            // bd-vjmae countermetric: statements that are NOT plain
+            // INSERT...VALUES (here INSERT...SELECT) must keep the
+            // full-rematerialization discipline — the mirror gets marked for
+            // reload rather than incrementally patched.
+            let _profile_guard = StatementReuseHotPathProfileGuard::new();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("vjmae_countermetric.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&db_str).await.unwrap();
+            conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, v TEXT);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO src VALUES (1, 'x'), (2, 'y');")
+                .await
+                .unwrap();
+            let _ = conn.query("SELECT COUNT(*) FROM dst;").await.unwrap();
+
+            // INSERT...SELECT is exactly tracked at HEAD (row-stream replay
+            // into per-row direct inserts) — mechanism-agnostic correctness
+            // is the invariant: mirror equals a fresh-connection oracle.
+            conn.execute("INSERT INTO dst SELECT id, v FROM src;")
+                .await
+                .unwrap();
+            let rows = conn.query("SELECT COUNT(*) FROM dst;").await.unwrap();
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(2)));
+
+            // Mechanism countermetric: a statement shape the engine provably
+            // cannot exactly track — UPDATE ... RETURNING routes through the
+            // fallback lane — must dirty the mirror and rematerialize at the
+            // next read boundary rather than serve a stale image.
+            reset_hot_path_profile();
+            conn.execute("UPDATE dst SET v = 'z' WHERE id = 1 RETURNING v;")
+                .await
+                .unwrap();
+            let rows = conn.query("SELECT v FROM dst WHERE id = 1;").await.unwrap();
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::Text("z".into())));
+            let profile = hot_path_profile_snapshot();
+            assert!(
+                profile.prepared_update_delete_fallback_returning >= 1
+                    || profile.memdb_refresh_count >= 1,
+                "the untrackable RETURNING shape must take the full path: {profile:?}"
+            );
+
+            // Byte-equality oracle after the mixed workload.
+            let incremental: Vec<Vec<SqliteValue>> = conn
+                .query("SELECT id, v FROM dst ORDER BY id;")
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect();
+            let oracle_conn = Connection::open(&db_str).await.unwrap();
+            let rematerialized: Vec<Vec<SqliteValue>> = oracle_conn
+                .query("SELECT id, v FROM dst ORDER BY id;")
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect();
+            assert_eq!(
+                incremental, rematerialized,
+                "mirror must match full rematerialization after the mixed workload"
+            );
+        });
+    }
+
+    #[test]
     fn test_prepared_direct_insert_preserialize_fallback_does_not_publish_child_profile() {
         asupersync::test_utils::run_test(|| async {
             // The preserialize-family attribution asserted below is
