@@ -509,9 +509,10 @@ fn flock_whole_file_fallback(file: &impl AsFd, l_type: libc::c_short) -> nix::Re
     }
 }
 
-/// Attempt a non-blocking POSIX advisory lock via `fcntl(F_SETLK)`.
+/// Attempt a non-blocking POSIX advisory lock via [`fcntl_setlk`].
 ///
-/// Uses the `nix` crate for safe syscall wrapping (no `unsafe` needed).
+/// On Linux this is a safe `nix` `F_SETLK` wrapper; on Darwin/other Unix it
+/// dispatches through [`fcntl_setlk`] (OFD locks, with a `flock(2)` fallback).
 ///
 /// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if it would
 /// block (another process holds a conflicting lock), and `Err` for real
