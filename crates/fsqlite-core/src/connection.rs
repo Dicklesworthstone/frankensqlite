@@ -18677,25 +18677,55 @@ impl Connection {
         // clears it. Explicit reload_memdb_from_pager calls (not this prepare path)
         // still consume it, so the one-shot reload contract is unchanged.
         let saved_preservation_receipt = self.pending_local_live_vtab_preservation.borrow().clone();
-        self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
-            .await?;
-        if self.committed_pager_refresh_allowed() {
-            // File-backed autocommit prepares must refresh the committed MemDB
-            // image before prepared-cache lookup so any cache hit is keyed
-            // against the latest visible snapshot rather than stale local state.
-            //
-            // Keep this before the lightweight prepared-schema refresh below:
-            // that path may advance `memdb_visible_commit_seq` without
-            // hydrating rows, which would make a stale row image look current
-            // to file-backed direct row lookup preparation.
-            self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
-            if !self.memdb_rows_loaded.get() {
-                self.reload_memdb_from_pager(&op_cx).await?;
-            } else {
-                self.refresh_memdb_if_stale(&op_cx).await?;
+        // bd-t16-busy-recovery-qzu9p: the refresh prologue is a startup-class
+        // admission — under concurrent opens of a live-WAL file family, a
+        // peer's WAL-index recovery (legacy shm lock protocol, exclusive
+        // recovery locks) makes these refreshes transiently Busy/BusyRecovery
+        // and prepare failed fast, aborting T16 worker setup. Retry the
+        // transient class within the busy-timeout window (bootstrap floor for
+        // zero-timeout connections), exactly like the autocommit conflict
+        // retry and retry_busy_connection_bootstrap; non-transient errors and
+        // the compile phase below are untouched.
+        let busy_timeout_ms = (self.pragma_state.borrow().busy_timeout_ms.max(0) as u64)
+            .max(CONNECTION_BOOTSTRAP_BUSY_TIMEOUT_MS);
+        let refresh_deadline = Duration::from_millis(busy_timeout_ms);
+        let refresh_started = Instant::now();
+        let mut refresh_handoff = BeginBusyRetryHandoff::default();
+        loop {
+            let attempt: Result<()> = async {
+                self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
+                    .await?;
+                if self.committed_pager_refresh_allowed() {
+                    // File-backed autocommit prepares must refresh the committed MemDB
+                    // image before prepared-cache lookup so any cache hit is keyed
+                    // against the latest visible snapshot rather than stale local state.
+                    //
+                    // Keep this before the lightweight prepared-schema refresh below:
+                    // that path may advance `memdb_visible_commit_seq` without
+                    // hydrating rows, which would make a stale row image look current
+                    // to file-backed direct row lookup preparation.
+                    self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
+                    if !self.memdb_rows_loaded.get() {
+                        self.reload_memdb_from_pager(&op_cx).await?;
+                    } else {
+                        self.refresh_memdb_if_stale(&op_cx).await?;
+                    }
+                }
+                let _ = self.refresh_prepared_schema_state(&op_cx, true).await?;
+                Ok(())
+            }
+            .await;
+            match attempt {
+                Ok(()) => break,
+                Err(error) if error.is_transient() => {
+                    match refresh_handoff.next_wait(refresh_started, refresh_deadline) {
+                        Some(wait) => perform_begin_busy_retry_handoff(wait).await,
+                        None => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
-        let _ = self.refresh_prepared_schema_state(&op_cx, true).await?;
         if saved_preservation_receipt.is_some()
             && self.pending_local_live_vtab_preservation.borrow().is_none()
         {
