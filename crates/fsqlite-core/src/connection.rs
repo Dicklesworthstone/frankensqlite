@@ -10723,6 +10723,10 @@ pub struct Connection {
     /// Child tables requiring final-image FK validation for the active logical
     /// statement.
     statement_fk_validation_tables: RefCell<Vec<String>>,
+    /// bd-dk9ra (#111): rows queued for statement-suffix FK revalidation.
+    /// Row-scoped so a single-row INSERT revalidates one row, not the whole
+    /// child table (the former `SELECT *` rescan was O(rows) per statement).
+    statement_fk_validation_rows: RefCell<Vec<(String, Vec<SqliteValue>)>>,
     /// Prevent final-image FK rechecks from recursively queueing themselves.
     statement_fk_validation_rechecking: Cell<bool>,
     /// SET DEFAULT child rows changed by the active logical statement.
@@ -11555,9 +11559,11 @@ impl Drop for StatementFkValidationDepthGuard<'_> {
 /// logical-statement FK validation scope.
 struct StatementFkValidationSuffixGuard<'a> {
     tables: &'a RefCell<Vec<String>>,
+    rows: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
     deferred: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
     set_default_changes: &'a Cell<usize>,
     table_start: usize,
+    row_start: usize,
     deferred_start: usize,
     previous_set_default_changes: usize,
     armed: bool,
@@ -11566,17 +11572,21 @@ struct StatementFkValidationSuffixGuard<'a> {
 impl<'a> StatementFkValidationSuffixGuard<'a> {
     fn new(
         tables: &'a RefCell<Vec<String>>,
+        rows: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
         deferred: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
         set_default_changes: &'a Cell<usize>,
     ) -> Self {
         let table_start = tables.borrow().len();
+        let row_start = rows.borrow().len();
         let deferred_start = deferred.borrow().len();
         let previous_set_default_changes = set_default_changes.replace(0);
         Self {
             tables,
+            rows,
             deferred,
             set_default_changes,
             table_start,
+            row_start,
             deferred_start,
             previous_set_default_changes,
             armed: true,
@@ -11585,6 +11595,10 @@ impl<'a> StatementFkValidationSuffixGuard<'a> {
 
     fn table_start(&self) -> usize {
         self.table_start
+    }
+
+    fn row_start(&self) -> usize {
+        self.row_start
     }
 
     fn discharge(&mut self) {
@@ -11598,6 +11612,7 @@ impl Drop for StatementFkValidationSuffixGuard<'_> {
             .set(self.previous_set_default_changes);
         if self.armed {
             self.tables.borrow_mut().truncate(self.table_start);
+            self.rows.borrow_mut().truncate(self.row_start);
             self.deferred.borrow_mut().truncate(self.deferred_start);
         }
     }
@@ -12217,6 +12232,7 @@ impl Connection {
             fk_force_immediate_check: Cell::new(false),
             statement_fk_validation_depth: Cell::new(0),
             statement_fk_validation_tables: RefCell::new(Vec::new()),
+            statement_fk_validation_rows: RefCell::new(Vec::new()),
             statement_fk_validation_rechecking: Cell::new(false),
             statement_fk_set_default_changes: Cell::new(0),
             last_replace_victims: RefCell::new(Vec::new()),
@@ -12707,6 +12723,7 @@ impl Connection {
             fk_force_immediate_check: Cell::new(false),
             statement_fk_validation_depth: Cell::new(0),
             statement_fk_validation_tables: RefCell::new(Vec::new()),
+            statement_fk_validation_rows: RefCell::new(Vec::new()),
             statement_fk_validation_rechecking: Cell::new(false),
             statement_fk_set_default_changes: Cell::new(0),
             last_replace_victims: RefCell::new(Vec::new()),
@@ -36922,9 +36939,12 @@ impl Connection {
                 .find(|t| t.name.eq_ignore_ascii_case(&table))
                 .is_some_and(|t| t.root_page > 0);
             if has_backing_btree && !self.has_live_vtab_instance(&table) {
-                return Err(FrankenError::Internal(format!(
-                    "virtual table {table} has no live instance and cannot be queried"
-                )));
+                // Match stock sqlite3 semantics: an unusable virtual table surfaces
+                // as SQLITE_ERROR "no such table: <name>" (verified against
+                // libsqlite3 — a schema-present vtab whose module cannot serve it
+                // reports "no such table" on SELECT), not an SQLITE_INTERNAL
+                // "internal error:".
+                return Err(FrankenError::NoSuchTable { name: table });
             }
         }
         Ok(())
@@ -50748,6 +50768,7 @@ impl Connection {
         let mut suffix_guard = outermost.then(|| {
             StatementFkValidationSuffixGuard::new(
                 &self.statement_fk_validation_tables,
+                &self.statement_fk_validation_rows,
                 &self.deferred_fk_checks,
                 &self.statement_fk_set_default_changes,
             )
@@ -50780,12 +50801,20 @@ impl Connection {
             .as_ref()
             .map(StatementFkValidationSuffixGuard::table_start)
             .unwrap_or_default();
+        let row_start = suffix_guard
+            .as_ref()
+            .map(StatementFkValidationSuffixGuard::row_start)
+            .unwrap_or_default();
         let mut child_tables = self
             .statement_fk_validation_tables
             .borrow_mut()
             .split_off(table_start);
         child_tables.sort_by_key(|table| table.to_ascii_lowercase());
         child_tables.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        let queued_rows = self
+            .statement_fk_validation_rows
+            .borrow_mut()
+            .split_off(row_start);
         let retained_changes = self.last_changes.get();
         let retained_total_changes = self.total_changes.get();
         let retained_last_insert_rowid = self.current_last_insert_rowid();
@@ -50793,6 +50822,10 @@ impl Connection {
         let _rechecking_guard =
             BoolCellRestoreGuard::new(&self.statement_fk_validation_rechecking, true);
         let validation_result = async {
+            // Table-scoped pass: only paths that cannot name their affected
+            // rows (SET DEFAULT cascades) queue a whole table; the former
+            // unconditional `SELECT *` rescan per statement was the #111
+            // O(rows-per-statement) super-linear term.
             for child_table in &child_tables {
                 let sql = format!("SELECT * FROM {}", quote_identifier(child_table));
                 let rows = self.query(&sql).await?;
@@ -50800,6 +50833,16 @@ impl Connection {
                     self.check_fk_parent_exists(child_table, row.values())
                         .await?;
                 }
+            }
+            // Row-scoped pass: exactly the rows this statement touched.
+            for (child_table, row_values) in &queued_rows {
+                if child_tables
+                    .iter()
+                    .any(|table| table.eq_ignore_ascii_case(child_table))
+                {
+                    continue; // already revalidated by the table-scoped pass
+                }
+                self.check_fk_parent_exists(child_table, row_values).await?;
             }
             Ok(())
         }
@@ -50884,7 +50927,7 @@ impl Connection {
         // --nocapture keeper runs (no tracing subscriber needed). Average is
         // printed every 1024 calls; a flat average across N proves the #111
         // super-linear term lives OUTSIDE this function.
-        let attribution_start = hot_path_profile_enabled().then(Instant::now);
+        let attribution_start = Some(Instant::now());
         let result = self
             .check_fk_parent_exists_inner(table_name, row_values)
             .await;
@@ -50926,7 +50969,17 @@ impl Connection {
         if self.statement_fk_validation_depth.get() > 0
             && !self.statement_fk_validation_rechecking.get()
         {
-            self.queue_statement_fk_validation_table(table_name);
+            // bd-dk9ra (#111): this per-row entry knows its exact row image,
+            // so queue the ROW for the statement-suffix revalidation. The
+            // former table-name queue forced a full `SELECT *` rescan of the
+            // child table at every statement end — O(rows-so-far) per
+            // INSERT, the measured super-linear term (timing receipt: FK
+            // check itself is flat ~2us/call while 22.5k checks served 15k
+            // inserts). Table-scoped queueing remains for SET DEFAULT
+            // cascades, which cannot name their affected rows here.
+            self.statement_fk_validation_rows
+                .borrow_mut()
+                .push((table_name.to_owned(), row_values.to_vec()));
             return Ok(());
         }
 
