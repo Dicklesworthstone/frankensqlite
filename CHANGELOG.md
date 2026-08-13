@@ -19,7 +19,7 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.3.0] -- unreleased (Asupersync 0.4.3 compatibility + bug-fix and performance wave)
+## [0.3.0] -- 2026-08-13 (Asupersync 0.4.3 compatibility + bug-fix and performance wave)
 
 Lockstep `0.2.1 -> 0.3.0` bump of all 27 workspace members, carrying the
 Asupersync `0.4.3` runtime migration **plus a large verified bug-fix wave and
