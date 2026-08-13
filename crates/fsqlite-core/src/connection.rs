@@ -50927,7 +50927,7 @@ impl Connection {
         // --nocapture keeper runs (no tracing subscriber needed). Average is
         // printed every 1024 calls; a flat average across N proves the #111
         // super-linear term lives OUTSIDE this function.
-        let attribution_start = Some(Instant::now());
+        let attribution_start = hot_path_profile_enabled().then(Instant::now);
         let result = self
             .check_fk_parent_exists_inner(table_name, row_values)
             .await;
@@ -147095,7 +147095,23 @@ mod tests {
                         format!("w{worker_id:02}-tx{txn_idx:03}-bd-{issue_idx:03}");
 
                     loop {
-                        conn.execute("BEGIN CONCURRENT;").await.unwrap();
+                        // BEGIN CONCURRENT can return a transient BusySnapshot
+                        // ("pager publication advanced between metadata bind and
+                        // reload transaction") when a peer commits between this
+                        // begin's metadata bind and its reload transaction — retry
+                        // it exactly like the UPDATE/COMMIT steps below.
+                        match conn.execute("BEGIN CONCURRENT;").await {
+                            Ok(_) => {}
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                drop(conn.execute("ROLLBACK;").await);
+                                continue;
+                            }
+                            Err(err) => panic!(
+                                "non-transient BEGIN CONCURRENT failure \
+                                 (worker={worker_id} txn={txn_idx} issue=bd-{issue_idx:03}): {err}"
+                            ),
+                        }
                         let update_sql = format!(
                             "UPDATE issues
                              SET content_hash = '{content_hash}',
