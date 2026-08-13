@@ -83466,6 +83466,10 @@ fn splice_added_column_into_create_sql(original_sql: &str, new_column_sql: &str)
     };
 
     // Find the column-list opening paren (first top-level '(').
+    // bd-lgolw: comments and `[...]` identifiers must be skipped like quoted
+    // spans — a paren/comma inside `-- ...`, `/* ... */`, or brackets is
+    // content, not structure; counting it corrupts the splice point on
+    // multi-line comment-bearing CREATEs.
     let mut i = 0usize;
     let open = loop {
         if i >= bytes.len() {
@@ -83473,6 +83477,24 @@ fn splice_added_column_into_create_sql(original_sql: &str, new_column_sql: &str)
         }
         match bytes[i] {
             b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
+            b'[' => {
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                i = (i + 1).min(bytes.len());
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
             b'(' => break i,
             _ => i += 1,
         }
@@ -83499,6 +83521,27 @@ fn splice_added_column_into_create_sql(original_sql: &str, new_column_sql: &str)
         match bytes[j] {
             b'\'' | b'"' | b'`' => {
                 j = skip_quoted(bytes, j);
+                continue;
+            }
+            b'[' => {
+                while j < bytes.len() && bytes[j] != b']' {
+                    j += 1;
+                }
+                j = (j + 1).min(bytes.len());
+                continue;
+            }
+            b'-' if bytes.get(j + 1) == Some(&b'-') => {
+                while j < bytes.len() && bytes[j] != b'\n' {
+                    j += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(j + 1) == Some(&b'*') => {
+                j += 2;
+                while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                    j += 1;
+                }
+                j = (j + 2).min(bytes.len());
                 continue;
             }
             b'(' => depth += 1,
@@ -83529,6 +83572,62 @@ fn splice_added_column_into_create_sql(original_sql: &str, new_column_sql: &str)
     out.push_str(new_column_sql);
     out.push_str(&original_sql[insert_at..]);
     Some(out)
+}
+
+#[cfg(test)]
+mod splice_added_column_tests {
+    use super::splice_added_column_into_create_sql;
+
+    #[test]
+    fn test_splice_ignores_close_paren_inside_line_comment() {
+        // bd-lgolw: a ')' inside `-- pk)` must not terminate the column-list
+        // scan — the new column belongs before the REAL closing paren, never
+        // inside the comment line.
+        let original = "CREATE TABLE t (\n    id INTEGER PRIMARY KEY, -- pk)\n    note TEXT\n)";
+        let spliced = splice_added_column_into_create_sql(original, "extra INTEGER")
+            .expect("comment-bearing CREATE must still splice");
+        assert_eq!(
+            spliced,
+            "CREATE TABLE t (\n    id INTEGER PRIMARY KEY, -- pk)\n    note TEXT\n, extra INTEGER)",
+        );
+    }
+
+    #[test]
+    fn test_splice_ignores_unbalanced_open_paren_inside_comment() {
+        // An unbalanced '(' in a comment must not inflate depth: the real ')'
+        // still ends the list and the splice lands before it.
+        let original = "CREATE TABLE t (\n    id INTEGER PRIMARY KEY, -- (see docs\n    note TEXT\n)";
+        let spliced = splice_added_column_into_create_sql(original, "extra INTEGER")
+            .expect("unbalanced comment paren must not break the splice");
+        assert_eq!(
+            spliced,
+            "CREATE TABLE t (\n    id INTEGER PRIMARY KEY, -- (see docs\n    note TEXT\n, extra INTEGER)",
+        );
+    }
+
+    #[test]
+    fn test_splice_ignores_block_comment_and_bracket_identifier() {
+        let original =
+            "CREATE TABLE t (\n    [weird(col] TEXT /* opener ( */,\n    note TEXT\n)";
+        let spliced = splice_added_column_into_create_sql(original, "extra INTEGER")
+            .expect("bracket identifiers and block comments must be skipped");
+        assert_eq!(
+            spliced,
+            "CREATE TABLE t (\n    [weird(col] TEXT /* opener ( */,\n    note TEXT\n, extra INTEGER)",
+        );
+    }
+
+    #[test]
+    fn test_splice_comment_free_input_is_unchanged_behavior() {
+        // The comment/bracket arms must be inert on comment-free inputs.
+        let original = "CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT)";
+        let spliced = splice_added_column_into_create_sql(original, "extra INTEGER")
+            .expect("plain CREATE must splice");
+        assert_eq!(
+            spliced,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT, extra INTEGER)",
+        );
+    }
 }
 
 fn rewrite_create_table_sql_for_alter(
