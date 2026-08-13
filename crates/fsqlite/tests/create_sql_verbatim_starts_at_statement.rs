@@ -17,7 +17,9 @@ fn assert_stored_products_sql_starts_at_create(batch: &'static str) {
                 .unwrap()
                 .as_nanos()
         ));
-        let conn = Connection::open(path.to_str().unwrap()).await.expect("open");
+        let conn = Connection::open(path.to_str().unwrap())
+            .await
+            .expect("open");
         conn.execute(batch).await.expect("execute");
         let rows = conn
             .query("SELECT sql FROM sqlite_master WHERE name = 'products';")
