@@ -4992,8 +4992,8 @@ mod tests {
         sidecar.extend_from_slice(
             &ParallelWalDurableCertificateRecord::new(
                 backend.inner.inner().generation_identity(),
-                2,
-                2,
+                1,
+                1,
                 overflow,
             )
             .expect("construct overflow orphan")
@@ -6197,7 +6197,7 @@ mod tests {
         assert_eq!(
             result,
             Some(committed),
-            "reader must ignore uncommitted tail frames"
+            "reader must ignore uncommitted (and unpublished) tail frames"
         );
     }
 
@@ -6345,6 +6345,7 @@ mod tests {
         adapter
             .append_frame(&cx, 3, &page3, 3)
             .expect("append commit");
+        adapter.sync(&cx).expect("publish staged frames");
 
         // All three pages should be readable via the index.
         assert_eq!(adapter.read_page(&cx, 1).expect("read"), Some(page1));
@@ -6371,6 +6372,7 @@ mod tests {
         adapter
             .append_frame(&cx, 5, &new_data, 1)
             .expect("append new (commit)");
+        adapter.sync(&cx).expect("publish staged frames");
 
         assert_eq!(
             adapter.read_page(&cx, 5).expect("read"),
@@ -6391,6 +6393,7 @@ mod tests {
         adapter
             .append_frame(&cx, 1, &old_data, 1)
             .expect("append commit");
+        adapter.sync(&cx).expect("publish staged frames");
 
         // Read page 1 to populate the index.
         assert_eq!(adapter.read_page(&cx, 1).expect("read old"), Some(old_data));
@@ -6411,6 +6414,7 @@ mod tests {
         adapter
             .append_frame(&cx, 1, &new_data, 1)
             .expect("append new generation commit");
+        adapter.sync(&cx).expect("publish new generation commit");
 
         // The index must have been invalidated; we should get the new data.
         let result = adapter.read_page(&cx, 1).expect("read after reset");
@@ -6446,6 +6450,7 @@ mod tests {
         adapter
             .append_frame(&cx, 1, &old_data, 1)
             .expect("append commit");
+        adapter.sync(&cx).expect("publish staged frames");
         assert_eq!(adapter.read_page(&cx, 1).expect("read old"), Some(old_data));
 
         adapter
@@ -6457,6 +6462,7 @@ mod tests {
         adapter
             .append_frame(&cx, 2, &new_data, 2)
             .expect("append new generation commit");
+        adapter.sync(&cx).expect("publish new generation commit");
         let refreshed = adapter
             .refresh_published_snapshot(&cx)
             .expect("refresh published snapshot after same-salt reset");
@@ -7409,6 +7415,7 @@ mod tests {
         adapter
             .append_frame(&cx, 5, &p5, 5)
             .expect("append p5 (commit)");
+        adapter.sync(&cx).expect("publish staged frames");
 
         // Pages 1 and 2 should be in the index (fast path).
         assert_eq!(
@@ -7482,6 +7489,7 @@ mod tests {
         adapter
             .append_frame(&cx, 2, &new_p2, 3)
             .expect("append p2 new (commit)");
+        adapter.sync(&cx).expect("publish staged frames");
 
         // The backwards scan from frame 2 should find the newest version first.
         assert_eq!(
@@ -7505,6 +7513,7 @@ mod tests {
         adapter
             .append_frame(&cx, 2, &p2, 2)
             .expect("append p2 commit");
+        adapter.sync(&cx).expect("publish staged frames");
 
         let last_commit = adapter
             .inner_mut()
@@ -7549,6 +7558,7 @@ mod tests {
         adapter
             .append_frame(&cx, 2, &p2, 2)
             .expect("append p2 commit");
+        adapter.sync(&cx).expect("publish staged frames");
 
         let last_commit = adapter
             .inner_mut()
@@ -7644,6 +7654,7 @@ mod tests {
         adapter
             .append_frame(&cx, 2, &p2_before, 2)
             .expect("commit tx1");
+        adapter.sync(&cx).expect("publish staged frames");
         adapter
             .begin_transaction(&cx)
             .expect("pin transaction snapshot");
@@ -7662,6 +7673,9 @@ mod tests {
         adapter
             .append_frame(&cx, 2, &p2_after, 3)
             .expect("commit later page 2 update");
+        // Publication gates conflict visibility exactly like reads: the
+        // later commit must be published before it can conflict.
+        adapter.sync(&cx).expect("publish later commit");
 
         let conflicts = adapter
             .conflicting_pages_since_snapshot(&cx, conflict_snapshot, &[2, 99], &[])
