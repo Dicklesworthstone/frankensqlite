@@ -106,7 +106,6 @@ fn vacuum_into_with_slack(slack: &[u8], label: &str) {
 }
 
 #[test]
-#[ignore = "bd-e26jr sig-2 keeper: red by design until the source-receipt fix lands (see bead)"]
 fn gh334_vacuum_into_tolerates_page_aligned_trailing_slack() {
     // One whole page of zero slack (page-size multiple keeps the length an
     // exact multiple, but longer than the header page count).
@@ -114,14 +113,12 @@ fn gh334_vacuum_into_tolerates_page_aligned_trailing_slack() {
 }
 
 #[test]
-#[ignore = "bd-e26jr sig-2 keeper: red by design until the source-receipt fix lands (see bead)"]
 fn gh334_vacuum_into_tolerates_unaligned_trailing_slack() {
     // A partial-page tail: the file length is not even a page multiple.
     vacuum_into_with_slack(&[0xA5_u8; 37], "unaligned");
 }
 
 #[test]
-#[ignore = "bd-e26jr sig-2 keeper: red by design until the source-receipt fix lands (see bead)"]
 fn gh334_in_place_vacuum_tolerates_trailing_slack() {
     // Same source-receipt mechanism as VACUUM INTO: in-place VACUUM must also
     // repair (and normalize) a slack-bearing file rather than refuse it.

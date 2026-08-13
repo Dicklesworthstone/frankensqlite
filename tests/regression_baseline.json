@@ -893,42 +893,6 @@
       }
     },
     {
-      "source_path": "crates/fsqlite-e2e/tests/gh334_vacuum_trailing_slack_e2e.rs",
-      "test_name": "gh334_in_place_vacuum_tolerates_trailing_slack",
-      "reason": "bd-e26jr sig-2 keeper: red by design until the source-receipt fix lands (see bead)",
-      "cfg_condition": null,
-      "kind": "known_bug",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Remove the ignore only after the unchanged exact keeper passes three consecutive runs at the release commit; content-hash the transcripts with commit and toolchain provenance (bd-e26jr sig-2: vacuum source-image receipt must tolerate trailing slack).",
-        "receipt": null
-      }
-    },
-    {
-      "source_path": "crates/fsqlite-e2e/tests/gh334_vacuum_trailing_slack_e2e.rs",
-      "test_name": "gh334_vacuum_into_tolerates_page_aligned_trailing_slack",
-      "reason": "bd-e26jr sig-2 keeper: red by design until the source-receipt fix lands (see bead)",
-      "cfg_condition": null,
-      "kind": "known_bug",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Remove the ignore only after the unchanged exact keeper passes three consecutive runs at the release commit; content-hash the transcripts with commit and toolchain provenance (bd-e26jr sig-2; this shape currently passes locally — promote after the stability requirement is met).",
-        "receipt": null
-      }
-    },
-    {
-      "source_path": "crates/fsqlite-e2e/tests/gh334_vacuum_trailing_slack_e2e.rs",
-      "test_name": "gh334_vacuum_into_tolerates_unaligned_trailing_slack",
-      "reason": "bd-e26jr sig-2 keeper: red by design until the source-receipt fix lands (see bead)",
-      "cfg_condition": null,
-      "kind": "known_bug",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Remove the ignore only after the unchanged exact keeper passes three consecutive runs at the release commit; content-hash the transcripts with commit and toolchain provenance (bd-e26jr sig-2: vacuum source-image receipt must tolerate trailing slack).",
-        "receipt": null
-      }
-    },
-    {
       "source_path": "crates/fsqlite-e2e/tests/index_range_eqp_diagnostic.rs",
       "test_name": "diagnostic_composite_desc_order_by",
       "reason": "diagnostic/A-B bench; run explicitly under --profile release-perf",
