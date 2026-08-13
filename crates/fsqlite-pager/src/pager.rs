@@ -8581,7 +8581,21 @@ impl<F: VfsFile> PagerInner<F> {
         if page_cache_invalidated {
             cache.clear();
         }
-        self.commit_seq = probe.visible_commit_seq;
+        // Cross-process monotonicity (bd-rjc): an external WAL checkpoint of our
+        // own already-committed frames is durability-increasing and
+        // visibility-preserving — it must never regress this connection's
+        // committed visibility. After such a reset the delta-based probe collapses
+        // visible_commit_seq back to a stale WAL base (e.g. 3 -> 1), so in
+        // steady-state (Normal) WAL refresh clamp to a monotonic floor exactly like
+        // `self.db_size` above (#70). PostRecovery (rollback-journal recovery, which
+        // can legitimately rewind) and non-WAL mode keep the probe value verbatim.
+        self.commit_seq = if mode == CommittedStateRefreshMode::PostRecovery
+            || self.journal_mode != JournalMode::Wal
+        {
+            probe.visible_commit_seq
+        } else {
+            self.commit_seq.max(probe.visible_commit_seq)
+        };
         self.committed_db_file_size_bytes = probe.file_size;
         self.committed_db_change_counter = probe.db_change_counter;
         self.committed_wal_generation = probe.wal_generation;
