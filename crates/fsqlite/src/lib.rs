@@ -7102,6 +7102,90 @@ mod tests {
                                 }
                             },
                             Ok(rows) => {
+                                if std::env::var_os("DK9RA_O81OV").is_some() {
+                                    let snap_count = conn
+                                        .query("SELECT COUNT(*) FROM accounts;")
+                                        .await
+                                        .ok()
+                                        .and_then(|r| r.first().map(|row| {
+                                            format!("{:?}", row_values(row).to_vec())
+                                        }));
+                                    let snap_min_max = conn
+                                        .query("SELECT MIN(id), MAX(id) FROM accounts;")
+                                        .await
+                                        .ok()
+                                        .and_then(|r| r.first().map(|row| {
+                                            format!("{:?}", row_values(row).to_vec())
+                                        }));
+                                    eprintln!(
+                                        "DK9RA_DIAG worker={worker_id} from_id={from_id} begin_seq={begin_seq} snap_count={snap_count:?} snap_min_max={snap_min_max:?}"
+                                    );
+                                    match Connection::open(&path).await {
+                                        Ok(fresh) => {
+                                            let fresh_count = fresh
+                                                .query("SELECT COUNT(*) FROM accounts;")
+                                                .await
+                                                .ok()
+                                                .and_then(|r| r.first().map(|row| {
+                                                    format!("{:?}", row_values(row).to_vec())
+                                                }));
+                                            let point = fresh
+                                                .query(&format!(
+                                                    "SELECT id FROM accounts WHERE id = {from_id};"
+                                                ))
+                                                .await
+                                                .ok()
+                                                .map(|r| r.len());
+                                            let range = fresh
+                                                .query(&format!(
+                                                    "SELECT id FROM accounts WHERE id >= {from_id} AND id <= {from_id};"
+                                                ))
+                                                .await
+                                                .ok()
+                                                .map(|r| r.len());
+                                            let cluster = fresh
+                                                .query(&format!(
+                                                    "SELECT id FROM accounts WHERE id >= {lo} AND id <= {hi} ORDER BY id;",
+                                                    lo = from_id.saturating_sub(4),
+                                                    hi = from_id + 4
+                                                ))
+                                                .await
+                                                .ok()
+                                                .map(|rows| {
+                                                    rows.iter()
+                                                        .map(|row| format!("{:?}", row_values(row).first()))
+                                                        .collect::<Vec<_>>()
+                                                        .join(",")
+                                                });
+                                            let dups = fresh
+                                                .query("SELECT id FROM accounts GROUP BY id HAVING COUNT(*) > 1;")
+                                                .await
+                                                .ok()
+                                                .map(|rows| {
+                                                    rows.iter()
+                                                        .map(|row| format!("{:?}", row_values(row).first()))
+                                                        .collect::<Vec<_>>()
+                                                        .join(",")
+                                                });
+                                            let integrity = fresh
+                                                .query("PRAGMA integrity_check;")
+                                                .await
+                                                .ok()
+                                                .and_then(|r| r.first().map(|row| {
+                                                    format!("{:?}", row_values(row).to_vec())
+                                                }));
+                                            eprintln!(
+                                                "DK9RA_DIAG_FRESH from_id={from_id} fresh_count={fresh_count:?} point={point:?} range={range:?} cluster=[{}] dups=[{}] integrity={integrity:?}",
+                                                cluster.unwrap_or_default(),
+                                                dups.unwrap_or_default()
+                                            );
+                                            let _ = fresh.close().await;
+                                        }
+                                        Err(open_err) => {
+                                            eprintln!("DK9RA_DIAG_FRESH open_failed={open_err:?}");
+                                        }
+                                    }
+                                }
                                 if let Err(rollback_error) = conn.execute("ROLLBACK;").await {
                                     outcome.failure = Some(format!(
                                         "rollback after missing account failed: {rollback_error:?}"
