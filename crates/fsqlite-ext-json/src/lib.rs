@@ -2931,6 +2931,41 @@ impl ScalarFunction for JsonbSetFunc {
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
 
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_paths_value_with_subtypes(
+            self.name(),
+            &input,
+            args,
+            arg_subtypes,
+            1,
+            EditMode::Set,
+        )?;
+        let blob = encode_jsonb_root(&edited)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
     fn num_args(&self) -> i32 {
         -1
     }
@@ -3053,6 +3088,41 @@ impl ScalarFunction for JsonbInsertFunc {
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
 
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_paths_value_with_subtypes(
+            self.name(),
+            &input,
+            args,
+            arg_subtypes,
+            1,
+            EditMode::Insert,
+        )?;
+        let blob = encode_jsonb_root(&edited)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
     fn num_args(&self) -> i32 {
         -1
     }
@@ -3171,6 +3241,41 @@ impl ScalarFunction for JsonbReplaceFunc {
             .map(|(path, value)| (path.as_str(), value.clone()))
             .collect::<Vec<_>>();
         let edited = edit_json_paths_value(&input, &pairs, EditMode::Replace)?;
+        let blob = encode_jsonb_root(&edited)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_paths_value_with_subtypes(
+            self.name(),
+            &input,
+            args,
+            arg_subtypes,
+            1,
+            EditMode::Replace,
+        )?;
         let blob = encode_jsonb_root(&edited)?;
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
