@@ -14,8 +14,8 @@
 //! the cursor position and page state.
 
 use crate::cell::{
-    BtreePageHeader, BtreePageType, CellRef, header_offset_for_page, parse_page_header,
-    read_cell_pointers, write_cell_pointers,
+    BtreePageHeader, BtreePageType, CellRef, MIN_CELL_ALLOCATION, header_offset_for_page,
+    parse_page_header, read_cell_pointers, write_cell_pointers,
 };
 use crate::cursor::PageWriter;
 use crate::instrumentation;
@@ -1539,7 +1539,8 @@ fn compute_leaf_distribution(
                 // Try moving the last cell from left to right.
                 if left_count > 1 {
                     let last_cell = &cells[right_start - 1];
-                    let cell_cost = last_cell.data.len() + CELL_POINTER_SIZE as usize;
+                    let cell_cost =
+                        last_cell.data.len().max(MIN_CELL_ALLOCATION) + CELL_POINTER_SIZE as usize;
 
                     let left_usage = page_sizes[i] - cell_cost;
                     let right_usage = page_sizes[i + 1] + cell_cost;
@@ -1564,7 +1565,8 @@ fn compute_leaf_distribution(
                 // Try moving the first cell from right to left.
                 if right_count > 1 {
                     let first_cell = &cells[right_start];
-                    let cell_cost = first_cell.data.len() + CELL_POINTER_SIZE as usize;
+                    let cell_cost =
+                        first_cell.data.len().max(MIN_CELL_ALLOCATION) + CELL_POINTER_SIZE as usize;
 
                     let left_usage = page_sizes[i] + cell_cost;
                     let right_usage = page_sizes[i + 1] - cell_cost;
@@ -1758,7 +1760,12 @@ fn validate_distribution(
 }
 
 fn cell_cost(cell: &GatheredCell) -> Option<usize> {
-    cell.data.len().checked_add(CELL_POINTER_SIZE as usize)
+    // Account cells at the SQLite MIN_CELL_ALLOCATION floor (bd-bfnlm) so
+    // distribution sizing matches what build_page actually allocates.
+    cell.data
+        .len()
+        .max(MIN_CELL_ALLOCATION)
+        .checked_add(CELL_POINTER_SIZE as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -1797,7 +1804,10 @@ fn build_page(
 
     for cell in cells {
         let cell_len = cell.data.len();
-        let Some(next_offset) = content_offset.checked_sub(cell_len) else {
+        // SQLite format floor (bd-bfnlm): every cell gets at least
+        // MIN_CELL_ALLOCATION bytes; padding stays zeroed (fresh buffer).
+        let alloc_len = cell_len.max(MIN_CELL_ALLOCATION);
+        let Some(next_offset) = content_offset.checked_sub(alloc_len) else {
             return Err(FrankenError::internal(format!(
                 "build_page overflow: page_type={page_type:?} header_offset={header_offset} \
                  page_size={full_page_size} usable_size={usable} content_offset={content_offset} cell_len={cell_len} \
@@ -1862,9 +1872,11 @@ async fn insert_cell_into_page<W: PageWriter>(
     let mut ptrs = read_cell_pointers(page_data.as_bytes(), &header, offset)?;
 
     let cell_len = cell_data.len();
+    // SQLite format floor (bd-bfnlm): allocate at least MIN_CELL_ALLOCATION.
+    let alloc_len = cell_len.max(MIN_CELL_ALLOCATION);
     let new_content_offset = header
         .content_offset(_usable_size)
-        .checked_sub(cell_len)
+        .checked_sub(alloc_len)
         .ok_or_else(|| FrankenError::internal("cell too large for page content area"))?;
 
     // Check there's room for the cell + pointer.
@@ -1891,6 +1903,8 @@ async fn insert_cell_into_page<W: PageWriter>(
     {
         let page_bytes = page_data.as_bytes_mut();
         page_bytes[new_content_offset..new_content_offset + cell_len].copy_from_slice(cell_data);
+        // Zero any allocation padding past the encoded cell bytes.
+        page_bytes[new_content_offset + cell_len..new_content_offset + alloc_len].fill(0);
         header.write(page_bytes, offset);
         write_cell_pointers(page_bytes, offset, &header, &ptrs);
     }

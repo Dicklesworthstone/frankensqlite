@@ -513,8 +513,37 @@ pub fn json_array_with_subtypes(values: &[SqliteValue], subtypes: &[u32]) -> Res
         .map_err(|error| FrankenError::function_error(format!("json_array encode failed: {error}")))
 }
 
+/// Serialize an ordered key/value list as JSON object text.
+///
+/// Preserves argument order AND duplicate labels verbatim — stock SQLite
+/// semantics (`json_object('a',1,'a',2)` -> `{"a":1,"a":2}`). serde_json's `Map`
+/// collapses duplicate labels to the last value, so the object text is assembled
+/// directly instead of routing through `Value::Object`.
+fn encode_json_object_members(members: &[(String, Value)]) -> Result<String> {
+    let mut out = String::from("{");
+    for (index, (key, value)) in members.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let key_json = serde_json::to_string(key).map_err(|error| {
+            FrankenError::function_error(format!("json_object key encode failed: {error}"))
+        })?;
+        out.push_str(&key_json);
+        out.push(':');
+        let value_json = serde_json::to_string(value).map_err(|error| {
+            FrankenError::function_error(format!("json_object value encode failed: {error}"))
+        })?;
+        out.push_str(&value_json);
+    }
+    out.push('}');
+    Ok(out)
+}
+
 /// Build a JSON object from alternating key/value arguments, embedding
 /// JSON-subtyped values as parsed JSON rather than quoting them as strings.
+///
+/// Duplicate labels are preserved verbatim in argument order, matching stock
+/// SQLite.
 pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Result<String> {
     if !args.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
@@ -522,7 +551,7 @@ pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Resu
         ));
     }
 
-    let mut map = Map::with_capacity(args.len() / 2);
+    let mut members = Vec::with_capacity(args.len() / 2);
     let mut idx = 0;
     while idx < args.len() {
         let key = match &args[idx] {
@@ -534,19 +563,17 @@ pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Resu
             }
         };
         let subtype = subtypes.get(idx + 1).copied().unwrap_or(0);
-        let value = sqlite_to_json_with_subtype(&args[idx + 1], subtype)?;
-        map.insert(key, value);
+        members.push((key, sqlite_to_json_with_subtype(&args[idx + 1], subtype)?));
         idx += 2;
     }
 
-    serde_json::to_string(&Value::Object(map)).map_err(|error| {
-        FrankenError::function_error(format!("json_object encode failed: {error}"))
-    })
+    encode_json_object_members(&members)
 }
 
 /// Build a JSON object from alternating key/value SQL arguments.
 ///
-/// Duplicate keys are overwritten by later entries.
+/// Duplicate labels are preserved verbatim in argument order, matching stock
+/// SQLite (`json_object('a',1,'a',2)` -> `{"a":1,"a":2}`).
 pub fn json_object(args: &[SqliteValue]) -> Result<String> {
     if !args.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
@@ -554,7 +581,7 @@ pub fn json_object(args: &[SqliteValue]) -> Result<String> {
         ));
     }
 
-    let mut map = Map::with_capacity(args.len() / 2);
+    let mut members = Vec::with_capacity(args.len() / 2);
     let mut idx = 0;
     while idx < args.len() {
         let key = match &args[idx] {
@@ -565,14 +592,11 @@ pub fn json_object(args: &[SqliteValue]) -> Result<String> {
                 ));
             }
         };
-        let value = sqlite_to_json(&args[idx + 1])?;
-        map.insert(key, value);
+        members.push((key, sqlite_to_json(&args[idx + 1])?));
         idx += 2;
     }
 
-    serde_json::to_string(&Value::Object(map)).map_err(|error| {
-        FrankenError::function_error(format!("json_object encode failed: {error}"))
-    })
+    encode_json_object_members(&members)
 }
 
 /// Build JSONB from SQL values.
@@ -600,9 +624,10 @@ pub fn jsonb_group_array(values: &[SqliteValue]) -> Result<Vec<u8>> {
 
 /// Aggregate key/value pairs into a JSON object.
 ///
-/// Duplicate keys keep the last value.
+/// Duplicate keys are preserved verbatim in row order, matching stock SQLite
+/// (rows `('a',1),('a',2)` -> `{"a":1,"a":2}`).
 pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<String> {
-    let mut map = Map::with_capacity(entries.len());
+    let mut members = Vec::with_capacity(entries.len());
     for (key_value, value) in entries {
         let key = match key_value {
             SqliteValue::Text(text) => text.to_string(),
@@ -612,11 +637,9 @@ pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Strin
                 ));
             }
         };
-        map.insert(key, sqlite_to_json(value)?);
+        members.push((key, sqlite_to_json(value)?));
     }
-    serde_json::to_string(&Value::Object(map)).map_err(|error| {
-        FrankenError::function_error(format!("json_group_object encode failed: {error}"))
-    })
+    encode_json_object_members(&members)
 }
 
 /// JSONB variant of `json_group_object`.
@@ -2908,6 +2931,41 @@ impl ScalarFunction for JsonbSetFunc {
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
 
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_paths_value_with_subtypes(
+            self.name(),
+            &input,
+            args,
+            arg_subtypes,
+            1,
+            EditMode::Set,
+        )?;
+        let blob = encode_jsonb_root(&edited)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
     fn num_args(&self) -> i32 {
         -1
     }
@@ -3030,6 +3088,41 @@ impl ScalarFunction for JsonbInsertFunc {
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
 
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_paths_value_with_subtypes(
+            self.name(),
+            &input,
+            args,
+            arg_subtypes,
+            1,
+            EditMode::Insert,
+        )?;
+        let blob = encode_jsonb_root(&edited)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
     fn num_args(&self) -> i32 {
         -1
     }
@@ -3148,6 +3241,41 @@ impl ScalarFunction for JsonbReplaceFunc {
             .map(|(path, value)| (path.as_str(), value.clone()))
             .collect::<Vec<_>>();
         let edited = edit_json_paths_value(&input, &pairs, EditMode::Replace)?;
+        let blob = encode_jsonb_root(&edited)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_paths_value_with_subtypes(
+            self.name(),
+            &input,
+            args,
+            arg_subtypes,
+            1,
+            EditMode::Replace,
+        )?;
         let blob = encode_jsonb_root(&edited)?;
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
@@ -3638,6 +3766,84 @@ mod tests {
         };
         assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":1,"b":9}"#);
         Ok(())
+    }
+
+    // bd-7h73c: jsonb_set/jsonb_insert/jsonb_replace must honor the JSON subtype
+    // on value args (results of json(), json_array(), ->, ...) and embed the value
+    // as a JSON subtree rather than stringify it — matching the text json_* twins
+    // and stock SQLite (verified sqlite3 3.46.1:
+    // json(jsonb_set('{}','$.a',json_array(1,2))) = {"a":[1,2]}).
+    #[test]
+    fn test_jsonb_set_honors_json_subtype_on_value() {
+        let out = JsonbSetFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string("{}")),
+                    SqliteValue::Text(SmallText::from_string("$.a")),
+                    SqliteValue::Text(SmallText::from_string("[1,2]")),
+                ],
+                &[0, 0, JSON_SUBTYPE],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_set should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":[1,2]}"#);
+    }
+
+    #[test]
+    fn test_jsonb_set_without_subtype_stringifies_value() {
+        // Negative control: a plain TEXT value (subtype 0) stays a JSON string.
+        let out = JsonbSetFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string("{}")),
+                    SqliteValue::Text(SmallText::from_string("$.a")),
+                    SqliteValue::Text(SmallText::from_string("[1,2]")),
+                ],
+                &[0, 0, 0],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_set should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":"[1,2]"}"#);
+    }
+
+    #[test]
+    fn test_jsonb_insert_honors_json_subtype_on_value() {
+        let out = JsonbInsertFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string(r#"{"a":1}"#)),
+                    SqliteValue::Text(SmallText::from_string("$.b")),
+                    SqliteValue::Text(SmallText::from_string("[3,4]")),
+                ],
+                &[0, 0, JSON_SUBTYPE],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_insert should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":1,"b":[3,4]}"#);
+    }
+
+    #[test]
+    fn test_jsonb_replace_honors_json_subtype_on_value() {
+        let out = JsonbReplaceFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string(r#"{"a":1}"#)),
+                    SqliteValue::Text(SmallText::from_string("$.a")),
+                    SqliteValue::Text(SmallText::from_string(r#"{"n":5}"#)),
+                ],
+                &[0, 0, JSON_SUBTYPE],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_replace should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":{"n":5}}"#);
     }
 
     #[test]
@@ -4165,8 +4371,11 @@ mod tests {
         assert_eq!(out, r#"{"a":1,"b":2}"#);
     }
 
+    // bd-55eq3: stock json_group_object also keeps duplicate labels verbatim in
+    // row order (`{"a":1,"a":2,"b":3}`, verified against sqlite3 3.46.1), not
+    // last-wins.
     #[test]
-    fn test_json_group_object_duplicate_keys_last_wins() {
+    fn test_json_group_object_duplicate_keys_kept_verbatim() {
         let out = json_group_object(&[
             (
                 SqliteValue::Text(SmallText::from_string("k")),
@@ -4178,7 +4387,7 @@ mod tests {
             ),
         ])
         .unwrap();
-        assert_eq!(out, r#"{"k":2}"#);
+        assert_eq!(out, r#"{"k":1,"k":2}"#);
     }
 
     #[test]
@@ -5007,8 +5216,12 @@ mod tests {
         assert_eq!(json_object(&[]).unwrap(), "{}");
     }
 
+    // bd-55eq3: stock SQLite keeps duplicate labels verbatim in argument order
+    // (`json_object('k',1,'k',2)` -> `{"k":1,"k":2}`, verified against sqlite3
+    // 3.46.1). serde_json's `Map` collapsed them to the last value; the object
+    // text is now assembled directly so both entries survive.
     #[test]
-    fn test_json_object_duplicate_keys() {
+    fn test_json_object_duplicate_keys_kept_verbatim() {
         let out = json_object(&[
             SqliteValue::Text(SmallText::from_string("k")),
             SqliteValue::Integer(1),
@@ -5016,7 +5229,22 @@ mod tests {
             SqliteValue::Integer(2),
         ])
         .unwrap();
-        assert_eq!(out, r#"{"k":2}"#);
+        assert_eq!(out, r#"{"k":1,"k":2}"#);
+    }
+
+    #[test]
+    fn test_json_object_duplicate_keys_preserve_interleaved_order() {
+        // Matches stock: json_object('a',1,'b',2,'a',3) -> {"a":1,"b":2,"a":3}.
+        let out = json_object(&[
+            SqliteValue::Text(SmallText::from_string("a")),
+            SqliteValue::Integer(1),
+            SqliteValue::Text(SmallText::from_string("b")),
+            SqliteValue::Integer(2),
+            SqliteValue::Text(SmallText::from_string("a")),
+            SqliteValue::Integer(3),
+        ])
+        .unwrap();
+        assert_eq!(out, r#"{"a":1,"b":2,"a":3}"#);
     }
 
     // -----------------------------------------------------------------------

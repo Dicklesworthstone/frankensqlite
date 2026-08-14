@@ -807,12 +807,30 @@ pub fn read_table_leaf_rowid_at_offset(page: &[u8], cell_offset: usize) -> Optio
     Some(rowid_raw as i64)
 }
 
+/// Minimum on-page allocation for any cell, per the SQLite file format
+/// (btree.c `cellSizePtr`: "the minimum size of any cell is 4 bytes").
+///
+/// A leaf-index cell whose key record encodes in fewer bytes (e.g. a
+/// single-column WITHOUT ROWID PRIMARY KEY holding 0/1 via serial types 8/9
+/// is 3 bytes) still occupies 4 bytes of the cell-content area; the trailing
+/// bytes are padding inside the cell's allocation. Stock `sqlite3` integrity
+/// checks count coverage at this floor, so tighter packing reads as page
+/// corruption ("Multiple uses for byte N"). bd-bfnlm.
+pub const MIN_CELL_ALLOCATION: usize = 4;
+
 /// Compute the on-page size of a cell without constructing a full [`CellRef`].
 ///
 /// The on-page size is the total number of bytes the cell occupies in the
 /// cell-content area, which equals:
 ///
-///   `(payload_offset - cell_start) + local_size + (4 if overflow else 0)`
+///   `max((payload_offset - cell_start) + local_size + (4 if overflow else 0),
+///        MIN_CELL_ALLOCATION)`
+///
+/// The [`MIN_CELL_ALLOCATION`] floor mirrors SQLite's `cellSizePtr` so that
+/// freeing and defragmentation account undersized leaf-index cells at their
+/// true allocated span. The floor is clamped at the usable-area boundary so a
+/// legacy tight-packed page (written before the floor existed) never yields a
+/// span past the page.
 ///
 /// Unlike [`CellRef::parse`] + [`crate::payload::cell_on_page_size`], this
 /// helper reads only the varints it needs and avoids the overflow-page
@@ -905,7 +923,12 @@ pub fn cell_on_page_size_fast(
         local_end - cell_offset
     };
 
-    Ok(total)
+    // SQLite format floor (bd-bfnlm): every cell occupies at least
+    // MIN_CELL_ALLOCATION bytes of the content area. Clamp at the usable
+    // boundary so legacy tight-packed pages never report a span past the page.
+    Ok(total
+        .max(MIN_CELL_ALLOCATION)
+        .min(usable_size as usize - cell_offset))
 }
 
 // ---------------------------------------------------------------------------
@@ -1749,6 +1772,31 @@ mod tests {
             cell_on_page_size_fast(&page, cell_offset, BtreePageType::LeafIndex, 4096).unwrap();
         assert_eq!(fast, expected);
         assert_eq!(fast, 1 + 5);
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_floors_to_min_cell_allocation() {
+        // bd-bfnlm: a leaf-index cell encoding in 3 bytes (payload_size=2,
+        // e.g. a single-column WITHOUT ROWID key using serial type 9) is
+        // accounted at the 4-byte SQLite allocation floor.
+        let mut page = vec![0u8; 4096];
+        let off = 3500;
+        page[off] = 2; // payload_size = 2
+        page[off + 1] = 0x02; // record header length
+        page[off + 2] = 0x09; // serial type 9 (integer 1, zero body bytes)
+        let fast = cell_on_page_size_fast(&page, off, BtreePageType::LeafIndex, 4096).unwrap();
+        assert_eq!(fast, MIN_CELL_ALLOCATION);
+
+        // Legacy tight-packed page: the same cell sitting 3 bytes before the
+        // usable boundary clamps at the boundary instead of reporting a span
+        // past the page.
+        let mut page = vec![0u8; 4096];
+        let off = 4093;
+        page[off] = 2;
+        page[off + 1] = 0x02;
+        page[off + 2] = 0x09;
+        let fast = cell_on_page_size_fast(&page, off, BtreePageType::LeafIndex, 4096).unwrap();
+        assert_eq!(fast, 3);
     }
 
     #[test]

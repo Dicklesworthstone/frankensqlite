@@ -3081,3 +3081,106 @@ mod rusqlite_parity {
         });
     }
 }
+
+/// bd-w9r11 (GH#222/#223): WITHOUT ROWID PRIMARY KEY DESC terms must control
+/// both scan order and on-disk key order. Before the fix the table root's
+/// comparator hardcoded all-ascending: DESC PKs scanned ascending and stock
+/// SQLite called the written file malformed ("row not in PRIMARY KEY order").
+#[test]
+fn without_rowid_desc_primary_key_orders_scan_and_file() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+
+        // GH#222: single-column INTEGER PRIMARY KEY DESC.
+        let single = dir.path().join("wr_desc_single.db");
+        let conn = Connection::open(single.to_str().unwrap()).await.unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY DESC) WITHOUT ROWID")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2),(1),(3)")
+            .await
+            .unwrap();
+        let rows = conn.query("SELECT a FROM t").await.unwrap();
+        let got: Vec<i64> = rows
+            .iter()
+            .map(|row| match row.values()[0] {
+                SqliteValue::Integer(i) => i,
+                ref other => panic!("unexpected value {other:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec![3, 2, 1], "single DESC PK must scan descending");
+        let point = conn.query("SELECT a FROM t WHERE a=1").await.unwrap();
+        assert_eq!(
+            point.len(),
+            1,
+            "fsqlite PK point lookup must find the row under a DESC comparator"
+        );
+        assert_eq!(point[0].values()[0], SqliteValue::Integer(1));
+        conn.close().await.unwrap();
+
+        let oracle = RusqliteConnection::open(&single).unwrap();
+        let integrity: String = oracle
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        // Full integrity: key order (bd-w9r11) AND the 4-byte minimum cell
+        // allocation floor (bd-bfnlm) must both hold.
+        assert_eq!(integrity, "ok", "sqlite3 must accept the DESC-PK file");
+        let oracle_order: Vec<i64> = oracle
+            .prepare("SELECT a FROM t")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(oracle_order, vec![3, 2, 1]);
+        let point: i64 = oracle
+            .query_row("SELECT a FROM t WHERE a=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(point, 1, "oracle PK point lookup must find the row");
+        drop(oracle);
+
+        // GH#223: composite PRIMARY KEY(a DESC, b ASC).
+        let composite = dir.path().join("wr_desc_composite.db");
+        let conn = Connection::open(composite.to_str().unwrap()).await.unwrap();
+        conn.execute(
+            "CREATE TABLE t(a INTEGER, b INTEGER, PRIMARY KEY(a DESC, b ASC)) WITHOUT ROWID",
+        )
+        .await
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1,2),(3,0),(1,1),(2,1)")
+            .await
+            .unwrap();
+        let rows = conn.query("SELECT a, b FROM t").await.unwrap();
+        let got: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|row| match (&row.values()[0], &row.values()[1]) {
+                (SqliteValue::Integer(a), SqliteValue::Integer(b)) => (*a, *b),
+                other => panic!("unexpected values {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![(3, 0), (2, 1), (1, 1), (1, 2)],
+            "composite PK must honor a DESC, b ASC"
+        );
+        let point = conn
+            .query("SELECT a, b FROM t WHERE a=1 AND b=2")
+            .await
+            .unwrap();
+        assert_eq!(
+            point.len(),
+            1,
+            "fsqlite composite-PK point lookup must find the row under a DESC comparator"
+        );
+        conn.close().await.unwrap();
+
+        let oracle = RusqliteConnection::open(&composite).unwrap();
+        let integrity: String = oracle
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity, "ok",
+            "sqlite3 must accept the composite DESC-PK file"
+        );
+    });
+}

@@ -128,7 +128,7 @@ fn single_writer_ddl_churn_republication_is_never_snapshot_refused() {
             .expect("integrity_check");
         match &integrity[0].values()[0] {
             SqliteValue::Text(s) => {
-                assert_eq!(s.as_str(), "ok", "integrity_check must pass: {s:?}");
+                assert_eq!(s.as_ref(), "ok", "integrity_check must pass: {s:?}");
             }
             other => panic!("unexpected integrity_check value: {other:?}"),
         }

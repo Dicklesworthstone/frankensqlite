@@ -6753,53 +6753,54 @@ impl<P: PageWriter> BtCursor<P> {
             let ptr_array_end = header_offset
                 + usize::from(entry.header.page_type.header_size())
                 + (entry.cell_pointers.len() + 1) * 2;
-            let new_cell_offset = if ptr_array_end <= content_offset {
-                if let Some(reused_offset) = Self::try_allocate_table_leaf_freeblock(
-                    entry,
-                    cell_data.len(),
-                    self.usable_size,
-                )? {
-                    reused_offset
-                } else if let Some(new_content_offset) = content_offset.checked_sub(cell_data.len())
-                    && ptr_array_end <= new_content_offset
-                {
-                    entry.header.cell_content_offset =
-                        u32::try_from(new_content_offset).map_err(|_| {
-                            FrankenError::DatabaseCorrupt {
+            // SQLite format floor (bd-bfnlm): allocate at least
+            // MIN_CELL_ALLOCATION bytes per cell; sub-4-byte leaf-index cells
+            // carry padding inside their allocation.
+            let alloc_len = cell_data.len().max(cell::MIN_CELL_ALLOCATION);
+            let new_cell_offset =
+                if ptr_array_end <= content_offset {
+                    if let Some(reused_offset) =
+                        Self::try_allocate_table_leaf_freeblock(entry, alloc_len, self.usable_size)?
+                    {
+                        reused_offset
+                    } else if let Some(new_content_offset) = content_offset.checked_sub(alloc_len)
+                        && ptr_array_end <= new_content_offset
+                    {
+                        entry.header.cell_content_offset = u32::try_from(new_content_offset)
+                            .map_err(|_| FrankenError::DatabaseCorrupt {
                                 detail: format!(
                                     "new leaf content offset {} exceeds u32 range on page {}",
                                     new_content_offset,
                                     leaf_page_no.get()
                                 ),
+                            })?;
+                        u16::try_from(new_content_offset).map_err(|_| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "new leaf cell offset {} exceeds u16 range on page {}",
+                                    new_content_offset,
+                                    leaf_page_no.get()
+                                ),
                             }
-                        })?;
-                    u16::try_from(new_content_offset).map_err(|_| {
-                        FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "new leaf cell offset {} exceeds u16 range on page {}",
-                                new_content_offset,
-                                leaf_page_no.get()
-                            ),
-                        }
-                    })?
+                        })?
+                    } else {
+                        debug!(
+                            page_number = leaf_page_no.get(),
+                            requested_insert_idx = insert_idx,
+                            reason = "content_underflow",
+                            "leaf insert requires balance or compaction"
+                        );
+                        return Ok(false);
+                    }
                 } else {
                     debug!(
                         page_number = leaf_page_no.get(),
                         requested_insert_idx = insert_idx,
-                        reason = "content_underflow",
+                        reason = "pointer_array_overlap",
                         "leaf insert requires balance or compaction"
                     );
                     return Ok(false);
-                }
-            } else {
-                debug!(
-                    page_number = leaf_page_no.get(),
-                    requested_insert_idx = insert_idx,
-                    reason = "pointer_array_overlap",
-                    "leaf insert requires balance or compaction"
-                );
-                return Ok(false);
-            };
+                };
             if insert_at == entry.cell_pointers.len() {
                 entry.cell_pointers.push(new_cell_offset);
             } else {
@@ -6819,6 +6820,11 @@ impl<P: PageWriter> BtCursor<P> {
                 let new_cell_offset_usize = usize::from(new_cell_offset);
                 page_bytes[new_cell_offset_usize..new_cell_offset_usize + cell_data.len()]
                     .copy_from_slice(cell_data);
+                // Zero any allocation padding past the encoded cell bytes so
+                // page images stay deterministic.
+                page_bytes
+                    [new_cell_offset_usize + cell_data.len()..new_cell_offset_usize + alloc_len]
+                    .fill(0);
                 entry.header.write(page_bytes, header_offset);
                 cell::write_cell_pointers(
                     page_bytes,
@@ -6956,7 +6962,10 @@ impl<P: PageWriter> BtCursor<P> {
         let header_offset = cell::header_offset_for_page(leaf_page_no);
         let insert_idx = header.cell_count;
         let content_offset = header.content_offset(self.usable_size);
-        let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
+        // SQLite format floor (bd-bfnlm): allocate at least
+        // MIN_CELL_ALLOCATION bytes per cell.
+        let alloc_len = cell_data.len().max(cell::MIN_CELL_ALLOCATION);
+        let Some(new_content_offset) = content_offset.checked_sub(alloc_len) else {
             return Ok(None);
         };
 
@@ -7002,6 +7011,9 @@ impl<P: PageWriter> BtCursor<P> {
             let page_bytes = page_data.as_bytes_mut();
             page_bytes[new_content_offset..new_content_offset + cell_data.len()]
                 .copy_from_slice(cell_data);
+            // Zero any allocation padding past the encoded cell bytes.
+            page_bytes[new_content_offset + cell_data.len()..new_content_offset + alloc_len]
+                .fill(0);
             page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
             header.write(page_bytes, header_offset);
         }

@@ -6959,6 +6959,16 @@ pub(crate) struct PagerInner<F: VfsFile> {
     access_mode: PagerAccessMode,
     /// Deallocated pages available for reuse.
     freelist: Vec<PageNumber>,
+    /// bd-vnxjd: EOF reservations abandoned by rolled-back CONCURRENT
+    /// transactions. Once later commits grow the durable image past such a
+    /// page number, the page is an unreferenced hole ("page N is never
+    /// used"). Unlike `freelist` (wholesale-replaced from durable state on
+    /// every committed-state refresh, which silently discarded these), this
+    /// pool survives refresh; the next WAL commit folds still-unwritten
+    /// entries into its freelist publication. Cleared at checkpoint
+    /// boundaries — the no-committed-frame publication filter is only sound
+    /// within one WAL generation.
+    abandoned_eof_reservations: Vec<PageNumber>,
     /// bd-r82et: the pager's last-known CURRENT durable freelist content —
     /// exactly the pages recorded free in durable page-1/trunk metadata. It
     /// is refreshed wherever durable freelist state is actually read
@@ -12371,6 +12381,7 @@ where
                     allocated_from_durable_freelist: HashSet::new(),
                     allocated_from_eof: Vec::new(),
                     savepoint_quarantined_allocations: Vec::new(),
+                    reclaimed_abandoned_reservations: Vec::new(),
                     writes_observed: false,
                     mode,
                     is_writer: eager_writer,
@@ -12590,6 +12601,7 @@ where
                 allocated_from_durable_freelist: HashSet::new(),
                 allocated_from_eof: Vec::new(),
                 savepoint_quarantined_allocations: Vec::new(),
+                reclaimed_abandoned_reservations: Vec::new(),
                 writes_observed: false,
                 mode,
                 is_writer: eager_writer,
@@ -12829,6 +12841,7 @@ where
                 };
                 let _mask = self.cleanup_cx.masked();
                 inner.checkpoint_active = false;
+                inner.abandoned_eof_reservations.clear();
                 self.published.publish_metadata_only(
                     &self.cleanup_cx,
                     PublishedPagerUpdate {
@@ -12933,6 +12946,7 @@ where
         // only after that handoff may observers see maintenance as inactive.
         drop(external_lock);
         inner.checkpoint_active = false;
+        inner.abandoned_eof_reservations.clear();
         self.published.publish_metadata_only(
             &cleanup_cx,
             PublishedPagerUpdate {
@@ -15838,6 +15852,7 @@ where
                 access_mode: PagerAccessMode::ReadWrite,
                 durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
                 freelist,
+                abandoned_eof_reservations: Vec::new(),
                 journal_mode: initial_journal_mode,
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
@@ -16242,6 +16257,7 @@ where
                     .map(|page: &PageNumber| page.get())
                     .collect(),
                 freelist,
+                abandoned_eof_reservations: Vec::new(),
                 journal_mode: JournalMode::Delete,
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
                 access_mode: PagerAccessMode::ReadOnly,
@@ -17125,6 +17141,13 @@ where
     /// back to the freelist only at transaction end (commit restore/rollback),
     /// when no live tree reference can persist.
     savepoint_quarantined_allocations: Vec<PageNumber>,
+    /// bd-vnxjd: abandonment-pool entries drained from
+    /// `PagerInner::abandoned_eof_reservations` by THIS commit attempt for
+    /// publication into the durable freelist. Cleared on commit success
+    /// (the pages are then durably free); re-pooled at the next commit
+    /// entry, rollback, or clean-commit restore if the attempt failed, so
+    /// a failed publication never re-leaks the hole.
+    reclaimed_abandoned_reservations: Vec<PageNumber>,
     /// #70 BUG-A / ghost-commit guard: set true as soon as any write-staging
     /// entry-point (`write_page`, `write_page_data`, `allocate_page`, or
     /// savepoint-driven commit reshuffle) runs on this transaction. Cleared
@@ -18548,14 +18571,49 @@ where
         self.allocated_from_durable_freelist.clear();
 
         if self.mode == TransactionMode::Concurrent {
-            return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-            return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
-            // bd-0shxy: transaction is ending — quarantined savepoint pages
-            // have no surviving tree references and may rejoin the freelist.
-            return_pages_to_freelist(
-                &mut inner.freelist,
-                self.savepoint_quarantined_allocations.drain(..),
-            );
+            if self.journal_mode == JournalMode::Wal {
+                // bd-vnxjd: abandoned EOF reservations and quarantined savepoint
+                // pages must survive committed-state refresh (which rebuilds
+                // inner.freelist from durable state) or they become permanent
+                // "page N is never used" holes. Park them in the abandonment
+                // pool; the next WAL commit publishes still-unwritten entries
+                // into the durable freelist. Reclaimed entries from a failed
+                // publication attempt return to the pool the same way.
+                inner
+                    .abandoned_eof_reservations
+                    .extend(self.reclaimed_abandoned_reservations.drain(..));
+                inner
+                    .abandoned_eof_reservations
+                    .extend(self.page_lease.drain(..));
+                inner
+                    .abandoned_eof_reservations
+                    .extend(self.allocated_from_eof.drain(..));
+                inner
+                    .abandoned_eof_reservations
+                    .extend(self.savepoint_quarantined_allocations.drain(..));
+            } else {
+                // Rollback-journal mode has no WAL commit to fold the
+                // abandonment pool into the durable freelist — pooling here
+                // would park these pages forever (bd-vnxjd's leak reintroduced
+                // one layer up). Keep the pre-pool volatile freelist return:
+                // journal commits run under the exclusive commit lock whose
+                // peer-claimed-range check covers reuse aliasing, and the
+                // single-connection journal shapes these pages come from do
+                // not hit the refresh wholesale-replace that motivated the
+                // pool (pinned by test_concurrent_rollback_reclaims_eof_
+                // allocations_without_holes and the beyond-db_size reuse
+                // keepers, which run in journal mode).
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.reclaimed_abandoned_reservations.drain(..),
+                );
+                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+                return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.savepoint_quarantined_allocations.drain(..),
+                );
+            }
         } else if inner.active_transactions <= 1 {
             return_pages_to_freelist(
                 &mut inner.freelist,
@@ -20973,6 +21031,7 @@ where
         self.pending_group_commit_attempt.take();
         if release {
             self.committed = true;
+            self.reclaimed_abandoned_reservations.clear();
             self.maintenance_lease.take();
             self.finished = true;
         } else {
@@ -21768,6 +21827,7 @@ where
                 debug_assert!(!notify_writer_idle);
                 drop(inner);
                 self.committed = true;
+            self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena on read-only commit path.
@@ -21838,6 +21898,7 @@ where
                     self.writer_idle.notify_one();
                 }
                 self.committed = true;
+            self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena on no-writes commit path.
@@ -21919,6 +21980,56 @@ where
             let pending_returned_pages = returned_allocations.all_pages();
             let mut pending_free_pages = pending_returned_pages.clone();
             pending_free_pages.extend(self.freed_pages.iter().copied());
+
+            // bd-vnxjd: fold abandoned EOF reservations (rolled-back peers on
+            // this pager parked them in the abandonment pool) into this
+            // commit's freelist publication. Only pages the durable image
+            // already covers (<= committed_db_size) and that carry NO
+            // committed WAL frame qualify: within one WAL generation, any
+            // page referenced by a committed tree has a committed frame, so
+            // a frameless covered page is a provable hole. Pages with a
+            // frame belong to a committed peer (two-growers loser's stale
+            // number) and are dropped from the pool permanently — they are
+            // not holes. This rides the same pending_free_pages channel the
+            // commit already uses for its own unstaged allocations, so the
+            // gh302 exactness guard and cross-process conflict machinery
+            // apply unchanged.
+            if self.journal_mode == JournalMode::Wal {
+                inner
+                    .abandoned_eof_reservations
+                    .extend(self.reclaimed_abandoned_reservations.drain(..));
+                let mut abandoned_candidates: Vec<PageNumber> = Vec::new();
+                inner.abandoned_eof_reservations.retain(|page| {
+                    let eligible = page.get() <= committed_db_size
+                        && !pending_free_pages.contains(page)
+                        && !self.write_set.contains_key(page);
+                    if eligible {
+                        abandoned_candidates.push(*page);
+                    }
+                    !eligible
+                });
+                if !abandoned_candidates.is_empty() {
+                    let backend = wal_backend_handle(&self.wal_backend)?;
+                    let mut wal_guard = async_rwlock_write(&backend, cx, "WAL backend").await?;
+                    let wal = wal_guard.as_mut();
+                    // A connection-local backend view can lag peers' commits;
+                    // the no-committed-frame test is only meaningful against
+                    // the refreshed publication horizon.
+                    let _ = wal.refresh_published_snapshot(cx).await?;
+                    for page in abandoned_candidates {
+                        match wal.read_page(cx, page.get()).await {
+                            Ok(None) => {
+                                self.reclaimed_abandoned_reservations.push(page);
+                                pending_free_pages.push(page);
+                            }
+                            Ok(Some(_)) => {}
+                            Err(_) => {
+                                inner.abandoned_eof_reservations.push(page);
+                            }
+                        }
+                    }
+                }
+            }
 
             // Declared outside the block so it survives to Phase C where freed
             // pages are promoted into inner.freelist after successful WAL commit.
@@ -22334,6 +22445,7 @@ where
                     // in-memory metadata application are both recorded. A
                     // dropped future must finish logical exit as a commit.
                     self.committed = true;
+            self.reclaimed_abandoned_reservations.clear();
                 }
                 let t_file_size_start = pager_commit_profile_start(pager_commit_profile_active);
                 if self.memory_db_bump_alloc {
@@ -22499,6 +22611,7 @@ where
                     self.rollback_commit_finalization_pending = false;
                 }
                 self.committed = true;
+            self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena after successful commit so
@@ -23348,6 +23461,12 @@ where
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
             let mut notify_writer_idle = false;
+            // bd-vnxjd: a failed commit attempt may have drained abandonment-
+            // pool entries for publication; the publication never became
+            // durable, so put them back.
+            inner
+                .abandoned_eof_reservations
+                .extend(self.reclaimed_abandoned_reservations.drain(..));
             if restored_from_journal {
                 self.allocated_from_freelist.clear();
                 self.allocated_from_durable_freelist.clear();
@@ -23385,15 +23504,34 @@ where
                     };
                 } else if self.is_writer && self.mode == TransactionMode::Concurrent {
                     // Concurrent: next_page is NOT reset, so lease pages and
-                    // aborted EOF allocations must return to the in-memory
-                    // freelist. Otherwise next_page skips over them permanently
-                    // and a later commit can grow page_count past those holes,
-                    // yielding "Page N: never used" corruption.
-                    return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-                    return_pages_to_freelist(
-                        &mut inner.freelist,
-                        self.allocated_from_eof.drain(..),
-                    );
+                    // aborted EOF allocations would become permanent holes once
+                    // a later commit grows page_count past them ("Page N:
+                    // never used"). bd-vnxjd: returning them to inner.freelist
+                    // did NOT survive: committed-state refresh wholesale-
+                    // replaces inner.freelist from durable state, silently
+                    // discarding these entries. Park them in the pager-level
+                    // abandonment pool instead — the next WAL commit folds
+                    // still-unwritten entries into its durable freelist
+                    // publication. Rollback-journal mode has no such fold, so
+                    // it keeps the volatile freelist return (see the matching
+                    // arm in restore_uncommitted_allocations_for_clean_commit).
+                    if self.journal_mode == JournalMode::Wal {
+                        inner
+                            .abandoned_eof_reservations
+                            .extend(self.page_lease.drain(..));
+                        inner
+                            .abandoned_eof_reservations
+                            .extend(self.allocated_from_eof.drain(..));
+                    } else {
+                        return_pages_to_freelist(
+                            &mut inner.freelist,
+                            self.page_lease.drain(..),
+                        );
+                        return_pages_to_freelist(
+                            &mut inner.freelist,
+                            self.allocated_from_eof.drain(..),
+                        );
+                    }
                 } else {
                     // Read-only transaction: lease should be empty (only writers
                     // allocate pages), but clear defensively.
@@ -24368,6 +24506,7 @@ where
                 };
                 let _mask = self.cleanup_cx.masked();
                 inner.checkpoint_active = false;
+                inner.abandoned_eof_reservations.clear();
                 self.published.publish_metadata_only(
                     &self.cleanup_cx,
                     PublishedPagerUpdate {

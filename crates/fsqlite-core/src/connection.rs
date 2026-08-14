@@ -10726,6 +10726,15 @@ pub struct Connection {
     /// `INTEGER PRIMARY KEY` column, which is an alias for `rowid`.
     /// Used by fallback paths (GROUP BY, JOIN) to resolve rowid/\_rowid\_/oid.
     rowid_alias_columns: RefCell<HashMap<String, usize>>,
+    /// bd-w9r11 (GH#222/#223): per-table descending flags for WITHOUT ROWID
+    /// PRIMARY KEY columns, keyed by lowercase table name (one Vec<bool> per
+    /// PK column, in PK order). Populated at CREATE TABLE and full schema
+    /// reload from the AST, which `TableSchema.primary_key_constraints`
+    /// (names only) discards. Consumed by the table-execution-metadata
+    /// builder so WITHOUT ROWID root-page comparators honor DESC PK terms.
+    /// Stale entries for dropped names are harmless (lookups are by live
+    /// table name; re-CREATE overwrites).
+    without_rowid_pk_desc: RefCell<HashMap<String, Vec<bool>>>,
     /// Original CREATE TABLE/INDEX/VIEW SQL text, keyed by lowercased
     /// object name.  Used by `build_sqlite_master_rows` so that
     /// `SELECT sql FROM sqlite_master` returns the text as written by the user,
@@ -12324,6 +12333,7 @@ impl Connection {
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
             differential_registry: DifferentialRegistry::default(),
             rowid_alias_columns: RefCell::new(HashMap::new()),
+            without_rowid_pk_desc: RefCell::new(HashMap::new()),
             original_ddl_sql: RefCell::new(HashMap::new()),
             pending_ddl_source: RefCell::new(None),
             autoincrement_tables: RefCell::new(HashSet::new()),
@@ -12823,6 +12833,7 @@ impl Connection {
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
             differential_registry: DifferentialRegistry::default(),
             rowid_alias_columns: RefCell::new(HashMap::new()),
+            without_rowid_pk_desc: RefCell::new(HashMap::new()),
             original_ddl_sql: RefCell::new(HashMap::new()),
             pending_ddl_source: RefCell::new(None),
             autoincrement_tables: RefCell::new(HashSet::new()),
@@ -47551,6 +47562,7 @@ impl Connection {
         let schema = self.schema.borrow();
         let rowid_alias_columns = self.rowid_alias_columns.borrow();
         let autoincrement_tables = self.autoincrement_tables.borrow();
+        let without_rowid_pk_desc = self.without_rowid_pk_desc.borrow();
         let mut autoincrement_table_name_by_root_page = HbHashMap::new();
         let mut rowid_alias_col_by_root_page = HbHashMap::new();
         let mut table_column_count_by_root_page = HbHashMap::with_capacity(schema.len());
@@ -47608,7 +47620,15 @@ impl Connection {
             if table.without_rowid
                 && let Some(pk_cols) = table.primary_key_constraints.first()
             {
-                let desc_flags: Vec<bool> = pk_cols.iter().map(|_| false).collect();
+                // bd-w9r11 (GH#222/#223): honor declared PK direction. The
+                // AST-derived registry keeps what primary_key_constraints
+                // (names only) discards; absent entries (legacy snapshots)
+                // conservatively fall back to all-ascending.
+                let desc_flags: Vec<bool> = without_rowid_pk_desc
+                    .get(&table_name_key)
+                    .filter(|flags| flags.len() == pk_cols.len())
+                    .cloned()
+                    .unwrap_or_else(|| pk_cols.iter().map(|_| false).collect());
                 let collations: Vec<Option<String>> = pk_cols
                     .iter()
                     .map(|name| {
@@ -47899,6 +47919,15 @@ impl Connection {
                     ));
                 }
                 let primary_key_constraints = collect_primary_key_constraints(columns, constraints);
+                if create.without_rowid {
+                    self.without_rowid_pk_desc.borrow_mut().insert(
+                        name_lc.clone(),
+                        collect_primary_key_desc_flags(columns, constraints)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default(),
+                    );
+                }
 
                 let col_infos: Vec<ColumnInfo> = columns
                     .iter()
@@ -49952,6 +49981,17 @@ impl Connection {
                 self.rowid_alias_columns
                     .borrow_mut()
                     .insert(new_key.clone(), idx);
+            }
+            // bd-w9r11: WITHOUT ROWID PK direction follows the rename. Keep
+            // the old-name entry too: statement-level renames can be undone
+            // by transaction rollback, which restores the schema snapshot
+            // but not this registry; a stale extra entry is harmless while a
+            // missing one would silently degrade a DESC PK to ascending.
+            let renamed_pk_desc = self.without_rowid_pk_desc.borrow().get(&old_key).cloned();
+            if let Some(flags) = renamed_pk_desc {
+                self.without_rowid_pk_desc
+                    .borrow_mut()
+                    .insert(new_key.clone(), flags);
             }
             let had_autoincrement = self.autoincrement_tables.borrow_mut().remove(&old_key);
             if had_autoincrement {
@@ -76861,6 +76901,7 @@ impl Connection {
                 Vec::new();
             let mut pending_materialized_live_vtabs: Vec<(String, String)> = Vec::new();
             let mut new_alias_map = HashMap::new();
+            let mut new_without_rowid_pk_desc: HashMap<String, Vec<bool>> = HashMap::new();
             let mut new_autoincrement_tables = HashSet::new();
             let mut new_sqlite_sequence_cache = HashMap::new();
             let mut new_original_ddl_sql = HashMap::new();
@@ -77139,6 +77180,15 @@ impl Connection {
                 {
                     primary_key_constraints =
                         collect_primary_key_constraints(col_defs, constraints);
+                    if without_rowid {
+                        new_without_rowid_pk_desc.insert(
+                            name.to_ascii_lowercase(),
+                            collect_primary_key_desc_flags(col_defs, constraints)
+                                .into_iter()
+                                .next()
+                                .unwrap_or_default(),
+                        );
+                    }
                     // Column-level FK constraints.
                     for (i, col) in col_defs.iter().enumerate() {
                         for c in &col.constraints {
@@ -77607,6 +77657,7 @@ impl Connection {
             *self.triggers_by_name.borrow_mut() = new_triggers_by_name;
             self.validate_schema_index();
             *self.rowid_alias_columns.borrow_mut() = new_alias_map;
+            *self.without_rowid_pk_desc.borrow_mut() = new_without_rowid_pk_desc;
             *self.autoincrement_tables.borrow_mut() = new_autoincrement_tables;
             *self.sqlite_sequence_cache.borrow_mut() = new_sqlite_sequence_cache;
             *self.original_ddl_sql.borrow_mut() = new_original_ddl_sql;
@@ -100686,6 +100737,47 @@ fn collect_primary_key_constraints(
     }));
 
     primary_keys
+}
+
+/// bd-w9r11 (GH#222/#223): per-PRIMARY-KEY-column descending flags, parallel
+/// to [`collect_primary_key_constraints`] (same group order, same filtering:
+/// expression PK terms disqualify the whole table-level group there and here).
+fn collect_primary_key_desc_flags(
+    columns: &[fsqlite_ast::ColumnDef],
+    constraints: &[fsqlite_ast::TableConstraint],
+) -> Vec<Vec<bool>> {
+    let mut flags = columns
+        .iter()
+        .filter_map(|column| {
+            column.constraints.iter().find_map(|constraint| {
+                if let ColumnConstraintKind::PrimaryKey { direction, .. } = &constraint.kind {
+                    Some(vec![matches!(direction, Some(SortDirection::Desc))])
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    flags.extend(constraints.iter().filter_map(|constraint| {
+        let TableConstraintKind::PrimaryKey {
+            columns: indexed_columns,
+            ..
+        } = &constraint.kind
+        else {
+            return None;
+        };
+        let directions = indexed_columns
+            .iter()
+            .map(normalize_indexed_column_term)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .map(|term| matches!(term.direction, Some(SortDirection::Desc)))
+            .collect::<Vec<_>>();
+        (!directions.is_empty()).then_some(directions)
+    }));
+
+    flags
 }
 
 /// Normalize an indexed-column AST node into a column name + collation + direction.

@@ -45,14 +45,26 @@ async fn probe_exists(conn: &Connection, id: &str) -> bool {
         .is_empty()
 }
 
-// bd-fcof5: KNOWN-RED reproduction anchor. A single-writer file-backed
-// BEGIN IMMEDIATE bulk import (~3200 rows, TEXT PK + partial indexes)
-// deterministically fails COMMIT with a self-conflict
-// `BusySnapshot { conflicting_pages: "8,9,10" }` — the o81ov cross-connection
-// EOF-alias guard (wal_adapter.rs conflicting_pages_since_snapshot) flags the
-// transaction's OWN spilled fresh pages as peer aliases. Un-ignore once the
-// guard learns to exclude the committing transaction's own frames.
-#[ignore = "bd-fcof5: reproduces the file-backed bulk-import BusySnapshot self-conflict; un-ignore when the alias-guard fix lands"]
+// bd-fcof5: GREEN regression guard (was a known-red anchor). A single-writer
+// file-backed BEGIN IMMEDIATE bulk import (~3200 rows, TEXT PK + partial
+// indexes) spills across multiple group-commit flushes. It once failed COMMIT
+// with a self-conflict `BusySnapshot { conflicting_pages: "8,9,10" }`: the
+// o81ov cross-connection EOF-alias guard (wal_adapter.rs
+// conflicting_pages_since_snapshot) misclassified the transaction's OWN
+// spilled fresh pages as peer aliases, because a later flush re-derived its
+// allocator base from the connection's stale begin-time db_size.
+//
+// Fixed at HEAD by the bd-vnxjd db_size-monotonicity floor in the group-commit
+// flusher (pager.rs: flush_base_db_size = max(inner.db_size, latest durable
+// certificate db_size)). Each spill flush now bases its snapshot_db_size on the
+// transaction's OWN prior committed growth, so the second import flush runs
+// with snapshot_db_size = 812 (covering the first flush's 812 pages) and those
+// pages are no longer "fresh past the allocator base" — the o81ov guard no
+// longer fires on them, while genuine cross-connection EOF double-allocation
+// (a peer's frame the committing connection never wrote) is still caught.
+//
+// This keeper locks the beads-shaped import contract green. If it regresses to
+// BusySnapshot, the db_size floor / alias-guard interaction has broken again.
 #[test]
 fn bulk_import_upsert_text_pk_has_no_phantom_pk_conflict() {
     asupersync::test_utils::run_test(|| async {
