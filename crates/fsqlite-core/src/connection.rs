@@ -13880,6 +13880,443 @@ impl Connection {
         )
     }
 
+// ---------------------------------------------------------------------------
+// Bounded semantic walker 2 of 4: index concordance
+//
+// Proves that every persisted index entry corresponds to a real table row and
+// that every table row appears in the index exactly where it should, using
+// bounded table rescans plus exact point probes rather than an O(rows)
+// reconciliation map. Ordering and uniqueness are checked on the scan; the
+// point probes catch a row that is present but filed under the wrong key.
+// ---------------------------------------------------------------------------
+
+    fn bounded_index_spec(
+        table: &TableSchema,
+        index: &IndexSchema,
+    ) -> Result<BoundedIndexValidationSpec> {
+        let column_positions = if index.key_expressions.is_empty() {
+            index
+                .columns
+                .iter()
+                .map(|column| {
+                    table
+                        .column_index(column)
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` references unknown column `{column}` on table `{}`",
+                                index.name, table.name
+                            ),
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let key_expressions = index
+            .key_expressions
+            .iter()
+            .map(|expression| {
+                fsqlite_parser::expr::parse_expr(expression).map_err(|error| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "index `{}` has invalid key expression `{expression}`: {error}",
+                            index.name
+                        ),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let predicate = Self::parse_partial_index_predicate_for_integrity(index)?;
+        Ok(BoundedIndexValidationSpec {
+            column_positions,
+            key_expressions,
+            predicate,
+        })
+    }
+
+    fn bounded_index_key(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        spec: &BoundedIndexValidationSpec,
+        rowid: i64,
+        row_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        let mut values = if spec.key_expressions.is_empty() {
+            spec.column_positions
+                .iter()
+                .map(|position| {
+                    row_values.get(*position).cloned().ok_or_else(|| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` references missing column position {position}",
+                                index.name
+                            ),
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            self.bounded_evaluate_index_expressions(
+                table,
+                &spec.key_expressions,
+                rowid,
+                row_values,
+                rowid_alias_col_idx,
+            )?
+        };
+        values.push(SqliteValue::Integer(rowid));
+        let value_bytes = values.iter().try_fold(0_usize, |total, value| {
+            let bytes = match value {
+                SqliteValue::Text(value) => value.len(),
+                SqliteValue::Blob(value) => value.len(),
+                SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Float(_) => 9,
+            };
+            total.checked_add(bytes).ok_or(FrankenError::TooBig)
+        })?;
+        if value_bytes > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "index `{}` computed key values exceed the fixed {}-byte record bound",
+                index.name, BOUNDED_VALIDATION_MAX_RECORD_BYTES
+            )));
+        }
+        let record = serialize_record(&values);
+        if record.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "index `{}` computed record {} exceeds the fixed {}-byte bound",
+                index.name,
+                record.len(),
+                BOUNDED_VALIDATION_MAX_RECORD_BYTES
+            )));
+        }
+        Ok(record)
+    }
+
+    fn bounded_unique_terms_equal(
+        &self,
+        index: &IndexSchema,
+        lhs: &[SqliteValue],
+        rhs: &[SqliteValue],
+    ) -> bool {
+        let term_count = index.key_term_count();
+        if lhs.len() < term_count
+            || rhs.len() < term_count
+            || lhs[..term_count]
+                .iter()
+                .any(|value| matches!(value, SqliteValue::Null))
+            || rhs[..term_count]
+                .iter()
+                .any(|value| matches!(value, SqliteValue::Null))
+        {
+            return false;
+        }
+        self.compare_index_key_values_for_integrity(index, &lhs[..term_count], &rhs[..term_count])
+            == Some(std::cmp::Ordering::Equal)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bounded_validate_index_concordance<T: TransactionHandle + ?Sized>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        table: &TableSchema,
+        index: &IndexSchema,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        rowid_alias_col_idx: Option<usize>,
+        column_defaults: Option<&[Option<SqliteValue>]>,
+        counters: &mut BoundedValidationCounters,
+    ) -> Result<()> {
+        let spec = Self::bounded_index_spec(table, index)?;
+        let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
+        let index_root = page_number_from_schema_root(index.root_page, &index.name, "index")?;
+        let descending = (0..index.key_term_count())
+            .map(|position| index.key_term_descending(position))
+            .collect::<Vec<_>>();
+        let collations = (0..index.key_term_count())
+            .map(|position| index.key_term_collation(position).map(str::to_owned))
+            .collect::<Vec<_>>();
+
+        let mut expected_count = 0_u64;
+        let mut after = None;
+        while let Some((rowid, payload)) =
+            Self::bounded_next_table_row(cx, txn, table_root, page_size, reserved_per_page, after)
+                .await?
+        {
+            let payload_values =
+                parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                        table.name
+                    ),
+                })?;
+            let row_values = Self::inflate_table_row_values_for_integrity(
+                table,
+                rowid,
+                &payload_values,
+                rowid_alias_col_idx,
+                column_defaults,
+            )?;
+            counters.table_rows_checked = counters
+                .table_rows_checked
+                .checked_add(1)
+                .ok_or(FrankenError::TooBig)?;
+            if Self::row_matches_partial_index_for_integrity(
+                table,
+                spec.predicate.as_ref(),
+                rowid,
+                &row_values,
+                rowid_alias_col_idx,
+            )? {
+                let expected = self.bounded_index_key(
+                    table,
+                    index,
+                    &spec,
+                    rowid,
+                    &row_values,
+                    rowid_alias_col_idx,
+                )?;
+                let mut cursor = Self::new_header_btree_index_cursor(
+                    txn,
+                    index_root,
+                    page_size,
+                    reserved_per_page,
+                    descending.clone(),
+                    collations.clone(),
+                    Arc::clone(&self.collation_registry),
+                );
+                let found = cursor.index_move_to(cx, &expected).await?;
+                counters.index_point_probes = counters
+                    .index_point_probes
+                    .checked_add(1)
+                    .ok_or(FrankenError::TooBig)?;
+                if !found.is_found() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` rowid {rowid} is missing from index `{}`",
+                            table.name, index.name
+                        ),
+                    });
+                }
+                let actual = cursor.payload(cx).await?;
+                if actual.as_slice() != expected.as_slice() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "index `{}` entry for table `{}` rowid {rowid} is not byte-exact",
+                            index.name, table.name
+                        ),
+                    });
+                }
+                expected_count = expected_count.checked_add(1).ok_or(FrankenError::TooBig)?;
+            }
+            after = Some(rowid);
+        }
+
+        let mut actual_count = 0_u64;
+        let mut cursor = Self::new_header_btree_index_cursor(
+            txn,
+            index_root,
+            page_size,
+            reserved_per_page,
+            descending,
+            collations,
+            Arc::clone(&self.collation_registry),
+        );
+        let mut previous_payload: Option<Vec<u8>> = None;
+        let mut previous_values: Option<Vec<SqliteValue>> = None;
+        if cursor.first(cx).await? {
+            loop {
+                let payload = cursor.payload(cx).await?;
+                if payload.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "index `{}` entry exceeds the fixed record bound",
+                        index.name
+                    )));
+                }
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("index `{}` contains an invalid record", index.name),
+                    })?;
+                if values.len() != index.key_term_count().saturating_add(1)
+                    || !matches!(values.last(), Some(SqliteValue::Integer(_)))
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "index `{}` entry does not contain exactly {} key terms plus an integer rowid",
+                            index.name,
+                            index.key_term_count()
+                        ),
+                    });
+                }
+                if let (Some(previous_payload), Some(previous_values)) =
+                    (previous_payload.as_ref(), previous_values.as_ref())
+                {
+                    let ordering = self
+                        .compare_index_key_values_for_integrity(index, previous_values, &values)
+                        .unwrap_or_else(|| previous_payload.as_slice().cmp(payload.as_slice()));
+                    if ordering != std::cmp::Ordering::Less {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` entries are duplicate or out of declared collation/direction order",
+                                index.name
+                            ),
+                        });
+                    }
+                    if index.is_unique
+                        && self.bounded_unique_terms_equal(index, previous_values, &values)
+                    {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "UNIQUE index `{}` contains duplicate non-NULL logical keys",
+                                index.name
+                            ),
+                        });
+                    }
+                }
+                previous_payload = Some(payload);
+                previous_values = Some(values);
+                actual_count = actual_count.checked_add(1).ok_or(FrankenError::TooBig)?;
+                counters.index_entries_checked = counters
+                    .index_entries_checked
+                    .checked_add(1)
+                    .ok_or(FrankenError::TooBig)?;
+                if !cursor.next(cx).await? {
+                    break;
+                }
+            }
+        }
+        if actual_count != expected_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "index `{}` contains {actual_count} entries but table `{}` requires exactly {expected_count}",
+                    index.name, table.name
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn bounded_mark_durable_freelist<T: TransactionHandle + ?Sized>(
+        cx: &Cx,
+        txn: &T,
+        page_size: PageSize,
+        owners: &mut crate::bounded_validation::PrivatePageOwnership,
+        freelist_trunk: u32,
+        freelist_count: u32,
+    ) -> Result<()> {
+        let mut counted = 0_u32;
+        let mut next = PageNumber::new(freelist_trunk);
+        let mut trunk_index = 0_usize;
+        while let Some(trunk_page) = next {
+            owners.mark(page_size, trunk_page, 4, "freelist trunk")?;
+            let page = txn.get_page(cx, trunk_page).await?;
+            let trunk =
+                fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(|error| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "freelist trunk page {} is malformed: {error}",
+                            trunk_page.get()
+                        ),
+                    }
+                })?;
+            counted = counted.checked_add(1).ok_or(FrankenError::TooBig)?;
+            for leaf in trunk.leaf_pages.iter().copied() {
+                owners.mark(page_size, leaf, 4, "freelist leaf")?;
+                counted = counted.checked_add(1).ok_or(FrankenError::TooBig)?;
+            }
+            next = trunk.next_trunk;
+            trunk_index = trunk_index.saturating_add(1);
+            if u32::try_from(trunk_index).unwrap_or(u32::MAX) > freelist_count {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "freelist trunk cycle or overlong chain".to_owned(),
+                });
+            }
+        }
+        if counted != freelist_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "freelist header claims {freelist_count} pages but structural walk found {counted}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn bounded_evaluate_index_expressions(
+        &self,
+        table: &TableSchema,
+        expressions: &[Expr],
+        rowid: i64,
+        row_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+    ) -> Result<Vec<SqliteValue>> {
+        let mut eval_row = row_values.to_vec();
+        let mut col_map = table
+            .columns
+            .iter()
+            .map(|column| (table.name.clone(), column.name.clone(), false))
+            .collect::<Vec<_>>();
+        let shadows_rowid = table.columns.iter().any(|column| {
+            matches!(
+                column.name.to_ascii_lowercase().as_str(),
+                "rowid" | "_rowid_" | "oid"
+            )
+        });
+        if !shadows_rowid {
+            eval_row.push(SqliteValue::Integer(rowid));
+            col_map.push((table.name.clone(), "rowid".to_owned(), true));
+        }
+        let mut column_collations = table
+            .columns
+            .iter()
+            .map(|column| column.collation.clone())
+            .collect::<Vec<_>>();
+        let mut column_affinities = table
+            .columns
+            .iter()
+            .map(|column| affinity_char_to_type(column.affinity))
+            .collect::<Vec<_>>();
+        if !shadows_rowid {
+            column_collations.push(None);
+            column_affinities.push(TypeAffinity::Integer);
+        }
+        let _guard = JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+            column_collations,
+            column_affinities,
+            // Index key expressions are evaluated against one table's row,
+            // never a join, so there are no USING/NATURAL coalesced columns.
+            using_column_projections: HashMap::new(),
+            registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+        });
+        expressions
+            .iter()
+            .map(|expression| {
+                let mut expression = expression.clone();
+                if let Some(ipk_column) =
+                    rowid_alias_col_idx.and_then(|index| table.columns.get(index))
+                {
+                    rewrite_rowid_aliases_in_expr(&mut expression, table, &ipk_column.name);
+                }
+                eval_join_expr(&expression, &eval_row, &col_map)
+            })
+            .collect()
+    }
+
+    fn parse_partial_index_predicate_for_integrity(index: &IndexSchema) -> Result<Option<Expr>> {
+        index
+            .where_clause
+            .as_deref()
+            .map(fsqlite_parser::expr::parse_expr)
+            .transpose()
+            .map_err(|err| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "index `{}` has an invalid partial index predicate: {err}",
+                    index.name
+                ),
+            })
+    }
+
     /// Refuse candidate schema shapes the bounded semantic walkers cannot
     /// prove — the structural half of the admission gate.
     ///
@@ -33923,6 +34360,17 @@ const BOUNDED_VALIDATION_MAX_GLOB_PATTERN_CHARS: usize = 4 * 1024;
 const BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES: usize = 65_536;
 /// Fixed ceiling on expression-AST depth while admitting one expression.
 const BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH: usize = 512;
+
+/// Everything walker 2 needs to recompute one index key from a table row.
+///
+/// `key_expressions` covers expression indexes; `predicate` covers partial
+/// indexes, whose rows are only expected in the index when the predicate holds.
+#[derive(Debug)]
+struct BoundedIndexValidationSpec {
+    column_positions: Vec<usize>,
+    key_expressions: Vec<Expr>,
+    predicate: Option<Expr>,
+}
 
 /// Semantic proof counters for a bounded whole-image validation.
 ///
