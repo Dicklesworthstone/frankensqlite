@@ -2501,11 +2501,14 @@ impl ScalarFunction for JsonValidFunc {
             SqliteValue::Null => return Ok(SqliteValue::Null),
             SqliteValue::Text(text) => json_valid(text, flags),
             SqliteValue::Blob(bytes) => json_valid_blob(bytes, flags),
-            // A bare SQL numeric renders to its JSON numeric form, which is valid
-            // JSON — except a non-finite REAL (Inf/NaN), which C SQLite rejects
-            // (e.g. json_valid(9e999) -> 0).
-            SqliteValue::Integer(_) => 1,
-            SqliteValue::Float(f) => i64::from(f.is_finite()),
+            // C SQLite validates a bare SQL numeric via sqlite3_value_text():
+            // it renders to its JSON numeric text and is checked against the
+            // requested flags. So it is valid JSON/JSON5 (flags 1/2) but is NOT
+            // a JSONB blob (flags 4/8 -> 0), and a non-finite REAL renders as
+            // non-JSON text (e.g. json_valid(9e999) -> 0).
+            SqliteValue::Integer(n) => json_valid(&n.to_string(), flags),
+            SqliteValue::Float(f) if f.is_finite() => json_valid(&f.to_string(), flags),
+            SqliteValue::Float(_) => 0,
         };
         Ok(SqliteValue::Integer(value))
     }
@@ -4962,6 +4965,31 @@ mod tests {
             f.invoke(&[SqliteValue::Float(f64::INFINITY)]).unwrap(),
             SqliteValue::Integer(0)
         );
+        assert_eq!(
+            f.invoke(&[SqliteValue::Float(f64::NAN)]).unwrap(),
+            SqliteValue::Integer(0)
+        );
+        // A bare numeric renders to its JSON numeric text and is checked against
+        // the flags, so it is valid JSON/JSON5 (1/2) but is NOT a JSONB blob
+        // (4/8 -> 0), matching C SQLite json_valid(123,4)=0 / (123,8)=0.
+        assert_eq!(
+            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(1)]).unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(2)]).unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(4)]).unwrap(),
+            SqliteValue::Integer(0)
+        );
+        assert_eq!(
+            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(8)]).unwrap(),
+            SqliteValue::Integer(0)
+        );
+        // json_valid(NULL) -> NULL.
+        assert_eq!(f.invoke(&[SqliteValue::Null]).unwrap(), SqliteValue::Null);
     }
 
     #[test]
