@@ -223211,6 +223211,79 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_delete_not_in_ordered_limited_subquery_matches_oracle() {
+        // bd-brzp8 oracle (sqlite3 3.46.1): the mcp_agent_mail_rust prune
+        // shape — DELETE ... WHERE pinned=0 AND id NOT IN (SELECT id ...
+        // ORDER BY updated_ts DESC LIMIT ?) — keeps pinned rows plus the
+        // most-recent N unpinned rows (kept ids {2,3,4} for LIMIT 2 on the
+        // seed below). 0.3.0 halted with 'IN probe codegen invariant failed:
+        // unsupported probe source'. File-backed: the failure is in the
+        // compiled VDBE probe path.
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join("brzp8_prune.db")
+                .to_string_lossy()
+                .into_owned();
+            let conn = Connection::open(path).await.unwrap();
+            conn.execute(
+                "CREATE TABLE search_recipes(id INTEGER PRIMARY KEY, pinned INTEGER NOT NULL DEFAULT 0, updated_ts INTEGER NOT NULL);",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO search_recipes VALUES (1,0,100),(2,0,200),(3,1,50),(4,0,300),(5,0,150);",
+            )
+            .await
+            .unwrap();
+
+            // Parameterized LIMIT, exactly like the downstream statement.
+            let stmt = conn
+                .prepare(
+                    "DELETE FROM search_recipes WHERE pinned=0 AND id NOT IN \
+                     (SELECT id FROM search_recipes WHERE pinned=0 ORDER BY updated_ts DESC LIMIT ?1)",
+                )
+                .await
+                .expect("prune statement must prepare");
+            stmt.execute_with_params(&[SqliteValue::Integer(2)])
+                .await
+                .expect("prune statement must execute (bd-brzp8)");
+
+            let rows = conn
+                .query("SELECT id FROM search_recipes ORDER BY id;")
+                .await
+                .unwrap();
+            let ids: Vec<_> = rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Integer(3),
+                    SqliteValue::Integer(4),
+                ],
+                "prune must keep pinned + most-recent-2 unpinned (oracle parity)"
+            );
+
+            // Literal-LIMIT variant of the same shape must also run.
+            conn.execute(
+                "DELETE FROM search_recipes WHERE pinned=0 AND id NOT IN \
+                 (SELECT id FROM search_recipes WHERE pinned=0 ORDER BY updated_ts DESC LIMIT 1)",
+            )
+            .await
+            .expect("literal-limit prune must execute");
+            let rows = conn
+                .query("SELECT id FROM search_recipes ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2, "kept pinned row 3 + newest unpinned row 4");
+        });
+    }
+
+    #[test]
     fn test_pragma_integrity_check_honors_collate_in_partial_index_predicate() {
         // bd-integrity-partial-collate-puctc oracle (sqlite3 3.46.1): the row
         // ('FiRe') satisfies `label COLLATE NOCASE = 'fire'`, is admitted to
