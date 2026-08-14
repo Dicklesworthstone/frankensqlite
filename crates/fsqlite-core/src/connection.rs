@@ -13445,6 +13445,81 @@ impl Connection {
         Ok(header)
     }
 
+    /// Refuse candidate schema shapes the bounded semantic walkers cannot
+    /// prove — the structural half of the admission gate.
+    ///
+    /// This is **Gate-A only**: table-count ceiling, WITHOUT ROWID, virtual or
+    /// rootless tables, STRICT tables, and generated columns. The branch gate
+    /// additionally validated persisted CHECK expressions, column defaults, and
+    /// column collations against a bounded AST/function/collation policy
+    /// (`validate_bounded_ast_semantics_with_function_policy` and friends), and
+    /// none of that subsystem exists on this line yet.
+    ///
+    /// Consequently this function is **not sufficient to admit an image for
+    /// semantic validation** and must not be wired to a public entry point on
+    /// its own. A half-gate admits schemas whose CHECK expressions or custom
+    /// collations the walkers cannot evaluate, and the validation would then
+    /// certify them — the precise failure mode this gate exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// [`FrankenError::NotImplemented`], via
+    /// [`Self::bounded_validation_refusal`], naming the exact unsupported
+    /// shape.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn validate_bounded_schema_shape_support(&self) -> Result<()> {
+        let schema = self.schema.borrow().clone();
+        if schema.len() > BOUNDED_VALIDATION_MAX_SCHEMA_TABLES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "schema contains {} tables, above the fixed limit {BOUNDED_VALIDATION_MAX_SCHEMA_TABLES}",
+                schema.len()
+            )));
+        }
+        let original_ddl = self.original_ddl_sql.borrow().clone();
+        for table in &schema {
+            if table.without_rowid {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "WITHOUT ROWID table `{}`",
+                    table.name
+                )));
+            }
+            // A rootless table has no btree to walk, and a virtual table's rows
+            // do not live in this image at all.
+            if table.root_page <= 0
+                || original_ddl
+                    .get(&table.name.to_ascii_lowercase())
+                    .is_some_and(|sql| is_virtual_table_sql(sql))
+            {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "virtual or rootless table `{}`",
+                    table.name
+                )));
+            }
+            if table.strict
+                || table
+                    .columns
+                    .iter()
+                    .any(|column| column.strict_type.is_some())
+            {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "STRICT table `{}`",
+                    table.name
+                )));
+            }
+            if let Some(column) = table
+                .columns
+                .iter()
+                .find(|column| column.generated_expr.is_some())
+            {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "generated column `{}.{}`",
+                    table.name, column.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Prove exact page ownership for this connection's image with fixed
     /// resident memory.
     ///
@@ -33381,6 +33456,60 @@ impl DatabaseImagePublication {
             Self::CommittedConnectionPoisoned { detail, .. } => Some(detail),
         }
     }
+}
+
+/// Semantic proof counters for a bounded whole-image validation.
+///
+/// Note the shape: this **contains** the structural proof rather than sitting
+/// beside it. A semantic validation is a structural validation plus row, index
+/// and foreign-key concordance over the same pinned snapshot, so a caller reads
+/// `stats.structural.*` and `stats.table_rows_checked` off one value. That
+/// containment is also why a structural-only proof can never be substituted
+/// here: it has no rows, probes, or constraint counts to report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoundedDatabaseValidationStats {
+    /// Exact structural ownership proof for the same pinned image.
+    pub structural: BoundedDatabaseStructuralStats,
+    /// Ordinary ROWID table rows recomputed for index concordance.
+    pub table_rows_checked: u64,
+    /// Persisted CHECK expressions evaluated against inflated table rows.
+    pub check_constraint_evaluations: u64,
+    /// Declared foreign-key constraints fully checked in the pinned snapshot.
+    pub foreign_key_constraints_checked: u64,
+    /// Child rows streamed while checking declared foreign keys.
+    pub foreign_key_child_rows_checked: u64,
+    /// Direct parent ROWID or UNIQUE-index probes made for non-NULL child keys.
+    pub foreign_key_parent_probes: u64,
+    /// Persisted index entries scanned for ordering, uniqueness, and counts.
+    pub index_entries_checked: u64,
+    /// Exact full-key index probes made from recomputed table rows.
+    pub index_point_probes: u64,
+}
+
+/// Running counters accumulated by the bounded semantic walkers.
+///
+/// Separate from the public stats so the walkers can increment without
+/// exposing partially-populated evidence: a caller must never see counters
+/// from a validation that refused part-way.
+#[derive(Debug, Clone, Copy, Default)]
+struct BoundedValidationCounters {
+    table_rows_checked: u64,
+    check_constraint_evaluations: u64,
+    foreign_key_constraints_checked: u64,
+    foreign_key_child_rows_checked: u64,
+    foreign_key_parent_probes: u64,
+    index_entries_checked: u64,
+    index_point_probes: u64,
+}
+
+/// Increment a proof counter, refusing rather than wrapping.
+///
+/// A wrapped counter would under-report work in exactly the evidence a caller
+/// relies on, so overflow is a typed refusal.
+fn bounded_increment_validation_counter(counter: &mut u64) -> Result<()> {
+    let next = counter.checked_add(1).ok_or(FrankenError::TooBig)?;
+    *counter = next;
+    Ok(())
 }
 
 /// Where a page-ownership walk records the pages it claims.
