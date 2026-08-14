@@ -3122,14 +3122,9 @@ fn without_rowid_desc_primary_key_orders_scan_and_file() {
         let integrity: String = oracle
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap();
-        // Scope: this bead fixes key ORDER. The residual byte-4092 free-block /
-        // fragmentation accounting complaint is direction-independent (repros
-        // with a plain ASC WITHOUT ROWID PK) and tracked by bd-bfnlm; tighten
-        // to `integrity == "ok"` when that closes.
-        assert!(
-            !integrity.contains("not in PRIMARY KEY order"),
-            "sqlite3 must accept the DESC-PK key order, got: {integrity}"
-        );
+        // Full integrity: key order (bd-w9r11) AND the 4-byte minimum cell
+        // allocation floor (bd-bfnlm) must both hold.
+        assert_eq!(integrity, "ok", "sqlite3 must accept the DESC-PK file");
         let oracle_order: Vec<i64> = oracle
             .prepare("SELECT a FROM t")
             .unwrap()
@@ -3183,10 +3178,9 @@ fn without_rowid_desc_primary_key_orders_scan_and_file() {
         let integrity: String = oracle
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap();
-        // Same scoping as above: free-block accounting residue is bd-bfnlm.
-        assert!(
-            !integrity.contains("not in PRIMARY KEY order"),
-            "sqlite3 must accept the composite DESC-PK key order, got: {integrity}"
+        assert_eq!(
+            integrity, "ok",
+            "sqlite3 must accept the composite DESC-PK file"
         );
     });
 }
