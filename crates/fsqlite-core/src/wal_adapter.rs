@@ -2360,10 +2360,25 @@ where
             let _ = db_file.close(cx);
             return candidates;
         }
+        // bd-jygg3: committed page count from the just-validated header
+        // (bytes 28..32). A no-baseline candidate BEYOND this bound is the
+        // transaction's own fresh allocation: it was never read (hence no
+        // baseline, by construction) and no committed content exists out
+        // there for a benign checkpoint to have replaced — failing it closed
+        // aborted every single-connection bulk commit whose fresh index
+        // pages landed in the candidate set after a mid-transaction WAL
+        // generation change (TEXT PRIMARY KEY repro: BusySnapshot on pages
+        // 4-10 with zero peers). In-range no-baseline candidates keep the
+        // fail-closed verdict: those genuinely cannot be validated.
+        let committed_page_count =
+            u32::from_be_bytes([page_one[28], page_one[29], page_one[30], page_one[31]]);
 
         let mut conflicts = Vec::new();
         for &page_number in &candidates {
             let Some(expected_hash) = baselines.get(&page_number).copied() else {
+                if committed_page_count > 0 && page_number > committed_page_count {
+                    continue;
+                }
                 conflicts.push(page_number);
                 continue;
             };
