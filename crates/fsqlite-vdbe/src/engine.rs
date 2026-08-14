@@ -35895,8 +35895,8 @@ mod tests {
         };
 
         let savepoint = {
-            let guard = handle.lock();
-            fsqlite_mvcc::concurrent_savepoint(&guard, "sp1").unwrap()
+            let mut guard = handle.lock();
+            fsqlite_mvcc::concurrent_savepoint(&mut guard, "sp1").unwrap()
         };
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
