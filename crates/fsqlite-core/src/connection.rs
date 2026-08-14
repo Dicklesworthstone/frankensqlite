@@ -38732,6 +38732,42 @@ impl Connection {
         Ok(())
     }
 
+    /// Validate an `INDEXED BY` hint on an UPDATE/DELETE target relation the
+    /// same way [`Self::validate_select_index_hints`] does for SELECT sources.
+    ///
+    /// `EXPLAIN [QUERY PLAN]` renders UPDATE/DELETE from a synthetic summary, and
+    /// `try_compile_statement` catches an unknown table but not a missing forced
+    /// index — so the plan surfaces silently described a plan that ignored the
+    /// hint instead of refusing like C SQLite does at prepare time (bd-2ijbe).
+    fn validate_explain_target_index_hint(
+        &self,
+        table: &fsqlite_ast::QualifiedTableRef,
+    ) -> Result<()> {
+        let Some(fsqlite_ast::IndexHint::IndexedBy(idx)) = &table.index_hint else {
+            return Ok(());
+        };
+        let name = &table.name;
+        if let Some(ti) = self.schema_index_of(&name.name) {
+            let known = self.schema.borrow().get(ti).is_some_and(|t| {
+                t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(idx))
+            });
+            if known {
+                Ok(())
+            } else {
+                Err(FrankenError::FunctionError(format!("no such index: {idx}")))
+            }
+        } else if name.schema.as_deref().is_some_and(|schema| {
+            !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
+        }) {
+            // Attached schemas are validated by the attached-statement path.
+            Ok(())
+        } else {
+            Err(FrankenError::NoSuchTable {
+                name: name.name.clone(),
+            })
+        }
+    }
+
     fn select_result_column_count(
         &self,
         select: &SelectStatement,
@@ -54605,22 +54641,40 @@ impl Connection {
         !self.collect_sqlite_schema_references(select).is_empty()
     }
 
-    /// Collect sqlite_master/sqlite_schema names referenced by this SELECT.
-    fn collect_sqlite_schema_references(&self, select: &SelectStatement) -> Vec<String> {
+    /// Collect catalog names referenced by this SELECT, paired with whether
+    /// each reference reads the TEMP catalog (bd-0te6s GH#237/#238):
+    /// `temp.sqlite_master` / `temp.sqlite_schema` and the
+    /// `sqlite_temp_master` / `sqlite_temp_schema` aliases materialize the
+    /// TEMP schema's objects; everything else keeps the main catalog. When
+    /// one statement spells the SAME canonical name with both main and temp
+    /// qualifiers, the first-seen backing wins (name-keyed materialization
+    /// cannot serve both; the alias spellings are unambiguous).
+    fn collect_sqlite_schema_references(&self, select: &SelectStatement) -> Vec<(String, bool)> {
         let schema = self.schema.borrow();
-        let mut referenced = Vec::new();
+        let mut referenced: Vec<(String, bool)> = Vec::new();
 
         let mut push_if_needed = |name: &QualifiedName| {
-            if let Some(canonical) =
-                qualified_relation_name(name).and_then(canonical_sqlite_schema_name)
+            let Some(local_name) = qualified_relation_name(name) else {
+                return false;
+            };
+            let resolved = if let Some(canonical) = canonical_sqlite_schema_name(local_name) {
+                let is_temp = name
+                    .schema
+                    .as_deref()
+                    .is_some_and(|schema_name| schema_name.eq_ignore_ascii_case("temp"));
+                Some((canonical, is_temp))
+            } else {
+                canonical_sqlite_temp_schema_name(local_name).map(|canonical| (canonical, true))
+            };
+            if let Some((canonical, is_temp)) = resolved
                 && !schema
                     .iter()
                     .any(|t| t.name.eq_ignore_ascii_case(canonical))
                 && !referenced
                     .iter()
-                    .any(|n: &String| n.eq_ignore_ascii_case(canonical))
+                    .any(|(n, _)| n.eq_ignore_ascii_case(canonical))
             {
-                referenced.push(canonical.to_owned());
+                referenced.push((canonical.to_owned(), is_temp));
             }
             false
         };
@@ -54656,14 +54710,20 @@ impl Connection {
                     .await;
             }
 
-            let virtual_rows = self.build_sqlite_master_rows();
+            let main_rows = self.build_sqlite_master_rows();
+            let temp_rows = if referenced.iter().any(|(_, is_temp)| *is_temp) {
+                self.build_sqlite_temp_master_rows()
+            } else {
+                Vec::new()
+            };
             let virtual_columns = sqlite_master_column_infos();
             let mut materialized = MaterializedTablesCleanupGuard::new(self);
 
             self.reserve_clean_memdb_root_pages(referenced.len())
                 .await?;
 
-            for table_name in referenced {
+            for (table_name, is_temp) in referenced {
+                let virtual_rows = if is_temp { &temp_rows } else { &main_rows };
                 let root_page = self.db.borrow_mut().create_table(virtual_columns.len());
                 self.schema.borrow_mut().push(TableSchema {
                     name: table_name.clone(),
@@ -54964,6 +55024,102 @@ impl Connection {
         }
 
         for trigger in triggers.iter().filter(|t| !t.temporary) {
+            rows.push(vec![
+                SqliteValue::Text("trigger".into()),
+                SqliteValue::Text(trigger.name.clone().into()),
+                SqliteValue::Text(trigger.table_name.clone().into()),
+                SqliteValue::Integer(0),
+                SqliteValue::Text(trigger.create_sql.clone().into()),
+            ]);
+        }
+
+        rows
+    }
+
+    /// TEMP-catalog counterpart of [`build_sqlite_master_rows`] (bd-0te6s
+    /// GH#237/#238): temp tables (with their indexes), temp views, and temp
+    /// triggers — exactly the objects the main catalog excludes. Serves
+    /// `temp.sqlite_master` and the `sqlite_temp_master` alias.
+    fn build_sqlite_temp_master_rows(&self) -> Vec<Vec<SqliteValue>> {
+        let schema = self.schema.borrow();
+        let views = self.views.borrow();
+        let triggers = self.triggers.borrow();
+        let temp_table_names = self.temp_table_names.borrow();
+        let ddl_cache = self.original_ddl_sql.borrow();
+        let mut rows = Vec::new();
+
+        for table in schema.iter() {
+            if is_sqlite_schema_name(&table.name)
+                || !temp_table_names.contains(&table.name.to_ascii_lowercase())
+            {
+                continue;
+            }
+            let is_autoincrement = self
+                .autoincrement_tables
+                .borrow()
+                .contains(&table.name.to_ascii_lowercase());
+
+            let table_sql = ddl_cache
+                .get(&table.name.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| {
+                    render_create_table_sql(table, is_autoincrement, |index| {
+                        let original_sql = ddl_cache.get(&index.name.to_ascii_lowercase());
+                        is_implicit_autoindex_entry(
+                            &index.name,
+                            &table.name,
+                            original_sql.map(String::as_str),
+                        )
+                    })
+                });
+
+            rows.push(vec![
+                SqliteValue::Text("table".into()),
+                SqliteValue::Text(table.name.clone().into()),
+                SqliteValue::Text(table.name.clone().into()),
+                SqliteValue::Integer(i64::from(table.root_page)),
+                SqliteValue::Text(table_sql.into()),
+            ]);
+
+            for index in &table.indexes {
+                let original_sql = ddl_cache.get(&index.name.to_ascii_lowercase());
+                let index_sql = if is_implicit_autoindex_entry(
+                    &index.name,
+                    &table.name,
+                    original_sql.map(String::as_str),
+                ) {
+                    SqliteValue::Null
+                } else {
+                    let sql = original_sql
+                        .cloned()
+                        .unwrap_or_else(|| render_create_index_sql(index, &table.name));
+                    SqliteValue::Text(sql.into())
+                };
+                rows.push(vec![
+                    SqliteValue::Text("index".into()),
+                    SqliteValue::Text(index.name.clone().into()),
+                    SqliteValue::Text(table.name.clone().into()),
+                    SqliteValue::Integer(i64::from(index.root_page)),
+                    index_sql,
+                ]);
+            }
+        }
+
+        for view in views.iter().filter(|view| view.temporary) {
+            let view_sql = ddl_cache
+                .get(&view.name.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| format!("CREATE VIEW {}", view.name));
+            rows.push(vec![
+                SqliteValue::Text("view".into()),
+                SqliteValue::Text(view.name.clone().into()),
+                SqliteValue::Text(view.name.clone().into()),
+                SqliteValue::Integer(0),
+                SqliteValue::Text(view_sql.into()),
+            ]);
+        }
+
+        for trigger in triggers.iter().filter(|t| t.temporary) {
             rows.push(vec![
                 SqliteValue::Text("trigger".into()),
                 SqliteValue::Text(trigger.name.clone().into()),
@@ -75260,11 +75416,16 @@ impl Connection {
         // instead of silently describing a plan that ignores the hint.
         match stmt {
             Statement::Select(select) => self.validate_select_index_hints(select)?,
-            Statement::Update(_) | Statement::Delete(_) if query_plan => {
-                // EQP renders UPDATE/DELETE from a synthetic summary rather
-                // than the compiled program. Compile once for validation so
-                // an unknown table or forced index cannot be hidden behind
-                // that summary. Plain EXPLAIN already compiles below.
+            Statement::Update(update) if query_plan => {
+                // EQP renders UPDATE/DELETE from a synthetic summary rather than
+                // the compiled program. try_compile_statement catches an unknown
+                // table but NOT a missing `INDEXED BY` target (bd-2ijbe), so
+                // validate the forced index explicitly first, then compile.
+                self.validate_explain_target_index_hint(&update.table)?;
+                self.try_compile_statement(stmt).await?;
+            }
+            Statement::Delete(delete) if query_plan => {
+                self.validate_explain_target_index_hint(&delete.table)?;
                 self.try_compile_statement(stmt).await?;
             }
             _ => {}
@@ -84796,6 +84957,20 @@ fn is_sqlite_schema_name(name: &str) -> bool {
     canonical_sqlite_schema_name(name).is_some()
 }
 
+/// Canonicalize the TEMP-catalog alias spellings (bd-0te6s GH#237/#238).
+/// Kept separate from [`canonical_sqlite_schema_name`] because that helper
+/// also drives internal-table filtering, where the temp aliases must NOT
+/// count as schema tables.
+fn canonical_sqlite_temp_schema_name(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case("sqlite_temp_master") {
+        Some("sqlite_temp_master")
+    } else if name.eq_ignore_ascii_case("sqlite_temp_schema") {
+        Some("sqlite_temp_schema")
+    } else {
+        None
+    }
+}
+
 fn is_internal_sqlite_table(name: &str) -> bool {
     is_sqlite_schema_name(name)
         || name.eq_ignore_ascii_case("sqlite_sequence")
@@ -89659,7 +89834,10 @@ fn subquery_references_sqlite_schema(sub: &SelectStatement, conn: &Connection) -
     let schema = conn.schema.borrow();
     select_contains_relation_reference(sub, &mut |name| {
         qualified_relation_name(name)
-            .and_then(canonical_sqlite_schema_name)
+            .and_then(|local_name| {
+                canonical_sqlite_schema_name(local_name)
+                    .or_else(|| canonical_sqlite_temp_schema_name(local_name))
+            })
             .is_some_and(|canonical| {
                 !schema
                     .iter()
@@ -235969,6 +236147,11 @@ mod pager_routing_tests {
         });
     }
 
+    // bd-4nuqo (split from bd-2ijbe): a custom BINARY collation override must
+    // disable the canonical hash-join fast path so the custom comparator governs
+    // equality JOINs; today the hash path hashes raw bytes and the join returns 0
+    // rows instead of 2. Un-ignore when bd-4nuqo lands.
+    #[ignore = "bd-4nuqo: custom BINARY override must disable the canonical hash-join fast path (wrong JOIN rows)"]
     #[test]
     fn test_custom_binary_override_disables_binary_hash_and_exists_memos() {
         struct AlwaysEqualBinary;
