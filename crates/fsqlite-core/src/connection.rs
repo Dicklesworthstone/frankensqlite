@@ -32526,6 +32526,13 @@ impl PendingDatabaseImagePublication<'_> {
 
         let precommit = async {
             validation.close().await?;
+            // The guard hands the caller a window the single-call form never
+            // had. A transaction opened on the source inside that window would
+            // not be caught by the source CAS below, because it has not
+            // committed anything yet — so re-prove quiescence here.
+            self.source
+                .quiesce_database_image_publication_state(&cx)
+                .await?;
             let validated = self
                 .source
                 .pager
