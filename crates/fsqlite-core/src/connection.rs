@@ -34045,6 +34045,14 @@ fn first_unsupported_bounded_ast(
                         pending.push((BoundedCollationAstNode::Expr(item), child_depth));
                     }
                 }
+                // Fail closed on Expr variants added after this admission
+                // walker was written: an unrecognized shape cannot be proven
+                // bounded, so it is refused rather than silently admitted.
+                _ => {
+                    return Ok(Some(BoundedAstUnsupported::Shape(
+                        "expression shape not admitted by bounded persisted-schema validation",
+                    )));
+                }
             },
             BoundedCollationAstNode::Select(select) => {
                 if let Some(limit) = select.limit.as_ref() {
@@ -95755,6 +95763,43 @@ fn aggregate_args_len_for_lookup(args: &FunctionArgs) -> i32 {
         FunctionArgs::List(exprs) => i32::try_from(exprs.len()).unwrap_or(i32::MAX),
         FunctionArgs::Star => 0,
     }
+}
+
+fn function_args_len(args: &FunctionArgs) -> i32 {
+    match args {
+        FunctionArgs::List(exprs) => i32::try_from(exprs.len()).unwrap_or(i32::MAX),
+        FunctionArgs::Star => -1,
+    }
+}
+
+/// Gate-B bounded-CHECK admission helpers. The Gate-B AST admission commit
+/// (9380f1cc2) referenced these but their definitions lived only on the
+/// unmerged hfdt-0117-bounded-validation-20260730 branch (e7f3b0400),
+/// leaving main uncompilable; restored verbatim from that branch.
+fn bounded_check_binary_operator_supported(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Modulo
+            | BinaryOp::Concat
+            | BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge
+            | BinaryOp::And
+            | BinaryOp::Or
+    )
+}
+
+fn bounded_check_cast_target_supported(type_name: &fsqlite_ast::TypeName) -> bool {
+    type_name.arg1.is_none()
+        && type_name.arg2.is_none()
+        && (type_name.name.trim().eq_ignore_ascii_case("INTEGER")
+            || type_name.name.trim().eq_ignore_ascii_case("BLOB"))
 }
 
 fn json_access_function_name(arrow: JsonArrow) -> &'static str {
