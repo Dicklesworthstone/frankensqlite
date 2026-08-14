@@ -106425,7 +106425,18 @@ fn evaluate_having_value(
         Expr::Column(col_ref, _) => {
             let col_name = &col_ref.column;
             let table_prefix = col_ref.table.as_deref();
-            // First check result column aliases.
+            // A HAVING term naming a base (input) column binds to that column even
+            // when a SELECT output alias shadows the name: C SQLite resolves input
+            // columns before output aliases (GH #174). Resolve from the raw group
+            // data via col_map FIRST, before the alias/result-name checks below.
+            if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name, None) {
+                return Ok(group_rows
+                    .first()
+                    .and_then(|r| r.get(idx))
+                    .cloned()
+                    .unwrap_or(SqliteValue::Null));
+            }
+            // Then check result column aliases.
             if table_prefix.is_none() {
                 for (i, rc) in columns.iter().enumerate() {
                     if let ResultColumn::Expr {
@@ -106463,14 +106474,6 @@ fn evaluate_having_value(
                 {
                     return Ok(values.get(i).cloned().unwrap_or(SqliteValue::Null));
                 }
-            }
-            // Fall back to resolving from raw group data via col_map.
-            if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name, None) {
-                return Ok(group_rows
-                    .first()
-                    .and_then(|r| r.get(idx))
-                    .cloned()
-                    .unwrap_or(SqliteValue::Null));
             }
             Ok(SqliteValue::Null)
         }
