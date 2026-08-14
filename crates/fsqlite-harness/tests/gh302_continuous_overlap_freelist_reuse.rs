@@ -539,9 +539,11 @@ fn test_gh302_freelist_reuse_across_checkpoint_boundary() {
         let freelist_before = query_i64(&writer, "PRAGMA freelist_count;").await;
         assert!(freelist_before > 0, "delete must free pages: {freelist_before}");
 
-        // Checkpoint the freed state into the main database file.
-        writer
-            .execute_batch("PRAGMA wal_checkpoint(FULL);")
+        // Checkpoint the freed state into the main database file. The pragma
+        // returns a result row (busy/log/checkpointed), so drive it as a
+        // query like the prepared-pragma dispatch tests do.
+        let _ = writer
+            .query("PRAGMA wal_checkpoint(FULL);")
             .await
             .expect("checkpoint after delete");
         let page_count_at_checkpoint = query_i64(&writer, "PRAGMA page_count;").await;
@@ -578,8 +580,8 @@ fn test_gh302_freelist_reuse_across_checkpoint_boundary() {
 
         // Second checkpoint so the stock oracle reads a fully materialized
         // main file as well as the WAL tail.
-        writer
-            .execute_batch("PRAGMA wal_checkpoint(FULL);")
+        let _ = writer
+            .query("PRAGMA wal_checkpoint(FULL);")
             .await
             .expect("checkpoint after reuse");
         writer.close().await.expect("close writer");
