@@ -38,6 +38,9 @@ preflight target.
 - **Committed-freelist safety**: append-gate guard refuses committed-freelist
   resurrection/erasure/double-consumption under continuous overlap
   (05144b4f4 + chain, bd-gh302, bd-0shxy).
+- **Group-commit waiter livelock**: `wait_for_epoch_outcome_async` no longer
+  livelocks when settlement resolves to a terminal error (62dfd9f98,
+  bd-keoaf).
 
 - **Schema text fidelity**: stored `CREATE TABLE` text now ends at the
   statement's final token (trailing `;`/comments stripped, `1c75f65fc`) and
