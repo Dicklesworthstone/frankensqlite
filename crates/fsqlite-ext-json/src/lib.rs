@@ -2742,6 +2742,16 @@ impl ScalarFunction for JsonbArrayFunc {
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
 
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        let s = json_array_with_subtypes(args, arg_subtypes)?;
+        let blob = jsonb(&s)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
     fn num_args(&self) -> i32 {
         -1
     }
@@ -2786,6 +2796,16 @@ pub struct JsonbObjectFunc;
 impl ScalarFunction for JsonbObjectFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         let blob = jsonb_object(args)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        let s = json_object_with_subtypes(args, arg_subtypes)?;
+        let blob = jsonb(&s)?;
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
 
