@@ -33745,38 +33745,6 @@ fn bounded_increment_validation_counter(counter: &mut u64) -> Result<()> {
 // are part 2. Gate-A plus this traversal is still a half-gate.
 // ---------------------------------------------------------------------------
 
-/// Binary operators the bounded CHECK evaluator can reproduce exactly.
-///
-/// Deliberately omits `Divide`: SQLite's divide-by-zero yields NULL rather than
-/// an error, and reproducing that faithfully in the bounded evaluator is not
-/// something this proof claims yet.
-fn bounded_check_binary_operator_supported(op: BinaryOp) -> bool {
-    matches!(
-        op,
-        BinaryOp::Add
-            | BinaryOp::Subtract
-            | BinaryOp::Multiply
-            | BinaryOp::Modulo
-            | BinaryOp::Concat
-            | BinaryOp::Eq
-            | BinaryOp::Ne
-            | BinaryOp::Lt
-            | BinaryOp::Le
-            | BinaryOp::Gt
-            | BinaryOp::Ge
-            | BinaryOp::And
-            | BinaryOp::Or
-    )
-}
-
-/// CAST targets whose affinity conversion the bounded evaluator reproduces.
-fn bounded_check_cast_target_supported(type_name: &fsqlite_ast::TypeName) -> bool {
-    type_name.arg1.is_none()
-        && type_name.arg2.is_none()
-        && (type_name.name.trim().eq_ignore_ascii_case("INTEGER")
-            || type_name.name.trim().eq_ignore_ascii_case("BLOB"))
-}
-
 /// Declared argument count for registry lookup; `-1` denotes `*`.
 fn bounded_function_args_len(args: &FunctionArgs) -> i32 {
     match args {
@@ -34239,13 +34207,12 @@ fn first_unsupported_bounded_ast(
                         pending.push((BoundedCollationAstNode::Expr(item), child_depth));
                     }
                 }
-                // Fail closed on expression kinds this line grew after the
-                // traversal was written, for the same reason as statements:
-                // an unrecognised construct must be refused, never admitted
-                // by omission.
+                // Fail closed on Expr variants added after this admission
+                // walker was written: an unrecognized shape cannot be proven
+                // bounded, so it is refused rather than silently admitted.
                 _ => {
                     return Ok(Some(BoundedAstUnsupported::Shape(
-                        "expression kind unknown to the bounded admission traversal",
+                        "expression shape not admitted by bounded persisted-schema validation",
                     )));
                 }
             },
@@ -96033,6 +96000,49 @@ fn aggregate_args_len_for_lookup(args: &FunctionArgs) -> i32 {
         FunctionArgs::List(exprs) => i32::try_from(exprs.len()).unwrap_or(i32::MAX),
         FunctionArgs::Star => 0,
     }
+}
+
+fn function_args_len(args: &FunctionArgs) -> i32 {
+    match args {
+        FunctionArgs::List(exprs) => i32::try_from(exprs.len()).unwrap_or(i32::MAX),
+        FunctionArgs::Star => -1,
+    }
+}
+
+/// Gate-B bounded-CHECK admission helpers. The Gate-B AST admission commit
+/// (9380f1cc2) referenced these but their definitions lived only on the
+/// unmerged hfdt-0117-bounded-validation-20260730 branch (e7f3b0400),
+/// leaving main uncompilable; restored verbatim from that branch.
+///
+/// Coverage boundary worth stating rather than rediscovering: `Divide` is
+/// deliberately NOT admitted. SQLite's divide-by-zero yields NULL rather than
+/// an error, and the bounded evaluator does not reproduce that, so a CHECK
+/// constraint containing division is refused rather than proven. CAST targets
+/// are likewise limited to INTEGER and BLOB.
+fn bounded_check_binary_operator_supported(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Modulo
+            | BinaryOp::Concat
+            | BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge
+            | BinaryOp::And
+            | BinaryOp::Or
+    )
+}
+
+fn bounded_check_cast_target_supported(type_name: &fsqlite_ast::TypeName) -> bool {
+    type_name.arg1.is_none()
+        && type_name.arg2.is_none()
+        && (type_name.name.trim().eq_ignore_ascii_case("INTEGER")
+            || type_name.name.trim().eq_ignore_ascii_case("BLOB"))
 }
 
 fn json_access_function_name(arrow: JsonArrow) -> &'static str {

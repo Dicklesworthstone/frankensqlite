@@ -60,5 +60,12 @@ fn aoj0g_insert_phase_profile() {
         run_case("A no-index    k=i%100", false, Some(100)).await;
         run_case("B with-index  k=i     ", true, None).await;
         run_case("C with-index  k=i%100", true, Some(100)).await;
+        // bd-aoj0g duplicate-run hypothesis probes: if the seek walks the
+        // duplicate run linearly, D (one key, all rows duplicates) should
+        // ramp hardest and E (10 dups/key at 10k rows) mildly — while a pure
+        // cache-locality cause would rank C >= E > D (D touches one hot
+        // subtree with perfect locality).
+        run_case("D with-index  k=1     ", true, Some(1)).await;
+        run_case("E with-index  k=i%1000", true, Some(1000)).await;
     });
 }
