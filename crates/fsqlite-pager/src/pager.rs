@@ -11737,6 +11737,12 @@ pub struct SimplePager<V: Vfs> {
     /// enforced where writes actually enter the write set, not merely
     /// recorded at open time.
     write_set_page_limit: Arc<AtomicUsize>,
+    /// Distinct dirty pages staged by the active transaction.
+    write_set_current_pages: Arc<AtomicUsize>,
+    /// High-water dirty-page count for the latest transaction.
+    write_set_high_water_pages: Arc<AtomicUsize>,
+    /// Pre-admission cap refusals in the latest transaction.
+    write_set_cap_refusals: Arc<AtomicU64>,
     /// Shared page buffer pool cloned into transactions for write staging.
     pool: PageBufPool,
     /// Published metadata/page plane for lock-light steady-state reads.
@@ -11761,6 +11767,35 @@ pub struct SimplePager<V: Vfs> {
 /// The digest covers the page size, exact file length, page numbers, and all
 /// logical database pages. SQLite's reserved lock-byte page is deliberately
 /// excluded because it is process-lock state rather than database content.
+/// Dirty-write-set accounting for the latest transaction on this pager.
+///
+/// Distinct from page-cache residency: `PageCachePeakSnapshot` answers "how
+/// many pages were resident", which is a memory bound. This answers "how much
+/// of the database did the transaction actually rewrite", which is what a
+/// bounded-migration certifier needs and what a residency peak cannot
+/// substitute for.
+///
+/// `cap_refusals` is the honest counterpart to the ceiling: a bound that was
+/// never approached and a bound that refused work both leave the same
+/// high-water mark, and only this distinguishes them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteSetStats {
+    /// Maximum distinct dirty pages admitted to one transaction.
+    pub page_limit: usize,
+    /// Exact byte ceiling implied by `page_limit * page_size`.
+    pub byte_limit: usize,
+    /// Distinct dirty pages currently staged by the active transaction.
+    pub current_dirty_pages: usize,
+    /// Exact bytes currently staged by the active transaction.
+    pub current_dirty_bytes: usize,
+    /// Largest distinct dirty-page count observed in the latest transaction.
+    pub dirty_pages_high_water: usize,
+    /// Largest staged byte count observed in the latest transaction.
+    pub dirty_bytes_high_water: usize,
+    /// Pre-admission cap refusals in the latest transaction.
+    pub cap_refusals: u64,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct DatabaseImageReceipt {
     identity: FileIdentity,
@@ -12441,6 +12476,9 @@ where
                     group_commit_queue: Arc::clone(&self.group_commit_queue),
                     inner: Arc::clone(&self.inner),
                     write_set_page_limit: Arc::clone(&self.write_set_page_limit),
+                    write_set_current_pages: Arc::clone(&self.write_set_current_pages),
+                    write_set_high_water_pages: Arc::clone(&self.write_set_high_water_pages),
+                    write_set_cap_refusals: Arc::clone(&self.write_set_cap_refusals),
                     db_file: Arc::clone(&inner.db_file),
                     writer_idle: Arc::clone(&self.writer_idle),
                     cache: Arc::clone(&self.cache),
@@ -12662,6 +12700,9 @@ where
                 group_commit_queue: Arc::clone(&self.group_commit_queue),
                 inner: Arc::clone(&self.inner),
                 write_set_page_limit: Arc::clone(&self.write_set_page_limit),
+                write_set_current_pages: Arc::clone(&self.write_set_current_pages),
+                write_set_high_water_pages: Arc::clone(&self.write_set_high_water_pages),
+                write_set_cap_refusals: Arc::clone(&self.write_set_cap_refusals),
                 db_file,
                 writer_idle: Arc::clone(&self.writer_idle),
                 cache: Arc::clone(&self.cache),
@@ -14242,6 +14283,32 @@ where
     pub fn set_write_set_page_limit(&self, page_limit: usize) {
         self.write_set_page_limit
             .store(page_limit, AtomicOrdering::Relaxed);
+    }
+
+    /// Dirty-write-set accounting for the latest transaction, when a ceiling
+    /// is configured.
+    ///
+    /// `None` when no ceiling is in force: without one there is no budget to
+    /// report against, and reporting zeroes would read as "nothing was
+    /// written" rather than "nothing was bounded".
+    #[must_use]
+    pub fn write_set_stats(&self) -> Option<WriteSetStats> {
+        let page_limit = self.write_set_page_limit.load(AtomicOrdering::Relaxed);
+        if page_limit == 0 {
+            return None;
+        }
+        let page_size = self.page_size.as_usize();
+        let current_dirty_pages = self.write_set_current_pages.load(AtomicOrdering::Relaxed);
+        let dirty_pages_high_water = self.write_set_high_water_pages.load(AtomicOrdering::Relaxed);
+        Some(WriteSetStats {
+            page_limit,
+            byte_limit: page_limit.saturating_mul(page_size),
+            current_dirty_pages,
+            current_dirty_bytes: current_dirty_pages.saturating_mul(page_size),
+            dirty_pages_high_water,
+            dirty_bytes_high_water: dirty_pages_high_water.saturating_mul(page_size),
+            cap_refusals: self.write_set_cap_refusals.load(AtomicOrdering::Relaxed),
+        })
     }
 
     /// The write-set page ceiling in force, `0` meaning unlimited.
@@ -15981,6 +16048,9 @@ where
             writer_idle: Arc::new(Condvar::new()),
             cache: Arc::new(cache),
             write_set_page_limit: Arc::new(AtomicUsize::new(0)),
+            write_set_current_pages: Arc::new(AtomicUsize::new(0)),
+            write_set_high_water_pages: Arc::new(AtomicUsize::new(0)),
+            write_set_cap_refusals: Arc::new(AtomicU64::new(0)),
             pool,
             published: Arc::new(PublishedPagerState::new(
                 db_size,
@@ -16390,6 +16460,9 @@ where
             writer_idle: Arc::new(Condvar::new()),
             cache: Arc::new(cache),
             write_set_page_limit: Arc::new(AtomicUsize::new(0)),
+            write_set_current_pages: Arc::new(AtomicUsize::new(0)),
+            write_set_high_water_pages: Arc::new(AtomicUsize::new(0)),
+            write_set_cap_refusals: Arc::new(AtomicU64::new(0)),
             pool,
             published: Arc::new(PublishedPagerState::new(
                 db_size,
@@ -17191,6 +17264,10 @@ where
     cache: Arc<ShardedPageCache>,
     /// Write-set page ceiling inherited from the pager. `0` means unlimited.
     write_set_page_limit: Arc<AtomicUsize>,
+    /// Dirty-write-set accounting shared with the owning pager.
+    write_set_current_pages: Arc<AtomicUsize>,
+    write_set_high_water_pages: Arc<AtomicUsize>,
+    write_set_cap_refusals: Arc<AtomicU64>,
     published: Arc<PublishedPagerState>,
     /// WAL backend for WAL-mode operation (D1-CRITICAL: separate lock for split-lock commit).
     wal_backend: SharedWalBackend,
