@@ -761,15 +761,29 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let last_commit_frame = self.wal.last_commit_frame(cx)?;
         // While a local batch is staged, the WAL's own commit horizon includes
         // frames this handle appended but has not yet fsynced. Refresh and
-        // unpinned read paths must not expose them, so clamp to the durable
-        // prefix. With nothing staged the horizon is used unchanged, preserving
-        // publication of commits made durable elsewhere.
+        // unpinned read paths must not expose them, so clamp them out. The
+        // clamp must exclude ONLY THIS HANDLE'S staged frames: peers' commits
+        // appended below our staged batch are legitimately visible even when
+        // not yet fsynced (stock WAL semantics; a crash that erased them would
+        // erase our later frames too). Clamping to the fsynced prefix here
+        // hid peers' deferred-sync commits from the append-gate guards — a
+        // committing flusher then validated page-1/freelist state against a
+        // PRE-PEER snapshot and republished a consumed freelist head
+        // (bd-dw8oe: `freelist trunk N leaf_count ... exceeds max 1022`).
         let last_commit_frame = if self.pending_publication_commit.is_some() {
+            let our_staged_start = self
+                .pending_publication_frames
+                .iter()
+                .map(|frame| frame.frame_index)
+                .min();
             let durable_frames = self.wal.last_fsynced_frame_count();
             last_commit_frame.filter(|frame| {
-                frame
+                let fsync_covered = frame
                     .checked_add(1)
-                    .is_some_and(|frame_count| frame_count <= durable_frames)
+                    .is_some_and(|frame_count| frame_count <= durable_frames);
+                let below_our_staged_batch =
+                    our_staged_start.is_some_and(|start| *frame < start);
+                fsync_covered || below_our_staged_batch
             })
         } else {
             last_commit_frame
