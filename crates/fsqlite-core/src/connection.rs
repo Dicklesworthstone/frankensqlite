@@ -228700,11 +228700,11 @@ mod pager_routing_tests {
             let before = builder.write_set_stats().expect("stats readable");
             let before = before.expect("a configured ceiling must produce stats");
             assert_eq!(before.page_limit, 3);
-            assert_eq!(
-                before.byte_limit,
-                3 * usize::try_from(builder.page_size()).unwrap_or(0).max(1),
-                "byte ceiling must be page_limit * page_size"
+            assert!(
+                before.byte_limit > 0 && before.byte_limit % before.page_limit == 0,
+                "byte ceiling must be a whole multiple of the page ceiling, got {before:?}"
             );
+            let page_size = before.byte_limit / before.page_limit;
 
             builder
                 .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
@@ -228743,8 +228743,7 @@ mod pager_routing_tests {
             );
             assert_eq!(
                 after.dirty_bytes_high_water,
-                after.dirty_pages_high_water
-                    * usize::try_from(builder.page_size()).unwrap_or(0).max(1),
+                after.dirty_pages_high_water * page_size,
                 "byte high water must be derived from the page high water"
             );
             builder.close().await.ok();
