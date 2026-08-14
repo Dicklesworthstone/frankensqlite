@@ -6940,6 +6940,18 @@ pub(crate) struct PagerInner<F: VfsFile> {
     access_mode: PagerAccessMode,
     /// Deallocated pages available for reuse.
     freelist: Vec<PageNumber>,
+    /// bd-r82et: the pager's last-known CURRENT durable freelist content —
+    /// exactly the pages recorded free in durable page-1/trunk metadata. It
+    /// is refreshed wherever durable freelist state is actually read
+    /// (committed-state refresh, VACUUM rebuild) or written (a successful
+    /// commit that carried a freelist publication). Unlike `freelist`, it
+    /// NEVER contains in-memory-only entries (aborted transactions' returned
+    /// EOF pages, volatile lease returns), so a freelist pop can be
+    /// classified as durable-origin (a peer could also have observed the
+    /// page free) or in-memory-only (no peer could ever have seen it free).
+    /// The append-gate double-consumption guard (bd-gh302/bd-0shxy) must
+    /// only refuse durable-origin pops.
+    durable_freelist_view: HashSet<u32>,
     /// Current journal mode (rollback journal vs WAL).
     journal_mode: JournalMode,
     /// WAL commit sync policy derived from `PRAGMA synchronous`.
@@ -8657,6 +8669,9 @@ impl<F: VfsFile> PagerInner<F> {
         } else {
             2
         };
+        // bd-r82et: this freelist was just read from durable committed state,
+        // so it is the exact current durable freelist content.
+        self.durable_freelist_view = freelist.iter().map(|page| page.get()).collect();
         self.freelist = freelist;
         // Only clear the cache if the database was modified by another
         // connection. In WAL mode this uses the latest visible page-1
@@ -9439,13 +9454,22 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
                 .copied()
                 .filter(|page| !published_set.contains(page) && !consumed.contains(page)),
         )
-        // DOUBLE-CONSUMPTION: a page this batch consumed must still be on the
-        // current durable freelist — if a peer's commit already removed it,
-        // both connections popped the same committed-free page from
-        // begin-time views, and the peer's frame can predate this
-        // transaction's (rebased) conflict horizon, escaping the FCW scan.
+        // DOUBLE-CONSUMPTION: a page this batch consumed from the DURABLE
+        // freelist must still be on the current durable freelist — if a
+        // peer's commit already removed it, both connections popped the same
+        // committed-free page from begin-time views, and the peer's frame can
+        // predate this transaction's (rebased) conflict horizon, escaping the
+        // FCW scan. bd-r82et: this check is restricted to durable-origin pops
+        // (`consumed_durable_freelist_pages`). A pop of an in-memory-only
+        // freelist entry (an aborted transaction's returned EOF page that was
+        // never serialized into durable page-1/trunk metadata) is invisible
+        // to every peer, so its absence from the current durable freelist is
+        // the expected steady state — refusing it made a single-connection
+        // multi-statement DDL batch fail deterministically with
+        // BusySnapshot even though no peer existed.
         .chain(
-            consumed
+            batch
+                .consumed_durable_freelist_pages
                 .iter()
                 .copied()
                 .filter(|page| !current.contains(page)),
@@ -12294,6 +12318,7 @@ where
                     freed_pages: Vec::new(),
                     freed_page_bounds: None,
                     allocated_from_freelist: Vec::new(),
+                allocated_from_durable_freelist: HashSet::new(),
                     allocated_from_eof: Vec::new(),
                     savepoint_quarantined_allocations: Vec::new(),
                     writes_observed: false,
@@ -12512,6 +12537,7 @@ where
                 freed_pages: Vec::new(),
                 freed_page_bounds: None,
                 allocated_from_freelist: Vec::new(),
+                allocated_from_durable_freelist: HashSet::new(),
                 allocated_from_eof: Vec::new(),
                 savepoint_quarantined_allocations: Vec::new(),
                 writes_observed: false,
@@ -13786,6 +13812,8 @@ where
             } else {
                 2
             };
+            // bd-r82et: rebuilt straight from the vacuumed durable image.
+            inner.durable_freelist_view = rebuilt_freelist.iter().map(|page| page.get()).collect();
             inner.freelist = rebuilt_freelist;
             // The durable SQLite header counter is a wrapping u32, whereas
             // the pager visibility clock is monotonic u64. VACUUM is exactly
@@ -15727,6 +15755,7 @@ where
                 active_transactions: 0,
                 checkpoint_active: false,
                 access_mode: PagerAccessMode::ReadWrite,
+                durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
                 freelist,
                 journal_mode: initial_journal_mode,
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -16127,6 +16156,7 @@ where
                 writer_active: false,
                 active_transactions: 0,
                 checkpoint_active: false,
+                durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
                 freelist,
                 journal_mode: JournalMode::Delete,
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -16990,6 +17020,16 @@ where
     freed_pages: Vec<PageNumber>,
     freed_page_bounds: Option<(PageNumber, PageNumber)>,
     allocated_from_freelist: Vec<PageNumber>,
+    /// bd-r82et: the subset of `allocated_from_freelist` pops that were on
+    /// the pager's durable-freelist view (`PagerInner::durable_freelist_view`)
+    /// at pop time — pages a cross-connection peer could also have observed
+    /// as committed-free. Only these pops are eligible for the append gate's
+    /// double-consumption refusal; pops of in-memory-only freelist entries
+    /// (aborted transactions' returned EOF pages) were never durably free and
+    /// can never be double-consumed by a peer. Consulted strictly via
+    /// intersection with the live `allocated_from_freelist`, so partial
+    /// drains/retains of that list need no mirrored bookkeeping here.
+    allocated_from_durable_freelist: HashSet<u32>,
     allocated_from_eof: Vec<PageNumber>,
     /// bd-0shxy: page numbers reclaimed from post-savepoint allocations by
     /// ROLLBACK TO SAVEPOINT. They must NOT reach the shared freelist while
@@ -17361,6 +17401,7 @@ where
         self.savepoint_stack.clear();
         self.rolled_back_pages.clear();
         self.allocated_from_freelist.clear();
+        self.allocated_from_durable_freelist.clear();
         self.allocated_from_eof.clear();
         self.page_lease.clear();
         self.writes_observed = false;
@@ -17516,6 +17557,7 @@ where
         self.savepoint_stack.clear();
         self.rolled_back_pages.clear();
         self.allocated_from_freelist.clear();
+        self.allocated_from_durable_freelist.clear();
         self.allocated_from_eof.clear();
         self.page_lease.clear();
         self.retained_memory_overlay_dirty_pages.clear();
@@ -18419,6 +18461,7 @@ where
         inner: &mut PagerInner<V::File>,
     ) {
         return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
+        self.allocated_from_durable_freelist.clear();
 
         if self.mode == TransactionMode::Concurrent {
             return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
@@ -18964,6 +19007,7 @@ where
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             queue,
             &mut publication_authorization,
             None,
@@ -18998,6 +19042,10 @@ where
         published_durable_freelist: Option<Vec<u32>>,
         freelist_publication_freed_pages: Vec<u32>,
         freelist_publication_consumed_pages: Vec<u32>,
+        // bd-r82et: subset of the consumed pages that was popped from the
+        // DURABLE freelist — the only pops eligible for the append gate's
+        // double-consumption refusal.
+        freelist_publication_consumed_durable_pages: Vec<u32>,
         queue: &GroupCommitQueueRef,
         publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
         txn_attempt: Option<&Arc<PendingGroupCommitTxnAttempt<V::File>>>,
@@ -19095,6 +19143,7 @@ where
             published_durable_freelist,
             freelist_publication_freed_pages,
             freelist_publication_consumed_pages,
+            freelist_publication_consumed_durable_pages,
         );
         let conflict_snapshot_us = elapsed_profile_us(t_conflict_snapshot_start);
 
@@ -20777,6 +20826,7 @@ where
         self.retained_memory_overlay_dirty_pages.clear();
         self.clear_freed_pages();
         self.allocated_from_freelist.clear();
+        self.allocated_from_durable_freelist.clear();
         self.allocated_from_eof.clear();
         self.page_lease.clear();
         self.savepoint_stack.clear();
@@ -21325,6 +21375,9 @@ where
                             .rposition(|page| page.get() > inner.db_size)
                     {
                         let page = inner.freelist.remove(idx);
+                        if inner.durable_freelist_view.contains(&page.get()) {
+                            self.allocated_from_durable_freelist.insert(page.get());
+                        }
                         self.allocated_from_freelist.push(page);
                         alloc_ledger(self as *const _ as usize, "alloc_freelist_hi", page.get(), 0);
                         return Ok(page);
@@ -21348,11 +21401,17 @@ where
                     // never reused committed free pages and every churn
                     // workload grew the file at EOF without bound.
                     if sole_current_snapshot && let Some(page) = inner.freelist.pop() {
+                        if inner.durable_freelist_view.contains(&page.get()) {
+                            self.allocated_from_durable_freelist.insert(page.get());
+                        }
                         self.allocated_from_freelist.push(page);
                         alloc_ledger(self as *const _ as usize, "alloc_freelist_gated", page.get(), 0);
                         return Ok(page);
                     }
                 } else if let Some(page) = inner.freelist.pop() {
+                    if inner.durable_freelist_view.contains(&page.get()) {
+                        self.allocated_from_durable_freelist.insert(page.get());
+                    }
                     self.allocated_from_freelist.push(page);
                     alloc_ledger(self as *const _ as usize, "alloc_freelist_nc", page.get(), 0);
                     return Ok(page);
@@ -21705,6 +21764,9 @@ where
             // publishes (None when freelist metadata is not serialized),
             // carried to the append-gate resurrection/erasure guard.
             let mut published_durable_freelist: Option<Vec<u32>> = None;
+            // bd-r82et: retained copy of the same publication for updating
+            // PagerInner::durable_freelist_view once the commit is durable.
+            let mut published_for_durable_view: Option<Vec<u32>> = None;
             {
                 // ShardedPageCache uses per-shard internal locking
                 //
@@ -21781,6 +21843,7 @@ where
                         Ok(published) => {
                             published_durable_freelist =
                                 Some(published.iter().map(|page| page.get()).collect());
+                            published_for_durable_view = published_durable_freelist.clone();
                         }
                         Err(e) => {
                             if wal_attempt.is_some() {
@@ -21917,6 +21980,11 @@ where
                         .iter()
                         .map(|page| page.get())
                         .collect(),
+                    self.allocated_from_freelist
+                        .iter()
+                        .map(|page| page.get())
+                        .filter(|page| self.allocated_from_durable_freelist.contains(page))
+                        .collect(),
                     &self.group_commit_queue,
                     &mut wal_publication_authorization,
                     wal_attempt.as_ref(),
@@ -22027,6 +22095,12 @@ where
                         .await?;
                         self.finish_authorized_wal_attempt(&cleanup_cx, true)
                             .await?;
+                        // bd-r82et: the freelist publication is durable now.
+                        if let Some(view) = published_for_durable_view.take()
+                            && let Ok(mut inner) = self.inner.lock()
+                        {
+                            inner.durable_freelist_view = view.into_iter().collect();
+                        }
                         return Ok(());
                     }
                     PendingGroupCommitTxnResolution::NotCommitted => {
@@ -22053,6 +22127,11 @@ where
                 // durable.
                 return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                 return_pages_to_freelist(&mut inner.freelist, pending_freed);
+                // bd-r82et: a successful journal/memory commit that carried a
+                // freelist publication just made that list the durable truth.
+                if let Some(view) = published_for_durable_view.take() {
+                    inner.durable_freelist_view = view.into_iter().collect();
+                }
                 // Cross-process #70: the group-commit flusher already set
                 // inner.db_size to final_db_size in WAL mode, but with concurrent
                 // peer commits extending the same file, our flusher's view of
@@ -22458,6 +22537,9 @@ where
             // bd-gh302/bd-0shxy: exact durable-freelist content this commit
             // publishes, carried to the append-gate resurrection/erasure guard.
             let mut published_durable_freelist: Option<Vec<u32>> = None;
+            // bd-r82et: retained copy of the same publication for updating
+            // PagerInner::durable_freelist_view once the commit is durable.
+            let mut published_for_durable_view: Option<Vec<u32>> = None;
             let commit_result = {
                 let freelist_dirty = freelist_dirty_for_retain;
                 // Match the normal commit path: capture semantic Page 1 intent
@@ -22511,6 +22593,7 @@ where
                         Ok(published) => {
                             published_durable_freelist =
                                 Some(published.iter().map(|page| page.get()).collect());
+                            published_for_durable_view = published_durable_freelist.clone();
                         }
                         Err(e) => {
                             if wal_attempt.is_some() {
@@ -22632,6 +22715,11 @@ where
                             .iter()
                             .map(|page| page.get())
                             .collect(),
+                        self.allocated_from_freelist
+                            .iter()
+                            .map(|page| page.get())
+                            .filter(|page| self.allocated_from_durable_freelist.contains(page))
+                            .collect(),
                         &self.group_commit_queue,
                         &mut wal_publication_authorization,
                         wal_attempt.as_ref(),
@@ -22720,6 +22808,12 @@ where
                         .await?;
                         self.finish_authorized_wal_attempt(&cleanup_cx, false)
                             .await?;
+                        // bd-r82et: the freelist publication is durable now.
+                        if let Some(view) = published_for_durable_view.take()
+                            && let Ok(mut inner) = self.inner.lock()
+                        {
+                            inner.durable_freelist_view = view.into_iter().collect();
+                        }
                         return Ok(true);
                     }
                     PendingGroupCommitTxnResolution::NotCommitted => {
@@ -22742,6 +22836,11 @@ where
                 // to the consolidated max across all batched transactions - don't revert it.
                 return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                 return_pages_to_freelist(&mut inner.freelist, pending_freed);
+                // bd-r82et: a successful retained commit that carried a
+                // freelist publication just made that list the durable truth.
+                if let Some(view) = published_for_durable_view.take() {
+                    inner.durable_freelist_view = view.into_iter().collect();
+                }
                 // See commit() Phase C1: keep inner.db_size monotonic across
                 // concurrent cross-process commits so we never publish a db_size
                 // smaller than a peer's just-committed extent.
@@ -22808,6 +22907,7 @@ where
                 self.write_pages_sorted.clear();
                 self.clear_freed_pages();
                 self.allocated_from_freelist.clear();
+                self.allocated_from_durable_freelist.clear();
                 self.allocated_from_eof.clear();
                 self.savepoint_stack.clear();
                 self.rolled_back_pages.clear();
@@ -23085,6 +23185,7 @@ where
             let mut notify_writer_idle = false;
             if restored_from_journal {
                 self.allocated_from_freelist.clear();
+                self.allocated_from_durable_freelist.clear();
                 self.allocated_from_eof.clear();
                 // Lease pages were EOF allocations that were never written to
                 // disk. After journal recovery rebuilds committed state, these
@@ -23096,6 +23197,7 @@ where
                     &mut inner.freelist,
                     self.allocated_from_freelist.drain(..),
                 );
+                self.allocated_from_durable_freelist.clear();
 
                 if self.is_writer && self.mode != TransactionMode::Concurrent {
                     // Non-concurrent: next_page will be reset below, so lease
@@ -23459,6 +23561,7 @@ where
         } else {
             // Ordinary uncommitted drop: restore freelist allocations.
             return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
+            self.allocated_from_durable_freelist.clear();
 
             if self.is_writer && self.mode != TransactionMode::Concurrent {
                 // Non-concurrent: next_page will be reset, so lease pages
