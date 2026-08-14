@@ -14965,6 +14965,45 @@ impl Connection {
                 }
             }
         }
+
+        // Tables are not the whole schema. A persisted view or trigger carries
+        // expressions that become part of what a published image means, and an
+        // image whose trigger bodies were never admitted is an image this proof
+        // cannot speak for. TEMP objects are connection-local and never travel
+        // with the image, so they are out of scope by construction.
+        for view in self
+            .views
+            .borrow()
+            .iter()
+            .filter(|view| !view.temporary)
+        {
+            self.validate_bounded_ast_semantics(
+                BoundedCollationAstNode::Select(&view.query),
+                &format!("view `{}`", view.name),
+                true,
+            )?;
+        }
+        for trigger in self
+            .triggers
+            .borrow()
+            .iter()
+            .filter(|trigger| !trigger.temporary)
+        {
+            if let Some(when_clause) = trigger.when_clause.as_ref() {
+                self.validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Expr(when_clause),
+                    &format!("WHEN clause of trigger `{}`", trigger.name),
+                    true,
+                )?;
+            }
+            for statement in &trigger.body {
+                self.validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Statement(statement),
+                    &format!("body of trigger `{}`", trigger.name),
+                    true,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -228885,12 +228924,119 @@ mod pager_routing_tests {
                 "a child row pointing at a missing parent must be refused, got {semantic:?}"
             );
             let error = semantic.unwrap_err();
+            // Must be a CONCORDANCE failure, not a gate refusal. If this were
+            // allowed to accept NotImplemented, the test would also pass when
+            // the admission gate rejected the schema outright and the walkers
+            // never ran — which would prove nothing about the walkers at all.
             assert!(
-                matches!(&error, FrankenError::DatabaseCorrupt { .. })
-                    || matches!(&error, FrankenError::NotImplemented(_)),
-                "expected a typed refusal, got {error:?}"
+                matches!(&error, FrankenError::DatabaseCorrupt { .. }),
+                "expected a DatabaseCorrupt concordance failure from the walkers, \
+                 got {error:?} (a NotImplemented here means the gate refused the \
+                 schema and the walkers never executed)"
             );
 
+            snapshot.finish().await.ok();
+        });
+    }
+
+    /// A persisted trigger whose WHEN clause and body stay inside the admitted
+    /// fragment must not block validation.
+    ///
+    /// This is the positive half of trigger admissibility. Without it, a gate
+    /// that refused *every* trigger would pass the negative test below and look
+    /// correct while making the validator useless on any real schema.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_admits_a_deterministic_trigger() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let image_path = dir.path().join("trig-ok.db");
+            let receipt = build_self_contained_image(
+                &dir.path().join("trig-ok-builder.db"),
+                &image_path,
+                &[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT);",
+                    "CREATE TABLE audit (id INTEGER PRIMARY KEY, tag TEXT);",
+                    "CREATE TRIGGER t_ins AFTER INSERT ON t WHEN NEW.tag IS NOT NULL \
+                     BEGIN INSERT INTO audit(id, tag) VALUES (NEW.id, NEW.tag); END;",
+                    "INSERT INTO t VALUES (1, 'alpha');",
+                ],
+            )
+            .await;
+
+            let owner = Connection::open(
+                dir.path().join("trig-ok-owner.db").to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            let snapshot = owner
+                .begin_bounded_structural_snapshot(&receipt, &image_path, 256)
+                .await
+                .expect("snapshot opens");
+            let stats = snapshot
+                .connection()
+                .validate_database_integrity_bounded(dir.path())
+                .await;
+            assert!(
+                stats.is_ok(),
+                "a deterministic trigger must not make an image inadmissible: {stats:?}"
+            );
+            snapshot.finish().await.expect("recertify");
+        });
+    }
+
+    /// A persisted trigger whose WHEN clause calls a NONDETERMINISTIC function
+    /// must make the image inadmissible, naming the trigger.
+    ///
+    /// This is the upstream verdict that lets HFDT's
+    /// SEC_XBRL_0117_INADMISSIBLE_TRIGGERS workaround be deleted (hfdt-wkcxd):
+    /// trigger admissibility becomes a typed refusal crossing the bridge rather
+    /// than something the caller has to decide by parsing SQL itself.
+    ///
+    /// `random()` is the case that matters: a bounded proof recomputes rows and
+    /// compares them against what is persisted, and a trigger whose firing
+    /// condition changes between evaluations cannot be reconciled at all.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_refuses_a_nondeterministic_trigger() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let image_path = dir.path().join("trig-bad.db");
+            let receipt = build_self_contained_image(
+                &dir.path().join("trig-bad-builder.db"),
+                &image_path,
+                &[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT);",
+                    "CREATE TABLE audit (id INTEGER PRIMARY KEY, tag TEXT);",
+                    "CREATE TRIGGER t_rand AFTER INSERT ON t WHEN random() > 0 \
+                     BEGIN INSERT INTO audit(id, tag) VALUES (NEW.id, NEW.tag); END;",
+                    "INSERT INTO t VALUES (1, 'alpha');",
+                ],
+            )
+            .await;
+
+            let owner = Connection::open(
+                dir.path().join("trig-bad-owner.db").to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            let snapshot = owner
+                .begin_bounded_structural_snapshot(&receipt, &image_path, 256)
+                .await
+                .expect("STRUCTURE is sound, so the snapshot must still open");
+
+            let outcome = snapshot
+                .connection()
+                .validate_database_integrity_bounded(dir.path())
+                .await;
+            let error = outcome.expect_err("a nondeterministic trigger must be refused");
+            // Must be the admission gate refusing, not a concordance failure:
+            // the image is perfectly concordant, it is simply not provable.
+            assert!(
+                matches!(&error, FrankenError::NotImplemented(detail)
+                    if detail.contains("trigger")),
+                "expected a NotImplemented naming the trigger, got {error:?}"
+            );
             snapshot.finish().await.ok();
         });
     }
