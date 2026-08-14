@@ -127,7 +127,9 @@ fn single_writer_ddl_churn_republication_is_never_snapshot_refused() {
             .await
             .expect("integrity_check");
         match &integrity[0].values()[0] {
-            SqliteValue::Text(s) => assert_eq!(s, "ok", "integrity_check must pass: {s:?}"),
+            SqliteValue::Text(s) => {
+                assert_eq!(s.as_str(), "ok", "integrity_check must pass: {s:?}");
+            }
             other => panic!("unexpected integrity_check value: {other:?}"),
         }
         let _ = std::fs::remove_file(&path);
