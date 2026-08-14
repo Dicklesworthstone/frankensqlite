@@ -12771,6 +12771,18 @@ impl Connection {
             });
         }
 
+        // `export_bytes` checkpoints WAL into the main database, but SQLite
+        // deliberately leaves the main-header format bytes at `(2, 2)` while
+        // the connection remains in WAL mode. An import is self-contained by
+        // contract and gets a fresh private VFS with no companion files, so
+        // carrying that marker into generic pager bootstrap would make it
+        // manufacture a pointless `-wal` sidecar (and can exceed an exact
+        // MemoryVfs byte cap). Normalize only the coherent WAL marker here;
+        // mixed format bytes remain untouched for the pager to reject as
+        // corruption.
+        let normalize_self_contained_wal_header =
+            bytes.len() >= DATABASE_HEADER_SIZE && bytes[18] == 2 && bytes[19] == 2;
+
         let path = ":memory:".to_owned();
         let bootstrap_cx =
             env.runtime()
@@ -12784,6 +12796,9 @@ impl Connection {
         let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         let (mut db_file, _) = vfs.open(&bootstrap_cx, Some(&db_path), flags)?;
         db_file.write(&bootstrap_cx, bytes, 0).await?;
+        if normalize_self_contained_wal_header {
+            db_file.write(&bootstrap_cx, &[1, 1], 18).await?;
+        }
         db_file.sync(&bootstrap_cx, fsqlite_types::flags::SyncFlags::NORMAL)?;
         db_file.close(&bootstrap_cx)?;
         let mut pager = SimplePager::open_with_cx_and_page_buffer_max(
@@ -33506,6 +33521,11 @@ impl DatabaseImagePublication {
     }
 }
 
+/// Fixed ceiling on nodes visited while admitting one persisted expression.
+const BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES: usize = 65_536;
+/// Fixed ceiling on expression-AST depth while admitting one expression.
+const BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH: usize = 512;
+
 /// Semantic proof counters for a bounded whole-image validation.
 ///
 /// Note the shape: this **contains** the structural proof rather than sitting
@@ -33561,6 +33581,599 @@ fn bounded_increment_validation_counter(counter: &mut u64) -> Result<()> {
     let next = counter.checked_add(1).ok_or(FrankenError::TooBig)?;
     *counter = next;
     Ok(())
+}
+
+
+// ---------------------------------------------------------------------------
+// Gate-B (part 1): bounded expression-AST admission traversal
+//
+// Ported from the pre-0.3 validation line. Pure AST inspection with no I/O, so
+// unlike the structural walkers this needed no async conversion.
+//
+// The traversal answers one question: does this persisted expression stay
+// inside the fragment the bounded semantic walkers can actually evaluate? It
+// returns the FIRST unsupported construct rather than a bare bool so a refusal
+// can name what it refused, and it is bounded in both node count and depth —
+// a proof that could be made to run unboundedly by a hostile schema would not
+// be a bound at all.
+//
+// Not wired to the gate yet: the policies and the Connection-level validators
+// are part 2. Gate-A plus this traversal is still a half-gate.
+// ---------------------------------------------------------------------------
+
+fn is_bounded_builtin_collation(collation: &str) -> bool {
+    ["binary", "nocase", "rtrim"]
+        .iter()
+        .any(|builtin| collation.eq_ignore_ascii_case(builtin))
+}
+
+#[derive(Clone, Copy)]
+enum BoundedCollationAstNode<'a> {
+    Statement(&'a Statement),
+    Expr(&'a Expr),
+    Select(&'a SelectStatement),
+    SelectCore(&'a SelectCore),
+    From(&'a FromClause),
+    TableSource(&'a TableOrSubquery),
+    Window(&'a WindowSpec),
+    Frame(&'a FrameSpec),
+    FrameBound(&'a FrameBound),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedCollationTraversalLimit {
+    Nodes,
+    Depth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoundedAstUnsupported {
+    Collation(String),
+    Function { name: String, arity: i32 },
+    Shape(&'static str),
+    Statement(&'static str),
+}
+
+fn first_unsupported_bounded_ast(
+    root: BoundedCollationAstNode<'_>,
+    reject_custom_collations: bool,
+    supported_function: Option<&dyn Fn(&str, &FunctionArgs, bool) -> bool>,
+    supported_like: Option<&dyn Fn(&LikeOp, &Expr, Option<&Expr>) -> bool>,
+    reject_schema_expression_shapes: bool,
+) -> std::result::Result<Option<BoundedAstUnsupported>, BoundedCollationTraversalLimit> {
+    let mut pending = vec![(root, 0_usize)];
+    let mut visited = 0_usize;
+
+    while let Some((node, depth)) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if visited > BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES {
+            return Err(BoundedCollationTraversalLimit::Nodes);
+        }
+        if depth > BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH {
+            return Err(BoundedCollationTraversalLimit::Depth);
+        }
+        let child_depth = depth.saturating_add(1);
+
+        match node {
+            BoundedCollationAstNode::Statement(statement) => match statement {
+                Statement::Select(select) => {
+                    pending.push((BoundedCollationAstNode::Select(select), child_depth));
+                }
+                Statement::Insert(insert) => {
+                    for column in insert.returning.iter().rev() {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                        }
+                    }
+                    for upsert in insert.upsert.iter().rev() {
+                        if let UpsertAction::Update {
+                            assignments,
+                            where_clause,
+                        } = &upsert.action
+                        {
+                            if let Some(predicate) = where_clause.as_deref() {
+                                pending
+                                    .push((BoundedCollationAstNode::Expr(predicate), child_depth));
+                            }
+                            for assignment in assignments.iter().rev() {
+                                pending.push((
+                                    BoundedCollationAstNode::Expr(&assignment.value),
+                                    child_depth,
+                                ));
+                            }
+                        }
+                        if let Some(target) = upsert.target.as_ref() {
+                            if let Some(predicate) = target.where_clause.as_ref() {
+                                pending
+                                    .push((BoundedCollationAstNode::Expr(predicate), child_depth));
+                            }
+                            for column in target.columns.iter().rev() {
+                                pending.push((
+                                    BoundedCollationAstNode::Expr(&column.expr),
+                                    child_depth,
+                                ));
+                            }
+                        }
+                    }
+                    match &insert.source {
+                        InsertSource::Values(rows) => {
+                            for row in rows.iter().rev() {
+                                for expression in row.iter().rev() {
+                                    pending.push((
+                                        BoundedCollationAstNode::Expr(expression),
+                                        child_depth,
+                                    ));
+                                }
+                            }
+                        }
+                        InsertSource::Select(select) => {
+                            pending.push((BoundedCollationAstNode::Select(select), child_depth));
+                        }
+                        InsertSource::DefaultValues => {}
+                    }
+                    if let Some(with) = insert.with.as_ref() {
+                        for cte in with.ctes.iter().rev() {
+                            pending
+                                .push((BoundedCollationAstNode::Select(&cte.query), child_depth));
+                        }
+                    }
+                }
+                Statement::Update(update) => {
+                    if let Some(limit) = update.limit.as_ref() {
+                        if let Some(offset) = limit.offset.as_ref() {
+                            pending.push((BoundedCollationAstNode::Expr(offset), child_depth));
+                        }
+                        pending.push((BoundedCollationAstNode::Expr(&limit.limit), child_depth));
+                    }
+                    for term in update.order_by.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(&term.expr), child_depth));
+                    }
+                    for column in update.returning.iter().rev() {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                        }
+                    }
+                    if let Some(predicate) = update.where_clause.as_ref() {
+                        pending.push((BoundedCollationAstNode::Expr(predicate), child_depth));
+                    }
+                    if let Some(from) = update.from.as_ref() {
+                        pending.push((BoundedCollationAstNode::From(from), child_depth));
+                    }
+                    for assignment in update.assignments.iter().rev() {
+                        pending.push((
+                            BoundedCollationAstNode::Expr(&assignment.value),
+                            child_depth,
+                        ));
+                    }
+                    if let Some(with) = update.with.as_ref() {
+                        for cte in with.ctes.iter().rev() {
+                            pending
+                                .push((BoundedCollationAstNode::Select(&cte.query), child_depth));
+                        }
+                    }
+                }
+                Statement::Delete(delete) => {
+                    if let Some(limit) = delete.limit.as_ref() {
+                        if let Some(offset) = limit.offset.as_ref() {
+                            pending.push((BoundedCollationAstNode::Expr(offset), child_depth));
+                        }
+                        pending.push((BoundedCollationAstNode::Expr(&limit.limit), child_depth));
+                    }
+                    for term in delete.order_by.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(&term.expr), child_depth));
+                    }
+                    for column in delete.returning.iter().rev() {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                        }
+                    }
+                    if let Some(predicate) = delete.where_clause.as_ref() {
+                        pending.push((BoundedCollationAstNode::Expr(predicate), child_depth));
+                    }
+                    if let Some(with) = delete.with.as_ref() {
+                        for cte in with.ctes.iter().rev() {
+                            pending
+                                .push((BoundedCollationAstNode::Select(&cte.query), child_depth));
+                        }
+                    }
+                }
+                Statement::Explain { stmt, .. } => {
+                    pending.push((BoundedCollationAstNode::Statement(stmt), child_depth));
+                }
+                Statement::CreateTable(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("CREATE TABLE")));
+                }
+                Statement::CreateIndex(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("CREATE INDEX")));
+                }
+                Statement::CreateView(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("CREATE VIEW")));
+                }
+                Statement::CreateTrigger(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("CREATE TRIGGER")));
+                }
+                Statement::CreateVirtualTable(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement(
+                        "CREATE VIRTUAL TABLE",
+                    )));
+                }
+                Statement::Drop(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("DROP")));
+                }
+                Statement::AlterTable(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("ALTER TABLE")));
+                }
+                Statement::Begin(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("BEGIN")));
+                }
+                Statement::Commit => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("COMMIT")));
+                }
+                Statement::Rollback(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("ROLLBACK")));
+                }
+                Statement::Savepoint(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("SAVEPOINT")));
+                }
+                Statement::Release(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("RELEASE")));
+                }
+                Statement::Attach(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("ATTACH")));
+                }
+                Statement::Detach(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("DETACH")));
+                }
+                Statement::Pragma(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("PRAGMA")));
+                }
+                Statement::Vacuum(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("VACUUM")));
+                }
+                Statement::Reindex(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("REINDEX")));
+                }
+                Statement::Analyze(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("ANALYZE")));
+                }
+            },
+            BoundedCollationAstNode::Expr(expr) => match expr {
+                Expr::Literal(literal, _) => {
+                    if supported_like.is_some()
+                        && matches!(
+                            literal,
+                            Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp
+                        )
+                    {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "nondeterministic current-time literal in persisted CHECK expression",
+                        )));
+                    }
+                }
+                Expr::Column(_, _) => {}
+                Expr::Raise { .. } => {
+                    if reject_schema_expression_shapes {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "RAISE expression in persisted schema expression",
+                        )));
+                    }
+                }
+                Expr::Placeholder(_, _) => {
+                    if reject_schema_expression_shapes {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "bind parameter in persisted schema expression",
+                        )));
+                    }
+                }
+                Expr::BinaryOp {
+                    left, op, right, ..
+                } => {
+                    if supported_like.is_some() && matches!(op, BinaryOp::Is | BinaryOp::IsNot) {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "IS or IS NOT operator in persisted CHECK expression",
+                        )));
+                    }
+                    if supported_like.is_some() && !bounded_check_binary_operator_supported(*op) {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "unsupported binary operator in persisted CHECK expression",
+                        )));
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(right), child_depth));
+                    pending.push((BoundedCollationAstNode::Expr(left), child_depth));
+                }
+                Expr::UnaryOp { op, expr, .. } => {
+                    if supported_like.is_some()
+                        && !matches!(
+                            (op, expr.as_ref()),
+                            (UnaryOp::Negate, Expr::Literal(Literal::Integer(_), _))
+                                | (UnaryOp::Not | UnaryOp::BitNot, _)
+                        )
+                    {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "unsupported unary operator or operand in persisted CHECK expression",
+                        )));
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::IsNull { expr, .. } => {
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::Cast {
+                    expr, type_name, ..
+                } => {
+                    if supported_like.is_some() && !bounded_check_cast_target_supported(type_name) {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "unsupported CAST target in persisted CHECK expression; only exact INTEGER and BLOB targets are admitted",
+                        )));
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::Collate {
+                    expr, collation, ..
+                } => {
+                    if reject_custom_collations && !is_bounded_builtin_collation(collation) {
+                        return Ok(Some(BoundedAstUnsupported::Collation(collation.clone())));
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::Between {
+                    expr, low, high, ..
+                } => {
+                    pending.push((BoundedCollationAstNode::Expr(high), child_depth));
+                    pending.push((BoundedCollationAstNode::Expr(low), child_depth));
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::In { expr, set, .. } => {
+                    match set {
+                        InSet::List(expressions) => {
+                            for item in expressions.iter().rev() {
+                                pending.push((BoundedCollationAstNode::Expr(item), child_depth));
+                            }
+                        }
+                        InSet::Subquery(select) => {
+                            if reject_schema_expression_shapes {
+                                return Ok(Some(BoundedAstUnsupported::Shape(
+                                    "subquery in persisted schema expression",
+                                )));
+                            }
+                            pending.push((BoundedCollationAstNode::Select(select), child_depth));
+                        }
+                        InSet::Table(_) => {
+                            if reject_schema_expression_shapes {
+                                return Ok(Some(BoundedAstUnsupported::Shape(
+                                    "table shorthand in persisted schema IN expression",
+                                )));
+                            }
+                        }
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::Like {
+                    expr,
+                    pattern,
+                    op,
+                    escape,
+                    ..
+                } => {
+                    if let Some(is_supported) = supported_like
+                        && !is_supported(op, pattern, escape.as_deref())
+                    {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "non-literal, over-limit, or unsupported pattern operator in persisted CHECK expression",
+                        )));
+                    }
+                    if let Some(escape) = escape.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(escape), child_depth));
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(pattern), child_depth));
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::Case {
+                    operand,
+                    whens,
+                    else_expr,
+                    ..
+                } => {
+                    if let Some(else_expr) = else_expr.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(else_expr), child_depth));
+                    }
+                    for (when, then) in whens.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(then), child_depth));
+                        pending.push((BoundedCollationAstNode::Expr(when), child_depth));
+                    }
+                    if let Some(operand) = operand.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(operand), child_depth));
+                    }
+                }
+                Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+                    if reject_schema_expression_shapes {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "subquery in persisted schema expression",
+                        )));
+                    }
+                    pending.push((BoundedCollationAstNode::Select(subquery), child_depth));
+                }
+                Expr::FunctionCall {
+                    name,
+                    args,
+                    order_by,
+                    filter,
+                    over,
+                    ..
+                } => {
+                    let has_aggregate_decorations =
+                        !order_by.is_empty() || filter.is_some() || over.is_some();
+                    if let Some(is_supported) = supported_function
+                        && !is_supported(name, args, has_aggregate_decorations)
+                    {
+                        return Ok(Some(BoundedAstUnsupported::Function {
+                            name: name.clone(),
+                            arity: function_args_len(args),
+                        }));
+                    }
+                    if let Some(window) = over.as_ref() {
+                        pending.push((BoundedCollationAstNode::Window(window), child_depth));
+                    }
+                    if let Some(filter) = filter.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(filter), child_depth));
+                    }
+                    for term in order_by.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(&term.expr), child_depth));
+                    }
+                    if let FunctionArgs::List(expressions) = args {
+                        for argument in expressions.iter().rev() {
+                            pending.push((BoundedCollationAstNode::Expr(argument), child_depth));
+                        }
+                    }
+                }
+                Expr::JsonAccess { expr, path, .. } => {
+                    if reject_schema_expression_shapes {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "JSON access in persisted schema expression",
+                        )));
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(path), child_depth));
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::RowValue(expressions, _) => {
+                    if reject_schema_expression_shapes {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "row-value expression in persisted schema expression",
+                        )));
+                    }
+                    for item in expressions.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(item), child_depth));
+                    }
+                }
+            },
+            BoundedCollationAstNode::Select(select) => {
+                if let Some(limit) = select.limit.as_ref() {
+                    if let Some(offset) = limit.offset.as_ref() {
+                        pending.push((BoundedCollationAstNode::Expr(offset), child_depth));
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(&limit.limit), child_depth));
+                }
+                for term in select.order_by.iter().rev() {
+                    pending.push((BoundedCollationAstNode::Expr(&term.expr), child_depth));
+                }
+                for (_, core) in select.body.compounds.iter().rev() {
+                    pending.push((BoundedCollationAstNode::SelectCore(core), child_depth));
+                }
+                pending.push((
+                    BoundedCollationAstNode::SelectCore(&select.body.select),
+                    child_depth,
+                ));
+                if let Some(with) = select.with.as_ref() {
+                    for cte in with.ctes.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Select(&cte.query), child_depth));
+                    }
+                }
+            }
+            BoundedCollationAstNode::SelectCore(core) => match core {
+                SelectCore::Select {
+                    columns,
+                    from,
+                    where_clause,
+                    group_by,
+                    having,
+                    windows,
+                    ..
+                } => {
+                    for window in windows.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Window(&window.spec), child_depth));
+                    }
+                    if let Some(having) = having.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(having), child_depth));
+                    }
+                    for expression in group_by.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(expression), child_depth));
+                    }
+                    if let Some(predicate) = where_clause.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(predicate), child_depth));
+                    }
+                    if let Some(from) = from.as_ref() {
+                        pending.push((BoundedCollationAstNode::From(from), child_depth));
+                    }
+                    for column in columns.iter().rev() {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                        }
+                    }
+                }
+                SelectCore::Values(rows) => {
+                    for row in rows.iter().rev() {
+                        for expression in row.iter().rev() {
+                            pending.push((BoundedCollationAstNode::Expr(expression), child_depth));
+                        }
+                    }
+                }
+            },
+            BoundedCollationAstNode::From(from) => {
+                for join in from.joins.iter().rev() {
+                    if let Some(JoinConstraint::On(expression)) = &join.constraint {
+                        pending.push((BoundedCollationAstNode::Expr(expression), child_depth));
+                    }
+                    pending.push((
+                        BoundedCollationAstNode::TableSource(&join.table),
+                        child_depth,
+                    ));
+                }
+                pending.push((
+                    BoundedCollationAstNode::TableSource(&from.source),
+                    child_depth,
+                ));
+            }
+            BoundedCollationAstNode::TableSource(source) => match source {
+                TableOrSubquery::Table { .. } => {}
+                TableOrSubquery::Subquery { query, .. } => {
+                    pending.push((BoundedCollationAstNode::Select(query), child_depth));
+                }
+                TableOrSubquery::TableFunction { args, .. } => {
+                    if supported_function.is_some() {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "table-valued function in persisted view or trigger",
+                        )));
+                    }
+                    for argument in args.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(argument), child_depth));
+                    }
+                }
+                TableOrSubquery::ParenJoin(from) => {
+                    pending.push((BoundedCollationAstNode::From(from), child_depth));
+                }
+            },
+            BoundedCollationAstNode::Window(window) => {
+                if let Some(frame) = window.frame.as_ref() {
+                    pending.push((BoundedCollationAstNode::Frame(frame), child_depth));
+                }
+                for term in window.order_by.iter().rev() {
+                    pending.push((BoundedCollationAstNode::Expr(&term.expr), child_depth));
+                }
+                for expression in window.partition_by.iter().rev() {
+                    pending.push((BoundedCollationAstNode::Expr(expression), child_depth));
+                }
+            }
+            BoundedCollationAstNode::Frame(frame) => {
+                if let Some(end) = frame.end.as_ref() {
+                    pending.push((BoundedCollationAstNode::FrameBound(end), child_depth));
+                }
+                pending.push((
+                    BoundedCollationAstNode::FrameBound(&frame.start),
+                    child_depth,
+                ));
+            }
+            BoundedCollationAstNode::FrameBound(bound) => match bound {
+                FrameBound::Preceding(expression) | FrameBound::Following(expression) => {
+                    pending.push((BoundedCollationAstNode::Expr(expression), child_depth));
+                }
+                FrameBound::UnboundedPreceding
+                | FrameBound::CurrentRow
+                | FrameBound::UnboundedFollowing => {}
+            },
+        }
+    }
+
+    Ok(None)
 }
 
 /// Where a page-ownership walk records the pages it claims.
@@ -126409,7 +127022,7 @@ mod tests {
     #[cfg(unix)]
     use fsqlite_vfs::UnixVfs;
     use fsqlite_vfs::traits::{Vfs, VfsFile};
-    use fsqlite_vfs::{FileIdentity, MemoryVfs};
+    use fsqlite_vfs::{FileIdentity, MemoryVfs, MemoryVfsConfig};
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -156082,6 +156695,80 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
             assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+        });
+    }
+
+    #[test]
+    fn test_import_bytes_normalizes_exported_wal_header_without_sidecar_at_exact_cap() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("wal-export-source.db");
+            let source = Connection::open(db_path.to_string_lossy().into_owned())
+                .await
+                .unwrap();
+            source
+                .execute("CREATE TABLE import_t (id INTEGER PRIMARY KEY, name TEXT);")
+                .await
+                .unwrap();
+            source
+                .execute("INSERT INTO import_t VALUES (1, 'alpha'), (2, 'beta');")
+                .await
+                .unwrap();
+
+            let bytes = source.export_bytes().await.unwrap();
+            assert_eq!(
+                &bytes[18..20],
+                &[2, 2],
+                "WAL export must retain the source header marker so this test exercises import normalization"
+            );
+            source.close().await.unwrap();
+
+            let image_len = bytes.len();
+            let mut env = ConnectionEnv::default();
+            env.set_memory_vfs_config(MemoryVfsConfig {
+                initial_reserve_bytes: image_len,
+                growth_chunk_bytes: 1,
+                max_bytes: Some(image_len),
+            });
+            let imported = Connection::import_bytes_with_env(&bytes, env).await.unwrap();
+
+            let rows = imported
+                .query("SELECT id, name FROM import_t ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+
+            let journal_mode = imported.query("PRAGMA journal_mode;").await.unwrap();
+            assert_eq!(journal_mode.len(), 1);
+            assert_eq!(
+                journal_mode[0].get(0),
+                Some(&SqliteValue::Text("memory".into())),
+                "a private imported image must report SQLite-visible memory mode"
+            );
+
+            let normalized = imported.export_bytes().await.unwrap();
+            assert_eq!(normalized.len(), image_len);
+            assert_eq!(
+                &normalized[18..20],
+                &[1, 1],
+                "the private self-contained main image must bootstrap in rollback mode"
+            );
+
+            let stats = imported
+                .memory_stats()
+                .unwrap()
+                .memory_vfs
+                .expect("an imported image must use MemoryVfs");
+            assert_eq!(stats.max_bytes, Some(image_len));
+            assert_eq!(stats.file_count, 1, "import must not create a WAL sidecar");
+            assert_eq!(stats.file_bytes, image_len);
+            assert_eq!(stats.file_reserved_bytes, image_len);
+            assert_eq!(stats.peak_reserved_bytes, image_len);
+            assert_eq!(stats.shm_region_count, 0);
+            assert_eq!(stats.shm_bytes, 0);
+            assert_eq!(stats.shm_reserved_bytes, 0);
         });
     }
 
