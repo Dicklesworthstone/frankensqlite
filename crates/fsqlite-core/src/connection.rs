@@ -107713,7 +107713,15 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> Result<SqliteValue>
                 Ok(SqliteValue::Text(parts.join(",").into()))
             }
         }
-        _ => Ok(SqliteValue::Null),
+        // bd-9nhpg: this arm used to be `Ok(SqliteValue::Null)`, which
+        // silently corrupted results for any aggregate that reached the
+        // builtin fallback without an implementation — bd-a8ygy's
+        // json_group_array NULLs rode it undetected for a month. Every name
+        // the registry or a dedicated evaluator owns is handled before this
+        // chain; reaching here is a routing bug, so fail loudly.
+        other => Err(FrankenError::NotImplemented(format!(
+            "aggregate {other}() is not implemented in the grouped-fallback evaluator"
+        ))),
     }
 }
 
@@ -127221,6 +127229,45 @@ fn glob_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
             }
         }
         '?' => ti < txt.len() && glob_dp(pat, txt, pi + 1, ti + 1),
+        '[' => {
+            // Bracket character class, mirroring the function-path matcher
+            // (fsqlite-func glob_match_inner): `^` negates; `X-Y` is a range
+            // unless `Y` is `]`; a `]` immediately after `[`/`[^` is a literal
+            // member; and an unterminated class (pattern ends before `]`)
+            // matches nothing, exactly like C SQLite patternCompare
+            // (bd-gh-glob-charclass-tobn9 — the interpreter path had no bracket
+            // support at all and matched `[` literally).
+            if ti >= txt.len() {
+                return false;
+            }
+            let mut pj = pi + 1;
+            let negate = pj < pat.len() && pat[pj] == '^';
+            if negate {
+                pj += 1;
+            }
+            let mut found = false;
+            let mut first = true;
+            while pj < pat.len() && (first || pat[pj] != ']') {
+                first = false;
+                if pj + 2 < pat.len() && pat[pj + 1] == '-' && pat[pj + 2] != ']' {
+                    if txt[ti] >= pat[pj] && txt[ti] <= pat[pj + 2] {
+                        found = true;
+                    }
+                    pj += 3;
+                } else {
+                    if txt[ti] == pat[pj] {
+                        found = true;
+                    }
+                    pj += 1;
+                }
+            }
+            if pj < pat.len() && pat[pj] == ']' {
+                pj += 1;
+            } else {
+                return false;
+            }
+            found != negate && glob_dp(pat, txt, pj, ti + 1)
+        }
         c => ti < txt.len() && txt[ti] == c && glob_dp(pat, txt, pi + 1, ti + 1),
     }
 }
@@ -164285,6 +164332,27 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(10));
         });
+    }
+
+    /// bd-9nhpg: an aggregate name reaching the builtin fallback computation
+    /// without an implementation is a routing bug and must error loudly, not
+    /// return SQL NULL (the silent arm hid bd-a8ygy's json_group NULLs for a
+    /// month).
+    #[test]
+    fn test_compute_aggregate_unknown_name_fails_loudly() {
+        let values = [&SqliteValue::Integer(1)];
+        let error = super::compute_aggregate("json_group_array", &values)
+            .expect_err("unknown aggregate must not silently return NULL");
+        assert!(
+            matches!(error, FrankenError::NotImplemented(ref msg)
+                if msg.contains("json_group_array")),
+            "unexpected error shape: {error:?}"
+        );
+        // Implemented names keep working through the same entry point.
+        assert_eq!(
+            super::compute_aggregate("count", &values).unwrap(),
+            SqliteValue::Integer(1)
+        );
     }
 
     /// bd-z22mq: the one-entry bucket fast-lane memo must never serve stale

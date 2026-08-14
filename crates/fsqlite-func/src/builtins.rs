@@ -2551,6 +2551,10 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
             'f' => {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
                 param_idx += 1;
+                // C SQLite normalizes signed zero for %f/%e/%g: -0.0 renders as
+                // 0 (no minus), and any sign flag then applies to +0.0
+                // (bd-gh-printf-negative-zero-era4w). `-0.0 == 0.0` is true.
+                let val = if val == 0.0 { 0.0 } else { val };
                 let formatted = if alt_form2 && val.is_finite() {
                     // Alternate-form-2 (`!`): shortest round-trip representation
                     // (always with a decimal point), ignoring precision — matches
@@ -2574,6 +2578,8 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
             'e' | 'E' => {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
                 param_idx += 1;
+                // Normalize signed zero (bd-gh-printf-negative-zero-era4w).
+                let val = if val == 0.0 { 0.0 } else { val };
                 let prec = precision.unwrap_or(6);
                 if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign)
                 {
@@ -2594,6 +2600,9 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
             'g' | 'G' => {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
                 param_idx += 1;
+                // Normalize signed zero, incl. the alt-form path that bypasses
+                // format_float_g (bd-gh-printf-negative-zero-era4w).
+                let val = if val == 0.0 { 0.0 } else { val };
                 let prec = precision.unwrap_or(6);
                 let sig = prec.max(1);
                 if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign)
@@ -2866,7 +2875,9 @@ fn format_float_f(
     if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign) {
         return s;
     }
-    // Use is_sign_negative() to detect -0.0 (IEEE 754: -0.0 < 0.0 is false).
+    // Emit '-' for negative values. Signed zero is normalized to +0.0 by the
+    // caller (bd-gh-printf-negative-zero-era4w), so this only fires for genuine
+    // negatives; is_sign_negative and `val < 0.0` are equivalent here.
     let sign = if val.is_sign_negative() {
         "-".to_owned()
     } else if show_sign {
@@ -4925,6 +4936,45 @@ mod tests {
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("0"))
         );
+    }
+
+    #[test]
+    fn test_format_signed_zero_all_specs() {
+        // bd-gh-printf-negative-zero-era4w (#258): -0.0 normalizes to 0 for
+        // %f/%e/%g and every sub-path (sign flags, width, alt-form), matching
+        // C SQLite 3.46.1; real negatives keep the minus sign.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: f64| -> String {
+            match f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(spec)),
+                    SqliteValue::Float(v),
+                ])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        // Negative zero -> canonical zero across specifiers.
+        assert_eq!(fmt("%f", -0.0), "0.000000");
+        assert_eq!(fmt("%e", -0.0), "0.000000e+00");
+        assert_eq!(fmt("%E", -0.0), "0.000000E+00");
+        assert_eq!(fmt("%G", -0.0), "0");
+        // Sign flags apply to the normalized +0.0.
+        assert_eq!(fmt("%+g", -0.0), "+0");
+        assert_eq!(fmt("% g", -0.0), " 0");
+        assert_eq!(fmt("%+f", -0.0), "+0.000000");
+        // Width/precision.
+        assert_eq!(fmt("%8.2f", -0.0), "    0.00");
+        // Alt-form (`!`) path also normalizes.
+        assert_eq!(fmt("%!g", -0.0), "0.0");
+        // Arithmetic-produced negative zero (underflow) normalizes too.
+        assert_eq!(fmt("%g", -1e-320 * 1e-10), "0");
+        // Real negatives are UNCHANGED (regression guard).
+        assert_eq!(fmt("%g", -1.5), "-1.5");
+        assert_eq!(fmt("%f", -2.25), "-2.250000");
+        assert_eq!(fmt("%+g", -1.5), "-1.5");
     }
 
     #[test]
