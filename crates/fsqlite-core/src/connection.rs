@@ -106,9 +106,9 @@ use fsqlite_func::vtab::{
     VirtualTable, VirtualTableCursor, VtabModuleFactory, module_factory_from,
 };
 use fsqlite_func::{
-    ApplicationFunctionKind, ErasedWindowFunction, FunctionArity, FunctionRegistry,
-    ResolvedScalarFunction, ScalarSchemaSafety, get_last_changes, get_last_insert_rowid,
-    get_total_changes, sqlite_compile_options,
+    ApplicationFunctionKind, BuiltinFunctionFamily, ErasedWindowFunction, FunctionArity,
+    FunctionRegistry, ResolvedScalarFunction, ScalarSchemaSafety, builtin_function_surface_inventory,
+    get_last_changes, get_last_insert_rowid, get_total_changes, sqlite_compile_options,
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_pager::ConnectionPagerOpenMode;
@@ -13482,6 +13482,148 @@ impl Connection {
         let rollback_result = txn.rollback(cx).await;
         rollback_result?;
         Ok(header)
+    }
+
+    fn bounded_ast_unsupported_refusal(
+        object_name: &str,
+        unsupported: BoundedAstUnsupported,
+    ) -> FrankenError {
+        let detail = match unsupported {
+            BoundedAstUnsupported::Collation(collation) => {
+                format!("`{object_name}` uses custom or unknown collation `{collation}`")
+            }
+            BoundedAstUnsupported::Function { name, arity } => format!(
+                "`{object_name}` uses unsupported, non-built-in, non-deterministic, or wrong-arity function `{name}`/{arity}"
+            ),
+            BoundedAstUnsupported::Shape(shape) => {
+                format!("`{object_name}` uses unsupported AST shape: {shape}")
+            }
+            BoundedAstUnsupported::Statement(statement) => {
+                format!("`{object_name}` contains unsupported trigger-body statement `{statement}`")
+            }
+        };
+        Self::bounded_validation_refusal(detail)
+    }
+
+    fn validate_bounded_ast_render_budget(
+        root: BoundedCollationAstNode<'_>,
+        object_name: &str,
+    ) -> Result<()> {
+        match first_unsupported_bounded_ast(root, false, None, None, false) {
+            Ok(None) => Ok(()),
+            Ok(Some(unsupported)) => Err(Self::bounded_ast_unsupported_refusal(
+                object_name,
+                unsupported,
+            )),
+            Err(BoundedCollationTraversalLimit::Nodes) => {
+                Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` expression AST exceeds the fixed {BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES}-node rendering limit"
+                )))
+            }
+            Err(BoundedCollationTraversalLimit::Depth) => {
+                Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` expression AST exceeds the fixed rendering depth limit {BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH}"
+                )))
+            }
+        }
+    }
+
+    fn validate_bounded_ast_semantics(
+        &self,
+        root: BoundedCollationAstNode<'_>,
+        object_name: &str,
+        reject_schema_expression_shapes: bool,
+    ) -> Result<()> {
+        let registry = self.func_registry.borrow();
+        let supported_function = |name: &str, args: &FunctionArgs, decorated: bool| {
+            bounded_builtin_scalar_function_supported(&registry, name, args, decorated)
+        };
+        self.validate_bounded_ast_semantics_with_function_policy(
+            root,
+            object_name,
+            reject_schema_expression_shapes,
+            &supported_function,
+            None,
+        )
+    }
+
+    fn validate_bounded_ast_semantics_with_function_policy(
+        &self,
+        root: BoundedCollationAstNode<'_>,
+        object_name: &str,
+        reject_schema_expression_shapes: bool,
+        supported_function: &dyn Fn(&str, &FunctionArgs, bool) -> bool,
+        supported_like: Option<&dyn Fn(&LikeOp, &Expr, Option<&Expr>) -> bool>,
+    ) -> Result<()> {
+        match first_unsupported_bounded_ast(
+            root,
+            true,
+            Some(supported_function),
+            supported_like,
+            reject_schema_expression_shapes,
+        ) {
+            Ok(None) => Ok(()),
+            Ok(Some(unsupported)) => Err(Self::bounded_ast_unsupported_refusal(
+                object_name,
+                unsupported,
+            )),
+            Err(BoundedCollationTraversalLimit::Nodes) => {
+                Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` expression AST exceeds the fixed {BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES}-node proof limit"
+                )))
+            }
+            Err(BoundedCollationTraversalLimit::Depth) => {
+                Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` expression AST exceeds the fixed depth limit {BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH}"
+                )))
+            }
+        }
+    }
+
+    fn validate_bounded_schema_expression_in_sql(
+        &self,
+        sql: &str,
+        object_name: &str,
+    ) -> Result<()> {
+        let expression = fsqlite_parser::expr::parse_expr(sql).map_err(|error| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "schema object `{object_name}` has invalid persisted expression: {error}"
+                ),
+            }
+        })?;
+        self.validate_bounded_ast_semantics(
+            BoundedCollationAstNode::Expr(&expression),
+            object_name,
+            true,
+        )
+    }
+
+    fn validate_bounded_check_expression_in_sql(&self, sql: &str, object_name: &str) -> Result<()> {
+        let expression = fsqlite_parser::expr::parse_expr(sql).map_err(|error| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "schema object `{object_name}` has invalid persisted expression: {error}"
+                ),
+            }
+        })?;
+        let registry = self.func_registry.borrow();
+        let supported_function = |name: &str, args: &FunctionArgs, decorated: bool| {
+            if !bounded_check_scalar_function_supported(name, args, decorated) {
+                return false;
+            }
+            let arity = bounded_function_args_len(args);
+            registry.find_scalar(name, arity).is_some_and(|function| {
+                function.is_deterministic() && function.arity().accepts(arity)
+            })
+        };
+        self.validate_bounded_ast_semantics_with_function_policy(
+            BoundedCollationAstNode::Expr(&expression),
+            object_name,
+            true,
+            &supported_function,
+            Some(&bounded_check_like_supported),
+        )
     }
 
     /// Refuse candidate schema shapes the bounded semantic walkers cannot
@@ -33521,6 +33663,8 @@ impl DatabaseImagePublication {
     }
 }
 
+/// Fixed ceiling on a GLOB/LIKE pattern admitted into a bounded proof.
+const BOUNDED_VALIDATION_MAX_GLOB_PATTERN_CHARS: usize = 4 * 1024;
 /// Fixed ceiling on nodes visited while admitting one persisted expression.
 const BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES: usize = 65_536;
 /// Fixed ceiling on expression-AST depth while admitting one expression.
@@ -33600,6 +33744,46 @@ fn bounded_increment_validation_counter(counter: &mut u64) -> Result<()> {
 // Not wired to the gate yet: the policies and the Connection-level validators
 // are part 2. Gate-A plus this traversal is still a half-gate.
 // ---------------------------------------------------------------------------
+
+/// Binary operators the bounded CHECK evaluator can reproduce exactly.
+///
+/// Deliberately omits `Divide`: SQLite's divide-by-zero yields NULL rather than
+/// an error, and reproducing that faithfully in the bounded evaluator is not
+/// something this proof claims yet.
+fn bounded_check_binary_operator_supported(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Modulo
+            | BinaryOp::Concat
+            | BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge
+            | BinaryOp::And
+            | BinaryOp::Or
+    )
+}
+
+/// CAST targets whose affinity conversion the bounded evaluator reproduces.
+fn bounded_check_cast_target_supported(type_name: &fsqlite_ast::TypeName) -> bool {
+    type_name.arg1.is_none()
+        && type_name.arg2.is_none()
+        && (type_name.name.trim().eq_ignore_ascii_case("INTEGER")
+            || type_name.name.trim().eq_ignore_ascii_case("BLOB"))
+}
+
+/// Declared argument count for registry lookup; `-1` denotes `*`.
+fn bounded_function_args_len(args: &FunctionArgs) -> i32 {
+    match args {
+        FunctionArgs::List(exprs) => i32::try_from(exprs.len()).unwrap_or(i32::MAX),
+        FunctionArgs::Star => -1,
+    }
+}
 
 fn is_bounded_builtin_collation(collation: &str) -> bool {
     ["binary", "nocase", "rtrim"]
@@ -33836,6 +34020,16 @@ fn first_unsupported_bounded_ast(
                 Statement::Analyze(_) => {
                     return Ok(Some(BoundedAstUnsupported::Statement("ANALYZE")));
                 }
+                // Fail closed on statement kinds this line grew after the
+                // traversal was written. An admission gate that silently
+                // accepts a construct it does not recognise is worse than no
+                // gate: the walkers would then be asked to prove something
+                // nobody checked they can evaluate.
+                _ => {
+                    return Ok(Some(BoundedAstUnsupported::Statement(
+                        "statement kind unknown to the bounded admission traversal",
+                    )));
+                }
             },
             BoundedCollationAstNode::Expr(expr) => match expr {
                 Expr::Literal(literal, _) => {
@@ -34008,7 +34202,7 @@ fn first_unsupported_bounded_ast(
                     {
                         return Ok(Some(BoundedAstUnsupported::Function {
                             name: name.clone(),
-                            arity: function_args_len(args),
+                            arity: bounded_function_args_len(args),
                         }));
                     }
                     if let Some(window) = over.as_ref() {
@@ -34044,6 +34238,15 @@ fn first_unsupported_bounded_ast(
                     for item in expressions.iter().rev() {
                         pending.push((BoundedCollationAstNode::Expr(item), child_depth));
                     }
+                }
+                // Fail closed on expression kinds this line grew after the
+                // traversal was written, for the same reason as statements:
+                // an unrecognised construct must be refused, never admitted
+                // by omission.
+                _ => {
+                    return Ok(Some(BoundedAstUnsupported::Shape(
+                        "expression kind unknown to the bounded admission traversal",
+                    )));
                 }
             },
             BoundedCollationAstNode::Select(select) => {
@@ -34174,6 +34377,81 @@ fn first_unsupported_bounded_ast(
     }
 
     Ok(None)
+}
+
+
+// ---------------------------------------------------------------------------
+// Gate-B (part 2): admission policies
+//
+// The traversal above decides SHAPE; these decide which functions, LIKE/GLOB
+// forms and collations inside that shape the bounded evaluator can reproduce
+// exactly. Both halves are needed: a supported shape containing an
+// unreproducible function is still not provable.
+// ---------------------------------------------------------------------------
+
+fn bounded_builtin_scalar_function_supported(
+    registry: &FunctionRegistry,
+    name: &str,
+    args: &FunctionArgs,
+    has_aggregate_decorations: bool,
+) -> bool {
+    if has_aggregate_decorations || matches!(args, FunctionArgs::Star) {
+        return false;
+    }
+    let arity = bounded_function_args_len(args);
+    let declared_builtin = builtin_function_surface_inventory().iter().any(|entry| {
+        entry.family == BuiltinFunctionFamily::Scalar
+            && entry.name.eq_ignore_ascii_case(name)
+            && (entry.num_args == arity || entry.num_args == -1)
+    });
+    declared_builtin
+        && registry.find_scalar(name, arity).is_some_and(|function| {
+            function.is_deterministic() && function.arity().accepts(arity)
+        })
+}
+
+fn bounded_check_scalar_function_supported(
+    name: &str,
+    args: &FunctionArgs,
+    has_aggregate_decorations: bool,
+) -> bool {
+    if has_aggregate_decorations || matches!(args, FunctionArgs::Star) {
+        return false;
+    }
+    let FunctionArgs::List(arguments) = args else {
+        return false;
+    };
+    let arity = bounded_function_args_len(args);
+    match (name.to_ascii_lowercase().as_str(), arity) {
+        ("length" | "upper" | "typeof" | "trim", 1) | ("instr", 2) | ("substr", 2 | 3) => true,
+        ("replace", 3) => {
+            let (
+                Some(Expr::Literal(Literal::String(needle), _)),
+                Some(Expr::Literal(Literal::String(replacement), _)),
+            ) = (arguments.get(1), arguments.get(2))
+            else {
+                return false;
+            };
+            needle.is_empty() || replacement.len() <= needle.len()
+        }
+        _ => false,
+    }
+}
+
+fn bounded_check_like_supported(op: &LikeOp, pattern: &Expr, escape: Option<&Expr>) -> bool {
+    escape.is_none()
+        && matches!(op, LikeOp::Glob)
+        && matches!(
+            pattern,
+            Expr::Literal(Literal::String(value), _)
+                if value
+                    .split('\0')
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .count()
+                    <= BOUNDED_VALIDATION_MAX_GLOB_PATTERN_CHARS
+        )
 }
 
 /// Where a page-ownership walk records the pages it claims.
