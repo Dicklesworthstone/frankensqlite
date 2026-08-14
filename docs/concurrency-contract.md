@@ -400,7 +400,7 @@ be multiple callers that could run in the same process.
   contract. Substantial #70 fixes have landed, but `bd-zywqc` remains open; the
   practical bound is the largest harness scale and duration you have measured
   green on your platform.
-- Cap N at whatever your `swarm_multiprocess --workers N --seconds
+- Cap N at whatever your `swarm-multiprocess --workers N --seconds
   3600` run is green on. Publish that number in your caller's own
   README so downstream is not guessing.
 - On startup, clean up 0–32-byte WAL sidecars before opening (see
