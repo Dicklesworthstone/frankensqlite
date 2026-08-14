@@ -10850,6 +10850,21 @@ pub struct Connection {
     /// Last commit sequence assigned to a successful local COMMIT executed
     /// through this connection.
     last_local_commit_seq: RefCell<Option<CommitSeq>>,
+    /// bd-pragma-data-version-approximation-b3dpn: count of write commits made
+    /// by THIS connection. `PRAGMA data_version` returns
+    /// `data_version_global - data_version_own_commits`: an own write commit
+    /// bumps BOTH the shared per-database counter and this one, so they cancel
+    /// and the reported value is unchanged (matching stock, where own commits —
+    /// DML *or* DDL — never move data_version); another connection's commit bumps
+    /// only the shared counter and is therefore observed as a change. Both are
+    /// incremented together in `emit_differential_commit_invalidations`, which
+    /// every commit-entry path invokes exactly once per successful write commit
+    /// (never on rollback or read-only commits).
+    data_version_own_commits: Cell<u64>,
+    /// bd-pragma-data-version-approximation-b3dpn: clone of
+    /// `SharedMvccState::data_version_global` — the shared per-database
+    /// write-commit counter this connection subtracts its own commits from.
+    data_version_global: Arc<AtomicU64>,
     /// One-shot self-read fast path for the exact live VTAB instances enlisted
     /// in a validated local commit. The receipt is tied to that commit sequence;
     /// any other committed write clears it before a later reload can reuse it.
@@ -12270,6 +12285,7 @@ impl Connection {
             active_commit_seqs: Arc::clone(&shared_mvcc_state.active_commit_seqs),
             next_commit_seq: Arc::clone(&shared_mvcc_state.next_commit_seq),
             stable_commit_seq: Arc::clone(&shared_mvcc_state.stable_commit_seq),
+            data_version_global: Arc::clone(&shared_mvcc_state.data_version_global),
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             // Never hydrate rows — this is the whole point of schema-only.
@@ -12277,6 +12293,7 @@ impl Connection {
             memdb_requires_active_txn_reload: Cell::new(false),
             memdb_storage_count_shortcuts_safe: Cell::new(false),
             last_local_commit_seq: RefCell::new(None),
+            data_version_own_commits: Cell::new(0),
             pending_local_live_vtab_preservation: RefCell::new(None),
             closed: RefCell::new(false),
             post_vacuum_rebind_failure: RefCell::new(None),
@@ -12765,12 +12782,14 @@ impl Connection {
             active_commit_seqs: Arc::clone(&shared_mvcc_state.active_commit_seqs),
             next_commit_seq: Arc::clone(&shared_mvcc_state.next_commit_seq),
             stable_commit_seq: Arc::clone(&shared_mvcc_state.stable_commit_seq),
+            data_version_global: Arc::clone(&shared_mvcc_state.data_version_global),
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             memdb_rows_loaded: Cell::new(eager_memdb_rows),
             memdb_requires_active_txn_reload: Cell::new(false),
             memdb_storage_count_shortcuts_safe: Cell::new(eager_memdb_rows),
             last_local_commit_seq: RefCell::new(None),
+            data_version_own_commits: Cell::new(0),
             pending_local_live_vtab_preservation: RefCell::new(None),
             closed: RefCell::new(false),
             post_vacuum_rebind_failure: RefCell::new(None),
@@ -59653,13 +59672,24 @@ impl Connection {
                     ],
                 })
                 .collect()),
-            // PRAGMA data_version — returns the data-version counter.
-            // In SQLite this changes when another connection modifies the DB.
-            // We approximate it using the schema cookie.
+            // PRAGMA data_version — stock semantics: a per-connection change
+            // counter that advances when ANOTHER connection commits a change and
+            // stays constant across commits (DML or DDL) on this same
+            // connection. bd-pragma-data-version-approximation-b3dpn: computed as
+            // the shared per-database write-commit counter (`data_version_global`,
+            // bumped exactly once per write commit by whichever connection
+            // commits) minus this connection's own write commits, so own commits
+            // cancel and only peers' commits are observed as a change. (Was
+            // previously approximated with the schema cookie, which both MISSED
+            // peer DML and FALSE-POSITIVED on own DDL.)
             "data_version" => {
-                let cookie = self.schema_cookie();
+                let global = self.data_version_global.load(AtomicOrdering::Acquire);
+                let own = self.data_version_own_commits.get();
+                let data_version = global.saturating_sub(own);
                 Ok(vec![Row {
-                    values: vec![SqliteValue::Integer(i64::from(cookie))],
+                    values: vec![SqliteValue::Integer(
+                        i64::try_from(data_version).unwrap_or(i64::MAX),
+                    )],
                 }])
             }
             // PRAGMA encoding — return the database text encoding.
@@ -61114,6 +61144,21 @@ impl Connection {
     }
 
     fn emit_differential_commit_invalidations(&self, committed_seq: CommitSeq) {
+        // bd-pragma-data-version-approximation-b3dpn: this is the single
+        // exactly-once-per-own-write-commit sink — every commit-entry path
+        // (the autocommit fast paths and explicit `execute_commit_with_cx`)
+        // invokes it once, guarded by `committed_write`, and never on rollback
+        // or read-only commits. Bump the shared per-database write-commit counter
+        // and this connection's own count together, BEFORE the subscriber
+        // early-return so it fires regardless of differential-view
+        // subscriptions, so PRAGMA data_version (= global - own) reports only
+        // OTHER connections' commits and never moves on this connection's own
+        // DML or DDL.
+        self.data_version_global
+            .fetch_add(1, AtomicOrdering::AcqRel);
+        self.data_version_own_commits
+            .set(self.data_version_own_commits.get().saturating_add(1));
+
         if !self.has_differential_subscribers() {
             return;
         }
@@ -88398,6 +88443,11 @@ struct SharedMvccCoordinationState {
     stable_commit_seq: Arc<AtomicU64>,
     committed_schema_cookie: Arc<AtomicU32>,
     open_connection_count: Arc<AtomicUsize>,
+    /// bd-pragma-data-version-approximation-b3dpn: shared count of write commits
+    /// across every connection to this database. `PRAGMA data_version` returns
+    /// this minus the reading connection's own write-commit count, so it moves
+    /// only when ANOTHER connection commits (stock semantics).
+    data_version_global: Arc<AtomicU64>,
 }
 
 impl SharedMvccCoordinationState {
@@ -88417,6 +88467,7 @@ impl SharedMvccCoordinationState {
             stable_commit_seq: Arc::new(AtomicU64::new(0)),
             committed_schema_cookie: Arc::new(AtomicU32::new(0)),
             open_connection_count: Arc::new(AtomicUsize::new(0)),
+            data_version_global: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -88433,6 +88484,7 @@ struct SharedMvccState {
     stable_commit_seq: Arc<AtomicU64>,
     committed_schema_cookie: Arc<AtomicU32>,
     open_connection_count: Arc<AtomicUsize>,
+    data_version_global: Arc<AtomicU64>,
     _coordination: Arc<SharedMvccCoordinationState>,
     _runtime: Arc<RuntimeContext>,
     runtime_state: Mutex<SharedRuntimeState>,
@@ -88493,6 +88545,7 @@ impl SharedMvccState {
             stable_commit_seq: Arc::clone(&coordination.stable_commit_seq),
             committed_schema_cookie: Arc::clone(&coordination.committed_schema_cookie),
             open_connection_count: Arc::clone(&coordination.open_connection_count),
+            data_version_global: Arc::clone(&coordination.data_version_global),
             _coordination: coordination,
             _runtime: runtime,
             runtime_state: Mutex::new(SharedRuntimeState {
@@ -223210,6 +223263,80 @@ mod pager_routing_tests {
         });
     }
 
+    #[cfg(feature = "ext-json")]
+    #[test]
+    fn test_jsonb_blobs_round_trip_through_stock_sqlite() {
+        // bd-t75hg: a JSONB blob stored by FrankenSQLite must be readable by
+        // stock SQLite (rusqlite = bundled C SQLite) and vice versa —
+        // numeric payloads are ASCII text per the JSONB spec, so both
+        // engines must render identical json() text from each other's blobs.
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join("jsonb_interop.db")
+                .to_string_lossy()
+                .into_owned();
+            let doc = r#"{"a":1,"b":-7,"c":1.5,"d":-0.0,"e":1e300,"f":[9223372036854775807,"x"],"g":"q\"z"}"#;
+
+            // FrankenSQLite writes, stock reads.
+            let conn = Connection::open(path.clone()).await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, doc BLOB);")
+                .await
+                .unwrap();
+            conn.execute(&format!(
+                "INSERT INTO t VALUES (1, jsonb('{}'));",
+                doc.replace('\'', "''")
+            ))
+            .await
+            .unwrap();
+            let ours = conn.query("SELECT json(doc) FROM t;").await.unwrap();
+            let ours_text = match &ours[0].values()[0] {
+                SqliteValue::Text(t) => t.to_string(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            let stock_text: String = stock
+                .query_row("SELECT json(doc) FROM t", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                stock_text, ours_text,
+                "stock sqlite3 must render our JSONB identically"
+            );
+
+            // Stock writes, FrankenSQLite reads.
+            stock
+                .execute(
+                    "INSERT INTO t VALUES (2, jsonb(?1))",
+                    rusqlite::params![doc],
+                )
+                .unwrap();
+            let stock_text2: String = stock
+                .query_row("SELECT json(doc) FROM t WHERE id = 2", [], |row| row.get(0))
+                .unwrap();
+            drop(stock);
+
+            let conn = Connection::open(path).await.unwrap();
+            let back = conn
+                .query("SELECT json(doc) FROM t WHERE id = 2;")
+                .await
+                .unwrap();
+            let back_text = match &back[0].values()[0] {
+                SqliteValue::Text(t) => t.to_string(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert_eq!(
+                back_text, stock_text2,
+                "we must render stock-written JSONB identically"
+            );
+        });
+    }
+
     #[test]
     fn test_delete_not_in_ordered_limited_subquery_matches_oracle() {
         // bd-brzp8 oracle (sqlite3 3.46.1): the mcp_agent_mail_rust prune
@@ -223254,10 +223381,7 @@ mod pager_routing_tests {
                 .query("SELECT id FROM search_recipes ORDER BY id;")
                 .await
                 .unwrap();
-            let ids: Vec<_> = rows
-                .iter()
-                .map(|row| row.values()[0].clone())
-                .collect();
+            let ids: Vec<_> = rows.iter().map(|row| row.values()[0].clone()).collect();
             assert_eq!(
                 ids,
                 vec![
@@ -223300,10 +223424,7 @@ mod pager_routing_tests {
                 .query("SELECT id FROM search_recipes ORDER BY id;")
                 .await
                 .unwrap();
-            let ids: Vec<_> = rows
-                .iter()
-                .map(|row| row.values()[0].clone())
-                .collect();
+            let ids: Vec<_> = rows.iter().map(|row| row.values()[0].clone()).collect();
             assert_eq!(
                 ids,
                 vec![

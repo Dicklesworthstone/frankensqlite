@@ -1,5 +1,24 @@
 //! Semantic analysis: name resolution, type checking, and scope validation.
 //!
+//! # ⚠️ ENGINE-UNUSED — FALSE-GREEN TRAP (bd-parser-semantic-orphan-qcv9u)
+//!
+//! **Nothing in the FrankenSQLite engine uses this module.** Real query
+//! name resolution happens in `fsqlite-core`'s `connection.rs` via the
+//! connection-owned resolver types (`SelectRelationResolver`,
+//! `SelectStructureResolver`, `SelectColumnReferenceResolver`,
+//! `CteResultMetadataResolver`). This module is a standalone resolver
+//! exercised only by `semantic_test.rs` in this crate.
+//!
+//! **Do NOT land engine resolution fixes here.** A change here can turn
+//! `semantic_test.rs` green while changing engine behavior not at all —
+//! a false-green failure class this repository has been bitten by. If you
+//! were routed here by a resolution bug, the fix belongs in
+//! `crates/fsqlite-core/src/connection.rs` (search the resolver type names
+//! above). Wiring this module into the engine is a deliberate architecture
+//! decision tracked by bd-parser-semantic-orphan-qcv9u — do not do it as a
+//! side effect of a bug fix, and do not delete this module without express
+//! authorization.
+//!
 //! Validates AST nodes against a schema to ensure:
 //! - Column references resolve to known tables/columns
 //! - Table aliases are unique within a query scope

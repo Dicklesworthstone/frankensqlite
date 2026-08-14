@@ -44,9 +44,13 @@ const JSONB_NULL_TYPE: u8 = 0x0;
 const JSONB_TRUE_TYPE: u8 = 0x1;
 const JSONB_FALSE_TYPE: u8 = 0x2;
 const JSONB_INT_TYPE: u8 = 0x3;
+const JSONB_INT5_TYPE: u8 = 0x4;
 const JSONB_FLOAT_TYPE: u8 = 0x5;
+const JSONB_FLOAT5_TYPE: u8 = 0x6;
 const JSONB_TEXT_TYPE: u8 = 0x7;
 const JSONB_TEXT_JSON_TYPE: u8 = 0x8;
+const JSONB_TEXT5_TYPE: u8 = 0x9;
+const JSONB_TEXTRAW_TYPE: u8 = 0xA;
 const JSONB_ARRAY_TYPE: u8 = 0xB;
 const JSONB_OBJECT_TYPE: u8 = 0xC;
 
@@ -132,8 +136,64 @@ pub fn json_from_jsonb(input: &[u8]) -> Result<String> {
 }
 
 fn encode_json_text(context: &str, value: &Value) -> Result<String> {
-    serde_json::to_string(value)
-        .map_err(|error| FrankenError::function_error(format!("{context}: {error}")))
+    let mut out = String::new();
+    write_canonical_json_text(value, &mut out)
+        .map_err(|error| FrankenError::function_error(format!("{context}: {error}")))?;
+    Ok(out)
+}
+
+/// Minified JSON writer with stock-SQLite-canonical float text: `{:?}` is
+/// Rust's shortest round-trip form ("1e300", "-0.0", "0.1"), whereas
+/// `serde_json::to_string` renders exponents with a non-canonical '+'
+/// ("1e+300") that diverges from stock `json()` output (bd-t75hg).
+fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(true) => out.push_str("true"),
+        Value::Bool(false) => out.push_str("false"),
+        Value::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                out.push_str(&number.to_string());
+            } else {
+                let float = number.as_f64().ok_or_else(|| {
+                    FrankenError::function_error("cannot render non-finite JSON number")
+                })?;
+                out.push_str(&format!("{float:?}"));
+            }
+        }
+        Value::String(text) => {
+            let escaped = serde_json::to_string(text).map_err(|error| {
+                FrankenError::function_error(format!("JSON string escape failed: {error}"))
+            })?;
+            out.push_str(&escaped);
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_json_text(item, out)?;
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                let escaped = serde_json::to_string(key).map_err(|error| {
+                    FrankenError::function_error(format!("JSON key escape failed: {error}"))
+                })?;
+                out.push_str(&escaped);
+                out.push(':');
+                write_canonical_json_text(item, out)?;
+            }
+            out.push('}');
+        }
+    }
+    Ok(())
 }
 
 fn parse_json_input_blob(input: &[u8]) -> Result<Value> {
@@ -932,23 +992,32 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
         Value::Bool(true) => append_jsonb_node(JSONB_TRUE_TYPE, &[], out),
         Value::Bool(false) => append_jsonb_node(JSONB_FALSE_TYPE, &[], out),
         Value::Number(number) => {
-            if let Some(i) = number.as_i64() {
-                append_jsonb_node(JSONB_INT_TYPE, &i.to_be_bytes(), out)
-            } else if let Some(u) = number.as_u64() {
-                if let Ok(i) = i64::try_from(u) {
-                    append_jsonb_node(JSONB_INT_TYPE, &i.to_be_bytes(), out)
-                } else {
-                    let float = u as f64;
-                    append_jsonb_node(JSONB_FLOAT_TYPE, &float.to_bits().to_be_bytes(), out)
-                }
+            // bd-t75hg: SQLite JSONB stores numeric payloads as the ASCII
+            // text of the number (RFC-8259 text for INT/FLOAT), never as
+            // fixed-width binary — a stock reader decodes binary payloads
+            // as garbage digits. Integers (including u64 beyond i64::MAX,
+            // which stock also keeps INT-typed) use decimal text; floats
+            // use serde's canonical shortest text, which matches stock's
+            // stored bytes whenever the source text was canonical.
+            if number.is_i64() || number.is_u64() {
+                append_jsonb_node(JSONB_INT_TYPE, number.to_string().as_bytes(), out)
             } else {
                 let float = number.as_f64().ok_or_else(|| {
                     FrankenError::function_error("failed to encode non-finite JSON number")
                 })?;
-                append_jsonb_node(JSONB_FLOAT_TYPE, &float.to_bits().to_be_bytes(), out)
+                if !float.is_finite() {
+                    return Err(FrankenError::function_error(
+                        "failed to encode non-finite JSON number",
+                    ));
+                }
+                // `{:?}` is Rust's shortest round-trip float text ("1e300",
+                // "-0.0", "0.1"), matching stock's stored bytes for
+                // canonical-form inputs; `Number::to_string` inserts a
+                // non-canonical '+' in exponents ("1e+300").
+                append_jsonb_node(JSONB_FLOAT_TYPE, format!("{float:?}").as_bytes(), out)
             }
         }
-        Value::String(text) => append_jsonb_node(JSONB_TEXT_TYPE, text.as_bytes(), out),
+        Value::String(text) => append_jsonb_string(text, out),
         Value::Array(array) => {
             let mut payload = Vec::new();
             for item in array {
@@ -959,7 +1028,7 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
         Value::Object(object) => {
             let mut payload = Vec::new();
             for (key, item) in object {
-                append_jsonb_node(JSONB_TEXT_JSON_TYPE, key.as_bytes(), &mut payload)?;
+                append_jsonb_string(key, &mut payload)?;
                 encode_jsonb_value(item, &mut payload)?;
             }
             append_jsonb_node(JSONB_OBJECT_TYPE, &payload, out)
@@ -967,41 +1036,65 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
     }
 }
 
-fn append_jsonb_node(node_type: u8, payload: &[u8], out: &mut Vec<u8>) -> Result<()> {
-    let (len_size, len_bytes) = encode_jsonb_payload_len(payload.len())?;
-    let len_size_u8 = u8::try_from(len_size).map_err(|error| {
-        FrankenError::function_error(format!("jsonb length-size conversion failed: {error}"))
-    })?;
-    // JSONB spec: lower 4 bits = node type, upper 4 bits = payload size category.
-    let header = (len_size_u8 << 4) | node_type;
-    out.push(header);
-    out.extend_from_slice(&len_bytes[..len_size]);
-    out.extend_from_slice(payload);
-    Ok(())
+/// Encode a string (value or object key) the way stock SQLite does: plain
+/// `TEXT` (0x7) when the payload needs no JSON escaping, otherwise `TEXTJ`
+/// (0x8) with the payload carrying RFC-8259 escape sequences. Emitting raw
+/// bytes under `TEXT` for a string containing quotes/control characters
+/// would make stock's `json()` render invalid JSON (bd-t75hg).
+fn append_jsonb_string(text: &str, out: &mut Vec<u8>) -> Result<()> {
+    if text
+        .bytes()
+        .all(|byte| byte != b'"' && byte != b'\\' && byte >= 0x20)
+    {
+        return append_jsonb_node(JSONB_TEXT_TYPE, text.as_bytes(), out);
+    }
+    let mut escaped = String::with_capacity(text.len() + 8);
+    for ch in text.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\u{000C}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            control if (control as u32) < 0x20 => {
+                escaped.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            other => escaped.push(other),
+        }
+    }
+    append_jsonb_node(JSONB_TEXT_JSON_TYPE, escaped.as_bytes(), out)
 }
 
-fn encode_jsonb_payload_len(payload_len: usize) -> Result<(usize, [u8; 8])> {
-    if payload_len == 0 {
-        return Ok((0, [0; 8]));
-    }
-
-    let payload_u64 = u64::try_from(payload_len).map_err(|error| {
-        FrankenError::function_error(format!("jsonb payload too large: {error}"))
-    })?;
-    let len_size = if u8::try_from(payload_u64).is_ok() {
-        1
-    } else if u16::try_from(payload_u64).is_ok() {
-        2
-    } else if u32::try_from(payload_u64).is_ok() {
-        4
+fn append_jsonb_node(node_type: u8, payload: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    // SQLite JSONB header: lower 4 bits = element type; upper 4 bits encode
+    // the payload size DIRECTLY for sizes 0..=11, and the values 12/13/14/15
+    // mean the size follows in 1/2/4/8 big-endian bytes (bd-t75hg — the
+    // previous scheme wrote a length byte for every non-empty payload, which
+    // stock misparses as payload content).
+    let len = payload.len();
+    if len <= 11 {
+        let header = (u8::try_from(len).expect("len <= 11 fits in u8") << 4) | node_type;
+        out.push(header);
+    } else if let Ok(len8) = u8::try_from(len) {
+        out.push((12 << 4) | node_type);
+        out.push(len8);
+    } else if let Ok(len16) = u16::try_from(len) {
+        out.push((13 << 4) | node_type);
+        out.extend_from_slice(&len16.to_be_bytes());
+    } else if let Ok(len32) = u32::try_from(len) {
+        out.push((14 << 4) | node_type);
+        out.extend_from_slice(&len32.to_be_bytes());
     } else {
-        8
-    };
-
-    let raw = payload_u64.to_be_bytes();
-    let mut out = [0u8; 8];
-    out[..len_size].copy_from_slice(&raw[8 - len_size..]);
-    Ok((len_size, out))
+        let len64 = u64::try_from(len).map_err(|error| {
+            FrankenError::function_error(format!("jsonb payload too large: {error}"))
+        })?;
+        out.push((15 << 4) | node_type);
+        out.extend_from_slice(&len64.to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+    Ok(())
 }
 
 fn decode_jsonb_root(input: &[u8]) -> Result<Value> {
@@ -1035,35 +1128,73 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
             }
             Value::Bool(false)
         }
-        JSONB_INT_TYPE => {
-            if payload.len() != 8 {
-                return Err(FrankenError::function_error(
-                    "invalid JSONB integer payload size",
-                ));
-            }
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(payload);
-            Value::Number(Number::from(i64::from_be_bytes(raw)))
+        JSONB_INT_TYPE | JSONB_INT5_TYPE => {
+            // bd-t75hg: numeric payloads are the ASCII text of the number.
+            // INT5 additionally admits JSON5 forms (hex, leading '+').
+            let text = std::str::from_utf8(payload).map_err(|error| {
+                FrankenError::function_error(format!("invalid JSONB integer payload: {error}"))
+            })?;
+            let normalized = if node_type == JSONB_INT5_TYPE {
+                text.strip_prefix('+').unwrap_or(text)
+            } else {
+                text
+            };
+            let number = if node_type == JSONB_INT5_TYPE
+                && let Some(hex) = normalized
+                    .strip_prefix("0x")
+                    .or_else(|| normalized.strip_prefix("0X"))
+            {
+                i64::from_str_radix(hex, 16).ok().map(Number::from)
+            } else if let Ok(int) = normalized.parse::<i64>() {
+                Some(Number::from(int))
+            } else if let Ok(uint) = normalized.parse::<u64>() {
+                Some(Number::from(uint))
+            } else {
+                // Stock keeps arbitrarily long integer text INT-typed; a
+                // value beyond u64 degrades to its nearest double, which
+                // preserves the numeric reading even though serde_json
+                // cannot carry the exact digits.
+                normalized.parse::<f64>().ok().and_then(Number::from_f64)
+            };
+            Value::Number(number.ok_or_else(|| {
+                FrankenError::function_error("invalid JSONB integer payload text")
+            })?)
         }
-        JSONB_FLOAT_TYPE => {
-            if payload.len() != 8 {
-                return Err(FrankenError::function_error(
-                    "invalid JSONB float payload size",
-                ));
-            }
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(payload);
-            let float = f64::from_bits(u64::from_be_bytes(raw));
+        JSONB_FLOAT_TYPE | JSONB_FLOAT5_TYPE => {
+            let text = std::str::from_utf8(payload).map_err(|error| {
+                FrankenError::function_error(format!("invalid JSONB float payload: {error}"))
+            })?;
+            let normalized = if node_type == JSONB_FLOAT5_TYPE {
+                text.strip_prefix('+').unwrap_or(text)
+            } else {
+                text
+            };
+            let float = normalized.parse::<f64>().map_err(|error| {
+                FrankenError::function_error(format!("invalid JSONB float payload text: {error}"))
+            })?;
             let number = Number::from_f64(float).ok_or_else(|| {
                 FrankenError::function_error("invalid non-finite JSONB float payload")
             })?;
             Value::Number(number)
         }
-        JSONB_TEXT_TYPE | JSONB_TEXT_JSON_TYPE => {
+        JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE => {
             let text = String::from_utf8(payload.to_vec()).map_err(|error| {
                 FrankenError::function_error(format!("invalid JSONB text payload: {error}"))
             })?;
             Value::String(text)
+        }
+        JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE => {
+            // Escaped text: the payload carries RFC-8259 (TEXTJ) or JSON5
+            // (TEXT5) escape sequences that must be resolved to the raw
+            // string (bd-t75hg: previously returned verbatim, so stock-
+            // written escaped strings decoded with literal backslashes).
+            let text = std::str::from_utf8(payload).map_err(|error| {
+                FrankenError::function_error(format!("invalid JSONB text payload: {error}"))
+            })?;
+            Value::String(decode_jsonb_escaped_text(
+                text,
+                node_type == JSONB_TEXT5_TYPE,
+            )?)
         }
         JSONB_ARRAY_TYPE => {
             let mut cursor = 0usize;
@@ -1105,29 +1236,95 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
     Ok((value, consumed))
 }
 
+/// Resolve TEXTJ/TEXT5 escape sequences to the raw string. TEXT5 adds the
+/// JSON5 forms (`\'`, `\xNN`, escaped line continuations) on top of the
+/// RFC-8259 set.
+fn decode_jsonb_escaped_text(text: &str, json5: bool) -> Result<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let Some(escape) = chars.next() else {
+            return Err(FrankenError::function_error(
+                "invalid JSONB text escape: trailing backslash",
+            ));
+        };
+        match escape {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000C}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let code: String = chars.by_ref().take(4).collect();
+                if code.len() != 4 {
+                    return Err(FrankenError::function_error(
+                        "invalid JSONB \\u escape: truncated",
+                    ));
+                }
+                let unit = u32::from_str_radix(&code, 16).map_err(|error| {
+                    FrankenError::function_error(format!("invalid JSONB \\u escape: {error}"))
+                })?;
+                // Lone surrogates are replaced, matching lossy JSON readers.
+                out.push(char::from_u32(unit).unwrap_or('\u{FFFD}'));
+            }
+            '\'' if json5 => out.push('\''),
+            '0' if json5 => out.push('\u{0000}'),
+            'x' if json5 => {
+                let code: String = chars.by_ref().take(2).collect();
+                let unit = u8::from_str_radix(&code, 16).map_err(|error| {
+                    FrankenError::function_error(format!("invalid JSONB \\x escape: {error}"))
+                })?;
+                out.push(char::from(unit));
+            }
+            '\n' if json5 => {}
+            other => {
+                return Err(FrankenError::function_error(format!(
+                    "invalid JSONB text escape: \\{other}"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn decode_jsonb_node(input: &[u8]) -> Result<(u8, &[u8], usize)> {
     if input.is_empty() {
         return Err(FrankenError::function_error("invalid JSONB: empty payload"));
     }
 
     let header = input[0];
-    // JSONB spec: lower 4 bits = node type, upper 4 bits = payload size category.
+    // SQLite JSONB header: lower 4 bits = element type; upper 4 bits are the
+    // payload size itself for 0..=11, or 12/13/14/15 meaning the size follows
+    // in 1/2/4/8 big-endian bytes (bd-t75hg).
     let node_type = header & 0x0f;
-    let len_size = usize::from(header >> 4);
-    if !matches!(len_size, 0 | 1 | 2 | 4 | 8) {
-        return Err(FrankenError::function_error(
-            "invalid JSONB length-size nibble",
-        ));
-    }
+    let size_nibble = usize::from(header >> 4);
+    let (len_size, direct_len) = match size_nibble {
+        0..=11 => (0usize, Some(size_nibble)),
+        12 => (1, None),
+        13 => (2, None),
+        14 => (4, None),
+        _ => (8, None),
+    };
     if !matches!(
         node_type,
         JSONB_NULL_TYPE
             | JSONB_TRUE_TYPE
             | JSONB_FALSE_TYPE
             | JSONB_INT_TYPE
+            | JSONB_INT5_TYPE
             | JSONB_FLOAT_TYPE
+            | JSONB_FLOAT5_TYPE
             | JSONB_TEXT_TYPE
             | JSONB_TEXT_JSON_TYPE
+            | JSONB_TEXT5_TYPE
+            | JSONB_TEXTRAW_TYPE
             | JSONB_ARRAY_TYPE
             | JSONB_OBJECT_TYPE
     ) {
@@ -1141,7 +1338,11 @@ fn decode_jsonb_node(input: &[u8]) -> Result<(u8, &[u8], usize)> {
     }
 
     let len_end = 1 + len_size;
-    let payload_len = decode_jsonb_payload_len(&input[1..len_end])?;
+    let payload_len = if let Some(direct) = direct_len {
+        direct
+    } else {
+        decode_jsonb_payload_len(&input[1..len_end])?
+    };
     let total = 1 + len_size + payload_len;
     if input.len() < total {
         return Err(FrankenError::function_error(
@@ -1175,32 +1376,32 @@ fn is_superficially_valid_jsonb(input: &[u8]) -> bool {
         return false;
     }
     let header = input[0];
-    // JSONB spec: lower 4 bits = node type, upper 4 bits = payload size category.
+    // SQLite JSONB header (bd-t75hg): lower 4 bits = element type; upper 4
+    // bits are the payload size for 0..=11, or 12/13/14/15 meaning the size
+    // follows in 1/2/4/8 big-endian bytes.
     let node_type = header & 0x0f;
-    let len_size = usize::from(header >> 4);
-    if !matches!(len_size, 0 | 1 | 2 | 4 | 8) {
-        return false;
-    }
-    if !matches!(
-        node_type,
-        JSONB_NULL_TYPE
-            | JSONB_TRUE_TYPE
-            | JSONB_FALSE_TYPE
-            | JSONB_INT_TYPE
-            | JSONB_FLOAT_TYPE
-            | JSONB_TEXT_TYPE
-            | JSONB_TEXT_JSON_TYPE
-            | JSONB_ARRAY_TYPE
-            | JSONB_OBJECT_TYPE
-    ) {
+    let size_nibble = usize::from(header >> 4);
+    let (len_size, direct_len) = match size_nibble {
+        0..=11 => (0usize, Some(size_nibble)),
+        12 => (1, None),
+        13 => (2, None),
+        14 => (4, None),
+        _ => (8, None),
+    };
+    if node_type > JSONB_OBJECT_TYPE {
         return false;
     }
     if input.len() < 1 + len_size {
         return false;
     }
     let len_end = 1 + len_size;
-    let Ok(payload_len) = decode_jsonb_payload_len(&input[1..len_end]) else {
-        return false;
+    let payload_len = if let Some(direct) = direct_len {
+        direct
+    } else {
+        let Ok(decoded) = decode_jsonb_payload_len(&input[1..len_end]) else {
+            return false;
+        };
+        decoded
     };
     1 + len_size + payload_len == input.len()
 }
@@ -5128,5 +5329,100 @@ mod tests {
     fn test_json_array_with_blob() {
         let err = json_array(&[SqliteValue::Blob(Arc::from(vec![0xCA, 0xFE]))]).unwrap_err();
         assert!(err.to_string().contains("JSON cannot hold BLOB values"));
+    }
+
+    /// bd-t75hg byte-level oracle keeper: every vector below is the exact
+    /// `hex(jsonb(...))` output of stock sqlite3 3.46.1, captured live on
+    /// 2026-08-14. Our encoder must be byte-identical for these canonical
+    /// shapes, and our decoder must read the oracle bytes back to the same
+    /// value.
+    #[test]
+    fn test_jsonb_bytes_match_sqlite3_oracle() {
+        let vectors: &[(&str, &str)] = &[
+            ("1", "1331"),
+            ("-7", "232D37"),
+            ("1.5", "35312E35"),
+            ("0.1", "35302E31"),
+            ("-0.0", "452D302E30"),
+            ("1e300", "553165333030"),
+            (
+                "9223372036854775807",
+                "C31339323233333732303336383534373735383037",
+            ),
+            (
+                "-9223372036854775808",
+                "C3142D39323233333732303336383534373735383038",
+            ),
+            (
+                "12345678901234567890",
+                "C3143132333435363738393031323334353637383930",
+            ),
+            ("[1,2.5,\"x\"]", "8B133135322E351778"),
+            ("{\"a\":1}", "4C17611331"),
+            ("[]", "0B"),
+            ("{}", "0C"),
+            ("\"\"", "07"),
+        ];
+        for (input, expected_hex) in vectors {
+            let value = parse_json_text(input).expect("oracle vector parses");
+            let encoded = encode_jsonb_root(&value).expect("oracle vector encodes");
+            let got_hex: String = encoded.iter().map(|b| format!("{b:02X}")).collect();
+            assert_eq!(
+                &got_hex, expected_hex,
+                "jsonb({input}) bytes must match stock sqlite3"
+            );
+            let oracle_bytes: Vec<u8> = (0..expected_hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&expected_hex[i..i + 2], 16).unwrap())
+                .collect();
+            let decoded = decode_jsonb_root(&oracle_bytes).expect("oracle bytes decode");
+            assert_eq!(
+                decoded, value,
+                "decoding stock sqlite3 bytes for {input} must recover the value"
+            );
+        }
+    }
+
+    /// bd-t75hg: escaped strings encode as TEXTJ with RFC-8259 escapes (the
+    /// shape stock emits and expects), and stock-written escaped payloads
+    /// decode to raw strings.
+    #[test]
+    fn test_jsonb_escaped_strings_round_trip_and_decode_stock_escapes() {
+        let value = parse_json_text("\"a\\\"b\\\\c\\nd\"").expect("escaped string parses");
+        let encoded = encode_jsonb_root(&value).expect("encodes");
+        assert_eq!(
+            encoded[0] & 0x0f,
+            JSONB_TEXT_JSON_TYPE,
+            "strings needing escapes must use TEXTJ"
+        );
+        let decoded = decode_jsonb_root(&encoded).expect("decodes");
+        assert_eq!(decoded, value, "escaped string round-trips");
+
+        // TEXT5 payload with JSON5 escapes decodes too (read tolerance).
+        let mut text5 = Vec::new();
+        let payload = b"it\\'s";
+        text5.push((u8::try_from(payload.len()).unwrap() << 4) | JSONB_TEXT5_TYPE);
+        text5.extend_from_slice(payload);
+        let decoded = decode_jsonb_root(&text5).expect("TEXT5 decodes");
+        assert_eq!(decoded, Value::String("it's".to_owned()));
+    }
+
+    /// bd-t75hg: INT5/FLOAT5 numeric text (JSON5 forms) decodes numerically.
+    #[test]
+    fn test_jsonb_json5_numeric_payloads_decode() {
+        let mut int5 = Vec::new();
+        int5.push((4u8 << 4) | JSONB_INT5_TYPE);
+        int5.extend_from_slice(b"0x1A");
+        assert_eq!(
+            decode_jsonb_root(&int5).unwrap(),
+            Value::Number(Number::from(26)),
+        );
+        let mut float5 = Vec::new();
+        float5.push((3u8 << 4) | JSONB_FLOAT5_TYPE);
+        float5.extend_from_slice(b"+.5");
+        assert_eq!(
+            decode_jsonb_root(&float5).unwrap(),
+            Value::Number(Number::from_f64(0.5).unwrap()),
+        );
     }
 }

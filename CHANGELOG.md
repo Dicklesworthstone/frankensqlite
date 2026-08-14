@@ -19,13 +19,28 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.3.1] -- unreleased
+## [0.3.1] -- 2026-08-14
 
 Post-0.3.0 correctness wave: every entry below cites the landed commit and its
 tracking bead; all fixes carry keeper tests and were verified on the release
 preflight target.
 
 ### Fixed
+
+- **JSONB interop**: `encode_jsonb_value` now emits SQLite-spec JSONB — ASCII
+  numeric payloads, direct size nibble, escaped-text elements — so stock
+  SQLite reads our JSONB correctly instead of silently decoding garbage
+  numbers (5f6602db6, bd-jsonb-numeric-payload-encoding-t75hg; byte-level
+  oracle keepers + cross-engine round-trip).
+- **PRAGMA data_version**: now bound to pager commit identity — it reflects
+  other-connection data commits and no longer false-positives on the
+  connection's own DDL (80a29780d, bd-pragma-data-version-approximation-b3dpn).
+- **Committed-freelist safety**: append-gate guard refuses committed-freelist
+  resurrection/erasure/double-consumption under continuous overlap
+  (05144b4f4 + chain, bd-gh302, bd-0shxy).
+- **Group-commit waiter livelock**: `wait_for_epoch_outcome_async` no longer
+  livelocks when settlement resolves to a terminal error (62dfd9f98,
+  bd-keoaf).
 
 - **Schema text fidelity**: stored `CREATE TABLE` text now ends at the
   statement's final token (trailing `;`/comments stripped, `1c75f65fc`) and

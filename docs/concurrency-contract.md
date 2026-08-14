@@ -18,11 +18,16 @@ issues whose common cause was never named.
 
 ## TL;DR
 
-- **Single-process, multi-Connection via MVCC WAL**: *release-blocked on the
-  current candidate*. This is the intended default, but `bd-9inpb` reproduces
-  corruption and wrong row counts with 10 or more ordinary implicit-autocommit
-  writers in both WAL and rollback-journal modes. The v0.2.0 tag must not be cut
-  until the exact gate is green.
+- **Single-process, multi-Connection via MVCC WAL**: *shipped as the intended
+  default, with a tracked high-concurrency known-limitation*. v0.2.0
+  (2026-08-04), v0.2.1 (2026-08-11), and v0.3.0 (2026-08-13) all shipped;
+  `bd-9inpb` no longer hard-blocks the tag. Correctness is fixed and verified at
+  the tested writer counts — the 0.3.0 wave landed the ≤8-writer concurrent-INSERT
+  stack, same-file open+write (GH#333), and concurrent-commit aliasing
+  (`bd-o81ov`). The underlying defect is still open: `bd-9inpb` (P0, IN_PROGRESS)
+  reproduces corruption and wrong row counts with 10 or more ordinary
+  implicit-autocommit writers in both WAL and rollback-journal modes — treat ≥10
+  concurrent writers as unsupported until its four-scenario gate is green.
 - **Single-process, single-Connection across threads**: *not supported by
   API*. `Connection` is `!Send + !Sync` by construction. Spawn one
   Connection per OS thread against the same file-backed database and
@@ -77,8 +82,10 @@ mechanism (MVCC, DPOR, page-conflict math), see the README's
 ### 1. Process count — how many caller processes can safely share one DB file?
 
 - **Single-process**: multiple `Connection` instances are the intended default,
-  but the current candidate is release-blocked by `bd-9inpb`; do not claim an
-  unconditional count until its four-scenario writer gate is green.
+  shipped since v0.2.0. `bd-9inpb` (P0, IN_PROGRESS) no longer blocks releases
+  but remains open: do not claim an unconditional writer count — treat ≥10
+  concurrent implicit-autocommit writers as unsupported until its four-scenario
+  gate is green.
 - **Multi-process**: target is N ≤ 32 short-lived writers per file
   (matching the swarm harness scale). Today the multi-process surface is
   *partial* — see the closed
@@ -158,7 +165,8 @@ family. The contract:
 - Same-process, multi-Connection: yes, unambiguously. `busy_timeout`
   applies to MVCC abort/retry and to WAL-index locks alike.
 - Cross-process: yes for advisory `fcntl(F_SETLK)` byte-range locks on
-  the DB file (see `crates/fsqlite-vfs/src/unix.rs` lines 275–410). The
+  the DB file (see the `F_SETLK` handling in
+  `crates/fsqlite-vfs/src/unix.rs` — `grep F_SETLK`). The
   VFS retries `F_SETLK` with exponential backoff up to `busy_timeout`,
   matching stock SQLite. Historical gap
   ([#45](https://github.com/Dicklesworthstone/frankensqlite/issues/45))
@@ -228,7 +236,7 @@ These are intentional or known gaps documented so callers can plan:
 - `PRAGMA integrity_check` semantics: parity is the target. The current checker
   can miss a referenced empty non-root leaf that stock SQLite reports as
   malformed (`bd-y5urj`), so a green FrankenSQLite result is not by itself a
-  complete corruption proof for v0.2.0.
+  complete corruption proof; `bd-y5urj` remains open as of v0.3.0.
 - Connection lifecycle: `open` / `close` semantics match stock —
   including the hand-off via WAL checkpoint on the last connection
   closing.
@@ -241,7 +249,7 @@ boundary between parity-claimed and parity-aspired.
 
 ## The concurrency contract
 
-### Release-blocked candidate: single-process, multi-Connection via MVCC WAL
+### Shipped with a tracked high-concurrency limitation: single-process, multi-Connection via MVCC WAL
 
 - *N* Connections opened against the same file-backed database within
   a single process, coordinated through the MVCC WAL layer
@@ -252,11 +260,13 @@ boundary between parity-claimed and parity-aspired.
   boundary, committed rows from other Connections are visible.
 - `PRAGMA integrity_check = ok` after the workload terminates.
 
-The bullets above are the contract target, not a green statement about the
-current candidate. `bd-9inpb` currently fails ordinary implicit-autocommit
-writer stress in both WAL and rollback-journal modes while the two explicit
-`BEGIN CONCURRENT` barrier controls pass. All four scenarios must pass on the
-candidate before this section can return to **Supported**.
+The bullets above are the contract target. They hold at the tested writer
+counts (verified in the 0.3.0 wave), which is why v0.2.x/0.3.0 shipped — this is
+no longer a release blocker. But `bd-9inpb` (P0, IN_PROGRESS) still fails
+ordinary implicit-autocommit writer stress at 10+ writers in both WAL and
+rollback-journal modes while the two explicit `BEGIN CONCURRENT` barrier
+controls pass. All four scenarios must pass before ≥10-writer concurrency is
+**Supported** without qualification.
 
 **`journal_mode = 'wal'` means MVCC here, not SQLite's single-writer WAL.**
 For file-format compatibility, `PRAGMA journal_mode` reports `wal` (and
@@ -317,7 +327,7 @@ root rather than through another point fix.
 
 **Current status**: substantial #70 fixes have landed, but the open P0
 `bd-zywqc` epic still carries the remaining program. Multi-process multi-writer
-remains **partial** until the current candidate's swarm harness is green at
+remains **partial** until the swarm harness is green at
 N ≥ 8 for ≥ 1 hour on the target platform. The bound is the measurement, not a
 claim that the historical issue closure completed every root-cause gate.
 
@@ -359,7 +369,7 @@ The canonical validation surface is:
 ```bash
 cargo test -p fsqlite-e2e --test correctness_concurrent_writes
 cargo test -p fsqlite-e2e --test mvcc_concurrent_writers
-cargo run -p fsqlite-e2e --bin swarm_multiprocess -- \
+cargo run -p fsqlite-e2e --bin swarm-multiprocess -- \
     --workers 8 --seconds 60
 ```
 
@@ -378,8 +388,9 @@ that opens `fsqlite` as a dependency):
 ### Default assumption
 
 Design around **single-process, multi-Connection via MVCC WAL**; that is the
-intended default. Do not deploy the current v0.2.0 candidate under concurrent
-write load until `bd-9inpb` is fixed and its four-scenario writer gate is green.
+intended default and shipped since v0.2.0. It is safe at the tested writer
+counts; do not push ≥10 concurrent writers under load until `bd-9inpb` is fixed
+and its four-scenario writer gate is green.
 If you think you need multi-process access, re-check — most reports turn out to
 be multiple callers that could run in the same process.
 
@@ -389,7 +400,7 @@ be multiple callers that could run in the same process.
   contract. Substantial #70 fixes have landed, but `bd-zywqc` remains open; the
   practical bound is the largest harness scale and duration you have measured
   green on your platform.
-- Cap N at whatever your `swarm_multiprocess --workers N --seconds
+- Cap N at whatever your `swarm-multiprocess --workers N --seconds
   3600` run is green on. Publish that number in your caller's own
   README so downstream is not guessing.
 - On startup, clean up 0–32-byte WAL sidecars before opening (see
@@ -410,7 +421,7 @@ Run the harness against your repro:
 
 ```bash
 cd $(fsqlite-repo)
-cargo run -p fsqlite-e2e --bin swarm_multiprocess -- \
+cargo run -p fsqlite-e2e --bin swarm-multiprocess -- \
     --workers 8 --seconds 300 --seed "$(date +%s)"
 ```
 
@@ -483,3 +494,11 @@ grow a scenario that proves the refusal actually refuses.
 - **2026-08-05**: #70, #79, and #80 are closed. Remaining multi-process work
   moved to the Beads tree; the contract stays *partial* by measurement, and
   multi-process checkpoint remains the weakest surface.
+- **2026-08-14**: Reconciled release framing with the shipped tags. v0.2.0
+  (2026-08-04), v0.2.1 (2026-08-11), and v0.3.0 (2026-08-13) all shipped;
+  `bd-9inpb` (10+ implicit-autocommit writers) was reclassified from a hard
+  release-blocker to a tracked open known-limitation, and `bd-zywqc` (issue #70
+  multi-process durability) remains the open epic. Also fixed the broken
+  `--bin swarm-multiprocess` invocation (was `swarm_multiprocess`) and refreshed
+  the stale `unix.rs` `F_SETLK` line-range anchor to a `grep`-stable pointer.
+  (bd-concurrency-contract-drift-2m25e)

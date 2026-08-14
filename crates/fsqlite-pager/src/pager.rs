@@ -1445,7 +1445,9 @@ fn alloc_ledger(txn_tag: usize, event: &str, page: u32, aux: u64) {
         return;
     };
     use std::io::Write as _;
-    let mut guard = writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = writer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = writeln!(guard, "{txn_tag:x} {event} {page} {aux}");
     let _ = guard.flush();
 }
@@ -3514,6 +3516,18 @@ impl GroupCommitQueue {
                     if let Some(error) = self.observe_failed_epoch(target_epoch) {
                         return Err(error);
                     }
+                    // bd-keoaf: only BusyRecovery is settlement CONGESTION
+                    // (a retryable refusal while claimable work remains, per
+                    // the settle-round contract). Any other error is a
+                    // terminal settlement verdict — e.g. an in-doubt epoch
+                    // whose backend reconcile is Unsupported can NEVER
+                    // resolve, and riding it out spins this waiter forever.
+                    // Fail closed instead: the epoch is stranded and no
+                    // flusher can commit the queued batch without recovery,
+                    // so ejecting cannot double-apply it.
+                    if !matches!(settlement_error, FrankenError::BusyRecovery) {
+                        return Err(settlement_error);
+                    }
                     // bd-0shxy exactly-once: this waiter's batch is ALREADY
                     // QUEUED in target_epoch. Surfacing a transient settlement
                     // error here ejects the waiter with pager state
@@ -3558,6 +3572,11 @@ impl GroupCommitQueue {
                     // while the queue-wide prerequisite was being settled.
                     if let Some(error) = pending_wake.observe_failure() {
                         return Err(error);
+                    }
+                    // bd-keoaf: same terminal/congestion split as the
+                    // pre-wait arm — only BusyRecovery is retryable.
+                    if !matches!(settlement_error, FrankenError::BusyRecovery) {
+                        return Err(settlement_error);
                     }
                     // bd-0shxy exactly-once: same ruling as the pre-wait arm —
                     // a queued-batch waiter never surfaces settlement
@@ -9282,7 +9301,12 @@ async fn conflicting_pages_since_batch_snapshots(
     for batch in batches {
         let Some(snapshot) = batch.conflict_snapshot else {
             if std::env::var_os("DK9RA_O81OV").is_some() {
-                let maxp = batch.frames.iter().map(|f| f.page_number).max().unwrap_or(0);
+                let maxp = batch
+                    .frames
+                    .iter()
+                    .map(|f| f.page_number)
+                    .max()
+                    .unwrap_or(0);
                 eprintln!(
                     "DK9RA_O81OV CPBS_SKIP no_snapshot n_conflict_pages={} max_frame_page={maxp}",
                     batch.conflict_pages.len()
@@ -9292,7 +9316,12 @@ async fn conflicting_pages_since_batch_snapshots(
         };
         if std::env::var_os("DK9RA_O81OV").is_some() {
             let maxc = batch.conflict_pages.iter().copied().max().unwrap_or(0);
-            let maxf = batch.frames.iter().map(|f| f.page_number).max().unwrap_or(0);
+            let maxf = batch
+                .frames
+                .iter()
+                .map(|f| f.page_number)
+                .max()
+                .unwrap_or(0);
             eprintln!(
                 "DK9RA_O81OV CPBS snap_db={} n_conflict_pages={} max_conflict={maxc} max_frame={maxf}",
                 snapshot.snapshot_db_size,
@@ -9392,9 +9421,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
         return Ok(all);
     }
 
-    let Some(page_one) =
-        read_durable_page_under_gate(cx, wal, db_file, page_size, 1).await?
-    else {
+    let Some(page_one) = read_durable_page_under_gate(cx, wal, db_file, page_size, 1).await? else {
         // Brand-new database: no durable freelist exists for peers to have
         // touched, so the publication stands.
         return Ok(Vec::new());
@@ -9404,9 +9431,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
     }
 
     let mut current = HashSet::<u32>::new();
-    let mut trunk = u32::from_be_bytes(
-        page_one[32..36].try_into().expect("header freelist slice"),
-    );
+    let mut trunk = u32::from_be_bytes(page_one[32..36].try_into().expect("header freelist slice"));
     let max_leaf_entries = (page_size / 4).saturating_sub(2).max(1);
     let mut walked = 0_u32;
     while trunk != 0 {
@@ -9416,8 +9441,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
             // validate against garbage.
             return Ok(vec![trunk]);
         }
-        let Some(image) =
-            read_durable_page_under_gate(cx, wal, db_file, page_size, trunk).await?
+        let Some(image) = read_durable_page_under_gate(cx, wal, db_file, page_size, trunk).await?
         else {
             return Ok(vec![trunk]);
         };
@@ -9425,9 +9449,8 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
             return Ok(vec![trunk]);
         }
         let next = u32::from_be_bytes(image[0..4].try_into().expect("trunk next slice"));
-        let leaf_count = u32::from_be_bytes(
-            image[4..8].try_into().expect("trunk count slice"),
-        ) as usize;
+        let leaf_count =
+            u32::from_be_bytes(image[4..8].try_into().expect("trunk count slice")) as usize;
         for index in 0..leaf_count.min(max_leaf_entries) {
             let base = 8 + index * 4;
             if base + 4 > image.len() {
@@ -9443,36 +9466,63 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
     let published_set: HashSet<u32> = published.iter().copied().collect();
     let freed: HashSet<u32> = batch.freed_pages.iter().copied().collect();
     let consumed: HashSet<u32> = batch.consumed_freelist_pages.iter().copied().collect();
+    // bd-jygg3: the durable-freelist serializer NORMALIZES the publication —
+    // entries above the publication's committed db_size are dropped by
+    // design (predicted_durable_freelist filters `page <= committed_db_size`;
+    // rollback restores legitimately park above-EOF page numbers on the
+    // shared freelist). Comparing raw sets made every publisher after such a
+    // restore look like an eraser of those above-EOF entries and fail closed
+    // forever (single-connection TEXT-PK bulk-commit repro: BusySnapshot on
+    // pages 4-10 with zero peers, non-transient because the retry re-derives
+    // the same normalized view). Above-publication-EOF pages cannot be
+    // resurrection-consumed — nothing durable exists there — so exempt them
+    // from the erasure arm.
+    let publication_db_size = batch
+        .frames
+        .iter()
+        .map(|frame| frame.db_size_if_commit)
+        .max()
+        .unwrap_or(0);
 
     let mut offending: Vec<u32> = published_set
         .iter()
         .copied()
         .filter(|page| !current.contains(page) && !freed.contains(page))
-        .chain(
-            current
-                .iter()
-                .copied()
-                .filter(|page| !published_set.contains(page) && !consumed.contains(page)),
-        )
+        .chain(current.iter().copied().filter(|page| {
+            !published_set.contains(page)
+                && !consumed.contains(page)
+                && !(publication_db_size > 0 && *page > publication_db_size)
+        }))
         // DOUBLE-CONSUMPTION: a page this batch consumed from the DURABLE
         // freelist must still be on the current durable freelist — if a
         // peer's commit already removed it, both connections popped the same
         // committed-free page from begin-time views, and the peer's frame can
         // predate this transaction's (rebased) conflict horizon, escaping the
-        // FCW scan. bd-r82et: this check is restricted to durable-origin pops
-        // (`consumed_durable_freelist_pages`). A pop of an in-memory-only
-        // freelist entry (an aborted transaction's returned EOF page that was
-        // never serialized into durable page-1/trunk metadata) is invisible
-        // to every peer, so its absence from the current durable freelist is
-        // the expected steady state — refusing it made a single-connection
-        // multi-statement DDL batch fail deterministically with
-        // BusySnapshot even though no peer existed.
+        // FCW scan.
+        //
+        // Two complementary exemptions, both required:
+        // - bd-r82et: only durable-origin pops (`consumed_durable_freelist_pages`)
+        //   can be a peer double-pop. In-memory-only pops (aborted-txn EOF
+        //   returns never serialized into page-1/trunk) are invisible to every
+        //   peer; refusing them made a single-connection multi-statement DDL
+        //   batch fail BusySnapshot with zero peers.
+        // - bd-jygg3: even a page listed as consumed cannot have been durably
+        //   free if it sits above the consumer's begin-time committed db_size
+        //   (the serializer drops above-EOF entries). That was the TEXT-PK
+        //   bulk-commit false positive on pages 4-10.
         .chain(
             batch
                 .consumed_durable_freelist_pages
                 .iter()
                 .copied()
-                .filter(|page| !current.contains(page)),
+                .filter(|page| {
+                    let begin_committed = batch
+                        .conflict_snapshot
+                        .map(|snapshot| snapshot.snapshot_db_size)
+                        .unwrap_or(0);
+                    let in_memory_only = begin_committed > 0 && *page > begin_committed;
+                    !current.contains(page) && !in_memory_only
+                }),
         )
         .collect();
     offending.sort_unstable();
@@ -16156,7 +16206,10 @@ where
                 writer_active: false,
                 active_transactions: 0,
                 checkpoint_active: false,
-                durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
+                durable_freelist_view: freelist
+                    .iter()
+                    .map(|page: &PageNumber| page.get())
+                    .collect(),
                 freelist,
                 journal_mode: JournalMode::Delete,
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -19561,6 +19614,36 @@ where
                         .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
                     inner.db_size
                 };
+                // bd-vnxjd: the flusher connection's `inner.db_size` lags the
+                // durable image whenever PEER connections grew the file since
+                // this connection's last refresh. Certifying that stale size
+                // REGRESSES db_size in the WAL commit marker / certificate /
+                // page-1 header, and the close-time checkpoint then truncates
+                // committed peer growth away (kqari forensic receipts: cert
+                // #2387 certified 168, fourteen stale delete commits then
+                // certified 165, checkpoint produced a 165-page file with a
+                // 168 header — malformed + destroyed pages). Floor the flush
+                // base with the latest durable certificate's size. Advisory
+                // here (errors and cert-less backends fall back to 0); the
+                // append gate below fail-closes the residual race.
+                let durable_certified_db_size = {
+                    match wal_backend_handle(wal_backend) {
+                        Ok(backend) => {
+                            match async_rwlock_write(&backend, cx, "WAL backend").await {
+                                Ok(mut wal_guard) => wal_guard
+                                    .as_mut()
+                                    .latest_authorized_parallel_wal_commit_certificate(cx)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map_or(0, |cert| cert.db_size_pages),
+                                Err(_) => 0,
+                            }
+                        }
+                        Err(_) => 0,
+                    }
+                };
+                let flush_base_db_size = flush_base_db_size.max(durable_certified_db_size);
                 let consolidated_db_size = group_commit_final_db_size(flush_base_db_size, &batches);
                 let promoted_page_one_headers =
                     promote_group_commit_page_one_headers(&mut batches, consolidated_db_size);
@@ -19855,6 +19938,27 @@ where
                                 let authorized_seed = wal
                                     .latest_authorized_parallel_wal_commit_certificate(cx)
                                     .await?;
+                                // bd-vnxjd: db_size monotonicity gate. A peer
+                                // may have committed growth between this
+                                // flush's prep-time floor read and this append
+                                // gate; certifying a smaller db_size would let
+                                // the checkpoint truncate that committed
+                                // growth away. Fail closed pre-durability —
+                                // the statement retry re-preps against the
+                                // fresh durable floor.
+                                if let Some(seed) = authorized_seed.as_ref()
+                                    && seed.db_size_pages > final_db_size
+                                {
+                                    tracing::warn!(
+                                        target: "fsqlite.pager.commit",
+                                        certified_db_size = final_db_size,
+                                        durable_db_size = seed.db_size_pages,
+                                        "commit refused: batch would regress durable db_size (bd-vnxjd)"
+                                    );
+                                    return Err(FrankenError::BusySnapshot {
+                                        conflicting_pages: "1".to_owned(),
+                                    });
+                                }
                                 frames_written_start = u64::try_from(wal.frame_count())
                                     .unwrap_or(u64::MAX)
                                     .saturating_add(1);
@@ -21379,7 +21483,12 @@ where
                             self.allocated_from_durable_freelist.insert(page.get());
                         }
                         self.allocated_from_freelist.push(page);
-                        alloc_ledger(self as *const _ as usize, "alloc_freelist_hi", page.get(), 0);
+                        alloc_ledger(
+                            self as *const _ as usize,
+                            "alloc_freelist_hi",
+                            page.get(),
+                            0,
+                        );
                         return Ok(page);
                     }
 
@@ -21405,7 +21514,12 @@ where
                             self.allocated_from_durable_freelist.insert(page.get());
                         }
                         self.allocated_from_freelist.push(page);
-                        alloc_ledger(self as *const _ as usize, "alloc_freelist_gated", page.get(), 0);
+                        alloc_ledger(
+                            self as *const _ as usize,
+                            "alloc_freelist_gated",
+                            page.get(),
+                            0,
+                        );
                         return Ok(page);
                     }
                 } else if let Some(page) = inner.freelist.pop() {
@@ -21413,7 +21527,12 @@ where
                         self.allocated_from_durable_freelist.insert(page.get());
                     }
                     self.allocated_from_freelist.push(page);
-                    alloc_ledger(self as *const _ as usize, "alloc_freelist_nc", page.get(), 0);
+                    alloc_ledger(
+                        self as *const _ as usize,
+                        "alloc_freelist_nc",
+                        page.get(),
+                        0,
+                    );
                     return Ok(page);
                 }
             }
@@ -23372,16 +23491,28 @@ where
                 let freelist_start = entry.allocated_from_freelist_snapshot.len();
                 let lease: Vec<PageNumber> = self.page_lease.drain(..).collect();
                 for page in &lease {
-                    alloc_ledger(self as *const _ as usize, "sp_quarantine_lease", page.get(), 0);
+                    alloc_ledger(
+                        self as *const _ as usize,
+                        "sp_quarantine_lease",
+                        page.get(),
+                        0,
+                    );
                 }
                 self.savepoint_quarantined_allocations.extend(lease);
                 let eof: Vec<PageNumber> = self.allocated_from_eof.drain(eof_start..).collect();
                 for page in &eof {
-                    alloc_ledger(self as *const _ as usize, "sp_quarantine_eof", page.get(), 0);
+                    alloc_ledger(
+                        self as *const _ as usize,
+                        "sp_quarantine_eof",
+                        page.get(),
+                        0,
+                    );
                 }
                 self.savepoint_quarantined_allocations.extend(eof);
-                let fl: Vec<PageNumber> =
-                    self.allocated_from_freelist.drain(freelist_start..).collect();
+                let fl: Vec<PageNumber> = self
+                    .allocated_from_freelist
+                    .drain(freelist_start..)
+                    .collect();
                 self.savepoint_quarantined_allocations.extend(fl);
                 // Keep the quarantine descending so `pop()` hands the LOWEST
                 // page number out first, matching the freelist convention and

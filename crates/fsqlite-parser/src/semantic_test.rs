@@ -1,3 +1,7 @@
+// ⚠️ These tests exercise the ENGINE-UNUSED standalone semantic resolver
+// (see the module-level warning in semantic.rs — bd-parser-semantic-orphan-
+// qcv9u). Green here proves NOTHING about engine name resolution; engine
+// resolution keepers live against fsqlite-core's connection.rs resolvers.
 use super::*;
 use crate::parser::Parser;
 

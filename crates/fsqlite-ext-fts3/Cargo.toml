@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-ext-fts3"
-version = "0.3.0"
+version = "0.3.1"
 description = "FTS3/FTS4 full-text search extension"
 edition.workspace = true
 license-file.workspace = true

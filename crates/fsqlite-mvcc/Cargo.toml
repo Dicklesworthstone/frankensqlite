@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-mvcc"
-version = "0.3.0"
+version = "0.3.1"
 description = "MVCC page-level versioning for concurrent writers"
 edition.workspace = true
 license-file.workspace = true
