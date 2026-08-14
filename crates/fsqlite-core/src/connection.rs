@@ -2760,6 +2760,13 @@ pub struct ConnectionEnv {
     /// converts otherwise-silent corruption symptoms into actionable
     /// `FrankenError::MultiProcessContractViolation` errors.
     strict_multi_process: bool,
+    /// Mandatory write-set page ceiling for the reserved schema-only builder
+    /// create path, and only that path. `None` everywhere else.
+    ///
+    /// Distinct from `page_buffer_max`, which caps resident buffers: that is a
+    /// memory bound, not a bound on how much of the database a build may
+    /// rewrite.
+    schema_only_write_set_page_limit: Option<usize>,
 }
 
 impl ConnectionEnv {
@@ -2771,6 +2778,7 @@ impl ConnectionEnv {
             page_buffer_max: None,
             memory_vfs_config: None,
             strict_multi_process: false,
+            schema_only_write_set_page_limit: None,
         }
     }
 
@@ -2791,6 +2799,45 @@ impl ConnectionEnv {
     /// trunk page past db_size, WAL checkpoint contention at open) and
     /// returns `FrankenError::MultiProcessContractViolation` instead.
     /// See frankensqlite#81.
+    /// Set the mandatory write-set page ceiling for the reserved schema-only
+    /// builder create path.
+    ///
+    /// Honoured only by
+    /// [`Connection::initialize_reserved_schema_only_builder`], which refuses
+    /// to run without it. Setting it on any other open is inert.
+    pub fn set_schema_only_write_set_page_limit(&mut self, page_limit: usize) {
+        self.schema_only_write_set_page_limit = Some(page_limit);
+    }
+
+    /// The configured builder write-set ceiling, if any.
+    #[must_use]
+    pub const fn schema_only_write_set_page_limit(&self) -> Option<usize> {
+        self.schema_only_write_set_page_limit
+    }
+
+    /// Validate the builder write-set ceiling at the create boundary.
+    ///
+    /// The limit is mandatory on that path and must admit at least Page 1, so
+    /// an absent limit is a typed refusal rather than a default: a build that
+    /// silently ran unbounded is exactly the outcome this exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// [`FrankenError::NotImplemented`] when no limit was set, and
+    /// [`FrankenError::OutOfRange`] for a zero limit.
+    pub fn validated_schema_only_write_set_page_limit(&self) -> Result<usize> {
+        match self.schema_only_write_set_page_limit {
+            None => Err(FrankenError::not_implemented(
+                "reserved schema-only builder initialization requires an explicit write-set page limit",
+            )),
+            Some(0) => Err(FrankenError::OutOfRange {
+                what: "schema-only builder write-set page limit".to_owned(),
+                value: "0".to_owned(),
+            }),
+            Some(limit) => Ok(limit),
+        }
+    }
+
     pub fn set_strict_multi_process(&mut self, strict: bool) {
         self.strict_multi_process = strict;
     }
@@ -2848,6 +2895,7 @@ impl Default for ConnectionEnv {
             page_buffer_max: None,
             memory_vfs_config: None,
             strict_multi_process: false,
+            schema_only_write_set_page_limit: None,
         }
     }
 }
@@ -3856,6 +3904,18 @@ impl PagerBackend {
             Self::Unix(p) => p.cache_peak_snapshot(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.cache_peak_snapshot(),
+        }
+    }
+
+    fn set_write_set_page_limit(&self, page_limit: usize) {
+        match self {
+            Self::Memory(p) => p.set_write_set_page_limit(page_limit),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.set_write_set_page_limit(page_limit),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.set_write_set_page_limit(page_limit),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.set_write_set_page_limit(page_limit),
         }
     }
 
@@ -13119,6 +13179,195 @@ impl Connection {
             self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
         }
         self.pager.capture_vacuum_source_image(&cx).await
+    }
+
+    /// Atomically claim a pathname for a replacement image and retain the
+    /// descriptor that created it.
+    ///
+    /// Phase 1 of the two-phase build protocol; see
+    /// [`DatabaseBuilderReservation`] for why the returned value must be held
+    /// across the whole build.
+    ///
+    /// # Errors
+    ///
+    /// [`FrankenError::CannotOpen`] when the path is empty, is `:memory:`, or
+    /// already names anything at all — existing regular files, hard links,
+    /// directories, FIFOs, and live or dangling symlinks are refused without
+    /// being opened, truncated, replaced, or unlinked. [`FrankenError::Unsupported`]
+    /// on non-native builds.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn reserve_schema_only_builder_target(
+        path: impl AsRef<Path>,
+    ) -> Result<DatabaseBuilderReservation> {
+        Self::reserve_schema_only_builder_target_with_env(path, &ConnectionEnv::default())
+    }
+
+    /// Environment-bound form of [`Self::reserve_schema_only_builder_target`].
+    ///
+    /// The environment's write-set page limit is validated here rather than at
+    /// phase 2, so a caller learns it forgot the mandatory ceiling before it
+    /// has claimed a pathname.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::reserve_schema_only_builder_target`] returns, plus
+    /// the refusals from
+    /// [`ConnectionEnv::validated_schema_only_write_set_page_limit`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn reserve_schema_only_builder_target_with_env(
+        path: impl AsRef<Path>,
+        env: &ConnectionEnv,
+    ) -> Result<DatabaseBuilderReservation> {
+        let write_set_page_limit = env.validated_schema_only_write_set_page_limit()?;
+        #[cfg(feature = "native")]
+        {
+            let requested = path.as_ref();
+            let requested_text = requested.to_str().ok_or_else(|| FrankenError::CannotOpen {
+                path: requested.to_owned(),
+            })?;
+            if requested_text.is_empty() || requested_text == ":memory:" {
+                return Err(FrankenError::CannotOpen {
+                    path: requested.to_owned(),
+                });
+            }
+            let cx = env
+                .runtime()
+                .root_cx
+                .create_child()
+                .with_trace_context(next_trace_id(), 0, 0);
+            let stable = PagerBackend::resolve_stable_database_path(requested_text, &cx)?;
+            let stable_path = std::path::PathBuf::from(stable);
+            let reservation = fsqlite_vfs::host_fs::reserve_new_file(&stable_path).map_err(
+                |error| match error {
+                    FrankenError::Io(io_error)
+                        if io_error.kind() == std::io::ErrorKind::AlreadyExists =>
+                    {
+                        FrankenError::CannotOpen {
+                            path: stable_path.clone(),
+                        }
+                    }
+                    other => other,
+                },
+            )?;
+            let metadata = reservation.metadata()?;
+            let Some(identity) = FileIdentity::from_file(&reservation)? else {
+                return Err(FrankenError::CannotOpen { path: stable_path });
+            };
+            // The reserved object must be regular, empty and single-linked at
+            // the instant of the claim, or the claim is not what it appears.
+            let single_linked = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    metadata.nlink() == 1
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            };
+            if !metadata.is_file() || metadata.len() != 0 || !single_linked {
+                return Err(FrankenError::CannotOpen { path: stable_path });
+            }
+            Ok(DatabaseBuilderReservation {
+                path: stable_path,
+                identity,
+                write_set_page_limit,
+                reservation,
+            })
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            let _ = (path, write_set_page_limit);
+            Err(FrankenError::Unsupported)
+        }
+    }
+
+    /// Initialize a reserved target and return its identity-bound writable
+    /// schema-only builder.
+    ///
+    /// Phase 2. Revalidates the reservation at `expected_len = Some(0)`,
+    /// confirms the stable path still resolves to the reserved pathname, and
+    /// opens that exact identity through the existing-file writable schema-only
+    /// path with the validated write-set ceiling recorded on the environment.
+    ///
+    /// The ceiling is **recorded and validated, not enforced** — see
+    /// [`DatabaseBuilderReservation::write_set_limit_enforced`]. Callers that
+    /// need a proven bound on how much of the image a build rewrote must wait
+    /// for write-set telemetry; this method deliberately does not let them
+    /// believe otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`FrankenError::CannotOpen`] when revalidation fails or the reserved
+    /// path no longer resolves to itself, the refusals from
+    /// [`ConnectionEnv::validated_schema_only_write_set_page_limit`], and any
+    /// propagated open error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn initialize_reserved_schema_only_builder(
+        reservation: &DatabaseBuilderReservation,
+        mut env: ConnectionEnv,
+    ) -> Result<Self> {
+        let page_limit = env.validated_schema_only_write_set_page_limit()?;
+        if page_limit != reservation.write_set_page_limit() {
+            return Err(FrankenError::OutOfRange {
+                what: "schema-only builder write-set page limit changed between reservation and initialization"
+                    .to_owned(),
+                value: page_limit.to_string(),
+            });
+        }
+        // Nothing has been written yet, so the reserved object must still be
+        // exactly zero bytes.
+        reservation.revalidate_final_target(Some(0))?;
+
+        let cx = env
+            .runtime()
+            .root_cx
+            .create_child()
+            .with_trace_context(next_trace_id(), 0, 0);
+        let path_text = reservation
+            .path()
+            .to_str()
+            .ok_or_else(|| FrankenError::CannotOpen {
+                path: reservation.path().to_owned(),
+            })?;
+        let stable = PagerBackend::resolve_stable_database_path(path_text, &cx)?;
+        if Path::new(&stable) != reservation.path() {
+            return Err(FrankenError::CannotOpen {
+                path: reservation.path().to_owned(),
+            });
+        }
+        env.set_schema_only_write_set_page_limit(page_limit);
+
+        // A reserved pathname is an EMPTY file, which is not yet a database.
+        // Bootstrap page 1 through the identity-bound reserved-open path first;
+        // the existing-file schema-only path below would refuse a zero-byte
+        // file. The ceiling is deliberately NOT installed for this step: page 1
+        // is engine bootstrap, not caller-attributable build work, and counting
+        // it would make a small budget unusable for the reason a caller cannot
+        // see.
+        let bootstrap = Self::open_reserved_with_expected_identity_and_env(
+            stable.clone(),
+            reservation.identity(),
+            env.clone(),
+        )
+        .await?;
+        bootstrap.close().await?;
+
+        // The file is now a database, so the length is no longer zero; identity
+        // and single-linkage must still hold.
+        reservation.revalidate_final_target(None)?;
+
+        let builder = Self::open_existing_schema_only_with_expected_identity_and_env(
+            stable,
+            reservation.identity(),
+            env,
+        )
+        .await?;
+        // Install the ceiling on the pager itself, so it is enforced where
+        // pages actually enter the write set rather than recorded at open time.
+        builder.pager.set_write_set_page_limit(page_limit);
+        Ok(builder)
     }
 
     /// Receipt an image at `image_path` **without opening a connection on it**.
@@ -32925,6 +33174,140 @@ impl Drop for PendingDatabaseImagePublication<'_> {
                  its own receipt"
             );
         }
+    }
+}
+
+/// An atomically claimed, identity-bound pathname for building a replacement
+/// database image.
+///
+/// Two-phase create protocol. Phase 1 ([`Connection::reserve_schema_only_builder_target`])
+/// claims the pathname with create-new/no-follow semantics and **retains the
+/// descriptor that created it**. Phase 2
+/// ([`Connection::initialize_reserved_schema_only_builder`]) revalidates and
+/// hands back a writable builder connection bound to [`Self::identity`].
+///
+/// Keeping this value alive for the whole build is not bookkeeping — it is the
+/// guarantee. Holding the creating descriptor open prevents the inode being
+/// recycled, so every later check runs against a stable identity rather than a
+/// re-resolved pathname, which is what closes the create-then-swap window. A
+/// caller must therefore hold the reservation across construction and finish
+/// with [`Self::revalidate_final_target`], not drop it after phase 2.
+///
+/// Existing paths are never opened, truncated, replaced, or unlinked by
+/// reservation: the builder can only ever write to a file it created.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+pub struct DatabaseBuilderReservation {
+    path: std::path::PathBuf,
+    identity: FileIdentity,
+    write_set_page_limit: usize,
+    /// The descriptor that atomically created `path`. Held for the lifetime of
+    /// the reservation so the identity cannot be reused underneath it.
+    #[cfg(feature = "native")]
+    reservation: std::fs::File,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DatabaseBuilderReservation {
+    /// Absolute, stable pathname atomically reserved for the builder.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Stable identity of the retained create-new descriptor.
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// The validated write-set page ceiling recorded for this build.
+    #[must_use]
+    pub const fn write_set_page_limit(&self) -> usize {
+        self.write_set_page_limit
+    }
+
+    /// Whether the recorded write-set ceiling is enforced by the engine during
+    /// the build.
+    ///
+    /// `true`: the ceiling is installed on the builder's pager and checked in
+    /// `SimpleTransaction::write_page` / `write_page_data` before a new page
+    /// enters the write set, so an over-budget build fails with a typed
+    /// [`FrankenError::OutOfRange`] at the moment of excess rather than at
+    /// commit. Distinct from `page_buffer_max`, which caps resident buffers —
+    /// a memory bound, not a bound on how much of the database is rewritten.
+    ///
+    /// The ceiling covers caller-staged pages; commit-time engine metadata
+    /// (page 1, freelist serialization) is excluded and is not
+    /// caller-attributable.
+    #[must_use]
+    pub const fn write_set_limit_enforced(&self) -> bool {
+        true
+    }
+
+    /// Fail-closed final validation of the retained create-new authority.
+    ///
+    /// Call after the private build and immediately before releasing the
+    /// reservation. Proves, twice over, that the retained descriptor and the
+    /// final no-follow pathname resolve to the same regular file of the
+    /// expected exact length, with no hard-link alias introduced.
+    ///
+    /// # Errors
+    ///
+    /// [`FrankenError::CannotOpen`] on any mismatch, and
+    /// [`FrankenError::Unsupported`] on non-native builds, which refuse rather
+    /// than skipping the check.
+    pub fn revalidate_final_target(&self, expected_len: Option<u64>) -> Result<()> {
+        #[cfg(feature = "native")]
+        {
+            Self::validate_single_link_reservation(&self.reservation, self.identity, expected_len)
+                .and_then(|()| {
+                    let by_path =
+                        fsqlite_vfs::host_fs::open_existing_regular_file_no_follow(&self.path)?;
+                    Self::validate_single_link_reservation(&by_path, self.identity, expected_len)
+                })
+                .map_err(|_| FrankenError::CannotOpen {
+                    path: self.path.clone(),
+                })
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            let _ = expected_len;
+            Err(FrankenError::Unsupported)
+        }
+    }
+
+    /// The four checks applied to each of the two handles.
+    #[cfg(feature = "native")]
+    fn validate_single_link_reservation(
+        file: &std::fs::File,
+        expected_identity: FileIdentity,
+        expected_len: Option<u64>,
+    ) -> Result<()> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(FrankenError::Unsupported);
+        }
+        if let Some(expected_len) = expected_len
+            && metadata.len() != expected_len
+        {
+            return Err(FrankenError::Unsupported);
+        }
+        match FileIdentity::from_file(file)? {
+            Some(identity) if identity == expected_identity => {}
+            _ => return Err(FrankenError::Unsupported),
+        }
+        // The anti-aliasing clause: a second link appearing at any point
+        // between reservation and finalization is a swap vector, not a
+        // cosmetic difference.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.nlink() != 1 {
+                return Err(FrankenError::Unsupported);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -225273,6 +225656,159 @@ mod pager_routing_tests {
                 std::fs::read(&image_path).unwrap(),
                 before,
                 "the image must be byte-identical after every refused write"
+            );
+        });
+    }
+
+    /// A build that exceeds its write-set ceiling must fail at the moment of
+    /// excess, not at commit and not silently.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn builder_refuses_a_build_that_exceeds_its_write_set_ceiling() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("bounded-builder.db");
+
+            let mut env = ConnectionEnv::default();
+            // Deliberately tiny: enough to bootstrap, far too small to hold the
+            // table pages the loop below writes.
+            env.set_schema_only_write_set_page_limit(3);
+            let reservation = Connection::reserve_schema_only_builder_target_with_env(
+                &target, &env,
+            )
+            .expect("reserve a fresh target");
+            assert_eq!(reservation.write_set_page_limit(), 3);
+            assert!(
+                reservation.write_set_limit_enforced(),
+                "the ceiling must be enforced, not merely recorded"
+            );
+
+            let builder = Connection::initialize_reserved_schema_only_builder(&reservation, env)
+                .await
+                .expect("initialize the reserved builder");
+
+            // Write until the ceiling refuses. A generous bound on the loop so a
+            // failure to enforce shows up as a test failure rather than a hang.
+            let mut refusal = None;
+            builder
+                .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+                .await
+                .ok();
+            for id in 1..=4096_i64 {
+                let filler = "x".repeat(512);
+                match builder
+                    .execute(&format!("INSERT INTO t VALUES ({id}, '{filler}');"))
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) => {
+                        refusal = Some(error);
+                        break;
+                    }
+                }
+            }
+
+            let refusal = refusal.expect("a 3-page ceiling must refuse this build");
+            assert!(
+                matches!(&refusal, FrankenError::OutOfRange { what, .. }
+                    if what.contains("write-set page limit")),
+                "expected the typed write-set refusal, got {refusal:?}"
+            );
+
+            builder.close().await.ok();
+        });
+    }
+
+    /// The ceiling is documented as inert on any open other than the reserved
+    /// builder create path. Prove it rather than assert it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn write_set_ceiling_is_inert_on_an_ordinary_open() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("inert-ceiling.db");
+
+            let mut env = ConnectionEnv::default();
+            // The same tiny ceiling that refuses the build above.
+            env.set_schema_only_write_set_page_limit(3);
+            let conn = Connection::open_with_env(
+                db_path.to_string_lossy().into_owned(),
+                env,
+            )
+            .await
+            .expect("ordinary open must ignore the builder-only ceiling");
+
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+                .await
+                .expect("DDL must not be bounded on an ordinary open");
+            // Far more pages than the ceiling would ever admit.
+            for id in 1..=400_i64 {
+                let filler = "y".repeat(512);
+                conn.execute(&format!("INSERT INTO t VALUES ({id}, '{filler}');"))
+                    .await
+                    .expect("writes must not be bounded on an ordinary open");
+            }
+            let rows = conn.query("SELECT COUNT(*) FROM t;").await.unwrap();
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(400));
+            conn.close().await.expect("close");
+        });
+    }
+
+    /// The ceiling is mandatory on the create path: no limit is a typed
+    /// refusal, and zero is out of range.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn builder_reservation_requires_an_explicit_nonzero_ceiling() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+
+            let missing = Connection::reserve_schema_only_builder_target(
+                dir.path().join("no-ceiling.db"),
+            )
+            .expect_err("an absent ceiling must refuse rather than default");
+            assert!(
+                matches!(missing, FrankenError::NotImplemented(_)),
+                "expected NotImplemented, got {missing:?}"
+            );
+
+            let mut zero_env = ConnectionEnv::default();
+            zero_env.set_schema_only_write_set_page_limit(0);
+            let zero = Connection::reserve_schema_only_builder_target_with_env(
+                dir.path().join("zero-ceiling.db"),
+                &zero_env,
+            )
+            .expect_err("a zero ceiling is not a bound");
+            assert!(
+                matches!(zero, FrankenError::OutOfRange { .. }),
+                "expected OutOfRange, got {zero:?}"
+            );
+        });
+    }
+
+    /// Reservation claims only fresh pathnames and never touches what is
+    /// already there.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn builder_reservation_refuses_an_existing_path_without_touching_it() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let occupied = dir.path().join("occupied.db");
+            std::fs::write(&occupied, b"pre-existing bytes").unwrap();
+            let before = std::fs::read(&occupied).unwrap();
+
+            let mut env = ConnectionEnv::default();
+            env.set_schema_only_write_set_page_limit(64);
+            let error =
+                Connection::reserve_schema_only_builder_target_with_env(&occupied, &env)
+                    .expect_err("an occupied path must never be claimed");
+            assert!(
+                matches!(error, FrankenError::CannotOpen { .. }),
+                "expected CannotOpen, got {error:?}"
+            );
+            assert_eq!(
+                std::fs::read(&occupied).unwrap(),
+                before,
+                "a refused reservation must not open, truncate, or replace the file"
             );
         });
     }
