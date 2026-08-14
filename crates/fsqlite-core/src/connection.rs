@@ -126275,6 +126275,45 @@ fn glob_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
             }
         }
         '?' => ti < txt.len() && glob_dp(pat, txt, pi + 1, ti + 1),
+        '[' => {
+            // Bracket character class, mirroring the function-path matcher
+            // (fsqlite-func glob_match_inner): `^` negates; `X-Y` is a range
+            // unless `Y` is `]`; a `]` immediately after `[`/`[^` is a literal
+            // member; and an unterminated class (pattern ends before `]`)
+            // matches nothing, exactly like C SQLite patternCompare
+            // (bd-gh-glob-charclass-tobn9 — the interpreter path had no bracket
+            // support at all and matched `[` literally).
+            if ti >= txt.len() {
+                return false;
+            }
+            let mut pj = pi + 1;
+            let negate = pj < pat.len() && pat[pj] == '^';
+            if negate {
+                pj += 1;
+            }
+            let mut found = false;
+            let mut first = true;
+            while pj < pat.len() && (first || pat[pj] != ']') {
+                first = false;
+                if pj + 2 < pat.len() && pat[pj + 1] == '-' && pat[pj + 2] != ']' {
+                    if txt[ti] >= pat[pj] && txt[ti] <= pat[pj + 2] {
+                        found = true;
+                    }
+                    pj += 3;
+                } else {
+                    if txt[ti] == pat[pj] {
+                        found = true;
+                    }
+                    pj += 1;
+                }
+            }
+            if pj < pat.len() && pat[pj] == ']' {
+                pj += 1;
+            } else {
+                return false;
+            }
+            found != negate && glob_dp(pat, txt, pj, ti + 1)
+        }
         c => ti < txt.len() && txt[ti] == c && glob_dp(pat, txt, pi + 1, ti + 1),
     }
 }
