@@ -18540,25 +18540,49 @@ where
         self.allocated_from_durable_freelist.clear();
 
         if self.mode == TransactionMode::Concurrent {
-            // bd-vnxjd: abandoned EOF reservations and quarantined savepoint
-            // pages must survive committed-state refresh (which rebuilds
-            // inner.freelist from durable state) or they become permanent
-            // "page N is never used" holes. Park them in the abandonment
-            // pool; the next WAL commit publishes still-unwritten entries
-            // into the durable freelist. Reclaimed entries from a failed
-            // publication attempt return to the pool the same way.
-            inner
-                .abandoned_eof_reservations
-                .extend(self.reclaimed_abandoned_reservations.drain(..));
-            inner
-                .abandoned_eof_reservations
-                .extend(self.page_lease.drain(..));
-            inner
-                .abandoned_eof_reservations
-                .extend(self.allocated_from_eof.drain(..));
-            inner
-                .abandoned_eof_reservations
-                .extend(self.savepoint_quarantined_allocations.drain(..));
+            if self.journal_mode == JournalMode::Wal {
+                // bd-vnxjd: abandoned EOF reservations and quarantined savepoint
+                // pages must survive committed-state refresh (which rebuilds
+                // inner.freelist from durable state) or they become permanent
+                // "page N is never used" holes. Park them in the abandonment
+                // pool; the next WAL commit publishes still-unwritten entries
+                // into the durable freelist. Reclaimed entries from a failed
+                // publication attempt return to the pool the same way.
+                inner
+                    .abandoned_eof_reservations
+                    .extend(self.reclaimed_abandoned_reservations.drain(..));
+                inner
+                    .abandoned_eof_reservations
+                    .extend(self.page_lease.drain(..));
+                inner
+                    .abandoned_eof_reservations
+                    .extend(self.allocated_from_eof.drain(..));
+                inner
+                    .abandoned_eof_reservations
+                    .extend(self.savepoint_quarantined_allocations.drain(..));
+            } else {
+                // Rollback-journal mode has no WAL commit to fold the
+                // abandonment pool into the durable freelist — pooling here
+                // would park these pages forever (bd-vnxjd's leak reintroduced
+                // one layer up). Keep the pre-pool volatile freelist return:
+                // journal commits run under the exclusive commit lock whose
+                // peer-claimed-range check covers reuse aliasing, and the
+                // single-connection journal shapes these pages come from do
+                // not hit the refresh wholesale-replace that motivated the
+                // pool (pinned by test_concurrent_rollback_reclaims_eof_
+                // allocations_without_holes and the beyond-db_size reuse
+                // keepers, which run in journal mode).
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.reclaimed_abandoned_reservations.drain(..),
+                );
+                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+                return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.savepoint_quarantined_allocations.drain(..),
+                );
+            }
         } else if inner.active_transactions <= 1 {
             return_pages_to_freelist(
                 &mut inner.freelist,
@@ -23442,13 +23466,26 @@ where
                     // discarding these entries. Park them in the pager-level
                     // abandonment pool instead — the next WAL commit folds
                     // still-unwritten entries into its durable freelist
-                    // publication.
-                    inner
-                        .abandoned_eof_reservations
-                        .extend(self.page_lease.drain(..));
-                    inner
-                        .abandoned_eof_reservations
-                        .extend(self.allocated_from_eof.drain(..));
+                    // publication. Rollback-journal mode has no such fold, so
+                    // it keeps the volatile freelist return (see the matching
+                    // arm in restore_uncommitted_allocations_for_clean_commit).
+                    if self.journal_mode == JournalMode::Wal {
+                        inner
+                            .abandoned_eof_reservations
+                            .extend(self.page_lease.drain(..));
+                        inner
+                            .abandoned_eof_reservations
+                            .extend(self.allocated_from_eof.drain(..));
+                    } else {
+                        return_pages_to_freelist(
+                            &mut inner.freelist,
+                            self.page_lease.drain(..),
+                        );
+                        return_pages_to_freelist(
+                            &mut inner.freelist,
+                            self.allocated_from_eof.drain(..),
+                        );
+                    }
                 } else {
                     // Read-only transaction: lease should be empty (only writers
                     // allocate pages), but clear defensively.
