@@ -19202,6 +19202,15 @@ impl Connection {
             && !self.pager.is_memory()
             && self.pager.journal_mode() == JournalMode::Wal
             && !self.pager.is_readonly()
+            // bd-lcuoc: only a connection that performed a durable write may fold
+            // the WAL into the main DB at close. The close-time passive checkpoint
+            // is opportunistic WAL hygiene (a WAL-preserving close is fully
+            // correct — see the transient-error handling below), so a consumer
+            // that only ever read must leave the main-DB bytes byte-stable
+            // (MTDT's source-integrity law). `is_readonly()` above only covers
+            // O_RDONLY opens; a read-write open that never committed a write was
+            // still mutating the file here.
+            && self.data_version_own_commits.get() > 0
             && !self.wal_checkpoint_blocked_by_active_concurrent_txns()
         {
             if best_effort {
