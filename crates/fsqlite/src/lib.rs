@@ -19,6 +19,17 @@ pub use fsqlite_core::connection::{
     Connection, ConnectionEnv, DatabaseImageReceipt, IoPollStrategy, PreparedStatement, Row,
     RuntimeConfig, RuntimeContext, TraceEvent, TraceMask, init_global_runtime,
 };
+/// Whole-database-image capture, bounded structural proof, and publication.
+///
+/// These name the guards and proof counters returned by
+/// [`Connection::begin_bounded_structural_snapshot`] and
+/// [`Connection::begin_database_image_publication`]; without them a caller can
+/// call those methods but cannot write down the types they hand back.
+pub use fsqlite_core::connection::BoundedDatabaseStructuralStats;
+#[cfg(not(target_arch = "wasm32"))]
+pub use fsqlite_core::connection::{
+    BoundedStructuralSnapshot, DatabaseImagePublication, PendingDatabaseImagePublication,
+};
 pub use fsqlite_error::{DatabaseImagePublicationErrorClass, FrankenError};
 pub use fsqlite_types::SqliteValue;
 pub use fsqlite_vfs;

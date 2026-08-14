@@ -3092,6 +3092,67 @@ impl PagerBackend {
         }
     }
 
+    /// Set both mutable header counters independently.
+    ///
+    /// Whole-image publication uses this to undo its own change-counter repair
+    /// when validation refuses a candidate, restoring the caller's image to its
+    /// exact provisional receipt — which may legitimately carry
+    /// `change_counter != version_valid_for`.
+    async fn restore_vacuum_candidate_header_counters(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        expected: &DatabaseImageReceipt,
+        change_counter: u32,
+        version_valid_for: u32,
+    ) -> Result<DatabaseImageReceipt> {
+        match self {
+            Self::Memory(p) => {
+                p.restore_vacuum_candidate_header_counters(
+                    cx,
+                    path,
+                    expected,
+                    change_counter,
+                    version_valid_for,
+                )
+                .await
+            }
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => {
+                p.restore_vacuum_candidate_header_counters(
+                    cx,
+                    path,
+                    expected,
+                    change_counter,
+                    version_valid_for,
+                )
+                .await
+            }
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => {
+                p.restore_vacuum_candidate_header_counters(
+                    cx,
+                    path,
+                    expected,
+                    change_counter,
+                    version_valid_for,
+                )
+                .await
+            }
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => {
+                p.restore_vacuum_candidate_header_counters(
+                    cx,
+                    path,
+                    expected,
+                    change_counter,
+                    version_valid_for,
+                )
+                .await
+            }
+        }
+    }
+
     async fn publish_validated_database_image(
         &self,
         cx: &Cx,
@@ -10878,6 +10939,20 @@ pub struct Connection {
     /// Returning the post-commit reload error without poisoning would leave
     /// stale root-page mappings available to later statements.
     post_vacuum_rebind_failure: RefCell<Option<String>>,
+    /// Same fail-closed marker for whole-image publication: the replacement
+    /// image is durable, but this connection could not rebuild its
+    /// schema/root-page bindings onto it. Kept separate from the VACUUM marker
+    /// so the diagnostic names the operation that actually crossed its commit
+    /// point.
+    post_image_publication_rebind_failure: RefCell<Option<String>>,
+    /// One-shot injection after a durable whole-image publication but before
+    /// the masked connection rebind begins.
+    #[cfg(test)]
+    cancel_image_publication_after_publish_once: Cell<bool>,
+    /// One-shot injection proving a failed post-publication reload poisons this
+    /// connection while leaving the committed image reopenable.
+    #[cfg(test)]
+    fail_image_publication_rebind_once: Cell<bool>,
     /// One-shot test hook that fails an in-place VACUUM after the rebuilt
     /// image has reopened and passed both integrity checks but before it is
     /// published over the source database.
@@ -12297,6 +12372,11 @@ impl Connection {
             pending_local_live_vtab_preservation: RefCell::new(None),
             closed: RefCell::new(false),
             post_vacuum_rebind_failure: RefCell::new(None),
+            post_image_publication_rebind_failure: RefCell::new(None),
+            #[cfg(test)]
+            cancel_image_publication_after_publish_once: Cell::new(false),
+            #[cfg(test)]
+            fail_image_publication_rebind_once: Cell::new(false),
             #[cfg(test)]
             fail_vacuum_rebuild_validation_once: Cell::new(false),
             #[cfg(test)]
@@ -12793,6 +12873,11 @@ impl Connection {
             pending_local_live_vtab_preservation: RefCell::new(None),
             closed: RefCell::new(false),
             post_vacuum_rebind_failure: RefCell::new(None),
+            post_image_publication_rebind_failure: RefCell::new(None),
+            #[cfg(test)]
+            cancel_image_publication_after_publish_once: Cell::new(false),
+            #[cfg(test)]
+            fail_image_publication_rebind_once: Cell::new(false),
             #[cfg(test)]
             fail_vacuum_rebuild_validation_once: Cell::new(false),
             #[cfg(test)]
@@ -13038,24 +13123,430 @@ impl Connection {
         spool_parent: impl AsRef<Path>,
     ) -> Result<BoundedDatabaseStructuralStats> {
         let spool_parent = spool_parent.as_ref();
+        // Reuses this connection's transaction when one is already open, which
+        // is how the bounded snapshot composite keeps the proof and the
+        // caller's subsequent reads inside one pinned snapshot. With no open
+        // transaction this begins and rolls back its own read transaction.
+        self.with_integrity_txn(async |cx, txn| {
+            self.bounded_validate_structure_in_txn(cx, txn, spool_parent)
+                .await
+        })
+        .await
+    }
+
+    /// Open a structurally-proven, receipt-bound snapshot of an external image.
+    ///
+    /// This is the read side of full-image publication. It checks that
+    /// `image_path` still matches `expected`, opens that exact file identity
+    /// physically read-only, pins one deferred transaction, proves complete
+    /// structural page ownership inside it, and hands back a guard holding all
+    /// of it open. Every read the caller needs from the proven snapshot must go
+    /// through [`BoundedStructuralSnapshot::connection`]; opening the path
+    /// separately would leave the snapshot.
+    ///
+    /// The caller **must** end the snapshot with
+    /// [`BoundedStructuralSnapshot::finish`], which releases the transaction and
+    /// then proves the image is still byte-for-byte equal to `expected`. That
+    /// final compare-and-swap is what makes a candidate built from this snapshot
+    /// safe to publish; dropping the guard instead skips it and the result must
+    /// not be trusted.
+    ///
+    /// `validation_page_limit` caps the validation connection's page buffer.
+    /// Note that the cross-process page-limit fence is not yet restored on this
+    /// line, so this bounds local residency, not concurrent writers; the
+    /// receipt CAS above and below the window is what detects interference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] for a zero page limit,
+    /// [`FrankenError::Unsupported`] for a memory-backed source,
+    /// [`FrankenError::BusySnapshot`] when the image no longer matches
+    /// `expected`, and any propagated open or validation error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn begin_bounded_structural_snapshot<'a>(
+        &'a self,
+        expected: &DatabaseImageReceipt,
+        image_path: impl AsRef<Path>,
+        validation_page_limit: usize,
+    ) -> Result<BoundedStructuralSnapshot<'a>> {
+        if validation_page_limit == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "database image structural validation page limit".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        if !self.pager.is_file_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+        let image_path = image_path.as_ref();
         let cx = self.op_cx()?;
-        let mut txn = self
-            .begin_pager_txn_with_busy_timeout(&self.pager, &cx, TransactionMode::ReadOnly, false)
+
+        let before = self
+            .pager
+            .inspect_self_contained_database_image(&cx, image_path)
             .await?;
-        let validation = self
-            .bounded_validate_structure_in_txn(&cx, &mut txn, spool_parent)
-            .await;
-        let rollback_result = txn.rollback(&cx).await;
-        match (validation, rollback_result) {
-            (Ok(stats), Ok(())) => Ok(stats),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(validation_error), Err(rollback_error)) => {
-                tracing::warn!(
-                    error = %rollback_error,
-                    "bounded structural validation failed and rollback also failed"
-                );
-                Err(validation_error)
+        if before != *expected {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages: "bounded structural source receipt changed before validation"
+                    .to_owned(),
+            });
+        }
+
+        let path = image_path
+            .to_str()
+            .ok_or_else(|| FrankenError::CannotOpen {
+                path: image_path.to_owned(),
+            })?;
+        let mut env = self.attach_env.clone();
+        env.set_page_buffer_max(validation_page_limit);
+        env.set_strict_multi_process(true);
+        let validation = Self::open_schema_only_with_expected_identity_and_env(
+            path.to_owned(),
+            expected.identity(),
+            env,
+        )
+        .await?;
+
+        // The spool lives beside the image, which is already a real directory
+        // the caller can write; `PrivatePageOwnership` unlinks it immediately.
+        let spool_parent = image_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_owned();
+
+        // Pin one deferred transaction, then prove ownership inside it. The
+        // proof reuses this transaction rather than opening its own, so the
+        // snapshot the caller reads is the snapshot that was proven.
+        let proof = async {
+            validation.begin_transaction().await?;
+            validation
+                .validate_database_structure_bounded(&spool_parent)
+                .await
+        }
+        .await;
+        let stats = match proof {
+            Ok(stats) => stats,
+            Err(error) => {
+                // Unwind the half-open snapshot before surfacing the failure,
+                // so a refused image never leaves a reader pinned.
+                let _ = validation.rollback_transaction().await;
+                if let Err(close_error) = validation.close().await {
+                    tracing::warn!(
+                        error = %close_error,
+                        image = %image_path.display(),
+                        "bounded structural validation failed and close also failed"
+                    );
+                }
+                return Err(error);
             }
+        };
+
+        Ok(BoundedStructuralSnapshot {
+            source: self,
+            validation: Some(validation),
+            stats,
+            expected: expected.clone(),
+            image_path: image_path.to_owned(),
+        })
+    }
+
+    /// Begin a whole-image publication and stop just before its commit point.
+    ///
+    /// This is the write side of full-image replacement, and the mirror of
+    /// [`Self::begin_bounded_structural_snapshot`]. It proves the source is
+    /// still exactly `source` and the candidate still exactly
+    /// `expected_candidate`, quiesces this connection, installs source-derived
+    /// change-counter provenance on the candidate, reopens the candidate
+    /// identity-bound and read-only, runs `quick_check` and `integrity_check`
+    /// on it, and hands back a guard pinning that state.
+    ///
+    /// The caller then runs whatever application-level checks it needs through
+    /// [`PendingDatabaseImagePublication::candidate`] and finishes with
+    /// [`PendingDatabaseImagePublication::commit`] to cross the commit point or
+    /// [`PendingDatabaseImagePublication::abandon`] to refuse. `abandon` also
+    /// restores the candidate's exact provisional header counters, so a refused
+    /// candidate is left byte-identical to what the caller handed in. Dropping
+    /// the guard does neither: the reader is released, but the candidate keeps
+    /// source-derived counters and no longer matches its own receipt, so a
+    /// later attempt fails closed rather than publishing something unproven.
+    /// That path logs an error.
+    ///
+    /// Nothing here is durable for the source database. Every failure before
+    /// `commit` leaves the source untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::Unsupported`] for a memory-backed connection,
+    /// [`FrankenError::Busy`] when a transaction, savepoint, or live
+    /// virtual-table transaction is open, [`FrankenError::BusySnapshot`] when
+    /// either image changed after its receipt was captured,
+    /// [`FrankenError::CannotOpen`] when the candidate names the source itself,
+    /// [`FrankenError::DatabaseCorrupt`] when the candidate fails its
+    /// pre-publication integrity checks, and any propagated pager error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn begin_database_image_publication<'a>(
+        &'a self,
+        source: &DatabaseImageReceipt,
+        expected_candidate: &DatabaseImageReceipt,
+        candidate_path: impl AsRef<Path>,
+    ) -> Result<PendingDatabaseImagePublication<'a>> {
+        if !self.pager.is_file_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+        let candidate_path = candidate_path.as_ref();
+        let cx = self.op_cx()?;
+
+        // Refuse an already-stale candidate before quiescing this connection,
+        // so a doomed attempt never disturbs a healthy source.
+        let observed_candidate = self
+            .pager
+            .inspect_self_contained_database_image(&cx, candidate_path)
+            .await?;
+        if observed_candidate != *expected_candidate {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages:
+                    "database candidate image changed after its publication receipt was captured"
+                        .to_owned(),
+            });
+        }
+        if observed_candidate.identity() == source.identity() {
+            return Err(FrankenError::CannotOpen {
+                path: candidate_path.to_owned(),
+            });
+        }
+
+        self.quiesce_database_image_publication_state(&cx).await?;
+        if self.pager.journal_mode() == JournalMode::Wal {
+            self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
+        }
+
+        // Bind the durable source generation. Everything after this point is a
+        // compare-and-swap against exactly this image.
+        let current_source = self.pager.capture_vacuum_source_image(&cx).await?;
+        if current_source != *source {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages:
+                    "database source image changed after its publication receipt was captured"
+                        .to_owned(),
+            });
+        }
+
+        // Re-read the candidate after quiescing: the window above is exactly
+        // where a peer with a handle on the candidate could have written.
+        let provisional = self
+            .pager
+            .inspect_self_contained_database_image(&cx, candidate_path)
+            .await?;
+        if provisional != *expected_candidate {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages:
+                    "database candidate image changed after its publication receipt was captured"
+                        .to_owned(),
+            });
+        }
+        if provisional.identity() == source.identity() {
+            return Err(FrankenError::CannotOpen {
+                path: candidate_path.to_owned(),
+            });
+        }
+
+        let expected_change_counter = source.header().change_counter.wrapping_add(1).max(1);
+        let repaired = self
+            .pager
+            .restore_vacuum_candidate_change_counter(
+                &cx,
+                candidate_path,
+                &provisional,
+                expected_change_counter,
+            )
+            .await?;
+
+        // From here the candidate carries source-derived provenance, so every
+        // failure has to put the caller's bytes back before returning.
+        let opened = async {
+            let repaired_check = self
+                .pager
+                .inspect_self_contained_database_image(&cx, candidate_path)
+                .await?;
+            if repaired_check != repaired {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "database candidate changed across source-derived change-counter repair"
+                        .to_owned(),
+                });
+            }
+            let path = candidate_path
+                .to_str()
+                .ok_or_else(|| FrankenError::CannotOpen {
+                    path: candidate_path.to_owned(),
+                })?;
+            let validation =
+                Self::open_schema_only_with_expected_identity(path.to_owned(), repaired.identity())
+                    .await
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            error = %error,
+                            image = %candidate_path.display(),
+                            "database candidate failed identity-bound pre-publication schema reload"
+                        );
+                    })?;
+            match Self::run_pre_publication_integrity_checks(&validation).await {
+                Ok(()) => Ok(validation),
+                Err(error) => {
+                    if let Err(close_error) = validation.close().await {
+                        tracing::warn!(
+                            error = %close_error,
+                            image = %candidate_path.display(),
+                            "database candidate integrity checks failed and close also failed"
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        }
+        .await;
+
+        let validation = match opened {
+            Ok(validation) => validation,
+            Err(error) => {
+                let restore = Self::restore_provisional_candidate(
+                    &self.pager,
+                    &cx,
+                    candidate_path,
+                    &repaired,
+                    &provisional,
+                )
+                .await;
+                return Err(Self::refusal_after_restore(error, restore));
+            }
+        };
+
+        Ok(PendingDatabaseImagePublication {
+            source: self,
+            validation: Some(validation),
+            candidate_path: candidate_path.to_owned(),
+            source_receipt: source.clone(),
+            provisional,
+            repaired,
+            expected_change_counter,
+            restore_hydrated_rows: self.memdb_rows_loaded.get(),
+        })
+    }
+
+    /// Publish an already-receipted private image, validating it with a caller
+    /// callback that runs on a read-only, identity-bound handle.
+    ///
+    /// Convenience over [`Self::begin_database_image_publication`] that
+    /// guarantees the refusal path: if `validate` returns an error, the
+    /// candidate's provisional header counters are restored before that error
+    /// is surfaced.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::begin_database_image_publication`] and
+    /// [`PendingDatabaseImagePublication::commit`] can return, plus whatever
+    /// `validate` returns.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn publish_database_image_from_receipt<F>(
+        &self,
+        source: &DatabaseImageReceipt,
+        expected_candidate: &DatabaseImageReceipt,
+        candidate_path: impl AsRef<Path>,
+        validate: F,
+    ) -> Result<DatabaseImagePublication>
+    where
+        F: std::ops::AsyncFnOnce(&Self) -> Result<()>,
+    {
+        let pending = self
+            .begin_database_image_publication(source, expected_candidate, candidate_path)
+            .await?;
+        match validate(pending.candidate()).await {
+            Ok(()) => pending.commit().await,
+            Err(validation_error) => {
+                let abandon_result = pending.abandon().await;
+                Err(Self::refusal_after_restore(
+                    validation_error,
+                    abandon_result,
+                ))
+            }
+        }
+    }
+
+    /// Run the pre-publication integrity gate on an opened candidate.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn run_pre_publication_integrity_checks(validation: &Self) -> Result<()> {
+        for pragma in ["quick_check", "integrity_check"] {
+            let rows = validation.query(&format!("PRAGMA {pragma};")).await?;
+            let passed = rows.len() == 1
+                && matches!(
+                    rows[0].values().first(),
+                    Some(SqliteValue::Text(message)) if message.eq_ignore_ascii_case("ok")
+                );
+            if !passed {
+                let details = rows
+                    .iter()
+                    .map(|row| {
+                        row.values()
+                            .first()
+                            .map_or_else(|| "<empty row>".to_owned(), SqliteValue::to_text)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "database candidate failed pre-publication {pragma}: {details}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Put a candidate back to its exact provisional receipt after a refusal.
+    ///
+    /// Succeeds only when the restored image is *proven* byte-identical to what
+    /// the caller handed in; a restore that lands on anything else is a
+    /// corruption report, not a partial success.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn restore_provisional_candidate(
+        pager: &PagerBackend,
+        cx: &Cx,
+        candidate_path: &Path,
+        repaired: &DatabaseImageReceipt,
+        provisional: &DatabaseImageReceipt,
+    ) -> Result<()> {
+        let restored = pager
+            .restore_vacuum_candidate_header_counters(
+                cx,
+                candidate_path,
+                repaired,
+                provisional.header().change_counter,
+                provisional.header().version_valid_for,
+            )
+            .await?;
+        if restored == *provisional {
+            return Ok(());
+        }
+        Err(FrankenError::DatabaseCorrupt {
+            detail: "database candidate provisional receipt restoration could not be proven exact"
+                .to_owned(),
+        })
+    }
+
+    /// Fold a restoration result into the refusal the caller should see.
+    ///
+    /// The refusal wins when the candidate was proven restored; otherwise both
+    /// failures are reported, because a caller cannot retry safely without
+    /// knowing its candidate is no longer the image it built.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refusal_after_restore(refusal: FrankenError, restore: Result<()>) -> FrankenError {
+        match restore {
+            Ok(()) => refusal,
+            Err(restore_error) => FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "database candidate validation failed and exact provisional receipt restoration also failed: validation={refusal}; restore={restore_error}"
+                ),
+            },
         }
     }
 
@@ -13116,6 +13607,15 @@ impl Connection {
         if let Some(detail) = self.post_vacuum_rebind_failure.borrow().as_deref() {
             return Err(FrankenError::Internal(format!(
                 "connection is unusable after a committed VACUUM image could not be rebound: {detail}"
+            )));
+        }
+        if let Some(detail) = self
+            .post_image_publication_rebind_failure
+            .borrow()
+            .as_deref()
+        {
+            return Err(FrankenError::Internal(format!(
+                "connection is unusable after a committed database image could not be rebound: {detail}"
             )));
         }
         if let Some(detail) = self.live_vtab_lifecycle_failure.borrow().as_deref() {
@@ -31780,6 +32280,407 @@ pub struct BoundedDatabaseStructuralStats {
     pub maximum_record_bytes: usize,
 }
 
+/// A pinned, structurally-proven snapshot of an external database image.
+///
+/// Returned by [`Connection::begin_bounded_structural_snapshot`]. While this
+/// guard is alive, one deferred transaction holds the proven snapshot open;
+/// read it through [`Self::connection`].
+///
+/// Finish with [`Self::finish`]. It releases the transaction and then proves
+/// the image never changed during the window — the second half of the
+/// compare-and-swap that makes work derived from this snapshot publishable.
+/// Dropping the guard without calling `finish` releases the reader but performs
+/// no such proof, so anything derived from the snapshot is unverified; the drop
+/// path logs an error rather than failing silently.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct BoundedStructuralSnapshot<'a> {
+    source: &'a Connection,
+    /// `None` only after [`Self::finish`] has taken it.
+    validation: Option<Connection>,
+    stats: BoundedDatabaseStructuralStats,
+    expected: DatabaseImageReceipt,
+    image_path: std::path::PathBuf,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for BoundedStructuralSnapshot<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Connection` is not `Debug`; report the snapshot's identity and proof
+        // instead, which is what a failure message needs anyway.
+        f.debug_struct("BoundedStructuralSnapshot")
+            .field("image_path", &self.image_path)
+            .field("stats", &self.stats)
+            .field("open", &self.validation.is_some())
+            .finish()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl BoundedStructuralSnapshot<'_> {
+    /// The identity-bound, read-only connection holding the proven snapshot.
+    ///
+    /// Every read of the validated image must go through this connection.
+    #[must_use]
+    pub fn connection(&self) -> &Connection {
+        self.validation
+            .as_ref()
+            .expect("snapshot connection is taken only by finish(), which consumes self")
+    }
+
+    /// Structural proof counters for the pinned image.
+    #[must_use]
+    pub const fn stats(&self) -> &BoundedDatabaseStructuralStats {
+        &self.stats
+    }
+
+    /// Release the snapshot and prove the image never changed during it.
+    ///
+    /// Rolls back the pinned transaction, closes the identity-bound handle, and
+    /// re-reads the whole-image receipt. Errors are reported in that order, so a
+    /// validation-window failure is never masked by a teardown failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::BusySnapshot`] if the image changed while the
+    /// snapshot was open, plus any rollback or close error.
+    pub async fn finish(mut self) -> Result<()> {
+        let validation = self
+            .validation
+            .take()
+            .expect("finish() consumes self, so the connection is still present");
+        let rollback_result = validation.rollback_transaction().await;
+        let close_result = validation.close().await;
+        match (rollback_result, close_result) {
+            (Ok(()), Ok(())) => {}
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+            (Err(rollback_error), Err(close_error)) => {
+                tracing::warn!(
+                    error = %close_error,
+                    image = %self.image_path.display(),
+                    "bounded snapshot rollback failed and close also failed"
+                );
+                return Err(rollback_error);
+            }
+        }
+
+        let cx = self.source.op_cx()?;
+        let after = self
+            .source
+            .pager
+            .inspect_self_contained_database_image(&cx, &self.image_path)
+            .await?;
+        if after != self.expected {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages: "bounded structural source receipt changed during validation"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for BoundedStructuralSnapshot<'_> {
+    fn drop(&mut self) {
+        if self.validation.is_some() {
+            // Teardown is async, so the drop path cannot run the closing
+            // receipt check itself. Say so loudly: anything derived from this
+            // snapshot has NOT been proven against an unchanged source.
+            tracing::error!(
+                image = %self.image_path.display(),
+                "bounded structural snapshot dropped without finish(); the closing \
+                 whole-image receipt check did NOT run and any candidate derived from \
+                 this snapshot is unverified"
+            );
+        }
+    }
+}
+
+/// A whole-image publication held open at the last point before commit.
+///
+/// Returned by [`Connection::begin_database_image_publication`]. The candidate
+/// already carries source-derived change-counter provenance and is open
+/// identity-bound and read-only; read it through [`Self::candidate`].
+///
+/// Finish with [`Self::commit`] or [`Self::abandon`]. Dropping the guard does
+/// neither and leaves the candidate carrying provenance it did not earn — it
+/// will fail its own receipt check on any later attempt, which is fail-closed
+/// but not what the caller asked for, so the drop path logs an error.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct PendingDatabaseImagePublication<'a> {
+    source: &'a Connection,
+    /// `None` only after [`Self::commit`] or [`Self::abandon`] has taken it.
+    validation: Option<Connection>,
+    candidate_path: std::path::PathBuf,
+    source_receipt: DatabaseImageReceipt,
+    /// The candidate exactly as the caller handed it in, before repair.
+    provisional: DatabaseImageReceipt,
+    /// The candidate after source-derived counter repair.
+    repaired: DatabaseImageReceipt,
+    expected_change_counter: u32,
+    restore_hydrated_rows: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for PendingDatabaseImagePublication<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingDatabaseImagePublication")
+            .field("candidate_path", &self.candidate_path)
+            .field("expected_change_counter", &self.expected_change_counter)
+            .field("open", &self.validation.is_some())
+            .finish()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PendingDatabaseImagePublication<'_> {
+    /// The identity-bound, read-only handle on the pinned candidate.
+    ///
+    /// Every pre-commit read of the candidate must go through this connection;
+    /// opening the path separately would not be identity-bound.
+    #[must_use]
+    pub fn candidate(&self) -> &Connection {
+        self.validation
+            .as_ref()
+            .expect("the candidate handle is taken only by commit()/abandon(), which consume self")
+    }
+
+    /// Exact receipt of the counter-repaired candidate about to be published.
+    #[must_use]
+    pub const fn candidate_receipt(&self) -> &DatabaseImageReceipt {
+        &self.repaired
+    }
+
+    /// Refuse this publication and restore the candidate's exact provisional
+    /// receipt.
+    ///
+    /// The source database is untouched; it was never written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::DatabaseCorrupt`] when the candidate could not
+    /// be proven restored to its provisional bytes, plus any close error.
+    pub async fn abandon(mut self) -> Result<()> {
+        let validation = self
+            .validation
+            .take()
+            .expect("abandon() consumes self, so the candidate handle is still present");
+        let close_result = validation.close().await;
+        let cx = self.source.op_cx()?;
+        let restore_result = Connection::restore_provisional_candidate(
+            &self.source.pager,
+            &cx,
+            &self.candidate_path,
+            &self.repaired,
+            &self.provisional,
+        )
+        .await;
+        match (restore_result, close_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Err(restore_error), Err(close_error)) => {
+                // Restoration is the caller-visible fact; a close failure on a
+                // handle we were discarding anyway must not mask it.
+                tracing::warn!(
+                    error = %close_error,
+                    image = %self.candidate_path.display(),
+                    "abandoned database candidate restoration failed and close also failed"
+                );
+                Err(restore_error)
+            }
+        }
+    }
+
+    /// Cross the commit point: publish the candidate over the source image.
+    ///
+    /// Re-proves that the candidate did not change while the caller held the
+    /// guard, checks that it still carries source-derived provenance, performs
+    /// the durable swap, and then rebinds this connection onto the new image.
+    /// A pre-commit refusal here restores the candidate exactly as
+    /// [`Self::abandon`] would.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::DatabaseCorrupt`] when the candidate changed
+    /// during the window or lost its provenance, and any propagated publication
+    /// error. A failure to rebind *after* the durable swap is not an error: it
+    /// is reported as
+    /// [`DatabaseImagePublication::CommittedConnectionPoisoned`].
+    pub async fn commit(mut self) -> Result<DatabaseImagePublication> {
+        let validation = self
+            .validation
+            .take()
+            .expect("commit() consumes self, so the candidate handle is still present");
+        let cx = self.source.op_cx()?;
+
+        let precommit = async {
+            validation.close().await?;
+            let validated = self
+                .source
+                .pager
+                .inspect_self_contained_database_image(&cx, &self.candidate_path)
+                .await?;
+            if validated != self.repaired {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "database candidate identity or content changed during semantic validation"
+                        .to_owned(),
+                });
+            }
+            if validated.header().change_counter != self.expected_change_counter
+                || validated.header().version_valid_for != self.expected_change_counter
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "database candidate lost source-derived change-counter provenance: change_counter={}, version_valid_for={}, expected={}",
+                        validated.header().change_counter,
+                        validated.header().version_valid_for,
+                        self.expected_change_counter
+                    ),
+                });
+            }
+            Ok(validated)
+        }
+        .await;
+
+        let validated = match precommit {
+            Ok(validated) => validated,
+            Err(error) => {
+                let restore = Connection::restore_provisional_candidate(
+                    &self.source.pager,
+                    &cx,
+                    &self.candidate_path,
+                    &self.repaired,
+                    &self.provisional,
+                )
+                .await;
+                return Err(Connection::refusal_after_restore(error, restore));
+            }
+        };
+
+        self.source
+            .pager
+            .publish_validated_database_image(
+                &cx,
+                &self.candidate_path,
+                &self.source_receipt,
+                &validated,
+            )
+            .await?;
+
+        #[cfg(test)]
+        if self
+            .source
+            .cancel_image_publication_after_publish_once
+            .replace(false)
+        {
+            cx.cancel();
+        }
+
+        match self
+            .source
+            .rebind_after_committed_image_publication(&cx, self.restore_hydrated_rows)
+            .await
+        {
+            Ok(()) => Ok(DatabaseImagePublication::Rebound {
+                receipt: validated,
+            }),
+            Err(error) => Ok(DatabaseImagePublication::CommittedConnectionPoisoned {
+                receipt: validated,
+                detail: error.to_string(),
+            }),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PendingDatabaseImagePublication<'_> {
+    fn drop(&mut self) {
+        if self.validation.is_some() {
+            // Restoration is async, so the drop path cannot put the caller's
+            // bytes back. Say so: the candidate now carries source-derived
+            // provenance for a publication that never happened.
+            tracing::error!(
+                image = %self.candidate_path.display(),
+                "pending database image publication dropped without commit() or abandon(); the \
+                 candidate retains source-derived change-counter provenance and no longer matches \
+                 its own receipt"
+            );
+        }
+    }
+}
+
+/// Outcome of a whole-database-image publication that crossed its commit point.
+///
+/// Both variants mean the replacement image is durable. They differ only in
+/// whether the publishing connection survived the mandatory post-commit rebind,
+/// which is why publication cannot report success as a bare `()`: a caller that
+/// keeps using a poisoned connection would read stale root-page bindings from
+/// an image that no longer exists.
+///
+/// Precommit refusals, validation failures, races, and rollback-complete faults
+/// are returned as [`Err`](Result::Err) instead, never as a variant here.
+#[derive(Clone)]
+#[must_use = "a publication outcome must be classified before deciding whether retry is safe"]
+#[cfg(not(target_arch = "wasm32"))]
+pub enum DatabaseImagePublication {
+    /// The image committed and this live connection was rebound successfully.
+    Rebound {
+        /// Exact receipt of the counter-repaired, validated candidate bytes.
+        receipt: DatabaseImageReceipt,
+    },
+    /// The image committed, but this live connection could not be rebound and
+    /// has been permanently poisoned against later operations.
+    CommittedConnectionPoisoned {
+        /// Exact receipt of the committed candidate bytes.
+        receipt: DatabaseImageReceipt,
+        /// Diagnostic detail from the failed mandatory rebind.
+        detail: String,
+    },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for DatabaseImagePublication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `DatabaseImageReceipt` is deliberately not `Debug` (it carries a full
+        // image digest), so report the decision a caller has to make instead.
+        match self {
+            Self::Rebound { .. } => f.write_str("DatabaseImagePublication::Rebound"),
+            Self::CommittedConnectionPoisoned { detail, .. } => f
+                .debug_struct("DatabaseImagePublication::CommittedConnectionPoisoned")
+                .field("detail", detail)
+                .finish(),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DatabaseImagePublication {
+    /// Exact receipt of the image that crossed the durable commit point.
+    #[must_use]
+    pub const fn receipt(&self) -> &DatabaseImageReceipt {
+        match self {
+            Self::Rebound { receipt } | Self::CommittedConnectionPoisoned { receipt, .. } => {
+                receipt
+            }
+        }
+    }
+
+    /// Whether the publishing connection is usable for subsequent operations.
+    #[must_use]
+    pub const fn connection_is_usable(&self) -> bool {
+        matches!(self, Self::Rebound { .. })
+    }
+
+    /// Rebind-failure detail when the committed connection was poisoned.
+    #[must_use]
+    pub fn poison_detail(&self) -> Option<&str> {
+        match self {
+            Self::Rebound { .. } => None,
+            Self::CommittedConnectionPoisoned { detail, .. } => Some(detail),
+        }
+    }
+}
+
 /// Where a page-ownership walk records the pages it claims.
 ///
 /// Both variants enforce the same invariant — every database page is owned by
@@ -49935,6 +50836,54 @@ impl Connection {
             *self.post_vacuum_rebind_failure.borrow_mut() = Some(detail.clone());
             return Err(FrankenError::Internal(format!(
                 "VACUUM committed successfully, but the live connection could not be rebound and has been poisoned: {detail}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Rebind every connection-local cache and schema mapping after a new
+    /// whole-database image is already durable.
+    ///
+    /// Same masked, non-optional discipline as
+    /// [`Self::rebind_after_committed_vacuum`], with one difference that
+    /// matters: a published replacement may legitimately carry the same schema
+    /// cookie as the source while naming entirely different `sqlite_master`
+    /// objects, so the cookie-equality fast path is unsafe here. Every
+    /// schema/root-page binding is rebuilt from the committed image.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn rebind_after_committed_image_publication(
+        &self,
+        parent_cx: &Cx,
+        restore_hydrated_rows: bool,
+    ) -> Result<()> {
+        let rebind_cx = parent_cx.create_child();
+        let _rebind_mask = rebind_cx.masked();
+        self.clear_compilation_reuse_caches();
+        self.invalidate_cached_read_snapshot(&rebind_cx).await;
+        self.invalidate_cached_write_txn(&rebind_cx).await;
+
+        #[cfg(test)]
+        let rebind_result = if self.fail_image_publication_rebind_once.replace(false) {
+            Err(FrankenError::Internal(
+                "injected post-publication database-image rebind failure".to_owned(),
+            ))
+        } else {
+            self.force_full_schema_reload_once.set(true);
+            self.reload_memdb_from_pager_with_mode(&rebind_cx, restore_hydrated_rows)
+                .await
+        };
+        #[cfg(not(test))]
+        let rebind_result = {
+            self.force_full_schema_reload_once.set(true);
+            self.reload_memdb_from_pager_with_mode(&rebind_cx, restore_hydrated_rows)
+                .await
+        };
+
+        if let Err(error) = rebind_result {
+            let detail = error.to_string();
+            *self.post_image_publication_rebind_failure.borrow_mut() = Some(detail.clone());
+            return Err(FrankenError::Internal(format!(
+                "database image committed successfully, but the live connection could not be rebound and has been poisoned: {detail}"
             )));
         }
         Ok(())
@@ -223054,6 +224003,393 @@ mod pager_routing_tests {
             assert!(
                 residue.is_empty(),
                 "bounded validation must not leave spool files behind, found {residue:?}"
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn seed_bounded_snapshot_db(path: &str) -> Connection {
+        let conn = Connection::open(path).await.expect("file-backed open");
+        conn.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+            .await
+            .unwrap();
+        for id in 1..=32_i64 {
+            conn.execute(&format!("INSERT INTO t VALUES ({id}, 'row {id}');"))
+                .await
+                .unwrap();
+        }
+        conn
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_snapshot_proves_then_recertifies_an_unchanged_image() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bounded-snapshot.db");
+            let conn = seed_bounded_snapshot_db(&db_path.to_string_lossy()).await;
+
+            let receipt = conn
+                .capture_database_image_receipt()
+                .await
+                .expect("capture a receipt for the quiesced image");
+            let snapshot = conn
+                .begin_bounded_structural_snapshot(&receipt, &db_path, 64)
+                .await
+                .expect("a healthy image matching its receipt must open a snapshot");
+
+            assert_eq!(
+                snapshot.stats().ownership_spool_bytes,
+                u64::from(snapshot.stats().database_pages),
+                "the proof must be one ownership byte per page"
+            );
+
+            // Reads must come from the pinned, proven snapshot itself.
+            let rows = snapshot
+                .connection()
+                .query("SELECT COUNT(*) FROM t;")
+                .await
+                .expect("the pinned snapshot connection must be readable");
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(32));
+
+            snapshot
+                .finish()
+                .await
+                .expect("an unchanged image must pass the closing receipt check");
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_snapshot_refuses_an_image_that_changed_before_the_window() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bounded-snapshot-stale.db");
+            let conn = seed_bounded_snapshot_db(&db_path.to_string_lossy()).await;
+
+            let receipt = conn.capture_database_image_receipt().await.unwrap();
+            conn.execute("INSERT INTO t VALUES (999, 'written after capture');")
+                .await
+                .unwrap();
+
+            let error = conn
+                .begin_bounded_structural_snapshot(&receipt, &db_path, 64)
+                .await
+                .expect_err("a receipt older than the image must not open a snapshot");
+            assert!(
+                matches!(error, FrankenError::BusySnapshot { .. }),
+                "expected a typed BusySnapshot refusal, got {error:?}"
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_snapshot_finish_catches_an_image_changed_during_the_window() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bounded-snapshot-torn.db");
+            let conn = seed_bounded_snapshot_db(&db_path.to_string_lossy()).await;
+
+            let receipt = conn.capture_database_image_receipt().await.unwrap();
+            let page_size = usize::try_from(receipt.header().page_size.get()).unwrap();
+            let snapshot = conn
+                .begin_bounded_structural_snapshot(&receipt, &db_path, 64)
+                .await
+                .expect("snapshot opens against a matching receipt");
+
+            // Mutate the image out from under the open snapshot, bypassing the
+            // engine entirely: one content byte inside page 2, so the file stays
+            // the same length and page count and only the digest moves.
+            {
+                use std::io::{Seek, SeekFrom, Write};
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&db_path)
+                    .expect("open image for out-of-band mutation");
+                file.seek(SeekFrom::Start(u64::try_from(page_size + 96).unwrap()))
+                    .unwrap();
+                file.write_all(&[0x5a]).unwrap();
+                file.sync_all().unwrap();
+            }
+
+            let error = snapshot
+                .finish()
+                .await
+                .expect_err("a source changed during the window must not recertify");
+            assert!(
+                matches!(error, FrankenError::BusySnapshot { .. }),
+                "expected a typed BusySnapshot refusal, got {error:?}"
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_snapshot_refuses_a_zero_page_limit_and_a_memory_source() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bounded-snapshot-limits.db");
+            let conn = seed_bounded_snapshot_db(&db_path.to_string_lossy()).await;
+            let receipt = conn.capture_database_image_receipt().await.unwrap();
+
+            let zero_limit = conn
+                .begin_bounded_structural_snapshot(&receipt, &db_path, 0)
+                .await
+                .expect_err("a zero page limit is not a bound");
+            assert!(
+                matches!(zero_limit, FrankenError::OutOfRange { .. }),
+                "expected OutOfRange, got {zero_limit:?}"
+            );
+
+            let memory = Connection::open(":memory:").await.unwrap();
+            let unsupported = memory
+                .begin_bounded_structural_snapshot(&receipt, &db_path, 64)
+                .await
+                .expect_err("a memory-backed source has no durable image to bind");
+            assert!(
+                matches!(unsupported, FrankenError::Unsupported),
+                "expected Unsupported, got {unsupported:?}"
+            );
+        });
+    }
+
+    /// Build a standalone replacement image with a different schema and rows,
+    /// then hand back its exact receipt with no handle left open on it.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn seed_publication_candidate(path: &str) -> DatabaseImageReceipt {
+        let conn = Connection::open(path).await.expect("file-backed open");
+        conn.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
+        conn.execute("CREATE TABLE replacement (id INTEGER PRIMARY KEY, label TEXT);")
+            .await
+            .unwrap();
+        for id in [10_i64, 20] {
+            conn.execute(&format!(
+                "INSERT INTO replacement VALUES ({id}, 'replacement {id}');"
+            ))
+            .await
+            .unwrap();
+        }
+        let receipt = conn
+            .capture_database_image_receipt()
+            .await
+            .expect("capture the candidate receipt");
+        conn.close().await.expect("close the candidate builder");
+        receipt
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn publication_swaps_a_validated_candidate_and_rebinds_the_source() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("publish-source.db");
+            let candidate_path = dir.path().join("publish-candidate.db");
+            let source = seed_bounded_snapshot_db(&source_path.to_string_lossy()).await;
+            let candidate_receipt =
+                seed_publication_candidate(&candidate_path.to_string_lossy()).await;
+            let source_receipt = source.capture_database_image_receipt().await.unwrap();
+            let expected_counter = source_receipt
+                .header()
+                .change_counter
+                .wrapping_add(1)
+                .max(1);
+
+            let validator_saw_replacement = std::cell::Cell::new(false);
+            let publication = source
+                .publish_database_image_from_receipt(
+                    &source_receipt,
+                    &candidate_receipt,
+                    &candidate_path,
+                    async |candidate: &Connection| {
+                        let rows = candidate
+                            .query("SELECT id FROM replacement ORDER BY id;")
+                            .await?;
+                        validator_saw_replacement.set(
+                            rows.len() == 2
+                                && *rows[0].get(0).unwrap() == SqliteValue::Integer(10)
+                                && *rows[1].get(0).unwrap() == SqliteValue::Integer(20),
+                        );
+                        Ok(())
+                    },
+                )
+                .await
+                .expect("an exact receipted candidate must publish");
+
+            assert!(
+                validator_saw_replacement.get(),
+                "the validator must read the candidate, not the source"
+            );
+            assert!(
+                matches!(&publication, DatabaseImagePublication::Rebound { .. }),
+                "a successful publication must leave the connection usable, got {publication:?}"
+            );
+            assert!(publication.connection_is_usable());
+            assert!(publication.poison_detail().is_none());
+            assert_eq!(
+                publication.receipt().identity(),
+                candidate_receipt.identity(),
+                "the published image must be the candidate's file identity"
+            );
+            assert_eq!(
+                publication.receipt().header().change_counter,
+                expected_counter,
+                "publication must install source-derived change-counter provenance"
+            );
+            assert_eq!(
+                publication.receipt().header().version_valid_for,
+                expected_counter
+            );
+
+            // The rebind is the point: the live connection must read the new
+            // image's schema, not the one it was opened on.
+            let rows = source
+                .query("SELECT id FROM replacement ORDER BY id;")
+                .await
+                .expect("the rebound source must see the published schema");
+            assert_eq!(rows.len(), 2);
+            assert!(
+                source.query("SELECT COUNT(*) FROM t;").await.is_err(),
+                "the source's old table must be gone after publication"
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn publication_refusal_restores_the_candidate_to_its_provisional_bytes() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("refuse-source.db");
+            let candidate_path = dir.path().join("refuse-candidate.db");
+            let source = seed_bounded_snapshot_db(&source_path.to_string_lossy()).await;
+            let candidate_receipt =
+                seed_publication_candidate(&candidate_path.to_string_lossy()).await;
+            let source_receipt = source.capture_database_image_receipt().await.unwrap();
+
+            let before = std::fs::read(&candidate_path).unwrap();
+            let source_bytes_before = std::fs::read(&source_path).unwrap();
+
+            let error = source
+                .publish_database_image_from_receipt(
+                    &source_receipt,
+                    &candidate_receipt,
+                    &candidate_path,
+                    async |_: &Connection| {
+                        Err(FrankenError::DatabaseCorrupt {
+                            detail: "application refused the candidate".to_owned(),
+                        })
+                    },
+                )
+                .await
+                .expect_err("a refused candidate must not publish");
+            assert!(
+                matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail
+                    .contains("application refused the candidate")),
+                "the caller's refusal must survive restoration, got {error:?}"
+            );
+
+            assert_eq!(
+                std::fs::read(&candidate_path).unwrap(),
+                before,
+                "a refused candidate must be byte-identical to what the caller handed in"
+            );
+            assert_eq!(
+                std::fs::read(&source_path).unwrap(),
+                source_bytes_before,
+                "a refused publication must not touch the source image"
+            );
+            let rows = source.query("SELECT COUNT(*) FROM t;").await.unwrap();
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(32));
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn publication_refuses_a_stale_source_receipt_and_a_self_candidate() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("stale-source.db");
+            let candidate_path = dir.path().join("stale-candidate.db");
+            let source = seed_bounded_snapshot_db(&source_path.to_string_lossy()).await;
+            let candidate_receipt =
+                seed_publication_candidate(&candidate_path.to_string_lossy()).await;
+            let source_receipt = source.capture_database_image_receipt().await.unwrap();
+
+            // Naming the source as its own candidate would publish an image
+            // over itself; it must be refused before anything is written.
+            let self_publication = source
+                .begin_database_image_publication(
+                    &source_receipt,
+                    &source_receipt,
+                    &source_path,
+                )
+                .await
+                .expect_err("the source is never a valid candidate for itself");
+            assert!(
+                matches!(self_publication, FrankenError::CannotOpen { .. }),
+                "expected CannotOpen, got {self_publication:?}"
+            );
+
+            source
+                .execute("INSERT INTO t VALUES (999, 'written after capture');")
+                .await
+                .unwrap();
+            let stale = source
+                .begin_database_image_publication(
+                    &source_receipt,
+                    &candidate_receipt,
+                    &candidate_path,
+                )
+                .await
+                .expect_err("a source receipt older than the source must not publish");
+            assert!(
+                matches!(stale, FrankenError::BusySnapshot { .. }),
+                "expected BusySnapshot, got {stale:?}"
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn publication_refuses_a_candidate_that_changed_after_its_receipt() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("drift-source.db");
+            let candidate_path = dir.path().join("drift-candidate.db");
+            let source = seed_bounded_snapshot_db(&source_path.to_string_lossy()).await;
+            let candidate_receipt =
+                seed_publication_candidate(&candidate_path.to_string_lossy()).await;
+            let source_receipt = source.capture_database_image_receipt().await.unwrap();
+
+            // One content byte inside page 2, out of band: same length, same
+            // page count, only the digest moves.
+            {
+                use std::io::{Seek, SeekFrom, Write};
+                let page_size =
+                    usize::try_from(candidate_receipt.header().page_size.get()).unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&candidate_path)
+                    .expect("open candidate for out-of-band mutation");
+                file.seek(SeekFrom::Start(u64::try_from(page_size + 96).unwrap()))
+                    .unwrap();
+                file.write_all(&[0x5a]).unwrap();
+                file.sync_all().unwrap();
+            }
+
+            let error = source
+                .begin_database_image_publication(
+                    &source_receipt,
+                    &candidate_receipt,
+                    &candidate_path,
+                )
+                .await
+                .expect_err("a candidate that drifted from its receipt must not publish");
+            assert!(
+                matches!(error, FrankenError::BusySnapshot { .. }),
+                "expected BusySnapshot, got {error:?}"
             );
         });
     }
