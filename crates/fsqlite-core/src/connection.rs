@@ -13096,6 +13096,68 @@ impl Connection {
         self.pager.capture_vacuum_source_image(&cx).await
     }
 
+    /// Receipt an image at `image_path` **without opening a connection on it**.
+    ///
+    /// [`Self::capture_database_image_receipt`] receipts the image this
+    /// connection is already open on. That is the wrong tool for a candidate a
+    /// caller has just built and intends to publish: receipting it would mean
+    /// opening a handle on the very file whose byte-for-byte stillness is the
+    /// thing being certified. This reads it through the pager instead, so the
+    /// candidate keeps exactly one writer — the process that built it — and
+    /// acquires no companion files from a bookkeeping open.
+    ///
+    /// The image must be self-contained: no `-wal`, `-shm`, or `-journal`
+    /// sibling. That is the same admission rule the publication and bounded
+    /// snapshot surfaces apply, so a receipt obtained here is a receipt those
+    /// surfaces will accept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::Unsupported`] for a memory-backed connection,
+    /// [`FrankenError::DatabaseCorrupt`] when `image_path` carries a companion
+    /// file, and any propagated pager error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn inspect_self_contained_image_receipt(
+        &self,
+        image_path: impl AsRef<Path>,
+    ) -> Result<DatabaseImageReceipt> {
+        if !self.pager.is_file_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+        let cx = self.op_cx()?;
+        self.pager
+            .inspect_self_contained_database_image(&cx, image_path.as_ref())
+            .await
+    }
+
+    /// Receipt an image at `image_path` without requiring it to be
+    /// self-contained.
+    ///
+    /// Use this to observe an image that may still carry companions — for
+    /// diagnostics, or to compare an image before and after an operation. The
+    /// publication and bounded-snapshot surfaces will not accept a receipt for
+    /// an image they would themselves refuse, so prefer
+    /// [`Self::inspect_self_contained_image_receipt`] when the goal is to
+    /// publish or validate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::Unsupported`] for a memory-backed connection and
+    /// any propagated pager error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn inspect_image_receipt(
+        &self,
+        image_path: impl AsRef<Path>,
+    ) -> Result<DatabaseImageReceipt> {
+        if !self.pager.is_file_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+        let cx = self.op_cx()?;
+        self.pager
+            .inspect_database_image(&cx, image_path.as_ref())
+            .await
+    }
+
     async fn current_database_header(&self, cx: &Cx) -> Result<DatabaseHeader> {
         let mut txn = self
             .begin_pager_txn_with_busy_timeout(&self.pager, cx, TransactionMode::ReadOnly, false)
@@ -224106,19 +224168,152 @@ mod pager_routing_tests {
         });
     }
 
+    /// Build a self-contained image at `image_path` and return its receipt,
+    /// leaving no handle open on it.
+    ///
+    /// The image is produced with `VACUUM INTO` rather than by writing the file
+    /// in place, and that is load-bearing rather than stylistic. A brand-new
+    /// file database boots into WAL (`bootstrap_journal_mode_from_storage`
+    /// takes the `storage_was_empty` arm), and neither
+    /// `PRAGMA journal_mode=DELETE` nor `close()` removes the `-wal` sibling
+    /// that open created — `set_journal_mode` rewrites the header version
+    /// bytes and nothing else. Any image built in place therefore keeps a
+    /// companion forever and is permanently refused by
+    /// `inspect_self_contained_database_image`, which gates both halves of the
+    /// whole-image API. `VACUUM INTO` is the supported way to produce a
+    /// publishable candidate, so it is what a real caller would reach for.
+    ///
+    /// The assertion below samples the companion after each step because the
+    /// first corrected run showed one present even for a `VACUUM INTO` image,
+    /// and which operation creates it decides whether a self-contained image is
+    /// producible at all through the public API.
     #[cfg(not(target_arch = "wasm32"))]
-    async fn seed_bounded_snapshot_db(path: &str) -> Connection {
-        let conn = Connection::open(path).await.expect("file-backed open");
-        conn.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+    async fn build_self_contained_image(
+        builder_path: &Path,
+        image_path: &Path,
+        schema_sql: &[&str],
+    ) -> DatabaseImageReceipt {
+        let builder = Connection::open(builder_path.to_string_lossy().into_owned())
             .await
-            .unwrap();
-        for id in 1..=32_i64 {
-            conn.execute(&format!("INSERT INTO t VALUES ({id}, 'row {id}');"))
-                .await
-                .unwrap();
+            .expect("file-backed builder open");
+        for sql in schema_sql {
+            builder.execute(sql).await.expect("seed the builder image");
         }
-        conn
+        builder
+            .execute(&format!(
+                "VACUUM INTO '{}';",
+                image_path.to_string_lossy().replace('\'', "''")
+            ))
+            .await
+            .expect("VACUUM INTO must write a self-contained image");
+        // Sample the companion at every step so a failure names the exact
+        // operation that created it, rather than only that one exists.
+        let wal_companion =
+            std::path::PathBuf::from(format!("{}-wal", image_path.to_string_lossy()));
+        let after_vacuum = wal_companion.exists();
+
+        // Receipt the image through the builder's pager rather than by opening
+        // a connection on the image. Opening it would be both a suspect in this
+        // very diagnostic and, more importantly, the wrong thing for a real
+        // caller to do to a candidate it is about to publish.
+        let receipt = builder
+            .inspect_self_contained_image_receipt(image_path)
+            .await
+            .expect("receipt the built image without opening it");
+        let after_receipt = wal_companion.exists();
+
+        builder.close().await.expect("close the builder");
+        let after_builder_close = wal_companion.exists();
+
+        assert!(
+            !after_vacuum && !after_receipt && !after_builder_close,
+            "a self-contained image must never carry a WAL companion ({}); presence after \
+             VACUUM INTO={after_vacuum}, after receipt={after_receipt}, after builder \
+             close={after_builder_close}",
+            wal_companion.display()
+        );
+        receipt
+    }
+
+    /// The 32-row source schema shared by the snapshot tests.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn bounded_snapshot_seed_sql() -> Vec<String> {
+        let mut sql = vec!["CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);".to_owned()];
+        for id in 1..=32_i64 {
+            sql.push(format!("INSERT INTO t VALUES ({id}, 'row {id}');"));
+        }
+        sql
+    }
+
+    /// Build a self-contained image and return an owner connection on a
+    /// *separate* database, that image's receipt, and its path.
+    ///
+    /// The owner is deliberately not opened on the image. The bounded snapshot
+    /// certifies an **external** image, and the caller's own connection is only
+    /// the thing driving that certification; opening the image would put a
+    /// second handle on the exact file whose byte-for-byte stillness is being
+    /// proven, which is what the receipt CAS exists to detect.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn seed_bounded_snapshot_db(
+        dir: &Path,
+        stem: &str,
+    ) -> (Connection, DatabaseImageReceipt, std::path::PathBuf) {
+        let builder_path = dir.join(format!("{stem}-builder.db"));
+        let image_path = dir.join(format!("{stem}.db"));
+        let owned = bounded_snapshot_seed_sql();
+        let sql: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let receipt = build_self_contained_image(&builder_path, &image_path, &sql).await;
+        let owner = Connection::open(
+            dir.join(format!("{stem}-owner.db"))
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .expect("open the owner connection");
+        (owner, receipt, image_path)
+    }
+
+    /// Open a live source connection on its own database and receipt it.
+    ///
+    /// Unlike the candidate, the source is receipted with
+    /// `capture_database_image_receipt` on its own connection — that is the
+    /// intended API for "the image I am currently open on", and it checkpoints
+    /// WAL first. The self-contained admission rule applies to the candidate
+    /// being published, not to the source being replaced.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn seed_publication_source(
+        dir: &Path,
+        stem: &str,
+    ) -> (Connection, DatabaseImageReceipt, std::path::PathBuf) {
+        let source_path = dir.join(format!("{stem}.db"));
+        let source = Connection::open(source_path.to_string_lossy().into_owned())
+            .await
+            .expect("open the publication source");
+        for sql in bounded_snapshot_seed_sql() {
+            source.execute(&sql).await.expect("seed the source");
+        }
+        let receipt = source
+            .capture_database_image_receipt()
+            .await
+            .expect("receipt the source image");
+        (source, receipt, source_path)
+    }
+
+    /// Flip one content byte inside page 2 of an image, bypassing the engine.
+    ///
+    /// The file keeps its length and page count, so only the receipt digest
+    /// moves — which is precisely what the CAS must catch.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn corrupt_one_content_byte(image_path: &Path, page_size: usize) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(image_path)
+            .expect("open image for out-of-band mutation");
+        file.seek(SeekFrom::Start(u64::try_from(page_size + 96).unwrap()))
+            .unwrap();
+        file.write_all(&[0x5a]).unwrap();
+        file.sync_all().unwrap();
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -224126,13 +224321,8 @@ mod pager_routing_tests {
     fn bounded_snapshot_proves_then_recertifies_an_unchanged_image() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("bounded-snapshot.db");
-            let conn = seed_bounded_snapshot_db(&db_path.to_string_lossy()).await;
-
-            let receipt = conn
-                .capture_database_image_receipt()
-                .await
-                .expect("capture a receipt for the quiesced image");
+            let (conn, receipt, db_path) =
+                seed_bounded_snapshot_db(dir.path(), "bounded-snapshot").await;
             let snapshot = conn
                 .begin_bounded_structural_snapshot(&receipt, &db_path, 64)
                 .await
@@ -224164,13 +224354,17 @@ mod pager_routing_tests {
     fn bounded_snapshot_refuses_an_image_that_changed_before_the_window() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("bounded-snapshot-stale.db");
-            let conn = seed_bounded_snapshot_db(&db_path.to_string_lossy()).await;
+            let (conn, receipt, db_path) =
+                seed_bounded_snapshot_db(dir.path(), "bounded-snapshot-stale").await;
 
-            let receipt = conn.capture_database_image_receipt().await.unwrap();
-            conn.execute("INSERT INTO t VALUES (999, 'written after capture');")
-                .await
-                .unwrap();
+            // Move the image after its receipt was taken, before any window
+            // opens. The owner connection is not on this file, so the change
+            // has to come from outside the engine — which is also the threat
+            // the receipt CAS is defending against.
+            corrupt_one_content_byte(
+                &db_path,
+                usize::try_from(receipt.header().page_size.get()).unwrap(),
+            );
 
             let error = conn
                 .begin_bounded_structural_snapshot(&receipt, &db_path, 64)
@@ -224188,30 +224382,16 @@ mod pager_routing_tests {
     fn bounded_snapshot_finish_catches_an_image_changed_during_the_window() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("bounded-snapshot-torn.db");
-            let conn = seed_bounded_snapshot_db(&db_path.to_string_lossy()).await;
-
-            let receipt = conn.capture_database_image_receipt().await.unwrap();
+            let (conn, receipt, db_path) =
+                seed_bounded_snapshot_db(dir.path(), "bounded-snapshot-torn").await;
             let page_size = usize::try_from(receipt.header().page_size.get()).unwrap();
             let snapshot = conn
                 .begin_bounded_structural_snapshot(&receipt, &db_path, 64)
                 .await
                 .expect("snapshot opens against a matching receipt");
 
-            // Mutate the image out from under the open snapshot, bypassing the
-            // engine entirely: one content byte inside page 2, so the file stays
-            // the same length and page count and only the digest moves.
-            {
-                use std::io::{Seek, SeekFrom, Write};
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&db_path)
-                    .expect("open image for out-of-band mutation");
-                file.seek(SeekFrom::Start(u64::try_from(page_size + 96).unwrap()))
-                    .unwrap();
-                file.write_all(&[0x5a]).unwrap();
-                file.sync_all().unwrap();
-            }
+            // Mutate the image out from under the open snapshot.
+            corrupt_one_content_byte(&db_path, page_size);
 
             let error = snapshot
                 .finish()
@@ -224229,9 +224409,8 @@ mod pager_routing_tests {
     fn bounded_snapshot_refuses_a_zero_page_limit_and_a_memory_source() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("bounded-snapshot-limits.db");
-            let conn = seed_bounded_snapshot_db(&db_path.to_string_lossy()).await;
-            let receipt = conn.capture_database_image_receipt().await.unwrap();
+            let (conn, receipt, db_path) =
+                seed_bounded_snapshot_db(dir.path(), "bounded-snapshot-limits").await;
 
             let zero_limit = conn
                 .begin_bounded_structural_snapshot(&receipt, &db_path, 0)
@@ -224257,25 +224436,17 @@ mod pager_routing_tests {
     /// Build a standalone replacement image with a different schema and rows,
     /// then hand back its exact receipt with no handle left open on it.
     #[cfg(not(target_arch = "wasm32"))]
-    async fn seed_publication_candidate(path: &str) -> DatabaseImageReceipt {
-        let conn = Connection::open(path).await.expect("file-backed open");
-        conn.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
-        conn.execute("CREATE TABLE replacement (id INTEGER PRIMARY KEY, label TEXT);")
-            .await
-            .unwrap();
-        for id in [10_i64, 20] {
-            conn.execute(&format!(
-                "INSERT INTO replacement VALUES ({id}, 'replacement {id}');"
-            ))
-            .await
-            .unwrap();
-        }
-        let receipt = conn
-            .capture_database_image_receipt()
-            .await
-            .expect("capture the candidate receipt");
-        conn.close().await.expect("close the candidate builder");
-        receipt
+    async fn seed_publication_candidate(dir: &Path, stem: &str) -> DatabaseImageReceipt {
+        build_self_contained_image(
+            &dir.join(format!("{stem}-builder.db")),
+            &dir.join(format!("{stem}.db")),
+            &[
+                "CREATE TABLE replacement (id INTEGER PRIMARY KEY, label TEXT);",
+                "INSERT INTO replacement VALUES (10, 'replacement 10');",
+                "INSERT INTO replacement VALUES (20, 'replacement 20');",
+            ],
+        )
+        .await
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -224283,12 +224454,11 @@ mod pager_routing_tests {
     fn publication_swaps_a_validated_candidate_and_rebinds_the_source() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let source_path = dir.path().join("publish-source.db");
-            let candidate_path = dir.path().join("publish-candidate.db");
-            let source = seed_bounded_snapshot_db(&source_path.to_string_lossy()).await;
+            let (source, source_receipt, _source_path) =
+                seed_publication_source(dir.path(), "publish-source").await;
             let candidate_receipt =
-                seed_publication_candidate(&candidate_path.to_string_lossy()).await;
-            let source_receipt = source.capture_database_image_receipt().await.unwrap();
+                seed_publication_candidate(dir.path(), "publish-candidate").await;
+            let candidate_path = dir.path().join("publish-candidate.db");
             let expected_counter = source_receipt
                 .header()
                 .change_counter
@@ -224360,12 +224530,11 @@ mod pager_routing_tests {
     fn publication_refusal_restores_the_candidate_to_its_provisional_bytes() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let source_path = dir.path().join("refuse-source.db");
-            let candidate_path = dir.path().join("refuse-candidate.db");
-            let source = seed_bounded_snapshot_db(&source_path.to_string_lossy()).await;
+            let (source, source_receipt, source_path) =
+                seed_publication_source(dir.path(), "refuse-source").await;
             let candidate_receipt =
-                seed_publication_candidate(&candidate_path.to_string_lossy()).await;
-            let source_receipt = source.capture_database_image_receipt().await.unwrap();
+                seed_publication_candidate(dir.path(), "refuse-candidate").await;
+            let candidate_path = dir.path().join("refuse-candidate.db");
 
             let before = std::fs::read(&candidate_path).unwrap();
             let source_bytes_before = std::fs::read(&source_path).unwrap();
@@ -224409,12 +224578,11 @@ mod pager_routing_tests {
     fn publication_refuses_a_stale_source_receipt_and_a_self_candidate() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let source_path = dir.path().join("stale-source.db");
-            let candidate_path = dir.path().join("stale-candidate.db");
-            let source = seed_bounded_snapshot_db(&source_path.to_string_lossy()).await;
+            let (source, source_receipt, source_path) =
+                seed_publication_source(dir.path(), "stale-source").await;
             let candidate_receipt =
-                seed_publication_candidate(&candidate_path.to_string_lossy()).await;
-            let source_receipt = source.capture_database_image_receipt().await.unwrap();
+                seed_publication_candidate(dir.path(), "stale-candidate").await;
+            let candidate_path = dir.path().join("stale-candidate.db");
 
             // Naming the source as its own candidate would publish an image
             // over itself; it must be refused before anything is written.
@@ -224455,28 +224623,16 @@ mod pager_routing_tests {
     fn publication_refuses_a_candidate_that_changed_after_its_receipt() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let source_path = dir.path().join("drift-source.db");
-            let candidate_path = dir.path().join("drift-candidate.db");
-            let source = seed_bounded_snapshot_db(&source_path.to_string_lossy()).await;
+            let (source, source_receipt, _source_path) =
+                seed_publication_source(dir.path(), "drift-source").await;
             let candidate_receipt =
-                seed_publication_candidate(&candidate_path.to_string_lossy()).await;
-            let source_receipt = source.capture_database_image_receipt().await.unwrap();
+                seed_publication_candidate(dir.path(), "drift-candidate").await;
+            let candidate_path = dir.path().join("drift-candidate.db");
 
-            // One content byte inside page 2, out of band: same length, same
-            // page count, only the digest moves.
-            {
-                use std::io::{Seek, SeekFrom, Write};
-                let page_size =
-                    usize::try_from(candidate_receipt.header().page_size.get()).unwrap();
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&candidate_path)
-                    .expect("open candidate for out-of-band mutation");
-                file.seek(SeekFrom::Start(u64::try_from(page_size + 96).unwrap()))
-                    .unwrap();
-                file.write_all(&[0x5a]).unwrap();
-                file.sync_all().unwrap();
-            }
+            corrupt_one_content_byte(
+                &candidate_path,
+                usize::try_from(candidate_receipt.header().page_size.get()).unwrap(),
+            );
 
             let error = source
                 .begin_database_image_publication(
