@@ -11064,29 +11064,37 @@ mod tests {
         assert!((snap.hit_rate_percent() - 80.0).abs() < 0.01);
     }
 
-    /// Drive residency up and prove the peak records the excursion after the
-    /// cache has already shrunk back below it.
+    /// Drive residency past a bound and prove the peak records the excursion
+    /// after the cache has already shrunk back below it.
     ///
-    /// This is the whole point of a high-water counter: an instantaneous gauge
-    /// read at the end would report the low value and a certifier would
-    /// conclude the bound was respected without ever having measured it.
+    /// This is the acceptance evidence for the high-water counters, and it is
+    /// deliberately run in single-connection mode with NO intermediate
+    /// snapshot: nothing samples residency between the climb and the fall, so
+    /// the recorded peak can only have come from the per-admission hook. A
+    /// counter that is merely sampled at a convenient moment would report
+    /// whatever the caller happened to look at, which is not evidence.
     #[test]
     fn peak_records_an_excursion_that_instantaneous_gauges_miss() {
         let page_size = PageSize::new(512).unwrap();
-        let cache = ShardedPageCache::with_max_buffers(page_size, 64);
+        let mut cache = ShardedPageCache::with_max_buffers(page_size, 64);
+        cache.enable_fast_path();
+        // Entering fast-path mode degrades exactness because the history before
+        // it was only sampled; a reset starts a window here, and from here every
+        // admission is observed under the admission lock.
+        cache.reset_peak_residency();
+        assert!(
+            cache.peak_snapshot().exact,
+            "a reset window in single-connection mode must be exact"
+        );
 
-        // Climb to 40 resident pages.
+        // Climb to 40 resident pages. Nothing observes residency in this loop
+        // except the admission path itself.
         for pgno in 1..=40_u32 {
             let page = PageNumber::new(pgno).unwrap();
             cache.insert_buffer_with_post_install(page, cache.pool.acquire().unwrap(), || {});
         }
-        let after_climb = cache.peak_snapshot();
-        assert!(
-            after_climb.peak_cached_pages >= 40,
-            "peak must have recorded the climb, got {after_climb:?}"
-        );
 
-        // Fall back down to a handful of pages.
+        // Fall back to a handful of pages.
         for pgno in 6..=40_u32 {
             cache.evict(PageNumber::new(pgno).unwrap());
         }
@@ -11102,31 +11110,57 @@ mod tests {
             live.cached_pages <= 5,
             "instantaneous gauge should show the low residency, got {live:?}"
         );
-        // ...while the peak still reports the excursion.
+        // ...while the peak reports the excursion that gauge can never show.
         let peak = cache.peak_snapshot();
-        assert!(
-            peak.peak_cached_pages >= 40,
-            "peak must survive the fall, got {peak:?}"
+        assert_eq!(
+            peak.peak_cached_pages, 40,
+            "the peak must be the true maximum reached, got {peak:?}"
         );
         assert!(
             peak.exact,
-            "a single-connection cache must report an exact peak, got {peak:?}"
+            "single-connection mode after a reset must be exact, got {peak:?}"
         );
 
-        // And it answers the question a certifier actually asks.
+        // And it answers the question a bounded-operation certifier asks.
         assert_eq!(
             peak.proves_ceiling_never_approached(64),
             Some(true),
-            "40 pages is within a 64-page ceiling"
+            "40 pages stayed within a 64-page ceiling"
         );
         assert_eq!(
             peak.proves_ceiling_never_approached(8),
             Some(false),
-            "40 pages breached an 8-page ceiling, and the peak must say so"
+            "40 pages breached an 8-page ceiling and the peak must say so"
+        );
+        assert_eq!(peak.peak_resident_bytes(), 40 * 512);
+    }
+
+    /// In sharded mode the peak is only a sampled lower bound, and the type
+    /// refuses to answer the ceiling question rather than answering it wrongly.
+    #[test]
+    fn sampled_peak_refuses_to_certify_a_ceiling() {
+        let page_size = PageSize::new(512).unwrap();
+        let cache = ShardedPageCache::with_max_buffers(page_size, 64);
+        // No fast path: residency is only observed when a full snapshot walks
+        // the shards, so a spike between samples is invisible.
+        for pgno in 1..=40_u32 {
+            let page = PageNumber::new(pgno).unwrap();
+            cache.insert_buffer_with_post_install(page, cache.pool.acquire().unwrap(), || {});
+        }
+        let peak = cache.peak_snapshot();
+        assert!(
+            !peak.exact,
+            "a multi-connection cache must not claim an exact peak, got {peak:?}"
         );
         assert_eq!(
-            peak.peak_resident_bytes(),
-            peak.peak_cached_pages as u64 * 512
+            peak.proves_ceiling_never_approached(64),
+            None,
+            "a sampled lower bound cannot certify a ceiling, and must not pretend to"
+        );
+        assert_eq!(
+            peak.proves_ceiling_never_approached(1),
+            None,
+            "not even an obviously breached ceiling may be answered from a sample"
         );
     }
 
