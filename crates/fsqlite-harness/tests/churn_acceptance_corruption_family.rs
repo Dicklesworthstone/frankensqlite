@@ -35,9 +35,6 @@ fn scale() -> (usize, usize) {
 }
 
 #[test]
-#[ignore = "bd-zeg99: mixed INSERT/DELETE concurrent churn deadlocks all writers \
-in InProcessPageLockTable::wait_for_holder_change (busy_timeout unbounded) — \
-this keeper FOUND that P0 on its first run; un-ignore when bd-zeg99 lands"]
 fn churn_acceptance_corruption_family() {
     asupersync::test_utils::run_test(|| async {
         let temp_dir = tempfile::tempdir().unwrap();

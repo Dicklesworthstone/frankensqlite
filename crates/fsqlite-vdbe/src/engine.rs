@@ -27,7 +27,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use fsqlite_btree::swiss_index::SwissIndex;
-use fsqlite_types::PageSize;
+use fsqlite_types::{PageSize, TxnId};
 use std::rc::Rc;
 
 /// bd-perf (V1.6): Flat array replacing HashMap for cursor storage.
@@ -2902,6 +2902,29 @@ fn normalize_page_data_to_size(page_size: usize, data: PageData) -> Result<PageD
     Ok(PageData::from_vec(page))
 }
 
+/// bd-zeg99: page-lock deadlock detection kill switch.
+/// `FSQLITE_PAGE_LOCK_DEADLOCK_DETECT=0` disables the cycle check (waits then
+/// resolve only via the busy timeout, the pre-detection behavior).
+fn page_lock_deadlock_detection_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSQLITE_PAGE_LOCK_DEADLOCK_DETECT").as_deref() != Ok("0")
+    })
+}
+
+/// bd-zeg99: RAII wait-for-edge registration so every exit path (timeout,
+/// wake, cancellation `?`, deadlock-victim abort) removes the edge.
+struct PageWaitEdgeGuard<'a> {
+    lock_table: &'a InProcessPageLockTable,
+    txn: TxnId,
+}
+
+impl Drop for PageWaitEdgeGuard<'_> {
+    fn drop(&mut self) {
+        self.lock_table.end_page_wait(self.txn);
+    }
+}
+
 fn wait_for_page_lock_holder_change(
     cx: &Cx,
     ctx: &ConcurrentContext,
@@ -2919,10 +2942,40 @@ fn wait_for_page_lock_holder_change(
         return Ok(false);
     }
 
+    // bd-zeg99: publish this transaction's wait-for edge and poll for
+    // page-lock cycles each slice. Mixed INSERT/DELETE churn on one hot
+    // bucket forms lock-order cycles that previously parked every writer
+    // for the FULL busy timeout per round (the kqari keeper wedge); the
+    // youngest cycle member now fails fast with the existing Busy path.
+    let waiter_txn = page_lock_deadlock_detection_enabled()
+        .then(|| TxnId::new(ctx.txn_id))
+        .flatten();
+    let _edge_guard = waiter_txn.map(|txn| {
+        ctx.lock_table.begin_page_wait(txn, page_no);
+        PageWaitEdgeGuard {
+            lock_table: &*ctx.lock_table,
+            txn,
+        }
+    });
+
     let metrics_enabled = vdbe_metrics_enabled();
     let started = Instant::now();
     let mut next_full_checkpoint = PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL;
     loop {
+        if let Some(txn) = waiter_txn
+            && ctx.lock_table.page_wait_deadlock_victim(txn, page_no)
+        {
+            add_vdbe_counter_if(metrics_enabled, &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAITS_TOTAL, 1);
+            tracing::warn!(
+                txn_id = ctx.txn_id,
+                page_id = page_no.get(),
+                visibility_decision = "write_deadlock_victim",
+                conflict_reason = "page_lock_cycle",
+                retry_policy = "park_wake",
+                "mvcc page-lock deadlock cycle detected; youngest member fails fast (bd-zeg99)"
+            );
+            return Ok(false);
+        }
         let mut elapsed = started.elapsed();
         // Keep the hot per-slice path cheap, but do not make e-process/native
         // cancellation wait for the whole busy timeout when the same holder

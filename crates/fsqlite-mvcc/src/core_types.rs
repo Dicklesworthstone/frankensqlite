@@ -468,6 +468,12 @@ pub struct InProcessPageLockTable {
     /// Optional conflict observer for MVCC analytics (bd-t6sv2.1).
     /// When `None`, conflict emission is a no-op branch (zero cost).
     observer: Option<std::sync::Arc<dyn fsqlite_observability::ConflictObserver>>,
+    /// bd-zeg99: wait-for edges (`TxnId.get()` → waited `PageNumber.get()`),
+    /// registered only while a transaction is parked on a page lock. Feeds
+    /// [`Self::page_wait_deadlock_victim`], which breaks insert-vs-delete
+    /// page-lock cycles immediately instead of burning the full busy timeout
+    /// per round. Cold path: touched only when a waiter actually blocks.
+    wait_edges: Mutex<HashMap<u64, u32>>,
 }
 
 /// State tracking for the draining table during a rolling rebuild.
@@ -612,6 +618,7 @@ impl InProcessPageLockTable {
             waiter_shards: Self::alloc_waiter_shards(),
             waiter_count: AtomicUsize::new(0),
             observer: None,
+            wait_edges: Mutex::new(HashMap::new()),
         }
     }
 
@@ -637,6 +644,7 @@ impl InProcessPageLockTable {
             waiter_shards: Self::alloc_waiter_shards(),
             waiter_count: AtomicUsize::new(0),
             observer: Some(observer),
+            wait_edges: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1133,6 +1141,61 @@ impl InProcessPageLockTable {
                 _ => return true,
             }
         }
+    }
+
+    /// bd-zeg99: publish that `txn` is parked waiting for `page`.
+    ///
+    /// Pair with [`Self::end_page_wait`] on every exit path. Edges exist only
+    /// while a waiter is actually blocked, so the map stays tiny (bounded by
+    /// the number of concurrently parked writers).
+    pub fn begin_page_wait(&self, txn: TxnId, page: PageNumber) {
+        self.wait_edges.lock().insert(txn.get(), page.get());
+    }
+
+    /// bd-zeg99: remove `txn`'s wait-for edge.
+    pub fn end_page_wait(&self, txn: TxnId) {
+        self.wait_edges.lock().remove(&txn.get());
+    }
+
+    /// bd-zeg99: decide whether `waiter` (parked on `page`) must abort to
+    /// break a page-lock deadlock cycle.
+    ///
+    /// Walks the wait-for graph: the holder of `page` may itself be parked on
+    /// another page, whose holder may be parked in turn. If the chain closes
+    /// back on `waiter`, a genuine cycle exists (mixed INSERT/DELETE churn
+    /// forms these constantly on a hot index bucket — the kqari keeper's
+    /// wedge). Victim policy: the YOUNGEST transaction in the cycle (largest
+    /// `TxnId`) aborts; every cycle member is a registered waiter re-running
+    /// this check on its poll slice, so exactly the youngest observes
+    /// `true` within one slice and fails with `Busy` (transient, caller
+    /// rolls back and retries), while the oldest member never aborts —
+    /// guaranteeing forward progress. Reads race with releases by design: a
+    /// stale positive costs one spurious transient retry, never a wedge.
+    #[must_use]
+    pub fn page_wait_deadlock_victim(&self, waiter: TxnId, page: PageNumber) -> bool {
+        const MAX_CYCLE_HOPS: usize = 64;
+        let edges = self.wait_edges.lock();
+        let mut cycle_max = waiter.get();
+        let mut current_page = page;
+        for _ in 0..MAX_CYCLE_HOPS {
+            let Some(holder) = self.holder(current_page) else {
+                return false;
+            };
+            if holder == waiter {
+                // Chain closed on the waiter: cycle confirmed.
+                return cycle_max == waiter.get();
+            }
+            cycle_max = cycle_max.max(holder.get());
+            let Some(next_page) = edges.get(&holder.get()).copied() else {
+                // Holder is running (not parked) — no cycle through it.
+                return false;
+            };
+            let Some(next_page) = PageNumber::new(next_page) else {
+                return false;
+            };
+            current_page = next_page;
+        }
+        false
     }
 
     /// Total number of locks currently held across all shards (active table only).
@@ -3503,6 +3566,68 @@ mod tests {
             waiter.join().unwrap(),
             "waiter should observe release before timing out"
         );
+    }
+
+    #[test]
+    fn test_page_wait_deadlock_victim_youngest_aborts() {
+        // bd-zeg99: A(txn 10) holds p1 and waits p2; B(txn 20) holds p2 and
+        // waits p1. Cycle. Youngest (20) is the victim; oldest (10) is not.
+        let table = InProcessPageLockTable::new();
+        let p1 = PageNumber::new(101).unwrap();
+        let p2 = PageNumber::new(102).unwrap();
+        let a = TxnId::new(10).unwrap();
+        let b = TxnId::new(20).unwrap();
+
+        table.try_acquire(p1, a).unwrap();
+        table.try_acquire(p2, b).unwrap();
+        table.begin_page_wait(a, p2);
+        table.begin_page_wait(b, p1);
+
+        assert!(
+            table.page_wait_deadlock_victim(b, p1),
+            "youngest cycle member must be the victim"
+        );
+        assert!(
+            !table.page_wait_deadlock_victim(a, p2),
+            "oldest cycle member must never abort"
+        );
+
+        // No cycle once B's edge is gone (B is running, not parked).
+        table.end_page_wait(b);
+        assert!(!table.page_wait_deadlock_victim(a, p2));
+
+        table.end_page_wait(a);
+        table.release_all(a);
+        table.release_all(b);
+    }
+
+    #[test]
+    fn test_page_wait_deadlock_victim_three_party_cycle() {
+        // bd-zeg99: A holds p1 waits p2, B holds p2 waits p3, C holds p3
+        // waits p1 — only the youngest (C, txn 30) aborts.
+        let table = InProcessPageLockTable::new();
+        let p1 = PageNumber::new(201).unwrap();
+        let p2 = PageNumber::new(202).unwrap();
+        let p3 = PageNumber::new(203).unwrap();
+        let a = TxnId::new(10).unwrap();
+        let b = TxnId::new(21).unwrap();
+        let c = TxnId::new(30).unwrap();
+
+        table.try_acquire(p1, a).unwrap();
+        table.try_acquire(p2, b).unwrap();
+        table.try_acquire(p3, c).unwrap();
+        table.begin_page_wait(a, p2);
+        table.begin_page_wait(b, p3);
+        table.begin_page_wait(c, p1);
+
+        assert!(table.page_wait_deadlock_victim(c, p1));
+        assert!(!table.page_wait_deadlock_victim(a, p2));
+        assert!(!table.page_wait_deadlock_victim(b, p3));
+
+        // A blocked chain WITHOUT a cycle must never nominate a victim.
+        table.end_page_wait(a);
+        assert!(!table.page_wait_deadlock_victim(c, p1));
+        assert!(!table.page_wait_deadlock_victim(b, p3));
     }
 
     #[test]
