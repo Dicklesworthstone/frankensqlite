@@ -4939,6 +4939,45 @@ mod tests {
     }
 
     #[test]
+    fn test_format_signed_zero_all_specs() {
+        // bd-gh-printf-negative-zero-era4w (#258): -0.0 normalizes to 0 for
+        // %f/%e/%g and every sub-path (sign flags, width, alt-form), matching
+        // C SQLite 3.46.1; real negatives keep the minus sign.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: f64| -> String {
+            match f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(spec)),
+                    SqliteValue::Float(v),
+                ])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        // Negative zero -> canonical zero across specifiers.
+        assert_eq!(fmt("%f", -0.0), "0.000000");
+        assert_eq!(fmt("%e", -0.0), "0.000000e+00");
+        assert_eq!(fmt("%E", -0.0), "0.000000E+00");
+        assert_eq!(fmt("%G", -0.0), "0");
+        // Sign flags apply to the normalized +0.0.
+        assert_eq!(fmt("%+g", -0.0), "+0");
+        assert_eq!(fmt("% g", -0.0), " 0");
+        assert_eq!(fmt("%+f", -0.0), "+0.000000");
+        // Width/precision.
+        assert_eq!(fmt("%8.2f", -0.0), "    0.00");
+        // Alt-form (`!`) path also normalizes.
+        assert_eq!(fmt("%!g", -0.0), "0.0");
+        // Arithmetic-produced negative zero (underflow) normalizes too.
+        assert_eq!(fmt("%g", -1e-320 * 1e-10), "0");
+        // Real negatives are UNCHANGED (regression guard).
+        assert_eq!(fmt("%g", -1.5), "-1.5");
+        assert_eq!(fmt("%f", -2.25), "-2.250000");
+        assert_eq!(fmt("%+g", -1.5), "-1.5");
+    }
+
+    #[test]
     fn test_format_altform2_flag() {
         // Regression (#176): the '!' (alternate-form-2) flag is accepted. For
         // string/int conversions the value formats normally; for %f it selects
