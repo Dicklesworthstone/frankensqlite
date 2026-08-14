@@ -439,7 +439,6 @@ fn test_gh302_page_count_bounded_under_racing_writer_churn() {
 /// GH#302 acceptance #3: committed-free pages must stay reusable across a
 /// CRASH/REOPEN boundary — recovery rebuilds the freelist from durable state,
 /// and a post-recovery writer reuses those pages instead of growing the file.
-#[ignore = "bd-gh302 acceptance #3: authored under the disk build-freeze; un-ignore after the first verified green run"]
 #[test]
 fn test_gh302_freelist_reuse_survives_crash_reopen() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -516,7 +515,6 @@ fn test_gh302_freelist_reuse_survives_crash_reopen() {
 /// boundary — pages freed before the checkpoint land in the main file's
 /// durable freelist metadata and stay reusable after it, with the stock
 /// oracle green on the checkpointed image.
-#[ignore = "bd-gh302 acceptance #3: authored under the disk build-freeze; un-ignore after the first verified green run"]
 #[test]
 fn test_gh302_freelist_reuse_across_checkpoint_boundary() {
     let temp_dir = tempfile::tempdir().unwrap();
