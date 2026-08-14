@@ -761,29 +761,28 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let last_commit_frame = self.wal.last_commit_frame(cx)?;
         // While a local batch is staged, the WAL's own commit horizon includes
         // frames this handle appended but has not yet fsynced. Refresh and
-        // unpinned read paths must not expose them, so clamp them out. The
-        // clamp must exclude ONLY THIS HANDLE'S staged frames: peers' commits
-        // appended below our staged batch are legitimately visible even when
-        // not yet fsynced (stock WAL semantics; a crash that erased them would
-        // erase our later frames too). Clamping to the fsynced prefix here
-        // hid peers' deferred-sync commits from the append-gate guards — a
-        // committing flusher then validated page-1/freelist state against a
-        // PRE-PEER snapshot and republished a consumed freelist head
-        // (bd-dw8oe: `freelist trunk N leaf_count ... exceeds max 1022`).
+        // unpinned read paths must not expose them, so clamp to the durable
+        // prefix. With nothing staged the horizon is used unchanged, preserving
+        // publication of commits made durable elsewhere.
+        //
+        // bd-dw8oe DESIGN INPUT (measured, do not re-attempt naively): this
+        // clamp also hides PEERS' appended-but-unfsynced commits from a
+        // flusher that refreshes while its own batch is staged — the
+        // append-gate guards then validate freelist/page-1 state against a
+        // pre-peer snapshot and can republish a consumed freelist head
+        // (traced: promote/gate both read the pre-consumption page-1).
+        // Relaxing the clamp to "fsynced OR below our own staged batch" did
+        // NOT reduce the churn corruption rate (6/8 before and after), so it
+        // was withdrawn rather than carried as risk — the guards need a
+        // dedicated file-tail conflict horizon, distinct from this
+        // reader-visibility plane, chartered under the freelist protocol
+        // rework.
         let last_commit_frame = if self.pending_publication_commit.is_some() {
-            let our_staged_start = self
-                .pending_publication_frames
-                .iter()
-                .map(|frame| frame.frame_index)
-                .min();
             let durable_frames = self.wal.last_fsynced_frame_count();
             last_commit_frame.filter(|frame| {
-                let fsync_covered = frame
+                frame
                     .checked_add(1)
-                    .is_some_and(|frame_count| frame_count <= durable_frames);
-                let below_our_staged_batch =
-                    our_staged_start.is_some_and(|start| *frame < start);
-                fsync_covered || below_our_staged_batch
+                    .is_some_and(|frame_count| frame_count <= durable_frames)
             })
         } else {
             last_commit_frame
