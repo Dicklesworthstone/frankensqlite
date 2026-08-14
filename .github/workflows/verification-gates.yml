@@ -544,6 +544,10 @@ jobs:
           cargo test -p fsqlite-core test_query_with_params_table_index_eq_single_anonymous_no_match_returns_empty -- --nocapture
           cargo test -p fsqlite-vdbe test_codegen_select_with_index -- --nocapture
 
+      - name: PRAGMA data_version oracle parity (bd-pragma-data-version-approximation-b3dpn)
+        run: |
+          cargo test -p fsqlite-core --test pragma_data_version_oracle -- --nocapture
+
   e2e-scenario-matrix:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
