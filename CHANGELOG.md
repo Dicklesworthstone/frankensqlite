@@ -19,6 +19,61 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.3.1] -- unreleased
+
+Post-0.3.0 correctness wave: every entry below cites the landed commit and its
+tracking bead; all fixes carry keeper tests and were verified on the release
+preflight target.
+
+### Fixed
+
+- **Schema text fidelity**: stored `CREATE TABLE` text now ends at the
+  statement's final token (trailing `;`/comments stripped, `1c75f65fc`) and
+  ALTER ADD COLUMN splicing skips comments and `[bracket]` identifiers so
+  comment-bearing multi-line CREATEs cannot be corrupted on rewrite
+  (`7e043b0f0`; bd-lgolw).
+- **Allocator page aliasing**: post-savepoint allocations are quarantined to
+  the owning transaction (own-txn reuse first, freelist only at txn end),
+  closing the dominant intra-transaction page re-grant corruption path
+  (`1f79a3482`; bd-0shxy).
+- **Freelist resurrection**: the append gate refuses committed-freelist
+  resurrection and erasure, keeping page counts bounded and stock-reader
+  bytes stable under continuous overlap and racing writer churn
+  (`05144b4f4`; bd-gh302-continuous-overlap-freelist-reuse-i5tx4).
+- **Concurrent-writer EOF growth**: EOF high-water is shared and
+  peer-claimed growth pages are rejected, eliminating cross-writer page
+  aliasing under concurrent commit (`70102790f`; bd-o81ov).
+- **Autocommit durability contract**: a successful file-backed autocommit is
+  committed before `execute` returns — immediately visible to already-open
+  peers and to peers opened only after acknowledgement (`38e903918`;
+  bd-792q5).
+- **Concurrent-open prepare**: `prepare`'s refresh prologue retries transient
+  `Busy`/`BusyRecovery` within the busy-timeout window instead of failing
+  fast during a peer's WAL-index recovery, fixing T16 showcase worker setup
+  aborts (`55d7fe2c5`; bd-t16-busy-recovery-qzu9p).
+- **Read-only open side effects**: read-only namespace admission of a
+  database never opened by FrankenSQLite is now sidecar-less — no
+  `-fsqlite-ns-gate`/`-ns-use` creation, byte-neutral for the whole file
+  family (`a410c2735`; bd-daqmp, GH#140).
+- **Darwin file locking**: OFD locks with flock fallback on macOS
+  (`6d439dd9c`; bd-3u63s).
+
+### Verified
+
+- **`PRAGMA integrity_check` / `foreign_key_check`**: COLLATE-aware
+  partial-index predicate re-evaluation and NULL row locators for
+  WITHOUT ROWID children verified against the sqlite3 oracle and locked
+  with keepers (`ba50ae51b`; bd-integrity-partial-collate-puctc, bd-y18u1).
+- **IN-probe over `ORDER BY`+`LIMIT` subqueries**: the 0.3.0-reported
+  `DELETE ... NOT IN (SELECT ... ORDER BY ... LIMIT ?)` halt is not
+  reproducible at HEAD (compiled path proven under strict no-fallback);
+  contract locked with oracle keepers (`391a445ea`; bd-brzp8).
+- **Concurrent-reader consistency**: the reader-deadlock fix that shipped in
+  0.3.0 (fail-closed start gate replacing the fallible post-open barrier)
+  re-verified at HEAD, 58/58 with zero hangs (bd-concurrent-reader-ff2wv).
+
+---
+
 ## [0.3.0] -- 2026-08-13 (Asupersync 0.4.3 compatibility + bug-fix and performance wave)
 
 Lockstep `0.2.1 -> 0.3.0` bump of all 27 workspace members, carrying the

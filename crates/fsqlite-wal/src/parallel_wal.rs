@@ -115,6 +115,14 @@ pub enum ParallelWalFallbackReason {
     /// validates, and both can publish the SAME physical page into different
     /// B-tree positions ("page N referenced multiple times").
     EofGrowth,
+    /// bd-gh302 / bd-0shxy: the batch publishes durable freelist metadata
+    /// (page-1 head/count + trunk pages) derived from the transaction's
+    /// begin-time freelist view. Such commits must take the serialized append
+    /// path so the resurrection guard can compare the publication against the
+    /// CURRENT durable freelist before it lands: concurrently validating
+    /// freelist publications could each re-publish a page the other just
+    /// consumed, granting one physical page to multiple connections.
+    FreelistPublication,
 }
 
 /// Explicit operator control surface for the D1.a contract.
@@ -473,6 +481,7 @@ pub fn parallel_wal_fallback_reason_name(
         Some(ParallelWalFallbackReason::CheckpointConflict) => "checkpoint_conflict",
         Some(ParallelWalFallbackReason::ControllerEvidenceLost) => "controller_evidence_lost",
         Some(ParallelWalFallbackReason::EofGrowth) => "eof_growth",
+        Some(ParallelWalFallbackReason::FreelistPublication) => "freelist_publication",
     }
 }
 
