@@ -952,7 +952,7 @@ async caller
   ← Result<Rows>
 ```
 
-Write transactions submit commit requests through an MPSC channel to a single write coordinator task. This serializes commit validation (SSI check plus first-committer-wins) and WAL appends without holding a lock across the entire commit. The safe merge ladder is not invoked by this live path. Each request includes a `oneshot::Sender<Result<()>>` so the caller can `.await` the result.
+Write transactions submit commit requests through an MPSC channel to a single write coordinator task, and each request carries a `oneshot::Sender<Result<()>>` so the caller can `.await` its result. The concurrent-commit critical section itself is deliberately **not** lock-free: `lock_registry_for_commit` takes a `TimedRegistryCommitGuard` over the shared concurrent registry and holds it across the entire publish sequence — FCW/SSI validation (`plan_concurrent_commit_with_registry`) → the physical pager write (`txn.commit`) → publication into the shared `CommitIndex` (`finalize_concurrent_commit_with_registry`). That single section is load-bearing for correctness (issue #115): an earlier design released the registry lock between validation and publication, letting a peer validate against a `CommitIndex` snapshot *after* this connection had physically written a freshly-allocated EOF page but *before* it published that page — the peer then claimed the same page number and left one physical page reachable from two b-trees, the "2nd reference to page" / "database disk image is malformed" TOCTOU (see `connection.rs::execute_commit_with_cx`). Only the commit-publish step is serialized: the page-version *work* (statement execution and page mutation) happens before `COMMIT` and overlaps freely between writers, so this is not a writer-blocks-writer bottleneck on the mutation path. The safe merge ladder is not invoked by this live path.
 
 ---
 
@@ -3038,11 +3038,15 @@ frankensqlite/
 ├── Cargo.lock                # Pinned dependency versions
 ├── rust-toolchain.toml       # Pinned dated nightly + rustfmt + clippy
 ├── AGENTS.md                 # AI agent development guidelines
-├── COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md  # Single source of truth (~9,500 lines)
-├── MVCC_SPECIFICATION.md     # Standalone MVCC formal specification
-├── PLAN_TO_PORT_SQLITE_TO_RUST.md    # 9-phase implementation roadmap
-├── PROPOSED_ARCHITECTURE.md  # Crate architecture + MVCC design spec
-├── EXISTING_SQLITE_STRUCTURE.md      # SQLite behavioral specification
+├── docs/
+│   ├── planning/             # Design corpus — all planning specs live here (not repo root)
+│   │   ├── COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md  # Single source of truth (~18,200 lines / 827 KB)
+│   │   ├── MVCC_SPECIFICATION.md          # Standalone MVCC formal specification
+│   │   ├── PLAN_TO_PORT_SQLITE_TO_RUST.md # 9-phase implementation roadmap
+│   │   ├── PROPOSED_ARCHITECTURE.md       # Crate architecture + MVCC design spec
+│   │   └── EXISTING_SQLITE_STRUCTURE.md   # SQLite behavioral specification
+│   ├── contracts/            # Normative surface + parity matrices
+│   └── concurrency-contract.md  # Caller-facing concurrency contract
 ├── crates/
 │   ├── fsqlite-types/        # Core types (2,800+ LOC, 64 tests)
 │   ├── fsqlite-error/        # Error handling (578 LOC, 13 tests)
