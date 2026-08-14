@@ -9501,7 +9501,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
         .chain(current.iter().copied().filter(|page| {
             !published_set.contains(page)
                 && !consumed.contains(page)
-                && !(publication_db_size > 0 && *page > publication_db_size)
+                && (publication_db_size == 0 || *page <= publication_db_size)
         }))
         // DOUBLE-CONSUMPTION: a page this batch consumed from the DURABLE
         // freelist must still be on the current durable freelist — if a
@@ -12451,7 +12451,7 @@ where
                     freed_pages: Vec::new(),
                     freed_page_bounds: None,
                     allocated_from_freelist: Vec::new(),
-                allocated_from_durable_freelist: HashSet::new(),
+                    allocated_from_durable_freelist: HashSet::new(),
                     allocated_from_eof: Vec::new(),
                     savepoint_quarantined_allocations: Vec::new(),
                     reclaimed_abandoned_reservations: Vec::new(),
@@ -13296,6 +13296,38 @@ where
         provisional: &DatabaseImageReceipt,
         change_counter: u32,
     ) -> Result<DatabaseImageReceipt> {
+        self.restore_vacuum_candidate_header_counters(
+            cx,
+            image_path,
+            provisional,
+            change_counter,
+            change_counter,
+        )
+        .await
+    }
+
+    /// Restore both mutable database-header counters on an identity-bound
+    /// private candidate.
+    ///
+    /// Whole-image publication uses this after a precommit validation refusal
+    /// so the caller-owned candidate returns to its exact provisional receipt
+    /// rather than retaining source-derived provenance from an image that was
+    /// never published. That rollback is the reason the two counters must be
+    /// settable independently: the provisional image may legitimately carry
+    /// `change_counter != version_valid_for`, and forcing them equal would
+    /// leave a receipt the caller cannot match.
+    ///
+    /// The same identity, exclusive-lock, full-page write, durable sync, and
+    /// byte-for-byte verification discipline as
+    /// [`Self::restore_vacuum_candidate_change_counter`] applies.
+    pub async fn restore_vacuum_candidate_header_counters(
+        &self,
+        cx: &Cx,
+        image_path: &Path,
+        provisional: &DatabaseImageReceipt,
+        change_counter: u32,
+        version_valid_for: u32,
+    ) -> Result<DatabaseImageReceipt> {
         let full_path = self.vfs.full_pathname(cx, image_path)?;
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         let (mut file, _) =
@@ -13332,9 +13364,8 @@ where
                 });
             }
             let mut expected_page_one = page_one.clone();
-            let counter_bytes = change_counter.to_be_bytes();
-            expected_page_one[24..28].copy_from_slice(&counter_bytes);
-            expected_page_one[92..96].copy_from_slice(&counter_bytes);
+            expected_page_one[24..28].copy_from_slice(&change_counter.to_be_bytes());
+            expected_page_one[92..96].copy_from_slice(&version_valid_for.to_be_bytes());
 
             file.write(cx, &expected_page_one, 0).await?;
             file.durable_sync(cx, SyncKind::FullDurable)?;
@@ -13356,7 +13387,7 @@ where
             .await?;
             let mut expected_header = provisional.header.clone();
             expected_header.change_counter = change_counter;
-            expected_header.version_valid_for = change_counter;
+            expected_header.version_valid_for = version_valid_for;
             if final_receipt.identity != provisional.identity
                 || final_receipt.file_size != provisional.file_size
                 || final_receipt.header != expected_header
@@ -19626,7 +19657,7 @@ where
 
                 let t_flush_frame_prep_start = detailed_metrics.then(Instant::now);
                 let conflicting_pages = conflicting_pages_across_group_commit_batches(&batches);
-                if std::env::var_os("DK9RA_O81OV").is_some() && batches.len() > 0 {
+                if std::env::var_os("DK9RA_O81OV").is_some() && !batches.is_empty() {
                     let per_batch: Vec<(u32, u32)> = batches
                         .iter()
                         .map(|b| {
@@ -21636,7 +21667,12 @@ where
             // out without touching the global `inner` mutex at all.
             if let Some(page) = self.page_lease.pop() {
                 self.allocated_from_eof.push(page);
-                alloc_ledger(self as *const _ as usize, "alloc_lease", page.get(), 0);
+                alloc_ledger(
+                    std::ptr::from_ref(self) as usize,
+                    "alloc_lease",
+                    page.get(),
+                    0,
+                );
                 return Ok(page);
             }
             // bd-0shxy: reuse savepoint-quarantined page numbers before any
@@ -21645,7 +21681,12 @@ where
             // transaction is the only re-grant that cannot alias.
             if let Some(page) = self.savepoint_quarantined_allocations.pop() {
                 self.allocated_from_eof.push(page);
-                alloc_ledger(self as *const _ as usize, "alloc_quarantine", page.get(), 0);
+                alloc_ledger(
+                    std::ptr::from_ref(self) as usize,
+                    "alloc_quarantine",
+                    page.get(),
+                    0,
+                );
                 return Ok(page);
             }
 
@@ -21706,7 +21747,7 @@ where
                         }
                         self.allocated_from_freelist.push(page);
                         alloc_ledger(
-                            self as *const _ as usize,
+                            std::ptr::from_ref(self) as usize,
                             "alloc_freelist_hi",
                             page.get(),
                             0,
@@ -21737,7 +21778,7 @@ where
                         }
                         self.allocated_from_freelist.push(page);
                         alloc_ledger(
-                            self as *const _ as usize,
+                            std::ptr::from_ref(self) as usize,
                             "alloc_freelist_gated",
                             page.get(),
                             0,
@@ -21750,7 +21791,7 @@ where
                     }
                     self.allocated_from_freelist.push(page);
                     alloc_ledger(
-                        self as *const _ as usize,
+                        std::ptr::from_ref(self) as usize,
                         "alloc_freelist_nc",
                         page.get(),
                         0,
@@ -21825,7 +21866,12 @@ where
                 );
             }
             self.allocated_from_eof.push(page);
-            alloc_ledger(self as *const _ as usize, "alloc_eof", page.get(), 0);
+            alloc_ledger(
+                std::ptr::from_ref(self) as usize,
+                "alloc_eof",
+                page.get(),
+                0,
+            );
             Ok(page)
         }
     }
@@ -23790,10 +23836,10 @@ where
                 let _ = &mut inner; // lock still held for sibling arms' symmetry
                 let eof_start = entry.allocated_from_eof_snapshot.len();
                 let freelist_start = entry.allocated_from_freelist_snapshot.len();
-                let lease: Vec<PageNumber> = self.page_lease.drain(..).collect();
+                let lease: Vec<PageNumber> = std::mem::take(&mut self.page_lease);
                 for page in &lease {
                     alloc_ledger(
-                        self as *const _ as usize,
+                        std::ptr::from_ref(self) as usize,
                         "sp_quarantine_lease",
                         page.get(),
                         0,
@@ -23803,7 +23849,7 @@ where
                 let eof: Vec<PageNumber> = self.allocated_from_eof.drain(eof_start..).collect();
                 for page in &eof {
                     alloc_ledger(
-                        self as *const _ as usize,
+                        std::ptr::from_ref(self) as usize,
                         "sp_quarantine_eof",
                         page.get(),
                         0,
