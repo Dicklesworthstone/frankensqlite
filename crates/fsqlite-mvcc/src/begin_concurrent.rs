@@ -216,6 +216,17 @@ pub struct ConcurrentHandle {
     has_out_rw: Cell<bool>,
     /// Whether this transaction was marked for abort by another committer.
     marked_for_abort: Cell<bool>,
+    /// bd-5310l/bd-aoj0g: incrementally maintained frozen copy of the
+    /// conflict-tracking page states, shared into [`ConcurrentSavepoint`]s by
+    /// `Arc` clone. Statement savepoints previously rebuilt the whole
+    /// snapshot map per statement — O(pages staged this txn) each — which
+    /// made bulk DML in one transaction O(n^2). With this cache a savepoint
+    /// costs O(pages dirtied since the previous savepoint), amortized via
+    /// `Arc::make_mut` once outstanding savepoints are dropped.
+    savepoint_snapshot_cache: Option<Arc<PageMap<SavepointPageState>>>,
+    /// Pages whose `page_states` entry changed since the cache was built.
+    /// Only maintained while a cache exists (a full rebuild ignores it).
+    savepoint_snapshot_dirty: PageSet,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -354,6 +365,8 @@ impl ConcurrentHandle {
             has_in_rw: Cell::new(false),
             has_out_rw: Cell::new(false),
             marked_for_abort: Cell::new(false),
+            savepoint_snapshot_cache: None,
+            savepoint_snapshot_dirty: PageSet::default(),
         }
     }
 
@@ -362,6 +375,8 @@ impl ConcurrentHandle {
     pub fn reset_for_new_transaction(&mut self, snapshot: Snapshot, txn_token: TxnToken) {
         self.snapshot = snapshot;
         self.page_states.clear();
+        self.savepoint_snapshot_cache = None;
+        self.savepoint_snapshot_dirty.clear();
         self.state = TransactionState::Active;
         self.read_set.clear();
         self.read_index.clear();
@@ -620,6 +635,9 @@ impl ConcurrentHandle {
     }
 
     fn ensure_page_state(&mut self, page: PageNumber) -> &mut PageTxnState {
+        // The returned &mut is how every state transition happens, so the
+        // page must be assumed dirtied (bd-5310l savepoint snapshot cache).
+        self.note_savepoint_state_dirty(page);
         self.page_states.entry(page).or_default()
     }
 
@@ -629,8 +647,76 @@ impl ConcurrentHandle {
             .get(&page)
             .is_some_and(PageTxnState::is_empty)
         {
+            self.note_savepoint_state_dirty(page);
             self.page_states.remove(&page);
         }
+    }
+
+    /// bd-5310l: mark `page` stale in the savepoint snapshot cache. Cheap
+    /// no-op while no cache exists (the first build is a full pass anyway).
+    fn note_savepoint_state_dirty(&mut self, page: PageNumber) {
+        if self.savepoint_snapshot_cache.is_some() {
+            self.savepoint_snapshot_dirty.insert(page);
+        }
+    }
+
+    /// bd-5310l: bring the savepoint snapshot cache up to date and return a
+    /// shared handle to it. First call after a build-invalidating event does
+    /// a full O(page_states) pass; steady-state statement savepoints pay
+    /// O(pages dirtied since the last savepoint).
+    fn refresh_savepoint_snapshot_cache(&mut self) -> Arc<PageMap<SavepointPageState>> {
+        if let Some(cache) = self.savepoint_snapshot_cache.as_mut() {
+            if !self.savepoint_snapshot_dirty.is_empty() {
+                let map = Arc::make_mut(cache);
+                for page in self.savepoint_snapshot_dirty.drain() {
+                    match self.page_states.get(&page) {
+                        Some(state) if state.tracks_write_conflict() => {
+                            map.insert(
+                                page,
+                                SavepointPageState {
+                                    staged_data: state.staged_data.clone(),
+                                    has_staged_write: state.has_staged_write,
+                                    is_freed: state.is_freed,
+                                    is_conflict_only: state.is_conflict_only,
+                                    metadata_exempt: state.metadata_exempt,
+                                },
+                            );
+                        }
+                        _ => {
+                            map.remove(&page);
+                        }
+                    }
+                }
+            }
+            return Arc::clone(cache);
+        }
+        self.savepoint_snapshot_dirty.clear();
+        let built: PageMap<SavepointPageState> = self
+            .page_states
+            .iter()
+            .filter_map(|(&page, state)| {
+                state.tracks_write_conflict().then_some((
+                    page,
+                    SavepointPageState {
+                        staged_data: state.staged_data.clone(),
+                        has_staged_write: state.has_staged_write,
+                        is_freed: state.is_freed,
+                        is_conflict_only: state.is_conflict_only,
+                        metadata_exempt: state.metadata_exempt,
+                    },
+                ))
+            })
+            .collect();
+        let arc = Arc::new(built);
+        self.savepoint_snapshot_cache = Some(Arc::clone(&arc));
+        arc
+    }
+
+    /// bd-5310l: drop the savepoint snapshot cache after a wholesale
+    /// `page_states` replacement (savepoint rollback) or teardown.
+    fn invalidate_savepoint_snapshot_cache(&mut self) {
+        self.savepoint_snapshot_cache = None;
+        self.savepoint_snapshot_dirty.clear();
     }
 }
 
@@ -747,10 +833,11 @@ impl ActiveTxnView for ConcurrentHandle {
 pub struct ConcurrentSavepoint {
     /// Savepoint name.
     pub name: String,
-    /// Snapshot of per-page tracking state at savepoint creation time.
-    /// Uses the fast page-number hasher: rebuilt on every statement
-    /// savepoint, so default SipHash here was profile-hot (bd-aoj0g).
-    page_states_snapshot: PageMap<SavepointPageState>,
+    /// Shared view of per-page tracking state at savepoint creation time.
+    /// `Arc`-shared with the handle's incrementally maintained cache
+    /// (bd-5310l): creating a statement savepoint no longer rebuilds this
+    /// map — it clones the `Arc` after an O(dirty-pages) refresh.
+    page_states_snapshot: Arc<PageMap<SavepointPageState>>,
     /// Number of pages in write_set at savepoint creation.
     write_set_len: usize,
 }
@@ -1531,6 +1618,7 @@ pub fn concurrent_clear_page_state(
         lock_table.release(page, txn_id);
     }
 
+    handle.note_savepoint_state_dirty(page);
     handle.page_states.remove(&page);
     Ok(())
 }
@@ -1715,6 +1803,7 @@ pub fn concurrent_has_page_state(handle: &ConcurrentHandle) -> bool {
 /// - Private page allocation counters that reconcile at commit
 /// - Structural B-tree metadata that can be merged safely
 pub fn concurrent_mark_metadata_exempt(handle: &mut ConcurrentHandle, page: PageNumber) {
+    handle.note_savepoint_state_dirty(page);
     if let Some(state) = handle.page_states.get_mut(&page) {
         state.metadata_exempt = true;
     }
@@ -3723,28 +3812,15 @@ pub fn concurrent_commit_read_only(
 /// `ROLLBACK TO`.  Page locks are NOT captured (they persist across
 /// rollback).
 pub fn concurrent_savepoint(
-    handle: &ConcurrentHandle,
+    handle: &mut ConcurrentHandle,
     name: &str,
 ) -> Result<ConcurrentSavepoint, MvccError> {
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
-    let page_states_snapshot = handle
-        .page_states
-        .iter()
-        .filter_map(|(&page, state)| {
-            state.tracks_write_conflict().then_some((
-                page,
-                SavepointPageState {
-                    staged_data: state.staged_data.clone(),
-                    has_staged_write: state.has_staged_write,
-                    is_freed: state.is_freed,
-                    is_conflict_only: state.is_conflict_only,
-                    metadata_exempt: state.metadata_exempt,
-                },
-            ))
-        })
-        .collect();
+    // bd-5310l: O(dirty-since-last-savepoint) refresh + Arc clone, instead of
+    // rebuilding the whole conflict-tracking snapshot per statement.
+    let page_states_snapshot = handle.refresh_savepoint_snapshot_cache();
     Ok(ConcurrentSavepoint {
         name: name.to_owned(),
         page_states_snapshot,
@@ -3788,7 +3864,7 @@ pub fn concurrent_rollback_to_savepoint(
         PageNumberBuildHasher::default(),
     );
 
-    for (&page, snapshot_state) in &savepoint.page_states_snapshot {
+    for (&page, snapshot_state) in savepoint.page_states_snapshot.iter() {
         restored.insert(
             page,
             PageTxnState {
@@ -3812,6 +3888,9 @@ pub fn concurrent_rollback_to_savepoint(
     }
 
     handle.page_states = restored;
+    // Wholesale replacement above invalidates the incremental savepoint
+    // snapshot cache; the next savepoint rebuilds it in full (bd-5310l).
+    handle.invalidate_savepoint_snapshot_cache();
     Ok(())
 }
 
@@ -4512,8 +4591,8 @@ mod tests {
 
         // Create savepoint.
         let sp = {
-            let handle = registry.get(s1).expect("handle");
-            concurrent_savepoint(&handle, "sp1").unwrap()
+            let mut handle = registry.get(s1).expect("handle");
+            concurrent_savepoint(&mut handle, "sp1").unwrap()
         };
         assert_eq!(sp.captured_len(), 1);
 
@@ -4580,8 +4659,8 @@ mod tests {
         }
 
         let sp = {
-            let handle = registry.get(s1).expect("handle");
-            concurrent_savepoint(&handle, "sp1").unwrap()
+            let mut handle = registry.get(s1).expect("handle");
+            concurrent_savepoint(&mut handle, "sp1").unwrap()
         };
 
         {
@@ -4682,7 +4761,7 @@ mod tests {
                 .ok_or(MvccError::InvalidState)?;
             concurrent_prepare_write_page(&mut handle, &lock_table, session_id, page)?;
             concurrent_stage_prepared_write_marker(&mut handle, page)?;
-            concurrent_savepoint(&handle, "sp1")?
+            concurrent_savepoint(&mut handle, "sp1")?
         };
 
         {
@@ -4819,7 +4898,7 @@ mod tests {
             let mut handle = registry.get_mut(s1).expect("handle");
             concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, PageNumber::ONE)
                 .unwrap();
-            concurrent_savepoint(&handle, "sp1").unwrap()
+            concurrent_savepoint(&mut handle, "sp1").unwrap()
         };
 
         {
@@ -4948,7 +5027,7 @@ mod tests {
 
         let mut handle = registry.get_mut(s1).expect("handle");
         concurrent_write_page(&mut handle, &lock_table, s1, page, expected.clone()).unwrap();
-        let savepoint = concurrent_savepoint(&handle, "sp1").unwrap();
+        let savepoint = concurrent_savepoint(&mut handle, "sp1").unwrap();
         concurrent_write_page(&mut handle, &lock_table, s1, test_page(12), test_data()).unwrap();
         concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &savepoint).unwrap();
         assert!(handle.held_locks().contains(&test_page(12)));
@@ -5089,7 +5168,7 @@ mod tests {
         {
             let mut handle = registry.get_mut(s1).expect("handle");
             concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
-            let savepoint = concurrent_savepoint(&handle, "sp1").unwrap();
+            let savepoint = concurrent_savepoint(&mut handle, "sp1").unwrap();
             concurrent_write_page(&mut handle, &lock_table, s1, test_page(6), test_data()).unwrap();
             concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &savepoint).unwrap();
             assert!(handle.held_locks().contains(&test_page(6)));
@@ -5116,7 +5195,7 @@ mod tests {
             .expect("session");
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            let savepoint = concurrent_savepoint(&handle, "sp1").unwrap();
+            let savepoint = concurrent_savepoint(&mut handle, "sp1").unwrap();
             concurrent_write_page(&mut handle, &lock_table, s1, test_page(6), test_data()).unwrap();
             concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &savepoint).unwrap();
             assert!(
@@ -6587,8 +6666,8 @@ mod tests {
 
         // Savepoint should fail on aborted handle.
         {
-            let handle = registry.get(s1).expect("handle");
-            let result = concurrent_savepoint(&handle, "sp1");
+            let mut handle = registry.get(s1).expect("handle");
+            let result = concurrent_savepoint(&mut handle, "sp1");
             assert_eq!(result.unwrap_err(), MvccError::InvalidState);
         }
     }
