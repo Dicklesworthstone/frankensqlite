@@ -16856,7 +16856,10 @@ struct SavepointEntry {
     /// Snapshot of the write-set at the time the savepoint was created.
     /// Stores published page data so savepoint capture can reuse the staged
     /// page's shared `Arc<Vec<u8>>` when available instead of cloning bytes.
-    write_set_snapshot: HashMap<PageNumber, PageData>,
+    /// Keyed with the same fast page-number hasher as the live write-set:
+    /// this map is rebuilt on EVERY statement savepoint, so SipHash here was
+    /// a top-of-profile cost for bulk DML transactions (bd-aoj0g).
+    write_set_snapshot: PagePageMap<PageData>,
     /// Sorted unique page ids in the write-set snapshot.
     write_pages_sorted_snapshot: Vec<PageNumber>,
     /// Snapshot of freed pages at the time the savepoint was created.
