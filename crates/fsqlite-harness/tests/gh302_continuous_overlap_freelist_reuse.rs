@@ -435,3 +435,166 @@ fn test_gh302_page_count_bounded_under_racing_writer_churn() {
         .expect("oracle integrity_check");
     assert_eq!(integrity, "ok", "stock integrity_check must pass");
 }
+
+/// GH#302 acceptance #3: committed-free pages must stay reusable across a
+/// CRASH/REOPEN boundary — recovery rebuilds the freelist from durable state,
+/// and a post-recovery writer reuses those pages instead of growing the file.
+#[ignore = "bd-gh302 acceptance #3: authored under the disk build-freeze; un-ignore after the first verified green run"]
+#[test]
+fn test_gh302_freelist_reuse_survives_crash_reopen() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("gh302_crash_reopen.db");
+    let db = db_path.to_string_lossy().into_owned();
+
+    // Phase 1: seed, free pages durably, then simulate a crash by DROPPING
+    // the connection without close() — no checkpoint, no clean shutdown; the
+    // committed state lives in the WAL.
+    let page_count_after_delete = {
+        let db = db.clone();
+        let mut result = 0_i64;
+        asupersync::test_utils::run_test(|| async {
+            let writer = Connection::open(&db).await.expect("open writer");
+            seed_database(&writer).await;
+            writer
+                .execute("BEGIN CONCURRENT;")
+                .await
+                .expect("begin delete");
+            writer
+                .execute(&format!("DELETE FROM t WHERE id < {};", ROWS / 2))
+                .await
+                .expect("delete");
+            writer.execute("COMMIT;").await.expect("commit delete");
+            let freelist_count = query_i64(&writer, "PRAGMA freelist_count;").await;
+            assert!(
+                freelist_count > 0,
+                "delete must free pages durably before the crash: {freelist_count}"
+            );
+            result = query_i64(&writer, "PRAGMA page_count;").await;
+            drop(writer); // crash: no close(), no checkpoint
+        });
+        result
+    };
+
+    // Phase 2: reopen (recovery), reinsert the same volume — the recovered
+    // freelist must satisfy the allocation without growing the file.
+    asupersync::test_utils::run_test(|| async {
+        let writer = Connection::open(&db).await.expect("reopen after crash");
+        let recovered_rows = query_i64(&writer, "SELECT COUNT(*) FROM t;").await;
+        assert_eq!(recovered_rows, ROWS / 2, "recovery must keep committed state");
+        writer
+            .execute("BEGIN CONCURRENT;")
+            .await
+            .expect("begin reinsert");
+        for id in 0..(ROWS / 2) {
+            let payload = format!("recover_{id}_{}", "r".repeat(PAYLOAD_LEN));
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({id}, '{payload}');"))
+                .await
+                .expect("reinsert");
+        }
+        writer.execute("COMMIT;").await.expect("commit reinsert");
+        let page_count_after_reuse = query_i64(&writer, "PRAGMA page_count;").await;
+        eprintln!(
+            "gh302 crash-reopen: before={page_count_after_delete} after={page_count_after_reuse}"
+        );
+        assert!(
+            page_count_after_reuse <= page_count_after_delete,
+            "post-recovery reinsert must reuse recovered free pages, not grow: \
+             {page_count_after_delete} -> {page_count_after_reuse}"
+        );
+        writer.close().await.expect("close writer");
+    });
+
+    let oracle = rusqlite::Connection::open(&db_path).expect("oracle open");
+    let integrity: String = oracle
+        .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+        .expect("oracle integrity_check");
+    assert_eq!(integrity, "ok", "stock integrity_check must pass after crash-reopen reuse");
+}
+
+/// GH#302 acceptance #3: freelist reuse must be exact across a CHECKPOINT
+/// boundary — pages freed before the checkpoint land in the main file's
+/// durable freelist metadata and stay reusable after it, with the stock
+/// oracle green on the checkpointed image.
+#[ignore = "bd-gh302 acceptance #3: authored under the disk build-freeze; un-ignore after the first verified green run"]
+#[test]
+fn test_gh302_freelist_reuse_across_checkpoint_boundary() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("gh302_checkpoint_boundary.db");
+    let db = db_path.to_string_lossy().into_owned();
+
+    asupersync::test_utils::run_test(|| async {
+        let writer = Connection::open(&db).await.expect("open writer");
+        seed_database(&writer).await;
+
+        writer
+            .execute("BEGIN CONCURRENT;")
+            .await
+            .expect("begin delete");
+        writer
+            .execute(&format!("DELETE FROM t WHERE id < {};", ROWS / 2))
+            .await
+            .expect("delete");
+        writer.execute("COMMIT;").await.expect("commit delete");
+        let freelist_before = query_i64(&writer, "PRAGMA freelist_count;").await;
+        assert!(freelist_before > 0, "delete must free pages: {freelist_before}");
+
+        // Checkpoint the freed state into the main database file.
+        writer
+            .execute_batch("PRAGMA wal_checkpoint(FULL);")
+            .await
+            .expect("checkpoint after delete");
+        let page_count_at_checkpoint = query_i64(&writer, "PRAGMA page_count;").await;
+        let freelist_at_checkpoint = query_i64(&writer, "PRAGMA freelist_count;").await;
+        assert_eq!(
+            freelist_at_checkpoint, freelist_before,
+            "checkpoint must carry the durable freelist across the boundary"
+        );
+
+        // Reinsert the same volume: reuse must come from the checkpointed
+        // freelist without growing the file.
+        writer
+            .execute("BEGIN CONCURRENT;")
+            .await
+            .expect("begin reinsert");
+        for id in 0..(ROWS / 2) {
+            let payload = format!("ckpt_{id}_{}", "c".repeat(PAYLOAD_LEN));
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({id}, '{payload}');"))
+                .await
+                .expect("reinsert");
+        }
+        writer.execute("COMMIT;").await.expect("commit reinsert");
+        let page_count_after_reuse = query_i64(&writer, "PRAGMA page_count;").await;
+        eprintln!(
+            "gh302 checkpoint-boundary: at_ckpt={page_count_at_checkpoint} \
+             freelist_at_ckpt={freelist_at_checkpoint} after={page_count_after_reuse}"
+        );
+        assert!(
+            page_count_after_reuse <= page_count_at_checkpoint,
+            "post-checkpoint reinsert must reuse checkpointed free pages, not grow: \
+             {page_count_at_checkpoint} -> {page_count_after_reuse}"
+        );
+
+        // Second checkpoint so the stock oracle reads a fully materialized
+        // main file as well as the WAL tail.
+        writer
+            .execute_batch("PRAGMA wal_checkpoint(FULL);")
+            .await
+            .expect("checkpoint after reuse");
+        writer.close().await.expect("close writer");
+    });
+
+    let oracle = rusqlite::Connection::open(&db_path).expect("oracle open");
+    let integrity: String = oracle
+        .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+        .expect("oracle integrity_check");
+    assert_eq!(
+        integrity, "ok",
+        "stock integrity_check must pass on the checkpointed image"
+    );
+    let rows: i64 = oracle
+        .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
+        .expect("oracle count");
+    assert_eq!(rows, ROWS);
+}
