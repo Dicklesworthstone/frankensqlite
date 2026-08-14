@@ -3514,6 +3514,18 @@ impl GroupCommitQueue {
                     if let Some(error) = self.observe_failed_epoch(target_epoch) {
                         return Err(error);
                     }
+                    // bd-keoaf: only BusyRecovery is settlement CONGESTION
+                    // (a retryable refusal while claimable work remains, per
+                    // the settle-round contract). Any other error is a
+                    // terminal settlement verdict — e.g. an in-doubt epoch
+                    // whose backend reconcile is Unsupported can NEVER
+                    // resolve, and riding it out spins this waiter forever.
+                    // Fail closed instead: the epoch is stranded and no
+                    // flusher can commit the queued batch without recovery,
+                    // so ejecting cannot double-apply it.
+                    if !matches!(settlement_error, FrankenError::BusyRecovery) {
+                        return Err(settlement_error);
+                    }
                     // bd-0shxy exactly-once: this waiter's batch is ALREADY
                     // QUEUED in target_epoch. Surfacing a transient settlement
                     // error here ejects the waiter with pager state
@@ -3558,6 +3570,11 @@ impl GroupCommitQueue {
                     // while the queue-wide prerequisite was being settled.
                     if let Some(error) = pending_wake.observe_failure() {
                         return Err(error);
+                    }
+                    // bd-keoaf: same terminal/congestion split as the
+                    // pre-wait arm — only BusyRecovery is retryable.
+                    if !matches!(settlement_error, FrankenError::BusyRecovery) {
+                        return Err(settlement_error);
                     }
                     // bd-0shxy exactly-once: same ruling as the pre-wait arm —
                     // a queued-batch waiter never surfaces settlement
