@@ -13013,6 +13013,52 @@ impl Connection {
         Ok(header)
     }
 
+    /// Prove exact page ownership for this connection's image with fixed
+    /// resident memory.
+    ///
+    /// Runs inside one read transaction and mutates neither the image nor this
+    /// connection. `spool_parent` names the directory that will hold the
+    /// anonymous ownership spool — one byte per database page, unlinked at
+    /// creation, so it never appears in the directory and cannot outlive the
+    /// call. It must be a real directory, not a symlink.
+    ///
+    /// This proves *structure* only: page ownership, freelist accounting, and
+    /// orphan detection. It performs no table/index semantic concordance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::DatabaseCorrupt`] for duplicate ownership,
+    /// cycles, out-of-range references, or orphan pages;
+    /// [`FrankenError::NotImplemented`] for an image shape this validator does
+    /// not admit (non-DELETE journal mode, or a schema above the fixed table
+    /// ceiling); and any propagated pager error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn validate_database_structure_bounded(
+        &self,
+        spool_parent: impl AsRef<Path>,
+    ) -> Result<BoundedDatabaseStructuralStats> {
+        let spool_parent = spool_parent.as_ref();
+        let cx = self.op_cx()?;
+        let mut txn = self
+            .begin_pager_txn_with_busy_timeout(&self.pager, &cx, TransactionMode::ReadOnly, false)
+            .await?;
+        let validation = self
+            .bounded_validate_structure_in_txn(&cx, &mut txn, spool_parent)
+            .await;
+        let rollback_result = txn.rollback(&cx).await;
+        match (validation, rollback_result) {
+            (Ok(stats), Ok(())) => Ok(stats),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(validation_error), Err(rollback_error)) => {
+                tracing::warn!(
+                    error = %rollback_error,
+                    "bounded structural validation failed and rollback also failed"
+                );
+                Err(validation_error)
+            }
+        }
+    }
+
     fn vacuum_extra_sqlite_master_entries(&self) -> Vec<crate::compat_persist::SqliteMasterEntry> {
         self.build_sqlite_master_rows()
             .into_iter()
@@ -31704,6 +31750,110 @@ impl InsertSelectReplayEmitter<'_> {
         InsertSelectReplayOutcome {
             changes: self.statement_changes,
             returning_rows: self.returning_rows,
+        }
+    }
+}
+
+/// Hard ceiling on a single record payload admitted by bounded validation.
+const BOUNDED_VALIDATION_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Hard ceiling on `sqlite_schema` tables admitted by one bounded validation.
+const BOUNDED_VALIDATION_MAX_SCHEMA_TABLES: usize = 4096;
+
+/// Proof counters from a bounded whole-image structural validation.
+///
+/// Every field is evidence that the proof ran within fixed resident memory:
+/// `ownership_spool_bytes` is exactly one byte per database page and
+/// `ownership_scan_window_bytes` is the fixed window used to scan that spool,
+/// neither of which grows with database size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedDatabaseStructuralStats {
+    /// Database pages declared by the validated main-file image.
+    pub database_pages: u32,
+    /// B-tree, overflow, freelist, and pointer-map pages claimed by the walk.
+    pub structural_pages_visited: u64,
+    /// Anonymous on-disk ownership bytes (exactly one byte per database page).
+    pub ownership_spool_bytes: u64,
+    /// Fixed resident window used to scan the ownership spool for orphans.
+    pub ownership_scan_window_bytes: usize,
+    /// Hard maximum record payload accepted by this bounded validator.
+    pub maximum_record_bytes: usize,
+}
+
+/// Where a page-ownership walk records the pages it claims.
+///
+/// Both variants enforce the same invariant — every database page is owned by
+/// exactly one structure — but they differ in residency. `Resident` keeps an
+/// owner string per page and is used by `integrity_check`, whose cost is
+/// already proportional to the database. `BoundedSpool` keeps one byte per page
+/// in an anonymous private file, so whole-image validation of an arbitrarily
+/// large database runs in fixed resident memory.
+///
+/// Having one sink keeps a single B-tree/overflow walker
+/// ([`Connection::walk_integrity_btree_pages`]) serving both paths, rather than
+/// a second copy of that walk drifting out of sync with this one.
+enum PageOwnershipSink<'a> {
+    /// Owner-string map, proportional to the database. `integrity_check`.
+    Resident(&'a mut HashMap<PageNumber, String>),
+    /// One byte per page in an anonymous spool, plus the diagnostic owner class
+    /// stamped for pages claimed through this sink.
+    #[cfg(not(target_arch = "wasm32"))]
+    BoundedSpool {
+        spool: &'a mut crate::bounded_validation::PrivatePageOwnership,
+        owner_class: u8,
+    },
+}
+
+impl PageOwnershipSink<'_> {
+    /// Claim `page_no` for `owner`, refusing a page that is already owned.
+    ///
+    /// The caller has already rejected out-of-range and lock-byte pages; this
+    /// is the duplicate/cycle/cross-tree check.
+    fn mark(&mut self, page_size: PageSize, page_no: PageNumber, owner: &str) -> Result<()> {
+        match self {
+            Self::Resident(owners) => {
+                if let Some(existing) = owners.insert(page_no, owner.to_owned()) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "page {} is referenced multiple times ({existing}; {owner})",
+                            page_no.get()
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::BoundedSpool { spool, owner_class } => {
+                spool.mark(page_size, page_no, *owner_class, owner)
+            }
+        }
+    }
+
+    /// First in-range page this sink never claimed, ignoring the lock-byte page.
+    ///
+    /// `Resident` answers from the owner map; `BoundedSpool` streams its
+    /// one-byte-per-page file through a fixed window, so neither path needs a
+    /// second database-proportional structure to find orphans.
+    fn first_unowned(&self, total_pages: u32, page_size: PageSize) -> Result<Option<PageNumber>> {
+        match self {
+            Self::Resident(owners) => Ok(Connection::first_unowned_database_page(
+                total_pages,
+                page_size,
+                |page_no| owners.contains_key(&page_no),
+            )),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::BoundedSpool { spool, .. } => spool.first_unowned(page_size),
+        }
+    }
+
+    /// Stamp the diagnostic owner class used for pages claimed next.
+    ///
+    /// No-op for `Resident`, which records a descriptive owner string instead.
+    const fn set_owner_class(&mut self, class: u8) {
+        match self {
+            Self::Resident(_) => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::BoundedSpool { owner_class, .. } => *owner_class = class,
         }
     }
 }
@@ -56333,7 +56483,7 @@ impl Connection {
     }
 
     fn record_integrity_page_owner(
-        owners: Option<&mut HashMap<PageNumber, String>>,
+        owners: Option<&mut PageOwnershipSink<'_>>,
         page_size: PageSize,
         page_no: PageNumber,
         total_pages: u32,
@@ -56357,15 +56507,8 @@ impl Connection {
             });
         }
 
-        if let Some(owners) = owners
-            && let Some(existing) = owners.insert(page_no, owner.clone())
-        {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "page {} is referenced multiple times ({existing}; {owner})",
-                    page_no.get()
-                ),
-            });
+        if let Some(owners) = owners {
+            owners.mark(page_size, page_no, &owner)?;
         }
 
         Ok(())
@@ -56402,7 +56545,7 @@ impl Connection {
         payload_size: u32,
         local_size: u32,
         owner: &str,
-        mut owners: Option<&mut HashMap<PageNumber, String>>,
+        mut owners: Option<&mut PageOwnershipSink<'_>>,
     ) -> Result<()> {
         let usable_size = page_size.usable(reserved_per_page);
         if usable_size <= 4 {
@@ -56506,7 +56649,7 @@ impl Connection {
         total_pages: u32,
         page_no: PageNumber,
         owner: &str,
-        mut owners: Option<&mut HashMap<PageNumber, String>>,
+        mut owners: Option<&mut PageOwnershipSink<'_>>,
     ) -> Result<()> {
         enum WalkTask {
             Btree {
@@ -56654,6 +56797,18 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Prove every page in the image is owned by exactly one structure.
+    ///
+    /// `owners` decides residency: `integrity_check` passes a `Resident` owner
+    /// map, whole-image bounded validation passes a `BoundedSpool`. The walk,
+    /// the freelist accounting, and the orphan scan are identical either way.
+    ///
+    /// `skip_orphan_scan` suppresses the final "page is never used" check. It
+    /// exists for auto-vacuum images, whose pointer-map pages this walk does not
+    /// claim and which would therefore read as orphans. A caller that has
+    /// claimed the pointer-map pages itself should pass `false` and get the
+    /// stronger check.
+    #[allow(clippy::too_many_arguments)]
     async fn validate_page_ownership_in_txn(
         cx: &Cx,
         txn: &mut TransactionKind,
@@ -56662,15 +56817,15 @@ impl Connection {
         total_pages: u32,
         freelist_trunk: u32,
         freelist_count: u32,
-        auto_vacuum_enabled: bool,
+        skip_orphan_scan: bool,
         schema: &[TableSchema],
         live_freelist: Option<&[PageNumber]>,
+        owners: &mut PageOwnershipSink<'_>,
     ) -> Result<()> {
         if total_pages == 0 {
             return Ok(());
         }
 
-        let mut owners = HashMap::new();
         Self::walk_integrity_btree_pages(
             cx,
             txn,
@@ -56679,7 +56834,7 @@ impl Connection {
             total_pages,
             PageNumber::ONE,
             "sqlite_master root",
-            Some(&mut owners),
+            Some(&mut *owners),
         )
         .await?;
 
@@ -56705,7 +56860,7 @@ impl Connection {
                     continue;
                 }
                 Self::record_integrity_page_owner(
-                    Some(&mut owners),
+                    Some(&mut *owners),
                     page_size,
                     free_page,
                     total_pages,
@@ -56718,7 +56873,7 @@ impl Connection {
             let mut trunk_index = 0_usize;
             while let Some(trunk_page) = next_trunk {
                 Self::record_integrity_page_owner(
-                    Some(&mut owners),
+                    Some(&mut *owners),
                     page_size,
                     trunk_page,
                     total_pages,
@@ -56738,7 +56893,7 @@ impl Connection {
 
                 for (leaf_idx, leaf_page) in trunk.leaf_pages.iter().copied().enumerate() {
                     Self::record_integrity_page_owner(
-                        Some(&mut owners),
+                        Some(&mut *owners),
                         page_size,
                         leaf_page,
                         total_pages,
@@ -56774,7 +56929,7 @@ impl Connection {
                     total_pages,
                     table_root,
                     &format!("table `{}` root", table.name),
-                    Some(&mut owners),
+                    Some(&mut *owners),
                 )
                 .await?;
             }
@@ -56790,24 +56945,137 @@ impl Connection {
                     total_pages,
                     index_root,
                     &format!("index `{}` root", index.name),
-                    Some(&mut owners),
+                    Some(&mut *owners),
                 )
                 .await?;
             }
         }
 
-        if !auto_vacuum_enabled
-            && let Some(page_no) =
-                Self::first_unowned_database_page(total_pages, page_size, |page_no| {
-                    owners.contains_key(&page_no)
-                })
-        {
+        if !skip_orphan_scan && let Some(page_no) = owners.first_unowned(total_pages, page_size)? {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!("page {} is never used", page_no.get()),
             });
         }
 
         Ok(())
+    }
+
+    fn bounded_validation_refusal(detail: impl Into<String>) -> FrankenError {
+        FrankenError::NotImplemented(format!(
+            "bounded whole-image validation refused unsupported candidate shape: {}",
+            detail.into()
+        ))
+    }
+
+    /// Prove exact page ownership for a self-contained image with fixed
+    /// resident memory.
+    ///
+    /// Walks every `sqlite_schema` table/index root (including WITHOUT ROWID
+    /// index B-trees), every overflow chain, the durable freelist, and
+    /// auto-vacuum pointer-map pages, recording ownership in an anonymous
+    /// one-byte-per-page spool. Duplicate ownership, cycles, out-of-range
+    /// references, and orphan pages are all detected without an O(database)
+    /// resident map.
+    ///
+    /// Pointer-map pages are claimed here, so the orphan scan runs even for
+    /// auto-vacuum images — stricter than `integrity_check`, which skips it.
+    ///
+    /// Owner classes are diagnostic only. The shared walk stamps a single class
+    /// for everything it claims; the pointer-map pass uses its own.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn bounded_validate_structure_in_txn(
+        &self,
+        cx: &Cx,
+        txn: &mut TransactionKind,
+        spool_parent: &Path,
+    ) -> Result<BoundedDatabaseStructuralStats> {
+        let header = {
+            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+            let bytes = page1.as_ref();
+            if bytes.iter().all(|byte| *byte == 0) || bytes.len() < DATABASE_HEADER_SIZE {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "bounded structural candidate has no initialized page 1".to_owned(),
+                });
+            }
+            parse_database_header_checked(bytes)?
+        };
+        if header.write_version != 1 || header.read_version != 1 {
+            return Err(Self::bounded_validation_refusal(
+                "main header is not rollback/DELETE mode",
+            ));
+        }
+
+        let published_pages = self.pager.refresh_published_snapshot(cx).await?.db_size;
+        if published_pages != header.page_count || published_pages == 0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "bounded candidate page extent mismatch: header={} snapshot={published_pages}",
+                    header.page_count
+                ),
+            });
+        }
+
+        let schema = self.schema.borrow().clone();
+        if schema.len() > BOUNDED_VALIDATION_MAX_SCHEMA_TABLES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "schema contains {} tables, above the fixed limit \
+                 {BOUNDED_VALIDATION_MAX_SCHEMA_TABLES}",
+                schema.len()
+            )));
+        }
+
+        let mut spool =
+            crate::bounded_validation::PrivatePageOwnership::create(spool_parent, published_pages)?;
+        let mut owners = PageOwnershipSink::BoundedSpool {
+            spool: &mut spool,
+            owner_class: 5,
+        };
+
+        if header.largest_root_page != 0 {
+            let usable_size = header.page_size.usable(header.reserved_per_page);
+            for raw_page in 2..=published_pages {
+                let page = PageNumber::new(raw_page).ok_or_else(|| {
+                    FrankenError::internal("non-zero pointer-map page number expected")
+                })?;
+                if fsqlite_btree::freelist::is_ptrmap_page(
+                    page,
+                    usable_size,
+                    header.page_size.get(),
+                ) {
+                    Self::record_integrity_page_owner(
+                        Some(&mut owners),
+                        header.page_size,
+                        page,
+                        published_pages,
+                        "auto-vacuum pointer-map page".to_owned(),
+                    )?;
+                }
+            }
+        }
+
+        owners.set_owner_class(1);
+        Self::validate_page_ownership_in_txn(
+            cx,
+            txn,
+            header.page_size,
+            header.reserved_per_page,
+            published_pages,
+            header.freelist_trunk,
+            header.freelist_count,
+            false,
+            &schema,
+            None,
+            &mut owners,
+        )
+        .await?;
+
+        Ok(BoundedDatabaseStructuralStats {
+            database_pages: published_pages,
+            structural_pages_visited: spool.marked_pages(),
+            ownership_spool_bytes: spool.spool_bytes(),
+            ownership_scan_window_bytes: crate::bounded_validation::OWNERSHIP_SCAN_WINDOW_BYTES,
+            maximum_record_bytes: BOUNDED_VALIDATION_MAX_RECORD_BYTES,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -56843,6 +57111,8 @@ impl Connection {
         };
 
         if !quick {
+            let mut owner_map = HashMap::new();
+            let mut owners = PageOwnershipSink::Resident(&mut owner_map);
             Self::validate_page_ownership_in_txn(
                 cx,
                 txn,
@@ -56854,6 +57124,7 @@ impl Connection {
                 auto_vacuum_enabled,
                 &schema,
                 live_freelist,
+                &mut owners,
             )
             .await?;
         } else {
@@ -222710,6 +222981,112 @@ mod pager_routing_tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].values()[0], SqliteValue::Text("Engineering".into()));
             assert_eq!(rows[0].values()[1], SqliteValue::Integer(220));
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_structural_validation_proves_ownership_in_fixed_residency() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bounded-structure.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&db_path).await.expect("file-backed open");
+            conn.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+                .await
+                .unwrap();
+            conn.execute("CREATE INDEX t_payload ON t (payload);")
+                .await
+                .unwrap();
+            // A payload well past one page forces an overflow chain, so the
+            // walk has to follow overflow pages to account for every page.
+            let long = "x".repeat(16 * 1024);
+            for id in 1..=8_i64 {
+                conn.execute(&format!("INSERT INTO t VALUES ({id}, '{long}');"))
+                    .await
+                    .unwrap();
+            }
+            // Freeing rows leaves durable freelist pages, which the walk must
+            // claim too or they would read as orphans.
+            conn.execute("DELETE FROM t WHERE id > 5;").await.unwrap();
+
+            let stats = conn
+                .validate_database_structure_bounded(dir.path())
+                .await
+                .expect("bounded structural validation must accept a healthy image");
+
+            assert!(stats.database_pages > 1, "image should span several pages");
+            assert_eq!(
+                stats.ownership_spool_bytes,
+                u64::from(stats.database_pages),
+                "the ownership spool must be exactly one byte per database page"
+            );
+            assert_eq!(
+                stats.ownership_scan_window_bytes,
+                crate::bounded_validation::OWNERSHIP_SCAN_WINDOW_BYTES,
+                "orphan scanning must use the fixed window, not a page-count-sized buffer"
+            );
+            assert!(
+                stats.structural_pages_visited > 0,
+                "the walk must claim pages"
+            );
+            assert!(
+                stats.structural_pages_visited <= u64::from(stats.database_pages),
+                "no page may be claimed more than once"
+            );
+
+            // The proof is read-only and repeatable: a second run must agree.
+            let again = conn
+                .validate_database_structure_bounded(dir.path())
+                .await
+                .expect("validation must not mutate the image it proves");
+            assert_eq!(stats, again);
+
+            // The spool is anonymous: nothing is left behind in the parent.
+            let residue: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| !name.starts_with("bounded-structure.db"))
+                .collect();
+            assert!(
+                residue.is_empty(),
+                "bounded validation must not leave spool files behind, found {residue:?}"
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_structural_validation_refuses_a_symlinked_spool_parent() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bounded-symlink.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&db_path).await.expect("file-backed open");
+            conn.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+
+            let real = dir.path().join("real-spool");
+            std::fs::create_dir(&real).unwrap();
+            let linked = dir.path().join("linked-spool");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&real, &linked).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_dir(&real, &linked).unwrap();
+
+            let error = conn
+                .validate_database_structure_bounded(&linked)
+                .await
+                .expect_err("a symlinked spool parent must be refused, not followed");
+            assert!(
+                matches!(error, FrankenError::NotImplemented(_)),
+                "expected a typed refusal, got {error:?}"
+            );
         });
     }
 
