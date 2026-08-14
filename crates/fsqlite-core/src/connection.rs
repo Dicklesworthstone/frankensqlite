@@ -32942,7 +32942,7 @@ const BOUNDED_VALIDATION_MAX_SCHEMA_TABLES: usize = 4096;
 /// `ownership_spool_bytes` is exactly one byte per database page and
 /// `ownership_scan_window_bytes` is the fixed window used to scan that spool,
 /// neither of which grows with database size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BoundedDatabaseStructuralStats {
     /// Database pages declared by the validated main-file image.
     pub database_pages: u32,
