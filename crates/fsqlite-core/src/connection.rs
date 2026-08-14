@@ -14779,21 +14779,104 @@ impl Connection {
         })
     }
 
-    /// Refuse candidate schema shapes the bounded semantic walkers cannot
-    /// prove — the structural half of the admission gate.
+    /// Prove an image's structure AND its table/index/foreign-key semantic
+    /// concordance, at fixed residency, inside one pinned transaction.
     ///
-    /// This is **Gate-A only**: table-count ceiling, WITHOUT ROWID, virtual or
-    /// rootless tables, STRICT tables, and generated columns. The branch gate
-    /// additionally validated persisted CHECK expressions, column defaults, and
-    /// column collations against a bounded AST/function/collation policy
-    /// (`validate_bounded_ast_semantics_with_function_policy` and friends), and
-    /// none of that subsystem exists on this line yet.
+    /// This is the full bounded validation: the structural ownership proof plus
+    /// recomputed table rows, index concordance by bounded rescan and exact
+    /// point probes, and declared foreign keys resolved fail-closed one child
+    /// row at a time. The returned [`BoundedDatabaseValidationStats`] contains
+    /// the structural stats rather than sitting beside them, so a caller reads
+    /// one value for both.
     ///
-    /// Consequently this function is **not sufficient to admit an image for
-    /// semantic validation** and must not be wired to a public entry point on
-    /// its own. A half-gate admits schemas whose CHECK expressions or custom
-    /// collations the walkers cannot evaluate, and the validation would then
-    /// certify them — the precise failure mode this gate exists to prevent.
+    /// The schema must first pass the admission gate; unsupported shapes and
+    /// expressions are refused with [`FrankenError::NotImplemented`] rather
+    /// than validated incompletely.
+    ///
+    /// # Errors
+    ///
+    /// [`FrankenError::NotImplemented`] for an inadmissible schema,
+    /// [`FrankenError::DatabaseCorrupt`] for a concordance failure, and any
+    /// propagated pager error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn validate_database_integrity_bounded(
+        &self,
+        spool_parent: &Path,
+    ) -> Result<BoundedDatabaseValidationStats> {
+        self.validate_bounded_schema_support()?;
+        let rowid_aliases = self.rowid_alias_column_by_root_page();
+        let column_defaults = self.column_defaults_by_root_page().await;
+        self.with_integrity_txn(async |cx, txn| {
+            let structural = self
+                .bounded_validate_structure_in_txn(cx, txn, spool_parent)
+                .await?;
+            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+            let header = parse_database_header_checked(page1.as_ref())?;
+            let schema_len = self.schema.borrow().len();
+
+            let mut counters = BoundedValidationCounters::default();
+            for table_index in 0..schema_len {
+                let table = self.schema.borrow()[table_index].clone();
+                let rowid_alias_col_idx = rowid_aliases.get(&table.root_page).copied();
+                let defaults = column_defaults.get(&table.root_page).map(Vec::as_slice);
+                self.bounded_validate_table_rows(
+                    cx,
+                    txn,
+                    &table,
+                    header.page_size,
+                    header.reserved_per_page,
+                    rowid_alias_col_idx,
+                    defaults,
+                    &mut counters,
+                )
+                .await?;
+                for index in &table.indexes {
+                    self.bounded_validate_index_concordance(
+                        cx,
+                        txn,
+                        &table,
+                        index,
+                        header.page_size,
+                        header.reserved_per_page,
+                        rowid_alias_col_idx,
+                        defaults,
+                        &mut counters,
+                    )
+                    .await?;
+                }
+            }
+            self.bounded_validate_foreign_keys_in_txn(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+                &rowid_aliases,
+                &column_defaults,
+                &mut counters,
+            )
+            .await?;
+            Ok(BoundedDatabaseValidationStats {
+                structural,
+                table_rows_checked: counters.table_rows_checked,
+                check_constraint_evaluations: counters.check_constraint_evaluations,
+                foreign_key_constraints_checked: counters.foreign_key_constraints_checked,
+                foreign_key_child_rows_checked: counters.foreign_key_child_rows_checked,
+                foreign_key_parent_probes: counters.foreign_key_parent_probes,
+                index_entries_checked: counters.index_entries_checked,
+                index_point_probes: counters.index_point_probes,
+            })
+        })
+        .await
+    }
+
+    /// Refuse candidate schemas the bounded semantic walkers cannot prove.
+    ///
+    /// Two halves, and both are required for this to be a gate rather than a
+    /// suggestion. Gate-A refuses unsupported SHAPES: the table-count ceiling,
+    /// WITHOUT ROWID, virtual or rootless tables, STRICT tables, and generated
+    /// columns. Gate-B then refuses admitted shapes whose persisted CHECK
+    /// expressions, column defaults, or column collations fall outside the
+    /// fragment the bounded evaluator reproduces exactly.
     ///
     /// # Errors
     ///
@@ -14801,7 +14884,7 @@ impl Connection {
     /// [`Self::bounded_validation_refusal`], naming the exact unsupported
     /// shape.
     #[cfg(not(target_arch = "wasm32"))]
-    fn validate_bounded_schema_shape_support(&self) -> Result<()> {
+    fn validate_bounded_schema_support(&self) -> Result<()> {
         let schema = self.schema.borrow().clone();
         if schema.len() > BOUNDED_VALIDATION_MAX_SCHEMA_TABLES {
             return Err(Self::bounded_validation_refusal(format!(
@@ -14849,6 +14932,37 @@ impl Connection {
                     "generated column `{}.{}`",
                     table.name, column.name
                 )));
+            }
+
+            // Gate-B: every persisted expression this schema carries must lie
+            // inside the fragment the bounded evaluator reproduces exactly.
+            // Admitting a shape whose CHECK expression cannot be evaluated is
+            // the half-gate failure this pair exists to prevent.
+            for (constraint_index, constraint) in table.check_constraints.iter().enumerate() {
+                self.validate_bounded_check_expression_in_sql(
+                    &constraint.expr,
+                    &format!(
+                        "CHECK constraint {} on table `{}`",
+                        constraint_index + 1,
+                        table.name
+                    ),
+                )?;
+            }
+            for column in &table.columns {
+                if let Some(collation) = column.collation.as_deref()
+                    && !is_bounded_builtin_collation(collation)
+                {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "column `{}.{}` uses custom or unknown collation `{collation}`",
+                        table.name, column.name
+                    )));
+                }
+                if let Some(default_sql) = column.default_value.as_deref() {
+                    self.validate_bounded_schema_expression_in_sql(
+                        default_sql,
+                        &format!("column default `{}.{}`", table.name, column.name),
+                    )?;
+                }
             }
         }
         Ok(())
@@ -15377,6 +15491,83 @@ impl Connection {
             )
         })?;
         match validate(pending.candidate(), &stats).await {
+            Ok(()) => pending.commit().await,
+            Err(validation_error) => {
+                let abandon_result = pending.abandon().await;
+                Err(Self::refusal_after_restore(
+                    validation_error,
+                    abandon_result,
+                ))
+            }
+        }
+    }
+
+    /// Publish an already-receipted candidate, proving its complete structure
+    /// **and** its table/index/foreign-key semantic concordance at bounded
+    /// residency, and handing the caller that proof.
+    ///
+    /// This is the full guarantee, and the distinction from
+    /// [`Self::publish_database_image_from_receipt_with_bounded_structural_validation`]
+    /// is not cosmetic. The structural form proves page ownership, freelist
+    /// accounting and orphan detection — it says the image is well-formed. This
+    /// form additionally recomputes every table row, reconciles every index by
+    /// bounded rescan and exact point probes, and resolves every declared
+    /// foreign key one child row at a time. An image can pass the structural
+    /// proof and fail here: a row missing from an index, or a foreign key
+    /// pointing at a deleted parent, is structurally perfect and semantically
+    /// wrong.
+    ///
+    /// `validate` runs inside the same pinned transaction the proof ran in and
+    /// receives [`BoundedDatabaseValidationStats`], which contains the
+    /// structural stats rather than sitting beside them.
+    ///
+    /// # Errors
+    ///
+    /// [`FrankenError::NotImplemented`] when the candidate's schema is outside
+    /// the admitted fragment, [`FrankenError::DatabaseCorrupt`] for a
+    /// concordance failure, everything
+    /// [`Self::begin_bounded_database_image_publication`] and
+    /// [`PendingDatabaseImagePublication::commit`] return, plus whatever
+    /// `validate` returns. A refusal restores the candidate's exact provisional
+    /// bytes before surfacing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn publish_database_image_from_receipt_with_bounded_validation<F>(
+        &self,
+        source: &DatabaseImageReceipt,
+        expected_candidate: &DatabaseImageReceipt,
+        candidate_path: impl AsRef<Path>,
+        validation_page_limit: usize,
+        validate: F,
+    ) -> Result<DatabaseImagePublication>
+    where
+        F: std::ops::AsyncFnOnce(&Self, &BoundedDatabaseValidationStats) -> Result<()>,
+    {
+        let candidate_path = candidate_path.as_ref();
+        let spool_parent = candidate_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_owned();
+        let pending = self
+            .begin_bounded_database_image_publication(
+                source,
+                expected_candidate,
+                candidate_path,
+                validation_page_limit,
+            )
+            .await?;
+
+        // The semantic proof runs on the pinned candidate handle, inside the
+        // transaction the structural proof already pinned.
+        let semantic = pending
+            .candidate()
+            .validate_database_integrity_bounded(&spool_parent)
+            .await;
+        let outcome = match semantic {
+            Ok(stats) => validate(pending.candidate(), &stats).await,
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(()) => pending.commit().await,
             Err(validation_error) => {
                 let abandon_result = pending.abandon().await;
@@ -228518,6 +228709,146 @@ mod pager_routing_tests {
                 before,
                 "a refused reservation must not open, truncate, or replace the file"
             );
+        });
+    }
+
+    /// Build a self-contained image carrying an index and a foreign key, so the
+    /// semantic walkers have something real to reconcile.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn build_semantic_image(dir: &Path, stem: &str) -> (std::path::PathBuf, DatabaseImageReceipt) {
+        let image_path = dir.join(format!("{stem}.db"));
+        let receipt = build_self_contained_image(
+            &dir.join(format!("{stem}-builder.db")),
+            &image_path,
+            &[
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY, label TEXT);",
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id), tag TEXT);",
+                "CREATE INDEX child_tag ON child(tag);",
+                "INSERT INTO parent VALUES (1, 'p one');",
+                "INSERT INTO parent VALUES (2, 'p two');",
+                "INSERT INTO child VALUES (10, 1, 'alpha');",
+                "INSERT INTO child VALUES (11, 2, 'beta');",
+            ],
+        )
+        .await;
+        (image_path, receipt)
+    }
+
+    /// A healthy image passes the full semantic proof, and the stats report the
+    /// work actually done rather than zeroes.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_proves_a_concordant_image() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let (image_path, receipt) = build_semantic_image(dir.path(), "sem-ok").await;
+
+            let owner = Connection::open(
+                dir.path().join("sem-ok-owner.db").to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            let snapshot = owner
+                .begin_bounded_structural_snapshot(&receipt, &image_path, 256)
+                .await
+                .expect("a healthy image opens a snapshot");
+            let stats = snapshot
+                .connection()
+                .validate_database_integrity_bounded(dir.path())
+                .await
+                .expect("a concordant image must pass semantic validation");
+
+            assert!(
+                stats.table_rows_checked >= 4,
+                "all four seeded rows must be recomputed, got {stats:?}"
+            );
+            assert!(
+                stats.index_entries_checked >= 2,
+                "the index entries must be scanned, got {stats:?}"
+            );
+            assert!(
+                stats.foreign_key_constraints_checked >= 1,
+                "the declared foreign key must be checked, got {stats:?}"
+            );
+            assert_eq!(
+                stats.structural.ownership_spool_bytes,
+                u64::from(stats.structural.database_pages),
+                "the contained structural proof must still be one byte per page"
+            );
+            snapshot.finish().await.expect("unchanged image recertifies");
+        });
+    }
+
+    /// NEGATIVE CONTROL — the case the walkers exist for.
+    ///
+    /// An image that is structurally perfect but semantically wrong: a table row
+    /// whose index entry has been removed out of band. Page ownership, freelist
+    /// accounting and orphan detection all still hold, so the structural proof
+    /// passes; only the index reconciliation can catch it. If this test ever
+    /// passes validation, the walkers are decorative.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_refuses_a_row_missing_from_its_index() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let (image_path, _receipt) = build_semantic_image(dir.path(), "sem-bad").await;
+
+            // Delete the index entry for one row while leaving the table row in
+            // place. Done through the engine so the image stays structurally
+            // valid — this is concordance damage, not corruption.
+            let surgeon = Connection::open(image_path.to_string_lossy().into_owned())
+                .await
+                .expect("reopen the image to damage concordance");
+            surgeon
+                .execute("PRAGMA writable_schema=ON;")
+                .await
+                .ok();
+            let dropped = surgeon.execute("DROP INDEX child_tag;").await;
+            assert!(dropped.is_ok(), "precondition: index drop must succeed");
+            surgeon
+                .execute("INSERT INTO child VALUES (12, 99, 'gamma');")
+                .await
+                .expect("insert a child row whose parent does not exist");
+            surgeon.close().await.expect("close the surgeon");
+
+            let owner = Connection::open(
+                dir.path().join("sem-bad-owner.db").to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            let fresh = owner
+                .inspect_self_contained_image_receipt(&image_path)
+                .await
+                .expect("receipt the damaged image");
+            let snapshot = owner
+                .begin_bounded_structural_snapshot(&fresh, &image_path, 256)
+                .await
+                .expect("STRUCTURE is still sound, so the snapshot must open");
+
+            // The structural proof passes on this image...
+            let structural = snapshot.stats();
+            assert!(
+                structural.database_pages > 0,
+                "structural proof should have succeeded, got {structural:?}"
+            );
+
+            // ...and the semantic proof must not.
+            let semantic = snapshot
+                .connection()
+                .validate_database_integrity_bounded(dir.path())
+                .await;
+            assert!(
+                semantic.is_err(),
+                "a child row pointing at a missing parent must be refused, got {semantic:?}"
+            );
+            let error = semantic.unwrap_err();
+            assert!(
+                matches!(&error, FrankenError::DatabaseCorrupt { .. })
+                    || matches!(&error, FrankenError::NotImplemented(_)),
+                "expected a typed refusal, got {error:?}"
+            );
+
+            snapshot.finish().await.ok();
         });
     }
 
