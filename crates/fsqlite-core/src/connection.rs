@@ -223317,6 +223317,73 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_delete_not_in_ordered_limited_subquery_shape_variants_never_halt() {
+        // bd-brzp8 fidelity sweep: the minimal bead shape passes at HEAD, but
+        // the downstream 0.3.0 halt may have depended on schema context.
+        // Every variant must at least EXECUTE (no 'VDBE halted' / probe
+        // invariant failure); strict no-fallback keeps the compiled path hot.
+        asupersync::test_utils::run_test(|| async {
+            let variants: &[(&str, &str, &str)] = &[
+                (
+                    "without_rowid",
+                    "CREATE TABLE sr(id TEXT PRIMARY KEY, pinned INTEGER NOT NULL DEFAULT 0, updated_ts INTEGER NOT NULL) WITHOUT ROWID;",
+                    "INSERT INTO sr VALUES ('a',0,100),('b',0,200),('c',1,50),('d',0,300);",
+                ),
+                (
+                    "text_pk_rowid",
+                    "CREATE TABLE sr(id TEXT PRIMARY KEY, pinned INTEGER NOT NULL DEFAULT 0, updated_ts INTEGER NOT NULL);",
+                    "INSERT INTO sr VALUES ('a',0,100),('b',0,200),('c',1,50),('d',0,300);",
+                ),
+                (
+                    "indexed_wide",
+                    "CREATE TABLE sr(id INTEGER PRIMARY KEY, name TEXT, query_json TEXT, pinned INTEGER NOT NULL DEFAULT 0, use_count INTEGER DEFAULT 0, updated_ts INTEGER NOT NULL); \
+                     CREATE INDEX idx_sr_ts ON sr(updated_ts DESC); \
+                     CREATE INDEX idx_sr_pinned ON sr(pinned) WHERE pinned=1;",
+                    "INSERT INTO sr(id,name,query_json,pinned,updated_ts) VALUES (1,'a','{}',0,100),(2,'b','{}',0,200),(3,'c','{}',1,50),(4,'d','{}',0,300);",
+                ),
+            ];
+            for (label, ddl, seed) in variants {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir
+                    .path()
+                    .join(format!("brzp8_{label}.db"))
+                    .to_string_lossy()
+                    .into_owned();
+                let conn = Connection::open(path).await.unwrap();
+                for stmt in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    conn.execute(stmt).await.unwrap();
+                }
+                conn.execute(seed).await.unwrap();
+                conn.set_strict_mem_fallback_rejection(true);
+                let result = conn
+                    .execute(
+                        "DELETE FROM sr WHERE pinned=0 AND id NOT IN \
+                         (SELECT id FROM sr WHERE pinned=0 ORDER BY updated_ts DESC LIMIT 2)",
+                    )
+                    .await;
+                conn.set_strict_mem_fallback_rejection(false);
+                match &result {
+                    Ok(_) => {}
+                    Err(error) => {
+                        let text = format!("{error:?}");
+                        assert!(
+                            !text.contains("halted") && !text.contains("invariant"),
+                            "variant {label} reproduced the bd-brzp8 halt: {text}"
+                        );
+                        panic!("variant {label} failed unexpectedly: {text}");
+                    }
+                }
+                let rows = conn.query("SELECT count(*) FROM sr;").await.unwrap();
+                assert_eq!(
+                    rows[0].values()[0],
+                    SqliteValue::Integer(3),
+                    "variant {label}: pinned + top-2 unpinned must remain"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn test_pragma_integrity_check_honors_collate_in_partial_index_predicate() {
         // bd-integrity-partial-collate-puctc oracle (sqlite3 3.46.1): the row
         // ('FiRe') satisfies `label COLLATE NOCASE = 'fire'`, is admitted to
