@@ -6203,6 +6203,13 @@ pub struct VdbeEngine {
     aggregate_function_cache: HashMap<usize, Arc<ErasedAggregateFunction>>,
     /// Collation registry for compare, sort, DISTINCT, and grouping semantics.
     collation_registry: Arc<Mutex<CollationRegistry>>,
+    /// bd-4nuqo: lazily cached answer to "is any built-in collation name
+    /// overridden by an application collation?". Comparison opcodes with an
+    /// absent or built-in-named P4 may only take the raw-byte/builtin fast
+    /// path when this is false. Sound to cache per engine because custom
+    /// collation registration invalidates prepared statements, so the answer
+    /// cannot change mid-program; reset when a registry is (re)attached.
+    builtin_collations_overridden_cache: Option<bool>,
     /// Lazily allocated feature state kept off the hot interpreter footprint.
     cold_state: Option<Box<ColdVdbeState>>,
     /// Schema cookie value provided by the Connection (bd-3mmj).
@@ -6766,6 +6773,7 @@ impl VdbeEngine {
             scalar_function_cache: HashMap::new(),
             aggregate_function_cache: HashMap::new(),
             collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
+            builtin_collations_overridden_cache: None,
             cold_state: None,
             schema_cookie: 0,
             last_compare_result: None,
@@ -8288,9 +8296,23 @@ impl VdbeEngine {
     /// Attach a shared collation registry for compare and sorting opcodes.
     pub fn set_collation_registry(&mut self, registry: Arc<Mutex<CollationRegistry>>) {
         self.collation_registry = Arc::clone(&registry);
+        self.builtin_collations_overridden_cache = None;
         if let Some(db) = self.db.as_mut() {
             db.set_collation_registry(registry);
         }
+    }
+
+    /// bd-4nuqo: whether an application override shadows a built-in collation
+    /// name. See `builtin_collations_overridden_cache` for the caching
+    /// soundness argument.
+    #[inline]
+    fn builtin_collations_overridden(&mut self) -> bool {
+        if let Some(cached) = self.builtin_collations_overridden_cache {
+            return cached;
+        }
+        let overridden = self.lock_collation().any_builtin_overridden();
+        self.builtin_collations_overridden_cache = Some(overridden);
+        overridden
     }
 
     /// Acquire a read-lock on the collation registry.  Callers should hold
@@ -9133,6 +9155,7 @@ impl VdbeEngine {
 
                 // ── Comparison Jumps ────────────────────────────────────
                 Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
+                    let builtins_overridden = self.builtin_collations_overridden();
                     let lhs = self.get_reg(op.p3);
                     let rhs = self.get_reg(op.p1);
                     let store_p2 = (op.p5 & 0x20) != 0; // SQLITE_STOREP2
@@ -9173,14 +9196,23 @@ impl VdbeEngine {
                         // when P5 cannot change that storage class. In
                         // particular, TEXT P5 must stringify numeric values and
                         // NUMERIC P5 must attempt to coerce each TEXT value.
-                        let cmp = if let Some(cmp) =
-                            fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5)
+                        let cmp = if !builtins_overridden
+                            && let Some(cmp) =
+                                fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5)
                         {
                             cmp
                         } else {
                             // General path: affinity coercion + collation.
+                            // bd-4nuqo: with a built-in name overridden, an
+                            // absent P4 still means BINARY — and BINARY may
+                            // now be an application comparator, so it must
+                            // resolve through the registry.
                             let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs, op.p5);
-                            if let P4::Collation(ref coll_name) = op.p4 {
+                            if builtins_overridden || matches!(op.p4, P4::Collation(_)) {
+                                let coll_name = match &op.p4 {
+                                    P4::Collation(name) => name.as_str(),
+                                    _ => "BINARY",
+                                };
                                 let coll = self.lock_collation();
                                 collate_compare(&cmp_lhs, &cmp_rhs, coll_name, &coll)
                             } else {
@@ -14827,6 +14859,7 @@ impl VdbeEngine {
 
     #[inline(always)]
     fn execute_comparison_jump_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<()> {
+        let builtins_overridden = self.builtin_collations_overridden();
         let lhs = self.get_reg(op.p3);
         let rhs = self.get_reg(op.p1);
         let store_p2 = (op.p5 & 0x20) != 0; // SQLITE_STOREP2
@@ -14859,11 +14892,20 @@ impl VdbeEngine {
             return Ok(());
         }
 
-        let cmp = if let Some(cmp) = fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5) {
+        let cmp = if !builtins_overridden
+            && let Some(cmp) = fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5)
+        {
             cmp
         } else {
+            // bd-4nuqo: with a built-in name overridden, an absent P4 still
+            // means BINARY — which may now be an application comparator, so
+            // it must resolve through the registry.
             let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs, op.p5);
-            if let P4::Collation(ref coll_name) = op.p4 {
+            if builtins_overridden || matches!(op.p4, P4::Collation(_)) {
+                let coll_name = match &op.p4 {
+                    P4::Collation(name) => name.as_str(),
+                    _ => "BINARY",
+                };
                 let coll = self.lock_collation();
                 collate_compare(&cmp_lhs, &cmp_rhs, coll_name, &coll)
             } else {

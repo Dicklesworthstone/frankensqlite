@@ -3866,6 +3866,44 @@ mod tests {
         assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":{"n":5}}"#);
     }
 
+    // bd-obb21: jsonb_array/jsonb_object must honor the JSON subtype on value
+    // args (same class as bd-7h73c) — embed as a JSON subtree, not stringify
+    // (verified sqlite3 3.46.1: json(jsonb_array(json_array(1,2),3)) = [[1,2],3];
+    // json(jsonb_object('a',json_array(1,2))) = {"a":[1,2]}).
+    #[test]
+    fn test_jsonb_array_honors_json_subtype_on_value() {
+        let out = JsonbArrayFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string("[1,2]")),
+                    SqliteValue::Integer(3),
+                ],
+                &[JSON_SUBTYPE, 0],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_array should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), "[[1,2],3]");
+    }
+
+    #[test]
+    fn test_jsonb_object_honors_json_subtype_on_value() {
+        let out = JsonbObjectFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string("a")),
+                    SqliteValue::Text(SmallText::from_string("[1,2]")),
+                ],
+                &[0, JSON_SUBTYPE],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_object should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":[1,2]}"#);
+    }
+
     #[test]
     fn test_registered_json_pretty_accepts_jsonb_blob_input() -> Result<()> {
         let mut registry = FunctionRegistry::new();

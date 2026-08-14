@@ -9572,6 +9572,11 @@ fn promote_group_commit_page_one_headers(
     promoted
 }
 
+/// bd-dw8oe diagnostics: tiny hex helper for the DW8OE_TRACE probes.
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// bd-dw8oe: make synthetic page-1 rewrites freelist-header-PRESERVING.
 ///
 /// A batch that rewrites page 1 without carrying a freelist publication
@@ -19896,11 +19901,18 @@ where
                             let count = u32::from_be_bytes(
                                 image[36..40].try_into().expect("durable count slice"),
                             );
-                            promote_group_commit_page_one_freelist_headers(
+                            let changed = promote_group_commit_page_one_freelist_headers(
                                 &mut batches,
                                 head,
                                 count,
                             );
+                            if std::env::var_os("DW8OE_TRACE").is_some() {
+                                eprintln!(
+                                    "DW8OE PROMOTE durable_head={head} durable_count={count} changed={changed}"
+                                );
+                            }
+                        } else if std::env::var_os("DW8OE_TRACE").is_some() {
+                            eprintln!("DW8OE PROMOTE no-durable-page1");
                         }
                     }
                 }
@@ -20180,6 +20192,23 @@ where
                                                 .iter()
                                                 .any(|frame| frame.page_number == 1)
                                     });
+                                    if std::env::var_os("DW8OE_TRACE").is_some() {
+                                        for batch in &batches {
+                                            for frame in &batch.frames {
+                                                if frame.page_number == 1
+                                                    && frame.page_data.len()
+                                                        >= DATABASE_HEADER_SIZE
+                                                {
+                                                    eprintln!(
+                                                        "DW8OE GATE-P1 reason={:?} pub={} bytes32_40={}",
+                                                        fallback_reason,
+                                                        batch.published_durable_freelist.is_some(),
+                                                        hex_bytes(&frame.page_data[32..40]),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                     if carries_synthetic_page_one {
                                         let durable_page_one = read_durable_page_under_gate(
                                             cx,
@@ -20189,6 +20218,16 @@ where
                                             1,
                                         )
                                         .await?;
+                                        if std::env::var_os("DW8OE_TRACE").is_some() {
+                                            eprintln!(
+                                                "DW8OE GATE durable32_40={}",
+                                                durable_page_one
+                                                    .as_deref()
+                                                    .map_or("none".to_owned(), |d| hex_bytes(
+                                                        &d[32..40]
+                                                    )),
+                                            );
+                                        }
                                         if stale_synthetic_page_one_freelist_header(
                                             &batches,
                                             durable_page_one.as_deref(),
@@ -22339,6 +22378,17 @@ where
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
                     wal_attempt = Some(attempt);
                 }
+                if std::env::var_os("DW8OE_TRACE").is_some() {
+                    let inrange = pending_free_pages
+                        .iter()
+                        .filter(|page| page.get() <= committed_db_size)
+                        .count();
+                    eprintln!(
+                        "DW8OE DIRTY freelist_dirty={freelist_dirty} pending={} inrange={inrange} committed_db={committed_db_size} inner_freelist={}",
+                        pending_free_pages.len(),
+                        inner.freelist.len(),
+                    );
+                }
                 if freelist_dirty {
                     match serialize_freelist_to_write_set(
                         cx,
@@ -23090,6 +23140,17 @@ where
                     ));
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
                     wal_attempt = Some(attempt);
+                }
+                if std::env::var_os("DW8OE_TRACE").is_some() {
+                    let inrange = pending_free_pages
+                        .iter()
+                        .filter(|page| page.get() <= committed_db_size)
+                        .count();
+                    eprintln!(
+                        "DW8OE DIRTY freelist_dirty={freelist_dirty} pending={} inrange={inrange} committed_db={committed_db_size} inner_freelist={}",
+                        pending_free_pages.len(),
+                        inner.freelist.len(),
+                    );
                 }
                 if freelist_dirty {
                     match serialize_freelist_to_write_set(
