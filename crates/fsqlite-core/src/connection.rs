@@ -112,7 +112,7 @@ use fsqlite_func::{
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_pager::ConnectionPagerOpenMode;
-use fsqlite_pager::pager::DatabaseImageReceipt;
+pub use fsqlite_pager::pager::DatabaseImageReceipt;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
@@ -12949,6 +12949,55 @@ impl Connection {
         let cx = self.op_cx()?;
         self.quiesce_pager_export_state(&cx).await?;
         self.pager.export_bytes(&cx).await
+    }
+
+    /// Quiesce this connection for whole-image capture or publication.
+    ///
+    /// Stricter than [`Self::quiesce_pager_export_state`]: whole-image work
+    /// binds a durable generation, so it additionally refuses while any local
+    /// transaction scope or live virtual-table transaction is open.
+    async fn quiesce_database_image_publication_state(&self, cx: &Cx) -> Result<()> {
+        if self.local_transaction_scope_is_active() {
+            return Err(FrankenError::Busy);
+        }
+        match self.live_vtab_transactions.try_borrow() {
+            Ok(transactions) if transactions.is_empty() => {}
+            Ok(_) | Err(_) => return Err(FrankenError::Busy),
+        }
+        self.quiesce_pager_export_state(cx).await
+    }
+
+    /// Capture an identity- and content-bound receipt for the current durable
+    /// main-database image.
+    ///
+    /// Capture is the first half of full-image publication. Callers must retain
+    /// the returned receipt while constructing a private replacement image and
+    /// pass the same receipt to the publication surface. Publication then
+    /// performs a full-image compare-and-swap against this exact source
+    /// generation. A peer commit, journal-mode transition, or any other source
+    /// change after capture causes publication to fail before it can commit.
+    ///
+    /// The connection must be file-backed and outside every explicit
+    /// transaction or savepoint. In WAL mode this method checkpoints and
+    /// truncates the WAL before capturing the receipt so the token describes a
+    /// self-contained main-file generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::Unsupported`] for a memory-backed connection,
+    /// [`FrankenError::Busy`] when a transaction, savepoint, or live
+    /// virtual-table transaction is open, and any propagated checkpoint or
+    /// pager error.
+    pub async fn capture_database_image_receipt(&self) -> Result<DatabaseImageReceipt> {
+        if !self.pager.is_file_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+        let cx = self.op_cx()?;
+        self.quiesce_database_image_publication_state(&cx).await?;
+        if self.pager.journal_mode() == JournalMode::Wal {
+            self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
+        }
+        self.pager.capture_vacuum_source_image(&cx).await
     }
 
     async fn current_database_header(&self, cx: &Cx) -> Result<DatabaseHeader> {
