@@ -223,8 +223,16 @@ clippy_output.*
 # Artifacts directories (CI/E2E/validation run outputs)
 artifacts/
 # Perf evidence should stay compact in Git. Run artifacts under
-# tests/artifacts/perf/ stay local by default. Force-add only the rare
-# Markdown or JSON proof artifact that has durable project value.
+# tests/artifacts/perf/ stay local by default.
+#
+# bd-oyaig WARNING: because of the blanket rule below, a plain `git add` of
+# anything under tests/artifacts/perf/ is SILENTLY SKIPPED — commits that
+# cite an artifact path here have shipped with the evidence dropped and no
+# error. Any artifact a commit, bead, or README cites MUST be made durable
+# with a per-directory unignore block (pattern below, same as the
+# crates/*/artifacts blocks) covering its compact provenance files
+# (README/verdict/manifest/checksums/rerun script); heavy run data
+# (tarballs, raw logs, dumps) stays local.
 !tests/artifacts/
 !tests/artifacts/perf/
 tests/artifacts/perf/**/*
