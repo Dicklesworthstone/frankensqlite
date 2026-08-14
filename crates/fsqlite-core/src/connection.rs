@@ -175974,12 +175974,13 @@ mod transaction_lifecycle_tests {
             conn.execute("INSERT INTO ordinary VALUES (1)")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-            let cx = conn.op_cx().unwrap();
-            conn.flush_retained_autocommit_txn(&cx).await.unwrap();
+            // bd-792q5: the file-backed ordinary write commits immediately (never
+            // parks), and its commit clears the prior vtab preservation receipt —
+            // the same invariant the disabled-retain path below relies on.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
             assert!(
                 conn.pending_local_live_vtab_preservation.borrow().is_none(),
-                "a retained ordinary-write flush must clear the prior vtab receipt"
+                "an ordinary-write immediate commit must clear the prior vtab receipt"
             );
 
             conn.execute("PRAGMA fsqlite.autocommit_retain = OFF")
@@ -176028,16 +176029,19 @@ mod transaction_lifecycle_tests {
             conn.execute("INSERT INTO ordinary VALUES (1)")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
+            // bd-792q5: the file-backed ordinary write commits immediately (never
+            // parks), so its commit clears the prior vtab preservation receipt
+            // before close is even reached.
+            assert!(conn.retained_autocommit_txn.borrow().is_none());
             assert!(
-                conn.pending_local_live_vtab_preservation.borrow().is_some(),
-                "the prior receipt remains until the retained ordinary write is committed"
+                conn.pending_local_live_vtab_preservation.borrow().is_none(),
+                "an ordinary-write immediate commit clears the prior vtab receipt"
             );
 
             conn.close_without_checkpoint_in_place().await.unwrap();
             assert!(
                 conn.pending_local_live_vtab_preservation.borrow().is_none(),
-                "close-time retained commit must clear the older vtab receipt before returning"
+                "the cleared vtab receipt stays cleared through close"
             );
 
             let reopened = Connection::open(db_str).await.unwrap();
