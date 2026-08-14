@@ -33475,7 +33475,10 @@ impl DatabaseImagePublication {
 /// `stats.structural.*` and `stats.table_rows_checked` off one value. That
 /// containment is also why a structural-only proof can never be substituted
 /// here: it has no rows, probes, or constraint counts to report.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Deliberately not `Default`: a zero-valued proof is indistinguishable from a
+/// real validation of an empty image, so there is no such thing as a default
+/// one. Stats exist only as the return value of a completed validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundedDatabaseValidationStats {
     /// Exact structural ownership proof for the same pinned image.
     pub structural: BoundedDatabaseStructuralStats,
