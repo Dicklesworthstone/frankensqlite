@@ -112,6 +112,7 @@ use fsqlite_func::{
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_pager::ConnectionPagerOpenMode;
+pub use fsqlite_pager::page_cache::PageCachePeakSnapshot;
 pub use fsqlite_pager::pager::DatabaseImageReceipt;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
@@ -3843,6 +3844,30 @@ impl PagerBackend {
             Self::Unix(p) => p.cache_metrics_snapshot(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.cache_metrics_snapshot(),
+        }
+    }
+
+    fn cache_peak_snapshot(&self) -> Result<fsqlite_pager::page_cache::PageCachePeakSnapshot> {
+        match self {
+            Self::Memory(p) => p.cache_peak_snapshot(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.cache_peak_snapshot(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.cache_peak_snapshot(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.cache_peak_snapshot(),
+        }
+    }
+
+    fn reset_cache_peak_residency(&self) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.reset_cache_peak_residency(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.reset_cache_peak_residency(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.reset_cache_peak_residency(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.reset_cache_peak_residency(),
         }
     }
 
@@ -13364,10 +13389,76 @@ impl Connection {
         expected_candidate: &DatabaseImageReceipt,
         candidate_path: impl AsRef<Path>,
     ) -> Result<PendingDatabaseImagePublication<'a>> {
+        self.begin_database_image_publication_inner(
+            source,
+            expected_candidate,
+            candidate_path.as_ref(),
+            None,
+        )
+        .await
+    }
+
+    /// Begin a publication that additionally proves the candidate's complete
+    /// page ownership at bounded residency.
+    ///
+    /// The bounded counterpart of
+    /// [`Self::begin_bounded_structural_snapshot`], and the reason the publish
+    /// side is not weaker than the read side: the candidate handle is opened
+    /// under a `validation_page_limit` page-buffer ceiling, one deferred
+    /// transaction is pinned on it, and complete structural page ownership is
+    /// proven inside that transaction before the caller sees the guard. The
+    /// resulting [`BoundedDatabaseStructuralStats`] is available from
+    /// [`PendingDatabaseImagePublication::structural_stats`], so a caller can
+    /// both bound the proof and assert afterwards what it cost.
+    ///
+    /// The caller's own reads run inside that same pinned transaction, so no
+    /// writer can cross a snapshot generation between the proof and those
+    /// reads.
+    ///
+    /// This proves **structure**: page ownership, freelist accounting, and
+    /// orphan detection. It performs no table/index semantic concordance —
+    /// that validator has not been forward-ported yet, and this method
+    /// deliberately does not pretend otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::begin_database_image_publication`] returns, plus
+    /// [`FrankenError::OutOfRange`] for a zero page limit and any structural
+    /// validation error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn begin_bounded_database_image_publication<'a>(
+        &'a self,
+        source: &DatabaseImageReceipt,
+        expected_candidate: &DatabaseImageReceipt,
+        candidate_path: impl AsRef<Path>,
+        validation_page_limit: usize,
+    ) -> Result<PendingDatabaseImagePublication<'a>> {
+        if validation_page_limit == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "database image validation page limit".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        self.begin_database_image_publication_inner(
+            source,
+            expected_candidate,
+            candidate_path.as_ref(),
+            Some(validation_page_limit),
+        )
+        .await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn begin_database_image_publication_inner<'a>(
+        &'a self,
+        source: &DatabaseImageReceipt,
+        expected_candidate: &DatabaseImageReceipt,
+        candidate_path: &Path,
+        validation_page_limit: Option<usize>,
+    ) -> Result<PendingDatabaseImagePublication<'a>> {
         if !self.pager.is_file_backed() {
             return Err(FrankenError::Unsupported);
         }
-        let candidate_path = candidate_path.as_ref();
         let cx = self.op_cx()?;
 
         // Refuse an already-stale candidate before quiescing this connection,
@@ -13453,24 +13544,61 @@ impl Connection {
                 .ok_or_else(|| FrankenError::CannotOpen {
                     path: candidate_path.to_owned(),
                 })?;
-            let validation =
+            let validation = if let Some(page_limit) = validation_page_limit {
+                let mut env = self.attach_env.clone();
+                env.set_page_buffer_max(page_limit);
+                env.set_strict_multi_process(true);
+                Self::open_schema_only_with_expected_identity_and_env(
+                    path.to_owned(),
+                    repaired.identity(),
+                    env,
+                )
+                .await
+            } else {
                 Self::open_schema_only_with_expected_identity(path.to_owned(), repaired.identity())
                     .await
-                    .inspect_err(|error| {
-                        tracing::warn!(
-                            error = %error,
-                            image = %candidate_path.display(),
-                            "database candidate failed identity-bound pre-publication schema reload"
-                        );
-                    })?;
-            match Self::run_pre_publication_integrity_checks(&validation).await {
-                Ok(()) => Ok(validation),
+            }
+            .inspect_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    image = %candidate_path.display(),
+                    "database candidate failed identity-bound pre-publication schema reload"
+                );
+            })?;
+
+            // Bounded mode pins one deferred transaction and proves complete
+            // page ownership inside it, so the caller's later reads and the
+            // proof share a single snapshot generation.
+            let proof = async {
+                Self::run_pre_publication_integrity_checks(&validation).await?;
+                match validation_page_limit {
+                    None => Ok(None),
+                    Some(_) => {
+                        validation.begin_transaction().await?;
+                        let spool_parent = candidate_path
+                            .parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                            .unwrap_or_else(|| Path::new("."))
+                            .to_owned();
+                        validation
+                            .validate_database_structure_bounded(&spool_parent)
+                            .await
+                            .map(Some)
+                    }
+                }
+            }
+            .await;
+            match proof {
+                Ok(stats) => Ok((validation, stats)),
                 Err(error) => {
+                    if validation_page_limit.is_some() {
+                        let _ = validation.rollback_transaction().await;
+                    }
                     if let Err(close_error) = validation.close().await {
                         tracing::warn!(
                             error = %close_error,
                             image = %candidate_path.display(),
-                            "database candidate integrity checks failed and close also failed"
+                            "database candidate validation failed and close also failed"
                         );
                     }
                     Err(error)
@@ -13479,8 +13607,8 @@ impl Connection {
         }
         .await;
 
-        let validation = match opened {
-            Ok(validation) => validation,
+        let (validation, structural_stats) = match opened {
+            Ok(opened) => opened,
             Err(error) => {
                 let restore = Self::restore_provisional_candidate(
                     &self.pager,
@@ -13503,6 +13631,8 @@ impl Connection {
             repaired,
             expected_change_counter,
             restore_hydrated_rows: self.memdb_rows_loaded.get(),
+            structural_stats,
+            validation_txn_open: validation_page_limit.is_some(),
         })
     }
 
@@ -13534,6 +13664,61 @@ impl Connection {
             .begin_database_image_publication(source, expected_candidate, candidate_path)
             .await?;
         match validate(pending.candidate()).await {
+            Ok(()) => pending.commit().await,
+            Err(validation_error) => {
+                let abandon_result = pending.abandon().await;
+                Err(Self::refusal_after_restore(
+                    validation_error,
+                    abandon_result,
+                ))
+            }
+        }
+    }
+
+    /// Publish an already-receipted candidate, proving its complete page
+    /// ownership at bounded residency and handing the caller that proof.
+    ///
+    /// The publish-side counterpart of
+    /// [`Self::begin_bounded_structural_snapshot`]: `validate` runs inside the
+    /// same pinned transaction the proof ran in, and receives the proof
+    /// counters so a downstream certifier can assert after the fact what the
+    /// validation actually cost rather than only what it configured.
+    ///
+    /// Structural proof only — no table/index semantic concordance. See
+    /// [`Self::begin_bounded_database_image_publication`].
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::begin_bounded_database_image_publication`] and
+    /// [`PendingDatabaseImagePublication::commit`] can return, plus whatever
+    /// `validate` returns. A `validate` error restores the candidate's exact
+    /// provisional bytes before surfacing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn publish_database_image_from_receipt_with_bounded_structural_validation<F>(
+        &self,
+        source: &DatabaseImageReceipt,
+        expected_candidate: &DatabaseImageReceipt,
+        candidate_path: impl AsRef<Path>,
+        validation_page_limit: usize,
+        validate: F,
+    ) -> Result<DatabaseImagePublication>
+    where
+        F: std::ops::AsyncFnOnce(&Self, &BoundedDatabaseStructuralStats) -> Result<()>,
+    {
+        let pending = self
+            .begin_bounded_database_image_publication(
+                source,
+                expected_candidate,
+                candidate_path,
+                validation_page_limit,
+            )
+            .await?;
+        let stats = *pending.structural_stats().ok_or_else(|| {
+            FrankenError::internal(
+                "bounded database image publication completed without proof statistics",
+            )
+        })?;
+        match validate(pending.candidate(), &stats).await {
             Ok(()) => pending.commit().await,
             Err(validation_error) => {
                 let abandon_result = pending.abandon().await;
@@ -13659,6 +13844,37 @@ impl Connection {
                 Some((entry_type, name, tbl_name, root_page, sql))
             })
             .collect()
+    }
+
+    /// High-water page-cache residency reached on this connection.
+    ///
+    /// [`Self::memory_stats`] reports instantaneous gauges, which let a caller
+    /// assert the ceiling it configured but not that the ceiling was never
+    /// approached. This reports the maximum residency actually reached, which
+    /// is the assertion a bounded-operation certifier needs after the fact.
+    ///
+    /// Read [`PageCachePeakSnapshot::exact`] before trusting the number: when
+    /// it is `false` the peak is a sampled lower bound, and
+    /// [`PageCachePeakSnapshot::proves_ceiling_never_approached`] returns
+    /// `None` rather than a boolean.
+    ///
+    /// # Errors
+    ///
+    /// Propagates pager errors.
+    pub fn page_cache_peak_snapshot(&self) -> Result<PageCachePeakSnapshot> {
+        self.pager.cache_peak_snapshot()
+    }
+
+    /// Begin a new high-water measurement window.
+    ///
+    /// Call immediately before a bounded operation so the peak read afterwards
+    /// describes that operation rather than the connection's whole history.
+    ///
+    /// # Errors
+    ///
+    /// Propagates pager errors.
+    pub fn reset_page_cache_peak_residency(&self) -> Result<()> {
+        self.pager.reset_cache_peak_residency()
     }
 
     /// Snapshot current connection memory usage and page-cache state.
@@ -32492,6 +32708,11 @@ pub struct PendingDatabaseImagePublication<'a> {
     repaired: DatabaseImageReceipt,
     expected_change_counter: u32,
     restore_hydrated_rows: bool,
+    /// `Some` only in bounded mode: the candidate's page-ownership proof.
+    structural_stats: Option<BoundedDatabaseStructuralStats>,
+    /// Whether a deferred transaction is pinned on the candidate handle and
+    /// must be rolled back before it closes.
+    validation_txn_open: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -32524,6 +32745,18 @@ impl PendingDatabaseImagePublication<'_> {
         &self.repaired
     }
 
+    /// Structural proof counters for the pinned candidate.
+    ///
+    /// `Some` only when the publication was begun with
+    /// [`Connection::begin_bounded_database_image_publication`]. `None` means
+    /// no ownership proof ran — the candidate passed `quick_check` and
+    /// `integrity_check` and nothing more, so a caller must not report it as
+    /// a bounded proof.
+    #[must_use]
+    pub const fn structural_stats(&self) -> Option<&BoundedDatabaseStructuralStats> {
+        self.structural_stats.as_ref()
+    }
+
     /// Refuse this publication and restore the candidate's exact provisional
     /// receipt.
     ///
@@ -32538,6 +32771,9 @@ impl PendingDatabaseImagePublication<'_> {
             .validation
             .take()
             .expect("abandon() consumes self, so the candidate handle is still present");
+        if self.validation_txn_open {
+            let _ = validation.rollback_transaction().await;
+        }
         let close_result = validation.close().await;
         let cx = self.source.op_cx()?;
         let restore_result = Connection::restore_provisional_candidate(
@@ -32587,6 +32823,9 @@ impl PendingDatabaseImagePublication<'_> {
         let cx = self.source.op_cx()?;
 
         let precommit = async {
+            if self.validation_txn_open {
+                validation.rollback_transaction().await?;
+            }
             validation.close().await?;
             // The guard hands the caller a window the single-call form never
             // had. A transaction opened on the source inside that window would
@@ -224687,6 +224926,175 @@ mod pager_routing_tests {
             assert!(
                 matches!(error, FrankenError::BusySnapshot { .. }),
                 "expected BusySnapshot, got {error:?}"
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_publication_proves_ownership_and_hands_the_caller_its_stats() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let (source, source_receipt, _source_path) =
+                seed_publication_source(dir.path(), "bpub-source").await;
+            let candidate_receipt = seed_publication_candidate(dir.path(), "bpub-candidate").await;
+            let candidate_path = dir.path().join("bpub-candidate.db");
+
+            let seen = std::cell::Cell::new(None::<BoundedDatabaseStructuralStats>);
+            let publication = source
+                .publish_database_image_from_receipt_with_bounded_structural_validation(
+                    &source_receipt,
+                    &candidate_receipt,
+                    &candidate_path,
+                    64,
+                    async |candidate: &Connection, stats: &BoundedDatabaseStructuralStats| {
+                        seen.set(Some(*stats));
+                        // The caller's reads share the proof's pinned snapshot.
+                        let rows = candidate.query("SELECT COUNT(*) FROM replacement;").await?;
+                        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(2));
+                        Ok(())
+                    },
+                )
+                .await
+                .expect("a bounded-validated candidate must publish");
+
+            assert!(publication.connection_is_usable());
+            let stats = seen.get().expect("the validator must receive proof stats");
+            assert_eq!(
+                stats.ownership_spool_bytes,
+                u64::from(stats.database_pages),
+                "the proof must be one ownership byte per page"
+            );
+            assert!(
+                stats.database_pages > 0,
+                "a published image must span at least one page"
+            );
+
+            let rows = source
+                .query("SELECT id FROM replacement ORDER BY id;")
+                .await
+                .expect("the rebound source must see the published schema");
+            assert_eq!(rows.len(), 2);
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_publication_refuses_a_zero_page_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let (source, source_receipt, _source_path) =
+                seed_publication_source(dir.path(), "bpub-zero-source").await;
+            let candidate_receipt =
+                seed_publication_candidate(dir.path(), "bpub-zero-candidate").await;
+            let candidate_path = dir.path().join("bpub-zero-candidate.db");
+
+            let error = source
+                .begin_bounded_database_image_publication(
+                    &source_receipt,
+                    &candidate_receipt,
+                    &candidate_path,
+                    0,
+                )
+                .await
+                .expect_err("a zero page limit is not a bound");
+            assert!(
+                matches!(error, FrankenError::OutOfRange { .. }),
+                "expected OutOfRange, got {error:?}"
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn unbounded_publication_reports_no_structural_proof() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let (source, source_receipt, _source_path) =
+                seed_publication_source(dir.path(), "upub-source").await;
+            let candidate_receipt = seed_publication_candidate(dir.path(), "upub-candidate").await;
+            let candidate_path = dir.path().join("upub-candidate.db");
+
+            let pending = source
+                .begin_database_image_publication(
+                    &source_receipt,
+                    &candidate_receipt,
+                    &candidate_path,
+                )
+                .await
+                .expect("the plain publication path must open");
+            // The plain path ran integrity checks and nothing more. Reporting
+            // None here is what stops a caller claiming a bounded proof it
+            // never asked for.
+            assert!(
+                pending.structural_stats().is_none(),
+                "an unbounded publication must not report ownership proof stats"
+            );
+            pending
+                .abandon()
+                .await
+                .expect("abandon must restore cleanly");
+        });
+    }
+
+    /// The write set of a schema-only identity-bound connection is zero, not
+    /// merely bounded, so no write-set ceiling knob is needed on it.
+    ///
+    /// `open_schema_only_with_expected_identity` passes `writable: false`, which
+    /// routes to `PagerBackend::open_readonly_with_page_buffer_max`; the pager
+    /// then carries a read-only access mode and refuses every eager-writer
+    /// transaction with `FrankenError::ReadOnly`. This proves that by
+    /// demonstration rather than by reading the code.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn schema_only_identity_bound_connection_cannot_write_at_all() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let image_path = dir.path().join("readonly-proof.db");
+            let receipt = build_self_contained_image(
+                &dir.path().join("readonly-proof-builder.db"),
+                &image_path,
+                &[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY);",
+                    "INSERT INTO t VALUES (1);",
+                ],
+            )
+            .await;
+
+            let before = std::fs::read(&image_path).unwrap();
+            let validation = Connection::open_schema_only_with_expected_identity(
+                image_path.to_string_lossy().into_owned(),
+                receipt.identity(),
+            )
+            .await
+            .expect("identity-bound schema-only open");
+
+            for sql in [
+                "INSERT INTO t VALUES (2);",
+                "DELETE FROM t WHERE id = 1;",
+                "UPDATE t SET id = 9 WHERE id = 1;",
+                "CREATE TABLE injected (x);",
+            ] {
+                let error = validation
+                    .execute(sql)
+                    .await
+                    .expect_err("a schema-only connection must refuse every write");
+                assert!(
+                    matches!(error, FrankenError::ReadOnly),
+                    "expected ReadOnly for {sql:?}, got {error:?}"
+                );
+            }
+
+            // Reads still work, so the refusal is the access mode and not a
+            // broken handle.
+            let rows = validation.query("SELECT COUNT(*) FROM t;").await.unwrap();
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+            validation.close().await.expect("close the validation handle");
+
+            assert_eq!(
+                std::fs::read(&image_path).unwrap(),
+                before,
+                "the image must be byte-identical after every refused write"
             );
         });
     }

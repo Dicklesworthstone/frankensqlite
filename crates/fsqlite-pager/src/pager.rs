@@ -14222,6 +14222,17 @@ where
         Ok(self.cache.metrics_snapshot())
     }
 
+    /// High-water page-cache residency for this pager.
+    pub fn cache_peak_snapshot(&self) -> Result<crate::page_cache::PageCachePeakSnapshot> {
+        Ok(self.cache.peak_snapshot())
+    }
+
+    /// Start a new high-water measurement window.
+    pub fn reset_cache_peak_residency(&self) -> Result<()> {
+        self.cache.reset_peak_residency();
+        Ok(())
+    }
+
     /// Capture cheap cache counters for hot-path statistical sampling.
     ///
     /// Skips per-slot iteration and the eviction-policy mutex. Suitable for
