@@ -1797,33 +1797,91 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             self.publish_latest_committed_snapshot(cx, "conflicting_pages_since_snapshot")
                 .await?;
             let latest = self.published_snapshot();
-            if latest.commit_count <= snapshot.commit_count
-                && latest.generation == snapshot.generation
-                && latest.last_commit_frame <= snapshot.last_commit_frame
-            {
-                return Ok(Vec::new());
-            }
 
-            if latest.generation != snapshot.generation {
-                return Ok(candidates);
-            }
-
-            let Some(latest_last_commit_frame) = latest.last_commit_frame else {
-                return Ok(Vec::new());
-            };
-            let start_frame = snapshot
-                .last_commit_frame
-                .map_or(0, |frame| frame.saturating_add(1));
-            if start_frame > latest_last_commit_frame {
-                return Ok(Vec::new());
-            }
-
-            let candidate_set = candidates.iter().copied().collect::<HashSet<_>>();
             let mut conflicts = HashSet::<u32>::new();
-            for frame_index in start_frame..=latest_last_commit_frame {
-                let header = self.wal.read_frame_header(cx, frame_index).await?;
-                if candidate_set.contains(&header.page_number) {
-                    conflicts.insert(header.page_number);
+
+            // bd-o81ov: cross-connection EOF double-allocation guard.
+            //
+            // Each committing connection has its own pager allocator, so two
+            // connections can both hand out the same fresh EOF page number from
+            // a stale committed `db_size`, link that one physical page into
+            // different B-tree positions, and both commit — leaving the durable
+            // image referencing a single page from multiple parents ("page N
+            // referenced multiple times", broken point-seeks, duplicated rows).
+            // A candidate page beyond this transaction's allocator base
+            // (`snapshot_db_size`) that already exists within the current durable
+            // committed size was allocated and committed by a peer first: fail
+            // closed so the caller retries against the refreshed size and
+            // re-allocates a non-conflicting page. This runs regardless of the
+            // horizon short-circuits below, because the aliasing peer commit can
+            // predate this transaction's own conflict horizon (its allocator
+            // `db_size` lagged the WAL state its snapshot already observed).
+            // Existing cross-process first-committer-wins: reject any candidate a
+            // peer committed after this transaction's WAL conflict horizon.
+            if !(latest.commit_count <= snapshot.commit_count
+                && latest.generation == snapshot.generation
+                && latest.last_commit_frame <= snapshot.last_commit_frame)
+            {
+                if latest.generation != snapshot.generation {
+                    for &page in &candidates {
+                        conflicts.insert(page);
+                    }
+                } else if let Some(latest_last_commit_frame) = latest.last_commit_frame {
+                    let start_frame = snapshot
+                        .last_commit_frame
+                        .map_or(0, |frame| frame.saturating_add(1));
+                    if start_frame <= latest_last_commit_frame {
+                        let candidate_set = candidates.iter().copied().collect::<HashSet<_>>();
+                        for frame_index in start_frame..=latest_last_commit_frame {
+                            let header = self.wal.read_frame_header(cx, frame_index).await?;
+                            if candidate_set.contains(&header.page_number) {
+                                conflicts.insert(header.page_number);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // A candidate beyond the allocator's begin-time committed size is a
+            // freshly allocated EOF page. If ANY committed frame for that page
+            // already exists in this WAL generation, a peer connection
+            // allocated and committed the same physical page first — committing
+            // ours would link one page into two B-tree positions ("page N
+            // referenced multiple times"). The horizon-relative scan above
+            // cannot catch this: a rebased/refreshed snapshot can sit PAST the
+            // peer's growth frame, and commit-frame `db_size` headers are not
+            // monotonic under concurrency (a stale-view pure-update commit
+            // regresses them), so a size comparison is unreliable. The
+            // generation-wide page index is the authoritative "was this page
+            // ever committed" source. A false positive is possible when the
+            // allocator base lags the publication plane and the candidate is
+            // an ordinary rewrite of a recently committed page — that fails
+            // closed as a transient BusySnapshot retry.
+            if snapshot.snapshot_db_size > 0
+                && latest.generation == snapshot.generation
+                && candidates
+                    .iter()
+                    .any(|page| *page > snapshot.snapshot_db_size)
+            {
+                let published = self.published_snapshot.clone();
+                for &page in &candidates {
+                    if page > snapshot.snapshot_db_size
+                        && !matches!(
+                            self.resolve_visible_frame(cx, &published, page).await?,
+                            WalPageLookupResolution::AuthoritativeMiss
+                                | WalPageLookupResolution::PartialIndexFallbackMiss
+                        )
+                    {
+                        tracing::debug!(
+                            target: "fsqlite.wal.conflict",
+                            page,
+                            allocation_base_db_size = snapshot.snapshot_db_size,
+                            latest_commit_frame = ?latest.last_commit_frame,
+                            "fresh EOF allocation aliases a committed page; failing \
+                             closed with BusySnapshot (bd-o81ov)"
+                        );
+                        conflicts.insert(page);
+                    }
                 }
             }
 
@@ -4487,6 +4545,7 @@ mod tests {
             generation: pinned.generation,
             last_commit_frame: pinned.last_commit_frame,
             commit_count: pinned.commit_count,
+            snapshot_db_size: 0,
         };
         replace_path_visible_wal(vfs, cx);
         (backend, snapshot, page_two)
@@ -7665,6 +7724,7 @@ mod tests {
             generation: pinned.generation,
             last_commit_frame: pinned.last_commit_frame,
             commit_count: pinned.commit_count,
+            snapshot_db_size: 0,
         };
 
         adapter

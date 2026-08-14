@@ -106,6 +106,15 @@ pub enum ParallelWalFallbackReason {
     RecoveryGap,
     CheckpointConflict,
     ControllerEvidenceLost,
+    /// bd-o81ov: the batch commits freshly allocated EOF pages (pages beyond
+    /// the transaction's begin-time committed database size). Growth commits
+    /// must take the serialized append path so the peer-claimed-range guard
+    /// can observe a prior grower's durable `db_size` before this batch
+    /// appends: in parallel lanes two connections' growth commits ride
+    /// concurrent single-batch epochs, neither durable when the other
+    /// validates, and both can publish the SAME physical page into different
+    /// B-tree positions ("page N referenced multiple times").
+    EofGrowth,
 }
 
 /// Explicit operator control surface for the D1.a contract.
@@ -463,6 +472,7 @@ pub fn parallel_wal_fallback_reason_name(
         Some(ParallelWalFallbackReason::RecoveryGap) => "recovery_gap",
         Some(ParallelWalFallbackReason::CheckpointConflict) => "checkpoint_conflict",
         Some(ParallelWalFallbackReason::ControllerEvidenceLost) => "controller_evidence_lost",
+        Some(ParallelWalFallbackReason::EofGrowth) => "eof_growth",
     }
 }
 

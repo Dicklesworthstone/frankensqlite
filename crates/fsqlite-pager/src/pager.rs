@@ -1340,6 +1340,18 @@ struct GroupCommitQueue {
     /// Stable per-queue ordering for deferred finalization lanes. A record
     /// keeps its first sequence across claims and cancellation requeues.
     next_finalization_sequence: AtomicU64,
+    /// bd-o81ov: shared per-file monotonic high-water for fresh EOF page
+    /// allocation. Concurrent writers each own a private `PagerInner` whose
+    /// `next_page` starts at the same committed db_size + 1, so without a shared
+    /// source two connections mint the SAME fresh page and both commit, linking
+    /// one physical page from multiple B-tree parents ("page N referenced
+    /// multiple times"). All connections to one file share this queue, so
+    /// minting fresh EOF pages from here makes cross-connection double-allocation
+    /// impossible. `0` means unseeded — the first allocator raises it to its
+    /// committed-aware floor via `fetch_max`. Never rewound: rolled-back
+    /// reservations become holes above committed db_size, exactly like the
+    /// connection-local `next_page`.
+    shared_eof_next_page: AtomicU32,
     /// Logical Phase-C owners keyed by the exact physical batch id.
     ///
     /// A single physical flush can contain transactions from several pager
@@ -1357,25 +1369,6 @@ struct GroupCommitQueue {
     commit_service_mode: AtomicU8,
     /// WAL-owned lane-local staging state for prepared batches.
     parallel_wal_lanes: ParallelWalLaneStager<traits::PreparedWalFrameBatch>,
-    /// bd-o81ov: highest EOF page number ever granted to any connection bound
-    /// to this database identity (0 = none granted yet). Every connection has
-    /// its own pager and therefore its own `inner.next_page`, so without
-    /// cross-connection coordination two connections can hand out the SAME
-    /// fresh EOF page from a stale committed `db_size`, link that one physical
-    /// page into different B-tree positions, and both commit — leaving the
-    /// durable image referencing a single page from multiple parents ("page N
-    /// referenced multiple times", broken point-seeks, duplicated rows). No
-    /// commit-time conflict scan can close that race: the colliding commits
-    /// ride separate concurrent single-batch group-commit epochs, and neither
-    /// is durable/visible when the other validates. File-backed WAL EOF
-    /// allocation therefore reserves page numbers through this shared
-    /// monotonic counter, making a double-grant impossible at the source. The
-    /// counter never rewinds while the identity stays open (matching the
-    /// pager's never-rewind `next_page` semantics: abandoned reservations are
-    /// benign holes above the committed size, reusable through the local
-    /// `> db_size` freelist pool); it resets only when the last connection
-    /// closes and the queue is dropped.
-    eof_allocation_high_water: AtomicU32,
     /// External database-lock restorations whose owning flusher future was
     /// dropped while the shared file handle was contended.
     ///
@@ -1443,6 +1436,31 @@ struct GroupCommitQueue {
 type LaneStagedPreparedBatch = ParallelWalLaneBatch<traits::PreparedWalFrameBatch>;
 
 static GROUP_COMMIT_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+// bd-0shxy allocation-event ledger: env-gated (FSQLITE_ALLOC_LEDGER_PATH),
+// file-backed so it cannot perturb libtest capture timing. Records the page
+// allocation lifecycle (allocate/quarantine/return/txn boundaries) so a
+// double-referenced page's history can be replayed after a failing run.
+static ALLOC_LEDGER: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+
+fn alloc_ledger(txn_tag: usize, event: &str, page: u32, aux: u64) {
+    let Some(writer) = ALLOC_LEDGER.get_or_init(|| {
+        std::env::var_os("FSQLITE_ALLOC_LEDGER_PATH").and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(|file| Mutex::new(std::io::BufWriter::new(file)))
+        })
+    }) else {
+        return;
+    };
+    use std::io::Write as _;
+    let mut guard = writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = writeln!(guard, "{txn_tag:x} {event} {page} {aux}");
+    let _ = guard.flush();
+}
 static GROUP_COMMIT_TRACE_FSYNC_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn group_commit_trace_enabled() -> bool {
@@ -1819,13 +1837,13 @@ impl GroupCommitQueue {
             persisted_epochs: Mutex::new(HashMap::new()),
             epoch_consumer_counts: Mutex::new(HashMap::new()),
             next_finalization_sequence: AtomicU64::new(1),
+            shared_eof_next_page: AtomicU32::new(0),
             pending_txn_attempts: Mutex::new(HashMap::new()),
             durability_combiner: Mutex::new(None),
             epoch_waiters: KeyedWaitRegistry::new(),
             commit_service_control_epoch: AtomicU64::new(0),
             commit_service_mode: AtomicU8::new(CommitServiceMode::Balanced.as_u8()),
             parallel_wal_lanes: ParallelWalLaneStager::new(parallel_wal_control),
-            eof_allocation_high_water: AtomicU32::new(0),
             pending_external_unlocks: Mutex::new(VecDeque::new()),
             external_unlock_claims_in_flight: AtomicUsize::new(0),
             identity_wide_external_unlock_claims_in_flight: AtomicUsize::new(0),
@@ -1842,40 +1860,6 @@ impl GroupCommitQueue {
 
     fn parallel_wal_control(&self) -> &ParallelWalControlSurface {
         self.parallel_wal_lanes.control()
-    }
-
-    /// Reserve one fresh EOF page at or above `local_next_page`, coordinated
-    /// across every connection sharing this database identity (bd-o81ov).
-    ///
-    /// The grant is the successor of the current shared high-water mark or of
-    /// the caller's own allocator position, whichever is higher — so a caller
-    /// whose committed-size view lags a peer's uncommitted growth can never be
-    /// handed a page number that peer already owns, while a caller that
-    /// observed newer durable growth (e.g. a cross-process commit) pulls the
-    /// shared mark forward. `pending_byte_page` is never granted, matching the
-    /// local allocator's skip. Returns `None` once the page-number space is
-    /// exhausted.
-    fn reserve_eof_page(&self, local_next_page: u32, pending_byte_page: u32) -> Option<u32> {
-        let mut current = self.eof_allocation_high_water.load(AtomicOrdering::Acquire);
-        loop {
-            let floor = current.max(local_next_page.saturating_sub(1));
-            let mut candidate = floor.saturating_add(1);
-            if candidate == pending_byte_page {
-                candidate = candidate.saturating_add(1);
-            }
-            if candidate == u32::MAX {
-                return None;
-            }
-            match self.eof_allocation_high_water.compare_exchange_weak(
-                current,
-                candidate,
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-            ) {
-                Ok(_) => return Some(candidate),
-                Err(observed) => current = observed,
-            }
-        }
     }
 
     fn next_parallel_wal_batch_id(&self) -> u64 {
@@ -18954,11 +18938,33 @@ where
         let parallel_wal_control = queue.parallel_wal_control().clone();
         let batch_id = queue.next_parallel_wal_batch_id();
         let lane_id = queue.current_parallel_wal_lane_id();
+        // bd-o81ov: a batch that commits freshly allocated EOF pages (any
+        // write page beyond the allocator's begin-time committed base) must
+        // take the serialized append path. Each connection has its own pager
+        // allocator, so two connections can hand out the SAME fresh EOF page
+        // from a stale committed db_size and link it into different B-tree
+        // positions. The commit-time peer-claimed-range guard
+        // (snapshot_db_size in TransactionConflictSnapshot) catches this only
+        // when the first grower's commit is durable before the second grower
+        // validates — which parallel lanes do not guarantee: the colliding
+        // commits ride concurrent single-batch epochs, mutually invisible at
+        // conflict-scan time, and both publish ("page N referenced multiple
+        // times", broken point-seeks, duplicated rows). Serializing only
+        // growth commits keeps pure-update traffic on the parallel lanes.
+        // `allocation_base_db_size == 0` means the base is untracked
+        // (memory/test harness paths) — no coordination is possible or
+        // needed there.
+        let commits_fresh_eof_pages = allocation_base_db_size > 0
+            && write_pages_sorted
+                .last()
+                .is_some_and(|page| page.get() > allocation_base_db_size);
         let mut staging_fallback_reason = if matches!(
             parallel_wal_control.mode,
             ParallelWalOperatingMode::Conservative
         ) {
             Some(ParallelWalFallbackReason::OperatorForced)
+        } else if commits_fresh_eof_pages {
+            Some(ParallelWalFallbackReason::EofGrowth)
         } else if let Some(limit) = parallel_wal_control.max_parallel_commit_bytes {
             if group_commit_batch_staged_bytes(&batch) > limit {
                 Some(ParallelWalFallbackReason::LaneOverflow)
@@ -21041,11 +21047,26 @@ where
         async move {
             self.ensure_writer(cx).await?;
 
+            // bd-o81ov: WAL-backed concurrent writers mint fresh EOF pages from
+            // the shared per-file high-water (see the EOF arm below) so no two
+            // connections ever hand out the same page. That also makes the local
+            // `> db_size` freelist — this connection's own rolled-back EOF
+            // reservations — safe to reuse under concurrency WITHOUT the
+            // sole-snapshot gate: the gate only guarded against a peer having
+            // committed one of those pages, which shared minting now makes
+            // impossible. Reusing them here is also what keeps the file from
+            // leaking "never used" pages: an abandoned reservation is reclaimed
+            // by this connection's next allocation instead of becoming a hole
+            // once a peer grows committed db_size past it.
+            let use_shared_eof =
+                self.mode == TransactionMode::Concurrent && !self.memory_db_bump_alloc;
+
             // ── Local lease fast path ──────────────────────────────────────
             // If we have pre-allocated pages from a previous batch, hand one
             // out without touching the global `inner` mutex at all.
             if let Some(page) = self.page_lease.pop() {
                 self.allocated_from_eof.push(page);
+                alloc_ledger(self as *const _ as usize, "alloc_lease", page.get(), 0);
                 return Ok(page);
             }
             // bd-0shxy: reuse savepoint-quarantined page numbers before any
@@ -21054,6 +21075,7 @@ where
             // transaction is the only re-grant that cannot alias.
             if let Some(page) = self.savepoint_quarantined_allocations.pop() {
                 self.allocated_from_eof.push(page);
+                alloc_ledger(self as *const _ as usize, "alloc_quarantine", page.get(), 0);
                 return Ok(page);
             }
 
@@ -21102,7 +21124,7 @@ where
                     // detection, exactly as for EOF growth.
                     let sole_current_snapshot = inner.active_transactions == 1
                         && self.published_visible_commit_seq.get() == inner.commit_seq;
-                    if sole_current_snapshot
+                    if (sole_current_snapshot || use_shared_eof)
                         && let Some(idx) = inner
                             .freelist
                             .iter()
@@ -21110,6 +21132,7 @@ where
                     {
                         let page = inner.freelist.remove(idx);
                         self.allocated_from_freelist.push(page);
+                        alloc_ledger(self as *const _ as usize, "alloc_freelist_hi", page.get(), 0);
                         return Ok(page);
                     }
 
@@ -21132,10 +21155,12 @@ where
                     // workload grew the file at EOF without bound.
                     if sole_current_snapshot && let Some(page) = inner.freelist.pop() {
                         self.allocated_from_freelist.push(page);
+                        alloc_ledger(self as *const _ as usize, "alloc_freelist_gated", page.get(), 0);
                         return Ok(page);
                     }
                 } else if let Some(page) = inner.freelist.pop() {
                     self.allocated_from_freelist.push(page);
+                    alloc_ledger(self as *const _ as usize, "alloc_freelist_nc", page.get(), 0);
                     return Ok(page);
                 }
             }
@@ -21150,47 +21175,77 @@ where
             let pending_byte_page = (0x4000_0000 / inner.page_size.get()) + 1;
             let already_allocated =
                 !self.allocated_from_eof.is_empty() || !self.allocated_from_freelist.is_empty();
-            let batch = if self.mode == TransactionMode::Concurrent && already_allocated {
+            // bd-o81ov: concurrent writers on a WAL-backed file each own a
+            // private PagerInner whose `next_page` starts at the same committed
+            // db_size + 1, so two connections would otherwise mint the SAME
+            // fresh EOF page number, write different B-tree content into it, and
+            // both commit — linking one physical page from multiple parents
+            // ("page N referenced multiple times", duplicated rows, broken
+            // point-seeks). The commit-time conflict scan cannot catch this: the
+            // colliding allocations ride concurrent single-batch group-commit
+            // epochs, mutually invisible until durable. Coordinate at the source:
+            // mint fresh EOF pages from the shared per-file high-water so no two
+            // connections can ever hand out the same physical page. Immediate/
+            // deferred writers are write-lock serialized (no race) and memory
+            // bump-alloc has a single owner, so both keep the local path.
+            let batch = if use_shared_eof {
+                // Shared-water minting is lock-free, so the batch existed only to
+                // amortize the inner-mutex cost. Worse, batching strands the
+                // unused lease pages: each is claimed from the shared high-water
+                // but, once a peer grows committed db_size past it, becomes a
+                // "never used" page that fails integrity_check. Mint exactly one
+                // page per call so nothing is reserved that is not immediately
+                // handed back to the caller.
+                1
+            } else if self.mode == TransactionMode::Concurrent && already_allocated {
                 PAGE_LEASE_BATCH_SIZE
             } else {
                 1
             };
             let mut first_page: Option<PageNumber> = None;
 
-            // bd-o81ov: file-backed WAL databases must reserve EOF pages
-            // through the identity-shared high-water mark so two connections
-            // (each with its own `inner.next_page`) can never be granted the
-            // same physical page. Private `:memory:` databases stay on the
-            // single-connection bump allocator, and rollback-journal databases
-            // keep the connection-local allocator (their peer-claimed-range
-            // check runs under the exclusive commit lock).
-            let shared_eof_coordination =
-                !self.memory_db_bump_alloc && self.journal_mode == JournalMode::Wal;
-
             for _ in 0..batch {
-                let raw = if shared_eof_coordination {
-                    let Some(page) = self
-                        .group_commit_queue
-                        .reserve_eof_page(inner.next_page, pending_byte_page)
-                    else {
-                        // Page-number space exhausted; continuing would hand
-                        // out duplicate page numbers.
-                        break;
+                let raw = if use_shared_eof {
+                    // Reserve one page number atomically from the shared
+                    // high-water, floored at this connection's committed-aware
+                    // `next_page` so we never hand out a page at or below
+                    // committed content this connection can still see.
+                    let shared = &self.group_commit_queue.shared_eof_next_page;
+                    let reserved = loop {
+                        let cur = shared.load(AtomicOrdering::Acquire);
+                        let mut base = cur.max(inner.next_page);
+                        if base == pending_byte_page {
+                            base = base.saturating_add(1);
+                        }
+                        let advanced = base.saturating_add(1);
+                        if advanced == base {
+                            // u32::MAX saturation — cannot advance further.
+                            break base;
+                        }
+                        if shared
+                            .compare_exchange_weak(
+                                cur,
+                                advanced,
+                                AtomicOrdering::AcqRel,
+                                AtomicOrdering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            break base;
+                        }
                     };
-                    // Keep the local allocator position in sync so local-only
-                    // consumers (freelist bounds, restore arms) observe the
-                    // grant.
-                    inner.next_page = page.saturating_add(1);
-                    page
+                    // Keep the connection-local view consistent for the rest of
+                    // the allocator (freelist upper bounds, refresh, rollback).
+                    inner.next_page = inner.next_page.max(reserved.saturating_add(1));
+                    reserved
                 } else {
                     let mut raw = inner.next_page;
                     if raw == pending_byte_page {
                         raw = raw.saturating_add(1);
                     }
                     let next = raw.saturating_add(1);
-                    // Stop the batch if next_page can no longer advance
-                    // (u32::MAX saturation). Continuing would hand out
-                    // duplicate page numbers.
+                    // Stop the batch if next_page can no longer advance (u32::MAX
+                    // saturation). Continuing would hand out duplicate page numbers.
                     if next == raw {
                         break;
                     }
@@ -21203,6 +21258,8 @@ where
                     } else {
                         self.page_lease.push(page);
                     }
+                } else {
+                    break;
                 }
             }
             let dbg_alloc_db_size = inner.db_size;
@@ -21222,6 +21279,7 @@ where
                 );
             }
             self.allocated_from_eof.push(page);
+            alloc_ledger(self as *const _ as usize, "alloc_eof", page.get(), 0);
             Ok(page)
         }
     }
@@ -23026,8 +23084,14 @@ where
                 let eof_start = entry.allocated_from_eof_snapshot.len();
                 let freelist_start = entry.allocated_from_freelist_snapshot.len();
                 let lease: Vec<PageNumber> = self.page_lease.drain(..).collect();
+                for page in &lease {
+                    alloc_ledger(self as *const _ as usize, "sp_quarantine_lease", page.get(), 0);
+                }
                 self.savepoint_quarantined_allocations.extend(lease);
                 let eof: Vec<PageNumber> = self.allocated_from_eof.drain(eof_start..).collect();
+                for page in &eof {
+                    alloc_ledger(self as *const _ as usize, "sp_quarantine_eof", page.get(), 0);
+                }
                 self.savepoint_quarantined_allocations.extend(eof);
                 let fl: Vec<PageNumber> =
                     self.allocated_from_freelist.drain(freelist_start..).collect();

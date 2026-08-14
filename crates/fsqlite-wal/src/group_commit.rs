@@ -194,6 +194,13 @@ pub struct TransactionConflictSnapshot {
     pub generation: WalGenerationIdentity,
     pub last_commit_frame: Option<usize>,
     pub commit_count: u64,
+    /// Committed database size (pages) the submitting transaction's allocator
+    /// used as its base. Any page number greater than this was freshly
+    /// allocated by this transaction; if such a page already exists within the
+    /// current durable committed size, a peer connection allocated and
+    /// committed the same physical page first — a cross-connection EOF
+    /// double-allocation (bd-o81ov). 0 means "not tracked" (skip the guard).
+    pub snapshot_db_size: u32,
 }
 
 /// Snapshot-bound full-page hash for one cross-process conflict candidate.
@@ -2717,6 +2724,7 @@ mod tests {
             generation,
             last_commit_frame: Some(42),
             commit_count: 7,
+            snapshot_db_size: 0,
         };
         let copied = a;
         assert_eq!(copied, a);
@@ -2724,6 +2732,7 @@ mod tests {
             generation,
             last_commit_frame: None,
             commit_count: 7,
+            snapshot_db_size: 0,
         };
         assert_ne!(a, b);
         let dbg = format!("{a:?}");
