@@ -123,6 +123,16 @@ pub enum ParallelWalFallbackReason {
     /// freelist publications could each re-publish a page the other just
     /// consumed, granting one physical page to multiple connections.
     FreelistPublication,
+    /// bd-dw8oe: the batch carries a page-1 frame. Page-1 header fields
+    /// (page_count, freelist head/count) are promoted at FLUSH time from the
+    /// current durable state; lane staging serializes frames BEFORE the
+    /// flusher runs, so a lane-staged page-1 frame appends its stale
+    /// begin-time header bytes verbatim — republishing a consumed freelist
+    /// head (trunk-chain garbage) or an erased freelist (never-used orphans)
+    /// or a regressed page_count. Every page-1-carrying batch takes the
+    /// serialized path where promotion and the append-gate header checks
+    /// actually apply to the appended bytes.
+    PageOneHeader,
 }
 
 /// Explicit operator control surface for the D1.a contract.
@@ -482,6 +492,7 @@ pub fn parallel_wal_fallback_reason_name(
         Some(ParallelWalFallbackReason::ControllerEvidenceLost) => "controller_evidence_lost",
         Some(ParallelWalFallbackReason::EofGrowth) => "eof_growth",
         Some(ParallelWalFallbackReason::FreelistPublication) => "freelist_publication",
+        Some(ParallelWalFallbackReason::PageOneHeader) => "page_one_header",
     }
 }
 

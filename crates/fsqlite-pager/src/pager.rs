@@ -19398,6 +19398,11 @@ where
             // publications validating concurrently could each re-publish a
             // page the other just consumed.
             Some(ParallelWalFallbackReason::FreelistPublication)
+        } else if write_pages_sorted.first() == Some(&PageNumber::ONE) {
+            // bd-dw8oe: page-1 header fields are promoted at flush time from
+            // durable state; lane staging would append the stale begin-time
+            // bytes verbatim (see ParallelWalFallbackReason::PageOneHeader).
+            Some(ParallelWalFallbackReason::PageOneHeader)
         } else if let Some(limit) = parallel_wal_control.max_parallel_commit_bytes {
             if group_commit_batch_staged_bytes(&batch) > limit {
                 Some(ParallelWalFallbackReason::LaneOverflow)
