@@ -14317,6 +14317,468 @@ impl Connection {
             })
     }
 
+// ---------------------------------------------------------------------------
+// Bounded semantic walkers 3 and 4 of 4: foreign keys
+//
+// Declared foreign keys are resolved fail-closed and checked one child row at a
+// time inside the pinned snapshot: a non-NULL child key must find its parent by
+// direct ROWID or by a proven UNIQUE-index probe. Streaming per child row is
+// what keeps this bounded — the obvious implementation builds a parent key set
+// and is O(parent rows) resident.
+// ---------------------------------------------------------------------------
+
+    async fn bounded_parent_key_exists_in_txn<T: TransactionHandle + ?Sized>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        parent: &TableSchema,
+        check: &BoundedForeignKeyCheck,
+        parent_values: &[SqliteValue],
+        page_size: PageSize,
+        reserved_per_page: u8,
+        counters: &mut BoundedValidationCounters,
+    ) -> Result<bool> {
+        match check.parent_probe {
+            BoundedForeignKeyParentProbe::IntegerPrimaryKey { column_index } => {
+                if check.parent_columns.as_slice() != [column_index] {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "bounded FOREIGN KEY IPK probe metadata is inconsistent".to_owned(),
+                    });
+                }
+                let Some(SqliteValue::Integer(parent_rowid)) = parent_values.first() else {
+                    return Ok(false);
+                };
+                let parent_root =
+                    page_number_from_schema_root(parent.root_page, &parent.name, "table")?;
+                let mut cursor = Self::new_header_btree_cursor(
+                    txn,
+                    parent_root,
+                    page_size,
+                    reserved_per_page,
+                    true,
+                );
+                bounded_increment_validation_counter(&mut counters.foreign_key_parent_probes)?;
+                Ok(cursor.table_move_to(cx, *parent_rowid).await?.is_found())
+            }
+            BoundedForeignKeyParentProbe::UniqueIndex { index_index } => {
+                let index = parent.indexes.get(index_index).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "bounded FOREIGN KEY probe references missing index {index_index} on parent table `{}`",
+                            parent.name
+                        ),
+                    }
+                })?;
+                if parent_values.len() != index.key_term_count() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "bounded FOREIGN KEY probe for index `{}` has {} values but the index has {} terms",
+                            index.name,
+                            parent_values.len(),
+                            index.key_term_count()
+                        ),
+                    });
+                }
+                let value_bytes = parent_values.iter().try_fold(0_usize, |total, value| {
+                    total
+                        .checked_add(bounded_sqlite_value_bytes(value))
+                        .ok_or(FrankenError::TooBig)
+                })?;
+                if value_bytes > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "FOREIGN KEY parent probe values for index `{}` exceed the fixed {BOUNDED_VALIDATION_MAX_RECORD_BYTES}-byte bound",
+                        index.name
+                    )));
+                }
+                let probe = serialize_record(parent_values);
+                if probe.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "FOREIGN KEY parent probe record for index `{}` exceeds the fixed {BOUNDED_VALIDATION_MAX_RECORD_BYTES}-byte bound",
+                        index.name
+                    )));
+                }
+                let index_root =
+                    page_number_from_schema_root(index.root_page, &index.name, "index")?;
+                let descending = (0..index.key_term_count())
+                    .map(|position| index.key_term_descending(position))
+                    .collect::<Vec<_>>();
+                let collations = (0..index.key_term_count())
+                    .map(|position| index.key_term_collation(position).map(str::to_owned))
+                    .collect::<Vec<_>>();
+                let mut cursor = Self::new_header_btree_index_cursor(
+                    txn,
+                    index_root,
+                    page_size,
+                    reserved_per_page,
+                    descending,
+                    collations,
+                    Arc::clone(&self.collation_registry),
+                );
+                bounded_increment_validation_counter(&mut counters.foreign_key_parent_probes)?;
+                let _seek_result = cursor.index_move_to(cx, &probe).await?;
+                if cursor.eof() {
+                    return Ok(false);
+                }
+                let payload = cursor.payload(cx).await?;
+                if payload.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "FOREIGN KEY parent index `{}` yielded a record above the fixed {BOUNDED_VALIDATION_MAX_RECORD_BYTES}-byte bound",
+                        index.name
+                    )));
+                }
+                let stored =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "FOREIGN KEY parent index `{}` yielded an invalid record",
+                            index.name
+                        ),
+                    })?;
+                if stored.len() != index.key_term_count().saturating_add(1)
+                    || !matches!(stored.last(), Some(SqliteValue::Integer(_)))
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "FOREIGN KEY parent index `{}` entry does not contain exactly {} logical terms plus an integer rowid",
+                            index.name,
+                            index.key_term_count()
+                        ),
+                    });
+                }
+                Ok(self.bounded_unique_terms_equal(index, &stored, parent_values))
+            }
+        }
+    }
+
+    async fn bounded_validate_foreign_key_in_txn<T: TransactionHandle + ?Sized>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        check: &BoundedForeignKeyCheck,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        rowid_aliases: &HashMap<i32, usize>,
+        column_defaults: &HashMap<i32, Vec<Option<SqliteValue>>>,
+        counters: &mut BoundedValidationCounters,
+    ) -> Result<()> {
+        let (child, parent) = {
+            let schema = self.schema.borrow();
+            let child = schema
+                .get(check.child_table_index)
+                .cloned()
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "bounded FOREIGN KEY proof references missing child table index {}",
+                        check.child_table_index
+                    ),
+                })?;
+            let parent = schema
+                .get(check.parent_table_index)
+                .cloned()
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "bounded FOREIGN KEY proof references missing parent table index {}",
+                        check.parent_table_index
+                    ),
+                })?;
+            (child, parent)
+        };
+        let child_root = page_number_from_schema_root(child.root_page, &child.name, "table")?;
+        let child_rowid_alias = rowid_aliases.get(&child.root_page).copied();
+        let child_defaults = column_defaults.get(&child.root_page).map(Vec::as_slice);
+        let mut after = None;
+        while let Some((rowid, payload)) =
+            Self::bounded_next_table_row(cx, txn, child_root, page_size, reserved_per_page, after)
+                .await?
+        {
+            let payload_values =
+                parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "FOREIGN KEY child table `{}` rowid {rowid} has an invalid record",
+                        child.name
+                    ),
+                })?;
+            if payload_values.len() > child.columns.len() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "FOREIGN KEY child table `{}` rowid {rowid} stores {} columns but schema allows {}",
+                        child.name,
+                        payload_values.len(),
+                        child.columns.len()
+                    ),
+                });
+            }
+            let inflated = Self::inflate_table_row_values_for_integrity(
+                &child,
+                rowid,
+                &payload_values,
+                child_rowid_alias,
+                child_defaults,
+            )?;
+            bounded_increment_validation_counter(&mut counters.foreign_key_child_rows_checked)?;
+            let child_values = check
+                .child_columns
+                .iter()
+                .map(|position| {
+                    inflated
+                        .get(*position)
+                        .cloned()
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "FOREIGN KEY constraint {} on table `{}` references missing inflated child column {position}",
+                                check.constraint_index + 1,
+                                child.name
+                            ),
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if child_values.iter().any(SqliteValue::is_null) {
+                after = Some(rowid);
+                continue;
+            }
+            let parent_values = child_values
+                .into_iter()
+                .zip(&check.parent_columns)
+                .map(|(value, parent_column)| {
+                    value.apply_affinity(affinity_char_to_type(
+                        parent.columns[*parent_column].affinity,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if !self.bounded_parent_key_exists_in_txn(
+                cx,
+                txn,
+                &parent,
+                check,
+                &parent_values,
+                page_size,
+                reserved_per_page,
+                counters,
+            )
+            .await? {
+                let child_column_names = check
+                    .child_columns
+                    .iter()
+                    .map(|position| child.columns[*position].name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let parent_column_names = check
+                    .parent_columns
+                    .iter()
+                    .map(|position| parent.columns[*position].name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "FOREIGN KEY constraint {} on table `{}` rowid {rowid} violates `{}({child_column_names}) REFERENCES {}({parent_column_names})`",
+                        check.constraint_index + 1,
+                        child.name,
+                        child.name,
+                        parent.name
+                    ),
+                });
+            }
+            after = Some(rowid);
+        }
+        bounded_increment_validation_counter(&mut counters.foreign_key_constraints_checked)?;
+        Ok(())
+    }
+
+    async fn bounded_validate_foreign_keys_in_txn<T: TransactionHandle + ?Sized>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        rowid_aliases: &HashMap<i32, usize>,
+        column_defaults: &HashMap<i32, Vec<Option<SqliteValue>>>,
+        counters: &mut BoundedValidationCounters,
+    ) -> Result<()> {
+        let schema_len = self.schema.borrow().len();
+        for child_table_index in 0..schema_len {
+            let constraint_count = self
+                .schema
+                .borrow()
+                .get(child_table_index)
+                .map_or(0, |table| table.foreign_keys.len());
+            for constraint_index in 0..constraint_count {
+                let check =
+                    self.bounded_resolve_foreign_key_check(child_table_index, constraint_index)?;
+                self.bounded_validate_foreign_key_in_txn(
+                    cx,
+                    txn,
+                    &check,
+                    page_size,
+                    reserved_per_page,
+                    rowid_aliases,
+                    column_defaults,
+                    counters,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn bounded_resolve_foreign_key_check(
+        &self,
+        child_table_index: usize,
+        constraint_index: usize,
+    ) -> Result<BoundedForeignKeyCheck> {
+        let schema = self.schema.borrow();
+        let child = schema
+            .get(child_table_index)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "FOREIGN KEY validation references missing child table index {child_table_index}"
+                ),
+            })?;
+        let foreign_key = child.foreign_keys.get(constraint_index).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "FOREIGN KEY validation references missing constraint {} on table `{}`",
+                    constraint_index + 1,
+                    child.name
+                ),
+            }
+        })?;
+        if foreign_key.child_columns.is_empty()
+            || foreign_key.child_columns.len() > BOUNDED_VALIDATION_MAX_FOREIGN_KEY_COLUMNS
+        {
+            return Err(Self::bounded_validation_refusal(format!(
+                "FOREIGN KEY constraint {} on table `{}` has {} child columns; the bounded proof requires 1..={BOUNDED_VALIDATION_MAX_FOREIGN_KEY_COLUMNS}",
+                constraint_index + 1,
+                child.name,
+                foreign_key.child_columns.len()
+            )));
+        }
+        if foreign_key.parent_columns.is_empty() {
+            return Err(Self::bounded_validation_refusal(format!(
+                "FOREIGN KEY constraint {} on table `{}` omits its parent-column list",
+                constraint_index + 1,
+                child.name
+            )));
+        }
+        if foreign_key.parent_columns.len() != foreign_key.child_columns.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "FOREIGN KEY constraint {} on table `{}` has {} child columns but {} parent columns",
+                    constraint_index + 1,
+                    child.name,
+                    foreign_key.child_columns.len(),
+                    foreign_key.parent_columns.len()
+                ),
+            });
+        }
+
+        let child_columns = foreign_key.child_columns.clone();
+        if child_columns
+            .iter()
+            .any(|position| child.columns.get(*position).is_none())
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "FOREIGN KEY constraint {} on table `{}` has a missing child column",
+                    constraint_index + 1,
+                    child.name
+                ),
+            });
+        }
+        if child_columns.iter().collect::<HashSet<_>>().len() != child_columns.len() {
+            return Err(Self::bounded_validation_refusal(format!(
+                "FOREIGN KEY constraint {} on table `{}` repeats a child column; the bounded proof does not admit duplicate child columns",
+                constraint_index + 1,
+                child.name
+            )));
+        }
+
+        let parent_table_index = schema
+            .iter()
+            .position(|table| table.name.eq_ignore_ascii_case(&foreign_key.parent_table))
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "FOREIGN KEY constraint {} on table `{}` references missing parent table `{}`",
+                    constraint_index + 1,
+                    child.name,
+                    foreign_key.parent_table
+                ),
+            })?;
+        let parent = &schema[parent_table_index];
+        let parent_columns = foreign_key
+            .parent_columns
+            .iter()
+            .map(|column| {
+                parent
+                    .column_index(column)
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "FOREIGN KEY constraint {} on table `{}` references missing parent column `{}.{column}`",
+                            constraint_index + 1,
+                            child.name,
+                            parent.name
+                        ),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if parent_columns.iter().collect::<HashSet<_>>().len() != parent_columns.len() {
+            return Err(Self::bounded_validation_refusal(format!(
+                "FOREIGN KEY constraint {} on table `{}` repeats a parent column; the bounded proof does not admit duplicate parent columns",
+                constraint_index + 1,
+                child.name
+            )));
+        }
+
+        let parent_probe = if parent_columns.len() == 1 && parent.columns[parent_columns[0]].is_ipk
+        {
+            BoundedForeignKeyParentProbe::IntegerPrimaryKey {
+                column_index: parent_columns[0],
+            }
+        } else {
+            let parent_column_names = parent_columns
+                .iter()
+                .map(|position| parent.columns[*position].name.clone())
+                .collect::<Vec<_>>();
+            let index_index = parent.indexes.iter().position(|index| {
+                index.is_unique
+                    && index.supports_direct_column_lookup()
+                    && bounded_identifier_lists_equal(&index.columns, &parent_column_names)
+                    && parent_columns
+                        .iter()
+                        .enumerate()
+                        .all(|(key_index, parent_column_index)| {
+                            let column_collation = parent.columns[*parent_column_index]
+                                .collation
+                                .as_deref()
+                                .unwrap_or("BINARY");
+                            let index_collation = index
+                                .key_collations
+                                .get(key_index)
+                                .and_then(Option::as_deref)
+                                .unwrap_or("BINARY");
+                            column_collation.eq_ignore_ascii_case(index_collation)
+                        })
+            });
+            let Some(index_index) = index_index else {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "FOREIGN KEY constraint {} on table `{}` references `{}({})` without an exact, non-partial, plain-column UNIQUE index using the parent columns' collations",
+                    constraint_index + 1,
+                    child.name,
+                    parent.name,
+                    foreign_key.parent_columns.join(", ")
+                )));
+            };
+            BoundedForeignKeyParentProbe::UniqueIndex { index_index }
+        };
+
+        Ok(BoundedForeignKeyCheck {
+            constraint_index,
+            child_table_index,
+            parent_table_index,
+            child_columns,
+            parent_columns,
+            parent_probe,
+        })
+    }
+
     /// Refuse candidate schema shapes the bounded semantic walkers cannot
     /// prove — the structural half of the admission gate.
     ///
@@ -34354,12 +34816,48 @@ impl DatabaseImagePublication {
     }
 }
 
+/// Fixed ceiling on columns participating in one bounded foreign key.
+const BOUNDED_VALIDATION_MAX_FOREIGN_KEY_COLUMNS: usize = 32;
 /// Fixed ceiling on a GLOB/LIKE pattern admitted into a bounded proof.
 const BOUNDED_VALIDATION_MAX_GLOB_PATTERN_CHARS: usize = 4 * 1024;
 /// Fixed ceiling on nodes visited while admitting one persisted expression.
 const BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES: usize = 65_536;
 /// Fixed ceiling on expression-AST depth while admitting one expression.
 const BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH: usize = 512;
+
+#[derive(Debug, Clone, Copy)]
+enum BoundedForeignKeyParentProbe {
+    IntegerPrimaryKey { column_index: usize },
+    UniqueIndex { index_index: usize },
+}
+
+#[derive(Debug)]
+struct BoundedForeignKeyCheck {
+    constraint_index: usize,
+    child_table_index: usize,
+    parent_table_index: usize,
+    child_columns: Vec<usize>,
+    parent_columns: Vec<usize>,
+    parent_probe: BoundedForeignKeyParentProbe,
+}
+
+fn bounded_sqlite_value_bytes(value: &SqliteValue) -> usize {
+    match value {
+        SqliteValue::Null => 0,
+        SqliteValue::Integer(_) | SqliteValue::Float(_) => std::mem::size_of::<u64>(),
+        SqliteValue::Text(value) => value.len(),
+        SqliteValue::Blob(value) => value.len(),
+    }
+}
+
+fn bounded_identifier_lists_equal(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
 
 /// Everything walker 2 needs to recompute one index key from a table row.
 ///
