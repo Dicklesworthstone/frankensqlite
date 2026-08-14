@@ -236148,10 +236148,12 @@ mod pager_routing_tests {
     }
 
     // bd-4nuqo (split from bd-2ijbe): a custom BINARY collation override must
-    // disable the canonical hash-join fast path so the custom comparator governs
-    // equality JOINs; today the hash path hashes raw bytes and the join returns 0
-    // rows instead of 2. Un-ignore when bd-4nuqo lands.
-    #[ignore = "bd-4nuqo: custom BINARY override must disable the canonical hash-join fast path (wrong JOIN rows)"]
+    // govern every equality surface. The JOIN half is guarded by
+    // join_hash_pairs_are_binary (registry-aware); the EXISTS half regressed in
+    // the VDBE comparison opcodes, whose fast/general paths trusted raw-byte
+    // (or builtin-by-name) comparison for an absent or built-in P4 collation.
+    // Fixed by the registry-aware builtin_collations_overridden gate in
+    // fsqlite-vdbe::engine.
     #[test]
     fn test_custom_binary_override_disables_binary_hash_and_exists_memos() {
         struct AlwaysEqualBinary;

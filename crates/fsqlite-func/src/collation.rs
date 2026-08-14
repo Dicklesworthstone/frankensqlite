@@ -225,6 +225,21 @@ impl CollationRegistry {
             && !self.custom_collations.contains_key(&canon)
     }
 
+    /// Whether any built-in collation name (`BINARY`, `NOCASE`, `RTRIM`) is
+    /// currently shadowed by an application override.
+    ///
+    /// Comparison fast paths that assume built-in semantics when a compiled
+    /// program carries no explicit collation (the default is BINARY) must
+    /// consult this before trusting raw byte comparison — checking only an
+    /// explicit collation operand misses the overridden-default case
+    /// (bd-4nuqo).
+    #[must_use]
+    pub fn any_builtin_overridden(&self) -> bool {
+        ["BINARY", "NOCASE", "RTRIM"]
+            .iter()
+            .any(|name| self.custom_collations.contains_key(*name))
+    }
+
     /// Return registered collation names in stable display order.
     ///
     /// Built-ins always appear first (`BINARY`, `NOCASE`, `RTRIM`) so pragma
