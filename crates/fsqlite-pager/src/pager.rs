@@ -23281,6 +23281,14 @@ where
                 let fl: Vec<PageNumber> =
                     self.allocated_from_freelist.drain(freelist_start..).collect();
                 self.savepoint_quarantined_allocations.extend(fl);
+                // Keep the quarantine descending so `pop()` hands the LOWEST
+                // page number out first, matching the freelist convention and
+                // the pre-quarantine reuse order (compact growth; pinned by
+                // test_concurrent_rollback_to_savepoint_reclaims_eof_
+                // allocations expecting ascending re-grants).
+                self.savepoint_quarantined_allocations
+                    .sort_unstable_by_key(|page| std::cmp::Reverse(page.get()));
+                self.savepoint_quarantined_allocations.dedup();
             }
         }
 
