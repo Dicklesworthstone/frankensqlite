@@ -14965,6 +14965,45 @@ impl Connection {
                 }
             }
         }
+
+        // Tables are not the whole schema. A persisted view or trigger carries
+        // expressions that become part of what a published image means, and an
+        // image whose trigger bodies were never admitted is an image this proof
+        // cannot speak for. TEMP objects are connection-local and never travel
+        // with the image, so they are out of scope by construction.
+        for view in self
+            .views
+            .borrow()
+            .iter()
+            .filter(|view| !view.temporary)
+        {
+            self.validate_bounded_ast_semantics(
+                BoundedCollationAstNode::Select(&view.query),
+                &format!("view `{}`", view.name),
+                true,
+            )?;
+        }
+        for trigger in self
+            .triggers
+            .borrow()
+            .iter()
+            .filter(|trigger| !trigger.temporary)
+        {
+            if let Some(when_clause) = trigger.when_clause.as_ref() {
+                self.validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Expr(when_clause),
+                    &format!("WHEN clause of trigger `{}`", trigger.name),
+                    true,
+                )?;
+            }
+            for statement in &trigger.body {
+                self.validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Statement(statement),
+                    &format!("body of trigger `{}`", trigger.name),
+                    true,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -228882,10 +228921,15 @@ mod pager_routing_tests {
                 "a child row pointing at a missing parent must be refused, got {semantic:?}"
             );
             let error = semantic.unwrap_err();
+            // Must be a CONCORDANCE failure, not a gate refusal. If this were
+            // allowed to accept NotImplemented, the test would also pass when
+            // the admission gate rejected the schema outright and the walkers
+            // never ran — which would prove nothing about the walkers at all.
             assert!(
-                matches!(&error, FrankenError::DatabaseCorrupt { .. })
-                    || matches!(&error, FrankenError::NotImplemented(_)),
-                "expected a typed refusal, got {error:?}"
+                matches!(&error, FrankenError::DatabaseCorrupt { .. }),
+                "expected a DatabaseCorrupt concordance failure from the walkers, \
+                 got {error:?} (a NotImplemented here means the gate refused the \
+                 schema and the walkers never executed)"
             );
 
             snapshot.finish().await.ok();
