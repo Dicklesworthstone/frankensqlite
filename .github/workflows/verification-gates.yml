@@ -548,6 +548,10 @@ jobs:
         run: |
           cargo test -p fsqlite-core --test pragma_data_version_oracle -- --nocapture
 
+      - name: IN-subquery TEXT-LHS numeric affinity keeper (bd-a0oa9)
+        run: |
+          cargo test -p fsqlite-core --test in_subquery_text_affinity_oracle -- --nocapture
+
   e2e-scenario-matrix:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
