@@ -6345,6 +6345,21 @@ struct PreparedIndexedEqualityLastResult {
     rows: Vec<Row>,
 }
 
+/// bd-z22mq: prologue products of `execute_group_by_select` for a statement
+/// that reached the rowid-bucket SUM+GROUP BY mem-scan fast lane, so the next
+/// execution of the structurally identical statement skips the ~65us of
+/// schema-clone / col-map / collation / descriptor rebuilding and calls the
+/// lane directly. See the field doc on `Connection::group_by_bucket_fast_memo`
+/// for the invalidation contract.
+struct GroupByBucketFastMemo {
+    select: SelectStatement,
+    root_page: i32,
+    table_schema: TableSchema,
+    effective_label: String,
+    group_by_exprs: Vec<Expr>,
+    result_descriptors: Vec<GroupByColumn>,
+}
+
 impl PreparedIndexedEqualityLastResult {
     fn matches(
         &self,
@@ -11215,6 +11230,13 @@ pub struct Connection {
     /// Reuses the indexed-equality version key so writes and snapshot changes miss.
     prepared_count_indexed_rowid_probe_last_result:
         RefCell<Option<PreparedCountIndexedRowidProbeLastResult>>,
+    /// bd-z22mq: one-entry memo of the AST-derived prologue products feeding
+    /// the rowid-bucket SUM+GROUP BY mem-scan fast lane, keyed by structural
+    /// statement equality. Carries NO row data — the lane re-checks its
+    /// dynamic guards and reads live rows on every call — so it survives data
+    /// writes; every schema/registry change routes through the compilation
+    /// cache clears, which drop it.
+    group_by_bucket_fast_memo: RefCell<Option<GroupByBucketFastMemo>>,
     /// Schema-generation-scoped execution metadata cache for table-backed
     /// statements. Avoids rebuilding structural root-page maps on every VDBE
     /// run while leaving dynamic defaults and sqlite_sequence values live.
@@ -12525,6 +12547,7 @@ impl Connection {
             prepared_indexed_equality_cache: RefCell::new(HashMap::new()),
             prepared_indexed_equality_last_result: RefCell::new(None),
             prepared_count_indexed_rowid_probe_last_result: RefCell::new(None),
+            group_by_bucket_fast_memo: RefCell::new(None),
             table_execution_metadata_cache: RefCell::new(None),
             column_default_eval_depth: Cell::new(0),
             attached_schemas: RefCell::new(SchemaRegistry::new()),
@@ -13036,6 +13059,7 @@ impl Connection {
             prepared_indexed_equality_cache: RefCell::new(HashMap::new()),
             prepared_indexed_equality_last_result: RefCell::new(None),
             prepared_count_indexed_rowid_probe_last_result: RefCell::new(None),
+            group_by_bucket_fast_memo: RefCell::new(None),
             table_execution_metadata_cache: RefCell::new(None),
             column_default_eval_depth: Cell::new(0),
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
@@ -28602,6 +28626,7 @@ impl Connection {
         self.planner_directive_cache.borrow_mut().clear();
         self.storage_count_cache.borrow_mut().clear();
         self.clear_prepared_indexed_equality_caches();
+        *self.group_by_bucket_fast_memo.borrow_mut() = None;
         self.discard_cached_vdbe_engine();
         self.reset_statement_lookaside();
     }
@@ -28641,6 +28666,9 @@ impl Connection {
         self.planner_directive_cache.borrow_mut().clear();
         self.storage_count_cache.borrow_mut().clear();
         self.clear_prepared_indexed_equality_caches();
+        // bd-z22mq: the bucket memo caches only schema-derived products, but a
+        // write commit is the conservative superset boundary — drop it too.
+        *self.group_by_bucket_fast_memo.borrow_mut() = None;
         self.discard_cached_vdbe_engine();
         self.reset_statement_lookaside();
     }
@@ -30125,7 +30153,18 @@ impl Connection {
             // may be repairing malformed rows. Do not refresh the normal MemDB
             // schema image before the raw edit has had a chance to run.
             if should_refresh_active_txn_memdb && !writable_schema_dml {
-                self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
+                // bd-33sht: a read-free INSERT ... VALUES streak must not pay a
+                // full O(rows) MemDatabase reload per statement. Flush pending
+                // direct writes (the insert's own uniqueness/rowid checks read
+                // the txn b-tree) but skip the mirror reload — the mirror stays
+                // stale and is rebuilt once at the next actual read boundary.
+                if matches!(statement.as_ref(), Statement::Insert(ins)
+                    if insert_source_is_memdb_read_free(&ins.source))
+                {
+                    self.flush_pending_direct_write_runs(&op_cx).await?;
+                } else {
+                    self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
+                }
             }
             if !self.skip_statement_memdb_refresh.get() && !is_txn_control && !is_write {
                 self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
@@ -67743,6 +67782,32 @@ impl Connection {
             ));
         }
 
+        // bd-z22mq: repeated execution of the statement that last hit the
+        // rowid-bucket mem-scan fast lane skips the prologue rebuild entirely.
+        // The lane re-checks every dynamic guard (function overrides, memdb
+        // visibility) and reads live rows, so a memo hit is purely the cached
+        // AST products; a miss (or a lane refusal) falls through to the full
+        // prologue unchanged.
+        if params.is_none_or(<[SqliteValue]>::is_empty) {
+            let memo_result = {
+                let memo_slot = self.group_by_bucket_fast_memo.borrow();
+                match memo_slot.as_ref() {
+                    Some(memo) if memo.select == *select => self
+                        .try_execute_rowid_bucket_sum_group_by_mem_scan(
+                            memo.root_page,
+                            &memo.table_schema,
+                            &memo.effective_label,
+                            &memo.group_by_exprs,
+                            &memo.result_descriptors,
+                        )?,
+                    _ => None,
+                }
+            };
+            if let Some(result) = memo_result {
+                return Ok(result);
+            }
+        }
+
         // Extract GROUP BY expressions and result columns from the AST.
         let SelectCore::Select {
             columns,
@@ -68086,6 +68151,16 @@ impl Connection {
                 &result_descriptors,
             )?
         {
+            // bd-z22mq: remember the prologue products so the next execution
+            // of this exact statement jumps straight to the mem-scan lane.
+            *self.group_by_bucket_fast_memo.borrow_mut() = Some(GroupByBucketFastMemo {
+                select: select.clone(),
+                root_page: table_schema.root_page,
+                effective_label: effective_label.to_owned(),
+                table_schema,
+                group_by_exprs,
+                result_descriptors,
+            });
             return Ok(result);
         }
 
@@ -106236,6 +106311,63 @@ fn stmt_kind_label(stmt: &Statement) -> &'static str {
         Statement::Reindex(_) => "REINDEX",
         Statement::Explain { .. } => "EXPLAIN",
         _ => "unknown",
+    }
+}
+
+/// bd-33sht: an `INSERT ... VALUES` / `DEFAULT VALUES` whose value expressions
+/// read nothing from the database never consults the MemDatabase mirror during
+/// execution.
+///
+/// Such a statement can skip the eager per-statement mirror *reload* (its pending
+/// direct writes are still flushed, since its own uniqueness/rowid checks read
+/// the txn b-tree): the mirror stays stale through a bulk-insert streak and is
+/// rebuilt once at the next actual read boundary, turning O(rows x statements)
+/// ingest into O(rows + statements). Conservative — anything not provably
+/// read-free (a `SELECT` source, a subquery/EXISTS/IN, a column or function
+/// reference) keeps the full refresh.
+fn insert_source_is_memdb_read_free(source: &fsqlite_ast::InsertSource) -> bool {
+    match source {
+        fsqlite_ast::InsertSource::DefaultValues => true,
+        fsqlite_ast::InsertSource::Select(_) => false,
+        fsqlite_ast::InsertSource::Values(rows) => {
+            rows.iter().all(|row| row.iter().all(expr_is_memdb_read_free))
+        }
+    }
+}
+
+fn expr_is_memdb_read_free(expr: &fsqlite_ast::Expr) -> bool {
+    use fsqlite_ast::Expr;
+    match expr {
+        Expr::Literal(..) | Expr::Placeholder(..) => true,
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => expr_is_memdb_read_free(expr),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_is_memdb_read_free(left) && expr_is_memdb_read_free(right)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_is_memdb_read_free(expr)
+                && expr_is_memdb_read_free(low)
+                && expr_is_memdb_read_free(high)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_none_or(expr_is_memdb_read_free)
+                && whens
+                    .iter()
+                    .all(|(w, t)| expr_is_memdb_read_free(w) && expr_is_memdb_read_free(t))
+                && else_expr.as_deref().is_none_or(expr_is_memdb_read_free)
+        }
+        // Subquery / EXISTS / IN / column / function / row-value / bound-outer /
+        // and every other form: conservatively keep the full refresh.
+        _ => false,
     }
 }
 
@@ -161873,6 +162005,78 @@ mod tests {
                 .unwrap();
             assert_eq!(rows.len(), 2);
             assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(10));
+        });
+    }
+
+    /// bd-z22mq: the one-entry bucket fast-lane memo must never serve stale
+    /// results — a write commit, DDL, or statement change has to miss or be
+    /// re-validated against live rows.
+    #[test]
+    fn test_group_by_bucket_fast_memo_tracks_writes_and_ddl() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, value INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO bench VALUES (1, 10), (2, 20), (11, 100);")
+                .await
+                .unwrap();
+
+            let sql = "SELECT (id / 10), SUM(value) FROM bench GROUP BY (id / 10);";
+            let first = conn.query(sql).await.unwrap();
+            assert_eq!(
+                first.iter().map(row_values).collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(0), SqliteValue::Integer(30)],
+                    vec![SqliteValue::Integer(1), SqliteValue::Integer(100)],
+                ]
+            );
+
+            // Second execution of the identical statement takes the memo path.
+            let memo_hit = conn.query(sql).await.unwrap();
+            assert_eq!(
+                memo_hit.iter().map(row_values).collect::<Vec<_>>(),
+                first.iter().map(row_values).collect::<Vec<_>>()
+            );
+
+            // New committed rows must be visible on the very next execution.
+            conn.execute("INSERT INTO bench VALUES (3, 5), (21, 7);")
+                .await
+                .unwrap();
+            let after_insert = conn.query(sql).await.unwrap();
+            assert_eq!(
+                after_insert.iter().map(row_values).collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(0), SqliteValue::Integer(35)],
+                    vec![SqliteValue::Integer(1), SqliteValue::Integer(100)],
+                    vec![SqliteValue::Integer(2), SqliteValue::Integer(7)],
+                ]
+            );
+
+            // A structurally different statement must not hit the memo.
+            let other = conn
+                .query("SELECT (id / 20), SUM(value) FROM bench GROUP BY (id / 20);")
+                .await
+                .unwrap();
+            assert_eq!(
+                other.iter().map(row_values).collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(0), SqliteValue::Integer(135)],
+                    vec![SqliteValue::Integer(1), SqliteValue::Integer(7)],
+                ]
+            );
+
+            // DDL rebuilding the table (new schema, same name) must invalidate.
+            conn.execute("DROP TABLE bench;").await.unwrap();
+            conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, value INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO bench VALUES (5, 1);").await.unwrap();
+            let after_ddl = conn.query(sql).await.unwrap();
+            assert_eq!(
+                after_ddl.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(0), SqliteValue::Integer(1)]]
+            );
         });
     }
 
