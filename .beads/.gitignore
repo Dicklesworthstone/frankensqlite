@@ -16,3 +16,7 @@ last-touched
 # br CLI history snapshots (large + ephemeral)
 .br_history/
 .write.lock
+
+# Merge artifacts (temporary files from 3-way merge)
+beads.base.jsonl
+beads.base.meta.json
