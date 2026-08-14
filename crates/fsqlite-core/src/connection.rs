@@ -64871,6 +64871,30 @@ impl Connection {
         let result_descriptors: Vec<GroupByColumn> = expanded_columns
             .iter()
             .map(|col| match col {
+                // bd-a8ygy: builtin JSON aggregates (json_group_array/object)
+                // are computed by the grouped join-expression evaluator, which
+                // owns their NULL-keeping / two-argument / ORDER BY / DISTINCT
+                // semantics. Parsing them as Agg descriptors routes them to
+                // compute_aggregate's name table, which does not know them and
+                // silently yields NULL — keep the whole call as a Plain
+                // expression, exactly how nested json aggregates already
+                // execute on these paths. Application overrides keep the Agg
+                // route (its registry path handles them).
+                ResultColumn::Expr { expr, .. }
+                    if matches!(
+                        expr,
+                        Expr::FunctionCall { name, args, .. }
+                            if is_builtin_json_aggregate(name)
+                                && self.function_call_is_current_aggregate(name, args)
+                                && current_application_function_kind(
+                                    name,
+                                    aggregate_args_len_for_lookup(args),
+                                )
+                                .is_none()
+                    ) =>
+                {
+                    Ok(GroupByColumn::Plain(Box::new(expr.clone())))
+                }
                 ResultColumn::Expr {
                     expr:
                         Expr::FunctionCall {
@@ -69111,6 +69135,30 @@ impl Connection {
         let mut result_descriptors: Vec<GroupByColumn> = expanded_columns
             .iter()
             .map(|col| match col {
+                // bd-a8ygy: builtin JSON aggregates (json_group_array/object)
+                // are computed by the grouped join-expression evaluator, which
+                // owns their NULL-keeping / two-argument / ORDER BY / DISTINCT
+                // semantics. Parsing them as Agg descriptors routes them to
+                // compute_aggregate's name table, which does not know them and
+                // silently yields NULL — keep the whole call as a Plain
+                // expression, exactly how nested json aggregates already
+                // execute on these paths. Application overrides keep the Agg
+                // route (its registry path handles them).
+                ResultColumn::Expr { expr, .. }
+                    if matches!(
+                        expr,
+                        Expr::FunctionCall { name, args, .. }
+                            if is_builtin_json_aggregate(name)
+                                && self.function_call_is_current_aggregate(name, args)
+                                && current_application_function_kind(
+                                    name,
+                                    aggregate_args_len_for_lookup(args),
+                                )
+                                .is_none()
+                    ) =>
+                {
+                    Ok(GroupByColumn::Plain(Box::new(expr.clone())))
+                }
                 ResultColumn::Expr {
                     expr:
                         Expr::FunctionCall {
@@ -225484,6 +225532,22 @@ mod pager_routing_tests {
             assert_eq!(
                 one("SELECT json_group_object(k, v ORDER BY k) FROM kv").await,
                 r#"{"a":1,"b":2,"c":3}"#
+            );
+
+            // bd-a8ygy: plain top-level shapes and the JOIN route were both
+            // parsed into Agg descriptors that compute_aggregate's name table
+            // does not know, silently yielding NULL. Pin all three.
+            assert_eq!(
+                one("SELECT json_group_array(x) FROM t").await,
+                "[3,1,1,2]"
+            );
+            assert_eq!(
+                one("SELECT json_group_object(k, v) FROM kv").await,
+                r#"{"b":2,"a":1,"c":3}"#
+            );
+            assert_eq!(
+                one("SELECT json_group_array(x ORDER BY x) FROM t JOIN (SELECT 1) ON 1").await,
+                "[1,1,2,3]"
             );
         });
     }
