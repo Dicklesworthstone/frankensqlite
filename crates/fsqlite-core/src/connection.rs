@@ -29937,12 +29937,13 @@ impl Connection {
                     )
                 })?;
                 let registry = lock_unpoisoned(&self.concurrent_registry);
-                let handle = registry.get(session_id).ok_or_else(|| {
+                let mut handle = registry.get(session_id).ok_or_else(|| {
                     FrankenError::Internal("concurrent session handle not found".to_owned())
                 })?;
-                let snapshot = concurrent_savepoint(&handle, &savepoint_name).map_err(|e| {
-                    FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
-                })?;
+                let snapshot =
+                    concurrent_savepoint(&mut handle, &savepoint_name).map_err(|e| {
+                        FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
+                    })?;
                 Ok(Some(snapshot))
             })();
             match concurrent_result {
@@ -59368,10 +59369,10 @@ impl Connection {
                 })?;
                 let snapshot = {
                     let registry = lock_unpoisoned(&self.concurrent_registry);
-                    let handle = registry.get(session_id).ok_or_else(|| {
+                    let mut handle = registry.get(session_id).ok_or_else(|| {
                         FrankenError::Internal("concurrent session handle not found".to_owned())
                     })?;
-                    concurrent_savepoint(&handle, name).map_err(|e| {
+                    concurrent_savepoint(&mut handle, name).map_err(|e| {
                         FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
                     })?
                 };
@@ -136001,12 +136002,24 @@ mod tests {
     #[test]
     fn test_values_offset_beyond_row_count_returns_empty() {
         asupersync::test_utils::run_test(|| async {
+            // bd-m5q9p: reconciled to the oracle like its siblings above —
+            // stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES
+            // term ('near "ORDER": syntax error'); the functional
+            // offset-beyond-rows behavior is expressed via the subquery form.
             let conn = Connection::open(":memory:").await.unwrap();
             let rows = conn
-                .query("VALUES (1), (2) ORDER BY 1 LIMIT 10 OFFSET 99;")
+                .query("SELECT * FROM (VALUES (1), (2)) ORDER BY 1 LIMIT 10 OFFSET 99;")
                 .await
                 .unwrap();
             assert!(rows.is_empty());
+
+            let bare = conn
+                .query("VALUES (1), (2) ORDER BY 1 LIMIT 10 OFFSET 99;")
+                .await;
+            assert!(
+                matches!(bare, Err(FrankenError::ParseError { .. })),
+                "stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
+            );
         });
     }
 
