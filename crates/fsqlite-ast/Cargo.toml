@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-ast"
-version = "0.3.0"
+version = "0.3.1"
 description = "SQL abstract syntax tree node types"
 edition.workspace = true
 license-file.workspace = true
