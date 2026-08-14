@@ -127451,6 +127451,16 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             Some(SqliteValue::Blob(b)) => {
                 SqliteValue::Integer(fsqlite_ext_json::json_valid_blob(b, None))
             }
+            // bd-r02v6: numerics validate as their JSON-number text, mirroring
+            // the registered JsonValidFunc (stock: json_valid(5) = 1). NULL is
+            // already handled by the propagation guard above; non-finite
+            // floats render as non-JSON text and stay invalid.
+            Some(SqliteValue::Integer(n)) => {
+                SqliteValue::Integer(fsqlite_ext_json::json_valid(&n.to_string(), None))
+            }
+            Some(SqliteValue::Float(f)) if f.is_finite() => {
+                SqliteValue::Integer(fsqlite_ext_json::json_valid(&f.to_string(), None))
+            }
             _ => SqliteValue::Integer(0),
         },
         #[cfg(feature = "ext-json")]
@@ -164366,6 +164376,23 @@ mod tests {
             super::compute_aggregate("count", &values).unwrap(),
             SqliteValue::Integer(1)
         );
+    }
+
+    /// bd-r02v6: the interpreter-fallback json_valid arm must mirror the
+    /// registered JsonValidFunc for numeric and NULL arguments (oracle
+    /// sqlite3 3.46.1: json_valid(5)=1, json_valid(2.5)=1,
+    /// json_valid(9e999)=0, json_valid(NULL)=NULL).
+    #[cfg(feature = "ext-json")]
+    #[test]
+    fn test_eval_scalar_fn_json_valid_numeric_and_null_args() {
+        use SqliteValue as V;
+        let json_valid = |args: &[V]| super::eval_scalar_fn("json_valid", args);
+        assert_eq!(json_valid(&[V::Integer(5)]), V::Integer(1));
+        assert_eq!(json_valid(&[V::Float(2.5)]), V::Integer(1));
+        assert_eq!(json_valid(&[V::Float(f64::INFINITY)]), V::Integer(0));
+        assert_eq!(json_valid(&[V::Null]), V::Null);
+        assert_eq!(json_valid(&[V::Text("[1]".into())]), V::Integer(1));
+        assert_eq!(json_valid(&[V::Text("{bad".into())]), V::Integer(0));
     }
 
     /// bd-z22mq: the one-entry bucket fast-lane memo must never serve stale
