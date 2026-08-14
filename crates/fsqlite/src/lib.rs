@@ -21,7 +21,9 @@
 /// [`Connection::begin_bounded_structural_snapshot`] and
 /// [`Connection::begin_database_image_publication`]; without them a caller can
 /// call those methods but cannot write down the types they hand back.
-pub use fsqlite_core::connection::{BoundedDatabaseStructuralStats, PageCachePeakSnapshot};
+pub use fsqlite_core::connection::{
+    BoundedDatabaseStructuralStats, PageCachePeakSnapshot, WriteSetStats,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use fsqlite_core::connection::{
     BoundedStructuralSnapshot, DatabaseBuilderReservation, DatabaseImagePublication,

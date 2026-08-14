@@ -113,6 +113,7 @@ use fsqlite_func::{
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_pager::ConnectionPagerOpenMode;
 pub use fsqlite_pager::page_cache::PageCachePeakSnapshot;
+pub use fsqlite_pager::pager::WriteSetStats;
 pub use fsqlite_pager::pager::DatabaseImageReceipt;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
@@ -3916,6 +3917,18 @@ impl PagerBackend {
             Self::Unix(p) => p.set_write_set_page_limit(page_limit),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.set_write_set_page_limit(page_limit),
+        }
+    }
+
+    fn write_set_stats(&self) -> Option<fsqlite_pager::pager::WriteSetStats> {
+        match self {
+            Self::Memory(p) => p.write_set_stats(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.write_set_stats(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.write_set_stats(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.write_set_stats(),
         }
     }
 
@@ -15732,6 +15745,25 @@ impl Connection {
                 Some((entry_type, name, tbl_name, root_page, sql))
             })
             .collect()
+    }
+
+    /// Dirty-write-set accounting for the latest transaction on this
+    /// connection, when a write-set ceiling is in force.
+    ///
+    /// Distinct from [`Self::page_cache_peak_snapshot`], and the distinction is
+    /// the whole point: residency answers "how many pages were held in memory",
+    /// which is a memory bound. This answers "how much of the database did the
+    /// transaction actually rewrite", which is what a bounded-migration
+    /// certifier needs and what a residency peak cannot substitute for.
+    ///
+    /// `None` when no ceiling is configured — reporting zeroes there would read
+    /// as "nothing was written" rather than "nothing was bounded".
+    ///
+    /// # Errors
+    ///
+    /// Propagates pager errors.
+    pub fn write_set_stats(&self) -> Result<Option<WriteSetStats>> {
+        Ok(self.pager.write_set_stats())
     }
 
     /// High-water page-cache residency reached on this connection.
@@ -228638,6 +228670,84 @@ mod pager_routing_tests {
                 before,
                 "the image must be byte-identical after every refused write"
             );
+        });
+    }
+
+    /// The write-set telemetry must report real work, and must distinguish a
+    /// ceiling that held from one that bit.
+    ///
+    /// This is what `write_set_stats` is for downstream: proving after the fact
+    /// how much of the database a bounded build actually rewrote. An accessor
+    /// that returned plausible zeroes would satisfy the type and prove nothing,
+    /// so this asserts non-zero high water AND a non-zero refusal count on a
+    /// build that deliberately overruns.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn write_set_stats_report_high_water_and_cap_refusals() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("wss.db");
+            let mut env = ConnectionEnv::default();
+            env.set_schema_only_write_set_page_limit(3);
+            let reservation =
+                Connection::reserve_schema_only_builder_target_with_env(&target, &env)
+                    .expect("reserve");
+            let builder = Connection::initialize_reserved_schema_only_builder(&reservation, env)
+                .await
+                .expect("initialize");
+
+            // No ceiling would mean nothing to report against.
+            let before = builder.write_set_stats().expect("stats readable");
+            let before = before.expect("a configured ceiling must produce stats");
+            assert_eq!(before.page_limit, 3);
+            assert_eq!(
+                before.byte_limit,
+                3 * usize::try_from(builder.page_size()).unwrap_or(0).max(1),
+                "byte ceiling must be page_limit * page_size"
+            );
+
+            builder
+                .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+                .await
+                .ok();
+            let mut refused = false;
+            for id in 1..=512_i64 {
+                let filler = "z".repeat(512);
+                if builder
+                    .execute(&format!("INSERT INTO t VALUES ({id}, '{filler}');"))
+                    .await
+                    .is_err()
+                {
+                    refused = true;
+                    break;
+                }
+            }
+            assert!(refused, "a 3-page ceiling must refuse this build");
+
+            let after = builder
+                .write_set_stats()
+                .expect("stats readable")
+                .expect("ceiling configured");
+            assert!(
+                after.dirty_pages_high_water > 0,
+                "high water must record real staged pages, got {after:?}"
+            );
+            assert!(
+                after.dirty_pages_high_water <= after.page_limit,
+                "the ceiling must not be exceeded, got {after:?}"
+            );
+            assert!(
+                after.cap_refusals > 0,
+                "a build that overran must record refusals — a bound that held \
+                 and a bound that bit are otherwise indistinguishable, got {after:?}"
+            );
+            assert_eq!(
+                after.dirty_bytes_high_water,
+                after.dirty_pages_high_water
+                    * usize::try_from(builder.page_size()).unwrap_or(0).max(1),
+                "byte high water must be derived from the page high water"
+            );
+            builder.close().await.ok();
         });
     }
 
