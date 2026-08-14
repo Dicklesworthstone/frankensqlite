@@ -224303,6 +224303,19 @@ mod pager_routing_tests {
         let source = Connection::open(source_path.to_string_lossy().into_owned())
             .await
             .expect("open the publication source");
+        // The source must be in rollback mode too, and the two requirements
+        // that force it are worth stating together because they compose into a
+        // real constraint on callers:
+        //   - bounded structural validation admits only rollback/DELETE images;
+        //   - publication refuses a candidate whose file-format versions do not
+        //     match the source's journal mode.
+        // So a WAL source can never take a bounded-validated candidate. A
+        // caller whose live database is in WAL must move it to rollback mode
+        // before publishing one.
+        source
+            .execute("PRAGMA journal_mode=DELETE;")
+            .await
+            .expect("put the publication source in rollback mode");
         for sql in bounded_snapshot_seed_sql() {
             source.execute(&sql).await.expect("seed the source");
         }
