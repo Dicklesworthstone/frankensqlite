@@ -223210,6 +223210,75 @@ mod pager_routing_tests {
         });
     }
 
+    #[cfg(feature = "ext-json")]
+    #[test]
+    fn test_jsonb_blobs_round_trip_through_stock_sqlite() {
+        // bd-t75hg: a JSONB blob stored by FrankenSQLite must be readable by
+        // stock SQLite (rusqlite = bundled C SQLite) and vice versa —
+        // numeric payloads are ASCII text per the JSONB spec, so both
+        // engines must render identical json() text from each other's blobs.
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join("jsonb_interop.db")
+                .to_string_lossy()
+                .into_owned();
+            let doc = r#"{"a":1,"b":-7,"c":1.5,"d":-0.0,"e":1e300,"f":[9223372036854775807,"x"],"g":"q\"z"}"#;
+
+            // FrankenSQLite writes, stock reads.
+            let conn = Connection::open(path.clone()).await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, doc BLOB);")
+                .await
+                .unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES (1, jsonb('{}'));", doc.replace('\'', "''")))
+                .await
+                .unwrap();
+            let ours = conn.query("SELECT json(doc) FROM t;").await.unwrap();
+            let ours_text = match &ours[0].values()[0] {
+                SqliteValue::Text(t) => t.to_string(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").await.unwrap();
+            conn.close().await.unwrap();
+
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            let stock_text: String = stock
+                .query_row("SELECT json(doc) FROM t", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                stock_text, ours_text,
+                "stock sqlite3 must render our JSONB identically"
+            );
+
+            // Stock writes, FrankenSQLite reads.
+            stock
+                .execute(
+                    "INSERT INTO t VALUES (2, jsonb(?1))",
+                    rusqlite::params![doc],
+                )
+                .unwrap();
+            let stock_text2: String = stock
+                .query_row("SELECT json(doc) FROM t WHERE id = 2", [], |row| row.get(0))
+                .unwrap();
+            drop(stock);
+
+            let conn = Connection::open(path).await.unwrap();
+            let back = conn
+                .query("SELECT json(doc) FROM t WHERE id = 2;")
+                .await
+                .unwrap();
+            let back_text = match &back[0].values()[0] {
+                SqliteValue::Text(t) => t.to_string(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert_eq!(
+                back_text, stock_text2,
+                "we must render stock-written JSONB identically"
+            );
+        });
+    }
+
     #[test]
     fn test_delete_not_in_ordered_limited_subquery_matches_oracle() {
         // bd-brzp8 oracle (sqlite3 3.46.1): the mcp_agent_mail_rust prune
