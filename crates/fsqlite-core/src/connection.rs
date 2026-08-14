@@ -223280,6 +223280,39 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 2, "kept pinned row 3 + newest unpinned row 4");
+
+            // Strict no-fallback arm: the same shape must run on the COMPILED
+            // path too — the downstream 0.3.0 failure was a VDBE halt, so a
+            // keeper satisfied by the interpreted fallback alone would be
+            // vacuous for the reported defect.
+            conn.set_strict_mem_fallback_rejection(true);
+            conn.execute("INSERT INTO search_recipes VALUES (6,0,400),(7,0,50);")
+                .await
+                .unwrap();
+            conn.execute(
+                "DELETE FROM search_recipes WHERE pinned=0 AND id NOT IN \
+                 (SELECT id FROM search_recipes WHERE pinned=0 ORDER BY updated_ts DESC LIMIT 2)",
+            )
+            .await
+            .expect("strict-mode prune must execute on the compiled path (bd-brzp8)");
+            conn.set_strict_mem_fallback_rejection(false);
+            let rows = conn
+                .query("SELECT id FROM search_recipes ORDER BY id;")
+                .await
+                .unwrap();
+            let ids: Vec<_> = rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![
+                    SqliteValue::Integer(3),
+                    SqliteValue::Integer(4),
+                    SqliteValue::Integer(6),
+                ],
+                "strict-mode prune keeps pinned 3 + top-2 unpinned {{6,4}}"
+            );
         });
     }
 
