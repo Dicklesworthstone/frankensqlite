@@ -13338,6 +13338,26 @@ impl Connection {
             });
         }
         env.set_schema_only_write_set_page_limit(page_limit);
+
+        // A reserved pathname is an EMPTY file, which is not yet a database.
+        // Bootstrap page 1 through the identity-bound reserved-open path first;
+        // the existing-file schema-only path below would refuse a zero-byte
+        // file. The ceiling is deliberately NOT installed for this step: page 1
+        // is engine bootstrap, not caller-attributable build work, and counting
+        // it would make a small budget unusable for the reason a caller cannot
+        // see.
+        let bootstrap = Self::open_reserved_with_expected_identity_and_env(
+            stable.clone(),
+            reservation.identity(),
+            env.clone(),
+        )
+        .await?;
+        bootstrap.close().await?;
+
+        // The file is now a database, so the length is no longer zero; identity
+        // and single-linkage must still hold.
+        reservation.revalidate_final_target(None)?;
+
         let builder = Self::open_existing_schema_only_with_expected_identity_and_env(
             stable,
             reservation.identity(),
