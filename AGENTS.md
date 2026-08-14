@@ -232,7 +232,25 @@ Every component crate includes inline `#[cfg(test)]` unit tests alongside the im
 - Edge cases (empty input, max values, boundary conditions)
 - Error conditions
 
-Cross-component integration tests live in the workspace `tests/` directory.
+Cross-component integration tests live in the owning crate's `tests/`
+directory — primarily `crates/fsqlite-e2e/tests/` and
+`crates/fsqlite-harness/tests/`. Do NOT add tests to the workspace-root
+`tests/` directory: the root `Cargo.toml` is a virtual manifest (no
+`[package]`), so files there are never compiled or run by
+`cargo test --workspace`.
+
+### CI Coverage Warning: fsqlite-e2e Integration Tests Are Allowlisted (bd-ohk1x)
+
+`crates/fsqlite-e2e/tests/` contains ~270 integration test files, but CI
+executes only the explicitly named `--test` targets in
+`.github/workflows/*.yml` (currently on the order of a dozen across all
+workflows). `concurrent-platform-matrix.yml` builds the crate with
+`cargo test -p fsqlite-e2e --no-run` (build only) plus a hand-maintained
+allowlist, and `unit-test-shard-matrix.yml` runs `--lib` only, which never
+touches `tests/`. **A new integration test in fsqlite-e2e is silently inert
+in CI unless you also add it to a workflow.** When you land a regression
+guard there, either wire it into a workflow or state explicitly in the
+bead/commit that it is local-only. Tracked by bd-ohk1x.
 
 ### Unit Tests
 

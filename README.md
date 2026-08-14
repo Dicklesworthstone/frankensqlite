@@ -158,7 +158,7 @@ FrankenSQLite is organized as a 27-member Cargo workspace with strict layered de
 | | `fsqlite-ext-json` | JSON1 functions (extract, set, each, tree, etc.) |
 | | `fsqlite-ext-session` | Changeset/patchset generation and application |
 | | `fsqlite-ext-icu` | ICU collation and Unicode case folding |
-| | `fsqlite-ext-misc` | generate_series, carray, dbstat, dbpage |
+| | `fsqlite-ext-misc` | generate_series plus misc scalars (uuid, decimal); dbstat/carray/dbpage are not implemented |
 | **Integration** | `fsqlite-core` | Connection/runtime hub: parser dispatch, transaction control, schema management, VDBE bridge |
 | | `fsqlite` | Public API: `Connection::open()`, `execute()`, `query()`, `prepare()` |
 | | `fsqlite-cli` | Small REPL, `-c/--command`, `.read`, and decode-proof verification |
@@ -184,7 +184,8 @@ This README describes the target end-state architecture. The runnable code today
 - CLI status: `fsqlite-cli` is currently a small shell and command runner, not yet a full sqlite3-style front-end with the broad dot-command/output-mode surface described later in older revisions of this README.
 - Verification surface: most serious differential, conformance, and benchmark machinery lives in `fsqlite-harness` and `fsqlite-e2e`, not at the workspace root.
 - Operating modes: the current user-facing runtime is the compatibility/pager-backed path. Native-mode/ECS sections below should be read as design plus partial implementation unless explicitly called out as live behavior.
-- Extensions: extension crates are present and feature-gated in the workspace/public API crate, but extension virtual table/function wiring is still in progress.
+- Extensions: FTS5, JSON1 (`json_each`/`json_tree`), R-tree/geopoly, ICU, and misc (`generate_series`) register their scalar functions and/or virtual-table modules in the live engine. FTS3/FTS4 are helper-level only — no virtual-table module is registered, so `CREATE VIRTUAL TABLE ... USING fts3` (or `fts4`) returns a not-implemented error. The session extension is a manual library facade (see its section below). `dbstat`, `carray`, and `dbpage` are not implemented. Feature-gating caveat: the engine-side extension set is controlled by `fsqlite-core`'s `extensions` feature (pulled in by its default `native` feature); the top-level `fsqlite` crate's `json`/`fts5`/`rtree`/`icu`/`misc` features only gate facade re-exports, so disabling them does **not** strip the engine's built-in extension support — to truly remove an extension, depend on `fsqlite-core` with `default-features = false` and opt back into the specific `ext-*` features you want.
+- Dormant performance machinery: the vectorized batch kernels in `fsqlite-vdbe` (`vectorized_*.rs`: hash join, sort, aggregation, morsel dispatch) are a benchmarked library with no live call sites — only the vectorized `MakeRecord` encoder (`PRAGMA fsqlite.vectorized_makerecord`, on by default) is wired; the Silo-style epoch group-commit module (`fsqlite-mvcc/src/silo_epoch.rs`) is an unwired scaffold; and the pattern-matching VDBE JIT is functional but **off by default** (`PRAGMA fsqlite.jit_enable = 1` opts in; `PRAGMA fsqlite_jit_stats` shows whether it is engaging).
 - Storage stack status: `fsqlite-vfs`, `fsqlite-pager`, `fsqlite-wal`, `fsqlite-mvcc`, and `fsqlite-btree` are wired into default runtime execution. Remaining work focuses on removing residual fallback paths, closing opcode/behavior gaps, and finishing parity/certification tracks.
 - Safe write-merge ladder status: the ladder described below (intent replay +
   structured page patches) is **design plus dormant implementation, not live
@@ -1072,6 +1073,13 @@ Records changes to a database as changesets that can be applied elsewhere:
 - **Changeset inversion:** Generates the inverse changeset (for undo operations)
 - **Rebasing:** Combines changesets from parallel editing sessions
 
+> **Status:** the session crate implements the changeset/patchset codec and a
+> `Session` recorder, but it is currently a **manual library facade**, exposed
+> as `fsqlite::session` behind the top-level `session` Cargo feature. Callers
+> must invoke `record_insert`/`record_update`/`record_delete` themselves;
+> there is no automatic pre-update-hook capture from live SQL execution, and
+> the crate is not part of `fsqlite-core`'s `extensions` feature bundle.
+
 ---
 
 ## Built-In Functions
@@ -1479,7 +1487,7 @@ Checkpointing materializes a canonical `.db` for compatibility export, but the c
 
 ## Time Travel Queries
 
-FrankenSQLite supports temporal queries using SQL:2011-inspired `FOR SYSTEM_TIME AS OF` syntax. Today the externally verified surface is the `:memory:` / compatibility-runtime snapshot-ring path.
+FrankenSQLite supports temporal queries using SQL:2011-inspired `FOR SYSTEM_TIME AS OF` syntax. **Today this works for `:memory:` databases only**: snapshot capture returns immediately for file-backed connections, so their ring is never populated and any temporal query against a file-backed database fails with an explicit "no snapshot available" error rather than silently returning current data.
 
 **How it works:**
 
@@ -1505,6 +1513,12 @@ SELECT * FROM orders FOR SYSTEM_TIME AS OF '2024-06-15 09:30:00';
 
 **Limitations:**
 
+- **`:memory:`-only.** `capture_time_travel_snapshot` early-returns for any
+  non-`:memory:` path, so file-backed connections never accumulate
+  snapshots and every file-backed `FOR SYSTEM_TIME AS OF` query errors
+  explicitly. File-backed historical reads are design work: the
+  `.fsqlite-history` sidecar chosen in
+  `docs/design/time-travel-file-backed.md` is not yet implemented.
 - Snapshots are stored in memory (ring buffer, max 256). Oldest snapshots are evicted when the buffer is full.
 - JOINs and subqueries in time-travel SELECT use the interpreted `execute_join_select` path.
 - The VDBE/pager `SetSnapshot` + `VersionStore` path (for file-backed databases with page-level MVCC) is wired but not yet populated during normal operation. That remains the Native-mode enhancement needed for file-backed historical reads.
@@ -2408,7 +2422,7 @@ Collations affect not just WHERE comparisons but also ORDER BY sort order, GROUP
 
 ### Foreign Key Enforcement
 
-Foreign keys enforce referential integrity across tables. FrankenSQLite implements the full SQLite foreign key protocol, including deferred constraint checking.
+Foreign keys enforce referential integrity across tables. FrankenSQLite implements the SQLite foreign key protocol, including `DEFERRABLE INITIALLY DEFERRED` constraint deferral: violations by deferred constraints are queued during the transaction and re-checked at `COMMIT`, and a failing `COMMIT` reports the violation while leaving the transaction active, matching stock SQLite. `PRAGMA defer_foreign_keys` is **not** dispatched (unrecognised PRAGMAs are silently ignored), so per-transaction deferral of an otherwise-immediate constraint is not available; deferral must be declared on the constraint itself.
 
 ```
 Enforcement modes:
@@ -2874,14 +2888,20 @@ still serves as an authoritative reference.
   rejects the same assignment correctly, so only `UPDATE` is affected
   ([#165](https://github.com/Dicklesworthstone/frankensqlite/issues/165),
   [#166](https://github.com/Dicklesworthstone/frankensqlite/issues/166)).
-- **Foreign-key deferral is not implemented.** `DEFERRABLE INITIALLY DEFERRED`
-  is accepted but checks still run at statement time, and `PRAGMA
-  defer_foreign_keys` does not enable deferral. Transactions that temporarily
-  violate a constraint and repair it before `COMMIT` fail at the first
-  violating statement. Writes are refused, not mis-applied; order statements
-  so no intermediate state violates a constraint
-  ([#149](https://github.com/Dicklesworthstone/frankensqlite/issues/149),
-  [#161](https://github.com/Dicklesworthstone/frankensqlite/issues/161)).
+- **Foreign-key deferral works for `DEFERRABLE INITIALLY DEFERRED`
+  constraints; `PRAGMA defer_foreign_keys` is still missing.** Constraints
+  declared `DEFERRABLE INITIALLY DEFERRED` queue their violations during the
+  transaction and re-check them at `COMMIT`; a violating `COMMIT` fails while
+  leaving the transaction active for repair, matching stock SQLite
+  (implemented by bd-do0d6; the blanket "deferral is not implemented"
+  limitation originally tracked in
+  [#149](https://github.com/Dicklesworthstone/frankensqlite/issues/149) /
+  [#161](https://github.com/Dicklesworthstone/frankensqlite/issues/161) no
+  longer applies). What remains missing is `PRAGMA defer_foreign_keys`: it is
+  not dispatched (unrecognised PRAGMAs are silently ignored), so an
+  immediate, non-deferrable constraint cannot be deferred for a single
+  transaction. For those constraints, order statements so no intermediate
+  state violates them.
 - **`INSERT OR REPLACE` skips delete-side foreign-key actions.** Replacing a
   parent row does not fire `ON DELETE CASCADE` on its dependents as stock
   SQLite does. The replacement keeps the same key, so dependent rows are
