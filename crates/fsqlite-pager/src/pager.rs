@@ -18697,16 +18697,16 @@ where
                 // publication attempt return to the pool the same way.
                 inner
                     .abandoned_eof_reservations
-                    .extend(self.reclaimed_abandoned_reservations.drain(..));
+                    .append(&mut self.reclaimed_abandoned_reservations);
                 inner
                     .abandoned_eof_reservations
-                    .extend(self.page_lease.drain(..));
+                    .append(&mut self.page_lease);
                 inner
                     .abandoned_eof_reservations
-                    .extend(self.allocated_from_eof.drain(..));
+                    .append(&mut self.allocated_from_eof);
                 inner
                     .abandoned_eof_reservations
-                    .extend(self.savepoint_quarantined_allocations.drain(..));
+                    .append(&mut self.savepoint_quarantined_allocations);
             } else {
                 // Rollback-journal mode has no WAL commit to fold the
                 // abandonment pool into the durable freelist — pooling here
@@ -20223,7 +20223,7 @@ where
                                                 "DW8OE GATE durable32_40={}",
                                                 durable_page_one
                                                     .as_deref()
-                                                    .map_or("none".to_owned(), |d| hex_bytes(
+                                                    .map_or_else(|| "none".to_owned(), |d| hex_bytes(
                                                         &d[32..40]
                                                     )),
                                             );
@@ -22274,17 +22274,31 @@ where
             if self.journal_mode == JournalMode::Wal {
                 inner
                     .abandoned_eof_reservations
-                    .extend(self.reclaimed_abandoned_reservations.drain(..));
+                    .append(&mut self.reclaimed_abandoned_reservations);
                 let mut abandoned_candidates: Vec<PageNumber> = Vec::new();
+                let mut dw8oe_above = 0_usize;
                 inner.abandoned_eof_reservations.retain(|page| {
                     let eligible = page.get() <= committed_db_size
                         && !pending_free_pages.contains(page)
                         && !self.write_set.contains_key(page);
+                    if !eligible && page.get() > committed_db_size {
+                        dw8oe_above += 1;
+                    }
                     if eligible {
                         abandoned_candidates.push(*page);
                     }
                     !eligible
                 });
+                if std::env::var_os("DW8OE_TRACE").is_some()
+                    && (!inner.abandoned_eof_reservations.is_empty()
+                        || !abandoned_candidates.is_empty())
+                {
+                    eprintln!(
+                        "DW8OE FOLD pool_retained={} eligible={} above_committed={dw8oe_above} committed_db={committed_db_size}",
+                        inner.abandoned_eof_reservations.len(),
+                        abandoned_candidates.len(),
+                    );
+                }
                 if !abandoned_candidates.is_empty() {
                     let backend = wal_backend_handle(&self.wal_backend)?;
                     let mut wal_guard = async_rwlock_write(&backend, cx, "WAL backend").await?;
@@ -22293,17 +22307,29 @@ where
                     // the no-committed-frame test is only meaningful against
                     // the refreshed publication horizon.
                     let _ = wal.refresh_published_snapshot(cx).await?;
+                    let mut dw8oe_reclaimed = 0_usize;
+                    let mut dw8oe_framed = 0_usize;
+                    let mut dw8oe_errs = 0_usize;
                     for page in abandoned_candidates {
                         match wal.read_page(cx, page.get()).await {
                             Ok(None) => {
                                 self.reclaimed_abandoned_reservations.push(page);
                                 pending_free_pages.push(page);
+                                dw8oe_reclaimed += 1;
                             }
-                            Ok(Some(_)) => {}
+                            Ok(Some(_)) => {
+                                dw8oe_framed += 1;
+                            }
                             Err(_) => {
                                 inner.abandoned_eof_reservations.push(page);
+                                dw8oe_errs += 1;
                             }
                         }
+                    }
+                    if std::env::var_os("DW8OE_TRACE").is_some() {
+                        eprintln!(
+                            "DW8OE FOLD2 reclaimed={dw8oe_reclaimed} framed_dropped={dw8oe_framed} read_errs={dw8oe_errs}"
+                        );
                     }
                 }
             }
@@ -23765,7 +23791,7 @@ where
             // durable, so put them back.
             inner
                 .abandoned_eof_reservations
-                .extend(self.reclaimed_abandoned_reservations.drain(..));
+                .append(&mut self.reclaimed_abandoned_reservations);
             if restored_from_journal {
                 self.allocated_from_freelist.clear();
                 self.allocated_from_durable_freelist.clear();
@@ -23817,10 +23843,10 @@ where
                     if self.journal_mode == JournalMode::Wal {
                         inner
                             .abandoned_eof_reservations
-                            .extend(self.page_lease.drain(..));
+                            .append(&mut self.page_lease);
                         inner
                             .abandoned_eof_reservations
-                            .extend(self.allocated_from_eof.drain(..));
+                            .append(&mut self.allocated_from_eof);
                     } else {
                         return_pages_to_freelist(
                             &mut inner.freelist,
