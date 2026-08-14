@@ -35,11 +35,6 @@ fn scale() -> (usize, usize) {
 }
 
 #[test]
-#[ignore = "bd-vnxjd: page leak on churn abort paths — integrity_check reds \
-'page N is never used' (~2/12 runs). PROVEN independent of bd-zeg99's deadlock \
-fix (A/B with FSQLITE_PAGE_LOCK_DEADLOCK_DETECT=0 reproduces it via the \
-pre-existing busy-timeout abort path alone). The bd-zeg99 wedge itself is \
-FIXED (never-completes → ~7s); un-ignore when bd-vnxjd lands"]
 fn churn_acceptance_corruption_family() {
     asupersync::test_utils::run_test(|| async {
         let temp_dir = tempfile::tempdir().unwrap();
