@@ -11726,6 +11726,12 @@ pub struct SimplePager<V: Vfs> {
     /// Sharded page cache for high-concurrency workloads (bd-3wop3.2).
     /// Each shard has its own mutex, eliminating global lock contention.
     cache: Arc<ShardedPageCache>,
+    /// Write-set page ceiling for builder connections. `0` means unlimited.
+    ///
+    /// Shared with every transaction this pager opens so the ceiling is
+    /// enforced where writes actually enter the write set, not merely
+    /// recorded at open time.
+    write_set_page_limit: Arc<AtomicUsize>,
     /// Shared page buffer pool cloned into transactions for write staging.
     pool: PageBufPool,
     /// Published metadata/page plane for lock-light steady-state reads.
@@ -12429,6 +12435,7 @@ where
                     namespace_binding: self.namespace_binding.clone(),
                     group_commit_queue: Arc::clone(&self.group_commit_queue),
                     inner: Arc::clone(&self.inner),
+                    write_set_page_limit: Arc::clone(&self.write_set_page_limit),
                     db_file: Arc::clone(&inner.db_file),
                     writer_idle: Arc::clone(&self.writer_idle),
                     cache: Arc::clone(&self.cache),
@@ -12649,6 +12656,7 @@ where
                 namespace_binding: self.namespace_binding.clone(),
                 group_commit_queue: Arc::clone(&self.group_commit_queue),
                 inner: Arc::clone(&self.inner),
+                write_set_page_limit: Arc::clone(&self.write_set_page_limit),
                 db_file,
                 writer_idle: Arc::clone(&self.writer_idle),
                 cache: Arc::clone(&self.cache),
@@ -14220,6 +14228,21 @@ where
     /// Capture point-in-time page-cache counters.
     pub fn cache_metrics_snapshot(&self) -> Result<PageCacheMetricsSnapshot> {
         Ok(self.cache.metrics_snapshot())
+    }
+
+    /// Install a write-set page ceiling for every transaction this pager opens.
+    ///
+    /// `0` clears it. Used by the reserved schema-only builder create path so a
+    /// private build cannot rewrite more of the image than the caller budgeted.
+    pub fn set_write_set_page_limit(&self, page_limit: usize) {
+        self.write_set_page_limit
+            .store(page_limit, AtomicOrdering::Relaxed);
+    }
+
+    /// The write-set page ceiling in force, `0` meaning unlimited.
+    #[must_use]
+    pub fn write_set_page_limit(&self) -> usize {
+        self.write_set_page_limit.load(AtomicOrdering::Relaxed)
     }
 
     /// High-water page-cache residency for this pager.
@@ -15952,6 +15975,7 @@ where
             })),
             writer_idle: Arc::new(Condvar::new()),
             cache: Arc::new(cache),
+            write_set_page_limit: Arc::new(AtomicUsize::new(0)),
             pool,
             published: Arc::new(PublishedPagerState::new(
                 db_size,
@@ -16360,6 +16384,7 @@ where
             })),
             writer_idle: Arc::new(Condvar::new()),
             cache: Arc::new(cache),
+            write_set_page_limit: Arc::new(AtomicUsize::new(0)),
             pool,
             published: Arc::new(PublishedPagerState::new(
                 db_size,
@@ -17156,6 +17181,8 @@ where
     db_file: SharedDbFile<V::File>,
     writer_idle: Arc<Condvar>,
     cache: Arc<ShardedPageCache>,
+    /// Write-set page ceiling inherited from the pager. `0` means unlimited.
+    write_set_page_limit: Arc<AtomicUsize>,
     published: Arc<PublishedPagerState>,
     /// WAL backend for WAL-mode operation (D1-CRITICAL: separate lock for split-lock commit).
     wal_backend: SharedWalBackend,
@@ -21097,6 +21124,36 @@ where
     V: Vfs + Send,
     V::File: Send + Sync + 'static,
 {
+    /// Refuse a page that would grow the write set past its ceiling.
+    ///
+    /// Checked before staging, so the transaction fails at the moment of
+    /// excess rather than at commit, and a refused write leaves the prior write
+    /// set untouched. Re-writing a page already in the set is always admitted:
+    /// the ceiling bounds how much of the database a build rewrites, not how
+    /// many times it touches what it already claimed.
+    ///
+    /// The ceiling covers caller-staged pages. Commit-time engine metadata
+    /// staging (page 1, freelist serialization) is not caller-attributable and
+    /// is excluded, so a bounded build rewrites at most `limit` pages plus that
+    /// fixed metadata.
+    fn admit_new_write_set_page(&self, page_no: PageNumber) -> Result<()> {
+        let limit = self.write_set_page_limit.load(AtomicOrdering::Relaxed);
+        if limit == 0 || self.write_set.contains_key(&page_no) {
+            return Ok(());
+        }
+        if self.write_set.len() >= limit {
+            return Err(FrankenError::OutOfRange {
+                what: "schema-only builder write-set page limit".to_owned(),
+                value: format!(
+                    "staging page {} would make the write set {} pages, over the {limit}-page ceiling",
+                    page_no.get(),
+                    self.write_set.len() + 1
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn restore_not_committed_wal_attempt(&mut self) -> Result<()> {
         let attempt = self.pending_group_commit_attempt.clone().ok_or_else(|| {
             FrankenError::internal("cannot restore a missing group-commit transaction attempt")
@@ -21546,6 +21603,7 @@ where
                 return Ok(());
             }
 
+            self.admit_new_write_set_page(page_no)?;
             let staged = self.stage_page_bytes(data)?;
             // Mutate transaction bookkeeping only after fallible staging succeeds;
             // a capacity error must leave the prior free/write state untouched.
@@ -21597,6 +21655,7 @@ where
                 return Ok(());
             }
 
+            self.admit_new_write_set_page(page_no)?;
             insert_staged_page(
                 &mut self.write_set,
                 &mut self.write_pages_sorted,
