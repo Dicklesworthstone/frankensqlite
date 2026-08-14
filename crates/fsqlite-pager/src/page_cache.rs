@@ -134,6 +134,66 @@ impl PageCacheLightweightSnapshot {
     }
 }
 
+/// High-water residency evidence for a bounded operation.
+///
+/// The instantaneous gauges on [`PageCacheMetricsSnapshot`] let a caller assert
+/// the ceiling it *configured*; they cannot show the ceiling was never
+/// approached, which is the assertion that matters after the fact. This carries
+/// the maximum residency actually reached.
+///
+/// `exact` is the whole contract. In single-connection (fast-path) mode — the
+/// mode a bounded migration runs in — residency changes only under a lock the
+/// admission path already holds, so the peak is a true maximum. Otherwise the
+/// peak is refreshed when a full snapshot is taken and is therefore a **lower
+/// bound**: a spike between two samples is invisible. [`Self::proves_ceiling_never_approached`]
+/// returns `None` in that case rather than a boolean, so a lower bound cannot be
+/// mistaken for proof.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageCachePeakSnapshot {
+    /// Maximum pages simultaneously resident since open or since the last
+    /// [`ShardedPageCache::reset_peak_residency`].
+    pub peak_cached_pages: usize,
+    /// Whether `peak_cached_pages` is a true maximum rather than a sampled
+    /// lower bound.
+    pub exact: bool,
+    /// Configured buffer-pool capacity, for context.
+    pub pool_capacity: usize,
+    /// Page size, so residency converts to bytes without a second call.
+    pub page_size_bytes: usize,
+}
+
+impl PageCachePeakSnapshot {
+    /// Peak resident bytes, saturating.
+    #[must_use]
+    pub const fn peak_resident_bytes(&self) -> u64 {
+        (self.peak_cached_pages as u64).saturating_mul(self.page_size_bytes as u64)
+    }
+
+    /// Whether residency provably stayed at or below `ceiling_pages`.
+    ///
+    /// Returns `None` when the peak is only a sampled lower bound, because no
+    /// honest answer exists then. A certifier that treats `None` as "true" has
+    /// defeated the point of this type.
+    #[must_use]
+    pub const fn proves_ceiling_never_approached(&self, ceiling_pages: usize) -> Option<bool> {
+        if self.exact {
+            Some(self.peak_cached_pages <= ceiling_pages)
+        } else {
+            None
+        }
+    }
+
+    /// Peak residency as a percent of the configured pool capacity.
+    #[must_use]
+    pub fn peak_utilisation_percent(&self) -> f64 {
+        if self.pool_capacity == 0 {
+            0.0
+        } else {
+            (self.peak_cached_pages as f64 * 100.0) / self.pool_capacity as f64
+        }
+    }
+}
+
 /// Point-in-time page-cache counters and gauges.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PageCacheMetricsSnapshot {
@@ -2523,6 +2583,14 @@ pub struct ShardedPageCache {
     eviction_policy_enabled: AtomicBool,
     /// Shared eviction-policy tracker used by [`Self::evict_any`].
     eviction_policy: Mutex<PageCacheEvictionTracker>,
+    /// High-water residency. Updated on every fast-path admission (where it is
+    /// a true maximum) and refreshed from the totals a full snapshot already
+    /// computes (where it is a sampled lower bound).
+    peak_cached_pages: AtomicUsize,
+    /// Cleared whenever the cache leaves single-connection mode, because the
+    /// peak stops being a true maximum at that point and must not keep
+    /// claiming otherwise.
+    peak_is_exact: AtomicBool,
     /// Test-only receipt that distinguishes diagnostic snapshots from the
     /// bounded saturated-buffer reclaim path.
     #[cfg(test)]
@@ -2680,6 +2748,10 @@ impl ShardedPageCache {
             use_fast_path: AtomicBool::new(false),
             eviction_policy_enabled: AtomicBool::new(false),
             eviction_policy: Mutex::new(PageCacheEvictionTracker::default()),
+            peak_cached_pages: AtomicUsize::new(0),
+            // A freshly built cache has not left single-connection mode, so the
+            // peak starts out exact and only ever degrades.
+            peak_is_exact: AtomicBool::new(true),
             #[cfg(test)]
             diagnostic_snapshot_calls: AtomicU64::new(0),
             #[cfg(test)]
@@ -2699,6 +2771,11 @@ impl ShardedPageCache {
     /// of every cache tier so that hidden pages from a previous mode cannot
     /// later reappear and overwrite newer data.
     pub fn enable_fast_path(&mut self) {
+        // Entering single-connection mode does not retroactively measure the
+        // sharded period this cache just came from, so the accumulated peak
+        // stays a lower bound. Only `reset_peak_residency` can start an exact
+        // window, because only it establishes a window that begins here.
+        self.peak_is_exact.store(false, Ordering::Relaxed);
         if self.fast_array.is_none() {
             self.fast_array = Some(Mutex::new(FastPageArray::new()));
         }
@@ -2724,6 +2801,10 @@ impl ShardedPageCache {
     /// only waste memory and risk stale pages surfacing after later mode
     /// changes.
     pub fn disable_fast_path(&mut self) {
+        // Residency is no longer observed under a single admission lock, so the
+        // peak becomes a sampled lower bound from here on. Say so permanently
+        // rather than letting a later exact-looking read imply a proof.
+        self.peak_is_exact.store(false, Ordering::Relaxed);
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
                 fast.lock().cold_reset();
@@ -3014,7 +3095,14 @@ impl ShardedPageCache {
             if fast.contains(page_no) {
                 return false;
             }
-            return fast.insert(page_no, buf);
+            let admitted = fast.insert(page_no, buf);
+            // Observe residency under the same lock the admission took, which
+            // is what makes the fast-path peak a true maximum rather than a
+            // sample taken between admissions.
+            let resident = fast.len();
+            drop(fast);
+            self.observe_residency(resident);
+            return admitted;
         }
 
         let shard_idx = self.shard_index(page_no);
@@ -3074,6 +3162,62 @@ impl ShardedPageCache {
     /// Access the underlying page pool.
     pub fn pool(&self) -> &PageBufPool {
         &self.pool
+    }
+
+    /// Record a residency observation, keeping the running maximum.
+    #[inline]
+    fn observe_residency(&self, resident: usize) {
+        // Relaxed is sufficient: this is a monotone maximum over a value that
+        // is already only meaningful as an aggregate, and no other state is
+        // published through it.
+        let mut peak = self.peak_cached_pages.load(Ordering::Relaxed);
+        while resident > peak {
+            match self.peak_cached_pages.compare_exchange_weak(
+                peak,
+                resident,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => peak = observed,
+            }
+        }
+    }
+
+    /// High-water residency evidence for this cache.
+    ///
+    /// See [`PageCachePeakSnapshot`] for what `exact` means and why it is not
+    /// optional context.
+    #[must_use]
+    pub fn peak_snapshot(&self) -> PageCachePeakSnapshot {
+        // Fold in the current residency so a caller that never took a full
+        // snapshot still sees at least where the cache stands now.
+        self.observe_residency(self.len());
+        PageCachePeakSnapshot {
+            peak_cached_pages: self.peak_cached_pages.load(Ordering::Relaxed),
+            exact: self.peak_is_exact.load(Ordering::Relaxed)
+                && self.use_fast_path.load(Ordering::Relaxed),
+            pool_capacity: self.pool.capacity(),
+            page_size_bytes: self.page_size.as_usize(),
+        }
+    }
+
+    /// Reset the high-water mark, establishing a new measurement window.
+    ///
+    /// A bounded operation calls this immediately before it starts so the peak
+    /// it later reads describes that operation and not the process history.
+    /// A reset is the one operation that can restore exactness, because it
+    /// starts a window here: if the cache is in single-connection mode now,
+    /// every admission for the rest of the window is observed under the
+    /// admission lock, so the window's peak is a true maximum regardless of
+    /// what the cache did before.
+    pub fn reset_peak_residency(&self) {
+        // Order matters: mark the window's exactness from the mode in force
+        // before publishing the new baseline, so a concurrent reader can never
+        // pair a fresh baseline with a stale exactness claim.
+        self.peak_is_exact
+            .store(self.use_fast_path.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.peak_cached_pages.store(self.len(), Ordering::Relaxed);
     }
 
     /// Total number of pages across all shards (or fast array if enabled).
@@ -3349,7 +3493,9 @@ impl ShardedPageCache {
                 entry.mark_dirty();
                 entry.record_access();
             }
+            let resident = arr.len();
             drop(arr);
+            self.observe_residency(resident);
             if admitted_new {
                 self.record_eviction_admit(page_no);
             } else {
@@ -3388,7 +3534,12 @@ impl ShardedPageCache {
         if self.use_fast_path.load(Ordering::Relaxed)
             && let Some(ref fast) = self.fast_array
         {
-            let admitted_new = fast.lock().insert(page_no, buf);
+            let (admitted_new, resident) = {
+                let mut arr = fast.lock();
+                let admitted_new = arr.insert(page_no, buf);
+                (admitted_new, arr.len())
+            };
+            self.observe_residency(resident);
             // `FastPageArray::insert` constructs a clean entry. Do not
             // reacquire the array lock to mark by page number: a newer
             // dirty replacement may have won between those two critical
@@ -3837,12 +3988,14 @@ impl ShardedPageCache {
             && let Some(ref fast) = self.fast_array
         {
             let arr = fast.lock();
+            let cached_pages = arr.len();
+            self.observe_residency(cached_pages);
             return PageCacheLightweightSnapshot {
                 hits: arr.hits,
                 misses: arr.misses,
                 admits: arr.admits,
                 evictions: arr.evictions,
-                cached_pages: arr.len(),
+                cached_pages,
                 pool_capacity: self.pool.capacity(),
             };
         }
@@ -3859,6 +4012,7 @@ impl ShardedPageCache {
             total_evictions = total_evictions.saturating_add(s.evictions);
             total_pages = total_pages.saturating_add(s.len());
         }
+        self.observe_residency(total_pages);
         PageCacheLightweightSnapshot {
             hits: total_hits,
             misses: total_misses,
@@ -10908,6 +11062,141 @@ mod tests {
             ..PageCacheLightweightSnapshot::default()
         };
         assert!((snap.hit_rate_percent() - 80.0).abs() < 0.01);
+    }
+
+    /// Drive residency past a bound and prove the peak records the excursion
+    /// after the cache has already shrunk back below it.
+    ///
+    /// This is the acceptance evidence for the high-water counters, and it is
+    /// deliberately run in single-connection mode with NO intermediate
+    /// snapshot: nothing samples residency between the climb and the fall, so
+    /// the recorded peak can only have come from the per-admission hook. A
+    /// counter that is merely sampled at a convenient moment would report
+    /// whatever the caller happened to look at, which is not evidence.
+    #[test]
+    fn peak_records_an_excursion_that_instantaneous_gauges_miss() {
+        let page_size = PageSize::new(512).unwrap();
+        let mut cache = ShardedPageCache::with_max_buffers(page_size, 64);
+        cache.enable_fast_path();
+        // Entering fast-path mode degrades exactness because the history before
+        // it was only sampled; a reset starts a window here, and from here every
+        // admission is observed under the admission lock.
+        cache.reset_peak_residency();
+        assert!(
+            cache.peak_snapshot().exact,
+            "a reset window in single-connection mode must be exact"
+        );
+
+        // Climb to 40 resident pages. Nothing observes residency in this loop
+        // except the admission path itself.
+        for pgno in 1..=40_u32 {
+            let page = PageNumber::new(pgno).unwrap();
+            cache.insert_buffer_with_post_install(page, cache.pool.acquire().unwrap(), || {});
+        }
+
+        // Fall back to a handful of pages.
+        for pgno in 6..=40_u32 {
+            cache.evict(PageNumber::new(pgno).unwrap());
+        }
+        let resident_now = cache.len();
+        assert!(
+            resident_now <= 5,
+            "precondition: residency must have fallen, got {resident_now}"
+        );
+
+        // The instantaneous gauge now reports the low value...
+        let live = cache.metrics_lightweight_snapshot();
+        assert!(
+            live.cached_pages <= 5,
+            "instantaneous gauge should show the low residency, got {live:?}"
+        );
+        // ...while the peak reports the excursion that gauge can never show.
+        let peak = cache.peak_snapshot();
+        assert_eq!(
+            peak.peak_cached_pages, 40,
+            "the peak must be the true maximum reached, got {peak:?}"
+        );
+        assert!(
+            peak.exact,
+            "single-connection mode after a reset must be exact, got {peak:?}"
+        );
+
+        // And it answers the question a bounded-operation certifier asks.
+        assert_eq!(
+            peak.proves_ceiling_never_approached(64),
+            Some(true),
+            "40 pages stayed within a 64-page ceiling"
+        );
+        assert_eq!(
+            peak.proves_ceiling_never_approached(8),
+            Some(false),
+            "40 pages breached an 8-page ceiling and the peak must say so"
+        );
+        assert_eq!(peak.peak_resident_bytes(), 40 * 512);
+    }
+
+    /// In sharded mode the peak is only a sampled lower bound, and the type
+    /// refuses to answer the ceiling question rather than answering it wrongly.
+    #[test]
+    fn sampled_peak_refuses_to_certify_a_ceiling() {
+        let page_size = PageSize::new(512).unwrap();
+        let cache = ShardedPageCache::with_max_buffers(page_size, 64);
+        // No fast path: residency is only observed when a full snapshot walks
+        // the shards, so a spike between samples is invisible.
+        for pgno in 1..=40_u32 {
+            let page = PageNumber::new(pgno).unwrap();
+            cache.insert_buffer_with_post_install(page, cache.pool.acquire().unwrap(), || {});
+        }
+        let peak = cache.peak_snapshot();
+        assert!(
+            !peak.exact,
+            "a multi-connection cache must not claim an exact peak, got {peak:?}"
+        );
+        assert_eq!(
+            peak.proves_ceiling_never_approached(64),
+            None,
+            "a sampled lower bound cannot certify a ceiling, and must not pretend to"
+        );
+        assert_eq!(
+            peak.proves_ceiling_never_approached(1),
+            None,
+            "not even an obviously breached ceiling may be answered from a sample"
+        );
+    }
+
+    /// A reset establishes a new measurement window so a bounded operation's
+    /// peak describes that operation and not the process history.
+    #[test]
+    fn peak_reset_starts_a_new_measurement_window() {
+        let page_size = PageSize::new(512).unwrap();
+        let cache = ShardedPageCache::with_max_buffers(page_size, 64);
+
+        for pgno in 1..=32_u32 {
+            let page = PageNumber::new(pgno).unwrap();
+            cache.insert_buffer_with_post_install(page, cache.pool.acquire().unwrap(), || {});
+        }
+        assert!(cache.peak_snapshot().peak_cached_pages >= 32);
+
+        for pgno in 1..=32_u32 {
+            cache.evict(PageNumber::new(pgno).unwrap());
+        }
+        cache.reset_peak_residency();
+        let after_reset = cache.peak_snapshot();
+        assert!(
+            after_reset.peak_cached_pages <= 1,
+            "a reset window must not inherit the previous peak, got {after_reset:?}"
+        );
+
+        // A small excursion inside the new window is recorded on its own terms.
+        for pgno in 1..=3_u32 {
+            let page = PageNumber::new(pgno).unwrap();
+            cache.insert_buffer_with_post_install(page, cache.pool.acquire().unwrap(), || {});
+        }
+        let windowed = cache.peak_snapshot();
+        assert!(
+            (3..32).contains(&windowed.peak_cached_pages),
+            "the new window must report its own peak, got {windowed:?}"
+        );
     }
 
     #[test]
