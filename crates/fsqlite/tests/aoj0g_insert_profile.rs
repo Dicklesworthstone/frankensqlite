@@ -14,6 +14,43 @@ use std::time::Instant;
 const ROWS: usize = 10_000;
 const BATCH: usize = 1_000;
 
+async fn run_case_with_commit_every_batch(name: &str, key_mod: Option<usize>) {
+    let conn = Connection::open(":memory:").await.unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);")
+        .await
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_k ON t(k);").await.unwrap();
+    let mut batch_times = Vec::new();
+    for batch_start in (0..ROWS).step_by(BATCH) {
+        conn.execute("BEGIN;").await.unwrap();
+        let start = Instant::now();
+        for i in batch_start..batch_start + BATCH {
+            let k = key_mod.map_or(i, |m| i % m);
+            conn.execute(&format!(
+                "INSERT INTO t (id, k, v) VALUES ({}, {}, 'payload-{}');",
+                i + 1,
+                k,
+                i
+            ))
+            .await
+            .unwrap();
+        }
+        let ns_per_insert = start.elapsed().as_nanos() / BATCH as u128;
+        batch_times.push(ns_per_insert);
+        conn.execute("COMMIT;").await.unwrap();
+    }
+    let first = batch_times.first().copied().unwrap_or(0);
+    let last = batch_times.last().copied().unwrap_or(0);
+    let ramp = if first > 0 {
+        format!("{:.2}x", last as f64 / first as f64)
+    } else {
+        "n/a".to_owned()
+    };
+    println!(
+        "[aoj0g] {name}: per-batch ns/insert = {batch_times:?} | first {first} last {last} ramp {ramp}"
+    );
+}
+
 async fn run_case(name: &str, with_index: bool, key_mod: Option<usize>) {
     let conn = Connection::open(":memory:").await.unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);")
@@ -67,5 +104,10 @@ fn aoj0g_insert_phase_profile() {
         // subtree with perfect locality).
         run_case("D with-index  k=1     ", true, Some(1)).await;
         run_case("E with-index  k=i%1000", true, Some(1000)).await;
+        // F: same key shape as C but a fresh transaction per 1000-row batch.
+        // Flat F => the O(n) state lives in the open transaction (staged
+        // pages / witness set); ramping F => persistent structure (page
+        // cache, mvcc globals, index size itself).
+        run_case_with_commit_every_batch("F txn/batch   k=i%100", Some(100)).await;
     });
 }

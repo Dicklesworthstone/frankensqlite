@@ -748,7 +748,9 @@ pub struct ConcurrentSavepoint {
     /// Savepoint name.
     pub name: String,
     /// Snapshot of per-page tracking state at savepoint creation time.
-    page_states_snapshot: HashMap<PageNumber, SavepointPageState>,
+    /// Uses the fast page-number hasher: rebuilt on every statement
+    /// savepoint, so default SipHash here was profile-hot (bd-aoj0g).
+    page_states_snapshot: PageMap<SavepointPageState>,
     /// Number of pages in write_set at savepoint creation.
     write_set_len: usize,
 }

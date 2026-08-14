@@ -96304,13 +96304,6 @@ fn aggregate_args_len_for_lookup(args: &FunctionArgs) -> i32 {
     }
 }
 
-fn function_args_len(args: &FunctionArgs) -> i32 {
-    match args {
-        FunctionArgs::List(exprs) => i32::try_from(exprs.len()).unwrap_or(i32::MAX),
-        FunctionArgs::Star => -1,
-    }
-}
-
 /// Gate-B bounded-CHECK admission helpers. The Gate-B AST admission commit
 /// (9380f1cc2) referenced these but their definitions lived only on the
 /// unmerged hfdt-0117-bounded-validation-20260730 branch (e7f3b0400),
