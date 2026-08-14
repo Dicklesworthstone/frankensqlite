@@ -513,8 +513,37 @@ pub fn json_array_with_subtypes(values: &[SqliteValue], subtypes: &[u32]) -> Res
         .map_err(|error| FrankenError::function_error(format!("json_array encode failed: {error}")))
 }
 
+/// Serialize an ordered key/value list as JSON object text.
+///
+/// Preserves argument order AND duplicate labels verbatim — stock SQLite
+/// semantics (`json_object('a',1,'a',2)` -> `{"a":1,"a":2}`). serde_json's `Map`
+/// collapses duplicate labels to the last value, so the object text is assembled
+/// directly instead of routing through `Value::Object`.
+fn encode_json_object_members(members: &[(String, Value)]) -> Result<String> {
+    let mut out = String::from("{");
+    for (index, (key, value)) in members.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let key_json = serde_json::to_string(key).map_err(|error| {
+            FrankenError::function_error(format!("json_object key encode failed: {error}"))
+        })?;
+        out.push_str(&key_json);
+        out.push(':');
+        let value_json = serde_json::to_string(value).map_err(|error| {
+            FrankenError::function_error(format!("json_object value encode failed: {error}"))
+        })?;
+        out.push_str(&value_json);
+    }
+    out.push('}');
+    Ok(out)
+}
+
 /// Build a JSON object from alternating key/value arguments, embedding
 /// JSON-subtyped values as parsed JSON rather than quoting them as strings.
+///
+/// Duplicate labels are preserved verbatim in argument order, matching stock
+/// SQLite.
 pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Result<String> {
     if !args.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
@@ -522,7 +551,7 @@ pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Resu
         ));
     }
 
-    let mut map = Map::with_capacity(args.len() / 2);
+    let mut members = Vec::with_capacity(args.len() / 2);
     let mut idx = 0;
     while idx < args.len() {
         let key = match &args[idx] {
@@ -534,19 +563,17 @@ pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Resu
             }
         };
         let subtype = subtypes.get(idx + 1).copied().unwrap_or(0);
-        let value = sqlite_to_json_with_subtype(&args[idx + 1], subtype)?;
-        map.insert(key, value);
+        members.push((key, sqlite_to_json_with_subtype(&args[idx + 1], subtype)?));
         idx += 2;
     }
 
-    serde_json::to_string(&Value::Object(map)).map_err(|error| {
-        FrankenError::function_error(format!("json_object encode failed: {error}"))
-    })
+    encode_json_object_members(&members)
 }
 
 /// Build a JSON object from alternating key/value SQL arguments.
 ///
-/// Duplicate keys are overwritten by later entries.
+/// Duplicate labels are preserved verbatim in argument order, matching stock
+/// SQLite (`json_object('a',1,'a',2)` -> `{"a":1,"a":2}`).
 pub fn json_object(args: &[SqliteValue]) -> Result<String> {
     if !args.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
@@ -554,7 +581,7 @@ pub fn json_object(args: &[SqliteValue]) -> Result<String> {
         ));
     }
 
-    let mut map = Map::with_capacity(args.len() / 2);
+    let mut members = Vec::with_capacity(args.len() / 2);
     let mut idx = 0;
     while idx < args.len() {
         let key = match &args[idx] {
@@ -565,14 +592,11 @@ pub fn json_object(args: &[SqliteValue]) -> Result<String> {
                 ));
             }
         };
-        let value = sqlite_to_json(&args[idx + 1])?;
-        map.insert(key, value);
+        members.push((key, sqlite_to_json(&args[idx + 1])?));
         idx += 2;
     }
 
-    serde_json::to_string(&Value::Object(map)).map_err(|error| {
-        FrankenError::function_error(format!("json_object encode failed: {error}"))
-    })
+    encode_json_object_members(&members)
 }
 
 /// Build JSONB from SQL values.
@@ -600,9 +624,10 @@ pub fn jsonb_group_array(values: &[SqliteValue]) -> Result<Vec<u8>> {
 
 /// Aggregate key/value pairs into a JSON object.
 ///
-/// Duplicate keys keep the last value.
+/// Duplicate keys are preserved verbatim in row order, matching stock SQLite
+/// (rows `('a',1),('a',2)` -> `{"a":1,"a":2}`).
 pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<String> {
-    let mut map = Map::with_capacity(entries.len());
+    let mut members = Vec::with_capacity(entries.len());
     for (key_value, value) in entries {
         let key = match key_value {
             SqliteValue::Text(text) => text.to_string(),
@@ -612,11 +637,9 @@ pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Strin
                 ));
             }
         };
-        map.insert(key, sqlite_to_json(value)?);
+        members.push((key, sqlite_to_json(value)?));
     }
-    serde_json::to_string(&Value::Object(map)).map_err(|error| {
-        FrankenError::function_error(format!("json_group_object encode failed: {error}"))
-    })
+    encode_json_object_members(&members)
 }
 
 /// JSONB variant of `json_group_object`.
@@ -4165,8 +4188,11 @@ mod tests {
         assert_eq!(out, r#"{"a":1,"b":2}"#);
     }
 
+    // bd-55eq3: stock json_group_object also keeps duplicate labels verbatim in
+    // row order (`{"a":1,"a":2,"b":3}`, verified against sqlite3 3.46.1), not
+    // last-wins.
     #[test]
-    fn test_json_group_object_duplicate_keys_last_wins() {
+    fn test_json_group_object_duplicate_keys_kept_verbatim() {
         let out = json_group_object(&[
             (
                 SqliteValue::Text(SmallText::from_string("k")),
@@ -4178,7 +4204,7 @@ mod tests {
             ),
         ])
         .unwrap();
-        assert_eq!(out, r#"{"k":2}"#);
+        assert_eq!(out, r#"{"k":1,"k":2}"#);
     }
 
     #[test]
@@ -5007,8 +5033,12 @@ mod tests {
         assert_eq!(json_object(&[]).unwrap(), "{}");
     }
 
+    // bd-55eq3: stock SQLite keeps duplicate labels verbatim in argument order
+    // (`json_object('k',1,'k',2)` -> `{"k":1,"k":2}`, verified against sqlite3
+    // 3.46.1). serde_json's `Map` collapsed them to the last value; the object
+    // text is now assembled directly so both entries survive.
     #[test]
-    fn test_json_object_duplicate_keys() {
+    fn test_json_object_duplicate_keys_kept_verbatim() {
         let out = json_object(&[
             SqliteValue::Text(SmallText::from_string("k")),
             SqliteValue::Integer(1),
@@ -5016,7 +5046,22 @@ mod tests {
             SqliteValue::Integer(2),
         ])
         .unwrap();
-        assert_eq!(out, r#"{"k":2}"#);
+        assert_eq!(out, r#"{"k":1,"k":2}"#);
+    }
+
+    #[test]
+    fn test_json_object_duplicate_keys_preserve_interleaved_order() {
+        // Matches stock: json_object('a',1,'b',2,'a',3) -> {"a":1,"b":2,"a":3}.
+        let out = json_object(&[
+            SqliteValue::Text(SmallText::from_string("a")),
+            SqliteValue::Integer(1),
+            SqliteValue::Text(SmallText::from_string("b")),
+            SqliteValue::Integer(2),
+            SqliteValue::Text(SmallText::from_string("a")),
+            SqliteValue::Integer(3),
+        ])
+        .unwrap();
+        assert_eq!(out, r#"{"a":1,"b":2,"a":3}"#);
     }
 
     // -----------------------------------------------------------------------
