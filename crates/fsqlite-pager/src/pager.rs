@@ -9572,6 +9572,79 @@ fn promote_group_commit_page_one_headers(
     promoted
 }
 
+/// bd-dw8oe: make synthetic page-1 rewrites freelist-header-PRESERVING.
+///
+/// A batch that rewrites page 1 without carrying a freelist publication
+/// (growth page-count advance, change-counter bump, schema change) built its
+/// page-1 image from the transaction's begin-time snapshot — bytes 32..40
+/// (freelist head/count) revert to whatever that snapshot saw. Under churn a
+/// peer's consuming commit publishes `head=0,count=0`, then every later
+/// growth commit re-publishes the PRE-consumption header (`head=487,count=1`
+/// in the captured image), pointing the durable freelist at a page whose
+/// committed content is now a B-tree leaf — the begin-refresh chain walk then
+/// dies with `freelist trunk N leaf_count ... exceeds max`. Overwrite those
+/// bytes with the CURRENT durable header. Batches WITH a publication keep
+/// their serialized bytes (the append-gate resurrection guard validates them
+/// exactly). The residual promote→append window is closed fail-closed under
+/// the gate (`stale_synthetic_page_one_freelist_header`).
+fn promote_group_commit_page_one_freelist_headers(
+    batches: &mut [TransactionFrameBatch],
+    durable_freelist_head: u32,
+    durable_freelist_count: u32,
+) -> bool {
+    let mut promoted = false;
+    for batch in batches {
+        if batch.published_durable_freelist.is_some() {
+            continue;
+        }
+        for frame in &mut batch.frames {
+            if frame.page_number != 1 || frame.page_data.len() < DATABASE_HEADER_SIZE {
+                continue;
+            }
+            let head = u32::from_be_bytes(frame.page_data[32..36].try_into().expect("head slice"));
+            let count =
+                u32::from_be_bytes(frame.page_data[36..40].try_into().expect("count slice"));
+            if head != durable_freelist_head || count != durable_freelist_count {
+                frame.page_data[32..36].copy_from_slice(&durable_freelist_head.to_be_bytes());
+                frame.page_data[36..40].copy_from_slice(&durable_freelist_count.to_be_bytes());
+                promoted = true;
+            }
+        }
+    }
+    promoted
+}
+
+/// bd-dw8oe: append-gate check for the promote→append window — a
+/// non-publication batch whose page-1 frame still carries freelist header
+/// bytes different from the CURRENT durable page-1 must fail closed (the
+/// owner retries and re-promotes at the fresh header). Mutating the frame
+/// here is not an option: it is already prepared/checksummed.
+fn stale_synthetic_page_one_freelist_header(
+    batches: &[TransactionFrameBatch],
+    durable_page_one: Option<&[u8]>,
+) -> bool {
+    let Some(durable) = durable_page_one else {
+        return false;
+    };
+    if durable.len() < DATABASE_HEADER_SIZE {
+        return false;
+    }
+    for batch in batches {
+        if batch.published_durable_freelist.is_some() {
+            continue;
+        }
+        for frame in &batch.frames {
+            if frame.page_number != 1 || frame.page_data.len() < DATABASE_HEADER_SIZE {
+                continue;
+            }
+            if frame.page_data[32..40] != durable[32..40] {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn flatten_group_commit_batches<'a>(
     current_db_size: u32,
     batches: &'a [TransactionFrameBatch],
@@ -19705,6 +19778,58 @@ where
                 let consolidated_db_size = group_commit_final_db_size(flush_base_db_size, &batches);
                 let promoted_page_one_headers =
                     promote_group_commit_page_one_headers(&mut batches, consolidated_db_size);
+                // bd-dw8oe: synthetic page-1 rewrites must carry the CURRENT
+                // durable freelist header, not the transaction's begin-time
+                // bytes (which republish a consumed freelist head). Advisory
+                // freshness here; the append gate fail-closes the residual
+                // promote→append window.
+                if batches.iter().any(|batch| {
+                    batch.published_durable_freelist.is_none()
+                        && batch.frames.iter().any(|frame| frame.page_number == 1)
+                }) {
+                    let frame_page_size = batches
+                        .iter()
+                        .flat_map(|batch| batch.frames.iter())
+                        .map(|frame| frame.page_data.len())
+                        .next()
+                        .unwrap_or(0);
+                    if frame_page_size >= DATABASE_HEADER_SIZE {
+                        let db_file = {
+                            let inner = inner_arc.lock().map_err(|_| {
+                                FrankenError::internal("SimpleTransaction lock poisoned")
+                            })?;
+                            Arc::clone(&inner.db_file)
+                        };
+                        let durable_page_one = {
+                            let backend = wal_backend_handle(wal_backend)?;
+                            let mut wal_guard =
+                                async_rwlock_write(&backend, cx, "WAL backend").await?;
+                            read_durable_page_under_gate(
+                                cx,
+                                wal_guard.as_mut(),
+                                &db_file,
+                                frame_page_size,
+                                1,
+                            )
+                            .await?
+                        };
+                        if let Some(image) = durable_page_one
+                            && image.len() >= DATABASE_HEADER_SIZE
+                        {
+                            let head = u32::from_be_bytes(
+                                image[32..36].try_into().expect("durable head slice"),
+                            );
+                            let count = u32::from_be_bytes(
+                                image[36..40].try_into().expect("durable count slice"),
+                            );
+                            promote_group_commit_page_one_freelist_headers(
+                                &mut batches,
+                                head,
+                                count,
+                            );
+                        }
+                    }
+                }
                 let (frame_refs, final_db_size) =
                     flatten_group_commit_batches(flush_base_db_size, &batches);
                 debug_assert_eq!(final_db_size, consolidated_db_size);
@@ -19967,6 +20092,44 @@ where
                                     .map(|frame| frame.page_data.len())
                                     .next()
                                 {
+                                    // bd-dw8oe: a synthetic page-1 rewrite whose
+                                    // freelist header bytes no longer match the
+                                    // CURRENT durable page-1 would republish a
+                                    // consumed freelist head (the promote ran
+                                    // before this gate; a peer publication can
+                                    // land in between). Fail closed; the retry
+                                    // re-promotes at the fresh header.
+                                    let carries_synthetic_page_one = batches.iter().any(|batch| {
+                                        batch.published_durable_freelist.is_none()
+                                            && batch
+                                                .frames
+                                                .iter()
+                                                .any(|frame| frame.page_number == 1)
+                                    });
+                                    if carries_synthetic_page_one {
+                                        let durable_page_one = read_durable_page_under_gate(
+                                            cx,
+                                            wal,
+                                            &db_file,
+                                            frame_page_size,
+                                            1,
+                                        )
+                                        .await?;
+                                        if stale_synthetic_page_one_freelist_header(
+                                            &batches,
+                                            durable_page_one.as_deref(),
+                                        ) {
+                                            tracing::debug!(
+                                                target: "fsqlite.wal.conflict",
+                                                "synthetic page-1 freelist header is stale \
+                                                 against the current durable page 1; failing \
+                                                 closed with BusySnapshot (bd-dw8oe)"
+                                            );
+                                            return Err(FrankenError::BusySnapshot {
+                                                conflicting_pages: "1".to_owned(),
+                                            });
+                                        }
+                                    }
                                     let freelist_guard_pages =
                                         resurrected_or_erased_freelist_pages(
                                             cx,
