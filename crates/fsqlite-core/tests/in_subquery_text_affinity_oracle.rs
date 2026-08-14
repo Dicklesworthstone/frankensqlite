@@ -28,7 +28,11 @@ fn in_subquery_text_lhs_applies_numeric_affinity_like_stock() {
             .collect::<Result<Vec<_>, _>>()
             .expect("stock rows")
     };
-    assert_eq!(stock, vec![1, 2, 3], "premise: stock matches '2','02','2.0'");
+    assert_eq!(
+        stock,
+        vec![1, 2, 3],
+        "premise: stock matches '2','02','2.0'"
+    );
 
     // ── FrankenSQLite under test ──
     asupersync::test_utils::run_test(move || async move {

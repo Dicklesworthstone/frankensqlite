@@ -2907,9 +2907,8 @@ fn normalize_page_data_to_size(page_size: usize, data: PageData) -> Result<PageD
 /// resolve only via the busy timeout, the pre-detection behavior).
 fn page_lock_deadlock_detection_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FSQLITE_PAGE_LOCK_DEADLOCK_DETECT").as_deref() != Ok("0")
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var("FSQLITE_PAGE_LOCK_DEADLOCK_DETECT").as_deref() != Ok("0"))
 }
 
 /// bd-zeg99: RAII wait-for-edge registration so every exit path (timeout,

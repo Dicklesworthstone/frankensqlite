@@ -61154,7 +61154,8 @@ impl Connection {
         // subscriptions, so PRAGMA data_version (= global - own) reports only
         // OTHER connections' commits and never moves on this connection's own
         // DML or DDL.
-        self.data_version_global.fetch_add(1, AtomicOrdering::AcqRel);
+        self.data_version_global
+            .fetch_add(1, AtomicOrdering::AcqRel);
         self.data_version_own_commits
             .set(self.data_version_own_commits.get().saturating_add(1));
 
@@ -223283,15 +223284,20 @@ mod pager_routing_tests {
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, doc BLOB);")
                 .await
                 .unwrap();
-            conn.execute(&format!("INSERT INTO t VALUES (1, jsonb('{}'));", doc.replace('\'', "''")))
-                .await
-                .unwrap();
+            conn.execute(&format!(
+                "INSERT INTO t VALUES (1, jsonb('{}'));",
+                doc.replace('\'', "''")
+            ))
+            .await
+            .unwrap();
             let ours = conn.query("SELECT json(doc) FROM t;").await.unwrap();
             let ours_text = match &ours[0].values()[0] {
                 SqliteValue::Text(t) => t.to_string(),
                 other => panic!("expected text, got {other:?}"),
             };
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").await.unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                .await
+                .unwrap();
             conn.close().await.unwrap();
 
             let stock = rusqlite::Connection::open(&path).unwrap();
@@ -223375,10 +223381,7 @@ mod pager_routing_tests {
                 .query("SELECT id FROM search_recipes ORDER BY id;")
                 .await
                 .unwrap();
-            let ids: Vec<_> = rows
-                .iter()
-                .map(|row| row.values()[0].clone())
-                .collect();
+            let ids: Vec<_> = rows.iter().map(|row| row.values()[0].clone()).collect();
             assert_eq!(
                 ids,
                 vec![
@@ -223421,10 +223424,7 @@ mod pager_routing_tests {
                 .query("SELECT id FROM search_recipes ORDER BY id;")
                 .await
                 .unwrap();
-            let ids: Vec<_> = rows
-                .iter()
-                .map(|row| row.values()[0].clone())
-                .collect();
+            let ids: Vec<_> = rows.iter().map(|row| row.values()[0].clone()).collect();
             assert_eq!(
                 ids,
                 vec![

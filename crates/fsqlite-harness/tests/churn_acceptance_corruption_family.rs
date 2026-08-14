@@ -46,7 +46,10 @@ fn churn_acceptance_corruption_family() {
         // bd-vnxjd forensics: FSQLITE_CHURN_KEEP_DB=1 leaks the tempdir so a
         // failing run's database file survives for post-mortem page analysis.
         if std::env::var("FSQLITE_CHURN_KEEP_DB").as_deref() == Ok("1") {
-            eprintln!("FSQLITE_CHURN_KEEP_DB: preserving {}", temp_dir.path().display());
+            eprintln!(
+                "FSQLITE_CHURN_KEEP_DB: preserving {}",
+                temp_dir.path().display()
+            );
         }
         let db_path = temp_dir.path().join("churn_acceptance.db");
         let db = db_path.to_string_lossy().into_owned();

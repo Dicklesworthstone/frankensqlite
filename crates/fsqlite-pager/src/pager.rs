@@ -1445,7 +1445,9 @@ fn alloc_ledger(txn_tag: usize, event: &str, page: u32, aux: u64) {
         return;
     };
     use std::io::Write as _;
-    let mut guard = writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = writer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = writeln!(guard, "{txn_tag:x} {event} {page} {aux}");
     let _ = guard.flush();
 }
@@ -9284,7 +9286,12 @@ async fn conflicting_pages_since_batch_snapshots(
     for batch in batches {
         let Some(snapshot) = batch.conflict_snapshot else {
             if std::env::var_os("DK9RA_O81OV").is_some() {
-                let maxp = batch.frames.iter().map(|f| f.page_number).max().unwrap_or(0);
+                let maxp = batch
+                    .frames
+                    .iter()
+                    .map(|f| f.page_number)
+                    .max()
+                    .unwrap_or(0);
                 eprintln!(
                     "DK9RA_O81OV CPBS_SKIP no_snapshot n_conflict_pages={} max_frame_page={maxp}",
                     batch.conflict_pages.len()
@@ -9294,7 +9301,12 @@ async fn conflicting_pages_since_batch_snapshots(
         };
         if std::env::var_os("DK9RA_O81OV").is_some() {
             let maxc = batch.conflict_pages.iter().copied().max().unwrap_or(0);
-            let maxf = batch.frames.iter().map(|f| f.page_number).max().unwrap_or(0);
+            let maxf = batch
+                .frames
+                .iter()
+                .map(|f| f.page_number)
+                .max()
+                .unwrap_or(0);
             eprintln!(
                 "DK9RA_O81OV CPBS snap_db={} n_conflict_pages={} max_conflict={maxc} max_frame={maxf}",
                 snapshot.snapshot_db_size,
@@ -9394,9 +9406,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
         return Ok(all);
     }
 
-    let Some(page_one) =
-        read_durable_page_under_gate(cx, wal, db_file, page_size, 1).await?
-    else {
+    let Some(page_one) = read_durable_page_under_gate(cx, wal, db_file, page_size, 1).await? else {
         // Brand-new database: no durable freelist exists for peers to have
         // touched, so the publication stands.
         return Ok(Vec::new());
@@ -9406,9 +9416,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
     }
 
     let mut current = HashSet::<u32>::new();
-    let mut trunk = u32::from_be_bytes(
-        page_one[32..36].try_into().expect("header freelist slice"),
-    );
+    let mut trunk = u32::from_be_bytes(page_one[32..36].try_into().expect("header freelist slice"));
     let max_leaf_entries = (page_size / 4).saturating_sub(2).max(1);
     let mut walked = 0_u32;
     while trunk != 0 {
@@ -9418,8 +9426,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
             // validate against garbage.
             return Ok(vec![trunk]);
         }
-        let Some(image) =
-            read_durable_page_under_gate(cx, wal, db_file, page_size, trunk).await?
+        let Some(image) = read_durable_page_under_gate(cx, wal, db_file, page_size, trunk).await?
         else {
             return Ok(vec![trunk]);
         };
@@ -9427,9 +9434,8 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
             return Ok(vec![trunk]);
         }
         let next = u32::from_be_bytes(image[0..4].try_into().expect("trunk next slice"));
-        let leaf_count = u32::from_be_bytes(
-            image[4..8].try_into().expect("trunk count slice"),
-        ) as usize;
+        let leaf_count =
+            u32::from_be_bytes(image[4..8].try_into().expect("trunk count slice")) as usize;
         for index in 0..leaf_count.min(max_leaf_entries) {
             let base = 8 + index * 4;
             if base + 4 > image.len() {
@@ -19574,16 +19580,18 @@ where
                 // append gate below fail-closes the residual race.
                 let durable_certified_db_size = {
                     match wal_backend_handle(wal_backend) {
-                        Ok(backend) => match async_rwlock_write(&backend, cx, "WAL backend").await {
-                            Ok(mut wal_guard) => wal_guard
-                                .as_mut()
-                                .latest_authorized_parallel_wal_commit_certificate(cx)
-                                .await
-                                .ok()
-                                .flatten()
-                                .map_or(0, |cert| cert.db_size_pages),
-                            Err(_) => 0,
-                        },
+                        Ok(backend) => {
+                            match async_rwlock_write(&backend, cx, "WAL backend").await {
+                                Ok(mut wal_guard) => wal_guard
+                                    .as_mut()
+                                    .latest_authorized_parallel_wal_commit_certificate(cx)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map_or(0, |cert| cert.db_size_pages),
+                                Err(_) => 0,
+                            }
+                        }
                         Err(_) => 0,
                     }
                 };
@@ -21423,7 +21431,12 @@ where
                     {
                         let page = inner.freelist.remove(idx);
                         self.allocated_from_freelist.push(page);
-                        alloc_ledger(self as *const _ as usize, "alloc_freelist_hi", page.get(), 0);
+                        alloc_ledger(
+                            self as *const _ as usize,
+                            "alloc_freelist_hi",
+                            page.get(),
+                            0,
+                        );
                         return Ok(page);
                     }
 
@@ -21446,12 +21459,22 @@ where
                     // workload grew the file at EOF without bound.
                     if sole_current_snapshot && let Some(page) = inner.freelist.pop() {
                         self.allocated_from_freelist.push(page);
-                        alloc_ledger(self as *const _ as usize, "alloc_freelist_gated", page.get(), 0);
+                        alloc_ledger(
+                            self as *const _ as usize,
+                            "alloc_freelist_gated",
+                            page.get(),
+                            0,
+                        );
                         return Ok(page);
                     }
                 } else if let Some(page) = inner.freelist.pop() {
                     self.allocated_from_freelist.push(page);
-                    alloc_ledger(self as *const _ as usize, "alloc_freelist_nc", page.get(), 0);
+                    alloc_ledger(
+                        self as *const _ as usize,
+                        "alloc_freelist_nc",
+                        page.get(),
+                        0,
+                    );
                     return Ok(page);
                 }
             }
@@ -23367,16 +23390,28 @@ where
                 let freelist_start = entry.allocated_from_freelist_snapshot.len();
                 let lease: Vec<PageNumber> = self.page_lease.drain(..).collect();
                 for page in &lease {
-                    alloc_ledger(self as *const _ as usize, "sp_quarantine_lease", page.get(), 0);
+                    alloc_ledger(
+                        self as *const _ as usize,
+                        "sp_quarantine_lease",
+                        page.get(),
+                        0,
+                    );
                 }
                 self.savepoint_quarantined_allocations.extend(lease);
                 let eof: Vec<PageNumber> = self.allocated_from_eof.drain(eof_start..).collect();
                 for page in &eof {
-                    alloc_ledger(self as *const _ as usize, "sp_quarantine_eof", page.get(), 0);
+                    alloc_ledger(
+                        self as *const _ as usize,
+                        "sp_quarantine_eof",
+                        page.get(),
+                        0,
+                    );
                 }
                 self.savepoint_quarantined_allocations.extend(eof);
-                let fl: Vec<PageNumber> =
-                    self.allocated_from_freelist.drain(freelist_start..).collect();
+                let fl: Vec<PageNumber> = self
+                    .allocated_from_freelist
+                    .drain(freelist_start..)
+                    .collect();
                 self.savepoint_quarantined_allocations.extend(fl);
                 // Keep the quarantine descending so `pop()` hands the LOWEST
                 // page number out first, matching the freelist convention and

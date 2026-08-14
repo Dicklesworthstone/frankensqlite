@@ -68,7 +68,10 @@ fn test_gh302_page_count_bounded_under_continuous_overlap() {
             .execute_batch("PRAGMA busy_timeout=5000;")
             .await
             .expect("reader pragmas");
-        reader.execute("BEGIN CONCURRENT;").await.expect("reader begin");
+        reader
+            .execute("BEGIN CONCURRENT;")
+            .await
+            .expect("reader begin");
         let reader_count_before = query_i64(&reader, "SELECT COUNT(*) FROM t;").await;
         assert_eq!(reader_count_before, ROWS, "reader must see the seed rows");
 
@@ -90,9 +93,7 @@ fn test_gh302_page_count_bounded_under_continuous_overlap() {
                     }
                     let outcome = async {
                         writer
-                            .execute(&format!(
-                                "DELETE FROM t WHERE id >= {low} AND id < {high};"
-                            ))
+                            .execute(&format!("DELETE FROM t WHERE id >= {low} AND id < {high};"))
                             .await?;
                         writer.execute("COMMIT;").await
                     }
@@ -115,12 +116,9 @@ fn test_gh302_page_count_bounded_under_continuous_overlap() {
                     }
                     let outcome = async {
                         for id in low..high {
-                            let payload =
-                                format!("cycle_{id}_{}", "y".repeat(PAYLOAD_LEN));
+                            let payload = format!("cycle_{id}_{}", "y".repeat(PAYLOAD_LEN));
                             writer
-                                .execute(&format!(
-                                    "INSERT INTO t VALUES ({id}, '{payload}');"
-                                ))
+                                .execute(&format!("INSERT INTO t VALUES ({id}, '{payload}');"))
                                 .await?;
                         }
                         writer.execute("COMMIT;").await
