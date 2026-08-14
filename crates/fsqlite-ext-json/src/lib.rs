@@ -3768,6 +3768,84 @@ mod tests {
         Ok(())
     }
 
+    // bd-7h73c: jsonb_set/jsonb_insert/jsonb_replace must honor the JSON subtype
+    // on value args (results of json(), json_array(), ->, ...) and embed the value
+    // as a JSON subtree rather than stringify it — matching the text json_* twins
+    // and stock SQLite (verified sqlite3 3.46.1:
+    // json(jsonb_set('{}','$.a',json_array(1,2))) = {"a":[1,2]}).
+    #[test]
+    fn test_jsonb_set_honors_json_subtype_on_value() {
+        let out = JsonbSetFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string("{}")),
+                    SqliteValue::Text(SmallText::from_string("$.a")),
+                    SqliteValue::Text(SmallText::from_string("[1,2]")),
+                ],
+                &[0, 0, JSON_SUBTYPE],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_set should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":[1,2]}"#);
+    }
+
+    #[test]
+    fn test_jsonb_set_without_subtype_stringifies_value() {
+        // Negative control: a plain TEXT value (subtype 0) stays a JSON string.
+        let out = JsonbSetFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string("{}")),
+                    SqliteValue::Text(SmallText::from_string("$.a")),
+                    SqliteValue::Text(SmallText::from_string("[1,2]")),
+                ],
+                &[0, 0, 0],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_set should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":"[1,2]"}"#);
+    }
+
+    #[test]
+    fn test_jsonb_insert_honors_json_subtype_on_value() {
+        let out = JsonbInsertFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string(r#"{"a":1}"#)),
+                    SqliteValue::Text(SmallText::from_string("$.b")),
+                    SqliteValue::Text(SmallText::from_string("[3,4]")),
+                ],
+                &[0, 0, JSON_SUBTYPE],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_insert should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":1,"b":[3,4]}"#);
+    }
+
+    #[test]
+    fn test_jsonb_replace_honors_json_subtype_on_value() {
+        let out = JsonbReplaceFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string(r#"{"a":1}"#)),
+                    SqliteValue::Text(SmallText::from_string("$.a")),
+                    SqliteValue::Text(SmallText::from_string(r#"{"n":5}"#)),
+                ],
+                &[0, 0, JSON_SUBTYPE],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_replace should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":{"n":5}}"#);
+    }
+
     #[test]
     fn test_registered_json_pretty_accepts_jsonb_blob_input() -> Result<()> {
         let mut registry = FunctionRegistry::new();
