@@ -9445,28 +9445,59 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
     let published_set: HashSet<u32> = published.iter().copied().collect();
     let freed: HashSet<u32> = batch.freed_pages.iter().copied().collect();
     let consumed: HashSet<u32> = batch.consumed_freelist_pages.iter().copied().collect();
+    // bd-jygg3: the durable-freelist serializer NORMALIZES the publication —
+    // entries above the publication's committed db_size are dropped by
+    // design (predicted_durable_freelist filters `page <= committed_db_size`;
+    // rollback restores legitimately park above-EOF page numbers on the
+    // shared freelist). Comparing raw sets made every publisher after such a
+    // restore look like an eraser of those above-EOF entries and fail closed
+    // forever (single-connection TEXT-PK bulk-commit repro: BusySnapshot on
+    // pages 4-10 with zero peers, non-transient because the retry re-derives
+    // the same normalized view). Above-publication-EOF pages cannot be
+    // resurrection-consumed — nothing durable exists there — so exempt them
+    // from the erasure arm.
+    let publication_db_size = batch
+        .frames
+        .iter()
+        .map(|frame| frame.db_size_if_commit)
+        .max()
+        .unwrap_or(0);
 
     let mut offending: Vec<u32> = published_set
         .iter()
         .copied()
         .filter(|page| !current.contains(page) && !freed.contains(page))
-        .chain(
-            current
-                .iter()
-                .copied()
-                .filter(|page| !published_set.contains(page) && !consumed.contains(page)),
-        )
+        .chain(current.iter().copied().filter(|page| {
+            !published_set.contains(page)
+                && !consumed.contains(page)
+                && !(publication_db_size > 0 && *page > publication_db_size)
+        }))
         // DOUBLE-CONSUMPTION: a page this batch consumed must still be on the
         // current durable freelist — if a peer's commit already removed it,
         // both connections popped the same committed-free page from
         // begin-time views, and the peer's frame can predate this
         // transaction's (rebased) conflict horizon, escaping the FCW scan.
-        .chain(
-            consumed
-                .iter()
-                .copied()
-                .filter(|page| !current.contains(page)),
-        )
+        .chain(consumed.iter().copied().filter(|page| {
+            // bd-jygg3: a consumed page ABOVE the consumer's begin-time
+            // committed db_size (snapshot_db_size on the batch's conflict
+            // snapshot) can never have been durably free — the freelist
+            // serializer normalizes above-EOF entries away, so such pages
+            // exist only on the process-local in-memory freelist (rollback
+            // returns, DDL churn). Requiring them on the CURRENT durable
+            // freelist failed every legitimate same-process consumer
+            // permanently (single-connection TEXT-PK bulk repro: pages 4-10
+            // consumed from in-memory returns above a ~3-page committed
+            // size; current durable freelist empty by construction). The
+            // double-pop hazard this arm guards remains fully covered for
+            // durably-free pages: those are <= the begin-time committed
+            // size and keep the fail-closed check.
+            let begin_committed = batch
+                .conflict_snapshot
+                .map(|snapshot| snapshot.snapshot_db_size)
+                .unwrap_or(0);
+            let in_memory_only = begin_committed > 0 && *page > begin_committed;
+            !current.contains(page) && !in_memory_only
+        }))
         .collect();
     offending.sort_unstable();
     offending.dedup();
@@ -19529,6 +19560,34 @@ where
                         .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
                     inner.db_size
                 };
+                // bd-vnxjd: the flusher connection's `inner.db_size` lags the
+                // durable image whenever PEER connections grew the file since
+                // this connection's last refresh. Certifying that stale size
+                // REGRESSES db_size in the WAL commit marker / certificate /
+                // page-1 header, and the close-time checkpoint then truncates
+                // committed peer growth away (kqari forensic receipts: cert
+                // #2387 certified 168, fourteen stale delete commits then
+                // certified 165, checkpoint produced a 165-page file with a
+                // 168 header — malformed + destroyed pages). Floor the flush
+                // base with the latest durable certificate's size. Advisory
+                // here (errors and cert-less backends fall back to 0); the
+                // append gate below fail-closes the residual race.
+                let durable_certified_db_size = {
+                    match wal_backend_handle(wal_backend) {
+                        Ok(backend) => match async_rwlock_write(&backend, cx, "WAL backend").await {
+                            Ok(mut wal_guard) => wal_guard
+                                .as_mut()
+                                .latest_authorized_parallel_wal_commit_certificate(cx)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map_or(0, |cert| cert.db_size_pages),
+                            Err(_) => 0,
+                        },
+                        Err(_) => 0,
+                    }
+                };
+                let flush_base_db_size = flush_base_db_size.max(durable_certified_db_size);
                 let consolidated_db_size = group_commit_final_db_size(flush_base_db_size, &batches);
                 let promoted_page_one_headers =
                     promote_group_commit_page_one_headers(&mut batches, consolidated_db_size);
@@ -19823,6 +19882,27 @@ where
                                 let authorized_seed = wal
                                     .latest_authorized_parallel_wal_commit_certificate(cx)
                                     .await?;
+                                // bd-vnxjd: db_size monotonicity gate. A peer
+                                // may have committed growth between this
+                                // flush's prep-time floor read and this append
+                                // gate; certifying a smaller db_size would let
+                                // the checkpoint truncate that committed
+                                // growth away. Fail closed pre-durability —
+                                // the statement retry re-preps against the
+                                // fresh durable floor.
+                                if let Some(seed) = authorized_seed.as_ref()
+                                    && seed.db_size_pages > final_db_size
+                                {
+                                    tracing::warn!(
+                                        target: "fsqlite.pager.commit",
+                                        certified_db_size = final_db_size,
+                                        durable_db_size = seed.db_size_pages,
+                                        "commit refused: batch would regress durable db_size (bd-vnxjd)"
+                                    );
+                                    return Err(FrankenError::BusySnapshot {
+                                        conflicting_pages: "1".to_owned(),
+                                    });
+                                }
                                 frames_written_start = u64::try_from(wal.frame_count())
                                     .unwrap_or(u64::MAX)
                                     .saturating_add(1);

@@ -43,8 +43,16 @@ FIXED (never-completes → ~7s); un-ignore when bd-vnxjd lands"]
 fn churn_acceptance_corruption_family() {
     asupersync::test_utils::run_test(|| async {
         let temp_dir = tempfile::tempdir().unwrap();
+        // bd-vnxjd forensics: FSQLITE_CHURN_KEEP_DB=1 leaks the tempdir so a
+        // failing run's database file survives for post-mortem page analysis.
+        if std::env::var("FSQLITE_CHURN_KEEP_DB").as_deref() == Ok("1") {
+            eprintln!("FSQLITE_CHURN_KEEP_DB: preserving {}", temp_dir.path().display());
+        }
         let db_path = temp_dir.path().join("churn_acceptance.db");
         let db = db_path.to_string_lossy().into_owned();
+        if std::env::var("FSQLITE_CHURN_KEEP_DB").as_deref() == Ok("1") {
+            std::mem::forget(temp_dir);
+        }
 
         let setup = Connection::open(&db).await.unwrap();
         setup
