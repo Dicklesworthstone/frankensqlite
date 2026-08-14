@@ -15,10 +15,6 @@
 #![allow(clippy::future_not_send)]
 #![allow(clippy::large_futures)]
 
-pub use fsqlite_core::connection::{
-    Connection, ConnectionEnv, DatabaseImageReceipt, IoPollStrategy, PreparedStatement, Row,
-    RuntimeConfig, RuntimeContext, TraceEvent, TraceMask, init_global_runtime,
-};
 /// Whole-database-image capture, bounded structural proof, and publication.
 ///
 /// These name the guards and proof counters returned by
@@ -28,7 +24,12 @@ pub use fsqlite_core::connection::{
 pub use fsqlite_core::connection::{BoundedDatabaseStructuralStats, PageCachePeakSnapshot};
 #[cfg(not(target_arch = "wasm32"))]
 pub use fsqlite_core::connection::{
-    BoundedStructuralSnapshot, DatabaseImagePublication, PendingDatabaseImagePublication,
+    BoundedStructuralSnapshot, DatabaseBuilderReservation, DatabaseImagePublication,
+    PendingDatabaseImagePublication,
+};
+pub use fsqlite_core::connection::{
+    Connection, ConnectionEnv, DatabaseImageReceipt, IoPollStrategy, PreparedStatement, Row,
+    RuntimeConfig, RuntimeContext, TraceEvent, TraceMask, init_global_runtime,
 };
 pub use fsqlite_error::{DatabaseImagePublicationErrorClass, FrankenError};
 pub use fsqlite_types::SqliteValue;
