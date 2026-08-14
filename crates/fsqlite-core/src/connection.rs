@@ -13506,6 +13506,9 @@ impl Connection {
     /// [`Self::bounded_validation_refusal`], naming the exact unsupported
     /// shape.
     #[cfg(not(target_arch = "wasm32"))]
+    // bd-4gkbu: Gate-A shape gate, deliberately unwired — unsafe to call on its
+    // own without the hfdt-0117 Gate-B semantic walkers (see the doc above).
+    #[allow(dead_code)]
     fn validate_bounded_schema_shape_support(&self) -> Result<()> {
         let schema = self.schema.borrow().clone();
         if schema.len() > BOUNDED_VALIDATION_MAX_SCHEMA_TABLES {
@@ -33522,8 +33525,12 @@ impl DatabaseImagePublication {
 }
 
 /// Fixed ceiling on nodes visited while admitting one persisted expression.
+// bd-4gkbu: only read by the dead Gate-B traversal until hfdt-0117 wiring lands.
+#[allow(dead_code)]
 const BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES: usize = 65_536;
 /// Fixed ceiling on expression-AST depth while admitting one expression.
+// bd-4gkbu: only read by the dead Gate-B traversal until hfdt-0117 wiring lands.
+#[allow(dead_code)]
 const BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH: usize = 512;
 
 /// Semantic proof counters for a bounded whole-image validation.
@@ -33601,13 +33608,17 @@ fn bounded_increment_validation_counter(counter: &mut u64) -> Result<()> {
 // are part 2. Gate-A plus this traversal is still a half-gate.
 // ---------------------------------------------------------------------------
 
+// bd-4gkbu: Gate-B traversal helper — dead until hfdt-0117 wiring lands.
+#[allow(dead_code)]
 fn is_bounded_builtin_collation(collation: &str) -> bool {
     ["binary", "nocase", "rtrim"]
         .iter()
         .any(|builtin| collation.eq_ignore_ascii_case(builtin))
 }
 
+// bd-4gkbu: Gate-B traversal types — dead until hfdt-0117 wiring lands.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 enum BoundedCollationAstNode<'a> {
     Statement(&'a Statement),
     Expr(&'a Expr),
@@ -33621,12 +33632,14 @@ enum BoundedCollationAstNode<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // bd-4gkbu: dead until hfdt-0117 Gate-B wiring lands
 enum BoundedCollationTraversalLimit {
     Nodes,
     Depth,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // bd-4gkbu: dead until hfdt-0117 Gate-B wiring lands
 enum BoundedAstUnsupported {
     Collation(String),
     Function { name: String, arity: i32 },
@@ -33634,6 +33647,9 @@ enum BoundedAstUnsupported {
     Statement(&'static str),
 }
 
+// bd-4gkbu: Gate-B AST admission traversal — the zero-caller root of the dead
+// bounded-CHECK slice; wiring requires the hfdt-0117 semantic walkers.
+#[allow(dead_code)]
 fn first_unsupported_bounded_ast(
     root: BoundedCollationAstNode<'_>,
     reject_custom_collations: bool,
@@ -95776,6 +95792,7 @@ fn function_args_len(args: &FunctionArgs) -> i32 {
 /// (9380f1cc2) referenced these but their definitions lived only on the
 /// unmerged hfdt-0117-bounded-validation-20260730 branch (e7f3b0400),
 /// leaving main uncompilable; restored verbatim from that branch.
+#[allow(dead_code)] // bd-4gkbu: Gate-B helper, dead until hfdt-0117 wiring lands
 fn bounded_check_binary_operator_supported(op: BinaryOp) -> bool {
     matches!(
         op,
@@ -95795,6 +95812,7 @@ fn bounded_check_binary_operator_supported(op: BinaryOp) -> bool {
     )
 }
 
+#[allow(dead_code)] // bd-4gkbu: Gate-B helper, dead until hfdt-0117 wiring lands
 fn bounded_check_cast_target_supported(type_name: &fsqlite_ast::TypeName) -> bool {
     type_name.arg1.is_none()
         && type_name.arg2.is_none()
