@@ -186,6 +186,27 @@ pub struct TransactionFrameBatch {
     pub conflict_page_baselines: Vec<TransactionConflictPageBaseline>,
     /// Lane-local staging context captured before group-commit submission.
     pub context: TransactionFrameBatchContext,
+    /// bd-gh302 / bd-0shxy: the exact durable freelist content this batch's
+    /// page-1 + trunk frames publish, when the submitting transaction
+    /// serialized freelist metadata (`None` otherwise). The publication is
+    /// derived from the transaction's BEGIN-TIME freelist view, so a peer may
+    /// have consumed one of these pages since; the flusher must validate the
+    /// list against the CURRENT durable freelist under the append gate and
+    /// fail the batch closed instead of resurrecting a consumed page
+    /// ("committed-freelist resurrection": one physical page granted to
+    /// multiple connections through re-published stale freelist state).
+    pub published_durable_freelist: Option<Vec<u32>>,
+    /// Pages the submitting transaction itself durably freed in this commit.
+    /// These legitimately appear in `published_durable_freelist` without being
+    /// on the current durable freelist yet.
+    pub freed_pages: Vec<u32>,
+    /// Committed-freelist pages the submitting transaction consumed
+    /// (allocated) in this commit. These legitimately appear on the current
+    /// durable freelist without being in `published_durable_freelist`; any
+    /// OTHER page missing from the publication would be erased from the
+    /// durable freelist (the dual of resurrection: a peer's newly freed page
+    /// silently dropped, leaking it as "never used").
+    pub consumed_freelist_pages: Vec<u32>,
 }
 
 /// WAL conflict horizon captured by a submitting transaction.
@@ -235,7 +256,26 @@ impl TransactionFrameBatch {
             conflict_snapshot: None,
             conflict_page_baselines: Vec::new(),
             context: TransactionFrameBatchContext::default(),
+            published_durable_freelist: None,
+            freed_pages: Vec::new(),
+            consumed_freelist_pages: Vec::new(),
         }
+    }
+
+    /// Attach the durable-freelist publication this batch carries plus the
+    /// submitting transaction's own durably freed and consumed pages
+    /// (bd-gh302/bd-0shxy).
+    #[must_use]
+    pub fn with_freelist_publication(
+        mut self,
+        published_durable_freelist: Option<Vec<u32>>,
+        freed_pages: Vec<u32>,
+        consumed_freelist_pages: Vec<u32>,
+    ) -> Self {
+        self.published_durable_freelist = published_durable_freelist;
+        self.freed_pages = freed_pages;
+        self.consumed_freelist_pages = consumed_freelist_pages;
+        self
     }
 
     /// Attach cross-process conflict metadata for the submitting transaction.
