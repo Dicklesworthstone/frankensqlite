@@ -1324,12 +1324,21 @@ fn run_worker_to_terminal(
     // be able to skip the worker's sole connection-cleanup path.
     let receiver_drop_result = catch_unwind(AssertUnwindSafe(|| drop(rx)));
 
-    // An explicit no-checkpoint close is the only stop reason that skips the
-    // close-time WAL checkpoint. Shutdown, disconnection, and loop panics keep
-    // the checkpointing default, so implicit teardown behavior is unchanged.
-    let checkpoint_on_close = !matches!(
+    // Only an EXPLICIT checkpointing close may run the close-time WAL
+    // checkpoint. Implicit teardown — Drop (Shutdown), sender disconnection,
+    // or a loop panic — must never write to the database family from this
+    // detached thread AFTER the caller's `drop()` has already returned:
+    // bd-daqmp traced the shutdown cleanup's passive checkpoint landing
+    // ~50ms post-Drop and rewriting the main database file underneath
+    // forensic/salvage readers that sampled the family right after drop
+    // (observed as a phantom "read-only open rewrites the main db"). This
+    // also aligns `AsyncConnection`'s Drop with `Connection`'s documented
+    // Drop contract: dropping without an awaited close skips the passive
+    // checkpoint; committed frames stay durable in the WAL and the next
+    // open recovers them.
+    let checkpoint_on_close = matches!(
         &loop_result,
-        Ok(WorkerStop::ExplicitClose { checkpoint: false })
+        Ok(WorkerStop::ExplicitClose { checkpoint: true })
     );
 
     state.publish_phase(WorkerPhase::Closing);
@@ -1834,7 +1843,10 @@ fn async_admission_err<T>(error: async_mpsc::SendError<T>) -> FrankenError {
 ///
 /// When `AsyncConnection` is dropped, the worker thread is signalled to shut
 /// down. The underlying [`Connection`] is closed on the worker thread as part
-/// of its normal drop sequence.
+/// of its normal drop sequence, WITHOUT the close-time WAL checkpoint
+/// (matching [`Connection`]'s drop contract): the detached worker must not
+/// keep rewriting the database family after `drop()` has returned (bd-daqmp).
+/// Committed frames stay durable in the WAL and the next open recovers them.
 ///
 /// For explicit, error-checked shutdown use [`close`](Self::close) on the
 /// async path or [`close_sync`](Self::close_sync) on the synchronous path.
