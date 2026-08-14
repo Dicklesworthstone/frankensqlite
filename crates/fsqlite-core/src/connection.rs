@@ -13626,6 +13626,260 @@ impl Connection {
         )
     }
 
+// ---------------------------------------------------------------------------
+// Bounded semantic walker 1 of 4: table rows
+//
+// Recomputes every ordinary ROWID table row inside the pinned snapshot and
+// checks NOT NULL and persisted CHECK constraints against the inflated values.
+// Rows are streamed one at a time against a fixed record ceiling, so residency
+// does not grow with table size — the same discipline as the structural walk.
+//
+// Converted to async: cursor positioning and payload reads are async on this
+// line. Expression evaluation stays synchronous because it performs no I/O.
+// ---------------------------------------------------------------------------
+
+    async fn bounded_next_table_row<T: TransactionHandle + ?Sized>(
+        cx: &Cx,
+        txn: &mut T,
+        root_page: PageNumber,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        after_rowid: Option<i64>,
+    ) -> Result<Option<(i64, Vec<u8>)>> {
+        let mut cursor =
+            Self::new_header_btree_cursor(txn, root_page, page_size, reserved_per_page, true);
+        let positioned = match after_rowid {
+            None => cursor.first(cx).await?,
+            Some(i64::MAX) => false,
+            Some(after) => {
+                let target = after.checked_add(1).ok_or(FrankenError::IntegerOverflow)?;
+                let _ = cursor.table_move_to(cx, target).await?;
+                !cursor.eof()
+            }
+        };
+        if !positioned {
+            return Ok(None);
+        }
+        let rowid = cursor.rowid(cx).await?;
+        if after_rowid.is_some_and(|after| rowid <= after) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table B-tree rowid scan failed to advance past {}",
+                    after_rowid.unwrap_or_default()
+                ),
+            });
+        }
+        let payload = cursor.payload(cx).await?;
+        if payload.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "table row payload {} exceeds the fixed {}-byte record bound",
+                payload.len(),
+                BOUNDED_VALIDATION_MAX_RECORD_BYTES
+            )));
+        }
+        Ok(Some((rowid, payload)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bounded_validate_table_rows<T: TransactionHandle + ?Sized>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        table: &TableSchema,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        rowid_alias_col_idx: Option<usize>,
+        column_defaults: Option<&[Option<SqliteValue>]>,
+        counters: &mut BoundedValidationCounters,
+    ) -> Result<()> {
+        let root_page = page_number_from_schema_root(table.root_page, &table.name, "table")?;
+        let check_constraints = table
+            .check_constraints
+            .iter()
+            .enumerate()
+            .map(|(constraint_index, expression)| {
+                fsqlite_parser::expr::parse_expr(&expression.expr).map_err(|error| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "CHECK constraint {} on table `{}` is invalid: {error}",
+                            constraint_index + 1,
+                            table.name
+                        ),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut after = None;
+        while let Some((rowid, payload)) =
+            Self::bounded_next_table_row(cx, txn, root_page, page_size, reserved_per_page, after)
+                .await?
+        {
+            let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                    table.name
+                ),
+            })?;
+            if values.len() > table.columns.len() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table `{}` rowid {rowid} stores {} columns but schema allows {}",
+                        table.name,
+                        values.len(),
+                        table.columns.len()
+                    ),
+                });
+            }
+            let inflated = Self::inflate_table_row_values_for_integrity(
+                table,
+                rowid,
+                &values,
+                rowid_alias_col_idx,
+                column_defaults,
+            )?;
+            if !Self::inflated_row_satisfies_notnull(table, &inflated) {
+                let column =
+                    table
+                        .columns
+                        .iter()
+                        .zip(inflated.iter())
+                        .find_map(|(column, value)| {
+                            (column.notnull && !column.is_ipk && matches!(value, SqliteValue::Null))
+                                .then_some(column)
+                        });
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: column.map_or_else(
+                        || {
+                            format!(
+                                "table `{}` rowid {rowid} does not satisfy its NOT NULL constraints",
+                                table.name
+                            )
+                        },
+                        |column| {
+                            format!(
+                                "table `{}` rowid {rowid} stores NULL in NOT NULL column `{}`",
+                                table.name, column.name
+                            )
+                        },
+                    ),
+                });
+            }
+            for (constraint_index, expression) in check_constraints.iter().enumerate() {
+                let value = self.bounded_evaluate_check_expression(
+                    table,
+                    expression,
+                    rowid,
+                    &inflated,
+                    rowid_alias_col_idx,
+                )?;
+                counters.check_constraint_evaluations = counters
+                    .check_constraint_evaluations
+                    .checked_add(1)
+                    .ok_or(FrankenError::TooBig)?;
+                if !matches!(value, SqliteValue::Null) && !is_sqlite_truthy(&value) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` rowid {rowid} violates CHECK constraint {}",
+                            table.name,
+                            constraint_index + 1
+                        ),
+                    });
+                }
+            }
+            counters.table_rows_checked = counters
+                .table_rows_checked
+                .checked_add(1)
+                .ok_or(FrankenError::TooBig)?;
+            after = Some(rowid);
+        }
+        Ok(())
+    }
+
+    fn bounded_evaluate_table_expression(
+        &self,
+        table: &TableSchema,
+        expression: &Expr,
+        rowid: i64,
+        row_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+    ) -> Result<SqliteValue> {
+        let mut expression = expression.clone();
+        if let Some(ipk_column) = rowid_alias_col_idx.and_then(|idx| table.columns.get(idx)) {
+            rewrite_rowid_aliases_in_expr(&mut expression, table, &ipk_column.name);
+        }
+
+        let mut eval_row = row_values.to_vec();
+        let mut col_map = table
+            .columns
+            .iter()
+            .map(|column| (table.name.clone(), column.name.clone(), false))
+            .collect::<Vec<_>>();
+        let shadowed_names = table
+            .columns
+            .iter()
+            .map(|column| column.name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        if ["rowid", "_rowid_", "oid"]
+            .iter()
+            .any(|alias| !shadowed_names.contains(*alias))
+        {
+            eval_row.push(SqliteValue::Integer(rowid));
+            col_map.push((table.name.clone(), "rowid".to_owned(), true));
+        }
+
+        // Reuse the authoritative expression evaluator's collation and
+        // affinity context.  A partial predicate such as
+        // `label COLLATE NOCASE = 'fire'` must be evaluated with the same
+        // comparison semantics that built the index; binary-only integrity
+        // re-evaluation otherwise falsely reports a valid database as
+        // malformed.
+        let mut column_collations = table
+            .columns
+            .iter()
+            .map(|column| column.collation.clone())
+            .collect::<Vec<_>>();
+        let mut column_affinities = table
+            .columns
+            .iter()
+            .map(|column| affinity_char_to_type(column.affinity))
+            .collect::<Vec<_>>();
+        if col_map.len() > table.columns.len() {
+            column_collations.push(None);
+            column_affinities.push(TypeAffinity::Integer);
+        }
+        let _join_eval_collation_guard =
+            JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                column_collations,
+                column_affinities,
+                // A bounded CHECK expression is evaluated against one table's
+                // row, never a join, so there are no USING/NATURAL coalesced
+                // columns to project here.
+                using_column_projections: HashMap::new(),
+                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+            });
+        eval_join_expr(&expression, &eval_row, &col_map)
+    }
+
+    fn bounded_evaluate_check_expression(
+        &self,
+        table: &TableSchema,
+        expression: &Expr,
+        rowid: i64,
+        row_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+    ) -> Result<SqliteValue> {
+        let _evaluation_budget_guard = BoundedCheckEvaluationBudgetGuard::push();
+        let _function_guard =
+            BoundedCheckFunctionRegistryGuard::push(Arc::clone(&self.func_registry.borrow()));
+        self.bounded_evaluate_table_expression(
+            table,
+            expression,
+            rowid,
+            row_values,
+            rowid_alias_col_idx,
+        )
+    }
+
     /// Refuse candidate schema shapes the bounded semantic walkers cannot
     /// prove — the structural half of the admission gate.
     ///
@@ -34420,6 +34674,54 @@ fn bounded_check_like_supported(op: &LikeOp, pattern: &Expr, escape: Option<&Exp
                     <= BOUNDED_VALIDATION_MAX_GLOB_PATTERN_CHARS
         )
 }
+
+thread_local! {
+    static CURRENT_BOUNDED_CHECK_FUNCTION_REGISTRY: RefCell<Vec<Arc<FunctionRegistry>>> = const { RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    static CURRENT_BOUNDED_CHECK_EVALUATION_BYTES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+
+struct BoundedCheckFunctionRegistryGuard;
+
+impl BoundedCheckFunctionRegistryGuard {
+    fn push(registry: Arc<FunctionRegistry>) -> Self {
+        CURRENT_BOUNDED_CHECK_FUNCTION_REGISTRY.with(|stack| stack.borrow_mut().push(registry));
+        Self
+    }
+}
+
+impl Drop for BoundedCheckFunctionRegistryGuard {
+    fn drop(&mut self) {
+        CURRENT_BOUNDED_CHECK_FUNCTION_REGISTRY.with(|stack| {
+            let _ = stack.borrow_mut().pop();
+        });
+    }
+}
+
+fn current_bounded_check_function_registry() -> Option<Arc<FunctionRegistry>> {
+    CURRENT_BOUNDED_CHECK_FUNCTION_REGISTRY.with(|stack| stack.borrow().last().cloned())
+}
+
+struct BoundedCheckEvaluationBudgetGuard;
+
+impl BoundedCheckEvaluationBudgetGuard {
+    fn push() -> Self {
+        CURRENT_BOUNDED_CHECK_EVALUATION_BYTES.with(|stack| stack.borrow_mut().push(0));
+        Self
+    }
+}
+
+impl Drop for BoundedCheckEvaluationBudgetGuard {
+    fn drop(&mut self) {
+        CURRENT_BOUNDED_CHECK_EVALUATION_BYTES.with(|stack| {
+            let _ = stack.borrow_mut().pop();
+        });
+    }
+}
+
 
 /// Where a page-ownership walk records the pages it claims.
 ///
