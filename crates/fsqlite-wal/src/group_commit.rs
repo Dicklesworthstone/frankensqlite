@@ -207,6 +207,15 @@ pub struct TransactionFrameBatch {
     /// durable freelist (the dual of resurrection: a peer's newly freed page
     /// silently dropped, leaking it as "never used").
     pub consumed_freelist_pages: Vec<u32>,
+    /// bd-r82et: the subset of `consumed_freelist_pages` that was on the
+    /// DURABLE freelist when the submitting transaction popped it — pages a
+    /// peer connection could also have observed as committed-free. Only these
+    /// are eligible for the append gate's double-consumption refusal: a page
+    /// consumed from the in-memory-only freelist (e.g. an aborted
+    /// transaction's returned EOF page) was never durably free, so no peer
+    /// can have popped it and its absence from the current durable freelist
+    /// is expected, not evidence of a conflict.
+    pub consumed_durable_freelist_pages: Vec<u32>,
 }
 
 /// WAL conflict horizon captured by a submitting transaction.
@@ -259,22 +268,27 @@ impl TransactionFrameBatch {
             published_durable_freelist: None,
             freed_pages: Vec::new(),
             consumed_freelist_pages: Vec::new(),
+            consumed_durable_freelist_pages: Vec::new(),
         }
     }
 
     /// Attach the durable-freelist publication this batch carries plus the
     /// submitting transaction's own durably freed and consumed pages
-    /// (bd-gh302/bd-0shxy).
+    /// (bd-gh302/bd-0shxy). `consumed_durable_freelist_pages` is the subset
+    /// of `consumed_freelist_pages` popped from the durable freelist
+    /// (bd-r82et) — the only pops a peer could double-consume.
     #[must_use]
     pub fn with_freelist_publication(
         mut self,
         published_durable_freelist: Option<Vec<u32>>,
         freed_pages: Vec<u32>,
         consumed_freelist_pages: Vec<u32>,
+        consumed_durable_freelist_pages: Vec<u32>,
     ) -> Self {
         self.published_durable_freelist = published_durable_freelist;
         self.freed_pages = freed_pages;
         self.consumed_freelist_pages = consumed_freelist_pages;
+        self.consumed_durable_freelist_pages = consumed_durable_freelist_pages;
         self
     }
 
