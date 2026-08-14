@@ -74256,7 +74256,12 @@ impl Connection {
         {
             dedup_value_rows(&mut all_rows);
         }
-        let mut working_set: Vec<Vec<SqliteValue>> = all_rows.clone();
+        // Frontier tracked as a half-open range `[frontier_start, all_rows.len())`
+        // into `all_rows` instead of a separately-allocated working-set Vec: every
+        // recursive row is allocated exactly once (in `all_rows`) rather than also
+        // being cloned into a working set each iteration (bd-gpi5i residual:
+        // frontier Vec/Row alloc traffic). The initial frontier is all base rows.
+        let mut frontier_start: usize = 0;
         let recursive_arms_require_temp_table = recursive_arms
             .iter()
             .any(|(_, plan)| !matches!(plan, RecursiveCteArmExecutionPlan::Direct(_)));
@@ -74276,16 +74281,18 @@ impl Connection {
 
         // Iterate: feed working set to recursive arm, collect new rows.
         for _ in 0..RECURSIVE_CTE_MAX_RECURSION {
-            if working_set.is_empty() {
+            let frontier_end = all_rows.len();
+            if frontier_start >= frontier_end {
                 break;
             }
             if recursive_arms_require_temp_table {
-                // Put only the working set in the temp table for recursive
-                // arms that still read through the ordinary query engine.
+                // Put only the working set (current frontier slice) in the temp
+                // table for recursive arms that still read through the ordinary
+                // query engine.
                 let mut db = self.db.borrow_mut();
                 if let Some(table) = db.get_table_mut(root_page) {
                     table.clear();
-                    for (i, vals) in working_set.iter().enumerate() {
+                    for (i, vals) in all_rows[frontier_start..frontier_end].iter().enumerate() {
                         table.insert_row(i as i64 + 1, vals.clone());
                     }
                 }
@@ -74296,16 +74303,20 @@ impl Connection {
             // fixed per-iteration overhead).
             let mut new_rows: Vec<Vec<SqliteValue>> = Vec::new();
             for (op, execution_plan) in &recursive_arms {
+                // Re-borrow the frontier slice per arm; each borrow ends before the
+                // `all_rows.append` below, so appending the new frontier needs no
+                // clone (bd-gpi5i: the per-iteration redundant Vec clone).
+                let working_set = &all_rows[frontier_start..frontier_end];
                 let arm_rows = match execution_plan {
                     RecursiveCteArmExecutionPlan::Direct(plan) if plan.sync_evaluable => {
                         Self::execute_recursive_cte_direct_eval_plan_sync(
                             plan,
-                            &working_set,
+                            working_set,
                             params,
                         )?
                     }
                     _ => {
-                        self.execute_recursive_cte_arm_select(execution_plan, &working_set, params)
+                        self.execute_recursive_cte_arm_select(execution_plan, working_set, params)
                             .await?
                     }
                 };
@@ -74331,17 +74342,21 @@ impl Connection {
             if new_rows.is_empty() {
                 break;
             }
-            all_rows.extend(new_rows.iter().cloned());
-            working_set = new_rows;
+            // Move the new rows into `all_rows` (no per-row clone) and advance the
+            // frontier window to the just-appended tail.
+            frontier_start = all_rows.len();
+            all_rows.append(&mut new_rows);
         }
 
-        // Final: populate temp table with ALL accumulated rows.
+        // Final: populate temp table with ALL accumulated rows. `all_rows` is not
+        // read after this, so move each row into the temp table instead of cloning
+        // (bd-gpi5i: drops one O(total-rows) clone pass from the materialization).
         {
             let mut db = self.db.borrow_mut();
             if let Some(table) = db.get_table_mut(root_page) {
                 table.clear();
-                for (i, vals) in all_rows.iter().enumerate() {
-                    table.insert_row(i as i64 + 1, vals.clone());
+                for (i, vals) in all_rows.into_iter().enumerate() {
+                    table.insert_row(i as i64 + 1, vals);
                 }
             }
         }
