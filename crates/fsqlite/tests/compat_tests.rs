@@ -3184,3 +3184,81 @@ fn without_rowid_desc_primary_key_orders_scan_and_file() {
         );
     });
 }
+
+/// bd-0te6s (GH#237/#238): `temp.sqlite_master` and the `sqlite_temp_master`
+/// alias must expose the TEMP catalog (temp tables, views, and triggers),
+/// while main-qualified and unqualified `sqlite_master` stay main-only.
+/// Before the fix, `temp.sqlite_master` collapsed to the main catalog and
+/// the alias errored with "no such table".
+#[test]
+fn temp_sqlite_master_exposes_temp_catalog_and_alias() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE mt(a)").await.unwrap();
+        conn.execute("CREATE TEMP TABLE tt(b)").await.unwrap();
+        conn.execute("CREATE TEMP TRIGGER trg AFTER INSERT ON tt BEGIN SELECT 1; END")
+            .await
+            .unwrap();
+        conn.execute("CREATE TEMP VIEW tv AS SELECT * FROM tt")
+            .await
+            .unwrap();
+
+        let type_name_rows = |rows: &[fsqlite::Row]| -> Vec<(String, String)> {
+            rows.iter()
+                .map(|row| match (&row.values()[0], &row.values()[1]) {
+                    (SqliteValue::Text(t), SqliteValue::Text(n)) => (t.to_string(), n.to_string()),
+                    other => panic!("unexpected catalog row {other:?}"),
+                })
+                .collect()
+        };
+
+        let expected_temp = vec![
+            ("trigger".to_owned(), "trg".to_owned()),
+            ("table".to_owned(), "tt".to_owned()),
+            ("view".to_owned(), "tv".to_owned()),
+        ];
+        for catalog in ["temp.sqlite_master", "sqlite_temp_master"] {
+            let rows = conn
+                .query(&format!("SELECT type, name FROM {catalog} ORDER BY name"))
+                .await
+                .unwrap();
+            assert_eq!(
+                type_name_rows(&rows),
+                expected_temp,
+                "{catalog} must list exactly the TEMP objects"
+            );
+        }
+
+        for catalog in ["main.sqlite_master", "sqlite_master"] {
+            let rows = conn
+                .query(&format!("SELECT type, name FROM {catalog} ORDER BY name"))
+                .await
+                .unwrap();
+            assert_eq!(
+                type_name_rows(&rows),
+                vec![("table".to_owned(), "mt".to_owned())],
+                "{catalog} must stay main-only"
+            );
+        }
+
+        // Oracle parity: stock sqlite3 on the identical script and queries.
+        let oracle = RusqliteConnection::open_in_memory().unwrap();
+        oracle
+            .execute_batch(
+                "CREATE TABLE mt(a); CREATE TEMP TABLE tt(b); \
+                 CREATE TEMP TRIGGER trg AFTER INSERT ON tt BEGIN SELECT 1; END; \
+                 CREATE TEMP VIEW tv AS SELECT * FROM tt;",
+            )
+            .unwrap();
+        for catalog in ["temp.sqlite_master", "sqlite_temp_master"] {
+            let oracle_rows: Vec<(String, String)> = oracle
+                .prepare(&format!("SELECT type, name FROM {catalog} ORDER BY name"))
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(oracle_rows, expected_temp, "oracle disagrees on {catalog}");
+        }
+    });
+}
