@@ -228936,6 +228936,108 @@ mod pager_routing_tests {
         });
     }
 
+    /// A persisted trigger whose WHEN clause and body stay inside the admitted
+    /// fragment must not block validation.
+    ///
+    /// This is the positive half of trigger admissibility. Without it, a gate
+    /// that refused *every* trigger would pass the negative test below and look
+    /// correct while making the validator useless on any real schema.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_admits_a_deterministic_trigger() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let image_path = dir.path().join("trig-ok.db");
+            let receipt = build_self_contained_image(
+                &dir.path().join("trig-ok-builder.db"),
+                &image_path,
+                &[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT);",
+                    "CREATE TABLE audit (id INTEGER PRIMARY KEY, tag TEXT);",
+                    "CREATE TRIGGER t_ins AFTER INSERT ON t WHEN NEW.tag IS NOT NULL \
+                     BEGIN INSERT INTO audit(id, tag) VALUES (NEW.id, NEW.tag); END;",
+                    "INSERT INTO t VALUES (1, 'alpha');",
+                ],
+            )
+            .await;
+
+            let owner = Connection::open(
+                dir.path().join("trig-ok-owner.db").to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            let snapshot = owner
+                .begin_bounded_structural_snapshot(&receipt, &image_path, 256)
+                .await
+                .expect("snapshot opens");
+            let stats = snapshot
+                .connection()
+                .validate_database_integrity_bounded(dir.path())
+                .await;
+            assert!(
+                stats.is_ok(),
+                "a deterministic trigger must not make an image inadmissible: {stats:?}"
+            );
+            snapshot.finish().await.expect("recertify");
+        });
+    }
+
+    /// A persisted trigger whose WHEN clause calls a NONDETERMINISTIC function
+    /// must make the image inadmissible, naming the trigger.
+    ///
+    /// This is the upstream verdict that lets HFDT's
+    /// SEC_XBRL_0117_INADMISSIBLE_TRIGGERS workaround be deleted (hfdt-wkcxd):
+    /// trigger admissibility becomes a typed refusal crossing the bridge rather
+    /// than something the caller has to decide by parsing SQL itself.
+    ///
+    /// `random()` is the case that matters: a bounded proof recomputes rows and
+    /// compares them against what is persisted, and a trigger whose firing
+    /// condition changes between evaluations cannot be reconciled at all.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_refuses_a_nondeterministic_trigger() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let image_path = dir.path().join("trig-bad.db");
+            let receipt = build_self_contained_image(
+                &dir.path().join("trig-bad-builder.db"),
+                &image_path,
+                &[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT);",
+                    "CREATE TABLE audit (id INTEGER PRIMARY KEY, tag TEXT);",
+                    "CREATE TRIGGER t_rand AFTER INSERT ON t WHEN random() > 0 \
+                     BEGIN INSERT INTO audit(id, tag) VALUES (NEW.id, NEW.tag); END;",
+                    "INSERT INTO t VALUES (1, 'alpha');",
+                ],
+            )
+            .await;
+
+            let owner = Connection::open(
+                dir.path().join("trig-bad-owner.db").to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            let snapshot = owner
+                .begin_bounded_structural_snapshot(&receipt, &image_path, 256)
+                .await
+                .expect("STRUCTURE is sound, so the snapshot must still open");
+
+            let outcome = snapshot
+                .connection()
+                .validate_database_integrity_bounded(dir.path())
+                .await;
+            let error = outcome.expect_err("a nondeterministic trigger must be refused");
+            // Must be the admission gate refusing, not a concordance failure:
+            // the image is perfectly concordant, it is simply not provable.
+            assert!(
+                matches!(&error, FrankenError::NotImplemented(detail)
+                    if detail.contains("trigger")),
+                "expected a NotImplemented naming the trigger, got {error:?}"
+            );
+            snapshot.finish().await.ok();
+        });
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn bounded_structural_validation_refuses_a_symlinked_spool_parent() {
