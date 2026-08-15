@@ -26768,6 +26768,37 @@ fn emit_having_expr(
             b.free_temp(left_reg);
         }
 
+        // GH #225: `x IS [NOT] NULL` in HAVING must evaluate its operand through
+        // the HAVING resolver (so a bare column resolves to its captured first-row
+        // aggregate register) rather than the raw evaluator, which would leave the
+        // column NULL and wrongly satisfy `IS NULL`.
+        Expr::IsNull {
+            expr: inner, not, ..
+        } => {
+            let val_reg = b.alloc_temp();
+            emit_having_expr(
+                b,
+                inner,
+                val_reg,
+                output_cols,
+                agg_columns,
+                group_by_keys,
+                table,
+                out_regs,
+            );
+            let is_null_lbl = b.emit_label();
+            let done_lbl = b.emit_label();
+            b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, is_null_lbl, P4::None, 0);
+            // Operand is non-NULL: `IS NULL` -> 0, `IS NOT NULL` -> 1.
+            b.emit_op(Opcode::Integer, i32::from(*not), dest_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_lbl, P4::None, 0);
+            b.resolve_label(is_null_lbl);
+            // Operand is NULL: `IS NULL` -> 1, `IS NOT NULL` -> 0.
+            b.emit_op(Opcode::Integer, i32::from(!*not), dest_reg, 0, P4::None, 0);
+            b.resolve_label(done_lbl);
+            b.free_temp(val_reg);
+        }
+
         // For any other expression, delegate to the standard evaluator.
         _ => {
             emit_expr(b, expr, dest_reg, None);
