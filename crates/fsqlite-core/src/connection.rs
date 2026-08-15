@@ -13675,7 +13675,7 @@ impl Connection {
         root: BoundedCollationAstNode<'_>,
         object_name: &str,
     ) -> Result<()> {
-        match first_unsupported_bounded_ast(root, false, None, None, false) {
+        match first_unsupported_bounded_ast(root, false, None, None, BoundedSchemaExpressionRole::Unrestricted) {
             Ok(None) => Ok(()),
             Ok(Some(unsupported)) => Err(Self::bounded_ast_unsupported_refusal(
                 object_name,
@@ -13698,7 +13698,7 @@ impl Connection {
         &self,
         root: BoundedCollationAstNode<'_>,
         object_name: &str,
-        reject_schema_expression_shapes: bool,
+        expression_role: BoundedSchemaExpressionRole,
     ) -> Result<()> {
         let registry = self.func_registry.borrow();
         let supported_function = |name: &str, args: &FunctionArgs, decorated: bool| {
@@ -13707,7 +13707,7 @@ impl Connection {
         self.validate_bounded_ast_semantics_with_function_policy(
             root,
             object_name,
-            reject_schema_expression_shapes,
+            expression_role,
             &supported_function,
             None,
         )
@@ -13717,7 +13717,7 @@ impl Connection {
         &self,
         root: BoundedCollationAstNode<'_>,
         object_name: &str,
-        reject_schema_expression_shapes: bool,
+        expression_role: BoundedSchemaExpressionRole,
         supported_function: &dyn Fn(&str, &FunctionArgs, bool) -> bool,
         supported_like: Option<&dyn Fn(&LikeOp, &Expr, Option<&Expr>) -> bool>,
     ) -> Result<()> {
@@ -13726,7 +13726,7 @@ impl Connection {
             true,
             Some(supported_function),
             supported_like,
-            reject_schema_expression_shapes,
+            expression_role,
         ) {
             Ok(None) => Ok(()),
             Ok(Some(unsupported)) => Err(Self::bounded_ast_unsupported_refusal(
@@ -13761,7 +13761,7 @@ impl Connection {
         self.validate_bounded_ast_semantics(
             BoundedCollationAstNode::Expr(&expression),
             object_name,
-            true,
+            BoundedSchemaExpressionRole::Evaluated,
         )
     }
 
@@ -13786,7 +13786,7 @@ impl Connection {
         self.validate_bounded_ast_semantics_with_function_policy(
             BoundedCollationAstNode::Expr(&expression),
             object_name,
-            true,
+            BoundedSchemaExpressionRole::Evaluated,
             &supported_function,
             Some(&bounded_check_like_supported),
         )
@@ -15146,7 +15146,7 @@ impl Connection {
             self.validate_bounded_ast_semantics(
                 BoundedCollationAstNode::Select(&view.query),
                 &format!("view `{}`", view.name),
-                true,
+                BoundedSchemaExpressionRole::Unevaluated,
             )?;
         }
         for trigger in self
@@ -15159,14 +15159,14 @@ impl Connection {
                 self.validate_bounded_ast_semantics(
                     BoundedCollationAstNode::Expr(when_clause),
                     &format!("WHEN clause of trigger `{}`", trigger.name),
-                    true,
+                    BoundedSchemaExpressionRole::Unevaluated,
                 )?;
             }
             for statement in &trigger.body {
                 self.validate_bounded_ast_semantics(
                     BoundedCollationAstNode::Statement(statement),
                     &format!("body of trigger `{}`", trigger.name),
-                    true,
+                    BoundedSchemaExpressionRole::Unevaluated,
                 )?;
             }
         }
@@ -35958,12 +35958,70 @@ enum BoundedAstUnsupported {
     Statement(&'static str),
 }
 
+/// Which shape refusals apply to a persisted expression, by the role that
+/// expression plays in the image.
+///
+/// This replaced a single `reject_schema_expression_shapes: bool`. The boolean
+/// could only say "restrict everything" or "restrict nothing", so a construct
+/// that is unsafe in one role and inert in another had to be refused in both.
+///
+/// The distinction that matters is whether the bounded pass **evaluates** the
+/// expression. [`BoundedDatabaseValidationStats`] is the contract: it counts
+/// `check_constraint_evaluations`, table rows, foreign keys and index entries,
+/// and has no trigger or view counter — `validate_database_integrity_bounded`
+/// never fires a trigger or materializes a view. Their expressions are
+/// admitted for shape and then never used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedSchemaExpressionRole {
+    /// No shape restrictions. Used by the collation-rendering budget walk,
+    /// which asks only whether the AST can be rendered within its limits.
+    Unrestricted,
+    /// A CHECK constraint or column default: the bounded evaluator recomputes
+    /// this expression against real rows, so every shape it cannot reproduce
+    /// exactly must be refused. This is the historical `true` behaviour and is
+    /// unchanged.
+    Evaluated,
+    /// A trigger body, trigger WHEN clause, or view query: admitted for shape
+    /// and never evaluated by the bounded pass.
+    ///
+    /// Shapes are still refused here by default. The exception is a terminal
+    /// action with no value semantics, which cannot participate in any
+    /// reproduction the pass performs because the pass performs none — see
+    /// [`Self::rejects_terminal_actions`].
+    Unevaluated,
+}
+
+impl BoundedSchemaExpressionRole {
+    /// Whether shapes outside the reproducible fragment are refused.
+    ///
+    /// True for both restricted roles. Admitting a subquery, bind parameter,
+    /// JSON access or row-value here would retire a real protection, so this
+    /// stays uniform until each is argued individually. In particular the
+    /// subquery refusal is deliberately NOT relaxed for [`Self::Unevaluated`]:
+    /// unlike a terminal action, a subquery carries an arbitrary sub-AST, and
+    /// admitting it needs a node/depth budget argument that has not been made.
+    const fn rejects_shapes(self) -> bool {
+        !matches!(self, Self::Unrestricted)
+    }
+
+    /// Whether a terminal action such as `RAISE(ABORT, ...)` is refused.
+    ///
+    /// `RAISE` yields no value and has no children; the walker's arm for it is
+    /// already a no-op when refusals are off. In an [`Self::Evaluated`]
+    /// expression it is still refused, because the evaluator would have to
+    /// produce a value for it. In an [`Self::Unevaluated`] one nothing ever
+    /// asks it for a value, so refusing it guards no invariant.
+    const fn rejects_terminal_actions(self) -> bool {
+        matches!(self, Self::Evaluated)
+    }
+}
+
 fn first_unsupported_bounded_ast(
     root: BoundedCollationAstNode<'_>,
     reject_custom_collations: bool,
     supported_function: Option<&dyn Fn(&str, &FunctionArgs, bool) -> bool>,
     supported_like: Option<&dyn Fn(&LikeOp, &Expr, Option<&Expr>) -> bool>,
-    reject_schema_expression_shapes: bool,
+    expression_role: BoundedSchemaExpressionRole,
 ) -> std::result::Result<Option<BoundedAstUnsupported>, BoundedCollationTraversalLimit> {
     let mut pending = vec![(root, 0_usize)];
     let mut visited = 0_usize;
@@ -36186,14 +36244,17 @@ fn first_unsupported_bounded_ast(
                 }
                 Expr::Column(_, _) => {}
                 Expr::Raise { .. } => {
-                    if reject_schema_expression_shapes {
+                    // GH #340 follow-up: a terminal action, admitted in roles
+                    // the bounded pass never evaluates. Still refused inside an
+                    // evaluated expression.
+                    if expression_role.rejects_terminal_actions() {
                         return Ok(Some(BoundedAstUnsupported::Shape(
                             "RAISE expression in persisted schema expression",
                         )));
                     }
                 }
                 Expr::Placeholder(_, _) => {
-                    if reject_schema_expression_shapes {
+                    if expression_role.rejects_shapes() {
                         return Ok(Some(BoundedAstUnsupported::Shape(
                             "bind parameter in persisted schema expression",
                         )));
@@ -36265,7 +36326,7 @@ fn first_unsupported_bounded_ast(
                             }
                         }
                         InSet::Subquery(select) => {
-                            if reject_schema_expression_shapes {
+                            if expression_role.rejects_shapes() {
                                 return Ok(Some(BoundedAstUnsupported::Shape(
                                     "subquery in persisted schema expression",
                                 )));
@@ -36273,7 +36334,7 @@ fn first_unsupported_bounded_ast(
                             pending.push((BoundedCollationAstNode::Select(select), child_depth));
                         }
                         InSet::Table(_) => {
-                            if reject_schema_expression_shapes {
+                            if expression_role.rejects_shapes() {
                                 return Ok(Some(BoundedAstUnsupported::Shape(
                                     "table shorthand in persisted schema IN expression",
                                 )));
@@ -36320,7 +36381,7 @@ fn first_unsupported_bounded_ast(
                     }
                 }
                 Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
-                    if reject_schema_expression_shapes {
+                    if expression_role.rejects_shapes() {
                         return Ok(Some(BoundedAstUnsupported::Shape(
                             "subquery in persisted schema expression",
                         )));
@@ -36361,7 +36422,7 @@ fn first_unsupported_bounded_ast(
                     }
                 }
                 Expr::JsonAccess { expr, path, .. } => {
-                    if reject_schema_expression_shapes {
+                    if expression_role.rejects_shapes() {
                         return Ok(Some(BoundedAstUnsupported::Shape(
                             "JSON access in persisted schema expression",
                         )));
@@ -36370,7 +36431,7 @@ fn first_unsupported_bounded_ast(
                     pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
                 }
                 Expr::RowValue(expressions, _) => {
-                    if reject_schema_expression_shapes {
+                    if expression_role.rejects_shapes() {
                         return Ok(Some(BoundedAstUnsupported::Shape(
                             "row-value expression in persisted schema expression",
                         )));
@@ -231627,6 +231688,124 @@ mod pager_routing_tests {
         )
         .await;
         (image_path, receipt)
+    }
+
+    /// GH #340 follow-up: an append-only guard trigger using `RAISE(ABORT, ...)`
+    /// must be ADMITTED by bounded whole-image validation.
+    ///
+    /// `RAISE` is a terminal action with no value semantics, and the bounded
+    /// pass never evaluates a trigger body — `BoundedDatabaseValidationStats`
+    /// counts CHECK evaluations, table rows, foreign keys and index entries,
+    /// and has no trigger counter. Refusing this shape guarded nothing while
+    /// blocking every schema built on append-only guards.
+    ///
+    /// This is the test that fails if the terminal-action carve-out is removed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_admits_a_raise_guard_trigger() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let image_path = dir.path().join("raise-guard.db");
+            let receipt = build_self_contained_image(
+                &dir.path().join("raise-guard-builder.db"),
+                &image_path,
+                &[
+                    "CREATE TABLE audit_log (id INTEGER PRIMARY KEY, note TEXT NOT NULL);",
+                    "INSERT INTO audit_log VALUES (1, 'first');",
+                    // The exact shape the real client schema is built on.
+                    "CREATE TRIGGER trg_audit_log_no_update BEFORE UPDATE ON audit_log \
+                     BEGIN SELECT RAISE(ABORT, 'audit_log append-only: UPDATE refused'); END;",
+                    "CREATE TRIGGER trg_audit_log_no_delete BEFORE DELETE ON audit_log \
+                     BEGIN SELECT RAISE(ABORT, 'audit_log append-only: DELETE refused'); END;",
+                ],
+            )
+            .await;
+
+            let owner = Connection::open(
+                dir.path()
+                    .join("raise-guard-owner.db")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap();
+            let snapshot = owner
+                .begin_bounded_structural_snapshot(&receipt, &image_path, 256)
+                .await
+                .expect("the image opens a snapshot");
+            let stats = snapshot
+                .connection()
+                .validate_database_integrity_bounded(dir.path())
+                .await
+                .expect(
+                    "a RAISE(ABORT) guard trigger must be admitted: the bounded pass never \
+                     evaluates a trigger body, so refusing the shape guards nothing",
+                );
+            assert!(
+                stats.table_rows_checked >= 1,
+                "the proof must still do real work, got {stats:?}"
+            );
+        });
+    }
+
+    /// GH #340 follow-up, the other half of the split: `RAISE` inside an
+    /// EVALUATED expression is still refused.
+    ///
+    /// A CHECK constraint IS recomputed by the bounded evaluator, which would
+    /// have to produce a value for a construct that has none. The carve-out is
+    /// scoped to roles the pass never evaluates; this proves it did not leak
+    /// into the CHECK path.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_still_refuses_raise_inside_a_check_constraint() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let error = conn
+                .validate_bounded_check_expression_in_sql(
+                    "CASE WHEN id > 0 THEN 1 ELSE RAISE(ABORT, 'bad') END",
+                    "CHECK constraint 1 on table `t`",
+                )
+                .expect_err("RAISE in an evaluated CHECK expression must stay refused");
+            let message = error.to_string();
+            assert!(
+                message.contains("RAISE expression in persisted schema expression"),
+                "expected the RAISE shape refusal, got {message}"
+            );
+        });
+    }
+
+    /// GH #340 follow-up: the carve-out is TERMINAL ACTIONS ONLY.
+    ///
+    /// A subquery in a trigger WHEN clause carries an arbitrary sub-AST, so
+    /// admitting it needs a node/depth budget argument that has not been made.
+    /// It stays refused even in the unevaluated role. This test exists to make
+    /// widening the carve-out a deliberate, visible act rather than a silent
+    /// side effect of touching the policy.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_still_refuses_a_subquery_in_an_unevaluated_role() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let when_clause = fsqlite_parser::expr::parse_expr(
+                "EXISTS (SELECT 1 FROM audit_log AS existing WHERE existing.id = NEW.id)",
+            )
+            .expect("the WHEN clause parses");
+            let error = conn
+                .validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Expr(&when_clause),
+                    "WHEN clause of trigger `trg_probe`",
+                    BoundedSchemaExpressionRole::Unevaluated,
+                )
+                .expect_err(
+                    "a subquery must stay refused in the unevaluated role until its \
+                     node/depth budget is established",
+                );
+            let message = error.to_string();
+            assert!(
+                message.contains("subquery in persisted schema expression"),
+                "expected the subquery shape refusal, got {message}"
+            );
+        });
     }
 
     /// A healthy image passes the full semantic proof, and the stats report the
