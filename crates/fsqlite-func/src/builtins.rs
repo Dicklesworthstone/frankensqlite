@@ -50,6 +50,32 @@ thread_local! {
     /// and other LIKE evaluation paths so the pragma never has to be threaded
     /// through every call site.
     static CASE_SENSITIVE_LIKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The `'now'` Julian-day value captured once for the statement currently
+    /// executing on this thread. C SQLite reads the wall clock exactly once per
+    /// `sqlite3_step()` and reuses it for every `'now'`/`CURRENT_*` within that
+    /// statement, so `julianday('now')` is stable across the rows a single
+    /// statement produces. `None` means "not captured yet this statement"; the
+    /// Connection resets it to `None` at each statement start (see
+    /// `sync_change_tracking_context`) and the datetime path captures it lazily
+    /// on the first `'now'` use.
+    static STATEMENT_NOW: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Reset the captured statement `'now'` (called by the Connection at each
+/// statement start so the next statement re-reads the wall clock).
+pub fn reset_statement_now() {
+    STATEMENT_NOW.set(None);
+}
+
+/// The `'now'` value already captured for the current statement, if any.
+#[must_use]
+pub fn statement_now() -> Option<f64> {
+    STATEMENT_NOW.with(std::cell::Cell::get)
+}
+
+/// Record the statement `'now'` captured on its first use this statement.
+pub fn set_statement_now(now_jdn: f64) {
+    STATEMENT_NOW.set(Some(now_jdn));
 }
 
 /// Set the active `case_sensitive_like` flag for LIKE evaluation on this thread

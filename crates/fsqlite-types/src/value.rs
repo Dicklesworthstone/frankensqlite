@@ -960,6 +960,17 @@ impl SqliteValue {
             StrictColumnType::Any => Ok(self),
             StrictColumnType::Integer => match self {
                 Self::Integer(_) => Ok(self),
+                // GH #163: STRICT accepts a TEXT value that losslessly converts
+                // to the column's declared type (stock sqlite3 STRICT). For an
+                // INTEGER column only text parsing to an integer qualifies —
+                // '1.5' or 'abc' stay a type error.
+                Self::Text(s) => match try_coerce_text_to_numeric(s.as_str()) {
+                    Some(v @ Self::Integer(_)) => Ok(v),
+                    _ => Err(StrictTypeError {
+                        expected: col_type,
+                        actual: StorageClass::Text,
+                    }),
+                },
                 other => Err(StrictTypeError {
                     expected: col_type,
                     actual: other.storage_class(),
@@ -968,6 +979,16 @@ impl SqliteValue {
             StrictColumnType::Real => match self {
                 Self::Float(_) => Ok(self),
                 Self::Integer(i) => Ok(Self::Float(i as f64)),
+                // GH #163: numeric-looking TEXT losslessly converts into a REAL
+                // column (integer text promotes to float).
+                Self::Text(s) => match try_coerce_text_to_numeric(s.as_str()) {
+                    Some(Self::Integer(i)) => Ok(Self::Float(i as f64)),
+                    Some(v @ Self::Float(_)) => Ok(v),
+                    _ => Err(StrictTypeError {
+                        expected: col_type,
+                        actual: StorageClass::Text,
+                    }),
+                },
                 other => Err(StrictTypeError {
                     expected: col_type,
                     actual: other.storage_class(),
