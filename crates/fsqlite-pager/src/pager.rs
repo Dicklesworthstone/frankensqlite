@@ -11750,6 +11750,13 @@ pub struct SimplePager<V: Vfs> {
     write_set_high_water_pages: Arc<AtomicUsize>,
     /// Pre-admission cap refusals since the ceiling was installed.
     write_set_cap_refusals: Arc<AtomicU64>,
+    /// Serializes ceiling-window replacement with telemetry snapshots.
+    ///
+    /// Transaction-local dirty sets cannot be rebased from the pager, so a
+    /// replacement is admitted only while the pager is quiescent. This gate
+    /// then prevents observers from combining the old limit with freshly
+    /// reset counters (or vice versa).
+    write_set_stats_window_gate: Mutex<()>,
     /// Shared page buffer pool cloned into transactions for write staging.
     pool: PageBufPool,
     /// Published metadata/page plane for lock-light steady-state reads.
@@ -14296,11 +14303,28 @@ where
     ///
     /// `0` clears it. Used by the reserved schema-only builder create path so a
     /// private build cannot rewrite more of the image than the caller budgeted.
-    pub fn set_write_set_page_limit(&self, page_limit: usize) {
-        // Disable reporting before clearing the counters so a concurrent
-        // observer cannot mistake a partially reset window for new evidence.
-        self.write_set_page_limit
-            .store(0, AtomicOrdering::Relaxed);
+    /// Replacing the ceiling starts a fresh telemetry window and is therefore
+    /// refused while any transaction is active: the pager cannot honestly
+    /// reset a transaction-local accounted page set through this shared handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::Busy`] when a transaction is active.
+    pub fn set_write_set_page_limit(&self, page_limit: usize) -> Result<()> {
+        // Keep the same gate -> PagerInner lock order as `write_set_stats`,
+        // whose page-size read also takes PagerInner.
+        let _window_gate = self
+            .write_set_stats_window_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        if inner.active_transactions != 0 {
+            return Err(FrankenError::Busy);
+        }
+        self.write_set_page_limit.store(0, AtomicOrdering::Relaxed);
         self.write_set_current_pages
             .store(0, AtomicOrdering::Relaxed);
         self.write_set_high_water_pages
@@ -14309,6 +14333,8 @@ where
             .store(0, AtomicOrdering::Relaxed);
         self.write_set_page_limit
             .store(page_limit, AtomicOrdering::Relaxed);
+        drop(inner);
+        Ok(())
     }
 
     /// Dirty-write-set accounting since the ceiling was installed, when one is
@@ -14319,13 +14345,19 @@ where
     /// written" rather than "nothing was bounded".
     #[must_use]
     pub fn write_set_stats(&self) -> Option<WriteSetStats> {
+        let _window_gate = self
+            .write_set_stats_window_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let page_limit = self.write_set_page_limit.load(AtomicOrdering::Relaxed);
         if page_limit == 0 {
             return None;
         }
         let page_size = self.page_size().as_usize();
         let current_dirty_pages = self.write_set_current_pages.load(AtomicOrdering::Relaxed);
-        let dirty_pages_high_water = self.write_set_high_water_pages.load(AtomicOrdering::Relaxed);
+        let dirty_pages_high_water = self
+            .write_set_high_water_pages
+            .load(AtomicOrdering::Relaxed);
         Some(WriteSetStats {
             page_limit,
             byte_limit: page_limit.saturating_mul(page_size),
@@ -16077,6 +16109,7 @@ where
             write_set_current_pages: Arc::new(AtomicUsize::new(0)),
             write_set_high_water_pages: Arc::new(AtomicUsize::new(0)),
             write_set_cap_refusals: Arc::new(AtomicU64::new(0)),
+            write_set_stats_window_gate: Mutex::new(()),
             pool,
             published: Arc::new(PublishedPagerState::new(
                 db_size,
@@ -16489,6 +16522,7 @@ where
             write_set_current_pages: Arc::new(AtomicUsize::new(0)),
             write_set_high_water_pages: Arc::new(AtomicUsize::new(0)),
             write_set_cap_refusals: Arc::new(AtomicU64::new(0)),
+            write_set_stats_window_gate: Mutex::new(()),
             pool,
             published: Arc::new(PublishedPagerState::new(
                 db_size,
@@ -21333,7 +21367,9 @@ where
         let admitted = self.accounted_write_pages.len();
         self.write_set_current_pages
             .store(admitted, AtomicOrdering::Relaxed);
-        let mut high = self.write_set_high_water_pages.load(AtomicOrdering::Relaxed);
+        let mut high = self
+            .write_set_high_water_pages
+            .load(AtomicOrdering::Relaxed);
         while admitted > high {
             match self.write_set_high_water_pages.compare_exchange_weak(
                 high,
@@ -21349,10 +21385,8 @@ where
 
     fn remove_staged_write_set_page(&mut self, page_no: PageNumber) {
         if self.accounted_write_pages.remove(&page_no) {
-            self.write_set_current_pages.store(
-                self.accounted_write_pages.len(),
-                AtomicOrdering::Relaxed,
-            );
+            self.write_set_current_pages
+                .store(self.accounted_write_pages.len(), AtomicOrdering::Relaxed);
         }
     }
 
@@ -21854,6 +21888,10 @@ where
                 return Ok(());
             }
 
+            // Admission must precede every transaction-bookkeeping mutation.
+            // In particular, a refused write of a page already marked free
+            // must not silently undo that free.
+            let account_page = self.admit_new_write_set_page(page_no)?;
             let staged = StagedPage::from_page_data_with_cache_recovery(
                 &self.pool,
                 &self.cache,
@@ -21864,10 +21902,12 @@ where
             self.remove_freed_page_if_present(page_no);
             if let Some(existing) = self.write_set.get_mut(&page_no) {
                 *existing = staged;
+                if account_page {
+                    self.record_staged_write_set_page(page_no);
+                }
                 return Ok(());
             }
 
-            let account_page = self.admit_new_write_set_page(page_no)?;
             insert_staged_page(
                 &mut self.write_set,
                 &mut self.write_pages_sorted,
@@ -22286,7 +22326,7 @@ where
                 debug_assert!(!notify_writer_idle);
                 drop(inner);
                 self.committed = true;
-            self.reclaimed_abandoned_reservations.clear();
+                self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
                 self.reset_current_write_set_accounting();
                 self.finished = true;
@@ -22358,7 +22398,7 @@ where
                     self.writer_idle.notify_one();
                 }
                 self.committed = true;
-            self.reclaimed_abandoned_reservations.clear();
+                self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
                 self.reset_current_write_set_accounting();
                 self.finished = true;
@@ -22950,7 +22990,7 @@ where
                     // in-memory metadata application are both recorded. A
                     // dropped future must finish logical exit as a commit.
                     self.committed = true;
-            self.reclaimed_abandoned_reservations.clear();
+                    self.reclaimed_abandoned_reservations.clear();
                 }
                 let t_file_size_start = pager_commit_profile_start(pager_commit_profile_active);
                 if self.memory_db_bump_alloc {
@@ -23116,7 +23156,7 @@ where
                     self.rollback_commit_finalization_pending = false;
                 }
                 self.committed = true;
-            self.reclaimed_abandoned_reservations.clear();
+                self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
                 self.reset_current_write_set_accounting();
                 self.finished = true;
@@ -24043,10 +24083,7 @@ where
                             .abandoned_eof_reservations
                             .append(&mut self.allocated_from_eof);
                     } else {
-                        return_pages_to_freelist(
-                            &mut inner.freelist,
-                            self.page_lease.drain(..),
-                        );
+                        return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
                         return_pages_to_freelist(
                             &mut inner.freelist,
                             self.allocated_from_eof.drain(..),
@@ -24250,10 +24287,8 @@ where
         self.write_set = new_write_set;
         self.write_pages_sorted = write_pages_sorted_snapshot;
         self.accounted_write_pages = accounted_write_pages_snapshot;
-        self.write_set_current_pages.store(
-            self.accounted_write_pages.len(),
-            AtomicOrdering::Relaxed,
-        );
+        self.write_set_current_pages
+            .store(self.accounted_write_pages.len(), AtomicOrdering::Relaxed);
         if snapshot_was_empty {
             self.writes_observed = false;
         }
@@ -25862,7 +25897,9 @@ mod tests {
                     pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
                 }
                 assert_eq!(pager.journal_mode(), journal_mode);
-                pager.set_write_set_page_limit(4);
+                pager
+                    .set_write_set_page_limit(4)
+                    .expect("install write-set ceiling");
 
                 let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
                 let dirty_page = PageNumber::ONE;
@@ -25917,9 +25954,7 @@ mod tests {
                 assert!(txn.write_set.is_empty());
                 assert!(txn.write_pages_sorted.is_empty());
                 assert!(!txn.has_pending_writes());
-                let stats = pager
-                    .write_set_stats()
-                    .expect("configured write-set stats");
+                let stats = pager.write_set_stats().expect("configured write-set stats");
                 assert_eq!(
                     (stats.current_dirty_pages, stats.dirty_pages_high_water),
                     (0, 0),
@@ -31400,7 +31435,9 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = test_pager().await;
             let cx = Cx::new();
-            pager.set_write_set_page_limit(3);
+            pager
+                .set_write_set_page_limit(3)
+                .expect("install write-set ceiling");
 
             let initial = pager.write_set_stats().expect("configured stats");
             assert_eq!(initial.current_dirty_pages, 0);
@@ -31457,7 +31494,9 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = test_pager().await;
             let cx = Cx::new();
-            pager.set_write_set_page_limit(3);
+            pager
+                .set_write_set_page_limit(3)
+                .expect("install write-set ceiling");
 
             let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
             let first_page = txn.allocate_page(&cx).await.unwrap();
@@ -31523,7 +31562,9 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = test_pager().await;
             let cx = Cx::new();
-            pager.set_write_set_page_limit(1);
+            pager
+                .set_write_set_page_limit(1)
+                .expect("install write-set ceiling");
 
             let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
             let first_page = txn.allocate_page(&cx).await.unwrap();
@@ -31532,8 +31573,7 @@ mod tests {
                 .unwrap();
             let refused_page = txn.allocate_page(&cx).await.unwrap();
             assert!(matches!(
-                txn.write_page(&cx, refused_page, &sample_page(0x52))
-                    .await,
+                txn.write_page(&cx, refused_page, &sample_page(0x52)).await,
                 Err(FrankenError::OutOfRange { .. })
             ));
             assert!(
@@ -31563,12 +31603,87 @@ mod tests {
             assert_eq!(dropped.dirty_pages_high_water, 1);
             assert_eq!(dropped.cap_refusals, 1);
 
-            pager.set_write_set_page_limit(4);
+            pager
+                .set_write_set_page_limit(4)
+                .expect("reinstall write-set ceiling while quiescent");
             let reinstalled = pager.write_set_stats().expect("configured stats");
             assert_eq!(reinstalled.page_limit, 4);
             assert_eq!(reinstalled.current_dirty_pages, 0);
             assert_eq!(reinstalled.dirty_pages_high_water, 0);
             assert_eq!(reinstalled.cap_refusals, 0);
+        });
+    }
+
+    #[test]
+    fn write_set_ceiling_reinstall_refuses_a_live_transaction() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            pager
+                .set_write_set_page_limit(1)
+                .expect("install write-set ceiling");
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, page, &sample_page(0x61)).await.unwrap();
+            let before = pager.write_set_stats().expect("configured stats");
+
+            assert!(matches!(
+                pager.set_write_set_page_limit(2),
+                Err(FrankenError::Busy)
+            ));
+            assert_eq!(
+                pager.write_set_stats().expect("configured stats"),
+                before,
+                "a refused live reinstall must preserve the complete old window"
+            );
+
+            txn.rollback(&cx).await.unwrap();
+            pager
+                .set_write_set_page_limit(2)
+                .expect("quiescent reinstall must start a fresh window");
+            let fresh = pager.write_set_stats().expect("configured stats");
+            assert_eq!(fresh.page_limit, 2);
+            assert_eq!(fresh.current_dirty_pages, 0);
+            assert_eq!(fresh.dirty_pages_high_water, 0);
+            assert_eq!(fresh.cap_refusals, 0);
+        });
+    }
+
+    #[test]
+    fn write_page_data_ceiling_refusal_preserves_a_prior_free() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            pager
+                .set_write_set_page_limit(1)
+                .expect("install write-set ceiling");
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let admitted_page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, admitted_page, &sample_page(0x71))
+                .await
+                .unwrap();
+            let freed_page = txn.allocate_page(&cx).await.unwrap();
+            txn.free_page(&cx, freed_page).await.unwrap();
+            assert!(txn.contains_freed_page(freed_page));
+
+            let refusal = txn
+                .write_page_data(&cx, freed_page, PageData::from_vec(sample_page(0x72)))
+                .await
+                .expect_err("a second caller-staged page must exceed the ceiling");
+            assert!(matches!(refusal, FrankenError::OutOfRange { .. }));
+            assert!(
+                txn.contains_freed_page(freed_page),
+                "a ceiling refusal must not undo the prior free"
+            );
+            assert!(!txn.write_set.contains_key(&freed_page));
+            let stats = pager.write_set_stats().expect("configured stats");
+            assert_eq!(stats.current_dirty_pages, 1);
+            assert_eq!(stats.dirty_pages_high_water, 1);
+            assert_eq!(stats.cap_refusals, 1);
+
+            txn.rollback(&cx).await.unwrap();
         });
     }
 

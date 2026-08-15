@@ -3908,7 +3908,7 @@ impl PagerBackend {
         }
     }
 
-    fn set_write_set_page_limit(&self, page_limit: usize) {
+    fn set_write_set_page_limit(&self, page_limit: usize) -> Result<()> {
         match self {
             Self::Memory(p) => p.set_write_set_page_limit(page_limit),
             #[cfg(all(feature = "native", target_os = "linux"))]
@@ -13427,7 +13427,7 @@ impl Connection {
         .await?;
         // Install the ceiling on the pager itself, so it is enforced where
         // pages actually enter the write set rather than recorded at open time.
-        builder.pager.set_write_set_page_limit(page_limit);
+        builder.pager.set_write_set_page_limit(page_limit)?;
         Ok(builder)
     }
 
