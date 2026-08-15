@@ -15759,9 +15759,9 @@ impl Connection {
     /// Dirty-write-set accounting since the write-set ceiling was installed,
     /// when one is in force.
     ///
-    /// Build-level, not per-transaction: under autocommit each statement is its
-    /// own transaction, so a per-transaction figure would describe the last
-    /// statement rather than the build.
+    /// The high-water fields are window-wide maxima of each transaction's live
+    /// dirty-set cardinality. They deliberately do not sum or union pages from
+    /// separate autocommit transactions.
     ///
     /// Distinct from [`Self::page_cache_peak_snapshot`], and the distinction is
     /// the whole point: residency answers "how many pages were held in memory",
