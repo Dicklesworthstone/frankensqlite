@@ -188,7 +188,7 @@ use fsqlite_types::value::{
 };
 use fsqlite_types::{
     CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, RowId, RowIdMode,
-    SchemaEpoch, StrictColumnType, TableId, WitnessKey,
+    SchemaEpoch, StrictColumnType, TableId, TextEncoding, WitnessKey,
 };
 
 use crate::{
@@ -454,6 +454,10 @@ fn add_vdbe_duration_if(enabled: bool, counter: &AtomicU64, started: Instant) {
 struct BtreeCursorPageLayout {
     usable_size: u32,
     page_size: u32,
+    /// DB text encoding read from the page-1 header (bd-bld9w). `Utf8` for
+    /// headerless synthetic pages, so the decode hot path stays byte-identical
+    /// for UTF-8 databases.
+    text_encoding: TextEncoding,
 }
 
 impl BtreeCursorPageLayout {
@@ -462,6 +466,7 @@ impl BtreeCursorPageLayout {
         Self {
             usable_size: page_size,
             page_size,
+            text_encoding: TextEncoding::Utf8,
         }
     }
 }
@@ -481,6 +486,7 @@ async fn btree_cursor_page_layout_from_page_one<P: PageReader>(
     Some(BtreeCursorPageLayout {
         usable_size,
         page_size: header.page_size.get(),
+        text_encoding: header.text_encoding,
     })
 }
 
@@ -4293,6 +4299,11 @@ type RowDecodeScratch = fsqlite_types::record::RecordDecodeScratch;
 struct StorageCursor {
     cursor: CursorBackend,
     cx: Cx,
+    /// Database text encoding (bd-bld9w.5), copied from the engine at open so
+    /// the index-key decode fallbacks (which are free fns holding only
+    /// `&mut StorageCursor`) decode TEXT keys through the same encoding as
+    /// table-column reads. Defaults to UTF-8.
+    text_encoding: TextEncoding,
     /// Whether this cursor was opened for writing (`OpenWrite`).
     writable: bool,
     /// Stable root page associated with this cursor.
@@ -6152,6 +6163,10 @@ pub struct VdbeEngine {
     execution_cx: Cx,
     /// Page size for this database (bd-zjisk.2).
     page_size: PageSize,
+    /// Database text encoding (bd-bld9w.2). A per-database constant read from
+    /// the page-1 header; TEXT record columns decode through it. Defaults to
+    /// UTF-8 and is preserved across `reset_for_reuse` (same connection/DB).
+    text_encoding: TextEncoding,
     /// Whether opcode-level tracing is enabled, latched when the engine is constructed.
     trace_opcodes: bool,
     /// Execute-scoped metrics flag latched once per statement.
@@ -6754,6 +6769,7 @@ impl VdbeEngine {
             // allocation on every statement execution.
             execution_cx: execution_cx.clone(),
             page_size,
+            text_encoding: TextEncoding::Utf8,
             trace_opcodes: opcode_trace_enabled(),
             collect_vdbe_metrics: false,
             results: Vec::with_capacity(64),
@@ -7089,6 +7105,16 @@ impl VdbeEngine {
     }
 
     /// Convenience wrapper: reset without retaining cursors (legacy behavior).
+    /// Set the database text encoding (bd-bld9w.2), read from the page-1 header.
+    ///
+    /// TEXT record columns are decoded through this encoding. Call once per
+    /// statement setup from the connection's `DatabaseHeader.text_encoding`; it
+    /// is preserved across `reset_for_reuse` (the encoding is a per-database
+    /// constant and the engine is reused on the same connection/database).
+    pub fn set_text_encoding(&mut self, encoding: TextEncoding) {
+        self.text_encoding = encoding;
+    }
+
     pub fn reset_for_reuse(&mut self, register_count: i32, execution_cx: &Cx, page_size: PageSize) {
         self.reset_for_reuse_ex(register_count, execution_cx, page_size, false);
     }
@@ -9586,6 +9612,7 @@ impl VdbeEngine {
                             StorageCursor {
                                 cursor: CursorBackend::Mem(cursor),
                                 cx,
+                                text_encoding: self.text_encoding,
                                 writable: true,
                                 root_page: root_pgno.get() as i32,
                                 rowid_mode: RowIdMode::Normal,
@@ -15144,6 +15171,9 @@ impl VdbeEngine {
         let page_layout = BtreeCursorPageLayout {
             usable_size: old_sc.cursor.usable_size(),
             page_size: old_sc.cursor.page_size(),
+            // Time-travel reopen of an existing cursor: the database encoding is
+            // already established on the engine from the original open.
+            text_encoding: self.text_encoding,
         };
         let mut new_cursor = BtCursor::new_with_index_desc(
             tt_page_io,
@@ -15164,6 +15194,7 @@ impl VdbeEngine {
             StorageCursor {
                 cursor: CursorBackend::TimeTravel(new_cursor),
                 cx: old_sc.cx,
+                text_encoding: self.text_encoding,
                 writable: false,
                 root_page,
                 rowid_mode: old_sc.rowid_mode,
@@ -15799,6 +15830,7 @@ impl VdbeEngine {
         col_idx: usize,
         target: i32,
     ) -> Result<bool> {
+        let text_encoding = self.text_encoding;
         let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
             return Ok(false);
         };
@@ -15906,13 +15938,14 @@ impl VdbeEngine {
             // If raw bytes match, reuse the existing Arc (skip malloc+memcpy).
             note_decode_cache_miss(collect_vdbe_metrics);
             let hint = cursor.row_decode.cached_value(payload_idx);
-            let val = fsqlite_types::record::decode_column_from_offset_reuse(
+            let val = fsqlite_types::record::decode_column_from_offset_reuse_with_encoding(
                 &cursor.payload_buf,
                 cursor
                     .row_decode
                     .column_offset(payload_idx)
                     .expect("payload_idx checked against column_count"),
                 hint,
+                text_encoding,
                 collect_vdbe_metrics,
             )
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -15964,6 +15997,7 @@ impl VdbeEngine {
     /// because `row_decode.decoded_mask` uses a single `u64`.
     async fn cursor_column(&mut self, cursor_id: i32, col_idx: usize) -> Result<SqliteValue> {
         let collect_vdbe_metrics = self.collect_vdbe_metrics;
+        let text_encoding = self.text_encoding;
         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
@@ -16034,13 +16068,14 @@ impl VdbeEngine {
                 // bd-db300.4.4.2 K1: reuse hint from previous row's cached value.
                 note_decode_cache_miss(collect_vdbe_metrics);
                 let hint = cursor.row_decode.cached_value(payload_idx);
-                let val = fsqlite_types::record::decode_column_from_offset_reuse(
+                let val = fsqlite_types::record::decode_column_from_offset_reuse_with_encoding(
                     &cursor.payload_buf,
                     cursor
                         .row_decode
                         .column_offset(payload_idx)
                         .expect("payload_idx checked against column_count"),
                     hint,
+                    text_encoding,
                     collect_vdbe_metrics,
                 )
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -16419,6 +16454,15 @@ impl VdbeEngine {
                     self.page_size,
                 )
                 .await;
+                // bd-bld9w: adopt this database's TEXT encoding from the page-1
+                // header so the Column decode hot path (which reads
+                // `self.text_encoding`) decodes UTF-16 TEXT correctly. `Utf8`
+                // for UTF-8 databases keeps the decode byte-identical, and
+                // headerless synthetic pages default to `Utf8`. Written to the
+                // field directly (not via `set_text_encoding`) because
+                // `self.txn_page_io` is mutably borrowed as `page_io` across
+                // this block, and a `&mut self` method call would overlap it.
+                self.text_encoding = page_layout.text_encoding;
 
                 if is_valid_btree {
                     // Real B-tree backed by pager: infer table-vs-index from the
@@ -16478,6 +16522,7 @@ impl VdbeEngine {
                         StorageCursor {
                             cursor: CursorBackend::Txn(cursor),
                             cx: txn_cx,
+                            text_encoding: self.text_encoding,
                             writable,
                             root_page,
                             rowid_mode,
@@ -16633,6 +16678,7 @@ impl VdbeEngine {
                         StorageCursor {
                             cursor: CursorBackend::Txn(cursor),
                             cx: txn_cx,
+                            text_encoding: self.text_encoding,
                             writable,
                             root_page,
                             rowid_mode,
@@ -16825,6 +16871,7 @@ impl VdbeEngine {
             StorageCursor {
                 cursor: CursorBackend::Mem(cursor),
                 cx,
+                text_encoding: self.text_encoding,
                 writable,
                 root_page,
                 rowid_mode,
@@ -17617,10 +17664,11 @@ fn storage_cursor_current_first_index_key_equals_generic_fallback(
     col: ColumnOffset,
 ) -> Result<bool> {
     let hint = cursor.row_decode.cached_value(0);
-    let value = fsqlite_types::record::decode_column_from_offset_reuse(
+    let value = fsqlite_types::record::decode_column_from_offset_reuse_with_encoding(
         &cursor.payload_buf,
         &col,
         hint,
+        cursor.text_encoding,
         collect_vdbe_metrics,
     )
     .ok_or_else(|| FrankenError::internal(malformed_detail))?;
@@ -17641,10 +17689,11 @@ fn storage_cursor_current_first_index_key_compare_generic_fallback(
     compare_ctx: FirstIndexKeyCompareContext<'_>,
 ) -> Result<Ordering> {
     let hint = cursor.row_decode.cached_value(0);
-    let value = fsqlite_types::record::decode_column_from_offset_reuse(
+    let value = fsqlite_types::record::decode_column_from_offset_reuse_with_encoding(
         &cursor.payload_buf,
         &col,
         hint,
+        cursor.text_encoding,
         collect_vdbe_metrics,
     )
     .ok_or_else(|| FrankenError::internal(malformed_detail))?;
