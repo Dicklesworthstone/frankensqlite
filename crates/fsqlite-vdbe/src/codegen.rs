@@ -19411,6 +19411,17 @@ pub fn codegen_insert(
 
             let rec_reg = b.alloc_reg();
             emit_strict_type_check(b, table, col_regs);
+            // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+            // constraints see the affinity-coerced value (SQLite applies
+            // affinity, then evaluates constraints).
+            b.emit_op(
+                Opcode::Affinity,
+                col_regs,
+                n_cols,
+                0,
+                P4::Affinity(table.affinity_string()),
+                0,
+            );
             emit_check_constraints(b, table, col_regs, None);
             emit_not_null_constraints(b, table, col_regs, stmt_level, None);
             let pk_oe = effective_oe(
@@ -19712,6 +19723,17 @@ fn codegen_insert_values(
         // STRICT type check BEFORE affinity (SQLite validates raw storage
         // classes, then applies affinity for the on-disk format).
         emit_strict_type_check(b, table, val_regs);
+        // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+        // constraints see the affinity-coerced value (SQLite applies affinity,
+        // then evaluates constraints).
+        b.emit_op(
+            Opcode::Affinity,
+            val_regs,
+            n_cols as i32,
+            0,
+            P4::Affinity(table.affinity_string()),
+            0,
+        );
 
         // CHECK / NOT NULL validation. A row is skipped (IGNORE) when the
         // statement is `INSERT OR IGNORE`, or when a violated NOT NULL column
@@ -20034,6 +20056,17 @@ fn codegen_insert_values(
                 )?;
                 // Validate the rewritten image before removing the old row.
                 emit_strict_type_check(b, table, existing_regs);
+                // GH #169: coerce to column affinity before CHECK/NOT NULL so
+                // the constraints see the affinity-coerced value (SQLite applies
+                // affinity, then evaluates constraints).
+                b.emit_op(
+                    Opcode::Affinity,
+                    existing_regs,
+                    table.columns.len() as i32,
+                    0,
+                    P4::Affinity(table.affinity_string()),
+                    0,
+                );
                 emit_check_constraints(b, table, existing_regs, None);
                 emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
                 emit_index_deletes(b, table, cursor);
@@ -20524,6 +20557,17 @@ fn codegen_insert_select(
     // Apply column type affinities before packing the record.
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, final_regs);
+    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+    // constraints see the affinity-coerced value (SQLite applies affinity, then
+    // evaluates constraints).
+    b.emit_op(
+        Opcode::Affinity,
+        final_regs,
+        final_n_cols,
+        0,
+        P4::Affinity(target_table.affinity_string()),
+        0,
+    );
     let nn_ignore = target_table.columns.iter().any(|c| {
         c.notnull && !c.is_ipk && effective_oe(stmt_level, c.conflict_action) == OE_IGNORE
     });
@@ -20776,6 +20820,17 @@ fn codegen_insert_select_without_from(
 
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, final_regs);
+    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+    // constraints see the affinity-coerced value (SQLite applies affinity, then
+    // evaluates constraints).
+    b.emit_op(
+        Opcode::Affinity,
+        final_regs,
+        final_n_cols,
+        0,
+        P4::Affinity(target_table.affinity_string()),
+        0,
+    );
     emit_check_constraints(b, target_table, final_regs, check_ignore);
     emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
 
@@ -21260,6 +21315,17 @@ pub fn codegen_update(
             None
         };
     emit_strict_type_check(b, table, col_regs);
+    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+    // constraints see the affinity-coerced value (SQLite applies affinity, then
+    // evaluates constraints).
+    b.emit_op(
+        Opcode::Affinity,
+        col_regs,
+        n_cols as i32,
+        0,
+        P4::Affinity(table.affinity_string()),
+        0,
+    );
     emit_check_constraints(b, table, col_regs, constraint_ignore_label);
     emit_not_null_constraints(
         b,
@@ -21971,6 +22037,17 @@ fn codegen_update_from(
 
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, target, col_regs);
+    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+    // constraints see the affinity-coerced value (SQLite applies affinity, then
+    // evaluates constraints).
+    b.emit_op(
+        Opcode::Affinity,
+        col_regs,
+        n_cols as i32,
+        0,
+        P4::Affinity(target.affinity_string()),
+        0,
+    );
     emit_check_constraints(b, target, col_regs, None);
     emit_not_null_constraints(b, target, col_regs, stmt.or_conflict, None);
     let aff_str = target.affinity_string();
@@ -23465,6 +23542,17 @@ fn emit_without_rowid_row_insert(
     // mutation, so OR IGNORE can bail cleanly.
     emit_stored_generated_columns(b, table, val_regs);
     emit_strict_type_check(b, table, val_regs);
+    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+    // constraints see the affinity-coerced value (SQLite applies affinity, then
+    // evaluates constraints).
+    b.emit_op(
+        Opcode::Affinity,
+        val_regs,
+        n_cols as i32,
+        0,
+        P4::Affinity(table.affinity_string()),
+        0,
+    );
 
     let row_done = b.emit_label();
     let ignore_skip = if oe_flag == OE_IGNORE {
@@ -23831,6 +23919,17 @@ fn emit_without_rowid_upsert_row(
     )?;
     emit_stored_generated_columns(b, table, existing_regs);
     emit_strict_type_check(b, table, existing_regs);
+    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+    // constraints see the affinity-coerced value (SQLite applies affinity, then
+    // evaluates constraints).
+    b.emit_op(
+        Opcode::Affinity,
+        existing_regs,
+        n_cols as i32,
+        0,
+        P4::Affinity(table.affinity_string()),
+        0,
+    );
     emit_check_constraints(b, table, existing_regs, None);
     emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
 
@@ -24729,6 +24828,17 @@ fn codegen_update_without_rowid(
     emit_update_assignments(b, &stmt.assignments, table, col_regs, &update_ctx)?;
     emit_stored_generated_columns(b, table, col_regs);
     emit_strict_type_check(b, table, col_regs);
+    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+    // constraints see the affinity-coerced value (SQLite applies affinity, then
+    // evaluates constraints).
+    b.emit_op(
+        Opcode::Affinity,
+        col_regs,
+        n_cols as i32,
+        0,
+        P4::Affinity(table.affinity_string()),
+        0,
+    );
     let ignore_skip = if oe_flag == OE_IGNORE {
         Some(row_done)
     } else {
@@ -25035,6 +25145,17 @@ fn codegen_update_from_without_rowid(
     emit_update_assignments(b, &stmt.assignments, table, new_regs, &scan)?;
     emit_stored_generated_columns(b, table, new_regs);
     emit_strict_type_check(b, table, new_regs);
+    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+    // constraints see the affinity-coerced value (SQLite applies affinity, then
+    // evaluates constraints).
+    b.emit_op(
+        Opcode::Affinity,
+        new_regs,
+        n_cols as i32,
+        0,
+        P4::Affinity(table.affinity_string()),
+        0,
+    );
     emit_check_constraints(b, table, new_regs, None);
     emit_not_null_constraints(b, table, new_regs, stmt.or_conflict, None);
     let stash_rec = b.alloc_reg();
