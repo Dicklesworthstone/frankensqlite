@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use memchr::{memchr, memchr2, memmem};
 
-use crate::{StorageClass, StrictColumnType, StrictTypeError, TypeAffinity};
+use crate::{StorageClass, StrictColumnType, StrictTypeError, TextEncoding, TypeAffinity};
 
 // ============================================================================
 // Thread-Local Value Slab Allocator
@@ -334,6 +334,41 @@ impl SmallText {
         match simdutf8::basic::from_utf8(&bytes) {
             Ok(text) => Self::new(text),
             Err(_) => Self::from_raw_bytes(bytes),
+        }
+    }
+
+    /// Decode a SQLite TEXT record payload according to the database text
+    /// encoding (bd-bld9w.1).
+    ///
+    /// UTF-8 payloads keep the byte-preserving fast path of [`Self::from_bytes`].
+    /// UTF-16LE/BE payloads are decoded to canonical UTF-8: 16-bit code units are
+    /// read in the declared byte order and converted through
+    /// [`char::decode_utf16`], so a UTF-16 `sqlite_master` no longer decodes as
+    /// `t\0a\0b\0l\0e\0`. Lone surrogates decode to U+FFFD and any trailing odd
+    /// byte is ignored; byte-exact preservation of malformed UTF-16 sequences is
+    /// tracked separately (GH #180 / bd-bld9w.8). This is the shared decode core
+    /// the record-decode sites (bd-bld9w.2) route TEXT through.
+    #[must_use]
+    pub fn from_record_text_bytes(bytes: &[u8], encoding: TextEncoding) -> Self {
+        match encoding {
+            TextEncoding::Utf8 => Self::from_bytes(bytes),
+            TextEncoding::Utf16le | TextEncoding::Utf16be => {
+                let little_endian = matches!(encoding, TextEncoding::Utf16le);
+                // `as_chunks::<2>` drops any trailing odd byte, matching the
+                // lenient handling of a malformed UTF-16 payload length.
+                let (pairs, _trailing_odd_byte) = bytes.as_chunks::<2>();
+                let units = pairs.iter().map(|pair| {
+                    if little_endian {
+                        u16::from_le_bytes(*pair)
+                    } else {
+                        u16::from_be_bytes(*pair)
+                    }
+                });
+                let decoded: String = char::decode_utf16(units)
+                    .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect();
+                Self::from_string(decoded)
+            }
         }
     }
 
@@ -2489,6 +2524,72 @@ mod tests {
             pool_len(),
         );
         stats
+    }
+
+    fn utf16_record_bytes(text: &str, little_endian: bool) -> Vec<u8> {
+        text.encode_utf16()
+            .flat_map(|unit| {
+                if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn from_record_text_bytes_utf8_passthrough() {
+        assert_eq!(
+            SmallText::from_record_text_bytes(b"table", TextEncoding::Utf8).as_str(),
+            "table"
+        );
+        assert_eq!(
+            SmallText::from_record_text_bytes(b"", TextEncoding::Utf8).as_str(),
+            ""
+        );
+    }
+
+    #[test]
+    fn from_record_text_bytes_utf16_le_and_be_round_trip() {
+        for text in ["table", "café", "日本語", "😀 grin", ""] {
+            let le = SmallText::from_record_text_bytes(
+                &utf16_record_bytes(text, true),
+                TextEncoding::Utf16le,
+            );
+            assert_eq!(le.as_str(), text, "utf16le decode of {text:?}");
+            let be = SmallText::from_record_text_bytes(
+                &utf16_record_bytes(text, false),
+                TextEncoding::Utf16be,
+            );
+            assert_eq!(be.as_str(), text, "utf16be decode of {text:?}");
+        }
+    }
+
+    #[test]
+    fn from_record_text_bytes_utf16_sqlite_master_ascii_case() {
+        // The GoldGull mechanism (bd-bld9w): ASCII UTF-16LE "table" is byte-valid
+        // UTF-8 with embedded NULs, so a naive UTF-8 decode yields t\0a\0b\0l\0e\0
+        // and schema load silently drops the entry. Encoding-aware decode fixes it.
+        let bytes = utf16_record_bytes("table", true);
+        assert_eq!(bytes, vec![b't', 0, b'a', 0, b'b', 0, b'l', 0, b'e', 0]);
+        assert_eq!(
+            SmallText::from_record_text_bytes(&bytes, TextEncoding::Utf16le).as_str(),
+            "table"
+        );
+        // A naive UTF-8 interpretation would NOT equal "table".
+        assert_ne!(SmallText::from_bytes(&bytes).as_str(), "table");
+    }
+
+    #[test]
+    fn from_record_text_bytes_utf16_lone_surrogate_becomes_replacement() {
+        // Lone high surrogate with no following low surrogate decodes to U+FFFD
+        // (byte-exact preservation of malformed UTF-16 is GH #180 / bd-bld9w.8).
+        let bytes = 0xD800_u16.to_le_bytes().to_vec();
+        assert_eq!(
+            SmallText::from_record_text_bytes(&bytes, TextEncoding::Utf16le).as_str(),
+            "\u{FFFD}"
+        );
     }
 
     #[test]

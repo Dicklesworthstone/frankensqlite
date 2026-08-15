@@ -86,12 +86,39 @@ fn lab_unsafe_pragma_activates_and_reports() {
 fn unknown_write_merge_value_errors() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
+
+        // An arbitrary unknown value is rejected with a message that names the
+        // accepted values, and the mode is left at its previous (default) value.
         let err = conn
             .execute_batch("PRAGMA fsqlite.write_merge = RECKLESS;")
-            .await;
-        assert!(err.is_err(), "unknown write_merge value must error");
+            .await
+            .expect_err("unknown write_merge value must error");
+        assert!(
+            err.to_string().contains("SAFE or LAB_UNSAFE"),
+            "rejection must name the accepted values, got: {err}"
+        );
         // Mode stays at the previous (default) value on error.
         assert_eq!(conn.write_merge_mode(), WriteMergeMode::Safe);
+
+        // `OFF` is the specific value the README promises to reject (bd-p4dcv):
+        // only `SAFE | LAB_UNSAFE` are accepted, so `OFF`/`off` must fail closed
+        // and never mutate the mode. This pins the docs<->parser contract so a
+        // future change cannot silently reintroduce `OFF` as a no-op or an
+        // SSI-disable switch (the historical mis-documentation the bead flagged).
+        for value in ["OFF", "off"] {
+            let err = conn
+                .execute_batch(&format!("PRAGMA fsqlite.write_merge = {value};"))
+                .await;
+            assert!(
+                err.is_err(),
+                "write_merge = {value} must be rejected (README documents `OFF` as rejected)"
+            );
+            assert_eq!(
+                conn.write_merge_mode(),
+                WriteMergeMode::Safe,
+                "rejected write_merge = {value} must not mutate the mode"
+            );
+        }
     });
 }
 

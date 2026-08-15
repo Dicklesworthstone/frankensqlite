@@ -223,18 +223,6 @@
       }
     },
     {
-      "source_path": "crates/fsqlite-core/tests/integrity_check_empty_non_root_leaf.rs",
-      "test_name": "integrity_check_flags_empty_non_root_leaf",
-      "reason": "bd-y5urj: repro fixture inconclusive; integrity_check reads the corrupted empty-non-root leaf as ok \u2014 root-cause checker-wiring vs fixture validity before un-ignoring",
-      "cfg_condition": null,
-      "kind": "known_bug",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Resolve bd-y5urj's fixture-vs-checker question: either prove the fixture invalid (retire or re-point the probe) or fix integrity_check to flag the empty non-root leaf; remove the ignore only after three consecutive green runs at the release commit (bd-y5urj).",
-        "receipt": null
-      }
-    },
-    {
       "source_path": "crates/fsqlite-e2e/src/perf_runner.rs",
       "test_name": "tests::focused_disjoint_c8_release_perf_triplet_emits_results",
       "reason": "manual remote perf evidence for the flagship c8 row",

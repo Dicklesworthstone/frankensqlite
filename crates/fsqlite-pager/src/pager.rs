@@ -9423,6 +9423,15 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
             .map(|list| (list, batch))
     });
     let Some((published, batch)) = publications.next() else {
+        if std::env::var_os("RH4_TRACE").is_some() {
+            let consumed: Vec<u32> = batches
+                .iter()
+                .flat_map(|b| b.consumed_durable_freelist_pages.iter().copied())
+                .collect();
+            if !consumed.is_empty() {
+                eprintln!("RH4GUARD no_publication consumed_durable={consumed:?}");
+            }
+        }
         return Ok(Vec::new());
     };
     if publications.next().is_some() {
@@ -9542,6 +9551,27 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
                 }),
         )
         .collect();
+    if std::env::var_os("RH4_TRACE").is_some() {
+        let begin_committed = batch
+            .conflict_snapshot
+            .map(|snapshot| snapshot.snapshot_db_size)
+            .unwrap_or(0);
+        let cd = &batch.consumed_durable_freelist_pages;
+        if !cd.is_empty() {
+            let detail: Vec<String> = cd
+                .iter()
+                .map(|page| {
+                    let imo = begin_committed > 0 && *page > begin_committed;
+                    format!("{page}:cur={},imo={imo}", current.contains(page))
+                })
+                .collect();
+            eprintln!(
+                "RH4GUARD n_batches={} begin_committed={begin_committed} publication_db_size={publication_db_size} consumed_durable=[{}] offending={offending:?}",
+                batches.len(),
+                detail.join(",")
+            );
+        }
+    }
     offending.sort_unstable();
     offending.dedup();
     Ok(offending)
@@ -22148,8 +22178,17 @@ where
                     // never reused committed free pages and every churn
                     // workload grew the file at EOF without bound.
                     if sole_current_snapshot && let Some(page) = inner.freelist.pop() {
-                        if inner.durable_freelist_view.contains(&page.get()) {
+                        let durable_origin = inner.durable_freelist_view.contains(&page.get());
+                        if durable_origin {
                             self.allocated_from_durable_freelist.insert(page.get());
+                        }
+                        if std::env::var_os("RH4_TRACE").is_some() {
+                            eprintln!(
+                                "RH4POP ptr={:x} page={} arm=gated durable={durable_origin} committed_db={}",
+                                std::ptr::from_ref(self) as usize,
+                                page.get(),
+                                inner.db_size
+                            );
                         }
                         self.allocated_from_freelist.push(page);
                         alloc_ledger(
