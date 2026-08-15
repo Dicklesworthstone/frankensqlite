@@ -29,6 +29,7 @@ use crate::serial_type::{
     varint_len, write_varint,
 };
 use crate::sync_primitives::Instant;
+use crate::TextEncoding;
 use crate::value::{SmallText, SqliteValue, pool_acquire, pool_return_reusable};
 
 static FSQLITE_RECORD_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -342,8 +343,20 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
 ///
 /// Existing slots are reused when possible so repeated row decodes can keep
 /// text/blob backing storage alive across iterations.
-#[allow(clippy::cast_possible_truncation)]
 pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<()> {
+    parse_record_into_with_encoding(data, values, TextEncoding::Utf8)
+}
+
+/// Encoding-aware variant of [`parse_record_into`] (bd-bld9w.2).
+///
+/// TEXT columns are decoded according to the database `encoding`; passing
+/// [`TextEncoding::Utf8`] is byte-for-byte identical to [`parse_record_into`].
+#[allow(clippy::cast_possible_truncation)]
+pub fn parse_record_into_with_encoding(
+    data: &[u8],
+    values: &mut Vec<SqliteValue>,
+    encoding: TextEncoding,
+) -> Option<()> {
     let profile_enabled = record_profile_enabled();
     let start = profile_enabled.then(Instant::now);
     if profile_enabled {
@@ -387,9 +400,10 @@ pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<(
         // Reuse caller-owned scratch slots so repeated row decodes keep
         // existing text/blob backing storage alive across iterations.
         if let Some(slot) = values.get_mut(decoded_count) {
-            decode_value_into(serial_type, value_bytes, slot, profile_enabled)?;
+            decode_value_into(serial_type, value_bytes, slot, encoding, profile_enabled)?;
         } else {
-            let value = decode_value(serial_type, value_bytes, profile_enabled)?;
+            let value =
+                decode_value_with_encoding(serial_type, value_bytes, encoding, profile_enabled)?;
             values.push(value);
         }
         body_offset = end;
@@ -2462,6 +2476,20 @@ pub fn encode_batch_auto(rows: &[&[SqliteValue]]) -> fsqlite_error::Result<Vec<u
 /// per-column decoding without re-parsing the header.
 #[allow(clippy::cast_possible_truncation)]
 pub fn decode_value(serial_type: u64, bytes: &[u8], profile_enabled: bool) -> Option<SqliteValue> {
+    decode_value_with_encoding(serial_type, bytes, TextEncoding::Utf8, profile_enabled)
+}
+
+/// Decode a single serialized value, honoring the database text encoding.
+///
+/// Passing [`TextEncoding::Utf8`] is identical to [`decode_value`]; UTF-16LE/BE
+/// decode TEXT payloads to canonical UTF-8 via
+/// [`SmallText::from_record_text_bytes`] (bd-bld9w.2).
+pub fn decode_value_with_encoding(
+    serial_type: u64,
+    bytes: &[u8],
+    encoding: TextEncoding,
+    profile_enabled: bool,
+) -> Option<SqliteValue> {
     match classify_serial_type(serial_type) {
         // Serial types 10 and 11 are reserved for SQLite internal use and
         // are not expected in well-formed database files. Their serialized
@@ -2507,7 +2535,7 @@ pub fn decode_value(serial_type: u64, bytes: &[u8], profile_enabled: bool) -> Op
     }
 
     let mut slot = pool_acquire().unwrap_or(SqliteValue::Null);
-    decode_value_into(serial_type, bytes, &mut slot, profile_enabled)?;
+    decode_value_into(serial_type, bytes, &mut slot, encoding, profile_enabled)?;
     Some(slot)
 }
 
@@ -2529,6 +2557,7 @@ fn decode_value_into(
     serial_type: u64,
     bytes: &[u8],
     slot: &mut SqliteValue,
+    encoding: TextEncoding,
     profile_enabled: bool,
 ) -> Option<()> {
     match classify_serial_type(serial_type) {
@@ -2562,6 +2591,20 @@ fn decode_value_into(
             );
         }
         SerialTypeClass::Text => {
+            // bd-bld9w.2: a UTF-16LE/BE database stores TEXT as UTF-16 code
+            // units; decode to canonical UTF-8 up front. The reuse/overwrite
+            // fast paths below compare RAW record bytes and hold only for the
+            // identity UTF-8 encoding, so bypass them for UTF-16.
+            if !matches!(encoding, TextEncoding::Utf8) {
+                replace_decoded_slot(
+                    slot,
+                    SqliteValue::Text(SmallText::from_record_text_bytes(bytes, encoding)),
+                );
+                if profile_enabled {
+                    note_decoded_value(slot);
+                }
+                return Some(());
+            }
             // Fast path: if the slot already holds a TEXT value whose bytes
             // exactly match the incoming record bytes, we can skip the
             // `from_utf8` validation entirely — the existing slot contents
@@ -3077,8 +3120,14 @@ mod tests {
         let mut slot = SqliteValue::Text(SmallText::new(original));
 
         let serial_type = serial_type_for_text(original.len() as u64);
-        decode_value_into(serial_type, original.as_bytes(), &mut slot, false)
-            .expect("decode via equal-bytes fast path");
+        decode_value_into(
+            serial_type,
+            original.as_bytes(),
+            &mut slot,
+            TextEncoding::Utf8,
+            false,
+        )
+        .expect("decode via equal-bytes fast path");
 
         assert_eq!(slot.as_text(), Some(original));
 
@@ -3090,6 +3139,7 @@ mod tests {
             serial_type_for_text(short.len() as u64),
             short.as_bytes(),
             &mut slot,
+            TextEncoding::Utf8,
             false,
         )
         .expect("decode inline text via equal-bytes fast path");
@@ -3102,7 +3152,8 @@ mod tests {
         // Cover the non-fast-path overwrite of an existing Text slot.
         let mut slot = SqliteValue::Text(SmallText::new("previous value"));
         let invalid: &[u8] = &[0xFF, 0xFE, 0xFD]; // not valid UTF-8
-        let result = decode_value_into(serial_type_for_text(3), invalid, &mut slot, false);
+        let result =
+            decode_value_into(serial_type_for_text(3), invalid, &mut slot, TextEncoding::Utf8, false);
         result.expect("raw SQLite TEXT must decode without substitution");
         let SqliteValue::Text(text) = slot else {
             panic!("decoded value must retain the TEXT storage class");
@@ -3117,7 +3168,8 @@ mod tests {
         // round-trip for a raw TEXT payload.
         let mut slot = SqliteValue::Integer(7);
         let invalid: &[u8] = &[0xFF, 0xFE, 0xFD];
-        let result = decode_value_into(serial_type_for_text(3), invalid, &mut slot, false);
+        let result =
+            decode_value_into(serial_type_for_text(3), invalid, &mut slot, TextEncoding::Utf8, false);
         result.expect("raw SQLite TEXT must decode without substitution");
         let SqliteValue::Text(text) = &slot else {
             panic!("decoded value must retain the TEXT storage class");
@@ -3147,6 +3199,75 @@ mod tests {
         assert_eq!(values[0].as_blob(), Some(&[9u8, 10, 11][..]));
     }
 
+    fn utf16_le_bytes(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    fn utf16_be_bytes(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_be_bytes).collect()
+    }
+
+    #[test]
+    fn decode_value_with_encoding_utf16_text_decodes_to_utf8() {
+        // bd-bld9w.2: UTF-16LE "table" record bytes must decode to "table",
+        // NOT the t\0a\0b\0l\0e\0 that a naive UTF-8 decode would produce.
+        let le = utf16_le_bytes("table");
+        let value = decode_value_with_encoding(
+            serial_type_for_text(le.len() as u64),
+            &le,
+            TextEncoding::Utf16le,
+            false,
+        )
+        .expect("utf16le text decodes");
+        assert_eq!(value.as_text(), Some("table"));
+
+        let be = utf16_be_bytes("café");
+        let value_be = decode_value_with_encoding(
+            serial_type_for_text(be.len() as u64),
+            &be,
+            TextEncoding::Utf16be,
+            false,
+        )
+        .expect("utf16be text decodes");
+        assert_eq!(value_be.as_text(), Some("café"));
+
+        // UTF-8 path is unchanged (identical to decode_value).
+        let utf8 = decode_value_with_encoding(
+            serial_type_for_text(5),
+            b"table",
+            TextEncoding::Utf8,
+            false,
+        )
+        .expect("utf8 text decodes");
+        assert_eq!(utf8.as_text(), Some("table"));
+    }
+
+    #[test]
+    fn parse_record_into_with_encoding_decodes_utf16_row() {
+        let text = "grüße";
+        let body = utf16_le_bytes(text);
+        let serial = serial_type_for_text(body.len() as u64);
+        let mut serial_buf = [0u8; 9];
+        let serial_len = write_varint(&mut serial_buf, serial);
+        let header_size = 1 + serial_len;
+        assert!(header_size < 128, "test record header must fit one varint byte");
+        let mut record = vec![header_size as u8];
+        record.extend_from_slice(&serial_buf[..serial_len]);
+        record.extend_from_slice(&body);
+
+        let mut values = Vec::new();
+        parse_record_into_with_encoding(&record, &mut values, TextEncoding::Utf16le)
+            .expect("utf16 row decodes");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].as_text(), Some(text));
+
+        // Decoding the SAME bytes as UTF-8 must NOT recover the string — proving
+        // the encoding parameter is what fixes it (not incidental byte equality).
+        let mut utf8_values = Vec::new();
+        parse_record_into(&record, &mut utf8_values).expect("utf8 row decodes");
+        assert_ne!(utf8_values[0].as_text(), Some(text));
+    }
+
     #[test]
     fn decode_value_reuses_unique_blob_buffer_for_same_length_payload() {
         let mut slot = SqliteValue::Blob(Arc::from([1_u8, 2, 3, 4].as_slice()));
@@ -3156,8 +3277,14 @@ mod tests {
         };
         let original_ptr = Arc::as_ptr(existing);
 
-        decode_value_into(serial_type_for_blob(4), &[9_u8, 8, 7, 6], &mut slot, false)
-            .expect("decode succeeds");
+        decode_value_into(
+            serial_type_for_blob(4),
+            &[9_u8, 8, 7, 6],
+            &mut slot,
+            TextEncoding::Utf8,
+            false,
+        )
+        .expect("decode succeeds");
 
         assert!(matches!(&slot, SqliteValue::Blob(_)));
         let updated = if let SqliteValue::Blob(updated) = &slot {
