@@ -811,6 +811,18 @@ impl TextEncoding {
     pub const fn is_runtime_supported(self) -> bool {
         matches!(self, Self::Utf8)
     }
+
+    /// Whether this encoding is supported for READ-ONLY access (bd-bld9w.3).
+    ///
+    /// UTF-8 plus UTF-16LE/BE: the record-decode layer decodes UTF-16 TEXT to
+    /// canonical UTF-8 end to end, so reading a UTF-16 database is safe. Writing
+    /// one is NOT yet supported (the record-encode path is not wired into
+    /// `MakeRecord`), so callers must still reject mutations on a database whose
+    /// encoding is not [`Self::is_runtime_supported`].
+    #[must_use]
+    pub const fn is_read_supported(self) -> bool {
+        matches!(self, Self::Utf8 | Self::Utf16le | Self::Utf16be)
+    }
 }
 
 /// Journal mode for the database connection.
