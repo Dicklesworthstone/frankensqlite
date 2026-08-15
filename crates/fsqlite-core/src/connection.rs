@@ -4568,6 +4568,7 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
                 | "schema_version"
                 | "encoding"
                 | "foreign_keys"
+                | "defer_foreign_keys"
                 | "recursive_triggers"
                 | "query_only"
                 | "writable_schema"
@@ -4603,6 +4604,9 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     }
     if name_is("foreign_keys") {
         return &["foreign_keys"];
+    }
+    if name_is("defer_foreign_keys") {
+        return &["defer_foreign_keys"];
     }
     if name_is("recursive_triggers") {
         return &["recursive_triggers"];
@@ -10956,6 +10960,12 @@ pub struct Connection {
     /// When `true`, deferred FK checks are forced to run immediately (used while
     /// rechecking the deferred set at COMMIT so the recheck actually errors).
     fk_force_immediate_check: Cell<bool>,
+    /// `PRAGMA defer_foreign_keys` (GH #161): when `true`, ALL foreign-key NO
+    /// ACTION checks behave as deferred until COMMIT regardless of the
+    /// constraint's declared deferrability. SQLite auto-switches this off at the
+    /// conclusion of each transaction, so it is reset wherever the transaction
+    /// tears down.
+    defer_foreign_keys: Cell<bool>,
     /// Nesting depth of a logical statement whose row-replayed FK checks must
     /// observe the statement's final image.
     statement_fk_validation_depth: Cell<usize>,
@@ -12574,6 +12584,7 @@ impl Connection {
             inherited_recursive_program_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
+            defer_foreign_keys: Cell::new(false),
             statement_fk_validation_depth: Cell::new(0),
             statement_fk_validation_tables: RefCell::new(Vec::new()),
             statement_fk_validation_rows: RefCell::new(Vec::new()),
@@ -13091,6 +13102,7 @@ impl Connection {
             inherited_recursive_program_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
+            defer_foreign_keys: Cell::new(false),
             statement_fk_validation_depth: Cell::new(0),
             statement_fk_validation_tables: RefCell::new(Vec::new()),
             statement_fk_validation_rows: RefCell::new(Vec::new()),
@@ -56128,7 +56140,12 @@ impl Connection {
     /// implicit per-statement commit makes deferral equivalent to an immediate
     /// check, so we keep it immediate.
     fn fk_should_defer(&self, fk: &FkDef) -> bool {
-        fk.deferred && self.in_transaction.get() && !self.fk_force_immediate_check.get()
+        // GH #161: `PRAGMA defer_foreign_keys=ON` defers every NO ACTION check to
+        // COMMIT, exactly as a `DEFERRABLE INITIALLY DEFERRED` constraint would,
+        // regardless of the constraint's declared deferrability.
+        (fk.deferred || self.defer_foreign_keys.get())
+            && self.in_transaction.get()
+            && !self.fk_force_immediate_check.get()
     }
 
     /// Recheck every deferred FK parent-existence constraint accumulated during
@@ -60055,6 +60072,8 @@ impl Connection {
             *self.txn_snapshot.borrow_mut() = None;
             self.savepoints.borrow_mut().clear();
             self.in_transaction.set(false);
+            // GH #161: defer_foreign_keys is switched off at every txn end.
+            self.defer_foreign_keys.set(false);
             // Issue #110: forced rollback tore down the txn — drop the
             // transaction-scoped FK parent-validation cache.
             self.clear_fk_parent_validation_cache();
@@ -60423,6 +60442,9 @@ impl Connection {
         *self.txn_snapshot.borrow_mut() = None;
         self.savepoints.borrow_mut().clear();
         self.in_transaction.set(false);
+        // GH #161: defer_foreign_keys is switched off at the conclusion of the
+        // transaction (SQLite semantics).
+        self.defer_foreign_keys.set(false);
         // Issue #110: the transaction-scoped FK parent-validation cache is
         // bound to this transaction; drop it now that the txn is torn down.
         self.clear_fk_parent_validation_cache();
@@ -60895,6 +60917,8 @@ impl Connection {
             *self.txn_snapshot.borrow_mut() = None;
             self.savepoints.borrow_mut().clear();
             self.in_transaction.set(false);
+            // GH #161: defer_foreign_keys is switched off at every txn end.
+            self.defer_foreign_keys.set(false);
             // Issue #110: full ROLLBACK discards every in-transaction write,
             // including parents validated and cached this transaction. Drop
             // the transaction-scoped FK parent-validation cache.
@@ -63092,6 +63116,21 @@ impl Connection {
         // access to connection transaction state.
         if pragma_name == "foreign_keys" && pragma.value.is_some() && self.in_transaction.get() {
             return Ok(Vec::new());
+        }
+
+        // GH #161: `PRAGMA defer_foreign_keys` is a per-connection,
+        // transaction-scoped toggle that is NOT stored in PragmaState (it
+        // auto-resets at every transaction end). Handle its get/set here so it
+        // does not fall through to the unknown-pragma no-op that returned no row.
+        if pragma_name == "defer_foreign_keys" {
+            if let Some(value) = pragma.value.as_ref() {
+                let on = parse_pragma_bool(value)?;
+                self.defer_foreign_keys.set(on);
+                return Ok(Vec::new());
+            }
+            return Ok(vec![Row {
+                values: vec![SqliteValue::Integer(i64::from(self.defer_foreign_keys.get()))],
+            }]);
         }
 
         // The v0.2 runtime is UTF-8-only. SQLite normally permits an encoding
