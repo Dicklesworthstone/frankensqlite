@@ -5,6 +5,12 @@
 *.db.schema-migration-*
 *.db-fsqlite-ns-gate
 *.db-fsqlite-ns-use
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+
+# WAL certification sidecars (`*.db-wal` does not match these)
+*.db-wal-cert
+*.db-wal-cert-head
 
 # Lock files
 *.lock
