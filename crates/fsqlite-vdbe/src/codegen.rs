@@ -20172,6 +20172,29 @@ fn codegen_insert_values(
             }
         } else {
             // No upsert — normal insert path.
+            // GH #158: INSERT OR IGNORE on a rowid / INTEGER-PRIMARY-KEY conflict
+            // must skip the WHOLE row, RETURNING included. Opcode::Insert with
+            // OE_IGNORE suppresses the write on conflict, but execution falls
+            // through to emit_returning, which re-seeks the rowid and would emit
+            // the PRE-EXISTING row. Pre-probe the rowid and jump to the
+            // ignore-skip label on conflict, mirroring the WITHOUT ROWID path.
+            if pk_oe == OE_IGNORE
+                && let Some(skip) = ignore_skip
+            {
+                let do_insert = b.emit_label();
+                // NotExists jumps to do_insert when the rowid is free (no
+                // conflict); on an existing rowid we fall through and skip.
+                b.emit_jump_to_label(
+                    Opcode::NotExists,
+                    cursor,
+                    rowid_reg,
+                    do_insert,
+                    P4::None,
+                    0,
+                );
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
+                b.resolve_label(do_insert);
+            }
             let insert_p4 = emit_table_insert_record(
                 b,
                 val_regs,
