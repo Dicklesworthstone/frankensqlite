@@ -140,7 +140,8 @@ use fsqlite_types::record::{
     ColumnOffset, NumericColumnValue, PrecomputedRecordHeader, RecordHotPathProfileSnapshot,
     RecordProfileScope, decode_column_from_offset, decode_numeric_column_from_offset, encode_batch,
     enter_record_profile_scope, parse_record, parse_record_header_into, parse_record_into,
-    parse_record_projected_column_offsets, record_profile_enabled, record_profile_snapshot,
+    parse_record_into_with_encoding, parse_record_projected_column_offsets, record_profile_enabled,
+    record_profile_snapshot,
     reset_record_profile, serialize_record, serialize_record_iter_into,
     serialize_record_iter_with_precomputed_header_into,
     try_build_runtime_precomputed_record_header,
@@ -81061,12 +81062,21 @@ impl Connection {
                     loop {
                         let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
                         max_rowid = max_rowid.max(rowid);
-                        let values = parse_record(payload.as_ref()).ok_or_else(|| {
-                            FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "sqlite_master row {rowid} payload is not a valid SQLite record"
-                                ),
-                            }
+                        // bd-bld9w.3: decode sqlite_master rows through the DB
+                        // text encoding so a UTF-16 database's create_sql/name/
+                        // type reconstruct correctly (not t\0a\0b\0l\0e\0). Inert
+                        // until the admission gate above (80929) admits UTF-16;
+                        // header.text_encoding is Utf8 for every admitted db today.
+                        let mut values = Vec::new();
+                        parse_record_into_with_encoding(
+                            payload.as_ref(),
+                            &mut values,
+                            header.text_encoding,
+                        )
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master row {rowid} payload is not a valid SQLite record"
+                            ),
                         })?;
                         entries.push(values);
                         if !cursor.next(cx).await? {
@@ -107794,6 +107804,12 @@ fn evaluate_having_value(
             {
                 return result;
             }
+            // GH #270: a HAVING call to a function that does not exist must raise
+            // "no such function" (and a wrong-arity call the arity error), not
+            // silently evaluate to NULL. The HAVING interpreter bypasses the
+            // prepare-time resolution check, so run the same authority here
+            // before the built-in scalar fallback (over = None: a scalar call).
+            validate_function_call_resolution(name, args, None)?;
             Ok(eval_scalar_fn(name, &arg_values))
         }
 
