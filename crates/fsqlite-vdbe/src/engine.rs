@@ -4299,6 +4299,11 @@ type RowDecodeScratch = fsqlite_types::record::RecordDecodeScratch;
 struct StorageCursor {
     cursor: CursorBackend,
     cx: Cx,
+    /// Database text encoding (bd-bld9w.5), copied from the engine at open so
+    /// the index-key decode fallbacks (which are free fns holding only
+    /// `&mut StorageCursor`) decode TEXT keys through the same encoding as
+    /// table-column reads. Defaults to UTF-8.
+    text_encoding: TextEncoding,
     /// Whether this cursor was opened for writing (`OpenWrite`).
     writable: bool,
     /// Stable root page associated with this cursor.
@@ -9607,6 +9612,7 @@ impl VdbeEngine {
                             StorageCursor {
                                 cursor: CursorBackend::Mem(cursor),
                                 cx,
+                                text_encoding: self.text_encoding,
                                 writable: true,
                                 root_page: root_pgno.get() as i32,
                                 rowid_mode: RowIdMode::Normal,
@@ -15188,6 +15194,7 @@ impl VdbeEngine {
             StorageCursor {
                 cursor: CursorBackend::TimeTravel(new_cursor),
                 cx: old_sc.cx,
+                text_encoding: self.text_encoding,
                 writable: false,
                 root_page,
                 rowid_mode: old_sc.rowid_mode,
@@ -16515,6 +16522,7 @@ impl VdbeEngine {
                         StorageCursor {
                             cursor: CursorBackend::Txn(cursor),
                             cx: txn_cx,
+                            text_encoding: self.text_encoding,
                             writable,
                             root_page,
                             rowid_mode,
@@ -16670,6 +16678,7 @@ impl VdbeEngine {
                         StorageCursor {
                             cursor: CursorBackend::Txn(cursor),
                             cx: txn_cx,
+                            text_encoding: self.text_encoding,
                             writable,
                             root_page,
                             rowid_mode,
@@ -16862,6 +16871,7 @@ impl VdbeEngine {
             StorageCursor {
                 cursor: CursorBackend::Mem(cursor),
                 cx,
+                text_encoding: self.text_encoding,
                 writable,
                 root_page,
                 rowid_mode,
@@ -17654,10 +17664,11 @@ fn storage_cursor_current_first_index_key_equals_generic_fallback(
     col: ColumnOffset,
 ) -> Result<bool> {
     let hint = cursor.row_decode.cached_value(0);
-    let value = fsqlite_types::record::decode_column_from_offset_reuse(
+    let value = fsqlite_types::record::decode_column_from_offset_reuse_with_encoding(
         &cursor.payload_buf,
         &col,
         hint,
+        cursor.text_encoding,
         collect_vdbe_metrics,
     )
     .ok_or_else(|| FrankenError::internal(malformed_detail))?;
@@ -17678,10 +17689,11 @@ fn storage_cursor_current_first_index_key_compare_generic_fallback(
     compare_ctx: FirstIndexKeyCompareContext<'_>,
 ) -> Result<Ordering> {
     let hint = cursor.row_decode.cached_value(0);
-    let value = fsqlite_types::record::decode_column_from_offset_reuse(
+    let value = fsqlite_types::record::decode_column_from_offset_reuse_with_encoding(
         &cursor.payload_buf,
         &col,
         hint,
+        cursor.text_encoding,
         collect_vdbe_metrics,
     )
     .ok_or_else(|| FrankenError::internal(malformed_detail))?;
