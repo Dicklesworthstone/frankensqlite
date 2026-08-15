@@ -11777,10 +11777,11 @@ pub struct SimplePager<V: Vfs> {
 /// Dirty-write-set accounting since the write-set ceiling was installed.
 ///
 /// Distinct from page-cache residency: `PageCachePeakSnapshot` answers "how
-/// many pages were resident", which is a memory bound. This answers "how much
-/// of the database did the transaction actually rewrite", which is what a
-/// bounded-migration certifier needs and what a residency peak cannot
-/// substitute for.
+/// many pages were resident", which is a memory bound. This answers "how large
+/// did one live transaction's caller-staged write set become", which is the
+/// ceiling a bounded builder enforces and what a residency peak cannot
+/// substitute for. It does not count the union of pages rewritten by separate
+/// transactions.
 ///
 /// `cap_refusals` is the honest counterpart to the ceiling: a bound that was
 /// never approached and a bound that refused work both leave the same
@@ -11795,14 +11796,11 @@ pub struct WriteSetStats {
     pub current_dirty_pages: usize,
     /// Exact bytes currently staged by the active transaction.
     pub current_dirty_bytes: usize,
-    /// Largest distinct dirty-page count observed since the ceiling was
-    /// installed, across every transaction the builder ran.
+    /// Largest live caller-staged dirty-page count observed in any one
+    /// transaction since the ceiling was installed.
     ///
-    /// Deliberately NOT per-transaction. Under autocommit each statement is its
-    /// own transaction, so a per-transaction high water would report the last
-    /// statement rather than the build — useless for certifying how much of the
-    /// database a migration rewrote, which is the question this exists to
-    /// answer.
+    /// This is a window-wide maximum of per-transaction cardinalities, not the
+    /// union of distinct pages touched by all transactions in the window.
     pub dirty_pages_high_water: usize,
     /// Largest staged byte count observed since the ceiling was installed.
     pub dirty_bytes_high_water: usize,
@@ -12512,6 +12510,7 @@ where
                     published_db_size: Cell::new(bound_db_size),
                     write_set: PagePageMap::default(),
                     write_pages_sorted: Vec::new(),
+                    accounted_write_pages: PagePageSet::default(),
                     freed_pages: Vec::new(),
                     freed_pages_index: PagePageSet::default(),
                     freed_page_bounds: None,
@@ -12737,6 +12736,7 @@ where
                 published_db_size: Cell::new(bound_db_size),
                 write_set: PagePageMap::default(),
                 write_pages_sorted: Vec::new(),
+                accounted_write_pages: PagePageSet::default(),
                 freed_pages: Vec::new(),
                 freed_pages_index: PagePageSet::default(),
                 freed_page_bounds: None,
@@ -14297,6 +14297,16 @@ where
     /// `0` clears it. Used by the reserved schema-only builder create path so a
     /// private build cannot rewrite more of the image than the caller budgeted.
     pub fn set_write_set_page_limit(&self, page_limit: usize) {
+        // Disable reporting before clearing the counters so a concurrent
+        // observer cannot mistake a partially reset window for new evidence.
+        self.write_set_page_limit
+            .store(0, AtomicOrdering::Relaxed);
+        self.write_set_current_pages
+            .store(0, AtomicOrdering::Relaxed);
+        self.write_set_high_water_pages
+            .store(0, AtomicOrdering::Relaxed);
+        self.write_set_cap_refusals
+            .store(0, AtomicOrdering::Relaxed);
         self.write_set_page_limit
             .store(page_limit, AtomicOrdering::Relaxed);
     }
@@ -16951,6 +16961,8 @@ struct SavepointEntry {
     write_set_snapshot: PagePageMap<PageData>,
     /// Sorted unique page ids in the write-set snapshot.
     write_pages_sorted_snapshot: Vec<PageNumber>,
+    /// Caller-staged pages charged to the builder write-set ceiling.
+    accounted_write_pages_snapshot: PagePageSet,
     /// Snapshot of freed pages at the time the savepoint was created.
     freed_pages_snapshot: Vec<PageNumber>,
     /// Snapshot of the pager's next_page counter.
@@ -17329,6 +17341,9 @@ where
     published_db_size: Cell<u32>,
     write_set: PagePageMap<StagedPage>,
     write_pages_sorted: Vec<PageNumber>,
+    /// Caller-staged pages charged to the write-set ceiling in this logical
+    /// transaction. Commit-time pager metadata pages are deliberately absent.
+    accounted_write_pages: PagePageSet,
     freed_pages: Vec<PageNumber>,
     /// bd-8q9po: O(1) membership mirror of `freed_pages`, maintained in
     /// lockstep at every mutation site. `contains_freed_page` runs on EVERY
@@ -17722,6 +17737,7 @@ where
         // pending; discard every transaction-local staging surface instead.
         self.write_set.clear();
         self.write_pages_sorted.clear();
+        self.reset_current_write_set_accounting();
         self.clear_freed_pages();
         self.savepoint_stack.clear();
         self.rolled_back_pages.clear();
@@ -17886,6 +17902,7 @@ where
         self.allocated_from_eof.clear();
         self.page_lease.clear();
         self.retained_memory_overlay_dirty_pages.clear();
+        self.reset_current_write_set_accounting();
         self.writes_observed = false;
         {
             let mut inner = self
@@ -21284,12 +21301,12 @@ where
     /// staging (page 1, freelist serialization) is not caller-attributable and
     /// is excluded, so a bounded build rewrites at most `limit` pages plus that
     /// fixed metadata.
-    fn admit_new_write_set_page(&self, page_no: PageNumber) -> Result<()> {
+    fn admit_new_write_set_page(&self, page_no: PageNumber) -> Result<bool> {
         let limit = self.write_set_page_limit.load(AtomicOrdering::Relaxed);
-        if limit == 0 || self.write_set.contains_key(&page_no) {
-            return Ok(());
+        if limit == 0 || self.accounted_write_pages.contains(&page_no) {
+            return Ok(false);
         }
-        if self.write_set.len() >= limit {
+        if self.accounted_write_pages.len() >= limit {
             // A ceiling never approached and one that actively refused work
             // leave identical high-water marks; only this distinguishes them.
             self.write_set_cap_refusals
@@ -21299,12 +21316,21 @@ where
                 value: format!(
                     "staging page {} would make the write set {} pages, over the {limit}-page ceiling",
                     page_no.get(),
-                    self.write_set.len() + 1
+                    self.accounted_write_pages.len() + 1
                 ),
             });
         }
-        // Admitted: this page becomes the Nth distinct dirty page.
-        let admitted = self.write_set.len() + 1;
+        Ok(true)
+    }
+
+    /// Publish accounting only after a newly admitted page is durably owned by
+    /// the transaction's staging map. Fallible buffer acquisition must happen
+    /// before this point so an OOM cannot fabricate dirty-page evidence.
+    fn record_staged_write_set_page(&mut self, page_no: PageNumber) {
+        if !self.accounted_write_pages.insert(page_no) {
+            return;
+        }
+        let admitted = self.accounted_write_pages.len();
         self.write_set_current_pages
             .store(admitted, AtomicOrdering::Relaxed);
         let mut high = self.write_set_high_water_pages.load(AtomicOrdering::Relaxed);
@@ -21319,7 +21345,21 @@ where
                 Err(observed) => high = observed,
             }
         }
-        Ok(())
+    }
+
+    fn remove_staged_write_set_page(&mut self, page_no: PageNumber) {
+        if self.accounted_write_pages.remove(&page_no) {
+            self.write_set_current_pages.store(
+                self.accounted_write_pages.len(),
+                AtomicOrdering::Relaxed,
+            );
+        }
+    }
+
+    fn reset_current_write_set_accounting(&mut self) {
+        self.accounted_write_pages.clear();
+        self.write_set_current_pages
+            .store(0, AtomicOrdering::Relaxed);
     }
 
     fn restore_not_committed_wal_attempt(&mut self) -> Result<()> {
@@ -21420,6 +21460,7 @@ where
             self.discard_committed_pages();
             self.txn_read_cache.borrow_mut().clear();
         }
+        self.reset_current_write_set_accounting();
         self.retained_memory_overlay_dirty_pages.clear();
         self.clear_freed_pages();
         self.allocated_from_freelist.clear();
@@ -21771,7 +21812,7 @@ where
                 return Ok(());
             }
 
-            self.admit_new_write_set_page(page_no)?;
+            let account_page = self.admit_new_write_set_page(page_no)?;
             let staged = self.stage_page_bytes(data)?;
             // Mutate transaction bookkeeping only after fallible staging succeeds;
             // a capacity error must leave the prior free/write state untouched.
@@ -21783,6 +21824,9 @@ where
                 page_no,
                 staged,
             );
+            if account_page {
+                self.record_staged_write_set_page(page_no);
+            }
             Ok(())
         }
     }
@@ -21823,13 +21867,16 @@ where
                 return Ok(());
             }
 
-            self.admit_new_write_set_page(page_no)?;
+            let account_page = self.admit_new_write_set_page(page_no)?;
             insert_staged_page(
                 &mut self.write_set,
                 &mut self.write_pages_sorted,
                 page_no,
                 staged,
             );
+            if account_page {
+                self.record_staged_write_set_page(page_no);
+            }
             Ok(())
         }
     }
@@ -21886,6 +21933,7 @@ where
                 data,
                 "restore_staged_page_data",
             )?;
+            let account_page = self.admit_new_write_set_page(page_no)?;
             // #70 ghost-commit guard: mark only after fallible staging succeeds.
             self.writes_observed = true;
             insert_staged_page(
@@ -21894,6 +21942,9 @@ where
                 page_no,
                 staged,
             );
+            if account_page {
+                self.record_staged_write_set_page(page_no);
+            }
             Ok(())
         }
     }
@@ -22139,6 +22190,7 @@ where
             }
             if self.write_set.remove(&page_no).is_some() {
                 remove_page_sorted(&mut self.write_pages_sorted, page_no);
+                self.remove_staged_write_set_page(page_no);
             }
             Ok(())
         }
@@ -22236,6 +22288,7 @@ where
                 self.committed = true;
             self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
+                self.reset_current_write_set_accounting();
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena on read-only commit path.
                 self.scratch_arena.reset();
@@ -22307,6 +22360,7 @@ where
                 self.committed = true;
             self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
+                self.reset_current_write_set_accounting();
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena on no-writes commit path.
                 self.scratch_arena.reset();
@@ -23064,6 +23118,7 @@ where
                 self.committed = true;
             self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
+                self.reset_current_write_set_accounting();
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena after successful commit so
                 // transient per-transaction allocations do not linger. The arena
@@ -23646,6 +23701,7 @@ where
 
                 // Clear retained transaction state for reuse.
                 self.write_pages_sorted.clear();
+                self.reset_current_write_set_accounting();
                 self.clear_freed_pages();
                 self.allocated_from_freelist.clear();
                 self.allocated_from_durable_freelist.clear();
@@ -23910,6 +23966,7 @@ where
             }
             self.write_set.clear();
             self.write_pages_sorted.clear();
+            self.reset_current_write_set_accounting();
             self.clear_freed_pages();
             self.savepoint_stack.clear();
             self.rolled_back_pages.clear();
@@ -24040,6 +24097,7 @@ where
                 .map(|(&k, v)| (k, v.published_page()))
                 .collect(),
             write_pages_sorted_snapshot: self.write_pages_sorted.clone(),
+            accounted_write_pages_snapshot: self.accounted_write_pages.clone(),
             freed_pages_snapshot: self.freed_pages.clone(),
             next_page_snapshot: inner.next_page,
             freelist_snapshot: inner.freelist.clone(),
@@ -24176,6 +24234,7 @@ where
         let allocated_from_eof_snapshot = entry.allocated_from_eof_snapshot.clone();
         let freed_pages_snapshot = entry.freed_pages_snapshot.clone();
         let write_pages_sorted_snapshot = entry.write_pages_sorted_snapshot.clone();
+        let accounted_write_pages_snapshot = entry.accounted_write_pages_snapshot.clone();
         let snapshot_was_empty = entry.write_set_snapshot.is_empty();
 
         self.allocated_from_freelist = allocated_from_freelist_snapshot;
@@ -24190,6 +24249,11 @@ where
         // writes_observed should stay consistent with that.
         self.write_set = new_write_set;
         self.write_pages_sorted = write_pages_sorted_snapshot;
+        self.accounted_write_pages = accounted_write_pages_snapshot;
+        self.write_set_current_pages.store(
+            self.accounted_write_pages.len(),
+            AtomicOrdering::Relaxed,
+        );
         if snapshot_was_empty {
             self.writes_observed = false;
         }
@@ -24210,6 +24274,10 @@ where
         if self.finished {
             return;
         }
+        // The handle is no longer observable as an active transaction even if
+        // durable/logical cleanup must continue through a rooted detached
+        // obligation. Do not leave its abandoned staging count advertised.
+        self.reset_current_write_set_accounting();
         // Publish exact-handle ownership before touching PagerInner or
         // attempting a synchronous durable tail. If any later edge is not
         // terminal, this root is transferred unchanged to queued cleanup.
