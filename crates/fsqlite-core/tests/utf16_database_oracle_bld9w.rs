@@ -250,14 +250,26 @@ fn utf16_fixture_really_is_utf16_be() {
 }
 
 // ---------------------------------------------------------------------------
-// UTF-16 read parity — the acceptance gate. `#[ignore]`d until the read path
-// lands. Un-ignore when bld9w.2 (record decode + VDBE threading) + bld9w.3
-// (schema load + admission-lift) land; the ORDER-BY-name / GROUP-BY probes also
-// need bld9w.4 (compare+collate) to match stock byte ordering on decoded text.
+// UTF-16 read parity — the acceptance gate. `#[ignore]`d today.
+//
+// bld9w.2 (record decode + VDBE caller-threading) landed and the decode is
+// PROVEN: in a transient window where the bld9w.3 read admission gate was open,
+// all three non-collation arms below passed against HEAD (SageBluff probe
+// 2026-08-15). But the admission gate is currently toggled *closed* again —
+// FrankenSQLite returns "unsupported operation" on a UTF-16 open — while the
+// bld9w.3 write-safety/admission-activation design settles. So the arms stay
+// `#[ignore]`d to keep this file green; un-ignore each as bld9w.3 stably lands.
+//
+// One arm additionally encodes a real bld9w.4 (compare+collate) finding: BINARY
+// collation on a UTF-16 database must order by the *stored* encoding's bytes,
+// like stock SQLite — not FrankenSQLite's decoded UTF-8 form. This diverges only
+// for UTF-16**LE** non-ASCII text (LE byte order != code-point order); UTF-16BE
+// matches because BE byte order == code-point order == UTF-8 order for the BMP.
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "bd-bld9w.2/.3/.4: un-ignore when the UTF-16 read path lands (fails closed today)"]
+#[ignore = "bd-bld9w.3: un-ignore when the UTF-16 read admission-lift stably lands \
+            (record decode proven; admission currently gated closed pending write-safety)"]
 fn utf16le_read_parity_ascii() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -269,7 +281,10 @@ fn utf16le_read_parity_ascii() {
 }
 
 #[test]
-#[ignore = "bd-bld9w.2/.3/.4: un-ignore when the UTF-16 read path lands (fails closed today)"]
+#[ignore = "bd-bld9w.4 (compare+collate): BINARY collation on a UTF-16LE DB must \
+            order by the stored UTF-16LE bytes like stock (名前<Børge<Zoë<Élise via \
+            0x0D<0x42<0x5A<0xC9), but FrankenSQLite orders by the decoded UTF-8 form \
+            (Børge<Zoë<Élise<名前). Un-ignore when .4 makes BINARY compare in the DB encoding."]
 fn utf16le_read_parity_unicode() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -281,7 +296,8 @@ fn utf16le_read_parity_unicode() {
 }
 
 #[test]
-#[ignore = "bd-bld9w.2/.3/.4: un-ignore when the UTF-16 read path lands (fails closed today)"]
+#[ignore = "bd-bld9w.3: un-ignore when the UTF-16 read admission-lift stably lands \
+            (record decode proven; admission currently gated closed pending write-safety)"]
 fn utf16be_read_parity_ascii() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -293,7 +309,8 @@ fn utf16be_read_parity_ascii() {
 }
 
 #[test]
-#[ignore = "bd-bld9w.2/.3/.4: un-ignore when the UTF-16 read path lands (fails closed today)"]
+#[ignore = "bd-bld9w.3: un-ignore when the UTF-16 read admission-lift stably lands \
+            (record decode proven; admission currently gated closed pending write-safety)"]
 fn utf16be_read_parity_unicode() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
