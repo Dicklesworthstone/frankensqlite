@@ -29524,6 +29524,80 @@ mod tests {
         ));
     }
 
+    /// bd-6xjma (persistent ownership survives Drop): a recovery-open
+    /// finalization future that is dropped mid-await — cancelled before it
+    /// `finish()`es its claim — must RESTORE the orphaned-recovery receipt to
+    /// the gate rather than strand the persisted recovery lease. This exercises
+    /// `OrphanedRollbackRecoveryOpenClaim::drop`, exactly the path a dropped
+    /// recovery-open future triggers: the claim is taken from the gate exactly
+    /// as `enter_readwrite_open_for_orphan_recovery` does, then dropped WITHOUT
+    /// `finish()` — so it is not a false-positive that marks success before the
+    /// terminal receipt hand-off.
+    #[test]
+    fn dropped_recovery_open_claim_restores_the_orphaned_receipt() {
+        let gate = Arc::new(PagerMaintenanceGate::default());
+        let owner = gate.claim_rollback_recovery_owner().unwrap();
+        gate.orphan_rollback_recovery_owner(
+            owner,
+            RollbackJournalRecoveryState::ReplayPending,
+            RollbackRecoveryNamespace {
+                db_path: PathBuf::from("/dropped-recovery-open.db"),
+                journal_path: PathBuf::from("/dropped-recovery-open.db-journal"),
+                db_identity: None,
+                journal_mode: JournalMode::Delete,
+                #[cfg(all(feature = "native", any(unix, windows)))]
+                namespace_binding: None,
+            },
+        )
+        .unwrap();
+
+        // A recovery-open future takes the receipt out of the gate into its
+        // claim (mirroring `enter_readwrite_open_for_orphan_recovery`).
+        let recovery = {
+            let mut state = gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .orphaned_rollback_recovery
+                .take()
+                .expect("armed recovery must be retained until a claim takes it")
+        };
+        assert_eq!(recovery.owner, owner);
+        let claim = OrphanedRollbackRecoveryOpenClaim {
+            gate: Arc::clone(&gate),
+            recovery: Some(recovery),
+        };
+        // While the claim is live the gate holds no receipt — the future owns it.
+        assert!(
+            gate.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .orphaned_rollback_recovery
+                .is_none()
+        );
+
+        // The recovery-open future is dropped mid-await, before `finish()`.
+        drop(claim);
+
+        // The receipt is restored to the gate with its exact owner — the
+        // persistent recovery lease survives the drop instead of being stranded.
+        let state = gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let restored = state
+            .orphaned_rollback_recovery
+            .as_ref()
+            .expect("a dropped recovery-open claim must restore the receipt, not strand it");
+        assert_eq!(restored.owner, owner);
+        assert!(matches!(
+            restored.recovery_state,
+            RollbackJournalRecoveryState::ReplayPending
+        ));
+        assert_eq!(gate.rollback_recovery_owner(), Some(owner));
+    }
+
     #[test]
     fn dropped_owner_pager_keeps_identity_recovery_armed_until_adoption() {
         asupersync::test_utils::run_test(|| async {

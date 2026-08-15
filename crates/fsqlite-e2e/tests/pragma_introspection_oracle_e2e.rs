@@ -240,47 +240,40 @@ fn pragma_index_list_unique_origin() {
     });
 }
 
-/// GH #344 -- THIS TEST IS EXPECTED TO FAIL. THE RED IS CORRECT.
+/// GH #344 (bd-sn184) -- FIXED. Regression guard for `PRAGMA index_list` on a
+/// WITHOUT ROWID table reporting the PRIMARY KEY auto-index.
 ///
-/// =========================================================================
-/// READ THIS BEFORE YOU "FIX" A RED FROM THIS TEST
-/// =========================================================================
-/// This test is RED on purpose. It is not a broken test, not a flake, and not
-/// an environment problem. It pins a real, currently-unfixed engine defect:
-/// `PRAGMA index_list` on a WITHOUT ROWID table omits the PRIMARY KEY
-/// auto-index that stock SQLite reports.
-///
-/// Measured against the oracle in this same harness:
+/// The defect (now fixed): `PRAGMA index_list` on a WITHOUT ROWID table omitted
+/// the PRIMARY KEY auto-index that stock SQLite reports. Measured against the
+/// oracle in this same harness, the engine used to return:
 ///     frank: [_3|u, _2|u]
 ///     csql:  [_3|u, _2|u, sqlite_autoindex_w_1|pk]
-/// The `pk` row is ABSENT, not relabelled with some other origin string.
+/// i.e. the `pk` row was ABSENT.
 ///
-/// ROOT CAUSE: crates/fsqlite-core/src/connection.rs:52341 skips the hidden
-/// WITHOUT ROWID primary-key slot when building `implicit_indexes`, so
-/// `PRAGMA index_list` (:64711), which derives `origin` only for entries
-/// already present in `t.indexes`, has no entry to label. The engine conflates
-/// "not materialised as a separate b-tree" (correct -- stock does the same)
-/// with "not reportable by introspection" (incorrect -- stock reports it).
+/// ROOT CAUSE: the CREATE handler (connection.rs, is_hidden_without_rowid_
+/// primary_key) correctly skips the hidden WITHOUT ROWID primary-key slot when
+/// building `implicit_indexes` -- stock does not materialise a separate b-tree
+/// for it either -- but the `index_list` reporting handler derived `origin` only
+/// from entries already present in `t.indexes`, so it had nothing to label. The
+/// engine conflated "not materialised as a separate b-tree" (correct) with "not
+/// reportable by introspection" (incorrect -- stock reports it).
 ///
-/// WHAT WOULD MAKE THIS PASS: `index_list` / `index_xinfo` synthesising the
-/// primary-key entry for WITHOUT ROWID tables at the REPORTING layer, while
-/// leaving root allocation untouched. After such a fix, `sqlite_master` for
-/// `w` must STILL contain only sqlite_autoindex_w_2 and _3 -- no new schema
-/// row, no new root page. That criterion is what distinguishes the right fix
-/// from the wrong one.
+/// THE FIX (connection.rs `index_list`): synthesise the primary-key entry for
+/// WITHOUT ROWID tables at the REPORTING layer only -- at its canonical ordinal
+/// (the auto-index number missing from the persisted set), spliced into creation
+/// order so the reverse ordering matches stock. Root allocation is untouched:
+/// `sqlite_master` for `w` still contains only sqlite_autoindex_w_2 and _3 -- no
+/// new schema row, no new root page. The `sqlite_master` invariant is what
+/// distinguishes this reporting fix from the wrong one.
 ///
-/// DO NOT delete the skip at connection.rs:52341 to make this green: that
-/// would allocate a real root b-tree for an index that must not have one,
-/// which is a corruption risk, not a fix.
-///
-/// DO NOT relax this assertion, add #[ignore], or adjust the expectation to
-/// match FrankenSQLite's current output. Anyone who makes this green without
-/// fixing the engine has blessed the defect and destroyed the only signal that
-/// tells us when it is actually fixed.
+/// DO NOT make this green by deleting the CREATE-time skip: that would allocate
+/// a real root b-tree for an index that must not have one -- a corruption risk,
+/// not a fix. DO NOT relax this assertion or add #[ignore]; it is the signal
+/// that the reporting stays correct.
 ///
 /// The sibling `pragma_index_list_rowid_composite_pk` runs the identical DDL
-/// without the WITHOUT ROWID clause and PASSES, which scopes this defect to
-/// the WITHOUT ROWID path rather than to origin `pk` generally.
+/// without the WITHOUT ROWID clause and also passes, scoping the original defect
+/// to the WITHOUT ROWID path rather than to origin `pk` generally.
 #[test]
 fn pragma_index_list_without_rowid_composite_pk() {
     asupersync::test_utils::run_test(|| async {

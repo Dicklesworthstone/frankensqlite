@@ -64817,12 +64817,14 @@ impl Connection {
                         // most recently created index gets seq 0) and reports
                         // origin 'c' for CREATE INDEX, or 'u'/'pk' for the
                         // UNIQUE/PRIMARY KEY auto-index (sqlite_autoindex_*).
-                        let rows = t
+                        //
+                        // Build the entries in creation order first so the hidden
+                        // WITHOUT ROWID PRIMARY KEY auto-index can be spliced in at
+                        // its canonical ordinal before the reversal below.
+                        let mut entries: Vec<(String, i64, &'static str)> = t
                             .indexes
                             .iter()
-                            .rev()
-                            .enumerate()
-                            .map(|(seq, idx)| {
+                            .map(|idx| {
                                 let origin = if self.index_is_implicit_autoindex(&idx.name, &t.name)
                                 {
                                     let is_pk = t.primary_key_constraints.iter().any(|pk_cols| {
@@ -64836,15 +64838,53 @@ impl Connection {
                                 } else {
                                     "c"
                                 };
-                                Row {
-                                    values: vec![
-                                        SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
-                                        SqliteValue::Text(idx.name.clone().into()),
-                                        SqliteValue::Integer(i64::from(idx.is_unique)),
-                                        SqliteValue::Text(origin.into()),
-                                        SqliteValue::Integer(0),
-                                    ],
-                                }
+                                (idx.name.clone(), i64::from(idx.is_unique), origin)
+                            })
+                            .collect();
+
+                        // A WITHOUT ROWID table's PRIMARY KEY *is* the table's own
+                        // b-tree, so CREATE deliberately does not persist a
+                        // sqlite_autoindex_<t>_<N> schema row for it (see
+                        // is_hidden_without_rowid_primary_key). Stock SQLite still
+                        // reports it in `PRAGMA index_list` with origin 'pk'.
+                        // Synthesize that row here — reporting only, no schema row
+                        // and no root page — at its canonical ordinal: the one
+                        // auto-index number missing from the persisted set, spliced
+                        // into creation order so the reversal matches stock's
+                        // ordering. (GH #344 / bd-sn184)
+                        if t.without_rowid {
+                            let persisted: std::collections::BTreeSet<usize> = t
+                                .indexes
+                                .iter()
+                                .filter_map(|idx| parse_autoindex_ordinal(&idx.name, &t.name))
+                                .collect();
+                            if let Some(pk_ordinal) =
+                                (1..=persisted.len() + 1).find(|n| !persisted.contains(n))
+                            {
+                                let name = format!("sqlite_autoindex_{}_{pk_ordinal}", t.name);
+                                let pos = entries
+                                    .iter()
+                                    .position(|(nm, _, _)| {
+                                        parse_autoindex_ordinal(nm, &t.name)
+                                            .is_some_and(|o| o > pk_ordinal)
+                                    })
+                                    .unwrap_or(entries.len());
+                                entries.insert(pos, (name, 1, "pk"));
+                            }
+                        }
+
+                        let rows = entries
+                            .iter()
+                            .rev()
+                            .enumerate()
+                            .map(|(seq, (name, is_unique, origin))| Row {
+                                values: vec![
+                                    SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
+                                    SqliteValue::Text(name.clone().into()),
+                                    SqliteValue::Integer(*is_unique),
+                                    SqliteValue::Text((*origin).into()),
+                                    SqliteValue::Integer(0),
+                                ],
                             })
                             .collect();
                         Ok(rows)
