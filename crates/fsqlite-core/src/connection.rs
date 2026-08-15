@@ -35999,14 +35999,39 @@ enum BoundedSchemaExpressionRole {
 impl BoundedSchemaExpressionRole {
     /// Whether shapes outside the reproducible fragment are refused.
     ///
-    /// True for both restricted roles. Admitting a subquery, bind parameter,
-    /// JSON access or row-value here would retire a real protection, so this
-    /// stays uniform until each is argued individually. In particular the
-    /// subquery refusal is deliberately NOT relaxed for [`Self::Unevaluated`]:
-    /// unlike a terminal action, a subquery carries an arbitrary sub-AST, and
-    /// admitting it needs a node/depth budget argument that has not been made.
+    /// True for both restricted roles. Bind parameters, JSON access,
+    /// row-values and IN-table shorthand stay refused everywhere they were
+    /// before; each would need its own argument to relax, and none has one.
     const fn rejects_shapes(self) -> bool {
         !matches!(self, Self::Unrestricted)
+    }
+
+    /// Whether a subquery is refused by SHAPE.
+    ///
+    /// Refused inside an [`Self::Evaluated`] expression, where the bounded
+    /// evaluator would have to reproduce it exactly and cannot.
+    ///
+    /// Admitted in [`Self::Unevaluated`], where nothing evaluates it. Unlike a
+    /// terminal action a subquery carries an arbitrary sub-AST, so this rests
+    /// on two properties of the walker rather than on the node being trivial:
+    ///
+    /// 1. **Bounded.** The traversal is iterative over an explicit `pending`
+    ///    stack with per-node `visited` and `depth` counters checked against
+    ///    [`BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES`] and
+    ///    [`BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH`]. An admitted subquery
+    ///    pushes its `Select` onto that same stack at `child_depth`, so its
+    ///    children are counted and limited identically. An over-large subquery
+    ///    is refused BY THE BUDGET, which is the honest outcome: it says what
+    ///    could not be proven, where a shape refusal rejected inputs it could
+    ///    have proven.
+    /// 2. **Fail-closed.** No arm of this traversal silently skips a node. The
+    ///    `Expr` and `Statement` matches end in catch-alls that REFUSE, and the
+    ///    remaining node kinds are exhaustive enum matches with every
+    ///    expression-bearing field pushed. So descending into a subquery cannot
+    ///    admit anything without proving it; an unknown shape inside one is
+    ///    refused exactly as it would be at the top level.
+    const fn rejects_subqueries(self) -> bool {
+        matches!(self, Self::Evaluated)
     }
 
     /// Whether a terminal action such as `RAISE(ABORT, ...)` is refused.
@@ -36331,7 +36356,7 @@ fn first_unsupported_bounded_ast(
                             }
                         }
                         InSet::Subquery(select) => {
-                            if expression_role.rejects_shapes() {
+                            if expression_role.rejects_subqueries() {
                                 return Ok(Some(BoundedAstUnsupported::Shape(
                                     "subquery in persisted schema expression",
                                 )));
@@ -36386,7 +36411,7 @@ fn first_unsupported_bounded_ast(
                     }
                 }
                 Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
-                    if expression_role.rejects_shapes() {
+                    if expression_role.rejects_subqueries() {
                         return Ok(Some(BoundedAstUnsupported::Shape(
                             "subquery in persisted schema expression",
                         )));
@@ -231779,36 +231804,113 @@ mod pager_routing_tests {
         });
     }
 
-    /// GH #340 follow-up: the carve-out is TERMINAL ACTIONS ONLY.
+    /// A subquery in an unevaluated role is ADMITTED.
     ///
-    /// A subquery in a trigger WHEN clause carries an arbitrary sub-AST, so
-    /// admitting it needs a node/depth budget argument that has not been made.
-    /// It stays refused even in the unevaluated role. This test exists to make
-    /// widening the carve-out a deliberate, visible act rather than a silent
-    /// side effect of touching the policy.
+    /// This REPLACES `semantic_validation_still_refuses_a_subquery_in_an_unevaluated_role`,
+    /// which pinned the opposite behaviour while the budget question was open.
+    /// The boundary moved, so the pin moved with it rather than being deleted:
+    /// a pinned boundary that quietly disappears is worse than no pin, because
+    /// the next reader assumes the case was never protected. The three tests
+    /// here pin what actually holds now — admitted in the unevaluated role,
+    /// still refused in the evaluated one, and bounded by the budget rather
+    /// than by shape.
+    ///
+    /// Self-referential `WHEN EXISTS (...)` is the exact shape the real client
+    /// schema is built on (97 of its 157 triggers).
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn semantic_validation_still_refuses_a_subquery_in_an_unevaluated_role() {
+    fn semantic_validation_admits_a_subquery_in_an_unevaluated_role() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             let when_clause = fsqlite_parser::expr::parse_expr(
                 "EXISTS (SELECT 1 FROM audit_log AS existing WHERE existing.id = NEW.id)",
             )
             .expect("the WHEN clause parses");
+            conn.validate_bounded_ast_semantics(
+                BoundedCollationAstNode::Expr(&when_clause),
+                "WHEN clause of trigger `trg_probe`",
+                BoundedSchemaExpressionRole::Unevaluated,
+            )
+            .expect(
+                "a subquery must be admitted where nothing evaluates it: the walk stays \
+                 bounded by the node/depth budget and fails closed on unknown shapes",
+            );
+
+            // An IN-subquery takes the same path and must agree.
+            let in_subquery = fsqlite_parser::expr::parse_expr(
+                "NEW.id IN (SELECT existing.id FROM audit_log AS existing)",
+            )
+            .expect("the IN subquery parses");
+            conn.validate_bounded_ast_semantics(
+                BoundedCollationAstNode::Expr(&in_subquery),
+                "WHEN clause of trigger `trg_probe_in`",
+                BoundedSchemaExpressionRole::Unevaluated,
+            )
+            .expect("an IN-subquery must be admitted in the unevaluated role");
+        });
+    }
+
+    /// A subquery inside an EVALUATED expression is still refused.
+    ///
+    /// The bounded evaluator recomputes CHECK constraints against real rows and
+    /// cannot reproduce a subquery, so this half of the split must not move.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_still_refuses_a_subquery_inside_a_check_constraint() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
             let error = conn
-                .validate_bounded_ast_semantics(
-                    BoundedCollationAstNode::Expr(&when_clause),
-                    "WHEN clause of trigger `trg_probe`",
-                    BoundedSchemaExpressionRole::Unevaluated,
+                .validate_bounded_check_expression_in_sql(
+                    "EXISTS (SELECT 1 FROM other AS o WHERE o.id = id)",
+                    "CHECK constraint 1 on table `t`",
                 )
-                .expect_err(
-                    "a subquery must stay refused in the unevaluated role until its \
-                     node/depth budget is established",
-                );
+                .expect_err("a subquery in an evaluated CHECK expression must stay refused");
             let message = error.to_string();
             assert!(
                 message.contains("subquery in persisted schema expression"),
                 "expected the subquery shape refusal, got {message}"
+            );
+        });
+    }
+
+    /// The admitted subquery is bounded BY THE BUDGET, not by shape.
+    ///
+    /// This is the load-bearing safety property: admitting subqueries must not
+    /// convert a shape refusal into an unbounded walk. An over-deep nest is
+    /// refused with the DEPTH diagnostic, proving the traversal descends into
+    /// subquery children under the same counters rather than waving them
+    /// through. Without this test, "admitted" and "not traversed" would look
+    /// identical from the outside.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_bounds_an_admitted_subquery_by_the_depth_budget() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+
+            // Nest well past BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH (512).
+            let depth = BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH + 64;
+            let mut sql = String::from("SELECT 1");
+            for _ in 0..depth {
+                sql = format!("SELECT 1 WHERE EXISTS ({sql})");
+            }
+            let nested = fsqlite_parser::expr::parse_expr(&format!("EXISTS ({sql})"))
+                .expect("the deeply nested subquery parses");
+
+            let error = conn
+                .validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Expr(&nested),
+                    "WHEN clause of trigger `trg_deep`",
+                    BoundedSchemaExpressionRole::Unevaluated,
+                )
+                .expect_err("an over-deep admitted subquery must be refused by the budget");
+            let message = error.to_string();
+            assert!(
+                message.contains("depth limit") || message.contains("node"),
+                "expected a BUDGET refusal naming the depth or node limit, got {message}"
+            );
+            assert!(
+                !message.contains("subquery in persisted schema expression"),
+                "the refusal must come from the budget, not from the shape gate: {message}"
             );
         });
     }
