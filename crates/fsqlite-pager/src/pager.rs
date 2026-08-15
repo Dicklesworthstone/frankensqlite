@@ -21261,6 +21261,10 @@ where
             return Ok(());
         }
         if self.write_set.len() >= limit {
+            // A ceiling never approached and one that actively refused work
+            // leave identical high-water marks; only this distinguishes them.
+            self.write_set_cap_refusals
+                .fetch_add(1, AtomicOrdering::Relaxed);
             return Err(FrankenError::OutOfRange {
                 what: "schema-only builder write-set page limit".to_owned(),
                 value: format!(
@@ -21269,6 +21273,22 @@ where
                     self.write_set.len() + 1
                 ),
             });
+        }
+        // Admitted: this page becomes the Nth distinct dirty page.
+        let admitted = self.write_set.len() + 1;
+        self.write_set_current_pages
+            .store(admitted, AtomicOrdering::Relaxed);
+        let mut high = self.write_set_high_water_pages.load(AtomicOrdering::Relaxed);
+        while admitted > high {
+            match self.write_set_high_water_pages.compare_exchange_weak(
+                high,
+                admitted,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => high = observed,
+            }
         }
         Ok(())
     }
