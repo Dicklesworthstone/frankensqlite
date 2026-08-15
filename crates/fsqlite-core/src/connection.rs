@@ -56871,7 +56871,30 @@ impl Connection {
                         self.queue_statement_fk_validation_table(child_table);
                     }
                     FkActionType::NoAction | FkActionType::Restrict => {
-                        return Err(FrankenError::ForeignKeyViolation);
+                        // RESTRICT is always immediate. A DEFERRED (DEFERRABLE
+                        // INITIALLY DEFERRED) NO ACTION must not error at the
+                        // delete point — a parent re-inserted before COMMIT
+                        // satisfies it. Materialize the affected child rows and
+                        // enqueue each as a deferred parent-existence obligation,
+                        // rechecked by recheck_deferred_fk_at_commit
+                        // (bd-gh-deferred-fk-parent-dml, GH #149).
+                        if matches!(fk.on_delete, FkActionType::NoAction)
+                            && self.fk_should_defer(fk)
+                        {
+                            let fetch_sql = format!(
+                                "SELECT * FROM {} WHERE {}",
+                                quote_identifier(child_table),
+                                where_parts.join(" AND ")
+                            );
+                            let affected =
+                                self.fk_validation_query(&fetch_sql, &parent_values).await?;
+                            let mut queue = self.deferred_fk_checks.borrow_mut();
+                            for row in affected {
+                                queue.push((child_table.clone(), row.values().to_vec()));
+                            }
+                        } else {
+                            return Err(FrankenError::ForeignKeyViolation);
+                        }
                     }
                 }
             }
@@ -57228,7 +57251,29 @@ impl Connection {
                     }
                     fsqlite_vdbe::codegen::FkActionType::NoAction
                     | fsqlite_vdbe::codegen::FkActionType::Restrict => {
-                        return Err(FrankenError::ForeignKeyViolation);
+                        // Mirror of the ON DELETE NO ACTION deferral: a DEFERRED
+                        // ON UPDATE NO ACTION re-checks the affected children's
+                        // parent existence at COMMIT instead of erroring at the
+                        // update point (bd-gh-deferred-fk-parent-dml, GH #149).
+                        if matches!(
+                            fk.on_update,
+                            fsqlite_vdbe::codegen::FkActionType::NoAction
+                        ) && self.fk_should_defer(fk)
+                        {
+                            let fetch_sql = format!(
+                                "SELECT * FROM {} WHERE {}",
+                                quote_identifier(child_table),
+                                where_parts.join(" AND ")
+                            );
+                            let affected =
+                                self.fk_validation_query(&fetch_sql, &old_parent_vals).await?;
+                            let mut queue = self.deferred_fk_checks.borrow_mut();
+                            for row in affected {
+                                queue.push((child_table.clone(), row.values().to_vec()));
+                            }
+                        } else {
+                            return Err(FrankenError::ForeignKeyViolation);
+                        }
                     }
                 }
             }
