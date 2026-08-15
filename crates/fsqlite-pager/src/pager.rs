@@ -22726,6 +22726,31 @@ where
                         inner.freelist.len(),
                     );
                 }
+                // bd-84rh4 ERASURE probe: a commit that frees in-range pages but
+                // skips freelist serialization (freelist_dirty=false) never writes
+                // those frees to the durable trunk. If such a page is not already
+                // durably free, it can leak as "page N is never used". Gated on the
+                // hunt's existing RH4_TRACE so a stochastic churn leak is captured
+                // in one pass; inert in production and CI.
+                if !freelist_dirty && std::env::var_os("RH4_TRACE").is_some() {
+                    let inrange_freed: Vec<u32> = pending_free_pages
+                        .iter()
+                        .copied()
+                        .filter(|page| page.get() <= committed_db_size)
+                        .map(PageNumber::get)
+                        .collect();
+                    if !inrange_freed.is_empty() {
+                        let already_durable_free: Vec<u32> = inrange_freed
+                            .iter()
+                            .copied()
+                            .filter(|p| inner.freelist.iter().any(|f| f.get() == *p))
+                            .collect();
+                        eprintln!(
+                            "RH4ERASE skip_serialize committed_db={committed_db_size} inrange_freed={inrange_freed:?} already_durable_free={already_durable_free:?} inner_freelist_len={}",
+                            inner.freelist.len(),
+                        );
+                    }
+                }
                 if freelist_dirty {
                     match serialize_freelist_to_write_set(
                         cx,
@@ -23490,6 +23515,31 @@ where
                         pending_free_pages.len(),
                         inner.freelist.len(),
                     );
+                }
+                // bd-84rh4 ERASURE probe: a commit that frees in-range pages but
+                // skips freelist serialization (freelist_dirty=false) never writes
+                // those frees to the durable trunk. If such a page is not already
+                // durably free, it can leak as "page N is never used". Gated on the
+                // hunt's existing RH4_TRACE so a stochastic churn leak is captured
+                // in one pass; inert in production and CI.
+                if !freelist_dirty && std::env::var_os("RH4_TRACE").is_some() {
+                    let inrange_freed: Vec<u32> = pending_free_pages
+                        .iter()
+                        .copied()
+                        .filter(|page| page.get() <= committed_db_size)
+                        .map(PageNumber::get)
+                        .collect();
+                    if !inrange_freed.is_empty() {
+                        let already_durable_free: Vec<u32> = inrange_freed
+                            .iter()
+                            .copied()
+                            .filter(|p| inner.freelist.iter().any(|f| f.get() == *p))
+                            .collect();
+                        eprintln!(
+                            "RH4ERASE skip_serialize committed_db={committed_db_size} inrange_freed={inrange_freed:?} already_durable_free={already_durable_free:?} inner_freelist_len={}",
+                            inner.freelist.len(),
+                        );
+                    }
                 }
                 if freelist_dirty {
                     match serialize_freelist_to_write_set(
