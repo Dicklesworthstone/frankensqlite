@@ -399,6 +399,9 @@ claude-upgrade-progress.json
 # Beads local machine markers (never canonical tracker state)
 .beads/.local_version
 .beads/.migration-hint-ts
+# WAL certification sidecars (`*.db-wal` does not match beads.db-wal-cert)
+.beads/*.db-wal-cert
+.beads/*.db-wal-cert-head
 # br / cleanup session markers
 .last-cleanup
 # RCH virtual FS workload workspaces (compile offload scratch)
