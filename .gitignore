@@ -309,6 +309,8 @@ tmp_rch_probe/
 .beads/*.reindex_test_*
 .beads/*.vacuum_test_*
 .beads/recovery*/
+# br fsqlite WAL-cert sidecars — per-machine runtime, like -wal/-shm.
+.beads/*.db-wal-cert*
 
 # Remote compilation helper local cache. Keep the project transfer contract,
 # but ignore every other machine-local RCH file.
