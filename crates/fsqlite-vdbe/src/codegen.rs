@@ -14480,6 +14480,13 @@ fn emit_aggregate_accumulate_body(
     schema: &[TableSchema],
     agg_columns: &[AggColumn],
     accum_base: i32,
+    // GH #226: register holding 0 until the first scanned row's bare columns
+    // have been captured, then 1. Gates row-dependent bare-column stores so an
+    // aggregate query's bare column keeps the FIRST scanned row (matching stock
+    // sqlite3) instead of the last. Allocated + zeroed once in the caller's
+    // shared preamble (before any scan strategy), so a single init serves every
+    // scan path.
+    first_row_flag: i32,
 ) {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for (i, agg) in agg_columns.iter().enumerate() {
@@ -14489,7 +14496,7 @@ fn emit_aggregate_accumulate_body(
         }
         let accum_reg = accum_base + i as i32;
 
-        // Bare (non-aggregate) column: evaluate expression on each row
+        // Bare (non-aggregate) column: evaluate expression on the FIRST row only
         // and store in the accumulator register.  No AggStep needed.
         if let Some(ref bare) = agg.bare_expr {
             // Row-independent scalars belong to the aggregate output row, not
@@ -14506,7 +14513,11 @@ fn emit_aggregate_accumulate_body(
                 register_base: None,
                 secondaries: &[],
             };
+            // GH #226: capture the first scanned row's value; skip on later rows.
+            let skip_bare = b.emit_label();
+            b.emit_jump_to_label(Opcode::If, first_row_flag, 0, skip_bare, P4::None, 0);
             emit_expr(b, bare, accum_reg, Some(&scan_ctx));
+            b.resolve_label(skip_bare);
             continue;
         }
 
@@ -14609,6 +14620,9 @@ fn emit_aggregate_accumulate_body(
             b.resolve_label(skip_lbl);
         }
     }
+    // GH #226: after the first scanned row's bare columns are captured, mark the
+    // flag so subsequent rows skip the bare-column store (idempotent each row).
+    b.emit_op(Opcode::Integer, 1, first_row_flag, 0, P4::None, 0);
 }
 
 /// The index a `WHERE <equality-prefix>` aggregate can seek instead of scanning.
@@ -15165,6 +15179,9 @@ fn emit_aggregate_index_value_seek(
     schema: &[TableSchema],
     agg_columns: &[AggColumn],
     accum_base: i32,
+    // GH #226: forwarded to emit_aggregate_accumulate_body so a bare column
+    // keeps the first scanned row on this index-value-seek scan path too.
+    first_row_flag: i32,
     value: i64,
     covering: bool,
     residual_where: Option<&Expr>,
@@ -15259,6 +15276,7 @@ fn emit_aggregate_index_value_seek(
             schema,
             agg_columns,
             accum_base,
+            first_row_flag,
         );
         b.resolve_label(skip_row);
     }
@@ -15472,6 +15490,10 @@ fn codegen_select_aggregate(
             &mut agg_columns,
             &mut having_output_cols,
         );
+        // GH #225: capture bare columns referenced in HAVING (first scanned row)
+        // so a HAVING predicate on an unprojected column resolves to a real
+        // value instead of NULL.
+        collect_having_bare_columns(having_expr, table, &mut agg_columns);
     }
 
     // A single-group aggregate produces at most one row, but LIMIT/OFFSET still
@@ -15496,6 +15518,13 @@ fn codegen_select_aggregate(
     for i in 0..total_agg_count {
         b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
     }
+
+    // GH #226: a shared first-row flag for bare-column capture. Zeroed here in
+    // the single preamble that precedes every scan strategy, so all
+    // emit_aggregate_accumulate_body call sites gate on the same register and
+    // the bare column keeps the FIRST scanned row (stock sqlite3), not the last.
+    let first_row_flag = b.alloc_reg();
+    b.emit_op(Opcode::Integer, 0, first_row_flag, 0, P4::None, 0);
 
     // bd-2dgf5: indexed-equality seek instead of a full table scan.
     //
@@ -15855,6 +15884,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
+                first_row_flag,
             );
         }
 
@@ -15925,6 +15955,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
+            first_row_flag,
         );
         skip_scan = true;
     } else if let Some((range, has_residual)) = rowid_range_seek {
@@ -16017,6 +16048,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
+            first_row_flag,
         );
         b.resolve_label(range_skip_label);
         b.emit_op(Opcode::Next, cursor, range_loop_top, 0, P4::None, 0);
@@ -16058,6 +16090,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
+                first_row_flag,
                 value,
                 covering,
                 residual_where,
@@ -16242,6 +16275,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
+                first_row_flag,
             );
         }
 
@@ -16458,6 +16492,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
+                first_row_flag,
             );
         }
 
@@ -16573,6 +16608,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
+            first_row_flag,
         );
 
         b.resolve_label(skip_label);
@@ -16632,6 +16668,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
+                first_row_flag,
             );
             b.resolve_label(skip_label);
         }
@@ -16677,6 +16714,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
+            first_row_flag,
         );
         skip_scan = true;
     }
@@ -16719,6 +16757,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
+            first_row_flag,
         );
 
         // Skip label for WHERE-filtered rows.
@@ -18491,6 +18530,111 @@ fn collect_having_aggregates(
         Expr::RowValue(values, _) => {
             for value in values {
                 collect_having_aggregates(value, table, agg_columns, output_cols);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// GH #225: append every bare table column referenced by a HAVING clause OUTSIDE
+/// any aggregate as a HIDDEN `bare_expr` aggregate, so the implicit-aggregate
+/// scan captures the FIRST scanned row's value for it (matching stock sqlite3's
+/// bare-column-in-HAVING semantics). `emit_having_expr` then resolves the column
+/// to this aggregate's accumulator instead of falling back to NULL. Columns
+/// already covered by a `bare_expr` aggregate (e.g. also in the SELECT list) are
+/// not duplicated. Aggregate arguments are intentionally NOT descended into —
+/// those belong to the aggregate, not a bare column.
+fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &mut Vec<AggColumn>) {
+    match expr {
+        // A column referenced directly in HAVING: capture it (first row).
+        Expr::Column(_, _) => {
+            let Some(ci) = resolve_column_index(expr, table) else {
+                return;
+            };
+            let already = agg_columns.iter().any(|agg| {
+                agg.bare_expr
+                    .as_deref()
+                    .and_then(|be| resolve_column_index(be, table))
+                    == Some(ci)
+            });
+            if !already {
+                agg_columns.push(AggColumn {
+                    name: String::new(),
+                    num_args: 0,
+                    arg_col_index: None,
+                    arg_is_rowid: false,
+                    distinct: false,
+                    arg_expr: None,
+                    extra_args: Vec::new(),
+                    filter: None,
+                    wrapper_expr: None,
+                    hidden: true,
+                    multi_agg_indices: Vec::new(),
+                    bare_expr: Some(Box::new(expr.clone())),
+                    collation: None,
+                });
+            }
+        }
+        // Do not descend into an aggregate's own arguments.
+        Expr::FunctionCall { name, args, .. } if is_aggregate_function_call(name, args) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            collect_having_bare_columns(left, table, agg_columns);
+            collect_having_bare_columns(right, table, agg_columns);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            collect_having_bare_columns(inner, table, agg_columns);
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_having_bare_columns(inner, table, agg_columns);
+            collect_having_bare_columns(low, table, agg_columns);
+            collect_having_bare_columns(high, table, agg_columns);
+        }
+        Expr::In { expr: inner, .. } => {
+            collect_having_bare_columns(inner, table, agg_columns);
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_having_bare_columns(inner, table, agg_columns);
+            collect_having_bare_columns(pattern, table, agg_columns);
+            if let Some(escape) = escape.as_deref() {
+                collect_having_bare_columns(escape, table, agg_columns);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand.as_deref() {
+                collect_having_bare_columns(operand, table, agg_columns);
+            }
+            for (when_expr, then_expr) in whens {
+                collect_having_bare_columns(when_expr, table, agg_columns);
+                collect_having_bare_columns(then_expr, table, agg_columns);
+            }
+            if let Some(else_expr) = else_expr.as_deref() {
+                collect_having_bare_columns(else_expr, table, agg_columns);
+            }
+        }
+        // Non-aggregate function calls may carry bare columns in their arguments.
+        Expr::FunctionCall { args, .. } => {
+            if let FunctionArgs::List(list) = args {
+                for arg in list {
+                    collect_having_bare_columns(arg, table, agg_columns);
+                }
             }
         }
         _ => {}
@@ -26528,6 +26672,24 @@ fn emit_having_expr(
                         return;
                     }
                 }
+                // GH #225: a bare column referenced by HAVING (no GROUP BY, or an
+                // unprojected column) is captured as a hidden bare_expr aggregate
+                // holding the first scanned row's value. Resolve it to that
+                // aggregate's output register instead of NULL.
+                if let Some(agg_i) = agg_columns.iter().position(|agg| {
+                    agg.bare_expr
+                        .as_deref()
+                        .and_then(|be| resolve_column_index(be, table))
+                        == Some(col_idx)
+                }) {
+                    for (i, oc) in output_cols.iter().enumerate() {
+                        if matches!(oc, GroupByOutputCol::Aggregate { agg_index } if *agg_index == agg_i)
+                        {
+                            b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
+                            return;
+                        }
+                    }
+                }
             }
             // Fallback: emit NULL for unresolved column.
             b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
@@ -26604,6 +26766,37 @@ fn emit_having_expr(
             }
             b.free_temp(right_reg);
             b.free_temp(left_reg);
+        }
+
+        // GH #225: `x IS [NOT] NULL` in HAVING must evaluate its operand through
+        // the HAVING resolver (so a bare column resolves to its captured first-row
+        // aggregate register) rather than the raw evaluator, which would leave the
+        // column NULL and wrongly satisfy `IS NULL`.
+        Expr::IsNull {
+            expr: inner, not, ..
+        } => {
+            let val_reg = b.alloc_temp();
+            emit_having_expr(
+                b,
+                inner,
+                val_reg,
+                output_cols,
+                agg_columns,
+                group_by_keys,
+                table,
+                out_regs,
+            );
+            let is_null_lbl = b.emit_label();
+            let done_lbl = b.emit_label();
+            b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, is_null_lbl, P4::None, 0);
+            // Operand is non-NULL: `IS NULL` -> 0, `IS NOT NULL` -> 1.
+            b.emit_op(Opcode::Integer, i32::from(*not), dest_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_lbl, P4::None, 0);
+            b.resolve_label(is_null_lbl);
+            // Operand is NULL: `IS NULL` -> 1, `IS NOT NULL` -> 0.
+            b.emit_op(Opcode::Integer, i32::from(!*not), dest_reg, 0, P4::None, 0);
+            b.resolve_label(done_lbl);
+            b.free_temp(val_reg);
         }
 
         // For any other expression, delegate to the standard evaluator.
