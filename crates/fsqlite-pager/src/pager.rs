@@ -22307,6 +22307,20 @@ where
                 self.freed_pages.push(page_no);
                 self.freed_pages_index.insert(page_no);
                 self.note_freed_page_bound(page_no);
+            } else if std::env::var_os("RH4_TRACE").is_some()
+                && !self.freed_pages.iter().any(|&p| p == page_no)
+            {
+                // bd-84rh4 free-tracking probe: the dedup guard skipped this
+                // free because freed_pages_index/bounds say the page is already
+                // freed, but it is NOT actually in freed_pages — a stale-index
+                // GHOST. The free is silently lost -> the page orphans as
+                // "never used". Gated on RH4_TRACE; inert in prod/CI.
+                eprintln!(
+                    "RH4FREEGHOST page={} index_says_freed_but_absent_from_freed_pages freed_len={} bounds={:?}",
+                    page_no.get(),
+                    self.freed_pages.len(),
+                    self.freed_page_bounds.map(|(l, h)| (l.get(), h.get())),
+                );
             }
             if self.write_set.remove(&page_no).is_some() {
                 remove_page_sorted(&mut self.write_pages_sorted, page_no);
