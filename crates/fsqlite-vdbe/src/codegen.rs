@@ -15490,6 +15490,10 @@ fn codegen_select_aggregate(
             &mut agg_columns,
             &mut having_output_cols,
         );
+        // GH #225: capture bare columns referenced in HAVING (first scanned row)
+        // so a HAVING predicate on an unprojected column resolves to a real
+        // value instead of NULL.
+        collect_having_bare_columns(having_expr, table, &mut agg_columns);
     }
 
     // A single-group aggregate produces at most one row, but LIMIT/OFFSET still
@@ -18526,6 +18530,111 @@ fn collect_having_aggregates(
         Expr::RowValue(values, _) => {
             for value in values {
                 collect_having_aggregates(value, table, agg_columns, output_cols);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// GH #225: append every bare table column referenced by a HAVING clause OUTSIDE
+/// any aggregate as a HIDDEN `bare_expr` aggregate, so the implicit-aggregate
+/// scan captures the FIRST scanned row's value for it (matching stock sqlite3's
+/// bare-column-in-HAVING semantics). `emit_having_expr` then resolves the column
+/// to this aggregate's accumulator instead of falling back to NULL. Columns
+/// already covered by a `bare_expr` aggregate (e.g. also in the SELECT list) are
+/// not duplicated. Aggregate arguments are intentionally NOT descended into —
+/// those belong to the aggregate, not a bare column.
+fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &mut Vec<AggColumn>) {
+    match expr {
+        // A column referenced directly in HAVING: capture it (first row).
+        Expr::Column(_, _) => {
+            let Some(ci) = resolve_column_index(expr, table) else {
+                return;
+            };
+            let already = agg_columns.iter().any(|agg| {
+                agg.bare_expr
+                    .as_deref()
+                    .and_then(|be| resolve_column_index(be, table))
+                    == Some(ci)
+            });
+            if !already {
+                agg_columns.push(AggColumn {
+                    name: String::new(),
+                    num_args: 0,
+                    arg_col_index: None,
+                    arg_is_rowid: false,
+                    distinct: false,
+                    arg_expr: None,
+                    extra_args: Vec::new(),
+                    filter: None,
+                    wrapper_expr: None,
+                    hidden: true,
+                    multi_agg_indices: Vec::new(),
+                    bare_expr: Some(Box::new(expr.clone())),
+                    collation: None,
+                });
+            }
+        }
+        // Do not descend into an aggregate's own arguments.
+        Expr::FunctionCall { name, args, .. } if is_aggregate_function_call(name, args) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            collect_having_bare_columns(left, table, agg_columns);
+            collect_having_bare_columns(right, table, agg_columns);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            collect_having_bare_columns(inner, table, agg_columns);
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_having_bare_columns(inner, table, agg_columns);
+            collect_having_bare_columns(low, table, agg_columns);
+            collect_having_bare_columns(high, table, agg_columns);
+        }
+        Expr::In { expr: inner, .. } => {
+            collect_having_bare_columns(inner, table, agg_columns);
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_having_bare_columns(inner, table, agg_columns);
+            collect_having_bare_columns(pattern, table, agg_columns);
+            if let Some(escape) = escape.as_deref() {
+                collect_having_bare_columns(escape, table, agg_columns);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand.as_deref() {
+                collect_having_bare_columns(operand, table, agg_columns);
+            }
+            for (when_expr, then_expr) in whens {
+                collect_having_bare_columns(when_expr, table, agg_columns);
+                collect_having_bare_columns(then_expr, table, agg_columns);
+            }
+            if let Some(else_expr) = else_expr.as_deref() {
+                collect_having_bare_columns(else_expr, table, agg_columns);
+            }
+        }
+        // Non-aggregate function calls may carry bare columns in their arguments.
+        Expr::FunctionCall { args, .. } => {
+            if let FunctionArgs::List(list) = args {
+                for arg in list {
+                    collect_having_bare_columns(arg, table, agg_columns);
+                }
             }
         }
         _ => {}
@@ -26561,6 +26670,24 @@ fn emit_having_expr(
                     {
                         b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
                         return;
+                    }
+                }
+                // GH #225: a bare column referenced by HAVING (no GROUP BY, or an
+                // unprojected column) is captured as a hidden bare_expr aggregate
+                // holding the first scanned row's value. Resolve it to that
+                // aggregate's output register instead of NULL.
+                if let Some(agg_i) = agg_columns.iter().position(|agg| {
+                    agg.bare_expr
+                        .as_deref()
+                        .and_then(|be| resolve_column_index(be, table))
+                        == Some(col_idx)
+                }) {
+                    for (i, oc) in output_cols.iter().enumerate() {
+                        if matches!(oc, GroupByOutputCol::Aggregate { agg_index } if *agg_index == agg_i)
+                        {
+                            b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
+                            return;
+                        }
                     }
                 }
             }
