@@ -740,12 +740,25 @@ pub fn decode_column_from_offset(
     col: &ColumnOffset,
     profile_enabled: bool,
 ) -> Option<SqliteValue> {
+    decode_column_from_offset_with_encoding(data, col, TextEncoding::Utf8, profile_enabled)
+}
+
+/// Encoding-aware variant of [`decode_column_from_offset`] (bd-bld9w.2).
+///
+/// TEXT columns are decoded per `encoding`; [`TextEncoding::Utf8`] is identical
+/// to [`decode_column_from_offset`].
+pub fn decode_column_from_offset_with_encoding(
+    data: &[u8],
+    col: &ColumnOffset,
+    encoding: TextEncoding,
+    profile_enabled: bool,
+) -> Option<SqliteValue> {
     let start = col.body_offset as usize;
     let end = start.checked_add(col.value_len as usize)?;
     if end > data.len() {
         return None;
     }
-    decode_value(col.serial_type, &data[start..end], profile_enabled)
+    decode_value_with_encoding(col.serial_type, &data[start..end], encoding, profile_enabled)
 }
 
 /// Decode only the numeric aggregate-relevant shape of a projected column.
@@ -809,6 +822,28 @@ pub fn decode_column_from_offset_reuse(
     hint: Option<&SqliteValue>,
     profile_enabled: bool,
 ) -> Option<SqliteValue> {
+    decode_column_from_offset_reuse_with_encoding(
+        data,
+        col,
+        hint,
+        TextEncoding::Utf8,
+        profile_enabled,
+    )
+}
+
+/// Encoding-aware variant of [`decode_column_from_offset_reuse`] (bd-bld9w.2).
+///
+/// TEXT columns are decoded per `encoding`; [`TextEncoding::Utf8`] is identical
+/// to [`decode_column_from_offset_reuse`]. The Text hint fast path stays correct
+/// for UTF-16 because a decoded UTF-8 hint never byte-matches raw UTF-16 record
+/// bytes, so it falls through to a full decode.
+pub fn decode_column_from_offset_reuse_with_encoding(
+    data: &[u8],
+    col: &ColumnOffset,
+    hint: Option<&SqliteValue>,
+    encoding: TextEncoding,
+    profile_enabled: bool,
+) -> Option<SqliteValue> {
     let start = col.body_offset as usize;
     let end = start.checked_add(col.value_len as usize)?;
     if end > data.len() {
@@ -835,7 +870,7 @@ pub fn decode_column_from_offset_reuse(
         }
     }
 
-    decode_value(col.serial_type, bytes, profile_enabled)
+    decode_value_with_encoding(col.serial_type, bytes, encoding, profile_enabled)
 }
 
 /// Caller-owned scratch for lazy record decode and row materialization.
