@@ -34246,6 +34246,14 @@ impl Connection {
         rows: &[Row],
     ) -> Vec<ColumnInfo> {
         let col_names = self.select_result_column_names(select_stmt, &[], &mut Vec::new());
+        // Derive each column's affinity from the SELECT result-column decltype
+        // (via the AST), matching C SQLite CTAS. Sniffing the first materialized
+        // value instead coerced mixed storage classes to one affinity, e.g.
+        // ('1'),(2) all became TEXT (bd-gh-ctas-decltype-affinity).
+        let select_affinities = {
+            let schema = self.schema.borrow();
+            select_result_affinities(select_stmt, &schema)
+        };
         let width = rows.first().map_or(
             if col_names.is_empty() {
                 1
@@ -34257,16 +34265,22 @@ impl Connection {
 
         (0..width)
             .map(|i| {
-                let affinity = rows
-                    .iter()
-                    .map(|row| row.values().get(i).cloned().unwrap_or(SqliteValue::Null))
-                    .find(|value| !matches!(value, SqliteValue::Null))
-                    .map_or('A', |value| match value {
-                        SqliteValue::Integer(_) => 'D',
-                        SqliteValue::Float(_) => 'E',
-                        SqliteValue::Text(_) => 'B',
-                        SqliteValue::Blob(_) | SqliteValue::Null => 'A',
-                    });
+                let affinity = select_affinities.get(i).map_or_else(
+                    || {
+                        // No AST-derived affinity (e.g. an unresolved column) —
+                        // fall back to the first non-NULL value's storage class.
+                        rows.iter()
+                            .map(|row| row.values().get(i).cloned().unwrap_or(SqliteValue::Null))
+                            .find(|value| !matches!(value, SqliteValue::Null))
+                            .map_or('A', |value| match value {
+                                SqliteValue::Integer(_) => 'D',
+                                SqliteValue::Float(_) => 'E',
+                                SqliteValue::Text(_) => 'B',
+                                SqliteValue::Blob(_) | SqliteValue::Null => 'A',
+                            })
+                    },
+                    |affinity| type_affinity_to_char(*affinity),
+                );
                 ColumnInfo {
                     name: col_names
                         .get(i)
