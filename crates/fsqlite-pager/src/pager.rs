@@ -13521,19 +13521,60 @@ where
         .await
     }
 
+    /// Minimum bytes required for a SQLite WAL to carry one complete frame:
+    /// the 32-byte WAL header, the 24-byte frame header, and the smallest
+    /// permitted 512-byte SQLite page.
+    const MIN_COMPLETE_WAL_BYTES: u64 = 32 + 24 + 512;
+
+    /// Return whether a WAL companion is too small to carry a complete frame.
+    ///
+    /// This deliberately classifies by length alone. A damaged header need not
+    /// be parsed to establish that fewer than `MIN_COMPLETE_WAL_BYTES` bytes
+    /// cannot carry logical WAL state. The handle is opened read-write without
+    /// `CREATE`: a read-only WAL open can become a canonical inode descriptor
+    /// on Unix and poison a later writer with `EBADF`; failure to inspect or
+    /// close the handle is propagated so the caller fails closed.
+    fn wal_companion_is_too_small_for_a_complete_frame(
+        &self,
+        cx: &Cx,
+        wal_path: &Path,
+    ) -> Result<bool> {
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (mut wal, _) = self.vfs.open(cx, Some(wal_path), flags)?;
+        let size_result = wal.file_size(cx);
+        let close_result = wal.close(cx);
+        let byte_len = size_result?;
+        close_result?;
+        Ok(byte_len < Self::MIN_COMPLETE_WAL_BYTES)
+    }
+
     fn ensure_vacuum_candidate_is_self_contained(&self, cx: &Cx, image_path: &Path) -> Result<()> {
         for suffix in ["-journal", "-wal", "-shm", "-wal-fec"] {
             let mut sidecar = image_path.as_os_str().to_owned();
             sidecar.push(suffix);
             let sidecar = PathBuf::from(sidecar);
-            if self.vfs.access(cx, &sidecar, AccessFlags::EXISTS)? {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "VACUUM candidate is not self-contained: companion {} exists",
-                        sidecar.display()
-                    ),
-                });
+            if !self.vfs.access(cx, &sidecar, AccessFlags::EXISTS)? {
+                continue;
             }
+            // This is the sole narrow exception. A WAL too short for even one
+            // complete frame has no recoverable logical state. Every other
+            // sidecar remains a refusal: rollback journals can be hot,
+            // WAL-FEC has independent recovery semantics, and SHM is not part
+            // of a standalone image. `inspect_self_contained_database_image`
+            // calls this guard both before and after its full-image digest, so
+            // a companion that grows into a complete frame during inspection
+            // is refused by the second bracket.
+            if suffix == "-wal"
+                && self.wal_companion_is_too_small_for_a_complete_frame(cx, &sidecar)?
+            {
+                continue;
+            }
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "VACUUM candidate is not self-contained: companion {} exists",
+                    sidecar.display()
+                ),
+            });
         }
         Ok(())
     }
@@ -25288,6 +25329,59 @@ mod tests {
             .await
             .unwrap();
         (pager, path)
+    }
+
+    async fn inspect_self_containment_with_companion(
+        suffix: &str,
+        byte_len: usize,
+    ) -> Result<DatabaseImageReceipt> {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let database_path = PathBuf::from(format!("/self-contained-{suffix}.db"));
+        let pager = SimplePager::open(vfs.clone(), &database_path, PageSize::DEFAULT).await?;
+        let mut companion_name = database_path.as_os_str().to_owned();
+        companion_name.push(suffix);
+        let companion_path = PathBuf::from(companion_name);
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (mut companion, _) = vfs.open(&cx, Some(&companion_path), flags)?;
+        companion.write(&cx, &vec![0xA5; byte_len], 0).await?;
+        companion.close(&cx)?;
+        pager
+            .inspect_self_contained_database_image(&cx, &database_path)
+            .await
+    }
+
+    #[test]
+    fn self_containment_tolerates_only_a_wal_too_small_for_a_complete_frame() {
+        asupersync::test_utils::run_test(|| async {
+            let inert_wal_bytes =
+                usize::try_from(SimplePager::<MemoryVfs>::MIN_COMPLETE_WAL_BYTES - 1)
+                    .expect("inert WAL boundary fits usize");
+            let receipt = inspect_self_containment_with_companion("-wal", inert_wal_bytes)
+                .await
+                .expect("a WAL below one complete frame carries no logical state");
+            assert_ne!(receipt.file_size(), 0, "the main image must be receipted");
+
+            let complete_wal_bytes =
+                usize::try_from(SimplePager::<MemoryVfs>::MIN_COMPLETE_WAL_BYTES)
+                    .expect("complete WAL boundary fits usize");
+            for suffix in ["-wal", "-journal", "-shm", "-wal-fec"] {
+                let byte_len = if suffix == "-wal" {
+                    complete_wal_bytes
+                } else {
+                    inert_wal_bytes
+                };
+                assert!(
+                    matches!(
+                        &inspect_self_containment_with_companion(suffix, byte_len).await,
+                        Err(FrankenError::DatabaseCorrupt { detail })
+                            if detail.contains("not self-contained")
+                                && detail.contains(suffix)
+                    ),
+                    "only an incomplete WAL may be tolerated for {suffix}"
+                );
+            }
+        });
     }
 
     #[test]
