@@ -75941,6 +75941,12 @@ impl Connection {
         }
 
         let cte = with_clause.ctes.first()?.clone();
+        // GH #152: a LIMIT inside the recursive CTE caps its output, which the
+        // closed-form / direct SUM fast paths do not model — route those shapes
+        // to the general materialize_recursive_cte path, which honors the LIMIT.
+        if cte.query.limit.is_some() {
+            return None;
+        }
         let SelectCore::Select {
             distinct,
             columns,
@@ -76672,6 +76678,20 @@ impl Connection {
             .await?;
         let mut all_rows: Vec<Vec<SqliteValue>> =
             base_rows.iter().map(|r| r.values().to_vec()).collect();
+        // GH #152: a literal LIMIT inside the recursive CTE caps the total rows
+        // it produces (stock sqlite3 stops the recursion once the LIMIT is
+        // reached). A LIMIT with OFFSET or a non-literal expression is not capped
+        // here — the sum fast paths bail on any CTE limit, and other shapes keep
+        // the 1000-row recursion bound.
+        let recursive_cte_row_cap: Option<usize> =
+            cte.query.limit.as_ref().and_then(|lc| match (&lc.limit, &lc.offset) {
+                (fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(n), _), None)
+                    if *n >= 0 =>
+                {
+                    usize::try_from(*n).ok()
+                }
+                _ => None,
+            });
         let mut recursive_arms: Vec<(CompoundOp, RecursiveCteArmExecutionPlan)> = Vec::new();
         for (op, core) in &cte.query.body.compounds {
             if matches!(op, CompoundOp::Intersect | CompoundOp::Except) {
@@ -76816,6 +76836,19 @@ impl Connection {
             // frontier window to the just-appended tail.
             frontier_start = all_rows.len();
             all_rows.append(&mut new_rows);
+            // GH #152: stop once the CTE LIMIT has been reached.
+            if let Some(cap) = recursive_cte_row_cap
+                && all_rows.len() >= cap
+            {
+                all_rows.truncate(cap);
+                break;
+            }
+        }
+
+        // GH #152: cap the materialized rows to the CTE LIMIT — also covers the
+        // case where the base case alone already produced enough rows.
+        if let Some(cap) = recursive_cte_row_cap {
+            all_rows.truncate(cap);
         }
 
         // Final: populate temp table with ALL accumulated rows. `all_rows` is not
