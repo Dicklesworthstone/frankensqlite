@@ -13315,8 +13315,10 @@ impl Connection {
             let Some(identity) = FileIdentity::from_file(&reservation)? else {
                 return Err(FrankenError::CannotOpen { path: stable_path });
             };
-            // The reserved object must be regular, empty and single-linked at
-            // the instant of the claim, or the claim is not what it appears.
+            // The reserved object must be regular and empty. Unix additionally
+            // proves that it is single-linked; other supported platforms retain
+            // the exact descriptor/path identity checks but expose no portable
+            // link-count contract here.
             let single_linked = {
                 #[cfg(unix)]
                 {
@@ -13336,6 +13338,11 @@ impl Connection {
                 identity,
                 write_set_page_limit,
                 reservation,
+                initialization_phase: std::sync::atomic::AtomicU8::new(
+                    RESERVED_BUILDER_PHASE_FRESH,
+                ),
+                #[cfg(all(test, feature = "native"))]
+                bounded_writer_opener_attempts: AtomicU64::new(0),
             })
         }
         #[cfg(not(feature = "native"))]
@@ -13348,16 +13355,21 @@ impl Connection {
     /// Initialize a reserved target and return its identity-bound writable
     /// schema-only builder.
     ///
-    /// Phase 2. Revalidates the reservation at `expected_len = Some(0)`,
-    /// confirms the stable path still resolves to the reserved pathname, and
-    /// opens that exact identity through the existing-file writable schema-only
-    /// path with the validated write-set ceiling installed on the pager before
-    /// returning the builder.
+    /// Phase 2. On the first call, revalidates the reservation at
+    /// `expected_len = Some(0)`, confirms the stable path still resolves to the
+    /// reserved pathname, bootstraps page 1, and reopens that exact identity
+    /// through the existing-file writable schema-only path with the validated
+    /// write-set ceiling installed before return. Once the reserved opener has
+    /// returned successfully, later calls are idempotent bounded reopens. This
+    /// makes a close or post-bootstrap reopen failure safely retryable without
+    /// admitting a file that was nonempty before the first initialization.
     ///
     /// # Errors
     ///
     /// [`FrankenError::CannotOpen`] when revalidation fails or the reserved
-    /// path no longer resolves to itself, the refusals from
+    /// path no longer resolves to itself or a prior ambiguous partial
+    /// bootstrap poisoned initialization, [`FrankenError::Busy`] while another
+    /// initialization owns the bootstrap phase, the refusals from
     /// [`ConnectionEnv::validated_schema_only_write_set_page_limit`], and any
     /// propagated open error.
     #[cfg(not(target_arch = "wasm32"))]
@@ -13365,6 +13377,9 @@ impl Connection {
         reservation: &DatabaseBuilderReservation,
         env: ConnectionEnv,
     ) -> Result<Self> {
+        let Some(mut bootstrap_claim) = reservation.try_claim_initialization_bootstrap()? else {
+            return Self::reopen_reserved_schema_only_bounded_writer(reservation, env).await;
+        };
         let (_, stable) = reservation.validated_bounded_writer_open(&env, Some(0))?;
 
         // A reserved pathname is an EMPTY file, which is not yet a database.
@@ -13374,13 +13389,24 @@ impl Connection {
         // is engine bootstrap, not caller-attributable build work, and counting
         // it would make a small budget unusable for the reason a caller cannot
         // see.
+        #[cfg(all(test, feature = "native"))]
+        reservation.record_bounded_writer_opener_attempt();
         let bootstrap = Self::open_reserved_with_expected_identity_and_env(
             stable.clone(),
             reservation.identity(),
             env.clone(),
         )
         .await?;
-        bootstrap.close().await?;
+        // From this point onward, an error is retryable through the existing-
+        // only bounded reopen. Keep the shared phase IN_PROGRESS through close
+        // so a concurrent initializer cannot open a second writer while the
+        // bootstrap connection is still live. The claim remembers opener
+        // success locally, so its Drop path still records BOOTSTRAPPED if close
+        // is cancelled or returns an error.
+        bootstrap_claim.record_bootstrap_succeeded();
+        let close_result = bootstrap.close().await;
+        bootstrap_claim.finish_bootstrapped();
+        close_result?;
 
         Self::reopen_reserved_schema_only_bounded_writer(reservation, env).await
     }
@@ -13391,10 +13417,23 @@ impl Connection {
     /// The borrowed [`DatabaseBuilderReservation`] is the sole pathname,
     /// identity, and limit authority. The environment must repeat the same
     /// explicit nonzero ceiling; absence, zero, or drift is refused before any
-    /// database opener runs. The retained descriptor and the no-follow
+    /// database opener runs. The reservation must already have completed its
+    /// identity-bound bootstrap phase; fresh, poisoned, or concurrently
+    /// initializing reservations cannot bypass that phase through this API.
+    /// The retained descriptor and the no-follow
     /// pathname are then revalidated before the exact-identity existing-only
     /// schema path is opened. The ceiling is installed on the pager before the
     /// connection is returned, so callers cannot observe an unbounded writer.
+    ///
+    /// A rollback-header image (`read_version == write_version == 1`) receives
+    /// a read-only preflight that refuses already-present recovery or WAL
+    /// artifacts before opener handoff. The scan does not hold the namespace
+    /// lock, so callers must still preserve the cooperative namespace through
+    /// the open. A WAL-header image (`2, 2`) necessarily reopens its cooperative
+    /// WAL family: the reservation authenticates the main-file pathname and
+    /// identity, but does not independently authenticate companion contents. A
+    /// caller that requires independent WAL provenance must bind or receipt
+    /// that family separately.
     ///
     /// Other environment settings, including caller-rooted runtime context,
     /// strict multi-process refusal, and `page_buffer_max`, retain their normal
@@ -13407,15 +13446,20 @@ impl Connection {
     /// Returns the explicit-limit refusals from
     /// [`ConnectionEnv::validated_schema_only_write_set_page_limit`],
     /// [`FrankenError::OutOfRange`] when the limit differs from the retained
-    /// reservation, [`FrankenError::CannotOpen`] when reservation identity,
-    /// linkage, or stable-path validation fails, and any propagated open or
-    /// pager error.
+    /// reservation, [`FrankenError::CannotOpen`] when the reservation is not
+    /// safely bootstrapped, identity/stable-path validation fails, or a
+    /// rollback-header image has a companion artifact, and any propagated open
+    /// or pager error. On Unix, the identity validation also enforces a single
+    /// link; Windows does not promise a link-count check.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn reopen_reserved_schema_only_bounded_writer(
         reservation: &DatabaseBuilderReservation,
         env: ConnectionEnv,
     ) -> Result<Self> {
+        reservation.require_bootstrapped_for_reopen()?;
         let (page_limit, stable) = reservation.validated_bounded_writer_open(&env, None)?;
+        #[cfg(all(test, feature = "native"))]
+        reservation.record_bounded_writer_opener_attempt();
         let writer = Self::open_existing_schema_only_with_expected_identity_and_env(
             stable,
             reservation.identity(),
@@ -35015,6 +35059,15 @@ impl Drop for PendingDatabaseImagePublication<'_> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+const RESERVED_BUILDER_PHASE_FRESH: u8 = 0;
+#[cfg(not(target_arch = "wasm32"))]
+const RESERVED_BUILDER_PHASE_IN_PROGRESS: u8 = 1;
+#[cfg(not(target_arch = "wasm32"))]
+const RESERVED_BUILDER_PHASE_BOOTSTRAPPED: u8 = 2;
+#[cfg(not(target_arch = "wasm32"))]
+const RESERVED_BUILDER_PHASE_POISONED: u8 = 3;
+
 /// An atomically claimed, identity-bound pathname for building a replacement
 /// database image.
 ///
@@ -35031,6 +35084,12 @@ impl Drop for PendingDatabaseImagePublication<'_> {
 /// caller must therefore hold the reservation across construction and finish
 /// with [`Self::revalidate_final_target`], not drop it after phase 2.
 ///
+/// Every supported native platform rechecks the retained and pathname-opened
+/// handles against the reserved identity. Unix additionally requires each
+/// handle's link count to remain exactly one. Windows has no corresponding
+/// portable metadata check here, so this type does not promise link-count
+/// enforcement there.
+///
 /// Existing paths are never opened, truncated, replaced, or unlinked by
 /// reservation: the builder can only ever write to a file it created.
 #[cfg(not(target_arch = "wasm32"))]
@@ -35043,10 +35102,332 @@ pub struct DatabaseBuilderReservation {
     /// the reservation so the identity cannot be reused underneath it.
     #[cfg(feature = "native")]
     reservation: std::fs::File,
+    /// Initialization state. Only a successfully returned reserved opener may
+    /// cross from `IN_PROGRESS` to `BOOTSTRAPPED`; a provably clean failed
+    /// attempt may return to `FRESH`.
+    initialization_phase: std::sync::atomic::AtomicU8,
+    /// Test-local tripwire proving validation refusals occur before an opener.
+    #[cfg(all(test, feature = "native"))]
+    bounded_writer_opener_attempts: AtomicU64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct DatabaseBuilderBootstrapClaim<'a> {
+    reservation: &'a DatabaseBuilderReservation,
+    bootstrap_succeeded: bool,
+    completed: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DatabaseBuilderBootstrapClaim<'_> {
+    fn record_bootstrap_succeeded(&mut self) {
+        self.bootstrap_succeeded = true;
+    }
+
+    fn finish_bootstrapped(&mut self) {
+        debug_assert!(self.bootstrap_succeeded);
+        debug_assert_eq!(
+            self.reservation
+                .initialization_phase
+                .load(AtomicOrdering::Acquire),
+            RESERVED_BUILDER_PHASE_IN_PROGRESS
+        );
+        self.reservation
+            .initialization_phase
+            .store(RESERVED_BUILDER_PHASE_BOOTSTRAPPED, AtomicOrdering::Release);
+        self.completed = true;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for DatabaseBuilderBootstrapClaim<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let next_phase = if self.bootstrap_succeeded {
+            RESERVED_BUILDER_PHASE_BOOTSTRAPPED
+        } else if self.reservation.clean_empty_target_for_bootstrap_retry() {
+            RESERVED_BUILDER_PHASE_FRESH
+        } else {
+            // A failed or cancelled opener that left any nonempty/ambiguous
+            // artifact cannot be distinguished here from an external writer.
+            // Fail closed rather than laundering that state into a reopen.
+            RESERVED_BUILDER_PHASE_POISONED
+        };
+        let _ = self.reservation.initialization_phase.compare_exchange(
+            RESERVED_BUILDER_PHASE_IN_PROGRESS,
+            next_phase,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl DatabaseBuilderReservation {
+    fn try_claim_initialization_bootstrap(
+        &self,
+    ) -> Result<Option<DatabaseBuilderBootstrapClaim<'_>>> {
+        match self.initialization_phase.compare_exchange(
+            RESERVED_BUILDER_PHASE_FRESH,
+            RESERVED_BUILDER_PHASE_IN_PROGRESS,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => Ok(Some(DatabaseBuilderBootstrapClaim {
+                reservation: self,
+                bootstrap_succeeded: false,
+                completed: false,
+            })),
+            Err(RESERVED_BUILDER_PHASE_BOOTSTRAPPED) => Ok(None),
+            Err(RESERVED_BUILDER_PHASE_IN_PROGRESS) => Err(FrankenError::Busy),
+            Err(RESERVED_BUILDER_PHASE_POISONED) => Err(FrankenError::CannotOpen {
+                path: self.path.clone(),
+            }),
+            Err(unknown) => Err(FrankenError::internal(format!(
+                "unknown reserved-builder initialization phase {unknown}"
+            ))),
+        }
+    }
+
+    fn require_bootstrapped_for_reopen(&self) -> Result<()> {
+        match self.initialization_phase.load(AtomicOrdering::Acquire) {
+            RESERVED_BUILDER_PHASE_BOOTSTRAPPED => Ok(()),
+            RESERVED_BUILDER_PHASE_IN_PROGRESS => Err(FrankenError::Busy),
+            RESERVED_BUILDER_PHASE_FRESH | RESERVED_BUILDER_PHASE_POISONED => {
+                Err(FrankenError::CannotOpen {
+                    path: self.path.clone(),
+                })
+            }
+            unknown => Err(FrankenError::internal(format!(
+                "unknown reserved-builder initialization phase {unknown}"
+            ))),
+        }
+    }
+
+    /// Preflight already-present companions on a self-contained rollback-header
+    /// image before opener handoff. This read-only scan is not a namespace lock;
+    /// WAL-header images and the scan-to-open interval retain the ordinary
+    /// cooperative namespace contract.
+    fn validate_bounded_writer_recovery_artifacts(&self) -> Result<()> {
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        {
+            #[cfg(unix)]
+            fn read_header_at_zero(file: &std::fs::File, buffer: &mut [u8]) -> std::io::Result<()> {
+                use std::os::unix::fs::FileExt as _;
+
+                let mut read = 0;
+                while read < buffer.len() {
+                    let offset = u64::try_from(read).expect("header offset must fit in u64");
+                    let amount = file.read_at(&mut buffer[read..], offset)?;
+                    if amount == 0 {
+                        return Err(std::io::ErrorKind::UnexpectedEof.into());
+                    }
+                    read += amount;
+                }
+                Ok(())
+            }
+
+            #[cfg(windows)]
+            fn read_header_at_zero(file: &std::fs::File, buffer: &mut [u8]) -> std::io::Result<()> {
+                use std::os::windows::fs::FileExt as _;
+
+                let mut read = 0;
+                while read < buffer.len() {
+                    let offset = u64::try_from(read).expect("header offset must fit in u64");
+                    let amount = file.seek_read(&mut buffer[read..], offset)?;
+                    if amount == 0 {
+                        return Err(std::io::ErrorKind::UnexpectedEof.into());
+                    }
+                    read += amount;
+                }
+                Ok(())
+            }
+
+            let cannot_open = || FrankenError::CannotOpen {
+                path: self.path.clone(),
+            };
+            let file_size = self
+                .reservation
+                .metadata()
+                .map_err(|_| cannot_open())?
+                .len();
+            let header_size =
+                u64::try_from(DATABASE_HEADER_SIZE).expect("database header size must fit in u64");
+            if file_size < header_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "database file too small for bounded-reopen recovery-mode detection: \
+                         {file_size} bytes (< {DATABASE_HEADER_SIZE})"
+                    ),
+                });
+            }
+            let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+            read_header_at_zero(&self.reservation, &mut header_bytes).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    FrankenError::DatabaseCorrupt {
+                        detail: "database file changed while reading the bounded-reopen header"
+                            .to_owned(),
+                    }
+                } else {
+                    cannot_open()
+                }
+            })?;
+            let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid database header: {error}"),
+                }
+            })?;
+            match (header.write_version, header.read_version) {
+                (1, 1) => fsqlite_vfs::validate_reserved_database_artifacts(
+                    &self.path,
+                    fsqlite_vfs::WindowsLockSidecarPolicy::RejectAll,
+                ),
+                (2, 2) => Ok(()),
+                (write_version, read_version) => Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "database header has incompatible file-format versions: \
+                         write={write_version}, read={read_version}"
+                    ),
+                }),
+            }
+        }
+        #[cfg(not(all(feature = "native", any(unix, windows))))]
+        {
+            Err(FrankenError::Unsupported)
+        }
+    }
+
+    /// A cancelled/failed reserved opener may retry from Fresh only when both
+    /// identity-bound handles are still exactly empty and no recovery artifact
+    /// or platform advisory-lock sidecar forbidden by reserved admission
+    /// exists. Any uncertainty poisons initialization.
+    fn clean_empty_target_for_bootstrap_retry(&self) -> bool {
+        if self.revalidate_final_target(Some(0)).is_err() {
+            return false;
+        }
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        {
+            fsqlite_vfs::validate_reserved_database_artifacts(
+                &self.path,
+                fsqlite_vfs::WindowsLockSidecarPolicy::RejectAll,
+            )
+            .is_ok()
+        }
+        #[cfg(not(all(feature = "native", any(unix, windows))))]
+        {
+            false
+        }
+    }
+
+    #[cfg(all(test, feature = "native"))]
+    fn record_bounded_writer_opener_attempt(&self) {
+        self.bounded_writer_opener_attempts
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    #[cfg(all(test, feature = "native"))]
+    fn bounded_writer_opener_attempts(&self) -> u64 {
+        self.bounded_writer_opener_attempts
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(all(test, feature = "native"))]
+    fn initialization_phase_for_test(&self) -> u8 {
+        self.initialization_phase.load(AtomicOrdering::Acquire)
+    }
+
+    /// Populate a still-empty retained target from an already-built in-memory
+    /// image without reopening, replacing, or unlinking its pathname. The
+    /// test-only phase transition occurs only after exact header/extent and
+    /// byte-for-byte readback validation.
+    #[cfg(all(test, feature = "native", any(unix, windows)))]
+    fn write_retained_image_for_test(&self, image: &[u8]) -> Result<()> {
+        let mut claim =
+            self.try_claim_initialization_bootstrap()?
+                .ok_or_else(|| FrankenError::CannotOpen {
+                    path: self.path.clone(),
+                })?;
+        self.revalidate_final_target(Some(0))?;
+        self.write_retained_image_bytes_for_test(image)?;
+        fsqlite_vfs::validate_reserved_database_artifacts(
+            &self.path,
+            fsqlite_vfs::WindowsLockSidecarPolicy::RejectAll,
+        )?;
+        claim.record_bootstrap_succeeded();
+        claim.finish_bootstrapped();
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "native", any(unix, windows)))]
+    fn write_retained_image_bytes_for_test(&self, image: &[u8]) -> Result<()> {
+        let header_bytes: &[u8; DATABASE_HEADER_SIZE] = image
+            .get(..DATABASE_HEADER_SIZE)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "test image is shorter than the database header".to_owned(),
+            })?;
+        let header = DatabaseHeader::from_bytes(header_bytes).map_err(|error| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!("invalid retained test-image header: {error}"),
+            }
+        })?;
+        if (header.write_version, header.read_version) != (1, 1) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "retained test image must be self-contained rollback mode, got write={}, read={}",
+                    header.write_version, header.read_version
+                ),
+            });
+        }
+        let page_size = header.page_size.as_usize();
+        if image.is_empty() || !image.len().is_multiple_of(page_size) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "retained test-image extent is not an exact page multiple".to_owned(),
+            });
+        }
+        let page_count =
+            u32::try_from(image.len() / page_size).map_err(|_| FrankenError::OutOfRange {
+                what: "retained test-image page count".to_owned(),
+                value: (image.len() / page_size).to_string(),
+            })?;
+        if header.page_count != page_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "retained test-image header page count {} differs from extent {page_count}",
+                    header.page_count
+                ),
+            });
+        }
+        #[cfg(feature = "native")]
+        {
+            use std::io::{Read as _, Seek as _, Write as _};
+
+            let mut retained = self.reservation.try_clone()?;
+            retained.seek(std::io::SeekFrom::Start(0))?;
+            retained.write_all(image)?;
+            retained.sync_all()?;
+            let expected_len = u64::try_from(image.len())
+                .map_err(|_| FrankenError::internal("test image length exceeds u64"))?;
+            self.revalidate_final_target(Some(expected_len))?;
+            retained.seek(std::io::SeekFrom::Start(0))?;
+            let mut observed = vec![0_u8; image.len()];
+            retained.read_exact(&mut observed)?;
+            if observed != image {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "retained test-image readback differs from exported bytes".to_owned(),
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            let _ = image;
+            Err(FrankenError::Unsupported)
+        }
+    }
+
     /// Absolute, stable pathname atomically reserved for the builder.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -35099,6 +35480,13 @@ impl DatabaseBuilderReservation {
             });
         }
         self.revalidate_final_target(expected_len)?;
+        if expected_len.is_none() {
+            self.validate_bounded_writer_recovery_artifacts()?;
+            // Recheck the main identity after the companion preflight. This
+            // narrows main-file drift but does not make companion admission
+            // atomic; the documented cooperative namespace remains required.
+            self.revalidate_final_target(None)?;
+        }
 
         let cx = env
             .runtime()
@@ -35122,7 +35510,9 @@ impl DatabaseBuilderReservation {
     /// Call after the private build and immediately before releasing the
     /// reservation. Proves, twice over, that the retained descriptor and the
     /// final no-follow pathname resolve to the same regular file of the
-    /// expected exact length, with no hard-link alias introduced.
+    /// expected exact length. Unix additionally refuses any link count other
+    /// than one; Windows preserves the identity/path checks but does not expose
+    /// equivalent link-count enforcement through this contract.
     ///
     /// # Errors
     ///
@@ -35169,9 +35559,10 @@ impl DatabaseBuilderReservation {
             Some(identity) if identity == expected_identity => {}
             _ => return Err(FrankenError::Unsupported),
         }
-        // The anti-aliasing clause: a second link appearing at any point
+        // Unix anti-aliasing clause: a second link appearing at any point
         // between reservation and finalization is a swap vector, not a
-        // cosmetic difference.
+        // cosmetic difference. Other platforms retain the identity checks
+        // above without claiming a portable link-count observation.
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
@@ -195916,7 +196307,7 @@ mod pager_routing_tests {
     use super::*;
     use fsqlite_ast::{ColumnRef, Expr, OrderingTerm, ResultColumn, Span};
     use fsqlite_func::collation::CollationFunction;
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     use fsqlite_types::PageData;
     use tracing_subscriber::prelude::*;
 
@@ -229099,7 +229490,7 @@ mod pager_routing_tests {
         });
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native", any(unix, windows)))]
     fn retained_bounded_writer_test_dir(tag: &str) -> std::path::PathBuf {
         static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -229116,47 +229507,230 @@ mod pager_routing_tests {
         dir
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native", any(unix, windows)))]
     async fn build_reopenable_bounded_writer_image(
         target: &Path,
         page_limit: usize,
         page_buffer_max: usize,
         row_count: i64,
     ) -> (DatabaseBuilderReservation, ConnectionEnv) {
+        // Build and commit wholly inside MemoryVfs. The retained host target is
+        // populated only once, below, from the resulting self-contained bytes;
+        // no host rollback journal is created or cleaned up by this keeper.
+        let memory = Connection::open(":memory:")
+            .await
+            .expect("open in-memory image builder");
+        memory
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+            .await
+            .expect("create in-memory seed table");
+        let payload = "r".repeat(900);
+        for id in 1..=row_count {
+            memory
+                .execute(&format!("INSERT INTO t VALUES ({id}, '{payload}');"))
+                .await
+                .expect("grow the in-memory seed image");
+        }
+        let image = memory.export_bytes().await.expect("export seed image");
+        memory.close().await.expect("close in-memory image builder");
+
         let mut env = ConnectionEnv::default();
         env.set_schema_only_write_set_page_limit(page_limit);
         env.set_page_buffer_max(page_buffer_max);
         let reservation = Connection::reserve_schema_only_builder_target_with_env(target, &env)
             .expect("reserve bounded-writer target");
-        let writer = Connection::initialize_reserved_schema_only_builder(&reservation, env.clone())
-            .await
-            .expect("initialize bounded writer");
-        writer
-            .execute("PRAGMA journal_mode=DELETE;")
-            .await
-            .expect("use rollback journal for an image-local rollback oracle");
-        writer
-            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
-            .await
-            .expect("create seed table");
-        let payload = "r".repeat(900);
-        for id in 1..=row_count {
-            writer
-                .execute(&format!("INSERT INTO t VALUES ({id}, '{payload}');"))
-                .await
-                .expect("grow seed image one bounded transaction at a time");
-        }
-        writer.close().await.expect("close initial bounded writer");
+        reservation
+            .write_retained_image_for_test(&image)
+            .expect("populate the retained target from in-memory bytes");
         reservation
             .revalidate_final_target(None)
             .expect("seed image retains reserved identity");
+        assert_eq!(
+            reservation.bounded_writer_opener_attempts(),
+            0,
+            "populating retained bytes must not invoke a database opener"
+        );
         (reservation, env)
+    }
+
+    /// Source-level guard for the retained keeper family: its host-file path
+    /// may write a prebuilt image and stage pager pages, but must not introduce
+    /// an auto-cleaning temporary directory, a removal call, or a journal-mode
+    /// alias that actually selects filesystem rollback journaling.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native", any(unix, windows)))]
+    #[test]
+    fn reserved_bounded_writer_keeper_source_has_no_deleting_storage_primitive() {
+        let source = include_str!("connection.rs");
+        let start = source
+            .find("fn retained_bounded_writer_test_dir")
+            .expect("keeper block start");
+        let end_marker = concat!("/// The write-set telemetry", " must report real work");
+        let end_offset = source[start..].find(end_marker).expect("keeper block end");
+        let keeper = &source[start..start + end_offset];
+        let normalized = keeper
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        for forbidden in [
+            concat!("temp", "file::"),
+            concat!("temp", "dir"),
+            concat!("remove_", "file"),
+            concat!("remove_", "dir"),
+            concat!("journal_", "mode"),
+            concat!("journalmode", "::"),
+        ] {
+            assert!(
+                !normalized.contains(forbidden),
+                "bounded-writer keeper block contains forbidden storage primitive {forbidden:?}"
+            );
+        }
+    }
+
+    /// Once the reserved opener has returned, initialization is a monotone
+    /// phase: closing and calling initialize again performs an existing-only
+    /// bounded reopen instead of incorrectly reapplying the zero-length gate.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native", any(unix, windows)))]
+    #[test]
+    fn reserved_bounded_writer_initialization_is_idempotent_after_bootstrap() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = retained_bounded_writer_test_dir("idempotent-initialize");
+            let target = dir.join("bounded-initialize-idempotent.db");
+            let mut env = ConnectionEnv::default();
+            env.set_schema_only_write_set_page_limit(8);
+            let reservation =
+                Connection::reserve_schema_only_builder_target_with_env(&target, &env)
+                    .expect("reserve idempotent initialization target");
+
+            let first =
+                Connection::initialize_reserved_schema_only_builder(&reservation, env.clone())
+                    .await
+                    .expect("first initialization");
+            assert_eq!(
+                reservation.initialization_phase_for_test(),
+                RESERVED_BUILDER_PHASE_BOOTSTRAPPED
+            );
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 2);
+            first.close().await.expect("close first bounded writer");
+
+            let second = Connection::initialize_reserved_schema_only_builder(&reservation, env)
+                .await
+                .expect("idempotent initialization reopens the bootstrapped image");
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 3);
+            let stats = second
+                .write_set_stats()
+                .unwrap()
+                .expect("idempotent reopen retains the pager ceiling");
+            assert_eq!(stats.page_limit, 8);
+            second.close().await.expect("close second bounded writer");
+        });
+    }
+
+    /// A failed/cancelled reserved opener that leaves a nonempty target is
+    /// inherently ambiguous at this layer. It must poison initialization, not
+    /// reinterpret possibly external bytes as successful engine bootstrap.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native", any(unix, windows)))]
+    #[test]
+    fn reserved_bounded_writer_ambiguous_partial_bootstrap_fails_closed() {
+        asupersync::test_utils::run_test(|| async {
+            let memory = Connection::open(":memory:").await.unwrap();
+            let image = memory.export_bytes().await.unwrap();
+            memory.close().await.unwrap();
+
+            let dir = retained_bounded_writer_test_dir("ambiguous-bootstrap");
+            let target = dir.join("bounded-ambiguous-bootstrap.db");
+            let mut env = ConnectionEnv::default();
+            env.set_schema_only_write_set_page_limit(8);
+            let reservation =
+                Connection::reserve_schema_only_builder_target_with_env(&target, &env).unwrap();
+            let claim = reservation
+                .try_claim_initialization_bootstrap()
+                .unwrap()
+                .expect("fresh reservation owns a bootstrap claim");
+            reservation
+                .write_retained_image_bytes_for_test(&image)
+                .unwrap();
+            drop(claim);
+
+            assert_eq!(
+                reservation.initialization_phase_for_test(),
+                RESERVED_BUILDER_PHASE_POISONED
+            );
+            let error = Connection::initialize_reserved_schema_only_builder(&reservation, env)
+                .await
+                .expect_err("ambiguous nonempty partial bootstrap must remain poisoned");
+            assert!(matches!(error, FrankenError::CannotOpen { .. }));
+            let mut reopen_env = ConnectionEnv::default();
+            reopen_env.set_schema_only_write_set_page_limit(8);
+            let reopen_error = Connection::reopen_reserved_schema_only_bounded_writer(
+                &reservation,
+                reopen_env.clone(),
+            )
+            .await
+            .expect_err("direct reopen must not bypass a poisoned initialization phase");
+            assert!(matches!(reopen_error, FrankenError::CannotOpen { .. }));
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 0);
+
+            let sidecar_target = dir.join("bounded-ambiguous-sidecar.db");
+            let sidecar_reservation = Connection::reserve_schema_only_builder_target_with_env(
+                &sidecar_target,
+                &reopen_env,
+            )
+            .unwrap();
+            let sidecar_claim = sidecar_reservation
+                .try_claim_initialization_bootstrap()
+                .unwrap()
+                .expect("fresh sidecar target owns a bootstrap claim");
+            let mut sidecar = sidecar_target.as_os_str().to_owned();
+            sidecar.push("-journal");
+            std::fs::write(
+                std::path::PathBuf::from(sidecar),
+                b"retained ambiguous artifact",
+            )
+            .unwrap();
+            drop(sidecar_claim);
+            assert_eq!(
+                sidecar_reservation.initialization_phase_for_test(),
+                RESERVED_BUILDER_PHASE_POISONED,
+                "an empty main file with a recovery sidecar must not reset to Fresh"
+            );
+            assert_eq!(sidecar_reservation.bounded_writer_opener_attempts(), 0);
+
+            let clean_target = dir.join("bounded-clean-bootstrap-retry.db");
+            let clean_reservation =
+                Connection::reserve_schema_only_builder_target_with_env(&clean_target, &reopen_env)
+                    .unwrap();
+            let clean_claim = clean_reservation
+                .try_claim_initialization_bootstrap()
+                .unwrap()
+                .expect("fresh clean target owns a bootstrap claim");
+            assert!(matches!(
+                clean_reservation.try_claim_initialization_bootstrap(),
+                Err(FrankenError::Busy)
+            ));
+            drop(clean_claim);
+            assert_eq!(
+                clean_reservation.initialization_phase_for_test(),
+                RESERVED_BUILDER_PHASE_FRESH,
+                "an untouched exact-empty target must reset to Fresh"
+            );
+            let retry_claim = clean_reservation
+                .try_claim_initialization_bootstrap()
+                .unwrap()
+                .expect("a clean cancelled bootstrap must be claimable again");
+            drop(retry_claim);
+            assert_eq!(
+                clean_reservation.initialization_phase_for_test(),
+                RESERVED_BUILDER_PHASE_FRESH
+            );
+            assert_eq!(clean_reservation.bounded_writer_opener_attempts(), 0);
+        });
     }
 
     /// Every caller-controlled bounded-reopen input is checked before an
     /// opener can recover or otherwise touch the image. Ordinary identity-bound
     /// existing-schema opens deliberately remain outside this opt-in contract.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native", any(unix, windows)))]
     #[test]
     fn reserved_bounded_writer_reopen_requires_exact_limit_while_ordinary_open_is_inert() {
         asupersync::test_utils::run_test(|| async {
@@ -229173,6 +229747,7 @@ mod pager_routing_tests {
             .expect_err("an absent reopen ceiling must refuse");
             assert!(matches!(missing, FrankenError::NotImplemented(_)));
             assert_eq!(std::fs::read(&target).unwrap(), before);
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 0);
 
             let mut zero_env = env.clone();
             zero_env.set_schema_only_write_set_page_limit(0);
@@ -229182,6 +229757,7 @@ mod pager_routing_tests {
                     .expect_err("a zero reopen ceiling must refuse");
             assert!(matches!(zero, FrankenError::OutOfRange { .. }));
             assert_eq!(std::fs::read(&target).unwrap(), before);
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 0);
 
             let mut drifted_env = env.clone();
             drifted_env.set_schema_only_write_set_page_limit(9);
@@ -229191,11 +229767,12 @@ mod pager_routing_tests {
                     .expect_err("a reservation-limit drift must refuse");
             assert!(matches!(drifted, FrankenError::OutOfRange { .. }));
             assert_eq!(std::fs::read(&target).unwrap(), before);
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 0);
 
             let ordinary = Connection::open_existing_schema_only_with_expected_identity_and_env(
                 target.to_string_lossy().into_owned(),
                 reservation.identity(),
-                env,
+                env.clone(),
             )
             .await
             .expect("ordinary identity-bound existing-schema open");
@@ -229204,12 +229781,33 @@ mod pager_routing_tests {
                 "the reserved-writer env knob must stay inert on an ordinary open"
             );
             ordinary.close().await.expect("close ordinary writer");
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 0);
+
+            // This retained image is explicitly rollback-header/self-contained.
+            // A planted recovery artifact must be terminally refused before
+            // the bounded opener can inspect or consume it, and the artifact
+            // itself remains present as evidence after the refusal.
+            let mut journal = target.as_os_str().to_owned();
+            journal.push("-journal");
+            let journal = std::path::PathBuf::from(journal);
+            std::fs::write(&journal, b"untrusted retained rollback artifact").unwrap();
+            let artifact_error =
+                Connection::reopen_reserved_schema_only_bounded_writer(&reservation, env)
+                    .await
+                    .expect_err("rollback-header reopen must refuse a planted artifact");
+            assert!(matches!(artifact_error, FrankenError::CannotOpen { .. }));
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 0);
+            assert!(
+                journal.exists(),
+                "the refused artifact must remain retained"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), before);
         });
     }
 
     /// Replacing the reserved pathname with byte-identical content does not
     /// preserve authority: the retained descriptor identity is load-bearing.
-    #[cfg(unix)]
+    #[cfg(all(feature = "native", unix))]
     #[test]
     fn reserved_bounded_writer_reopen_refuses_path_identity_drift_before_open() {
         asupersync::test_utils::run_test(|| async {
@@ -229234,6 +229832,7 @@ mod pager_routing_tests {
                 replacement_before,
                 "a pre-open identity refusal must not mutate the replacement"
             );
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 0);
         });
     }
 
@@ -229241,7 +229840,7 @@ mod pager_routing_tests {
     /// before staging, rolls back byte-cleanly, and retains the same ceiling in
     /// later transactions. A deliberately smaller page-buffer pool proves that
     /// residency is not being mistaken for the write-set bound.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native", any(unix, windows)))]
     #[test]
     fn reserved_bounded_writer_reopen_enforces_exact_ceiling_across_transactions() {
         asupersync::test_utils::run_test(|| async {
@@ -229258,6 +229857,7 @@ mod pager_routing_tests {
             let writer = Connection::reopen_reserved_schema_only_bounded_writer(&reservation, env)
                 .await
                 .expect("reopen bounded writer");
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 1);
             assert_eq!(
                 std::fs::read(&target).unwrap(),
                 image_before,
