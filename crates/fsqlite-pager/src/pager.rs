@@ -25862,6 +25862,7 @@ mod tests {
                     pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
                 }
                 assert_eq!(pager.journal_mode(), journal_mode);
+                pager.set_write_set_page_limit(4);
 
                 let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
                 let dirty_page = PageNumber::ONE;
@@ -25916,6 +25917,16 @@ mod tests {
                 assert!(txn.write_set.is_empty());
                 assert!(txn.write_pages_sorted.is_empty());
                 assert!(!txn.has_pending_writes());
+                let stats = pager
+                    .write_set_stats()
+                    .expect("configured write-set stats");
+                assert_eq!(
+                    (stats.current_dirty_pages, stats.dirty_pages_high_water),
+                    (0, 0),
+                    "bead_id=bd-bounded-image-api-forward-port-vcnnf.3 \
+                     case=staging_oom_does_not_fabricate_dirty_pages mode={journal_mode:?}"
+                );
+                assert_eq!(stats.cap_refusals, 0);
 
                 txn.rollback(&cx).await.unwrap();
                 assert_eq!(vfs.db_write_fault_observation(), (Vec::new(), None));
