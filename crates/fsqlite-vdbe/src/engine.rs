@@ -188,7 +188,7 @@ use fsqlite_types::value::{
 };
 use fsqlite_types::{
     CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, RowId, RowIdMode,
-    SchemaEpoch, StrictColumnType, TableId, WitnessKey,
+    SchemaEpoch, StrictColumnType, TableId, TextEncoding, WitnessKey,
 };
 
 use crate::{
@@ -6152,6 +6152,10 @@ pub struct VdbeEngine {
     execution_cx: Cx,
     /// Page size for this database (bd-zjisk.2).
     page_size: PageSize,
+    /// Database text encoding (bd-bld9w.2). A per-database constant read from
+    /// the page-1 header; TEXT record columns decode through it. Defaults to
+    /// UTF-8 and is preserved across `reset_for_reuse` (same connection/DB).
+    text_encoding: TextEncoding,
     /// Whether opcode-level tracing is enabled, latched when the engine is constructed.
     trace_opcodes: bool,
     /// Execute-scoped metrics flag latched once per statement.
@@ -6754,6 +6758,7 @@ impl VdbeEngine {
             // allocation on every statement execution.
             execution_cx: execution_cx.clone(),
             page_size,
+            text_encoding: TextEncoding::Utf8,
             trace_opcodes: opcode_trace_enabled(),
             collect_vdbe_metrics: false,
             results: Vec::with_capacity(64),
@@ -7089,6 +7094,16 @@ impl VdbeEngine {
     }
 
     /// Convenience wrapper: reset without retaining cursors (legacy behavior).
+    /// Set the database text encoding (bd-bld9w.2), read from the page-1 header.
+    ///
+    /// TEXT record columns are decoded through this encoding. Call once per
+    /// statement setup from the connection's `DatabaseHeader.text_encoding`; it
+    /// is preserved across `reset_for_reuse` (the encoding is a per-database
+    /// constant and the engine is reused on the same connection/database).
+    pub fn set_text_encoding(&mut self, encoding: TextEncoding) {
+        self.text_encoding = encoding;
+    }
+
     pub fn reset_for_reuse(&mut self, register_count: i32, execution_cx: &Cx, page_size: PageSize) {
         self.reset_for_reuse_ex(register_count, execution_cx, page_size, false);
     }
@@ -15799,6 +15814,7 @@ impl VdbeEngine {
         col_idx: usize,
         target: i32,
     ) -> Result<bool> {
+        let text_encoding = self.text_encoding;
         let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
             return Ok(false);
         };
@@ -15906,13 +15922,14 @@ impl VdbeEngine {
             // If raw bytes match, reuse the existing Arc (skip malloc+memcpy).
             note_decode_cache_miss(collect_vdbe_metrics);
             let hint = cursor.row_decode.cached_value(payload_idx);
-            let val = fsqlite_types::record::decode_column_from_offset_reuse(
+            let val = fsqlite_types::record::decode_column_from_offset_reuse_with_encoding(
                 &cursor.payload_buf,
                 cursor
                     .row_decode
                     .column_offset(payload_idx)
                     .expect("payload_idx checked against column_count"),
                 hint,
+                text_encoding,
                 collect_vdbe_metrics,
             )
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -15964,6 +15981,7 @@ impl VdbeEngine {
     /// because `row_decode.decoded_mask` uses a single `u64`.
     async fn cursor_column(&mut self, cursor_id: i32, col_idx: usize) -> Result<SqliteValue> {
         let collect_vdbe_metrics = self.collect_vdbe_metrics;
+        let text_encoding = self.text_encoding;
         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
@@ -16034,13 +16052,14 @@ impl VdbeEngine {
                 // bd-db300.4.4.2 K1: reuse hint from previous row's cached value.
                 note_decode_cache_miss(collect_vdbe_metrics);
                 let hint = cursor.row_decode.cached_value(payload_idx);
-                let val = fsqlite_types::record::decode_column_from_offset_reuse(
+                let val = fsqlite_types::record::decode_column_from_offset_reuse_with_encoding(
                     &cursor.payload_buf,
                     cursor
                         .row_decode
                         .column_offset(payload_idx)
                         .expect("payload_idx checked against column_count"),
                     hint,
+                    text_encoding,
                     collect_vdbe_metrics,
                 )
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
