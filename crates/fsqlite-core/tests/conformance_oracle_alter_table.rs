@@ -539,3 +539,95 @@ fn alter_add_column_check_with_subquery_rejected() {
         assert_no_mismatches(&m, "alter_add_column_check_with_subquery_schema_clean");
     });
 }
+
+/// GH #231: ADD COLUMN back-fills existing rows, so on a *non-empty* table the
+/// default must be a literal constant (a bare literal or a signed number). C
+/// SQLite rejects an expression / function / CURRENT_* default with "Cannot add
+/// a column with non-constant default" once the table has rows, while still
+/// accepting a plain literal. Frank must match statement-for-statement: refuse
+/// the non-constant forms, admit the literal forms, and back-fill the admitted
+/// ones. Before the fix Frank accepted the non-constant forms and froze one
+/// evaluated value into every existing row — the exact divergence this guards.
+#[test]
+fn alter_add_column_nonconstant_default_rejected_on_nonempty_table() {
+    asupersync::test_utils::run_test(|| async {
+        let fconn = Connection::open(":memory:").await.unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&fconn, &rconn, &["CREATE TABLE t (a INTEGER)", "INSERT INTO t VALUES (1)"]).await;
+
+        let diverged = apply_checked(
+            &fconn,
+            &rconn,
+            &[
+                // Refused on a non-empty table (non-constant back-fill value).
+                "ALTER TABLE t ADD COLUMN r1 DEFAULT (random())",
+                "ALTER TABLE t ADD COLUMN r2 DEFAULT (1 + 2)",
+                "ALTER TABLE t ADD COLUMN r3 DEFAULT (abs(-5))",
+                "ALTER TABLE t ADD COLUMN r4 DEFAULT CURRENT_TIMESTAMP",
+                // Admitted: bare literal and signed-number literal defaults.
+                "ALTER TABLE t ADD COLUMN k1 INTEGER DEFAULT 7",
+                "ALTER TABLE t ADD COLUMN k2 INTEGER DEFAULT (-5)",
+                "ALTER TABLE t ADD COLUMN k3 TEXT DEFAULT 'x'",
+            ],
+        )
+        .await;
+        assert_no_mismatches(
+            &diverged,
+            "alter_add_column_nonconstant_default_rejected_on_nonempty_table",
+        );
+
+        // The admitted literal defaults back-fill the existing row; the refused
+        // columns never came into being (PRAGMA table_info agreement proves no
+        // partial admission of r1..r4).
+        let m = oracle_compare(
+            &fconn,
+            &rconn,
+            &["SELECT a, k1, k2, k3 FROM t ORDER BY a", "PRAGMA table_info(t)"],
+        )
+        .await;
+        assert_no_mismatches(
+            &m,
+            "alter_add_column_nonconstant_default_rejected_on_nonempty_table_backfill",
+        );
+    });
+}
+
+/// GH #231 control: the non-constant-default restriction is *row-gated*. On an
+/// empty table there are no rows to freeze a single evaluated value into, so C
+/// SQLite accepts an expression / function / CURRENT_* default — and Frank must
+/// match, i.e. the fix must not over-reject rowless tables. A row inserted
+/// afterward exercises the admitted deterministic defaults (the time-dependent
+/// CURRENT_TIMESTAMP column is admitted but its value is not compared).
+#[test]
+fn alter_add_column_nonconstant_default_allowed_on_empty_table() {
+    asupersync::test_utils::run_test(|| async {
+        let fconn = Connection::open(":memory:").await.unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&fconn, &rconn, &["CREATE TABLE t (a INTEGER)"]).await;
+
+        let diverged = apply_checked(
+            &fconn,
+            &rconn,
+            &[
+                "ALTER TABLE t ADD COLUMN e1 INTEGER DEFAULT (1 + 2)",
+                "ALTER TABLE t ADD COLUMN e2 INTEGER DEFAULT (abs(-5))",
+                "ALTER TABLE t ADD COLUMN e3 DEFAULT (random())",
+                "ALTER TABLE t ADD COLUMN e4 DEFAULT CURRENT_TIMESTAMP",
+            ],
+        )
+        .await;
+        assert_no_mismatches(
+            &diverged,
+            "alter_add_column_nonconstant_default_allowed_on_empty_table",
+        );
+
+        // Insert after the fact: the deterministic expression defaults evaluate
+        // per-row exactly as on stock SQLite (e1 = 3, e2 = 5).
+        apply(&fconn, &rconn, &["INSERT INTO t (a) VALUES (10)"]).await;
+        let m = oracle_compare(&fconn, &rconn, &["SELECT a, e1, e2 FROM t ORDER BY a"]).await;
+        assert_no_mismatches(
+            &m,
+            "alter_add_column_nonconstant_default_allowed_on_empty_table_values",
+        );
+    });
+}
