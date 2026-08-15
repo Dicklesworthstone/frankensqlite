@@ -2,6 +2,7 @@
 *.db
 *.db-shm
 *.db-wal
+*.db-wal-cert*
 *.db.schema-migration-*
 *.db-fsqlite-ns-gate
 *.db-fsqlite-ns-use
