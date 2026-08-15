@@ -105003,7 +105003,7 @@ fn collect_primary_key_constraints(
 /// bd-w9r11 (GH#222/#223): per-PRIMARY-KEY-column descending flags, parallel
 /// to [`collect_primary_key_constraints`] (same group order, same filtering:
 /// expression PK terms disqualify the whole table-level group there and here).
-fn collect_primary_key_desc_flags(
+pub(crate) fn collect_primary_key_desc_flags(
     columns: &[fsqlite_ast::ColumnDef],
     constraints: &[fsqlite_ast::TableConstraint],
 ) -> Vec<Vec<bool>> {
@@ -109483,7 +109483,7 @@ fn empty_column_defaults_arc() -> Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>> 
     Arc::clone(EMPTY.get_or_init(|| Arc::new(HbHashMap::new())))
 }
 
-fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
+pub(crate) fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
     match e {
         CodegenError::TableNotFound(name) => {
             FrankenError::Internal(format!("no such table: {name}"))
@@ -159175,6 +159175,747 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(actual, expected);
+        });
+    }
+
+    /// Read byte zero of `root_page` in a file-backed database.
+    ///
+    /// SQLite b-tree page types: `0x0D` leaf **table**, `0x05` interior
+    /// **table**, `0x0A` leaf **index**, `0x02` interior **index**. A
+    /// `WITHOUT ROWID` table's root must be an *index* page — its rows live in
+    /// an index b-tree keyed by the declared primary key, with no rowid at all.
+    ///
+    /// Which index page depends on DEPTH, not on the table being WITHOUT
+    /// ROWID: `0x0A` while the whole tree fits one leaf, `0x02` once it is
+    /// multi-level. Asserting `0x0A` unconditionally is therefore only valid
+    /// for a fixture small enough to stay single-leaf, and silently becomes a
+    /// wrong assertion the moment such a fixture grows — see
+    /// [`assert_without_rowid_tree_shape`], which callers should prefer.
+    async fn root_page_type_byte(db_path_text: &str, table: &str) -> u8 {
+        let conn = Connection::open_schema_only(db_path_text).await.unwrap();
+        let root_page = {
+            let schema = conn.schema.borrow();
+            schema
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(table))
+                .expect("table present in reopened schema")
+                .root_page
+        };
+        let cx = Cx::new();
+        let txn = conn
+            .pager
+            .begin(&cx, TransactionMode::Deferred)
+            .await
+            .unwrap();
+        let page_no = PageNumber::new(u32::try_from(root_page).unwrap()).unwrap();
+        let byte = txn.get_page(&cx, page_no).await.unwrap().as_ref()[0];
+        drop(txn);
+        conn.close().await.unwrap();
+        byte
+    }
+
+    /// Census every b-tree page type byte in a database FILE, keyed by type.
+    ///
+    /// Page 1 is reported separately because it always carries the
+    /// `sqlite_master` b-tree — a rowid table, hence `0x0D` — behind the
+    /// 100-byte file header. Counting it with the rest would make "no table
+    /// b-tree pages anywhere" impossible to state.
+    fn page_type_census(db_path: &std::path::Path) -> (u8, std::collections::BTreeMap<u8, usize>) {
+        let bytes = std::fs::read(db_path).expect("read database file");
+        let raw_page_size = u32::from(u16::from_be_bytes([bytes[16], bytes[17]]));
+        // The header encodes 65536 as 1.
+        let page_size = if raw_page_size == 1 {
+            65536
+        } else {
+            raw_page_size as usize
+        };
+        // Byte zero of page 1's b-tree header sits just past the file header.
+        let page1_type = bytes[100];
+        let mut census = std::collections::BTreeMap::new();
+        let page_count = bytes.len() / page_size;
+        for page_index in 1..page_count {
+            *census.entry(bytes[page_index * page_size]).or_insert(0) += 1;
+        }
+        (page1_type, census)
+    }
+
+    /// Assert the physical shape of a `WITHOUT ROWID` table's storage.
+    ///
+    /// Depth-aware by construction: it requires the root to be an *index* page
+    /// and, when `expect_multilevel`, requires it to be the INTERIOR index type
+    /// `0x02` specifically. It additionally censuses the whole file to prove no
+    /// *table* b-tree page (`0x0D`/`0x05`) exists at any depth outside page 1 —
+    /// the property that a serializer flipping only the root's type byte would
+    /// violate while still satisfying a root-only check.
+    async fn assert_without_rowid_tree_shape(
+        db_path: &std::path::Path,
+        db_path_text: &str,
+        table: &str,
+        expect_multilevel: bool,
+    ) {
+        const LEAF_INDEX: u8 = 0x0A;
+        const INTERIOR_INDEX: u8 = 0x02;
+        const LEAF_TABLE: u8 = 0x0D;
+        const INTERIOR_TABLE: u8 = 0x05;
+
+        let root = root_page_type_byte(db_path_text, table).await;
+        assert!(
+            root == LEAF_INDEX || root == INTERIOR_INDEX,
+            "WITHOUT ROWID table `{table}` root must be an index b-tree page \
+             (0x0A leaf or 0x02 interior), got {root:#04x}"
+        );
+        if expect_multilevel {
+            assert_eq!(
+                root, INTERIOR_INDEX,
+                "a multi-level WITHOUT ROWID tree must root at an INTERIOR index page"
+            );
+        } else {
+            assert_eq!(
+                root, LEAF_INDEX,
+                "a single-leaf WITHOUT ROWID tree must root at a LEAF index page"
+            );
+        }
+
+        let (page1_type, census) = page_type_census(db_path);
+        assert_eq!(
+            page1_type, LEAF_TABLE,
+            "page 1 always carries the sqlite_master rowid b-tree"
+        );
+        assert_eq!(
+            census.get(&LEAF_TABLE).copied().unwrap_or(0),
+            0,
+            "no leaf TABLE page may exist outside page 1 in this database; census {census:?}"
+        );
+        assert_eq!(
+            census.get(&INTERIOR_TABLE).copied().unwrap_or(0),
+            0,
+            "no interior TABLE page may exist in this database; census {census:?}"
+        );
+        if expect_multilevel {
+            assert!(
+                census.get(&INTERIOR_INDEX).copied().unwrap_or(0) >= 1,
+                "a multi-level tree must contain at least one interior index page; \
+                 census {census:?}"
+            );
+        }
+    }
+
+    /// GH #340: `VACUUM INTO` must persist a `WITHOUT ROWID` table as an index
+    /// b-tree keyed by its declared primary key.
+    ///
+    /// Before the compat-persist repair the serializer had no
+    /// `table.without_rowid` branch: it initialized every table root as a leaf
+    /// *table* page (`0x0D`) and inserted rows under a synthetic `MemDatabase`
+    /// rowid. fsqlite's own pre-publication `quick_check` caught the mismatch
+    /// and refused to publish, so the observable symptom was a hard refusal
+    /// ("WITHOUT ROWID table `wr` root page N is not an index b-tree page")
+    /// rather than a corrupt output file.
+    ///
+    /// This asserts output *validity*, not merely that `VACUUM INTO` returned
+    /// `Ok`: a serializer that emitted a structurally valid but wrongly-keyed
+    /// image would pass the statement and fail here.
+    #[test]
+    fn test_vacuum_into_persists_without_rowid_table_as_index_btree() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("wr-vacuum-source.db");
+            let target_path = dir.path().join("wr-vacuum-target.db");
+            let source_path_str = source_path.to_string_lossy().into_owned();
+            let target_path_str = target_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&source_path_str).await.unwrap();
+            // Requirement 1: multi-column WITHOUT ROWID primary key.
+            conn.execute(
+                "CREATE TABLE wr (\
+                   region TEXT NOT NULL, \
+                   sku    TEXT NOT NULL, \
+                   qty    INTEGER NOT NULL, \
+                   note   TEXT, \
+                   PRIMARY KEY (region, sku)\
+                 ) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+            // Requirement 2: a secondary index, so PK-suffix behavior is
+            // exercised. A WITHOUT ROWID index takes the primary-key columns as
+            // its suffix; the pre-repair builder appended a synthetic integer
+            // rowid instead (compat_persist.rs, index key loop).
+            conn.execute("CREATE INDEX wr_qty ON wr(qty);")
+                .await
+                .unwrap();
+            // Requirement 1: several rows inserted in NON primary-key order, so
+            // a builder that merely preserves insertion order cannot pass.
+            conn.execute(
+                "INSERT INTO wr(region, sku, qty, note) VALUES \
+                   ('west', 'bolt',   7, 'seventh'), \
+                   ('east', 'washer', 3, NULL), \
+                   ('west', 'anchor', 5, 'fifth'), \
+                   ('east', 'nut',    9, 'ninth'), \
+                   ('north','cam',    1, 'first');",
+            )
+            .await
+            .unwrap();
+            let expected_rows = conn
+                .query("SELECT region, sku, qty, note FROM wr ORDER BY region, sku;")
+                .await
+                .unwrap();
+            assert_eq!(expected_rows.len(), 5);
+            let expected_by_qty = conn
+                .query("SELECT region, sku FROM wr WHERE qty >= 5 ORDER BY qty;")
+                .await
+                .unwrap();
+            assert_eq!(expected_by_qty.len(), 3);
+
+            // Requirement 3: VACUUM INTO a new reserved path.
+            conn.execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target_path_str.clone().into())],
+            )
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+            assert!(target_path.exists(), "VACUUM INTO must publish its output");
+
+            // Requirement 4: the output validates through fsqlite.
+            let copied = Connection::open(&target_path_str).await.unwrap();
+            assert_eq!(
+                copied.query("PRAGMA quick_check;").await.unwrap()[0].values()[0],
+                SqliteValue::Text("ok".into()),
+                "vacuumed WITHOUT ROWID output must pass quick_check"
+            );
+            assert_eq!(
+                copied.query("PRAGMA integrity_check;").await.unwrap()[0].values()[0],
+                SqliteValue::Text("ok".into()),
+                "vacuumed WITHOUT ROWID output must pass integrity_check"
+            );
+
+            // Requirement 5: rows readable in primary-key order, and the
+            // secondary index still answers a query over it.
+            let actual_rows = copied
+                .query("SELECT region, sku, qty, note FROM wr ORDER BY region, sku;")
+                .await
+                .unwrap();
+            assert_eq!(
+                actual_rows, expected_rows,
+                "vacuumed WITHOUT ROWID rows must round-trip in primary-key order"
+            );
+            let actual_by_qty = copied
+                .query("SELECT region, sku FROM wr WHERE qty >= 5 ORDER BY qty;")
+                .await
+                .unwrap();
+            assert_eq!(
+                actual_by_qty, expected_by_qty,
+                "secondary index over a WITHOUT ROWID table must survive VACUUM INTO"
+            );
+            copied.close().await.unwrap();
+
+            // Requirement 5: the table root really is an index b-tree. This is
+            // the physical property the pre-repair serializer got wrong, and it
+            // is checked independently of any query result. Five rows is a
+            // single leaf, so `expect_multilevel` is false here; the
+            // interior-page case is covered by
+            // `test_vacuum_into_without_rowid_multilevel_tree_has_interior_index_pages`.
+            assert_without_rowid_tree_shape(&target_path, &target_path_str, "wr", false).await;
+
+            // Cross-check with stock SQLite: fsqlite agreeing with itself is
+            // not proof the image is portable.
+            let sqlite = rusqlite::Connection::open(&target_path).unwrap();
+            let quick_check: String = sqlite
+                .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+                .unwrap();
+            let integrity_check: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            let row_count: i64 = sqlite
+                .query_row("SELECT COUNT(*) FROM wr;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(quick_check, "ok", "stock SQLite quick_check on vacuum output");
+            assert_eq!(
+                integrity_check, "ok",
+                "stock SQLite integrity_check on vacuum output"
+            );
+            assert_eq!(row_count, 5);
+        });
+    }
+
+    /// GH #340 requirement 6: the rowid-table control. The `WITHOUT ROWID`
+    /// branch must not disturb the ordinary path — a rowid table's root stays a
+    /// leaf *table* b-tree (`0x0D`) and its rows keep their rowids.
+    #[test]
+    fn test_vacuum_into_rowid_table_control_keeps_table_btree_root() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("rowid-vacuum-source.db");
+            let target_path = dir.path().join("rowid-vacuum-target.db");
+            let source_path_str = source_path.to_string_lossy().into_owned();
+            let target_path_str = target_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&source_path_str).await.unwrap();
+            conn.execute(
+                "CREATE TABLE rt (id INTEGER PRIMARY KEY, region TEXT NOT NULL, qty INTEGER);",
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE INDEX rt_qty ON rt(qty);")
+                .await
+                .unwrap();
+            conn.execute(
+                "INSERT INTO rt(id, region, qty) VALUES \
+                   (30, 'west', 7), (10, 'east', 3), (20, 'north', 5);",
+            )
+            .await
+            .unwrap();
+            let expected = conn
+                .query("SELECT id, region, qty FROM rt ORDER BY id;")
+                .await
+                .unwrap();
+            let expected_rowids = conn
+                .query("SELECT rowid, id FROM rt ORDER BY rowid;")
+                .await
+                .unwrap();
+
+            conn.execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target_path_str.clone().into())],
+            )
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+
+            let copied = Connection::open(&target_path_str).await.unwrap();
+            assert_eq!(
+                copied.query("PRAGMA quick_check;").await.unwrap()[0].values()[0],
+                SqliteValue::Text("ok".into())
+            );
+            assert_eq!(
+                copied.query("PRAGMA integrity_check;").await.unwrap()[0].values()[0],
+                SqliteValue::Text("ok".into())
+            );
+            assert_eq!(
+                copied
+                    .query("SELECT id, region, qty FROM rt ORDER BY id;")
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                copied
+                    .query("SELECT rowid, id FROM rt ORDER BY rowid;")
+                    .await
+                    .unwrap(),
+                expected_rowids,
+                "rowid table must keep its rowids across VACUUM INTO"
+            );
+            copied.close().await.unwrap();
+
+            assert_eq!(
+                root_page_type_byte(&target_path_str, "rt").await,
+                0x0D,
+                "rowid table root must remain a leaf table b-tree"
+            );
+        });
+    }
+
+    /// GH #340: force a MULTI-LEVEL `WITHOUT ROWID` tree.
+    ///
+    /// The five-row fixture above never builds an interior page, so it cannot
+    /// distinguish a serializer that gets leaf pages right from one that
+    /// corrupts b-tree growth. This drives enough rows to split, then proves
+    /// the tree is genuinely multi-level and that no *table* b-tree page exists
+    /// at any depth.
+    #[test]
+    fn test_vacuum_into_without_rowid_multilevel_tree_has_interior_index_pages() {
+        asupersync::test_utils::run_test(|| async {
+            const ROWS: i64 = 4000;
+
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("wr-deep-source.db");
+            let target_path = dir.path().join("wr-deep-target.db");
+            let source_path_str = source_path.to_string_lossy().into_owned();
+            let target_path_str = target_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&source_path_str).await.unwrap();
+            conn.execute(
+                "CREATE TABLE wr (\
+                   k    TEXT NOT NULL, \
+                   part INTEGER NOT NULL, \
+                   note TEXT NOT NULL, \
+                   PRIMARY KEY (k, part)\
+                 ) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE INDEX wr_note ON wr(note);")
+                .await
+                .unwrap();
+
+            // Insert in an order that is NOT primary-key order: 7919 is coprime
+            // with 4000, so `n * 7919 % 4000` is a bijection that scatters the
+            // keys. A builder that merely preserved insertion order would
+            // produce a tree whose physical order contradicts its own key.
+            for chunk_start in (0..ROWS).step_by(200) {
+                use std::fmt::Write as _;
+                let mut sql = String::from("INSERT INTO wr(k, part, note) VALUES ");
+                for n in chunk_start..(chunk_start + 200).min(ROWS) {
+                    let scattered = (n * 7919) % ROWS;
+                    if n != chunk_start {
+                        sql.push_str(", ");
+                    }
+                    let _ = write!(
+                        sql,
+                        "('key{scattered:06}', {}, 'note{scattered:06}')",
+                        scattered % 3
+                    );
+                }
+                sql.push(';');
+                conn.execute(&sql).await.unwrap();
+            }
+
+            let expected_count = conn.query("SELECT COUNT(*) FROM wr;").await.unwrap();
+            assert_eq!(expected_count[0].values()[0], SqliteValue::Integer(ROWS));
+            let expected_head = conn
+                .query("SELECT k, part FROM wr ORDER BY k, part LIMIT 5;")
+                .await
+                .unwrap();
+
+            conn.execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target_path_str.clone().into())],
+            )
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+
+            let copied = Connection::open(&target_path_str).await.unwrap();
+            assert_eq!(
+                copied.query("PRAGMA quick_check;").await.unwrap()[0].values()[0],
+                SqliteValue::Text("ok".into())
+            );
+            assert_eq!(
+                copied.query("PRAGMA integrity_check;").await.unwrap()[0].values()[0],
+                SqliteValue::Text("ok".into())
+            );
+            assert_eq!(
+                copied.query("SELECT COUNT(*) FROM wr;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(ROWS)
+            );
+            assert_eq!(
+                copied
+                    .query("SELECT k, part FROM wr ORDER BY k, part LIMIT 5;")
+                    .await
+                    .unwrap(),
+                expected_head
+            );
+            copied.close().await.unwrap();
+
+            // The point of this fixture: the tree must actually be multi-level.
+            assert_without_rowid_tree_shape(&target_path, &target_path_str, "wr", true).await;
+
+            let sqlite = rusqlite::Connection::open(&target_path).unwrap();
+            let integrity_check: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            let row_count: i64 = sqlite
+                .query_row("SELECT COUNT(*) FROM wr;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity_check, "ok");
+            assert_eq!(row_count, ROWS);
+        });
+    }
+
+    /// GH #340: `DESC` in a `WITHOUT ROWID` primary key is PHYSICAL.
+    ///
+    /// `PRIMARY KEY (a ASC, b DESC)` stores rows in ascending `a`, descending
+    /// `b` order on disk; it is not a query-planning hint. This reads the rows
+    /// back with NO `ORDER BY`, so the result IS the b-tree's stored order.
+    ///
+    /// This is the test that fails if the `desc_flags` handed to
+    /// `BtCursor::new_with_index_desc` are dropped: the rebuild would store
+    /// ascending `b` while the schema text still declares `DESC`.
+    #[test]
+    fn test_vacuum_into_without_rowid_desc_primary_key_is_physically_ordered() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("wr-desc-source.db");
+            let target_path = dir.path().join("wr-desc-target.db");
+            let source_path_str = source_path.to_string_lossy().into_owned();
+            let target_path_str = target_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&source_path_str).await.unwrap();
+            conn.execute(
+                "CREATE TABLE wr (\
+                   a TEXT NOT NULL, \
+                   b INTEGER NOT NULL, \
+                   PRIMARY KEY (a ASC, b DESC)\
+                 ) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO wr(a, b) VALUES \
+                   ('bravo', 5), ('alpha', 3), ('bravo', 9), ('alpha', 7), ('bravo', 1);",
+            )
+            .await
+            .unwrap();
+
+            // Stored order: a ascending, b DESCENDING within each a.
+            let expected: Vec<Vec<SqliteValue>> = vec![
+                vec![SqliteValue::Text("alpha".into()), SqliteValue::Integer(7)],
+                vec![SqliteValue::Text("alpha".into()), SqliteValue::Integer(3)],
+                vec![SqliteValue::Text("bravo".into()), SqliteValue::Integer(9)],
+                vec![SqliteValue::Text("bravo".into()), SqliteValue::Integer(5)],
+                vec![SqliteValue::Text("bravo".into()), SqliteValue::Integer(1)],
+            ];
+            let source_scan = conn.query("SELECT a, b FROM wr;").await.unwrap();
+            assert_eq!(
+                source_scan
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                expected,
+                "source scan order must already reflect the declared DESC key"
+            );
+
+            conn.execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target_path_str.clone().into())],
+            )
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+
+            let copied = Connection::open(&target_path_str).await.unwrap();
+            assert_eq!(
+                copied.query("PRAGMA quick_check;").await.unwrap()[0].values()[0],
+                SqliteValue::Text("ok".into())
+            );
+            assert_eq!(
+                copied.query("PRAGMA integrity_check;").await.unwrap()[0].values()[0],
+                SqliteValue::Text("ok".into())
+            );
+            // No ORDER BY: this is the physical order the rebuild produced.
+            let rebuilt_scan = copied.query("SELECT a, b FROM wr;").await.unwrap();
+            assert_eq!(
+                rebuilt_scan
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                expected,
+                "VACUUM INTO must preserve the DESC component of the primary key \
+                 as physical b-tree order"
+            );
+            copied.close().await.unwrap();
+
+            let sqlite = rusqlite::Connection::open(&target_path).unwrap();
+            let integrity_check: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                integrity_check, "ok",
+                "stock SQLite must accept the DESC-keyed rebuild"
+            );
+        });
+    }
+
+    /// GH #340: a non-BINARY collation is part of `WITHOUT ROWID` KEY EQUALITY.
+    ///
+    /// With a leading `COLLATE NOCASE` primary-key column, `BRAVO` and `bravo`
+    /// are the SAME key. After `VACUUM INTO`, inserting the case variant must
+    /// still raise a UNIQUE violation against the rebuilt table.
+    ///
+    /// This is the test that fails if the PK collation context never reaches
+    /// the cursor: the rebuilt tree would be ordered by BINARY while its schema
+    /// still declares `NOCASE`.
+    ///
+    /// FIXTURE REQUIREMENT, learned by measurement. The keys must be chosen so
+    /// BINARY and NOCASE disagree, or the test cannot see the defect. An
+    /// earlier version of this fixture used `alpha`/`bravo`, which sort
+    /// identically under both collations; dropping the collation context left
+    /// that version GREEN. `apple`/`Banana`/`cherry` do disagree — BINARY puts
+    /// `Banana` first (`B` is 0x42, below `a` at 0x61) while NOCASE puts
+    /// `apple` first — so the stored order alone distinguishes them.
+    #[test]
+    fn test_vacuum_into_without_rowid_nocase_primary_key_keeps_key_equality() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("wr-nocase-source.db");
+            let target_path = dir.path().join("wr-nocase-target.db");
+            let source_path_str = source_path.to_string_lossy().into_owned();
+            let target_path_str = target_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&source_path_str).await.unwrap();
+            conn.execute(
+                "CREATE TABLE wr (\
+                   k TEXT COLLATE NOCASE NOT NULL, \
+                   b INTEGER NOT NULL, \
+                   v TEXT, \
+                   PRIMARY KEY (k, b)\
+                 ) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+            // Inserted in an order that is neither BINARY nor NOCASE order.
+            conn.execute(
+                "INSERT INTO wr(k, b, v) VALUES \
+                   ('cherry', 1, 'c'), ('Banana', 1, 'b'), ('apple', 1, 'a');",
+            )
+            .await
+            .unwrap();
+
+            // NOCASE order. Under BINARY this would be Banana, apple, cherry.
+            let expected: Vec<Vec<SqliteValue>> = vec![
+                vec![SqliteValue::Text("apple".into()), SqliteValue::Integer(1)],
+                vec![SqliteValue::Text("Banana".into()), SqliteValue::Integer(1)],
+                vec![SqliteValue::Text("cherry".into()), SqliteValue::Integer(1)],
+            ];
+            let source_scan = conn.query("SELECT k, b FROM wr;").await.unwrap();
+            assert_eq!(
+                source_scan
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                expected,
+                "source scan order must already reflect the declared NOCASE key"
+            );
+
+            // Sanity: the collation is enforced on the SOURCE before we rebuild.
+            let source_violation = conn
+                .execute("INSERT INTO wr(k, b, v) VALUES ('BANANA', 1, 'dupe');")
+                .await
+                .unwrap_err();
+            assert!(
+                source_violation.to_string().to_ascii_lowercase().contains("unique"),
+                "source NOCASE primary key must reject the case variant, got {source_violation:?}"
+            );
+
+            conn.execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target_path_str.clone().into())],
+            )
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+
+            let copied = Connection::open(&target_path_str).await.unwrap();
+            assert_eq!(
+                copied.query("PRAGMA quick_check;").await.unwrap()[0].values()[0],
+                SqliteValue::Text("ok".into())
+            );
+            assert_eq!(
+                copied.query("PRAGMA integrity_check;").await.unwrap()[0].values()[0],
+                SqliteValue::Text("ok".into())
+            );
+            // Load-bearing assertion #1: the STORED order is NOCASE order. No
+            // ORDER BY, so this reads the b-tree as the rebuild laid it out.
+            let rebuilt_scan = copied.query("SELECT k, b FROM wr;").await.unwrap();
+            assert_eq!(
+                rebuilt_scan
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                expected,
+                "VACUUM INTO must order the rebuilt WITHOUT ROWID table by its declared \
+                 NOCASE primary-key collation, not by BINARY"
+            );
+            // Load-bearing assertion #2: key equality survived the rebuild.
+            let rebuilt_violation = copied
+                .execute("INSERT INTO wr(k, b, v) VALUES ('BANANA', 1, 'dupe');")
+                .await
+                .unwrap_err();
+            assert!(
+                rebuilt_violation
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("unique"),
+                "rebuilt NOCASE primary key must still treat 'BANANA' and 'Banana' as one key; \
+                 got {rebuilt_violation:?}"
+            );
+            assert_eq!(
+                copied.query("SELECT COUNT(*) FROM wr;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(3)
+            );
+            copied.close().await.unwrap();
+
+            let sqlite = rusqlite::Connection::open(&target_path).unwrap();
+            let integrity_check: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity_check, "ok");
+        });
+    }
+
+    /// GH #340: an unresolvable primary-key collation must FAIL CLOSED.
+    ///
+    /// A collation registered on the source connection is not reachable from
+    /// the compatibility builder. Ordering the rebuilt table by BINARY instead
+    /// would produce a tree whose physical order contradicts its own declared
+    /// schema — a malformed image that still reports a successful VACUUM. The
+    /// builder must refuse instead, and must not publish an output.
+    ///
+    /// This is the test that fails if the refusal is downgraded to a silent
+    /// BINARY fallback.
+    #[test]
+    fn test_vacuum_into_without_rowid_unresolvable_pk_collation_is_refused() {
+        struct AppOrdering;
+
+        impl CollationFunction for AppOrdering {
+            fn name(&self) -> &str {
+                "APP_ORDERING"
+            }
+
+            fn compare(&self, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+                // Deliberately not BINARY: reversed, so a silent BINARY
+                // fallback would be observable as a different physical order.
+                right.cmp(left)
+            }
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("wr-collation-source.db");
+            let target_path = dir.path().join("wr-collation-target.db");
+            let source_path_str = source_path.to_string_lossy().into_owned();
+            let target_path_str = target_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&source_path_str).await.unwrap();
+            conn.register_collation_function(AppOrdering);
+            conn.execute(
+                "CREATE TABLE wr (\
+                   k TEXT COLLATE APP_ORDERING NOT NULL, \
+                   v TEXT, \
+                   PRIMARY KEY (k)\
+                 ) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO wr(k, v) VALUES ('alpha', 'a'), ('bravo', 'b');")
+                .await
+                .unwrap();
+
+            let error = conn
+                .execute_with_params(
+                    "VACUUM INTO ?1;",
+                    &[SqliteValue::Text(target_path_str.clone().into())],
+                )
+                .await
+                .expect_err(
+                    "a primary-key collation the builder cannot resolve must be refused, \
+                     never rebuilt as BINARY",
+                );
+            let message = error.to_string();
+            assert!(
+                message.contains("APP_ORDERING"),
+                "the refusal must name the unresolvable collation; got {message}"
+            );
+            assert!(
+                message.to_ascii_lowercase().contains("without rowid"),
+                "the refusal must name the WITHOUT ROWID table path; got {message}"
+            );
+            assert!(
+                !target_path.exists(),
+                "a refused rebuild must leave no published output behind"
+            );
+            conn.close().await.unwrap();
         });
     }
 

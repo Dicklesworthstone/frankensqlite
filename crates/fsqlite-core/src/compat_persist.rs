@@ -45,7 +45,8 @@ use fsqlite_types::record::{
 use fsqlite_types::value::SqliteValue;
 
 use crate::connection::{
-    ImplicitAutoindexSlot, column_def_is_exact_integer, implicit_autoindex_layout,
+    ImplicitAutoindexSlot, codegen_error_to_franken, collect_primary_key_desc_flags,
+    column_def_is_exact_integer, implicit_autoindex_layout,
     validate_builtin_persisted_index_expr_functions,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -53,6 +54,7 @@ use crate::connection::{eval_join_expr, is_sqlite_truthy};
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{
     CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema, bind_explicit_index,
+    without_rowid_pk_indices,
 };
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
@@ -1134,14 +1136,96 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             continue;
         };
 
+        // Prefer the original DDL when available — it preserves column-level
+        // CHECK constraints, exact DEFAULT formatting, and constraint ordering
+        // that build_create_table_sql might not reconstruct perfectly.
+        // Keys in original_ddl are lowercased (per reload_memdb_from_txn_with_mode).
+        //
+        // GH #340: resolved BEFORE any page is written, not after. A WITHOUT
+        // ROWID root must be keyed by the primary key exactly as the schema
+        // text published beside it declares, so the text has to be settled
+        // first. For rowid tables the move is a pure reordering.
+        let create_sql = original_ddl
+            .get(&table.name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| {
+                build_create_table_sql_with_implicit_index_predicate(table, |index| {
+                    parse_autoindex_ordinal(&index.name, &table.name).is_some()
+                        && !original_ddl.contains_key(&index.name.to_ascii_lowercase())
+                })
+            });
+
+        // GH #340: a WITHOUT ROWID table is stored as an index b-tree keyed by
+        // its PRIMARY KEY, never as a leaf-table b-tree under a synthetic
+        // rowid. Resolving the layout here also decides the row-locator suffix
+        // every secondary index below must carry.
+        let without_rowid_pk = if table.without_rowid {
+            Some(resolve_without_rowid_pk_layout(table, &create_sql)?)
+        } else {
+            None
+        };
+
         // Allocate a fresh root page for this table in the on-disk file.
         let root_page = txn.allocate_page(cx).await?;
 
-        // Initialize the root page as an empty leaf table B-tree.
-        init_leaf_table_page(cx, &mut txn, root_page, page_size_usize, usable_size).await?;
+        if let Some(pk) = without_rowid_pk.as_ref() {
+            // Index root (0x0A), not a table root (0x0D). Flipping only the
+            // type byte would be worse than the bug: it would leave table
+            // cells, which carry a rowid varint the index format has no slot
+            // for, sitting on a page every reader parses as index cells.
+            init_leaf_index_page(cx, &mut txn, root_page, page_size_usize, usable_size).await?;
 
-        // Insert all rows.
-        {
+            let mut cursor = fsqlite_btree::BtCursor::new_with_index_desc(
+                TransactionPageIo::new(&mut txn),
+                root_page,
+                usable_size,
+                // An index cursor: `table_insert` takes a rowid this table
+                // does not have.
+                false,
+                pk.desc_flags.clone(),
+            );
+            let collation_registry = cursor.collation_registry();
+            // Same refusal the secondary-index builder makes below, for the
+            // same reason: a collation this builder cannot resolve degrades
+            // silently to BINARY and produces a b-tree whose physical order
+            // contradicts its own declared schema. For a WITHOUT ROWID table
+            // that order IS the table, so the consequence is worse than a
+            // mis-ordered index — refuse rather than approximate.
+            {
+                let registry = collation_registry.lock().map_err(|_| {
+                    FrankenError::internal(
+                        "collation registry lock poisoned while rebuilding a WITHOUT ROWID table"
+                            .to_owned(),
+                    )
+                })?;
+                for collation in pk.collations.iter().flatten() {
+                    if !registry.contains(collation) {
+                        return Err(FrankenError::not_implemented(format!(
+                            "WITHOUT ROWID table `{}` declares primary-key collation \
+                             `{collation}`, which is not available to the compatibility \
+                             builder; rebuilding it would order the table by BINARY and \
+                             contradict its own declaration",
+                            table.name
+                        )));
+                    }
+                }
+            }
+            cursor.set_index_collation_context(pk.collations.clone(), collation_registry);
+            configure_btree_cursor_page_size(&mut cursor, usable_size, full_page_size);
+
+            for (_synthetic_rowid, values) in mem_table.iter_rows() {
+                // The stored record is the FULL row in declared column order;
+                // the b-tree key is its leading `pk.indices.len()` columns.
+                // `MemDatabase` keys WITHOUT ROWID rows under a synthetic
+                // counter assigned at load purely to index the map — it is not
+                // part of the row and must not reach the image.
+                cursor.index_insert(cx, &serialize_record(values)).await?;
+            }
+        } else {
+            // Initialize the root page as an empty leaf table B-tree.
+            init_leaf_table_page(cx, &mut txn, root_page, page_size_usize, usable_size).await?;
+
+            // Insert all rows.
             let mut cursor = fsqlite_btree::BtCursor::new(
                 TransactionPageIo::new(&mut txn),
                 root_page,
@@ -1155,19 +1239,6 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             }
         }
 
-        // Prefer the original DDL when available — it preserves column-level
-        // CHECK constraints, exact DEFAULT formatting, and constraint ordering
-        // that build_create_table_sql might not reconstruct perfectly.
-        // Keys in original_ddl are lowercased (per reload_memdb_from_txn_with_mode).
-        let create_sql = original_ddl
-            .get(&table.name.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_else(|| {
-                build_create_table_sql_with_implicit_index_predicate(table, |index| {
-                    parse_autoindex_ordinal(&index.name, &table.name).is_some()
-                        && !original_ddl.contains_key(&index.name.to_ascii_lowercase())
-                })
-            });
         let table_name = table.name.clone();
         master_entries.push((
             "table".to_owned(),
@@ -1236,16 +1307,15 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 // SQLite then reads the index with the declared semantics and
                 // reports the image as malformed.
                 //
-                // Scope of the trailing entry, stated exactly: the key loop
-                // below emits a *synthetic* integer rowid as the suffix
-                // (`key_values.push(SqliteValue::Integer(rowid))`). That layout
-                // is correct only for rowid tables. A WITHOUT ROWID index takes
-                // its primary-key columns as the suffix instead, and this
-                // builder does not produce that shape at all — so the single
-                // trailing ASC/BINARY entry pushed here describes the synthetic
-                // rowid this code actually writes, and must NOT be read as
-                // implementing SQLite's general index-suffix rule. WITHOUT
-                // ROWID suffix semantics remain unfixed (GH #304 acceptance).
+                // Scope of the trailing entries, stated exactly: the key loop
+                // below emits a row locator as the suffix. For a rowid table
+                // that is one synthetic integer rowid
+                // (`key_values.push(SqliteValue::Integer(rowid))`), described
+                // by the single trailing ASC/BINARY entry. For a WITHOUT ROWID
+                // table it is the primary-key columns in declared PK order,
+                // described by one entry per PK column carrying that column's
+                // own direction and collation (GH #340, which closed the
+                // WITHOUT ROWID suffix gap GH #304 recorded as unfixed).
                 //
                 // Collations resolve against the cursor's default registry
                 // (BINARY/NOCASE/RTRIM only). A collation registered on the
@@ -1277,11 +1347,23 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                         index.key_sort_directions.get(term).copied() == Some(SortDirection::Desc)
                     })
                     .collect();
-                index_desc_flags.push(false);
                 let mut index_collations: Vec<Option<String>> = (0..key_terms)
                     .map(|term| index.key_collations.get(term).cloned().flatten())
                     .collect();
-                index_collations.push(None);
+                // GH #340: metadata for the row-locator suffix. A rowid table's
+                // suffix is one synthetic integer, so one ASC/BINARY entry
+                // describes it. A WITHOUT ROWID table's suffix is its whole
+                // primary key, and each of those columns carries its own
+                // declared direction and collation — the single trailing entry
+                // that used to be pushed here described a rowid this branch
+                // does not write.
+                if let Some(pk) = without_rowid_pk.as_ref() {
+                    index_desc_flags.extend(pk.desc_flags.iter().copied());
+                    index_collations.extend(pk.collations.iter().cloned());
+                } else {
+                    index_desc_flags.push(false);
+                    index_collations.push(None);
+                }
 
                 let mut idx_cursor = fsqlite_btree::BtCursor::new_with_index_desc(
                     TransactionPageIo::new(&mut txn),
@@ -1377,7 +1459,21 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                                 }
                             }
                         }
-                        key_values.push(SqliteValue::Integer(rowid));
+                        // GH #340: append the row locator. A rowid table
+                        // appends its rowid; a WITHOUT ROWID table appends
+                        // every primary-key column in declared PK order, which
+                        // is the only way the entry can identify its row —
+                        // there is no rowid to point at. This matches the
+                        // ordinary index-backfill path.
+                        if let Some(pk) = without_rowid_pk.as_ref() {
+                            for &col_idx in &pk.indices {
+                                key_values.push(
+                                    values.get(col_idx).cloned().unwrap_or(SqliteValue::Null),
+                                );
+                            }
+                        } else {
+                            key_values.push(SqliteValue::Integer(rowid));
+                        }
                         let key = serialize_record(&key_values);
                         idx_cursor.index_insert(cx, &key).await?;
                     }
@@ -1943,6 +2039,111 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+/// Physical primary-key layout of a `WITHOUT ROWID` table root (GH #340).
+///
+/// A `WITHOUT ROWID` table has no rowid: its rows live directly in an **index**
+/// b-tree whose stored record is the full row in declared column order, keyed
+/// by the leading `indices.len()` columns. This is not a compat-layer
+/// invention — it is exactly what ordinary DML emits, `MakeRecord` over every
+/// column followed by `IdxInsert` with the PK count as its key arity (see
+/// `emit_without_rowid_row_insert` in `fsqlite-vdbe`).
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+struct WithoutRowidPkLayout {
+    /// Declared-order column positions of the primary key.
+    ///
+    /// `without_rowid_pk_indices` guarantees these are the *leading* columns,
+    /// which is what makes "key = leading N columns" well defined.
+    indices: Vec<usize>,
+    /// One flag per PK column: true when that column is declared `DESC`.
+    desc_flags: Vec<bool>,
+    /// One entry per PK column: that column's declared `COLLATE`, if any.
+    collations: Vec<Option<String>>,
+}
+
+/// Resolve the primary-key ordering a `WITHOUT ROWID` table root must be keyed
+/// by, from the exact `CREATE TABLE` text this rebuild is about to publish.
+///
+/// The direction is read from `create_sql` rather than from any ambient
+/// connection state on purpose: the emitted image must be *internally*
+/// consistent, so that the physical b-tree order agrees with the schema text
+/// stored beside it. Deriving order from one source and declaring it from
+/// another is precisely how an image ends up contradicting itself and failing
+/// `quick_check` — the failure class GH #340 was filed for.
+///
+/// Collations mirror the runtime table-cursor registration, which takes the
+/// *column's* declared `COLLATE` (see the `without_rowid` branch that builds
+/// `index_collations_by_root_page` in `connection.rs`). A `COLLATE` written on
+/// the PK term itself is not consulted there, so it is not consulted here
+/// either; diverging would make the rebuilt order disagree with the order the
+/// engine uses to read it back. That inherited limitation is the runtime's,
+/// not one introduced by this repair.
+///
+/// Refuses rather than guesses. An unparseable DDL, a PK this builder cannot
+/// place, or a direction vector whose arity disagrees with the key all produce
+/// a typed refusal, because the alternative is a silently mis-ordered image
+/// that still passes as "successful VACUUM".
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn resolve_without_rowid_pk_layout(
+    table: &TableSchema,
+    create_sql: &str,
+) -> Result<WithoutRowidPkLayout> {
+    // Leading-PK placement is fsqlite's storage rule for WITHOUT ROWID tables.
+    // Reuse the codegen helper that already owns it instead of restating it:
+    // two copies of this rule silently drifting apart is a worse failure than
+    // the one being fixed.
+    let indices = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
+
+    let Some(Statement::CreateTable(create)) = parse_single_statement(create_sql) else {
+        return Err(FrankenError::not_implemented(format!(
+            "WITHOUT ROWID table `{}` cannot be rebuilt: its CREATE TABLE text does not parse, \
+             so the primary-key direction its b-tree must be keyed by is unknown",
+            table.name
+        )));
+    };
+    let CreateTableBody::Columns {
+        columns: column_defs,
+        constraints,
+    } = &create.body
+    else {
+        return Err(FrankenError::not_implemented(format!(
+            "WITHOUT ROWID table `{}` cannot be rebuilt from a CREATE TABLE ... AS SELECT form: \
+             it declares no primary-key columns to key the table b-tree by",
+            table.name
+        )));
+    };
+
+    let desc_flags = collect_primary_key_desc_flags(column_defs, constraints)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    if desc_flags.len() != indices.len() {
+        return Err(FrankenError::not_implemented(format!(
+            "WITHOUT ROWID table `{}` declares {} primary-key column(s) but its CREATE TABLE text \
+             yields {} sort direction(s); refusing to rebuild rather than key the table b-tree by \
+             a direction vector that does not describe it",
+            table.name,
+            indices.len(),
+            desc_flags.len()
+        )));
+    }
+
+    let collations = indices
+        .iter()
+        .map(|&col_idx| {
+            table
+                .columns
+                .get(col_idx)
+                .and_then(|column| column.collation.clone())
+        })
+        .collect();
+
+    Ok(WithoutRowidPkLayout {
+        indices,
+        desc_flags,
+        collations,
+    })
+}
 
 /// Initialize a page as an empty leaf table B-tree page (type 0x0D).
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
