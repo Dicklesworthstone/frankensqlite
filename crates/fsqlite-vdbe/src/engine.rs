@@ -14988,6 +14988,16 @@ impl VdbeEngine {
         p4: &P4,
         rec_buf: &mut Vec<u8>,
     ) {
+        // bd-bld9w.7: on a UTF-16 database, TEXT columns must be re-encoded to
+        // the DB encoding and the serial types sized from the *encoded* byte
+        // length, so the precomputed-header / integer-SIMD fast paths below
+        // (whose serial types are computed from the UTF-8 layout) cannot be
+        // used. Route to the cold encoding-aware helper. The UTF-8 hot path
+        // (the overwhelming default) is byte-for-byte unchanged.
+        if !matches!(self.text_encoding, TextEncoding::Utf8) {
+            self.serialize_record_from_register_range_encoded(first_reg, n_cols, p4, rec_buf);
+            return;
+        }
         match p4 {
             P4::PrecomputedHeader(header) if header.column_count() == n_cols => {
                 let null_placeholder = SqliteValue::Null;
@@ -15066,6 +15076,55 @@ impl VdbeEngine {
                 }
             }
         }
+    }
+
+    /// UTF-16 (bd-bld9w.7) cold path for
+    /// [`Self::serialize_record_from_register_range`].
+    ///
+    /// Replicates each `p4` arm's value selection — precomputed-header
+    /// `NullPlaceholder` slots and affinity `X` columns still resolve to NULL,
+    /// exactly as the UTF-8 fast paths do — then serializes through
+    /// [`fsqlite_types::record::serialize_record_iter_into_with_encoding`], which
+    /// re-encodes TEXT to the database encoding. Never called for UTF-8
+    /// databases (the caller guards on `self.text_encoding`).
+    #[cold]
+    fn serialize_record_from_register_range_encoded(
+        &self,
+        first_reg: i32,
+        n_cols: usize,
+        p4: &P4,
+        rec_buf: &mut Vec<u8>,
+    ) {
+        let null_placeholder = SqliteValue::Null;
+        let mut values: smallvec::SmallVec<[&SqliteValue; 16]> =
+            smallvec::SmallVec::with_capacity(n_cols);
+        for i in 0..n_cols {
+            #[allow(clippy::cast_possible_wrap)]
+            let reg = first_reg + i as i32;
+            let value = match p4 {
+                P4::PrecomputedHeader(header) if header.column_count() == n_cols => {
+                    match header.slots.get(i) {
+                        Some(slot)
+                            if matches!(
+                                slot.kind,
+                                PrecomputedSerialTypeKind::NullPlaceholder
+                            ) =>
+                        {
+                            &null_placeholder
+                        }
+                        _ => self.get_reg(reg),
+                    }
+                }
+                P4::Affinity(aff) if aff.as_bytes().get(i) == Some(&b'X') => &null_placeholder,
+                _ => self.get_reg(reg),
+            };
+            values.push(value);
+        }
+        fsqlite_types::record::serialize_record_iter_into_with_encoding(
+            values.iter().copied(),
+            self.text_encoding,
+            rec_buf,
+        );
     }
 
     #[inline(always)]
