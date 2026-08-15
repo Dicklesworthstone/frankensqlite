@@ -9656,176 +9656,6 @@ fn promote_group_commit_page_one_freelist_headers(
     promoted
 }
 
-/// bd-84rh4: walk the durable freelist trunk chain under the append write lock
-/// and collect every free page (trunk pages + leaves), bounded against a
-/// corrupt/cyclic chain. Used by the merge-preserving flusher fix to learn which
-/// committed-free pages a publishing batch must not silently drop from page 1.
-async fn read_durable_freelist_pages_under_gate<F: VfsFile>(
-    cx: &Cx,
-    wal: &mut dyn WalBackend,
-    db_file: &SharedDbFile<F>,
-    page_size: usize,
-    page_one: &[u8],
-) -> Result<Vec<u32>> {
-    if page_one.len() < DATABASE_HEADER_SIZE {
-        return Ok(Vec::new());
-    }
-    let mut out: Vec<u32> = Vec::new();
-    let mut seen = HashSet::<u32>::new();
-    let mut trunk = u32::from_be_bytes(page_one[32..36].try_into().expect("freelist head slice"));
-    let max_leaf_entries = (page_size / 4).saturating_sub(2).max(1);
-    let mut walked = 0_u32;
-    while trunk != 0 {
-        walked = walked.saturating_add(1);
-        if walked > 65_536 || !seen.insert(trunk) {
-            // Corrupt/cyclic chain — stop; the append-gate guard fails closed.
-            break;
-        }
-        out.push(trunk);
-        let Some(image) = read_durable_page_under_gate(cx, wal, db_file, page_size, trunk).await?
-        else {
-            break;
-        };
-        if image.len() < 8 {
-            break;
-        }
-        let next = u32::from_be_bytes(image[0..4].try_into().expect("trunk next slice"));
-        let leaf_count =
-            u32::from_be_bytes(image[4..8].try_into().expect("trunk count slice")) as usize;
-        for index in 0..leaf_count.min(max_leaf_entries) {
-            let base = 8 + index * 4;
-            if base + 4 > image.len() {
-                break;
-            }
-            let leaf =
-                u32::from_be_bytes(image[base..base + 4].try_into().expect("trunk leaf slice"));
-            if seen.insert(leaf) {
-                out.push(leaf);
-            }
-        }
-        trunk = next;
-    }
-    Ok(out)
-}
-
-/// bd-84rh4: preserve a peer's committed-free pages that a publishing batch's
-/// (per-connection, possibly stale) freelist serialization would otherwise drop
-/// from the durable page-1 freelist head — the cross-connection page-1 overwrite
-/// erasure that surfaces as "page N is never used".
-///
-/// Runs under the flusher's exclusive WAL write lock against the freshly-read
-/// durable freelist, symmetric to
-/// [`promote_group_commit_page_one_freelist_headers`] (which handles the
-/// NON-publishing batches). For the single publishing batch, any in-range
-/// durable-free page it neither publishes nor consumes nor physically writes is
-/// prepended as one new freelist trunk (no re-serialization of the existing
-/// chain, no double-grant). Multi-publication groups are left to the append-gate
-/// guard, which refuses them; a run too large for a single new trunk is left to
-/// the guard/retry rather than growing the chain here.
-fn merge_preserve_publishing_batch_frees(
-    batches: &mut [TransactionFrameBatch],
-    durable_free: &[u32],
-    committed_db_size: u32,
-    page_size: usize,
-) -> bool {
-    if batches
-        .iter()
-        .filter(|batch| batch.published_durable_freelist.is_some())
-        .count()
-        != 1
-    {
-        // 0 publishers: nothing to preserve here. >1: the append-gate guard
-        // refuses the group outright, so do not mutate.
-        return false;
-    }
-    let max_leaf_entries = (page_size / 4).saturating_sub(2).max(1);
-    let mut merged = false;
-    for batch in batches.iter_mut() {
-        if batch.published_durable_freelist.is_none() {
-            continue;
-        }
-        let published: HashSet<u32> = batch
-            .published_durable_freelist
-            .as_ref()
-            .map(|list| list.iter().copied().collect())
-            .unwrap_or_default();
-        let mut protected: HashSet<u32> = batch
-            .consumed_durable_freelist_pages
-            .iter()
-            .copied()
-            .chain(batch.consumed_freelist_pages.iter().copied())
-            .collect();
-        // A page this batch physically writes is live for it; never re-free it.
-        protected.extend(batch.frames.iter().map(|frame| frame.page_number));
-        let missing: Vec<u32> = durable_free
-            .iter()
-            .copied()
-            .filter(|page| {
-                *page > 1
-                    && *page <= committed_db_size
-                    && !published.contains(page)
-                    && !protected.contains(page)
-            })
-            .collect();
-        if missing.is_empty() {
-            continue;
-        }
-        if missing.len().saturating_sub(1) > max_leaf_entries {
-            // Would need more than one new trunk; leave it to the append-gate
-            // guard / retry rather than restructure the chain here.
-            continue;
-        }
-        let Some(page_one_index) = batch.frames.iter().position(|frame| {
-            frame.page_number == 1 && frame.page_data.len() >= DATABASE_HEADER_SIZE
-        }) else {
-            continue;
-        };
-        let (old_head, old_count) = {
-            let page_data = &batch.frames[page_one_index].page_data;
-            (
-                u32::from_be_bytes(page_data[32..36].try_into().expect("head slice")),
-                u32::from_be_bytes(page_data[36..40].try_into().expect("count slice")),
-            )
-        };
-        let trunk_page = missing[0];
-        let leaves = &missing[1..];
-        let mut trunk_bytes = vec![0_u8; page_size];
-        trunk_bytes[0..4].copy_from_slice(&old_head.to_be_bytes());
-        trunk_bytes[4..8]
-            .copy_from_slice(&u32::try_from(leaves.len()).unwrap_or(0).to_be_bytes());
-        for (index, leaf) in leaves.iter().enumerate() {
-            let base = 8 + index * 4;
-            trunk_bytes[base..base + 4].copy_from_slice(&leaf.to_be_bytes());
-        }
-        {
-            let page_data = &mut batch.frames[page_one_index].page_data;
-            page_data[32..36].copy_from_slice(&trunk_page.to_be_bytes());
-            let new_count = old_count.saturating_add(u32::try_from(missing.len()).unwrap_or(0));
-            page_data[36..40].copy_from_slice(&new_count.to_be_bytes());
-        }
-        // Insert the new trunk frame before the commit frame so the commit
-        // marker stays last.
-        let insert_at = batch
-            .frames
-            .iter()
-            .rposition(|frame| frame.db_size_if_commit != 0)
-            .unwrap_or(batch.frames.len());
-        batch.frames.insert(
-            insert_at,
-            FrameSubmission {
-                page_number: trunk_page,
-                page_data: trunk_bytes,
-                db_size_if_commit: 0,
-            },
-        );
-        if let Some(published_mut) = batch.published_durable_freelist.as_mut() {
-            published_mut.extend_from_slice(&missing);
-        }
-        merged = true;
-    }
-    merged
-}
-
 /// bd-dw8oe: append-gate check for the promote→append window — a
 /// non-publication batch whose page-1 frame still carries freelist header
 /// bytes different from the CURRENT durable page-1 must fail closed (the
@@ -20280,32 +20110,18 @@ where
                             })?;
                             Arc::clone(&inner.db_file)
                         };
-                        let (durable_page_one, durable_free) = {
+                        let durable_page_one = {
                             let backend = wal_backend_handle(wal_backend)?;
                             let mut wal_guard =
                                 async_rwlock_write(&backend, cx, "WAL backend").await?;
-                            let page_one = read_durable_page_under_gate(
+                            read_durable_page_under_gate(
                                 cx,
                                 wal_guard.as_mut(),
                                 &db_file,
                                 frame_page_size,
                                 1,
                             )
-                            .await?;
-                            let free = match page_one.as_deref() {
-                                Some(image) => {
-                                    read_durable_freelist_pages_under_gate(
-                                        cx,
-                                        wal_guard.as_mut(),
-                                        &db_file,
-                                        frame_page_size,
-                                        image,
-                                    )
-                                    .await?
-                                }
-                                None => Vec::new(),
-                            };
-                            (page_one, free)
+                            .await?
                         };
                         if let Some(image) = durable_page_one
                             && image.len() >= DATABASE_HEADER_SIZE
@@ -20324,24 +20140,6 @@ where
                             if std::env::var_os("DW8OE_TRACE").is_some() {
                                 eprintln!(
                                     "DW8OE PROMOTE durable_head={head} durable_count={count} changed={changed}"
-                                );
-                            }
-                            // bd-84rh4: symmetric to the non-publishing promote
-                            // above — preserve a peer's committed-free pages that
-                            // the publishing batch's stale per-connection freelist
-                            // serialization would otherwise erase from page 1.
-                            let committed_db_size = u32::from_be_bytes(
-                                image[28..32].try_into().expect("durable page count slice"),
-                            );
-                            let merged = merge_preserve_publishing_batch_frees(
-                                &mut batches,
-                                &durable_free,
-                                committed_db_size,
-                                frame_page_size,
-                            );
-                            if merged && std::env::var_os("RH4_TRACE").is_some() {
-                                eprintln!(
-                                    "RH4MERGE preserved peer frees into the publishing batch"
                                 );
                             }
                         } else if std::env::var_os("DW8OE_TRACE").is_some() {
