@@ -12028,6 +12028,20 @@ impl Drop for MaterializedTablesCleanupGuard<'_> {
     }
 }
 
+/// Pager admission used by the schema-only connection constructor.
+///
+/// `ReservedEmptyRollback` is deliberately narrower than the public reserved
+/// opener: it initializes the caller-reserved empty main file through the same
+/// exact-identity pager path, but keeps the schema-only bootstrap on page 1's
+/// rollback-format default. Ordinary new-file and public reserved opens retain
+/// their WAL default.
+#[derive(Debug, Clone, Copy)]
+enum SchemaOnlyPagerDisposition {
+    Ordinary,
+    #[cfg(not(target_arch = "wasm32"))]
+    ReservedEmptyRollback(FileIdentity),
+}
+
 impl Connection {
     /// Open a connection.
     ///
@@ -12293,6 +12307,42 @@ impl Connection {
         writable: bool,
         defer_fts5_hydration: bool,
     ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
+            path,
+            expected_identity,
+            env,
+            writable,
+            defer_fts5_hydration,
+            SchemaOnlyPagerDisposition::Ordinary,
+        )
+        .await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn open_reserved_schema_only_rollback_with_expected_identity_and_env(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
+            path,
+            None,
+            env,
+            true,
+            false,
+            SchemaOnlyPagerDisposition::ReservedEmptyRollback(expected_identity),
+        )
+        .await
+    }
+
+    async fn open_schema_only_with_optional_expected_identity_and_env_and_disposition(
+        path: impl Into<String>,
+        expected_identity: Option<FileIdentity>,
+        env: ConnectionEnv,
+        writable: bool,
+        defer_fts5_hydration: bool,
+        disposition: SchemaOnlyPagerDisposition,
+    ) -> Result<Self> {
         let path = path.into();
         if path.is_empty()
             || (writable && path == ":memory:")
@@ -12310,27 +12360,43 @@ impl Connection {
                 .create_child()
                 .with_trace_context(next_trace_id(), 0, 0);
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
-        let pager = if writable {
-            retry_busy_connection_bootstrap(|| {
-                PagerBackend::open_existing_with_page_buffer_max(
-                    &path,
-                    &bootstrap_cx,
-                    expected_identity,
-                    env.page_buffer_max(),
-                )
-            })
-            .await?
-        } else {
-            retry_busy_connection_bootstrap(|| {
-                PagerBackend::open_readonly_with_page_buffer_max(
-                    &path,
-                    &bootstrap_cx,
-                    expected_identity,
-                    env.page_buffer_max(),
-                    env.memory_vfs_config(),
-                )
-            })
-            .await?
+        let pager = match disposition {
+            SchemaOnlyPagerDisposition::Ordinary if writable => {
+                retry_busy_connection_bootstrap(|| {
+                    PagerBackend::open_existing_with_page_buffer_max(
+                        &path,
+                        &bootstrap_cx,
+                        expected_identity,
+                        env.page_buffer_max(),
+                    )
+                })
+                .await?
+            }
+            SchemaOnlyPagerDisposition::Ordinary => {
+                retry_busy_connection_bootstrap(|| {
+                    PagerBackend::open_readonly_with_page_buffer_max(
+                        &path,
+                        &bootstrap_cx,
+                        expected_identity,
+                        env.page_buffer_max(),
+                        env.memory_vfs_config(),
+                    )
+                })
+                .await?
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            SchemaOnlyPagerDisposition::ReservedEmptyRollback(expected_identity) => {
+                retry_busy_connection_bootstrap(|| {
+                    PagerBackend::open_reserved_with_page_buffer_max(
+                        &path,
+                        &bootstrap_cx,
+                        expected_identity,
+                        env.page_buffer_max(),
+                        env.memory_vfs_config(),
+                    )
+                })
+                .await?
+            }
         };
         let file_identity = pager.file_identity(&bootstrap_cx).await?;
         let shared_mvcc_state =
@@ -13364,6 +13430,12 @@ impl Connection {
     /// makes a close or post-bootstrap reopen failure safely retryable without
     /// admitting a file that was nonempty before the first initialization.
     ///
+    /// This specialized builder bootstrap keeps page 1 in rollback format and
+    /// does not install a WAL backend. That is narrower than the ordinary and
+    /// public reserved-open policy, which keeps WAL as the new-file default.
+    /// The distinction prevents initialization alone from manufacturing a
+    /// companion that a later self-contained bounded reopen must refuse.
+    ///
     /// # Errors
     ///
     /// [`FrankenError::CannotOpen`] when revalidation fails or the reserved
@@ -13383,15 +13455,16 @@ impl Connection {
         let (_, stable) = reservation.validated_bounded_writer_open(&env, Some(0))?;
 
         // A reserved pathname is an EMPTY file, which is not yet a database.
-        // Bootstrap page 1 through the identity-bound reserved-open path first;
-        // the existing-file schema-only path below would refuse a zero-byte
-        // file. The ceiling is deliberately NOT installed for this step: page 1
-        // is engine bootstrap, not caller-attributable build work, and counting
-        // it would make a small budget unusable for the reason a caller cannot
-        // see.
+        // Bootstrap page 1 through the identity-bound reserved schema-only path
+        // first; the existing-file schema-only path below would refuse a
+        // zero-byte file. Unlike an ordinary new-file open, this path preserves
+        // page 1's rollback-format default and never installs a WAL backend.
+        // The ceiling is deliberately NOT installed for this step: page 1 is
+        // engine bootstrap, not caller-attributable build work, and counting it
+        // would make a small budget unusable for the reason a caller cannot see.
         #[cfg(all(test, feature = "native"))]
         reservation.record_bounded_writer_opener_attempt();
-        let bootstrap = Self::open_reserved_with_expected_identity_and_env(
+        let bootstrap = Self::open_reserved_schema_only_rollback_with_expected_identity_and_env(
             stable.clone(),
             reservation.identity(),
             env.clone(),
@@ -229508,6 +229581,40 @@ mod pager_routing_tests {
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native", any(unix, windows)))]
+    fn assert_reserved_builder_rollback_image_has_no_recovery_companion(target: &Path) {
+        let image = std::fs::read(target).expect("read reserved builder image");
+        let header_bytes: &[u8; DATABASE_HEADER_SIZE] = image
+            .get(..DATABASE_HEADER_SIZE)
+            .and_then(|bytes| bytes.try_into().ok())
+            .expect("reserved builder image has a complete header");
+        let header = DatabaseHeader::from_bytes(header_bytes)
+            .expect("reserved builder image has a valid header");
+        assert_eq!(
+            (header.write_version, header.read_version),
+            (1, 1),
+            "reserved builder initialization must retain rollback-format page 1"
+        );
+        fsqlite_vfs::validate_reserved_database_artifacts(
+            target,
+            fsqlite_vfs::WindowsLockSidecarPolicy::AllowExpected,
+        )
+        .expect("reserved builder image has no recovery or WAL companion");
+        for suffix in ["-wal-cert", "-wal-cert-head"] {
+            let mut companion = target.as_os_str().to_owned();
+            companion.push(suffix);
+            let companion = std::path::PathBuf::from(companion);
+            assert!(
+                matches!(
+                    std::fs::symlink_metadata(&companion),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ),
+                "reserved builder image must not acquire {}",
+                companion.display()
+            );
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native", any(unix, windows)))]
     async fn build_reopenable_bounded_writer_image(
         target: &Path,
         page_limit: usize,
@@ -229585,6 +229692,78 @@ mod pager_routing_tests {
                 "bounded-writer keeper block contains forbidden storage primitive {forbidden:?}"
             );
         }
+    }
+
+    /// Reserved-builder initialization is rollback-first: no recovery/WAL
+    /// family appears while the returned writer is live, after awaited close,
+    /// or across a later bounded reopen. The public reserved opener remains on
+    /// the ordinary new-file WAL policy and supplies the control case.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native", any(unix, windows)))]
+    #[test]
+    fn reserved_builder_rollback_bootstrap_never_creates_recovery_companions() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = retained_bounded_writer_test_dir("rollback-bootstrap");
+            let target = dir.join("bounded-rollback-bootstrap.db");
+            let mut env = ConnectionEnv::default();
+            env.set_schema_only_write_set_page_limit(8);
+            let reservation =
+                Connection::reserve_schema_only_builder_target_with_env(&target, &env)
+                    .expect("reserve rollback-first builder target");
+
+            let builder =
+                Connection::initialize_reserved_schema_only_builder(&reservation, env.clone())
+                    .await
+                    .expect("initialize rollback-first bounded builder");
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 2);
+            assert_reserved_builder_rollback_image_has_no_recovery_companion(&target);
+            builder
+                .close()
+                .await
+                .expect("close initialized bounded builder");
+            assert_reserved_builder_rollback_image_has_no_recovery_companion(&target);
+
+            let reopened =
+                Connection::reopen_reserved_schema_only_bounded_writer(&reservation, env.clone())
+                    .await
+                    .expect("reopen rollback-first bounded builder");
+            assert_eq!(reservation.bounded_writer_opener_attempts(), 3);
+            assert_reserved_builder_rollback_image_has_no_recovery_companion(&target);
+            reopened
+                .close()
+                .await
+                .expect("close reopened bounded builder");
+            assert_reserved_builder_rollback_image_has_no_recovery_companion(&target);
+
+            let public_target = dir.join("public-reserved-wal-control.db");
+            let public_reservation =
+                Connection::reserve_schema_only_builder_target_with_env(&public_target, &env)
+                    .expect("reserve public-open control target");
+            let public = Connection::open_reserved_with_expected_identity_and_env(
+                public_target.to_string_lossy().into_owned(),
+                public_reservation.identity(),
+                env,
+            )
+            .await
+            .expect("ordinary public reserved open");
+            let public_image = std::fs::read(&public_target).expect("read public-open control");
+            assert_eq!(
+                (public_image[18], public_image[19]),
+                (2, 2),
+                "the public reserved opener must retain the ordinary WAL default"
+            );
+            let mut public_wal = public_target.as_os_str().to_owned();
+            public_wal.push("-wal");
+            let public_wal = std::path::PathBuf::from(public_wal);
+            assert!(
+                public_wal.exists(),
+                "the ordinary public reserved opener is the WAL control"
+            );
+            public.close().await.expect("close public-open control");
+            assert!(
+                public_wal.exists(),
+                "the retained control artifact proves public semantics were unchanged"
+            );
+        });
     }
 
     /// Once the reserved opener has returned, initialization is a monotone
