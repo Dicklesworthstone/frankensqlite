@@ -5019,6 +5019,10 @@ fn pragma_table_function_columns(name: &str) -> Option<&'static [&'static str]> 
         Some(&PRAGMA_INDEX_XINFO_TVF_COLUMNS)
     } else if pragma.eq_ignore_ascii_case("foreign_key_list") {
         Some(&PRAGMA_FOREIGN_KEY_LIST_TVF_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("database_list") {
+        // No-argument pragma TVF: `SELECT * FROM pragma_database_list()` reuses
+        // the PRAGMA database_list row generator (GH #213).
+        Some(&PRAGMA_DATABASE_LIST_COLUMNS)
     } else {
         None
     }
