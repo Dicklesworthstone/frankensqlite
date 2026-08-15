@@ -275,13 +275,23 @@ fn parse_timestring(s: &str) -> Option<f64> {
 }
 
 fn current_time_jdn() -> f64 {
+    // GH #175: C SQLite reads the wall clock once per sqlite3_step() and reuses
+    // it for every `'now'`/`CURRENT_*` within that statement. Capture lazily on
+    // the first use this statement and cache it, so `julianday('now')` is stable
+    // across the rows a single statement produces (the Connection resets the
+    // cache at each statement start).
+    if let Some(cached) = crate::builtins::statement_now() {
+        return cached;
+    }
     use fsqlite_types::sync_primitives::SystemTime;
 
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    UNIX_EPOCH_JDN + secs / 86_400.0
+    let jdn = UNIX_EPOCH_JDN + secs / 86_400.0;
+    crate::builtins::set_statement_now(jdn);
+    jdn
 }
 
 fn sqlite_c_string_bytes(bytes: &[u8]) -> &[u8] {

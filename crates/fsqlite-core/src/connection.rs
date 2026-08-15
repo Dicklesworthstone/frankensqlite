@@ -98,7 +98,7 @@ use fsqlite_ext_misc::GenerateSeriesTable;
 use fsqlite_ext_rtree::{RtreeGeometry, RtreeVirtualTable};
 use fsqlite_func::builtins::{
     ChangeTrackingState, case_sensitive_like_active, get_change_tracking_state,
-    set_case_sensitive_like, set_change_tracking_state,
+    reset_statement_now, set_case_sensitive_like, set_change_tracking_state,
 };
 use fsqlite_func::collation::{CollationFunction, CollationRegistry};
 use fsqlite_func::vtab::{
@@ -10923,6 +10923,12 @@ pub struct Connection {
     /// before the rollback-recovery reload, forces the full sqlite_master scan
     /// so the connection-local schema is reconstructed from committed state.
     force_full_schema_reload_once: Cell<bool>,
+    /// Database text encoding cached from the page-1 header at reload (bd-bld9w.3).
+    /// Reads decode TEXT through it (the VDBE self-adopts the same value at
+    /// cursor open); mutations on a non-UTF-8 database are rejected, since the
+    /// record-encode/`MakeRecord` write path is not yet encoding-aware. UTF-8
+    /// until a UTF-16 database is admitted read-only.
+    db_text_encoding: Cell<TextEncoding>,
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
@@ -12557,6 +12563,7 @@ impl Connection {
             schema_cookie: RefCell::new(0),
             schema_generation: Cell::new(0),
             force_full_schema_reload_once: Cell::new(false),
+            db_text_encoding: Cell::new(TextEncoding::Utf8),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             inherited_recursive_program_depth: Cell::new(0),
@@ -13073,6 +13080,7 @@ impl Connection {
             schema_cookie: RefCell::new(0),
             schema_generation: Cell::new(0),
             force_full_schema_reload_once: Cell::new(false),
+            db_text_encoding: Cell::new(TextEncoding::Utf8),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             inherited_recursive_program_depth: Cell::new(0),
@@ -16090,6 +16098,11 @@ impl Connection {
     /// before every statement executes (all ad-hoc and prepared paths), so the
     /// thread-locals always reflect the connection currently running.
     fn sync_change_tracking_context(&self) {
+        // GH #175: a new statement re-reads the wall clock exactly once. Clear
+        // the cached `'now'` so the first `julianday('now')` / `CURRENT_*` in
+        // this statement captures a fresh value that then stays stable across
+        // the statement's rows.
+        reset_statement_now();
         let state = ChangeTrackingState {
             last_insert_rowid: self.last_insert_rowid.get(),
             last_changes: i64::try_from(self.last_changes.get()).unwrap_or(i64::MAX),
@@ -32207,6 +32220,20 @@ impl Connection {
     /// autocommit wrapping can bracket the entire execution.
     #[allow(clippy::too_many_lines)]
     #[allow(dead_code)]
+    /// bd-bld9w.3: reject a mutating statement on a database whose text encoding
+    /// is not fully supported. UTF-16 databases are admitted READ-ONLY (their
+    /// TEXT decodes end to end, but the record-encode/`MakeRecord` write path is
+    /// not yet encoding-aware), so a mutation fails closed rather than
+    /// serializing UTF-8 TEXT bytes into a UTF-16 database (silent corruption).
+    fn guard_mutation_encoding_supported(&self, statement: &Statement) -> Result<()> {
+        if self.db_text_encoding.get().is_runtime_supported()
+            || !statement_may_mutate_database(statement)
+        {
+            return Ok(());
+        }
+        Err(FrankenError::Unsupported)
+    }
+
     async fn execute_statement_dispatch(
         &self,
         statement: &Statement,
@@ -32229,6 +32256,13 @@ impl Connection {
         precompiled: Option<&VdbeProgram>,
         derived_storage_log_select: Option<&SelectStatement>,
     ) -> Result<Vec<Row>> {
+        // bd-bld9w.3: a UTF-16 database is admitted READ-ONLY (its TEXT decodes
+        // correctly, but the record-encode/MakeRecord write path is not yet
+        // encoding-aware). Reject any statement that could serialize a record
+        // into it before it reaches the write path. Every statement — including
+        // trigger/cascade recursion — funnels through here, so this is the
+        // authoritative mutation gate.
+        self.guard_mutation_encoding_supported(statement)?;
         if matches!(
             statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -80967,11 +81001,25 @@ impl Connection {
             }
 
             let header = parse_database_header_checked(page1_bytes)?;
+            // bd-bld9w.3: cache the DB text encoding for the read-decode layer
+            // and the mutation guard. The VDBE self-adopts the same value at
+            // cursor open; writes to a non-UTF-8 database are rejected at the
+            // write entry (guard_mutation_encoding_supported).
+            self.db_text_encoding.set(header.text_encoding);
             // Admission belongs on the already-bound reload transaction: its
             // page 1 reflects the installed WAL snapshot, and the check still
             // precedes every schema or row-image mutation below. Opening a
             // second standalone read transaction here would bypass the
             // publication bind required by schema-only live-WAL bootstrap.
+            //
+            // bd-bld9w.3: read-only UTF-16 admission is PROVEN to work for direct
+            // opens (test_utf16_read_only_admission_reads_and_rejects_writes, kept
+            // #[ignore] until this gate lifts), but stays fail-closed here because
+            // ATTACH of a UTF-16 database is not yet write-safe: writes to an
+            // attached table dispatch through the PARENT connection's guard, which
+            // sees the parent's (UTF-8) encoding and would let UTF-8 TEXT serialize
+            // into the attached UTF-16 file. Lifting to is_read_supported() requires
+            // closing that ATTACH/import write-safety gap first.
             if !header.text_encoding.is_runtime_supported() {
                 return Err(FrankenError::Unsupported);
             }
@@ -125734,6 +125782,28 @@ fn statement_rolls_back_transaction_on_constraint(statement: &Statement) -> bool
     )
 }
 
+/// bd-bld9w.3: whether a statement could serialize a record into the main
+/// database (DML/DDL that writes rows or schema). Used to reject writes on a
+/// UTF-16 database admitted read-only. Conservative: only clearly read-only
+/// statements (SELECT, transaction control, ATTACH/DETACH, PRAGMA, EXPLAIN,
+/// ANALYZE-less maintenance) are exempt; everything that writes records is a
+/// mutation.
+fn statement_may_mutate_database(statement: &Statement) -> bool {
+    !matches!(
+        statement,
+        Statement::Select(_)
+            | Statement::Begin(_)
+            | Statement::Commit
+            | Statement::Rollback(_)
+            | Statement::Savepoint(_)
+            | Statement::Release(_)
+            | Statement::Attach(_)
+            | Statement::Detach(_)
+            | Statement::Pragma(_)
+            | Statement::Explain { .. }
+    )
+}
+
 fn statement_preserves_prior_changes_on_constraint(statement: &Statement) -> bool {
     matches!(
         statement,
@@ -160272,6 +160342,91 @@ mod tests {
             assert_eq!(stats.shm_region_count, 0);
             assert_eq!(stats.shm_bytes, 0);
             assert_eq!(stats.shm_reserved_bytes, 0);
+        });
+    }
+
+    #[test]
+    #[ignore = "bd-bld9w.3: read-only UTF-16 admission is PROVEN by this keeper \
+                (passes when the reload admission gate uses is_read_supported), but \
+                the gate stays fail-closed until the ATTACH/import write-safety gap \
+                is closed. Un-ignore together with lifting the gate."]
+    fn test_utf16_read_only_admission_reads_and_rejects_writes() {
+        // bd-bld9w.3: a UTF-16LE/BE database is admitted READ-ONLY. Its TEXT
+        // decodes end to end (schema + rows + index keys + ORDER BY), matching
+        // stock sqlite3; any mutation fails closed (write-encode is not wired).
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            for encoding in ["UTF-16le", "UTF-16be"] {
+                let db_path = dir.path().join(format!("ro_{encoding}.db"));
+                let db_str = db_path.to_string_lossy().into_owned();
+                {
+                    let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                    sqlite
+                        .execute_batch(&format!(
+                            r#"PRAGMA encoding = '{encoding}';
+                               CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT);
+                               CREATE INDEX idx_name ON items(name);
+                               INSERT INTO items VALUES (1, 'Καλημέρα'), (2, 'café'), (3, '日本');"#
+                        ))
+                        .unwrap();
+                }
+
+                let conn = Connection::open(&db_str)
+                    .await
+                    .expect("UTF-16 database is admitted read-only");
+
+                // Schema + row TEXT decode (ordered by rowid).
+                let rows = conn
+                    .query("SELECT name FROM items ORDER BY id;")
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 3, "{encoding}: row count");
+                assert_eq!(rows[0].values()[0], SqliteValue::Text("Καλημέρα".into()));
+                assert_eq!(rows[1].values()[0], SqliteValue::Text("café".into()));
+                assert_eq!(rows[2].values()[0], SqliteValue::Text("日本".into()));
+
+                // WHERE on decoded TEXT.
+                let rows = conn
+                    .query("SELECT id FROM items WHERE name = 'café';")
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 1, "{encoding}: WHERE name = 'café'");
+                assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+
+                // ORDER BY text parity vs stock sqlite3.
+                let oracle = rusqlite::Connection::open(&db_path).unwrap();
+                let expected: Vec<String> = {
+                    let mut stmt = oracle.prepare("SELECT name FROM items ORDER BY name;").unwrap();
+                    let mapped = stmt
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .map(|r| r.unwrap())
+                        .collect::<Vec<_>>();
+                    mapped
+                };
+                let rows = conn
+                    .query("SELECT name FROM items ORDER BY name;")
+                    .await
+                    .unwrap();
+                let got: Vec<String> = rows
+                    .iter()
+                    .map(|row| match &row.values()[0] {
+                        SqliteValue::Text(text) => text.as_str().to_owned(),
+                        other => panic!("expected TEXT, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(got, expected, "{encoding}: ORDER BY name parity vs sqlite3");
+
+                // Mutations are rejected (read-only admission).
+                let err = conn
+                    .query("INSERT INTO items VALUES (4, 'x');")
+                    .await
+                    .expect_err("UTF-16 write must fail closed");
+                assert!(
+                    matches!(err, FrankenError::Unsupported),
+                    "{encoding}: write should be Unsupported, got {err:?}"
+                );
+            }
         });
     }
 
