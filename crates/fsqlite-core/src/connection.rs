@@ -53079,15 +53079,13 @@ impl Connection {
                 // SQLite only forbids adding a NOT NULL column without a default
                 // when there are existing rows to back-fill with NULL; on an
                 // empty table the column may be added (bd-nmt6h).
-                if notnull && default_value.is_none() {
-                    if add_column_table_has_rows {
-                        // FunctionError renders the message verbatim (ErrorCode::Error,
-                        // i.e. SQLITE_ERROR) rather than Internal's "internal error:"
-                        // prefix / SQLITE_INTERNAL code.
-                        return Err(FrankenError::FunctionError(
-                            "Cannot add a NOT NULL column without a default value".to_owned(),
-                        ));
-                    }
+                if notnull && default_value.is_none() && add_column_table_has_rows {
+                    // FunctionError renders the message verbatim (ErrorCode::Error,
+                    // i.e. SQLITE_ERROR) rather than Internal's "internal error:"
+                    // prefix / SQLITE_INTERNAL code.
+                    return Err(FrankenError::FunctionError(
+                        "Cannot add a NOT NULL column without a default value".to_owned(),
+                    ));
                 }
                 // Coerce the back-fill default through the new column's affinity so
                 // the stored storage class matches a normal INSERT default (the
