@@ -36046,6 +36046,43 @@ impl BoundedSchemaExpressionRole {
         matches!(self, Self::Evaluated)
     }
 
+    /// Whether a table-valued function in FROM/JOIN position is refused by
+    /// SHAPE.
+    ///
+    /// The obvious worry is that a TVF is unlike a subquery: a subquery carries
+    /// a sub-AST, which `visited`/`depth` already bound, whereas a TVF EXPANDS
+    /// TO ROWS, and a node/depth budget is not an instrument for row count.
+    ///
+    /// That worry does not apply here, because the expansion never happens.
+    /// Row production is a RUNTIME property, and this pass performs no runtime
+    /// evaluation of a trigger body or view query — see
+    /// [`BoundedDatabaseValidationStats`], which counts CHECK evaluations,
+    /// table rows, foreign keys and index entries and has no trigger or view
+    /// counter. What the walker does with `json_each(x)` is traverse the
+    /// `TableFunction` node and push its argument expressions, costing nodes
+    /// proportional to the AST, which is exactly what the budget measures. So
+    /// the counters are the right instrument, not an approximation of one.
+    ///
+    /// It is also unreachable in [`Self::Evaluated`] regardless of this
+    /// predicate, which is why admitting it cannot affect CHECK evaluation. A
+    /// TVF only exists in FROM/JOIN position, so reaching one from an
+    /// expression root requires entering a `Select`, and the only Expr-level
+    /// entries into a `Select` are `Expr::Exists`, `Expr::Subquery` and
+    /// `InSet::Subquery` — all refused by [`Self::rejects_subqueries`] in the
+    /// evaluated role. The subquery gate refuses first; this predicate stays
+    /// strict there as defence in depth rather than as the load-bearing check.
+    ///
+    /// Scope: this admits ANY table-valued function in an unevaluated role, not
+    /// an allowlist. Nothing evaluates it, so an unrecognised TVF name is no
+    /// more consequential than a recognised one — both are preserved verbatim
+    /// in the published schema text and both would fail at trigger-fire time if
+    /// wrong, which is outside this validation's remit. This matches how
+    /// subqueries were admitted: their referenced tables are not checked here
+    /// either.
+    const fn rejects_table_valued_functions(self) -> bool {
+        matches!(self, Self::Evaluated)
+    }
+
     /// Whether a terminal action such as `RAISE(ABORT, ...)` is refused.
     ///
     /// `RAISE` yields no value and has no children; the walker's arm for it is
@@ -36574,7 +36611,14 @@ fn first_unsupported_bounded_ast(
                     pending.push((BoundedCollationAstNode::Select(query), child_depth));
                 }
                 TableOrSubquery::TableFunction { args, .. } => {
-                    if supported_function.is_some() {
+                    // Was gated on `supported_function.is_some()` — the mere
+                    // PRESENCE of a function policy, not on whether this
+                    // function is supported — so a TVF the builder could
+                    // resolve was refused identically to one it could not.
+                    // Now gated by role: refused where the pass evaluates,
+                    // admitted where it does not. Arguments are traversed
+                    // either way, so the budget accounts for them.
+                    if expression_role.rejects_table_valued_functions() {
                         return Ok(Some(BoundedAstUnsupported::Shape(
                             "table-valued function in persisted view or trigger",
                         )));
@@ -232071,6 +232115,76 @@ mod pager_routing_tests {
             assert!(
                 !message.contains("subquery in persisted schema expression"),
                 "the refusal must come from the budget, not from the shape gate: {message}"
+            );
+        });
+    }
+
+    /// Wall 4: a table-valued function is ADMITTED in an unevaluated role.
+    ///
+    /// `json_each` in a trigger WHEN clause is the exact shape that blocked the
+    /// motivating client image — 7 of its 158 walked schema objects use one,
+    /// all in a single trigger family, all `json_each`.
+    ///
+    /// The budget question a TVF raises, and why it does not bite: a subquery
+    /// carries a sub-AST that `visited`/`depth` bound, whereas a TVF EXPANDS TO
+    /// ROWS, which a node budget does not measure. But the expansion is a
+    /// runtime property and this pass never evaluates a trigger body, so no row
+    /// is ever produced during validation. The walker only traverses the
+    /// `TableFunction` node and its arguments — AST cost, which is exactly what
+    /// the budget measures.
+    ///
+    /// Unlike the RAISE and subquery boundaries, no test pinned this refusal
+    /// before, so this ADDS the missing pin rather than replacing one.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_admits_a_table_valued_function_in_an_unevaluated_role() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let when_clause = fsqlite_parser::expr::parse_expr(
+                "EXISTS (SELECT 1 FROM json_each(NEW.target_array) AS t \
+                 WHERE t.value IS NOT NULL)",
+            )
+            .expect("the json_each WHEN clause parses");
+            conn.validate_bounded_ast_semantics(
+                BoundedCollationAstNode::Expr(&when_clause),
+                "WHEN clause of trigger `trg_probe_tvf`",
+                BoundedSchemaExpressionRole::Unevaluated,
+            )
+            .expect(
+                "a table-valued function must be admitted where nothing evaluates it: \
+                 it is never expanded to rows, and its arguments are traversed under \
+                 the same node/depth budget as any other expression",
+            );
+        });
+    }
+
+    /// Wall 4, the other half: a TVF stays refused in the EVALUATED role.
+    ///
+    /// Defence in depth rather than the load-bearing check. A TVF only appears
+    /// in FROM/JOIN position, so reaching one from an expression root requires
+    /// entering a `Select`, and every Expr-level entry into a `Select`
+    /// (`Expr::Exists`, `Expr::Subquery`, `InSet::Subquery`) is already refused
+    /// in the evaluated role — the subquery gate refuses first. This test pins
+    /// the outer guard so that if the subquery gate is ever relaxed for CHECK
+    /// expressions, a TVF does not silently become reachable there.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_still_refuses_a_table_valued_function_in_an_evaluated_role() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let error = conn
+                .validate_bounded_check_expression_in_sql(
+                    "EXISTS (SELECT 1 FROM json_each(payload) AS t)",
+                    "CHECK constraint 1 on table `t`",
+                )
+                .expect_err("a TVF must not be admitted into an evaluated expression");
+            let message = error.to_string();
+            // The subquery gate is what actually fires, and that is the point:
+            // the evaluated role never reaches the TVF at all.
+            assert!(
+                message.contains("subquery in persisted schema expression")
+                    || message.contains("table-valued function in persisted view or trigger"),
+                "expected a shape refusal before any TVF could be admitted, got {message}"
             );
         });
     }
