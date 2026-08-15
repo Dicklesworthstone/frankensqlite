@@ -5019,6 +5019,10 @@ fn pragma_table_function_columns(name: &str) -> Option<&'static [&'static str]> 
         Some(&PRAGMA_INDEX_XINFO_TVF_COLUMNS)
     } else if pragma.eq_ignore_ascii_case("foreign_key_list") {
         Some(&PRAGMA_FOREIGN_KEY_LIST_TVF_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("database_list") {
+        // No-argument pragma TVF: `SELECT * FROM pragma_database_list()` reuses
+        // the PRAGMA database_list row generator (GH #213).
+        Some(&PRAGMA_DATABASE_LIST_COLUMNS)
     } else {
         None
     }
@@ -22727,6 +22731,64 @@ impl Connection {
             self.note_connection_statement_execution_count(1);
             return Ok(rows);
         }
+        // bd-z22mq: prepared lane for the memoized rowid-bucket SUM+GROUP BY
+        // shape. The deferred route below re-enters the full statement
+        // pipeline (structure validation, subquery rewrite, autocommit
+        // wrapping, dispatch cascade) on every execution; when the deferred
+        // select is structurally identical to the memo, those stages are
+        // provably identity/no-ops (the memoized select already passed them,
+        // and DDL / write commits / registry changes drop the memo), so jump
+        // straight to the mem-scan lane. This runs AFTER
+        // `prepare_connection_for_prepared_read` (retained-autocommit mirror
+        // rehydration) and the schema-unchanged proof, mirroring the
+        // CTE-join fast path above; the lane re-checks its dynamic guards and
+        // reads live rows, and a refusal falls through unchanged. DISTINCT
+        // and parameterized executions are excluded as in the dispatch-level
+        // short-circuit.
+        if params.is_empty()
+            && let Some(Statement::Select(select)) = stmt.deferred_query_statement.as_deref()
+            && !is_distinct_select(select)
+        {
+            let memo_rows_result = {
+                let memo_slot = self.group_by_bucket_fast_memo.borrow();
+                match memo_slot.as_ref() {
+                    Some(memo) if memo.select == *select => self
+                        .try_execute_rowid_bucket_sum_group_by_mem_scan(
+                            memo.root_page,
+                            &memo.table_schema,
+                            &memo.effective_label,
+                            &memo.group_by_exprs,
+                            &memo.result_descriptors,
+                        ),
+                    _ => Ok(None),
+                }
+            };
+            match memo_rows_result {
+                Ok(Some(rows)) => {
+                    // Preserve strict parity-cert accounting: this is the same
+                    // fallback the deferred dispatch would have taken.
+                    let log_result = self.log_mem_execution_fallback("select", "group_by_fallback");
+                    self.finish_prepared_read_autocommit(
+                        prepared_auto_read,
+                        log_result.is_ok(),
+                        &op_cx,
+                    )
+                    .await?;
+                    log_result?;
+                    if hot_path_profile_enabled() {
+                        FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    self.note_connection_statement_execution_count(1);
+                    return Ok(rows);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
+                        .await?;
+                    return Err(err);
+                }
+            }
+        }
         if let Some(statement) = &stmt.deferred_query_statement {
             if hot_path_profile_enabled() {
                 FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -32175,6 +32237,41 @@ impl Connection {
                         .execute_with_materialized_sqlite_schema(select, params)
                         .await;
                 }
+                // bd-z22mq: dispatch-cascade short-circuit. When the incoming
+                // statement is structurally identical to the memoized
+                // rowid-bucket SUM+GROUP BY select, every guard walk below
+                // (aggregation classification, join/vtab routing, substrate
+                // admission), the IN-subquery rewrite, and the placeholder
+                // bind re-derive decisions the memo already proves: the
+                // memoized select passed this cascade to reach the mem-scan
+                // lane, and DDL, write commits, and registry changes all drop
+                // the memo. The lane itself re-checks its dynamic guards and
+                // reads live rows, so a refusal falls through to the full
+                // cascade unchanged. DISTINCT selects are excluded because
+                // their dedup pass runs below this point, and parameterized
+                // executions are excluded because binding rewrites the AST.
+                if params.is_none_or(<[SqliteValue]>::is_empty) && !is_distinct_select(select) {
+                    let memo_rows = {
+                        let memo_slot = self.group_by_bucket_fast_memo.borrow();
+                        match memo_slot.as_ref() {
+                            Some(memo) if memo.select == *select => self
+                                .try_execute_rowid_bucket_sum_group_by_mem_scan(
+                                    memo.root_page,
+                                    &memo.table_schema,
+                                    &memo.effective_label,
+                                    &memo.group_by_exprs,
+                                    &memo.result_descriptors,
+                                )?,
+                            _ => None,
+                        }
+                    };
+                    if let Some(rows) = memo_rows {
+                        // Preserve strict parity-cert accounting: this is the
+                        // same fallback the cascade would have taken.
+                        self.log_mem_execution_fallback("select", "group_by_fallback")?;
+                        return Ok(rows);
+                    }
+                }
                 let distinct = is_distinct_select(select);
                 let distinct_collations = if distinct {
                     let schema_snap = self.schema.borrow().clone();
@@ -33029,6 +33126,19 @@ impl Connection {
                     .materialize_update_limit_scope(&canonical_update, params)
                     .await?;
                 let table_name = &effective_update.table.name.name;
+                // Reject assigning to a generated column before routing to the
+                // compiled or row-by-row lane (bd-gh-generated-column-update-target).
+                {
+                    let schema = self.schema.borrow();
+                    if let Some(table_schema) =
+                        schema.iter().find(|t| t.name.eq_ignore_ascii_case(table_name))
+                    {
+                        Self::validate_update_target_columns(
+                            table_schema,
+                            &effective_update.assignments,
+                        )?;
+                    }
+                }
                 let targets_shadowed_main =
                     self.targets_shadowed_main(&effective_update.table.name);
                 // Collect columns being updated for UPDATE OF trigger matching.
@@ -36731,6 +36841,38 @@ impl Connection {
                 return Err(FrankenError::Internal(format!(
                     "cannot INSERT into generated column \"{column}\""
                 )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reject an UPDATE that assigns to a generated (VIRTUAL/STORED) column.
+    ///
+    /// SQLite treats generated columns as read-only and rejects
+    /// `UPDATE t SET gen = ...` with "cannot UPDATE generated column"
+    /// (bd-gh-generated-column-update-target). Unknown columns are left for the
+    /// normal execution path to report. Called on the shared UPDATE entry
+    /// before it routes to the compiled or row-by-row lane, so both are covered.
+    fn validate_update_target_columns(
+        table_schema: &TableSchema,
+        assignments: &[fsqlite_ast::Assignment],
+    ) -> Result<()> {
+        for assignment in assignments {
+            let targets: &[String] = match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => std::slice::from_ref(column),
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.as_slice(),
+            };
+            for column in targets {
+                let Some(idx) = table_schema.column_index(column) else {
+                    continue;
+                };
+                let col = &table_schema.columns[idx];
+                if col.generated_expr.is_some() || col.generated_stored.is_some() {
+                    return Err(FrankenError::Internal(format!(
+                        "cannot UPDATE generated column \"{column}\""
+                    )));
+                }
             }
         }
 
@@ -127887,12 +128029,13 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             }
         }
         "iif" => {
-            if args.len() >= 3 {
-                if is_sqlite_truthy(&args[0]) {
-                    args[1].clone()
-                } else {
-                    args[2].clone()
-                }
+            // Two-argument iif(X,Y) is shorthand for iif(X,Y,NULL): a truthy X
+            // must still return Y, not NULL (bd-gh-iif-two-arg-arity). Mirror
+            // IifFunc::invoke.
+            if is_sqlite_truthy(&args[0]) {
+                args[1].clone()
+            } else if args.len() >= 3 {
+                args[2].clone()
             } else {
                 SqliteValue::Null
             }
@@ -164647,6 +164790,101 @@ mod tests {
         );
     }
 
+    /// bd-3ua5h: the multi-correlated-term EXISTS family
+    /// (`t3.a = t2.a AND t3.id <> t2.id`) must stay oracle-exact when nested
+    /// inside a non-correlated outer EXISTS (route a) and under a COUNT outer
+    /// shape (route b). The data is discriminating: a one-term (`a`-only)
+    /// binding would return t2 id 1 as well; the same-id-only variant returns
+    /// nothing. Strict mode forbids the interpreted fallback so a silently
+    /// wrong compiled emit cannot hide; a router refusal (strict rejection
+    /// error) is acceptable fail-closed behavior and re-verified non-strict.
+    #[test]
+    fn test_nested_multi_correlated_exists_matches_oracle() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, a INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE t3 (id INTEGER PRIMARY KEY, a INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t2 VALUES (1, 100), (2, 100), (3, 500);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t3 VALUES (1, 100), (9, 900);")
+                .await
+                .unwrap();
+
+            conn.set_reject_mem_fallback(true);
+            conn.set_strict_mem_fallback_rejection(true);
+
+            let strict_or_fallback = async |sql: &str| -> Vec<Vec<SqliteValue>> {
+                match conn.query(sql).await {
+                    Ok(rows) => rows.iter().map(row_values).collect(),
+                    Err(error) => {
+                        // Router refused the shape to the (forbidden)
+                        // fallback: fail-closed is fine — verify the
+                        // interpreted answer instead.
+                        assert!(
+                            error.to_string().contains("fallback"),
+                            "{sql}: unexpected strict-mode error: {error}"
+                        );
+                        conn.set_strict_mem_fallback_rejection(false);
+                        conn.set_reject_mem_fallback(false);
+                        let rows = conn.query(sql).await.unwrap();
+                        conn.set_reject_mem_fallback(true);
+                        conn.set_strict_mem_fallback_rejection(true);
+                        rows.iter().map(row_values).collect()
+                    }
+                }
+            };
+
+            // Direct family: only t2 id 2 qualifies (t3 id 1 has a=100 and a
+            // different id; t2 id 1's sole a-match shares its id; 500 has no
+            // match). Oracle sqlite3 3.46.1: [2].
+            let direct = strict_or_fallback(
+                "SELECT t2.id FROM t2 WHERE EXISTS \
+                 (SELECT 1 FROM t3 WHERE t3.a = t2.a AND t3.id <> t2.id) \
+                 ORDER BY t2.id;",
+            )
+            .await;
+            assert_eq!(direct, vec![vec![SqliteValue::Integer(2)]]);
+
+            // Route (b): COUNT outer shape over the same predicate. Oracle: 1.
+            let counted = strict_or_fallback(
+                "SELECT COUNT(*) FROM t2 WHERE EXISTS \
+                 (SELECT 1 FROM t3 WHERE t3.a = t2.a AND t3.id <> t2.id);",
+            )
+            .await;
+            assert_eq!(counted, vec![vec![SqliteValue::Integer(1)]]);
+
+            // Route (a): non-correlated outer EXISTS whose body nests the
+            // family — outer must hit because t2 id 2 qualifies. Oracle: one
+            // row.
+            let nested_hit = strict_or_fallback(
+                "SELECT 1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS \
+                 (SELECT 1 FROM t3 WHERE t3.a = t2.a AND t3.id <> t2.id));",
+            )
+            .await;
+            assert_eq!(nested_hit, vec![vec![SqliteValue::Integer(1)]]);
+
+            // Same-id-only variant: after removing the cross-id witness, no
+            // t2 row qualifies and the outer EXISTS must go empty. Oracle:
+            // zero rows.
+            conn.set_strict_mem_fallback_rejection(false);
+            conn.set_reject_mem_fallback(false);
+            conn.execute("DELETE FROM t2 WHERE id <> 1;").await.unwrap();
+            conn.set_reject_mem_fallback(true);
+            conn.set_strict_mem_fallback_rejection(true);
+            let nested_empty = strict_or_fallback(
+                "SELECT 1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS \
+                 (SELECT 1 FROM t3 WHERE t3.a = t2.a AND t3.id <> t2.id));",
+            )
+            .await;
+            assert!(nested_empty.is_empty(), "got {nested_empty:?}");
+        });
+    }
+
     /// bd-r02v6: the interpreter-fallback json_valid arm must mirror the
     /// registered JsonValidFunc for numeric and NULL arguments (oracle
     /// sqlite3 3.46.1: json_valid(5)=1, json_valid(2.5)=1,
@@ -164732,6 +164970,33 @@ mod tests {
             assert_eq!(
                 after_ddl.iter().map(row_values).collect::<Vec<_>>(),
                 vec![vec![SqliteValue::Integer(0), SqliteValue::Integer(1)]]
+            );
+
+            // Prepared-statement leg (bd-z22mq dispatch short-circuit): the
+            // deferred prepared route re-enters the dispatch cascade, so the
+            // memo must serve repeated prepared executions AND still see every
+            // committed write in between.
+            let prepared = conn.prepare(sql).await.unwrap();
+            let prep_first = prepared.query().await.unwrap();
+            assert_eq!(
+                prep_first.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(0), SqliteValue::Integer(1)]]
+            );
+            let prep_memo_hit = prepared.query().await.unwrap();
+            assert_eq!(
+                prep_memo_hit.iter().map(row_values).collect::<Vec<_>>(),
+                prep_first.iter().map(row_values).collect::<Vec<_>>()
+            );
+            conn.execute("INSERT INTO bench VALUES (6, 2), (15, 4);")
+                .await
+                .unwrap();
+            let prep_after_insert = prepared.query().await.unwrap();
+            assert_eq!(
+                prep_after_insert.iter().map(row_values).collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(0), SqliteValue::Integer(3)],
+                    vec![SqliteValue::Integer(1), SqliteValue::Integer(4)],
+                ]
             );
         });
     }

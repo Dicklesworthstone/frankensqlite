@@ -129,7 +129,7 @@
     {
       "source_path": "crates/fsqlite-btree/src/instrumentation.rs",
       "test_name": "tests::bench_btree_metrics_gate_per_op_cost",
-      "reason": "microbench — run with --ignored --nocapture",
+      "reason": "microbench \u2014 run with --ignored --nocapture",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -141,7 +141,7 @@
     {
       "source_path": "crates/fsqlite-btree/src/quotient_filter_bench.rs",
       "test_name": "bench_absent_key_reject_10k",
-      "reason": "benchmark — invoke with --ignored",
+      "reason": "benchmark \u2014 invoke with --ignored",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -219,6 +219,30 @@
       "policy": "exempt",
       "evidence": {
         "requirement": "None; this is a manual profiler entrypoint and cannot satisfy release acceptance.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/integrity_check_empty_non_root_leaf.rs",
+      "test_name": "integrity_check_flags_empty_non_root_leaf",
+      "reason": "bd-y5urj: repro fixture inconclusive; integrity_check reads the corrupted empty-non-root leaf as ok \u2014 root-cause checker-wiring vs fixture validity before un-ignoring",
+      "cfg_condition": null,
+      "kind": "known_bug",
+      "policy": "block_release",
+      "evidence": {
+        "requirement": "Resolve bd-y5urj's fixture-vs-checker question: either prove the fixture invalid (retire or re-point the probe) or fix integrity_check to flag the empty non-root leaf; remove the ignore only after three consecutive green runs at the release commit (bd-y5urj).",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/update_generated_column_oracle.rs",
+      "test_name": "update_generated_column_matches_rusqlite_oracle",
+      "reason": "bd-gh-generated-column-update-target: KNOWN-RED anchor \u2014 the general-path guard landed (fea1ba8a8) but the :memory: precompiled fast lane (execute_precompiled_prepared_update_or_delete) is still unguarded; needs the check at the UPDATE prepare/compile gate. See module doc.",
+      "cfg_condition": null,
+      "kind": "known_bug",
+      "policy": "block_release",
+      "evidence": {
+        "requirement": "Guard the :memory: precompiled prepared UPDATE fast lane at the prepare/compile gate like the general path (fea1ba8a8); remove the ignore only after the oracle keeper passes three consecutive runs at the release commit (bd-gh-generated-column-update-target).",
         "receipt": null
       }
     },
@@ -1207,7 +1231,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/begin_concurrent.rs",
       "test_name": "tests::bench_active_edge_index_build",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1219,7 +1243,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/begin_concurrent.rs",
       "test_name": "tests::bench_handle_view_new_typical",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1231,7 +1255,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/begin_concurrent.rs",
       "test_name": "tests::bench_incoming_candidate_refs_empty_readers",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1243,7 +1267,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/begin_concurrent.rs",
       "test_name": "tests::bench_read_path_page_state_lookup",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1255,7 +1279,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/core_types.rs",
       "test_name": "tests::bench_notify_waiters_no_waiters",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1267,7 +1291,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/core_types.rs",
       "test_name": "tests::bench_unregister_waiter_drained",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1279,7 +1303,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/core_types.rs",
       "test_name": "tests::test_in_process_lock_table_wait_for_holder_change_microbench",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1303,7 +1327,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/invariants.rs",
       "test_name": "tests::bench_publish_cas_metrics_gate",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1315,7 +1339,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/invariants.rs",
       "test_name": "tests::bench_publish_visibility_ranges_gate",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1327,7 +1351,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/invariants.rs",
       "test_name": "tests::bench_resolve_visible_version_metric_gate",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1339,7 +1363,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/invariants.rs",
       "test_name": "tests::bench_visible_branchless",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1351,7 +1375,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/observability.rs",
       "test_name": "tests::bench_record_ssi_commit_validations_pruning",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1363,7 +1387,7 @@
     {
       "source_path": "crates/fsqlite-mvcc/src/observability.rs",
       "test_name": "tests::bench_snapshot_established_released_gate",
-      "reason": "microbench — run manually",
+      "reason": "microbench \u2014 run manually",
       "cfg_condition": "test",
       "kind": "performance",
       "policy": "exempt",
@@ -1595,6 +1619,18 @@
       }
     },
     {
+      "source_path": "crates/fsqlite/tests/aoj0g_insert_profile.rs",
+      "test_name": "aoj0g_insert_phase_profile",
+      "reason": "bd-aoj0g measurement harness, run explicitly with --ignored; prints timings",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run the exact ignored profile harness with --ignored --nocapture only for investigation; convert any conclusion into an asserted keeper or retained immutable artifact before release use (bd-aoj0g).",
+        "receipt": null
+      }
+    },
+    {
       "source_path": "crates/fsqlite/tests/composite_eq_plan_probe.rs",
       "test_name": "composite_eq_plan",
       "reason": "probe",
@@ -1805,8 +1841,8 @@
       }
     },
     {
-      "source_path": "crates/fsqlite/tests/\u0074rigger_depth_worker_probe.rs",
-      "test_name": "diag_worker_\u0074rigger_depth_survival",
+      "source_path": "crates/fsqlite/tests/trigger_depth_worker_probe.rs",
+      "test_name": "diag_worker_trigger_depth_survival",
       "reason": "diagnostic measurement, not a regression assertion",
       "cfg_condition": "all(feature=\"async-api\",not(target_arch=\"wasm32\"))",
       "kind": "diagnostic",

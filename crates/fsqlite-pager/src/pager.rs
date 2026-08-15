@@ -92,6 +92,7 @@ fn atomic_u64_checked_update(
 /// delegates to `write_u32`, so the identity hasher makes lookups a single
 /// shift+mask.
 type PagePageMap<V> = HashMap<PageNumber, V, PageNumberBuildHasher>;
+type PagePageSet = HashSet<PageNumber, PageNumberBuildHasher>;
 
 use fsqlite_wal::{
     ConsolidationPhase, FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig,
@@ -12506,6 +12507,7 @@ where
                     write_set: PagePageMap::default(),
                     write_pages_sorted: Vec::new(),
                     freed_pages: Vec::new(),
+                    freed_pages_index: PagePageSet::default(),
                     freed_page_bounds: None,
                     allocated_from_freelist: Vec::new(),
                     allocated_from_durable_freelist: HashSet::new(),
@@ -12730,6 +12732,7 @@ where
                 write_set: PagePageMap::default(),
                 write_pages_sorted: Vec::new(),
                 freed_pages: Vec::new(),
+                freed_pages_index: PagePageSet::default(),
                 freed_page_bounds: None,
                 allocated_from_freelist: Vec::new(),
                 allocated_from_durable_freelist: HashSet::new(),
@@ -17321,6 +17324,12 @@ where
     write_set: PagePageMap<StagedPage>,
     write_pages_sorted: Vec<PageNumber>,
     freed_pages: Vec<PageNumber>,
+    /// bd-8q9po: O(1) membership mirror of `freed_pages`, maintained in
+    /// lockstep at every mutation site. `contains_freed_page` runs on EVERY
+    /// `get_page`; perf-annotate showed the Vec linear scan at 45.8% of all
+    /// b-tree descent self-time once a delete-heavy transaction grew the vec
+    /// past the bounds pre-filter's usefulness.
+    freed_pages_index: PagePageSet,
     freed_page_bounds: Option<(PageNumber, PageNumber)>,
     allocated_from_freelist: Vec<PageNumber>,
     /// bd-r82et: the subset of `allocated_from_freelist` pops that were on
@@ -18255,10 +18264,12 @@ where
 
     fn clear_freed_pages(&mut self) {
         self.freed_pages.clear();
+        self.freed_pages_index.clear();
         self.freed_page_bounds = None;
     }
 
     fn restore_pending_freed_pages(&mut self, pending_freed: Vec<PageNumber>) {
+        self.freed_pages_index.extend(pending_freed.iter().copied());
         self.freed_pages.extend(pending_freed);
         self.refresh_freed_page_bounds();
     }
@@ -18269,7 +18280,7 @@ where
     }
 
     fn contains_freed_page(&self, page_no: PageNumber) -> bool {
-        self.might_have_freed_page(page_no) && self.freed_pages.contains(&page_no)
+        self.might_have_freed_page(page_no) && self.freed_pages_index.contains(&page_no)
     }
 
     fn remove_freed_page_if_present(&mut self, page_no: PageNumber) {
@@ -18278,6 +18289,7 @@ where
         }
         if let Some(pos) = self.freed_pages.iter().position(|&p| p == page_no) {
             self.freed_pages.swap_remove(pos);
+            self.freed_pages_index.remove(&page_no);
             if self.freed_pages.is_empty() {
                 self.freed_page_bounds = None;
             }
@@ -22112,6 +22124,7 @@ where
             }
             if !self.contains_freed_page(page_no) {
                 self.freed_pages.push(page_no);
+                self.freed_pages_index.insert(page_no);
                 self.note_freed_page_bound(page_no);
             }
             if self.write_set.remove(&page_no).is_some() {
@@ -22481,6 +22494,7 @@ where
                 let wal_page1_plan =
                     self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
                 pending_freed = std::mem::take(&mut self.freed_pages);
+                self.freed_pages_index.clear();
                 self.freed_page_bounds = None;
                 if self.journal_mode == JournalMode::Wal {
                     let staged_page_high_water =
@@ -23230,6 +23244,7 @@ where
             let mut pending_free_pages = pending_returned_pages.clone();
             pending_free_pages.extend(self.freed_pages.iter().copied());
             let mut pending_freed: Vec<PageNumber> = std::mem::take(&mut self.freed_pages);
+            self.freed_pages_index.clear();
             self.freed_page_bounds = None;
             let mut wal_publication_authorization = None;
             let mut wal_attempt: Option<Arc<PendingGroupCommitTxnAttempt<V::File>>> = None;
@@ -24150,6 +24165,7 @@ where
         self.allocated_from_freelist = allocated_from_freelist_snapshot;
         self.allocated_from_eof = allocated_from_eof_snapshot;
         self.freed_pages = freed_pages_snapshot;
+        self.freed_pages_index = self.freed_pages.iter().copied().collect();
         self.refresh_freed_page_bounds();
         // #70 ghost-commit guard: rollback-to-savepoint replaces write_set
         // with the snapshot. If the snapshot is empty, no writes are pending
