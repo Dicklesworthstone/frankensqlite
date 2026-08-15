@@ -7,6 +7,7 @@
 //!
 //! See: <https://www.sqlite.org/fileformat.html#record_format>
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -1477,6 +1478,67 @@ where
 /// Serialize a list of `SqliteValue` into the SQLite record format.
 pub fn serialize_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record_iter(values.iter())
+}
+
+/// Serialize a record for a database using the given text encoding (bd-bld9w.7)
+/// — the write-side inverse of [`parse_record_into_with_encoding`].
+///
+/// [`TextEncoding::Utf8`] is byte-for-byte identical to [`serialize_record`].
+/// For UTF-16LE/BE, TEXT columns are encoded to UTF-16 record bytes via
+/// [`SmallText::to_record_text_bytes`], and each TEXT value's serial type uses
+/// its *encoded* byte length. Each TEXT payload is encoded exactly once (cached
+/// between the header-sizing and body-writing passes).
+#[must_use]
+pub fn serialize_record_with_encoding(values: &[SqliteValue], encoding: TextEncoding) -> Vec<u8> {
+    if matches!(encoding, TextEncoding::Utf8) {
+        return serialize_record(values);
+    }
+
+    let mut header_content_size = 0usize;
+    let mut body_size = 0usize;
+    let mut serial_types: SmallVec<[u64; 16]> = SmallVec::with_capacity(values.len());
+    // For TEXT under UTF-16, cache the encoded payload so it is produced once.
+    let mut encoded_text: SmallVec<[Option<Cow<'_, [u8]>>; 16]> =
+        SmallVec::with_capacity(values.len());
+
+    for value in values {
+        if let SqliteValue::Text(text) = value {
+            let bytes = text.to_record_text_bytes(encoding);
+            let len = bytes.len();
+            let serial_type = serial_type_for_text(u64::try_from(len).unwrap_or(u64::MAX));
+            header_content_size += varint_len(serial_type);
+            body_size += len;
+            serial_types.push(serial_type);
+            encoded_text.push(Some(bytes));
+        } else {
+            let (serial_type, payload_len) = serialized_value_layout(value);
+            header_content_size += varint_len(serial_type);
+            body_size += payload_len;
+            serial_types.push(serial_type);
+            encoded_text.push(None);
+        }
+    }
+
+    let header_size = compute_header_size(header_content_size);
+    let mut buf = Vec::with_capacity(header_size + body_size);
+    buf.resize(header_size, 0);
+    let mut header_offset =
+        write_varint(buf.as_mut_slice(), u64::try_from(header_size).unwrap_or(u64::MAX));
+    for serial_type in &serial_types {
+        header_offset += write_varint(&mut buf[header_offset..], *serial_type);
+    }
+    debug_assert_eq!(header_offset, header_size);
+
+    for (value, encoded) in values.iter().zip(encoded_text.iter()) {
+        if let Some(bytes) = encoded {
+            buf.extend_from_slice(bytes);
+        } else {
+            let (_serial_type, payload_len) = serialized_value_layout(value);
+            append_serialized_value(value, payload_len, &mut buf);
+        }
+    }
+
+    buf
 }
 
 /// Serialize a list of `SqliteValue` references into the SQLite record format.
@@ -3301,6 +3363,52 @@ mod tests {
         let mut utf8_values = Vec::new();
         parse_record_into(&record, &mut utf8_values).expect("utf8 row decodes");
         assert_ne!(utf8_values[0].as_text(), Some(text));
+    }
+
+    #[test]
+    fn serialize_record_with_encoding_round_trips() {
+        let rows: Vec<Vec<SqliteValue>> = vec![
+            vec![
+                SqliteValue::Text(SmallText::new("table")),
+                SqliteValue::Integer(42),
+            ],
+            vec![
+                SqliteValue::Text(SmallText::new("café ☕")),
+                SqliteValue::Null,
+                SqliteValue::Text(SmallText::new("日本")),
+            ],
+            vec![
+                SqliteValue::Blob(Arc::from(&[1_u8, 2, 3][..])),
+                SqliteValue::Text(SmallText::new("😀")),
+            ],
+        ];
+        for encoding in [
+            TextEncoding::Utf8,
+            TextEncoding::Utf16le,
+            TextEncoding::Utf16be,
+        ] {
+            for row in &rows {
+                let record = serialize_record_with_encoding(row, encoding);
+                let mut decoded = Vec::new();
+                parse_record_into_with_encoding(&record, &mut decoded, encoding)
+                    .expect("round-trip decode");
+                assert_eq!(&decoded, row, "round-trip via {encoding:?}");
+            }
+        }
+        // UTF-8 path is byte-for-byte identical to serialize_record.
+        let row = vec![
+            SqliteValue::Text(SmallText::new("plain")),
+            SqliteValue::Integer(7),
+        ];
+        assert_eq!(
+            serialize_record_with_encoding(&row, TextEncoding::Utf8),
+            serialize_record(&row)
+        );
+        // UTF-16LE uses the ENCODED (2x) TEXT length in the serial type + body.
+        // "ab" -> 4 body bytes -> serial_type_for_text(4) = 13 + 4*2 = 21.
+        let utf16_row = vec![SqliteValue::Text(SmallText::new("ab"))];
+        let record = serialize_record_with_encoding(&utf16_row, TextEncoding::Utf16le);
+        assert_eq!(record, vec![2, 21, b'a', 0, b'b', 0]);
     }
 
     #[test]
