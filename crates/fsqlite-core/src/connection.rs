@@ -15756,8 +15756,12 @@ impl Connection {
             .collect()
     }
 
-    /// Dirty-write-set accounting for the latest transaction on this
-    /// connection, when a write-set ceiling is in force.
+    /// Dirty-write-set accounting since the write-set ceiling was installed,
+    /// when one is in force.
+    ///
+    /// Build-level, not per-transaction: under autocommit each statement is its
+    /// own transaction, so a per-transaction figure would describe the last
+    /// statement rather than the build.
     ///
     /// Distinct from [`Self::page_cache_peak_snapshot`], and the distinction is
     /// the whole point: residency answers "how many pages were held in memory",
@@ -229101,6 +229105,14 @@ mod pager_routing_tests {
                 .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
                 .await
                 .ok();
+
+            // Drive the inserts inside ONE explicit transaction. Under
+            // autocommit each statement is its own transaction and its write
+            // set is tiny, so a per-statement loop exercises the ceiling only
+            // by accident, when a page-split cascade happens to touch enough
+            // pages. An explicit transaction accumulates the write set, which
+            // is what the ceiling actually bounds.
+            builder.execute("BEGIN;").await.expect("begin");
             let mut refused = false;
             for id in 1..=512_i64 {
                 let filler = "z".repeat(512);
@@ -229114,6 +229126,7 @@ mod pager_routing_tests {
                 }
             }
             assert!(refused, "a 3-page ceiling must refuse this build");
+            builder.execute("ROLLBACK;").await.ok();
 
             let after = builder
                 .write_set_stats()
