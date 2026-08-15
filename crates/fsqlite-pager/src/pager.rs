@@ -11739,9 +11739,9 @@ pub struct SimplePager<V: Vfs> {
     write_set_page_limit: Arc<AtomicUsize>,
     /// Distinct dirty pages staged by the active transaction.
     write_set_current_pages: Arc<AtomicUsize>,
-    /// High-water dirty-page count for the latest transaction.
+    /// High-water dirty-page count since the ceiling was installed.
     write_set_high_water_pages: Arc<AtomicUsize>,
-    /// Pre-admission cap refusals in the latest transaction.
+    /// Pre-admission cap refusals since the ceiling was installed.
     write_set_cap_refusals: Arc<AtomicU64>,
     /// Shared page buffer pool cloned into transactions for write staging.
     pool: PageBufPool,
@@ -11767,7 +11767,7 @@ pub struct SimplePager<V: Vfs> {
 /// The digest covers the page size, exact file length, page numbers, and all
 /// logical database pages. SQLite's reserved lock-byte page is deliberately
 /// excluded because it is process-lock state rather than database content.
-/// Dirty-write-set accounting for the latest transaction on this pager.
+/// Dirty-write-set accounting since the write-set ceiling was installed.
 ///
 /// Distinct from page-cache residency: `PageCachePeakSnapshot` answers "how
 /// many pages were resident", which is a memory bound. This answers "how much
@@ -11788,11 +11788,18 @@ pub struct WriteSetStats {
     pub current_dirty_pages: usize,
     /// Exact bytes currently staged by the active transaction.
     pub current_dirty_bytes: usize,
-    /// Largest distinct dirty-page count observed in the latest transaction.
+    /// Largest distinct dirty-page count observed since the ceiling was
+    /// installed, across every transaction the builder ran.
+    ///
+    /// Deliberately NOT per-transaction. Under autocommit each statement is its
+    /// own transaction, so a per-transaction high water would report the last
+    /// statement rather than the build — useless for certifying how much of the
+    /// database a migration rewrote, which is the question this exists to
+    /// answer.
     pub dirty_pages_high_water: usize,
-    /// Largest staged byte count observed in the latest transaction.
+    /// Largest staged byte count observed since the ceiling was installed.
     pub dirty_bytes_high_water: usize,
-    /// Pre-admission cap refusals in the latest transaction.
+    /// Pre-admission cap refusals since the ceiling was installed.
     pub cap_refusals: u64,
 }
 
@@ -14285,8 +14292,8 @@ where
             .store(page_limit, AtomicOrdering::Relaxed);
     }
 
-    /// Dirty-write-set accounting for the latest transaction, when a ceiling
-    /// is configured.
+    /// Dirty-write-set accounting since the ceiling was installed, when one is
+    /// configured.
     ///
     /// `None` when no ceiling is in force: without one there is no budget to
     /// report against, and reporting zeroes would read as "nothing was
