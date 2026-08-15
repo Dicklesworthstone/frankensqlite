@@ -18277,7 +18277,11 @@ where
     }
 
     fn remove_freed_page_if_present(&mut self, page_no: PageNumber) {
-        if !self.might_have_freed_page(page_no) {
+        // bd-8q9po follow-up: O(1) reject via the index before the positional
+        // scan — post-mirror profiling showed this function inheriting the
+        // old contains cost (9.9% self-time) because every call still walked
+        // the vec even when the page was absent (the overwhelming case).
+        if !self.might_have_freed_page(page_no) || !self.freed_pages_index.contains(&page_no) {
             return;
         }
         if let Some(pos) = self.freed_pages.iter().position(|&p| p == page_no) {
