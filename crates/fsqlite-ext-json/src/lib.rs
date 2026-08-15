@@ -1824,6 +1824,19 @@ fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(Value, Option<&
     let input_value = match input_arg {
         SqliteValue::Text(input_text) => parse_json_text(input_text)?,
         SqliteValue::Blob(input_blob) => parse_json_input_blob(input_blob)?,
+        // A bare SQL numeric is a JSON number (C SQLite convention), mirroring
+        // the scalar `json_arg_value` path: json_each(1.5) yields a single row
+        // with type='real', atom=1.5; json_tree(7) yields type='integer'. A
+        // non-finite REAL is not representable as JSON and falls through to the
+        // error arm below.
+        SqliteValue::Integer(i) => Value::Number((*i).into()),
+        SqliteValue::Float(f) if f.is_finite() => serde_json::Number::from_f64(*f)
+            .map(Value::Number)
+            .ok_or_else(|| {
+                FrankenError::function_error(
+                    "json table-valued input is not representable as JSON",
+                )
+            })?,
         _ => {
             return Err(FrankenError::function_error(
                 "json table-valued input must be TEXT or BLOB JSON",
@@ -3499,6 +3512,12 @@ impl ScalarFunction for JsonErrorPositionFunc {
         let position = match &args[0] {
             SqliteValue::Text(text) => json_error_position(text),
             SqliteValue::Blob(bytes) => json_error_position_blob(bytes),
+            // A bare finite SQL numeric is valid JSON (a JSON number), so there
+            // is no parse error: json_error_position(1) = json_error_position(1.5)
+            // = 0 (C SQLite convention, matching the scalar json_arg_value path).
+            // Non-finite REAL is not representable as JSON and stays an error.
+            SqliteValue::Integer(_) => 0,
+            SqliteValue::Float(f) if f.is_finite() => 0,
             other => {
                 return Err(FrankenError::function_error(format!(
                     "{} argument 1 must be TEXT or BLOB, got {}",
@@ -5004,6 +5023,42 @@ mod tests {
             f.invoke(&[SqliteValue::Float(1.5)]).unwrap(),
             SqliteValue::Text(SmallText::from_string("real"))
         );
+    }
+
+    #[test]
+    fn test_json_table_valued_bare_numeric_input() {
+        // Regression (#260): json_each/json_tree accept a bare SQL numeric as a
+        // JSON number (yielding a single scalar row) instead of erroring
+        // "must be TEXT or BLOB JSON". C SQLite: json_each(1.5) -> type='real'
+        // atom=1.5; json_tree(7) -> type='integer'.
+        use serde_json::Value;
+        let (v_float, path) =
+            super::parse_json_table_filter_args(&[SqliteValue::Float(1.5)]).unwrap();
+        assert_eq!(v_float, Value::from(1.5));
+        assert!(path.is_none());
+        let (v_int, _) =
+            super::parse_json_table_filter_args(&[SqliteValue::Integer(7)]).unwrap();
+        assert_eq!(v_int, Value::from(7_i64));
+        // A non-finite REAL is not representable as JSON and is still rejected.
+        assert!(super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)]).is_err());
+    }
+
+    #[test]
+    fn test_json_error_position_bare_numeric() {
+        // Regression (#260): a bare finite numeric is valid JSON, so
+        // json_error_position(1) = json_error_position(1.5) = 0 (no parse error).
+        let f = JsonErrorPositionFunc;
+        assert_eq!(
+            f.invoke(&[SqliteValue::Integer(1)]).unwrap(),
+            SqliteValue::Integer(0)
+        );
+        assert_eq!(
+            f.invoke(&[SqliteValue::Float(1.5)]).unwrap(),
+            SqliteValue::Integer(0)
+        );
+        // NULL still short-circuits to NULL, and a non-finite REAL stays an error.
+        assert_eq!(f.invoke(&[SqliteValue::Null]).unwrap(), SqliteValue::Null);
+        assert!(f.invoke(&[SqliteValue::Float(f64::INFINITY)]).is_err());
     }
 
     #[test]
