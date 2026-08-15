@@ -239,3 +239,99 @@ fn pragma_index_list_unique_origin() {
         .await;
     });
 }
+
+/// GH #344 -- THIS TEST IS EXPECTED TO FAIL. THE RED IS CORRECT.
+///
+/// =========================================================================
+/// READ THIS BEFORE YOU "FIX" A RED FROM THIS TEST
+/// =========================================================================
+/// This test is RED on purpose. It is not a broken test, not a flake, and not
+/// an environment problem. It pins a real, currently-unfixed engine defect:
+/// `PRAGMA index_list` on a WITHOUT ROWID table omits the PRIMARY KEY
+/// auto-index that stock SQLite reports.
+///
+/// Measured against the oracle in this same harness:
+///     frank: [_3|u, _2|u]
+///     csql:  [_3|u, _2|u, sqlite_autoindex_w_1|pk]
+/// The `pk` row is ABSENT, not relabelled with some other origin string.
+///
+/// ROOT CAUSE: crates/fsqlite-core/src/connection.rs:52341 skips the hidden
+/// WITHOUT ROWID primary-key slot when building `implicit_indexes`, so
+/// `PRAGMA index_list` (:64711), which derives `origin` only for entries
+/// already present in `t.indexes`, has no entry to label. The engine conflates
+/// "not materialised as a separate b-tree" (correct -- stock does the same)
+/// with "not reportable by introspection" (incorrect -- stock reports it).
+///
+/// WHAT WOULD MAKE THIS PASS: `index_list` / `index_xinfo` synthesising the
+/// primary-key entry for WITHOUT ROWID tables at the REPORTING layer, while
+/// leaving root allocation untouched. After such a fix, `sqlite_master` for
+/// `w` must STILL contain only sqlite_autoindex_w_2 and _3 -- no new schema
+/// row, no new root page. That criterion is what distinguishes the right fix
+/// from the wrong one.
+///
+/// DO NOT delete the skip at connection.rs:52341 to make this green: that
+/// would allocate a real root b-tree for an index that must not have one,
+/// which is a corruption risk, not a fix.
+///
+/// DO NOT relax this assertion, add #[ignore], or adjust the expectation to
+/// match FrankenSQLite's current output. Anyone who makes this green without
+/// fixing the engine has blessed the defect and destroyed the only signal that
+/// tells us when it is actually fixed.
+///
+/// The sibling `pragma_index_list_rowid_composite_pk` runs the identical DDL
+/// without the WITHOUT ROWID clause and PASSES, which scopes this defect to
+/// the WITHOUT ROWID path rather than to origin `pk` generally.
+#[test]
+fn pragma_index_list_without_rowid_composite_pk() {
+    asupersync::test_utils::run_test(|| async {
+        // Stock SQLite 3.46.1 on this DDL:
+        //     0|sqlite_autoindex_w_3|1|u|0
+        //     1|sqlite_autoindex_w_2|1|u|0
+        //     2|sqlite_autoindex_w_1|1|pk|0
+        //
+        // No pre-existing case in this file uses a WITHOUT ROWID table, which
+        // is why the divergence survived on an otherwise oracle-covered
+        // surface.
+        let (f, r) = setup(&[
+            "CREATE TABLE w (a TEXT NOT NULL, b INTEGER NOT NULL, c TEXT NOT NULL, d TEXT NOT NULL, \
+             PRIMARY KEY(a,b), UNIQUE(a,c), UNIQUE(d)) WITHOUT ROWID",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &["PRAGMA index_list(w)"],
+            "pragma_index_list_without_rowid_composite_pk",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn pragma_index_list_rowid_composite_pk() {
+    asupersync::test_utils::run_test(|| async {
+        // Diagnostic sibling of the WITHOUT ROWID case above: identical DDL,
+        // no WITHOUT ROWID clause. This exercises origin 'pk' for the first
+        // time anywhere in this file -- `pragma_index_list_unique_origin`
+        // claims to cover it but its `id INTEGER PRIMARY KEY` fixture is a
+        // rowid alias that creates no auto-index at all, so on 3.46.1 that DDL
+        // yields only `idx_name|c` and `sqlite_autoindex_t_1|u` and never a
+        // 'pk' row.
+        //
+        // Read together with the WITHOUT ROWID case: this one GREEN means the
+        // defect is specific to WITHOUT ROWID; this one RED means origin 'pk'
+        // is unreported generally, which is a much larger blast radius.
+        let (f, r) = setup(&[
+            "CREATE TABLE r (a TEXT NOT NULL, b INTEGER NOT NULL, c TEXT NOT NULL, d TEXT NOT NULL, \
+             PRIMARY KEY(a,b), UNIQUE(a,c), UNIQUE(d))",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &["PRAGMA index_list(r)"],
+            "pragma_index_list_rowid_composite_pk",
+        )
+        .await;
+    });
+}
