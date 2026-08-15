@@ -1652,6 +1652,51 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         })
     }
 
+    // bd-dw8oe: gate-held read from the PHYSICAL appended tail. The published
+    // snapshot consulted by `read_page` clamps to the fsynced prefix under
+    // deferred sync, so it can lag peers' appended-but-unfsynced commits; the
+    // append-gate guards (synthetic page-1 promotion, stale-header byte check,
+    // freelist resurrection/erasure walk) need the newest appended frame, not
+    // the newest published one. Under the gate the tail is stable, so a
+    // backwards header scan from `frame_count() - 1` is exact.
+    fn read_page_at_appended_tail<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_number: u32,
+    ) -> WalFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let frame_count = self.wal.frame_count();
+            let Some(tail_frame) = frame_count.checked_sub(1) else {
+                return Ok(None);
+            };
+            let Some(frame_index) = self
+                .scan_backwards_for_page(cx, page_number, tail_frame)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let mut frame_buf = vec![0u8; self.wal.frame_size()];
+            let header = self
+                .wal
+                .read_frame_into(cx, frame_index, &mut frame_buf)
+                .await?;
+            if header.page_number != page_number {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "WAL appended-tail scan integrity failure: expected page \
+                         {page_number} at frame {frame_index}, found page {}",
+                        header.page_number
+                    ),
+                });
+            }
+            let header_size = fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE;
+            let page_size = self.wal.page_size();
+            frame_buf.copy_within(header_size.., 0);
+            frame_buf.truncate(page_size);
+            Ok(Some(frame_buf))
+        })
+    }
+
     // bd-db300.3.8.7: shared-lock read path for pinned snapshots.
     fn read_page_pinned<'a>(
         &'a self,
@@ -3719,6 +3764,20 @@ where
         Box::pin(async move {
             self.ensure_current_wal_path(cx).await?;
             self.inner.read_page(cx, page_number).await
+        })
+    }
+
+    // bd-dw8oe: gate reads must see the physical appended tail through the
+    // path-refreshing wrapper too, or the guards silently regress to the
+    // clamped published plane via the trait default.
+    fn read_page_at_appended_tail<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_number: u32,
+    ) -> WalFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            self.ensure_current_wal_path(cx).await?;
+            self.inner.read_page_at_appended_tail(cx, page_number).await
         })
     }
 

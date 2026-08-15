@@ -500,6 +500,30 @@ pub trait WalBackend: Send + Sync {
     /// partial index or recovery-oriented handling.
     fn read_page<'a>(&'a mut self, cx: &'a Cx, page_number: u32) -> WalFuture<'a, Option<Vec<u8>>>;
 
+    /// bd-dw8oe: look up the latest version of a page in the PHYSICAL appended
+    /// WAL tail, ignoring any reader-visibility publication plane.
+    ///
+    /// The published snapshot used by [`Self::read_page`] may clamp to the
+    /// fsynced prefix (deferred-sync), hiding PEER commits that are appended
+    /// but not yet fsynced. Append-gate guards that validate against "the
+    /// current durable freelist / header" must see every appended frame, or a
+    /// flusher refreshing mid-flush republishes stale page-1 freelist bytes
+    /// over a peer's just-published state (the bd-dw8oe trunk-corruption
+    /// mechanism: head=753 republished nine frames after a peer published
+    /// head=0). Only call this while the append gate (backend write lock plus
+    /// commit-serialization lock) is held: under the gate the appended tail is
+    /// stable and every appended frame belongs to a completed batch.
+    ///
+    /// The default implementation falls back to [`Self::read_page`], which is
+    /// exact for backends whose read plane never lags their appended tail.
+    fn read_page_at_appended_tail<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_number: u32,
+    ) -> WalFuture<'a, Option<Vec<u8>>> {
+        self.read_page(cx, page_number)
+    }
+
     /// Read a page from the WAL using a previously pinned read snapshot.
     ///
     /// This method takes `&self` instead of `&mut self`, enabling callers to

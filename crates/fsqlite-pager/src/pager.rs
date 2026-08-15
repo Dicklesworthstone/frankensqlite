@@ -9365,7 +9365,13 @@ async fn read_durable_page_under_gate<F: VfsFile>(
     page_size: usize,
     page_no: u32,
 ) -> Result<Option<Vec<u8>>> {
-    if let Some(image) = wal.read_page(cx, page_no).await? {
+    // bd-dw8oe: read the PHYSICAL appended tail, not the published plane. The
+    // published snapshot clamps to the fsynced prefix under deferred sync, so
+    // `read_page` can miss peers' appended-but-unfsynced commits and hand the
+    // gate guards a stale page-1 freelist header to "restore" (the proven
+    // trunk-corruption mechanism: head=753 republished over a peer's freshly
+    // appended head=0). Callers hold the append gate, so the tail is stable.
+    if let Some(image) = wal.read_page_at_appended_tail(cx, page_no).await? {
         return Ok(Some(image));
     }
     let offset = u64::from(page_no.saturating_sub(1)) * page_size as u64;
@@ -22434,8 +22440,14 @@ where
                     let mut dw8oe_reclaimed = 0_usize;
                     let mut dw8oe_framed = 0_usize;
                     let mut dw8oe_errs = 0_usize;
+                    // bd-dw8oe: the no-committed-frame test must see the
+                    // PHYSICAL appended tail. The published plane clamps to
+                    // the fsynced prefix, so a peer's appended-but-unfsynced
+                    // frame for this page would be invisible and the page
+                    // wrongly reclaimed while live. The backend write lock is
+                    // held, so the tail is stable.
                     for page in abandoned_candidates {
-                        match wal.read_page(cx, page.get()).await {
+                        match wal.read_page_at_appended_tail(cx, page.get()).await {
                             Ok(None) => {
                                 self.reclaimed_abandoned_reservations.push(page);
                                 pending_free_pages.push(page);
