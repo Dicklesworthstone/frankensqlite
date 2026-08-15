@@ -2181,10 +2181,31 @@ pub mod pragma {
         match &stmt.value {
             None => Ok(PragmaOutput::Int(i64::from(state.writable_schema))),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                // SQLite accepts `PRAGMA writable_schema = RESET`: it clears the
+                // toggle and reparses the in-memory schema from sqlite_schema.
+                // We honor the toggle-off; there is no separately cached parsed
+                // schema to discard at this layer, so RESET is observably
+                // equivalent to OFF. Without this, RESET errored
+                // "expected ON|OFF|TRUE|FALSE|1|0, got RESET" and aborted the
+                // rest of the script (GH #284).
+                if expr_is_reset(expr) {
+                    state.writable_schema = false;
+                    return Ok(PragmaOutput::Int(0));
+                }
                 let enabled = parse_bool(expr)?;
                 state.writable_schema = enabled;
                 Ok(PragmaOutput::Int(i64::from(enabled)))
             }
+        }
+    }
+
+    /// Whether a `PRAGMA writable_schema = <expr>` value is the `RESET` keyword
+    /// (a bareword identifier or a quoted string), case-insensitive.
+    fn expr_is_reset(expr: &Expr) -> bool {
+        match expr {
+            Expr::Column(col, _) => col.column.eq_ignore_ascii_case("reset"),
+            Expr::Literal(Literal::String(s), _) => s.eq_ignore_ascii_case("reset"),
+            _ => false,
         }
     }
 
