@@ -2952,7 +2952,7 @@ fn wait_for_page_lock_holder_change(
     let _edge_guard = waiter_txn.map(|txn| {
         ctx.lock_table.begin_page_wait(txn, page_no);
         PageWaitEdgeGuard {
-            lock_table: &*ctx.lock_table,
+            lock_table: &ctx.lock_table,
             txn,
         }
     });
