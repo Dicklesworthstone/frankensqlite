@@ -227,17 +227,23 @@ fn strict_insert_rejects_text_into_real() {
 }
 
 #[test]
-fn strict_insert_rejects_integer_into_text() {
+fn strict_insert_accepts_integer_into_text_gh272() {
     asupersync::test_utils::run_test(|| async {
         let conn = open_db("strict-int-to-text.db").await;
         conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT) STRICT;")
             .await
             .expect("create");
-        let err = conn
-            .execute("INSERT INTO t1 VALUES (1, 42);")
+        // GH #272: TEXT affinity converts INTEGER to its text form in a STRICT
+        // TEXT column (stock sqlite3 stores it as text '42'), rather than the
+        // former "cannot store INTEGER value in TEXT column" error.
+        conn.execute("INSERT INTO t1 VALUES (1, 42);")
             .await
-            .expect_err("integer into TEXT should fail");
-        assert_eq!(err.error_code(), ErrorCode::Constraint);
+            .expect("integer coerces to TEXT in a STRICT TEXT column");
+        let rows = conn
+            .query("SELECT 1 FROM t1 WHERE id = 1 AND typeof(val) = 'text' AND val = '42';")
+            .await
+            .expect("query");
+        assert!(!rows.is_empty(), "integer should store as text '42'");
     });
 }
 

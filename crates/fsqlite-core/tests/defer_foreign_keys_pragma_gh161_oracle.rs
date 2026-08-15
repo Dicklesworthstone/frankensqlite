@@ -150,10 +150,6 @@ fn defer_foreign_keys_parent_pk_update_gh161() {
 }
 
 #[test]
-#[ignore = "shares the bd-gh-deferred-fk-parent-dml (GH #149) stale-snapshot limitation: \
-the parent UPDATE queues the child's pid=1 snapshot, and re-pointing the child to a new \
-parent does not clear that stale commit-time obligation. Needs recheck_deferred_fk_at_commit \
-to re-query the current child row by identity instead of rechecking the queued snapshot."]
 fn defer_foreign_keys_parent_pk_update_reparent_gh161_needs_gh149() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();

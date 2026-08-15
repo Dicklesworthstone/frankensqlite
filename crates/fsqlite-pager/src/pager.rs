@@ -22770,6 +22770,33 @@ where
                             published_durable_freelist =
                                 Some(published.iter().map(|page| page.get()).collect());
                             published_for_durable_view = published_durable_freelist.clone();
+                            // bd-84rh4 ERASURE probe (publish site): a page freed
+                            // in-range this commit that is ABSENT from its own
+                            // published durable freelist was dropped by
+                            // serialization — the "page N is never used" origin
+                            // when no peer re-publishes it. If this never fires
+                            // yet pages still leak, the loss is a post-publish
+                            // page-1 overwrite, not a serialize drop. Gated on
+                            // RH4_TRACE; inert in prod/CI.
+                            if std::env::var_os("RH4_TRACE").is_some() {
+                                let published_set: std::collections::HashSet<u32> =
+                                    published.iter().copied().map(PageNumber::get).collect();
+                                let dropped: Vec<u32> = pending_free_pages
+                                    .iter()
+                                    .copied()
+                                    .map(PageNumber::get)
+                                    .filter(|page| {
+                                        *page <= committed_db_size
+                                            && !published_set.contains(page)
+                                    })
+                                    .collect();
+                                if !dropped.is_empty() {
+                                    eprintln!(
+                                        "RH4PUBDROP committed_db={committed_db_size} freed_dropped_from_own_publication={dropped:?} published_len={}",
+                                        published.len(),
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             if wal_attempt.is_some() {
@@ -23560,6 +23587,33 @@ where
                             published_durable_freelist =
                                 Some(published.iter().map(|page| page.get()).collect());
                             published_for_durable_view = published_durable_freelist.clone();
+                            // bd-84rh4 ERASURE probe (publish site): a page freed
+                            // in-range this commit that is ABSENT from its own
+                            // published durable freelist was dropped by
+                            // serialization — the "page N is never used" origin
+                            // when no peer re-publishes it. If this never fires
+                            // yet pages still leak, the loss is a post-publish
+                            // page-1 overwrite, not a serialize drop. Gated on
+                            // RH4_TRACE; inert in prod/CI.
+                            if std::env::var_os("RH4_TRACE").is_some() {
+                                let published_set: std::collections::HashSet<u32> =
+                                    published.iter().copied().map(PageNumber::get).collect();
+                                let dropped: Vec<u32> = pending_free_pages
+                                    .iter()
+                                    .copied()
+                                    .map(PageNumber::get)
+                                    .filter(|page| {
+                                        *page <= committed_db_size
+                                            && !published_set.contains(page)
+                                    })
+                                    .collect();
+                                if !dropped.is_empty() {
+                                    eprintln!(
+                                        "RH4PUBDROP committed_db={committed_db_size} freed_dropped_from_own_publication={dropped:?} published_len={}",
+                                        published.len(),
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             if wal_attempt.is_some() {
