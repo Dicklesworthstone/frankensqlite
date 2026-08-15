@@ -33627,32 +33627,173 @@ fn emit_scalar_subquery(
             return;
         }
 
-        // Non-aggregate scalar subquery: grab first row's first column value.
-        let rewind_addr = b.current_addr();
-        b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let loop_body = (rewind_addr + 1) as i32;
+        // GH #172: an ORDER BY (with optional LIMIT/OFFSET) selects a specific
+        // ordered row, not the first row in scan order. Route to a sorter-based
+        // path that materializes the matching rows, sorts by the ORDER BY terms,
+        // and reads the (OFFSET+1)-th result value. (An OFFSET without ORDER BY
+        // has an unspecified order in SQLite, so that keeps the first-row scan.)
+        if subquery.order_by.is_empty() {
+            // Non-aggregate scalar subquery: grab first row's first column value.
+            let rewind_addr = b.current_addr();
+            b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let loop_body = (rewind_addr + 1) as i32;
 
-        // Apply WHERE filter.
-        let next_label = b.emit_label();
-        if let Some(where_expr) = where_clause {
-            let r_cond = b.alloc_temp();
-            emit_expr_with_fallback(b, where_expr, r_cond, &sub_ctx, Some(outer_ctx));
-            b.emit_jump_to_label(Opcode::IfNot, r_cond, 1, next_label, P4::None, 0);
-            b.free_temp(r_cond);
+            // Apply WHERE filter.
+            let next_label = b.emit_label();
+            if let Some(where_expr) = where_clause {
+                let r_cond = b.alloc_temp();
+                emit_expr_with_fallback(b, where_expr, r_cond, &sub_ctx, Some(outer_ctx));
+                b.emit_jump_to_label(Opcode::IfNot, r_cond, 1, next_label, P4::None, 0);
+                b.free_temp(r_cond);
+            }
+
+            // Evaluate the first result column expression.
+            emit_scalar_subquery_result_value(b, columns, reg, &sub_ctx, outer_ctx);
+
+            // Got our value — jump to done (only need one row).
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+            b.resolve_label(next_label);
+            b.emit_op(Opcode::Next, sub_cursor, loop_body, 0, P4::None, 0);
+        } else {
+            emit_scalar_subquery_ordered(
+                b,
+                subquery,
+                columns,
+                sub_cursor,
+                &sub_ctx,
+                outer_ctx,
+                where_clause.as_deref(),
+                reg,
+                done_label,
+            );
         }
-
-        // Evaluate the first result column expression.
-        emit_scalar_subquery_result_value(b, columns, reg, &sub_ctx, outer_ctx);
-
-        // Got our value — jump to done (only need one row).
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-
-        b.resolve_label(next_label);
-        b.emit_op(Opcode::Next, sub_cursor, loop_body, 0, P4::None, 0);
     }
 
     b.resolve_label(done_label);
+}
+
+/// GH #172: emit an ordered non-aggregate scalar subquery.
+///
+/// Materializes every WHERE-matching row of the subquery into a sorter as
+/// `[order_key_0, .., order_key_{n-1}, result_value]`, sorts by the ORDER BY
+/// directions, skips `OFFSET` rows, and reads the result value of the next row
+/// into `reg`. `reg` is left as its pre-set NULL default when the subquery
+/// yields no row at the requested offset (empty match set, `OFFSET` past the
+/// end, or `LIMIT 0`). The caller resolves `done_label`.
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_scalar_subquery_ordered(
+    b: &mut ProgramBuilder,
+    subquery: &SelectStatement,
+    columns: &[ResultColumn],
+    sub_cursor: i32,
+    sub_ctx: &ScanCtx<'_>,
+    outer_ctx: &ScanCtx<'_>,
+    where_clause: Option<&Expr>,
+    reg: i32,
+    done_label: crate::Label,
+) {
+    let n_key = subquery.order_by.len();
+    // Sort-direction string: '+' ascending (default) / '-' descending per term.
+    let dir: String = subquery
+        .order_by
+        .iter()
+        .map(|term| match term.direction {
+            Some(SortDirection::Desc) => '-',
+            _ => '+',
+        })
+        .collect();
+
+    // LIMIT 0 short-circuits to NULL before any work.
+    if let Some(limit) = subquery.limit.as_ref() {
+        let r_lim = b.alloc_temp();
+        emit_expr(b, &limit.limit, r_lim, Some(outer_ctx));
+        // IfPos jumps (and decrements) when > 0; fall through means <= 0 -> NULL.
+        let lim_ok = b.emit_label();
+        b.emit_jump_to_label(Opcode::IfPos, r_lim, 0, lim_ok, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+        b.resolve_label(lim_ok);
+        b.free_temp(r_lim);
+    }
+
+    let sorter_cursor = b.alloc_aux_cursor_range(1);
+    b.emit_op(
+        Opcode::SorterOpen,
+        sorter_cursor,
+        n_key as i32,
+        0,
+        P4::Str(dir),
+        0,
+    );
+
+    // Scan the subquery source, filter by WHERE, and insert
+    // [order_keys.., result_value] into the sorter.
+    let scan_done = b.emit_label();
+    let rewind_addr = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, scan_done, P4::None, 0);
+    let loop_body = (rewind_addr + 1) as i32;
+
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        let r_cond = b.alloc_temp();
+        emit_expr_with_fallback(b, where_expr, r_cond, sub_ctx, Some(outer_ctx));
+        b.emit_jump_to_label(Opcode::IfNot, r_cond, 1, skip_label, P4::None, 0);
+        b.free_temp(r_cond);
+    }
+
+    let rec_regs = b.alloc_regs((n_key + 1) as i32);
+    for (j, term) in subquery.order_by.iter().enumerate() {
+        emit_expr_with_fallback(b, &term.expr, rec_regs + j as i32, sub_ctx, Some(outer_ctx));
+    }
+    emit_scalar_subquery_result_value(b, columns, rec_regs + n_key as i32, sub_ctx, outer_ctx);
+    let rec_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        rec_regs,
+        (n_key + 1) as i32,
+        rec_reg,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::SorterInsert, sorter_cursor, rec_reg, 0, P4::None, 0);
+
+    b.resolve_label(skip_label);
+    b.emit_op(Opcode::Next, sub_cursor, loop_body, 0, P4::None, 0);
+    b.resolve_label(scan_done);
+
+    // Sort; SorterSort jumps to `close` when the sorter is empty (NULL stays).
+    let close_label = b.emit_label();
+    b.emit_jump_to_label(Opcode::SorterSort, sorter_cursor, 0, close_label, P4::None, 0);
+
+    // Skip OFFSET rows (default 0). IfPos decrements r_off and jumps to
+    // `advance` while positive; falling through means offset exhausted -> read.
+    if let Some(offset_expr) = subquery.limit.as_ref().and_then(|l| l.offset.as_ref()) {
+        let r_off = b.alloc_temp();
+        emit_expr(b, offset_expr, r_off, Some(outer_ctx));
+        let skip_check = b.emit_label();
+        let advance = b.emit_label();
+        let read = b.emit_label();
+        b.resolve_label(skip_check);
+        b.emit_jump_to_label(Opcode::IfPos, r_off, 1, advance, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, read, P4::None, 0);
+        b.resolve_label(advance);
+        // SorterNext jumps to skip_check when another row exists; otherwise the
+        // sorter is exhausted mid-skip and the result stays NULL.
+        b.emit_jump_to_label(Opcode::SorterNext, sorter_cursor, 0, skip_check, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, close_label, P4::None, 0);
+        b.resolve_label(read);
+        b.free_temp(r_off);
+    }
+
+    // Materialize the current sorter record, then read the result value (the
+    // final field, at index n_key) into `reg`.
+    let scratch = b.alloc_reg();
+    b.emit_op(Opcode::SorterData, sorter_cursor, scratch, 0, P4::None, 0);
+    b.emit_op(Opcode::Column, sorter_cursor, n_key as i32, reg, P4::None, 0);
+
+    b.resolve_label(close_label);
+    b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
 }
 
 fn emit_scalar_count_star_subquery(
