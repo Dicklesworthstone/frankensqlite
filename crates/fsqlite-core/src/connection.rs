@@ -13183,6 +13183,11 @@ impl Connection {
 
     /// Export the current database as a self-contained SQLite database image.
     pub async fn export_bytes(&self) -> Result<Vec<u8>> {
+        // bd-wymdl gap 2: a dropped transaction wrapper's deferred rollback
+        // must run before image capture — otherwise the export quiesce either
+        // observes the stale open transaction or stays Busy until an
+        // unrelated SQL entrypoint happens to settle it.
+        self.settle_pending_transaction_cleanup().await?;
         let cx = self.op_cx()?;
         self.quiesce_pager_export_state(&cx).await?;
         self.pager.export_bytes(&cx).await
@@ -22045,17 +22050,25 @@ impl Connection {
     /// rollback cannot wedge the connection into retrying it forever; the
     /// error surfaces to the caller of whichever statement discharged it.
     async fn settle_pending_transaction_cleanup(&self) -> Result<()> {
-        if !self.pending_transaction_cleanup.replace(false) {
+        if !self.pending_transaction_cleanup.get() {
             return Ok(());
         }
         // An explicit commit/rollback may already have closed it, or the
         // wrapper may have been dropped after finalizing.
         if !self.in_transaction() {
+            self.pending_transaction_cleanup.set(false);
             return Ok(());
         }
         let cx = self.op_cx_after_background_status();
+        // bd-wymdl gap 2 (RusticBasin audit): clear the obligation only AFTER
+        // the rollback succeeds. The previous clear-first ordering silently
+        // dropped it when the rollback failed, letting later SQL run inside a
+        // half-rolled-back transaction. A failed settle now stays pending, so
+        // every subsequent entrypoint fails closed until a rollback succeeds.
         self.execute_rollback_with_cx(&cx, &fsqlite_ast::RollbackStatement { to_savepoint: None })
-            .await
+            .await?;
+        self.pending_transaction_cleanup.set(false);
+        Ok(())
     }
 
     /// Prepare and execute SQL with bound SQL parameters.
@@ -22097,6 +22110,12 @@ impl Connection {
         parameter_sets: &[Vec<SqliteValue>],
     ) -> Result<usize> {
         self.background_status()?;
+        // bd-wymdl gap 2: this route bypasses the public prepare()/execute()
+        // settle points (it calls the *_after_background_status internals
+        // directly). A dropped wrapper's transaction must be rolled back
+        // first; the explicit-transaction requirement below then correctly
+        // fails closed instead of batching into the stale transaction.
+        self.settle_pending_transaction_cleanup().await?;
         if !self.in_transaction() {
             return Err(FrankenError::internal(
                 "batched parameter execution requires an explicit transaction",
@@ -64983,6 +65002,11 @@ impl Connection {
                     .to_owned(),
             ));
         }
+        // bd-wymdl gap 2: settle a dropped wrapper's deferred rollback first —
+        // its stale open transaction would otherwise trip the autocommit
+        // requirement below (and the registration snapshot must not bind
+        // inside a half-rolled-back transaction).
+        self.settle_pending_transaction_cleanup().await?;
         if self.in_transaction.get() {
             return Err(FrankenError::NotImplemented(
                 "differential subscribers currently require autocommit mode".to_owned(),
@@ -164796,6 +164820,74 @@ mod tests {
                 .unwrap();
             assert_eq!(rows.len(), 2);
             assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(10));
+        });
+    }
+
+    /// bd-wymdl gap 2: entrypoints that bypass the public SQL surface must
+    /// still settle a dropped transaction wrapper's deferred rollback, and
+    /// the obligation must survive until a rollback actually succeeds.
+    #[test]
+    fn test_deferred_transaction_cleanup_covers_bypass_entrypoints() {
+        asupersync::test_utils::run_test(|| async {
+            // export_bytes: settles the dropped wrapper's txn, then exports.
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(v INTEGER);").await.unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            conn.mark_transaction_cleanup_required();
+            let bytes = conn
+                .export_bytes()
+                .await
+                .expect("export must settle the dropped wrapper and proceed");
+            assert!(!bytes.is_empty());
+            assert!(
+                !conn.in_transaction(),
+                "export_bytes must have rolled the stale transaction back"
+            );
+            let rows = conn.query("SELECT COUNT(*) FROM t;").await.unwrap();
+            assert!(
+                matches!(row_values(&rows[0])[0], SqliteValue::Integer(0)),
+                "the dropped wrapper's uncommitted INSERT must be rolled back"
+            );
+
+            // Batched skip-savepoint execution: fail closed (the stale txn is
+            // rolled back first, so the explicit-transaction requirement
+            // rejects) instead of batching into the dropped wrapper's txn.
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(v INTEGER);").await.unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.mark_transaction_cleanup_required();
+            let result = conn
+                .execute_many_with_params_skip_statement_savepoint_in_explicit_txn(
+                    "INSERT INTO t VALUES (?1);",
+                    &[vec![SqliteValue::Integer(7)]],
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "batched execution must not run inside a dropped wrapper's transaction"
+            );
+            assert!(!conn.in_transaction(), "stale transaction must be settled");
+
+            // Differential subscriber registration: the stale txn must not
+            // trip the autocommit requirement.
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA fsqlite_differential_views = ON;")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, v INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("CREATE VIEW v_items AS SELECT id, v FROM items;")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.mark_transaction_cleanup_required();
+            let (tx, _rx) = std::sync::mpsc::channel();
+            conn.register_differential_view_subscriber("v_items", tx)
+                .await
+                .expect("registration must settle the dropped wrapper, not refuse on its txn");
+            assert!(!conn.in_transaction());
         });
     }
 
