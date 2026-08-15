@@ -27,10 +27,10 @@ const SEED: &[&str] = &[
 
 // (sql, must_be_rejected)
 const CASES: &[(&str, bool)] = &[
-    ("UPDATE t SET s = 99", true),        // STORED generated
-    ("UPDATE t SET v = 99", true),        // VIRTUAL generated
+    ("UPDATE t SET s = 99", true),         // STORED generated
+    ("UPDATE t SET v = 99", true),         // VIRTUAL generated
     ("UPDATE t SET a = 5, s = 100", true), // mixed ordinary + generated
-    ("UPDATE t SET a = 5", false),        // ordinary column only — allowed
+    ("UPDATE t SET a = 5", false),         // ordinary column only — allowed
 ];
 
 fn oracle_rejects(sql: &str) -> bool {
@@ -47,23 +47,43 @@ async fn open_seeded(path: Option<&std::path::Path>) -> Connection {
         None => Connection::open(":memory:").await.unwrap(),
     };
     for s in SEED {
-        conn.execute(s).await.unwrap_or_else(|e| panic!("seed `{s}`: {e:?}"));
+        conn.execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("seed `{s}`: {e:?}"));
     }
     conn
 }
 
-#[ignore = "bd-gh-generated-column-update-target: KNOWN-RED anchor — the general-path guard landed (fea1ba8a8) but the :memory: precompiled fast lane (execute_precompiled_prepared_update_or_delete) is still unguarded; needs the check at the UPDATE prepare/compile gate. See module doc."]
 #[test]
 fn update_generated_column_matches_rusqlite_oracle() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
         for (case_i, (sql, must_reject)) in CASES.iter().enumerate() {
-            assert_eq!(oracle_rejects(sql), *must_reject, "oracle premise for `{sql}`");
+            assert_eq!(
+                oracle_rejects(sql),
+                *must_reject,
+                "oracle premise for `{sql}`"
+            );
 
             // Both the interpreted (:memory:) and compiled (file-backed) lanes.
             let file_path = dir.path().join(format!("case{case_i}.db"));
             for path in [None, Some(file_path.as_path())] {
                 let conn = open_seeded(path).await;
+                // bd-gh-generated-column-update-target-4r7kw: the PREPARED
+                // lane is the historically unguarded surface (the :memory:
+                // precompiled program bypasses the execute-path guard) — a
+                // generated-column target must now fail at prepare(), like
+                // stock's prepare-time "cannot UPDATE generated column".
+                let prepared = conn.prepare(sql).await;
+                if *must_reject {
+                    assert!(
+                        prepared.is_err(),
+                        "`{sql}` must be rejected at prepare, path={path:?}"
+                    );
+                } else {
+                    prepared
+                        .unwrap_or_else(|e| panic!("`{sql}` must prepare, path={path:?}: {e:?}"));
+                }
                 let result = conn.execute(sql).await;
                 if *must_reject {
                     assert!(
