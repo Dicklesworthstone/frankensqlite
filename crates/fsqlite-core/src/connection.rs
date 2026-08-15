@@ -51570,6 +51570,19 @@ impl Connection {
             else {
                 return Ok(());
             };
+            // GH #186: an INSERT OR IGNORE conflict allocates (burns) an
+            // AUTOINCREMENT rowid via NewRowid but inserts no row, so the
+            // stored-row scan misses it. The just-executed engine (parked in
+            // `cached_vdbe_engine` until the next program resets it) recorded the
+            // allocated high-water; fold it in so sqlite_sequence advances past
+            // the burned rowid, matching stock sqlite3. The borrow is copied out
+            // immediately so nothing is held across the await below.
+            let allocated_hw = self
+                .cached_vdbe_engine
+                .borrow()
+                .as_ref()
+                .and_then(|engine| engine.autoinc_alloc_high_water().get(&root_page).copied())
+                .unwrap_or(0);
             let max_rowid = self.table_max_rowid_in_txn(cx, txn, root_page).await?;
             let key = table_name.to_ascii_lowercase();
             let current_seq = self
@@ -51578,7 +51591,7 @@ impl Connection {
                 .get(&key)
                 .copied()
                 .unwrap_or(0);
-            let new_seq = current_seq.max(max_rowid);
+            let new_seq = current_seq.max(max_rowid).max(allocated_hw);
             if new_seq > current_seq {
                 self.upsert_sqlite_sequence_in_txn(cx, txn, table_name, new_seq)
                     .await?;

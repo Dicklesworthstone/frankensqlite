@@ -43,14 +43,6 @@ async fn run_both(fconn: &Connection, rconn: &rusqlite::Connection, stmts: &[&st
 }
 
 #[test]
-#[ignore = "bd-gh-autoincrement-sequence (GH #186): an INSERT OR IGNORE conflict allocates an \
-AUTOINCREMENT rowid (NewRowid, burning it) but inserts nothing, so the connection's sequence \
-write-back — which only sees affected=0 / last_insert_rowid / table_max_rowid_in_txn — never \
-records the burned rowid and sqlite_sequence does not advance. Fix map: capture the max allocated \
-AUTOINCREMENT rowid program-scoped in the VDBE engine's NewRowid handler (engine.rs ~10504, \
-RowIdMode::AutoIncrement, keyed by root_page), expose it like last_insert_rowid, surface it through \
-execute_table_program_with_db (connection.rs ~111474/111680), and have \
-refresh_autoincrement_sequence_after_insert use max(current, allocated_high_water). Un-ignore then."]
 fn autoincrement_or_ignore_advances_seq_gh186() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();

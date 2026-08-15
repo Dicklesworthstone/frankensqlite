@@ -6241,6 +6241,12 @@ pub struct VdbeEngine {
     last_insert_rowid: i64,
     /// Whether this execution recorded a real last-insert rowid.
     last_insert_rowid_valid: bool,
+    /// GH #186: the highest AUTOINCREMENT rowid ALLOCATED (via `NewRowid`) per
+    /// table root page during this execution, even for a row that a later
+    /// `INSERT OR IGNORE` conflict discards. `sqlite_sequence` must advance to
+    /// this high-water (stock sqlite3 burns the allocated rowid), which the
+    /// inserted-row scan alone cannot observe.
+    autoinc_alloc_high_water: BTreeMap<i32, i64>,
     /// Cursor ID used by the last Insert opcode (for conflict resolution in
     /// `IdxInsert`: allows the index handler to undo or replace the table row).
     last_insert_cursor_id: Option<i32>,
@@ -6797,6 +6803,7 @@ impl VdbeEngine {
             replace_victims: Vec::new(),
             last_insert_rowid: 0,
             last_insert_rowid_valid: false,
+            autoinc_alloc_high_water: BTreeMap::new(),
             last_insert_cursor_id: None,
             fk_counter: 0,
             autoincrement_seq_by_root_page: HashMap::new(),
@@ -7029,6 +7036,7 @@ impl VdbeEngine {
         self.replace_victims.clear();
         self.last_insert_rowid = 0;
         self.last_insert_rowid_valid = false;
+        self.autoinc_alloc_high_water.clear();
         self.last_insert_cursor_id = None;
         self.fk_counter = 0;
         if !preserve_runtime_setup {
@@ -7319,6 +7327,14 @@ impl VdbeEngine {
     pub fn last_insert_rowid(&self) -> Option<i64> {
         self.last_insert_rowid_valid
             .then_some(self.last_insert_rowid)
+    }
+
+    /// GH #186: highest AUTOINCREMENT rowid allocated during this execution per
+    /// table root page (including rowids burned by an `INSERT OR IGNORE`
+    /// conflict). Empty when no AUTOINCREMENT rowid was allocated.
+    #[must_use]
+    pub fn autoinc_alloc_high_water(&self) -> &BTreeMap<i32, i64> {
+        &self.autoinc_alloc_high_water
     }
 
     /// Enable or disable `OP_ResultRow` materialization.
@@ -10499,10 +10515,18 @@ impl VdbeEngine {
                         None
                     };
                     let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
+                    // GH #186: capture the AUTOINCREMENT table's root page so the
+                    // allocated rowid can be folded into the program-scoped
+                    // high-water AFTER the `sc` borrow ends (sqlite_sequence must
+                    // advance even when a later OR IGNORE discards the row).
+                    let mut new_autoinc_root: Option<i32> = None;
                     let rowid = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         let root_page = sc.root_page;
                         let autoinc_max = sc.autoincrement_high_water;
                         let rowid_mode = sc.rowid_mode;
+                        if matches!(rowid_mode, RowIdMode::AutoIncrement) {
+                            new_autoinc_root = Some(root_page);
+                        }
                         // Storage NewRowid probes max rowid via `last()`, which
                         // repositions the cursor. Clear any pending delete/next
                         // state so subsequent Next/Prev behavior is consistent
@@ -10554,6 +10578,13 @@ impl VdbeEngine {
                         }
                     };
                     self.set_reg(target, SqliteValue::Integer(rowid));
+                    // GH #186: fold the allocated AUTOINCREMENT rowid into the
+                    // program-scoped high-water so sqlite_sequence advances to it
+                    // even if the ensuing insert is discarded by OR IGNORE.
+                    if let Some(root) = new_autoinc_root {
+                        let entry = self.autoinc_alloc_high_water.entry(root).or_insert(0);
+                        *entry = (*entry).max(rowid);
+                    }
                     pc += 1;
                 }
 
