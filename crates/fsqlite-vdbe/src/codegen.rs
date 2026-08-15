@@ -14480,6 +14480,13 @@ fn emit_aggregate_accumulate_body(
     schema: &[TableSchema],
     agg_columns: &[AggColumn],
     accum_base: i32,
+    // GH #226: register holding 0 until the first scanned row's bare columns
+    // have been captured, then 1. Gates row-dependent bare-column stores so an
+    // aggregate query's bare column keeps the FIRST scanned row (matching stock
+    // sqlite3) instead of the last. Allocated + zeroed once in the caller's
+    // shared preamble (before any scan strategy), so a single init serves every
+    // scan path.
+    first_row_flag: i32,
 ) {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for (i, agg) in agg_columns.iter().enumerate() {
@@ -14489,7 +14496,7 @@ fn emit_aggregate_accumulate_body(
         }
         let accum_reg = accum_base + i as i32;
 
-        // Bare (non-aggregate) column: evaluate expression on each row
+        // Bare (non-aggregate) column: evaluate expression on the FIRST row only
         // and store in the accumulator register.  No AggStep needed.
         if let Some(ref bare) = agg.bare_expr {
             // Row-independent scalars belong to the aggregate output row, not
@@ -14506,7 +14513,11 @@ fn emit_aggregate_accumulate_body(
                 register_base: None,
                 secondaries: &[],
             };
+            // GH #226: capture the first scanned row's value; skip on later rows.
+            let skip_bare = b.emit_label();
+            b.emit_jump_to_label(Opcode::If, first_row_flag, 0, skip_bare, P4::None, 0);
             emit_expr(b, bare, accum_reg, Some(&scan_ctx));
+            b.resolve_label(skip_bare);
             continue;
         }
 
@@ -14609,6 +14620,9 @@ fn emit_aggregate_accumulate_body(
             b.resolve_label(skip_lbl);
         }
     }
+    // GH #226: after the first scanned row's bare columns are captured, mark the
+    // flag so subsequent rows skip the bare-column store (idempotent each row).
+    b.emit_op(Opcode::Integer, 1, first_row_flag, 0, P4::None, 0);
 }
 
 /// The index a `WHERE <equality-prefix>` aggregate can seek instead of scanning.
@@ -15165,6 +15179,9 @@ fn emit_aggregate_index_value_seek(
     schema: &[TableSchema],
     agg_columns: &[AggColumn],
     accum_base: i32,
+    // GH #226: forwarded to emit_aggregate_accumulate_body so a bare column
+    // keeps the first scanned row on this index-value-seek scan path too.
+    first_row_flag: i32,
     value: i64,
     covering: bool,
     residual_where: Option<&Expr>,
@@ -15259,6 +15276,7 @@ fn emit_aggregate_index_value_seek(
             schema,
             agg_columns,
             accum_base,
+            first_row_flag,
         );
         b.resolve_label(skip_row);
     }
@@ -15496,6 +15514,13 @@ fn codegen_select_aggregate(
     for i in 0..total_agg_count {
         b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
     }
+
+    // GH #226: a shared first-row flag for bare-column capture. Zeroed here in
+    // the single preamble that precedes every scan strategy, so all
+    // emit_aggregate_accumulate_body call sites gate on the same register and
+    // the bare column keeps the FIRST scanned row (stock sqlite3), not the last.
+    let first_row_flag = b.alloc_reg();
+    b.emit_op(Opcode::Integer, 0, first_row_flag, 0, P4::None, 0);
 
     // bd-2dgf5: indexed-equality seek instead of a full table scan.
     //
@@ -15855,6 +15880,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
+                first_row_flag,
             );
         }
 
@@ -15925,6 +15951,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
+            first_row_flag,
         );
         skip_scan = true;
     } else if let Some((range, has_residual)) = rowid_range_seek {
@@ -16017,6 +16044,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
+            first_row_flag,
         );
         b.resolve_label(range_skip_label);
         b.emit_op(Opcode::Next, cursor, range_loop_top, 0, P4::None, 0);
@@ -16058,6 +16086,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
+                first_row_flag,
                 value,
                 covering,
                 residual_where,
@@ -16242,6 +16271,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
+                first_row_flag,
             );
         }
 
@@ -16458,6 +16488,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
+                first_row_flag,
             );
         }
 
@@ -16573,6 +16604,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
+            first_row_flag,
         );
 
         b.resolve_label(skip_label);
@@ -16632,6 +16664,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
+                first_row_flag,
             );
             b.resolve_label(skip_label);
         }
@@ -16677,6 +16710,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
+            first_row_flag,
         );
         skip_scan = true;
     }
@@ -16719,6 +16753,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
+            first_row_flag,
         );
 
         // Skip label for WHERE-filtered rows.
