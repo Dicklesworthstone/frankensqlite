@@ -2645,6 +2645,46 @@ mod tests {
     }
 
     #[test]
+    fn utf16_decoded_text_compares_by_code_point_regardless_of_storage_encoding() {
+        // bd-bld9w.4 COMPARE+COLLATE: TEXT comparison must operate on decoded
+        // code points regardless of storage encoding, so `=` / `<` / ORDER BY
+        // match sqlite3 on a UTF-16 database. from_record_text_bytes decodes
+        // UTF-16LE/BE to a canonical UTF-8 SmallText, so Ord::cmp (via
+        // as_str_checked) — which is also what BINARY collation reduces to on
+        // valid UTF-8 — yields the same code-point ordering as the UTF-8 form.
+        // Mixed ASCII/Latin-1/CJK/astral samples exercise 1..=4 UTF-8 byte
+        // widths and cross the surrogate boundary.
+        let samples = [
+            "", "A", "Apple", "apple", "banana", "café", "cafz", "z", "Καλημέρα", "日本", "日本語",
+            "😀", "😀grin",
+        ];
+        for a in samples {
+            for b in samples {
+                let expected = SmallText::new(a).cmp(&SmallText::new(b));
+                for (enc, le) in [
+                    (TextEncoding::Utf16le, true),
+                    (TextEncoding::Utf16be, false),
+                ] {
+                    let da = SmallText::from_record_text_bytes(&utf16_record_bytes(a, le), enc);
+                    let db = SmallText::from_record_text_bytes(&utf16_record_bytes(b, le), enc);
+                    assert_eq!(
+                        da.cmp(&db),
+                        expected,
+                        "bd-bld9w.4 {enc:?}: cmp({a:?}, {b:?}) must equal code-point order"
+                    );
+                    // A decoded UTF-16 value is byte-for-byte its UTF-8 twin, so
+                    // it compares Equal to the value stored in a UTF-8 database.
+                    assert_eq!(
+                        da.cmp(&SmallText::new(a)),
+                        std::cmp::Ordering::Equal,
+                        "bd-bld9w.4 {enc:?}: decoded {a:?} must equal its UTF-8 form"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn to_record_text_bytes_round_trips_from_record_text_bytes() {
         for text in ["", "table", "café", "日本語 mix", "😀 grin 🎉"] {
             for encoding in [
