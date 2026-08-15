@@ -438,6 +438,29 @@ fn pragma_dispatch_attempts() -> u64 {
     FSQLITE_PRAGMA_DISPATCH_ATTEMPTS.get()
 }
 
+// Test-only settle-rollback fault injection for the bd-wymdl gap-2 residual.
+//
+// Models a deferred abandoned-transaction rollback that does NOT succeed, so
+// the counterkeeper can prove the obligation stays pending (fail closed)
+// instead of being cleared — the failure half of
+// `settle_pending_transaction_cleanup`'s contract that the happy-path keeper
+// does not exercise. Mirrors the bd-tc8u7 PRAGMA-dispatch hook above.
+#[cfg(test)]
+std::thread_local! {
+    static FSQLITE_SETTLE_ROLLBACK_ERROR_ONCE: RefCell<Option<FrankenError>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_settle_rollback_error_once(error: FrankenError) {
+    FSQLITE_SETTLE_ROLLBACK_ERROR_ONCE.with_borrow_mut(|slot| *slot = Some(error));
+}
+
+#[cfg(test)]
+fn take_settle_rollback_error_once() -> Option<FrankenError> {
+    FSQLITE_SETTLE_ROLLBACK_ERROR_ONCE.with_borrow_mut(Option::take)
+}
+
 /// Maximum trigger recursion depth (F-PGM.11).
 ///
 /// SQLite defines `SQLITE_MAX_TRIGGER_DEPTH = 1000`, but each Rust recursion
@@ -22183,6 +22206,15 @@ impl Connection {
         // dropped it when the rollback failed, letting later SQL run inside a
         // half-rolled-back transaction. A failed settle now stays pending, so
         // every subsequent entrypoint fails closed until a rollback succeeds.
+        //
+        // Test-only fault injection (bd-wymdl gap-2 residual): model a rollback
+        // that does not succeed. Returning before the flag is cleared leaves the
+        // obligation pending and surfaces the error to the caller — precisely
+        // the fail-closed contract the happy-path keeper cannot exercise.
+        #[cfg(test)]
+        if let Some(injected) = take_settle_rollback_error_once() {
+            return Err(injected);
+        }
         self.execute_rollback_with_cx(&cx, &fsqlite_ast::RollbackStatement { to_savepoint: None })
             .await?;
         self.pending_transaction_cleanup.set(false);
@@ -129640,7 +129672,8 @@ mod tests {
         MAX_TRIGGER_DEPTH, MAX_TRIGGER_PROGRAM_DEPTH, PagerBackend, PagerPublishedSnapshot,
         PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState,
         SimplePager, Snapshot, TriggerDepthLimitOverrideGuard, TriggerFrame, TriggerFrameGuard,
-        arm_trigger_stack_probe, attached_schema_key, bind_placeholders_in_select_for_fallback,
+        arm_settle_rollback_error_once, arm_trigger_stack_probe, attached_schema_key,
+        bind_placeholders_in_select_for_fallback,
         build_canonical_hash_join_key, canonical_hash_join_value, canonicalize_select_placeholders,
         cmp_values_with_comparison_affinity, implicit_autoindex_layout, init_global_runtime,
         is_correlated_subquery, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
@@ -165428,6 +165461,64 @@ mod tests {
                 .await
                 .expect("registration must settle the dropped wrapper, not refuse on its txn");
             assert!(!conn.in_transaction());
+        });
+    }
+
+    /// bd-wymdl gap-2 residual: the fail-closed half of the deferred
+    /// abandoned-transaction cleanup contract. A settle whose rollback FAILS
+    /// must keep the obligation PENDING (not clear it), so the failing statement
+    /// fails closed and a later statement re-attempts the rollback instead of
+    /// running inside a half-rolled-back transaction. The happy-path keeper
+    /// `test_deferred_transaction_cleanup_covers_bypass_entrypoints` proves only
+    /// the success ordering; this proves the failure ordering that a12a4a9fe's
+    /// clear-after-success reorder exists to guarantee.
+    #[test]
+    fn test_deferred_transaction_cleanup_stays_pending_on_rollback_failure() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(v INTEGER);").await.unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            conn.mark_transaction_cleanup_required();
+
+            // Arm one deferred-rollback failure for the next settle.
+            arm_settle_rollback_error_once(FrankenError::internal(
+                "injected settle rollback failure",
+            ));
+
+            // The next entrypoint discharges the obligation first; the injected
+            // rollback failure must surface AND leave the obligation pending,
+            // with the abandoned transaction still open.
+            let failed = conn.query("SELECT COUNT(*) FROM t;").await;
+            assert!(
+                failed.is_err(),
+                "a failed settle rollback must fail the statement closed"
+            );
+            assert!(
+                conn.pending_transaction_cleanup.get(),
+                "a failed settle must keep the obligation pending, not clear it"
+            );
+            assert!(
+                conn.in_transaction(),
+                "the transaction stays open when its rollback did not succeed"
+            );
+
+            // A subsequent entrypoint (no fault armed) re-attempts settle, which
+            // now succeeds: the obligation discharges and the abandoned INSERT is
+            // rolled back.
+            let rows = conn
+                .query("SELECT COUNT(*) FROM t;")
+                .await
+                .expect("the next statement settles cleanly once the rollback succeeds");
+            assert!(
+                !conn.pending_transaction_cleanup.get(),
+                "the obligation must discharge after a successful settle"
+            );
+            assert!(!conn.in_transaction());
+            assert!(
+                matches!(row_values(&rows[0])[0], SqliteValue::Integer(0)),
+                "the abandoned INSERT must be rolled back once settle succeeds"
+            );
         });
     }
 
