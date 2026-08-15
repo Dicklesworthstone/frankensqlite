@@ -83,7 +83,6 @@ fn deferred_on_delete_no_action_delete_without_reinsert_errors_at_commit() {
 // guards. Ignored until that mechanism lands. (Before the fix this UPDATE also
 // errored — immediately, at the UPDATE — so this is no regression.)
 #[test]
-#[ignore = "re-pointing needs commit-time re-query, not a defer-time snapshot (bd-gh-deferred-fk-parent-dml follow-up)"]
 fn deferred_on_update_no_action_reparent_children_commits() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();

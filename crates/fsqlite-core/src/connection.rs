@@ -56163,10 +56163,98 @@ impl Connection {
         let _force_immediate_guard =
             BoolCellRestoreGuard::new(&self.fk_force_immediate_check, true);
         for (table_name, row_values) in pending_guard.pending() {
-            self.check_fk_parent_exists(table_name, row_values).await?;
+            self.recheck_deferred_obligation(table_name, row_values).await?;
         }
         pending_guard.discharge();
         Ok(())
+    }
+
+    /// Recheck a single deferred FK obligation against the child row's CURRENT
+    /// state (GH #149 / GH #161).
+    ///
+    /// The obligation is queued as a SNAPSHOT of the child row at mutation time.
+    /// Between then and COMMIT the child may have been re-pointed to a different
+    /// (valid) parent, deleted, or had its own key changed — in which case
+    /// rechecking the stale snapshot yields a false `ForeignKeyViolation`. When
+    /// the child table has a usable identity (an INTEGER PRIMARY KEY rowid alias
+    /// or a declared PRIMARY KEY), re-read the row by that identity and validate
+    /// its present foreign keys instead: a child that no longer exists carries no
+    /// obligation, a re-pointed child validates against its new parent, and a
+    /// genuinely-orphaned child still errors. Tables without a usable identity
+    /// fall back to the snapshot recheck (unchanged prior behavior).
+    async fn recheck_deferred_obligation(
+        &self,
+        table_name: &str,
+        snapshot: &[SqliteValue],
+    ) -> Result<()> {
+        let identity = {
+            let schema = self.schema.borrow();
+            match schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(table_name))
+            {
+                // The child table itself is gone — nothing left to violate.
+                None => return Ok(()),
+                Some(table) => Self::fk_child_identity_predicate(table, snapshot),
+            }
+        };
+        let Some((where_sql, id_values)) = identity else {
+            // No usable identity: preserve the prior snapshot-based recheck.
+            return self.check_fk_parent_exists(table_name, snapshot).await;
+        };
+        let sql = format!(
+            "SELECT * FROM {} WHERE {}",
+            quote_identifier(table_name),
+            where_sql
+        );
+        let current = self.fk_validation_query(&sql, &id_values).await?;
+        match current.into_iter().next() {
+            // The child row was deleted (or its identity changed) before COMMIT
+            // — its deferred obligation is discharged.
+            None => Ok(()),
+            Some(row) => {
+                self.check_fk_parent_exists(table_name, &row.values().to_vec())
+                    .await
+            }
+        }
+    }
+
+    /// Build an identity predicate `col = ?n AND ...` (plus the matching values)
+    /// that uniquely selects the child row `snapshot` came from, using the
+    /// table's INTEGER PRIMARY KEY rowid alias or declared PRIMARY KEY. Returns
+    /// `None` when the table exposes no such identity or an identity component
+    /// is NULL (which cannot uniquely match), so the caller falls back to the
+    /// snapshot recheck.
+    fn fk_child_identity_predicate(
+        table: &TableSchema,
+        snapshot: &[SqliteValue],
+    ) -> Option<(String, Vec<SqliteValue>)> {
+        let mut id_cols: Vec<usize> = Vec::new();
+        if let Some(ipk) = table.columns.iter().position(|c| c.is_ipk) {
+            id_cols.push(ipk);
+        } else if let Some(pk_names) = table.primary_key_constraints.first() {
+            for name in pk_names {
+                id_cols.push(table.column_index(name)?);
+            }
+        }
+        if id_cols.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::with_capacity(id_cols.len());
+        let mut values = Vec::with_capacity(id_cols.len());
+        for (i, &ci) in id_cols.iter().enumerate() {
+            let value = snapshot.get(ci)?.clone();
+            if matches!(value, SqliteValue::Null) {
+                return None;
+            }
+            parts.push(format!(
+                "{} = ?{}",
+                quote_identifier(&table.columns[ci].name),
+                i + 1
+            ));
+            values.push(value);
+        }
+        Some((parts.join(" AND "), values))
     }
 
     /// Run internally row-replayed DML as one statement-end FK validation
