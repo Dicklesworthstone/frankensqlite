@@ -53002,6 +53002,23 @@ impl Connection {
                     .constraints
                     .iter()
                     .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
+                // ADD COLUMN back-fills existing rows, so a non-empty table
+                // constrains the default (the restriction is row-gated in C
+                // SQLite — an empty table accepts any default).
+                let add_column_table_has_rows = {
+                    let schema = self.schema.borrow();
+                    let root_page = schema
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                        .map(|t| t.root_page);
+                    drop(schema);
+                    root_page.is_some_and(|rp| {
+                        self.db
+                            .borrow()
+                            .get_table(rp)
+                            .is_some_and(|t| t.row_count() > 0)
+                    })
+                };
                 let default_value = col_def
                     .constraints
                     .iter()
@@ -53011,6 +53028,14 @@ impl Connection {
                     })
                     .map(|dv| -> Result<String> {
                         self.validate_default_value_is_constant(&col_def.name, dv)?;
+                        // On a non-empty table the back-filled default must be a
+                        // literal constant, not an expression/function/CURRENT_*
+                        // (bd-gh-alter-add-column-defaults).
+                        if add_column_table_has_rows && !add_column_default_is_literal_constant(dv) {
+                            return Err(FrankenError::FunctionError(
+                                "Cannot add a column with non-constant default".to_owned(),
+                            ));
+                        }
                         Ok(format_default_value(dv))
                     })
                     .transpose()?;
@@ -53055,21 +53080,7 @@ impl Connection {
                 // when there are existing rows to back-fill with NULL; on an
                 // empty table the column may be added (bd-nmt6h).
                 if notnull && default_value.is_none() {
-                    let table_has_rows = {
-                        let schema = self.schema.borrow();
-                        let root_page = schema
-                            .iter()
-                            .find(|t| t.name.eq_ignore_ascii_case(table_name))
-                            .map(|t| t.root_page);
-                        drop(schema);
-                        root_page.is_some_and(|rp| {
-                            self.db
-                                .borrow()
-                                .get_table(rp)
-                                .is_some_and(|t| t.row_count() > 0)
-                        })
-                    };
-                    if table_has_rows {
+                    if add_column_table_has_rows {
                         // FunctionError renders the message verbatim (ErrorCode::Error,
                         // i.e. SQLITE_ERROR) rather than Internal's "internal error:"
                         // prefix / SQLITE_INTERNAL code.
@@ -108845,6 +108856,38 @@ fn type_affinity_to_char(affinity: TypeAffinity) -> char {
 }
 
 /// Format a `DefaultValue` AST node as SQL text for PRAGMA table_info output.
+/// Whether an ALTER TABLE ADD COLUMN default is a literal constant.
+///
+/// On a non-empty table, C SQLite requires the ADD COLUMN default to be a
+/// literal (or a signed number literal) — not an expression, function call, or
+/// CURRENT_TIME/DATE/TIMESTAMP — because it back-fills existing rows with one
+/// evaluated value (bd-gh-alter-add-column-defaults, GH #231).
+fn add_column_default_is_literal_constant(dv: &DefaultValue) -> bool {
+    use fsqlite_ast::{Expr, Literal, UnaryOp};
+    let expr = match dv {
+        DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr) => expr,
+    };
+    let is_plain_literal = |lit: &Literal| {
+        !matches!(
+            lit,
+            Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp
+        )
+    };
+    match expr {
+        Expr::Literal(lit, _) => is_plain_literal(lit),
+        // A signed number literal, e.g. DEFAULT (-5) / DEFAULT (+5).
+        Expr::UnaryOp {
+            op: UnaryOp::Negate | UnaryOp::Plus,
+            expr: inner,
+            ..
+        } => matches!(
+            inner.as_ref(),
+            Expr::Literal(Literal::Integer(_) | Literal::Float(_), _)
+        ),
+        _ => false,
+    }
+}
+
 fn format_default_value(dv: &DefaultValue) -> String {
     match dv {
         DefaultValue::Expr(expr) => expr.to_string(),
