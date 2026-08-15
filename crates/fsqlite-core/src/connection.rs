@@ -5044,6 +5044,11 @@ fn pragma_table_function_columns(name: &str) -> Option<&'static [&'static str]> 
         Some(&PRAGMA_INDEX_XINFO_TVF_COLUMNS)
     } else if pragma.eq_ignore_ascii_case("foreign_key_list") {
         Some(&PRAGMA_FOREIGN_KEY_LIST_TVF_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("foreign_key_check") {
+        // GH #261: the table-valued `pragma_foreign_key_check([table])` form
+        // reuses the `PRAGMA foreign_key_check` violation-row generator through
+        // the generic TVF synthesis path.
+        Some(&PRAGMA_FOREIGN_KEY_CHECK_COLUMNS)
     } else if pragma.eq_ignore_ascii_case("database_list") {
         // No-argument pragma TVF: `SELECT * FROM pragma_database_list()` reuses
         // the PRAGMA database_list row generator (GH #213).
