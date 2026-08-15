@@ -454,6 +454,10 @@ fn add_vdbe_duration_if(enabled: bool, counter: &AtomicU64, started: Instant) {
 struct BtreeCursorPageLayout {
     usable_size: u32,
     page_size: u32,
+    /// DB text encoding read from the page-1 header (bd-bld9w). `Utf8` for
+    /// headerless synthetic pages, so the decode hot path stays byte-identical
+    /// for UTF-8 databases.
+    text_encoding: TextEncoding,
 }
 
 impl BtreeCursorPageLayout {
@@ -462,6 +466,7 @@ impl BtreeCursorPageLayout {
         Self {
             usable_size: page_size,
             page_size,
+            text_encoding: TextEncoding::Utf8,
         }
     }
 }
@@ -481,6 +486,7 @@ async fn btree_cursor_page_layout_from_page_one<P: PageReader>(
     Some(BtreeCursorPageLayout {
         usable_size,
         page_size: header.page_size.get(),
+        text_encoding: header.text_encoding,
     })
 }
 
@@ -15159,6 +15165,9 @@ impl VdbeEngine {
         let page_layout = BtreeCursorPageLayout {
             usable_size: old_sc.cursor.usable_size(),
             page_size: old_sc.cursor.page_size(),
+            // Time-travel reopen of an existing cursor: the database encoding is
+            // already established on the engine from the original open.
+            text_encoding: self.text_encoding,
         };
         let mut new_cursor = BtCursor::new_with_index_desc(
             tt_page_io,
@@ -16438,6 +16447,15 @@ impl VdbeEngine {
                     self.page_size,
                 )
                 .await;
+                // bd-bld9w: adopt this database's TEXT encoding from the page-1
+                // header so the Column decode hot path (which reads
+                // `self.text_encoding`) decodes UTF-16 TEXT correctly. `Utf8`
+                // for UTF-8 databases keeps the decode byte-identical, and
+                // headerless synthetic pages default to `Utf8`. Written to the
+                // field directly (not via `set_text_encoding`) because
+                // `self.txn_page_io` is mutably borrowed as `page_io` across
+                // this block, and a `&mut self` method call would overlap it.
+                self.text_encoding = page_layout.text_encoding;
 
                 if is_valid_btree {
                     // Real B-tree backed by pager: infer table-vs-index from the
