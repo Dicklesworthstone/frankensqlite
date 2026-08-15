@@ -128025,12 +128025,13 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             }
         }
         "iif" => {
-            if args.len() >= 3 {
-                if is_sqlite_truthy(&args[0]) {
-                    args[1].clone()
-                } else {
-                    args[2].clone()
-                }
+            // Two-argument iif(X,Y) is shorthand for iif(X,Y,NULL): a truthy X
+            // must still return Y, not NULL (bd-gh-iif-two-arg-arity). Mirror
+            // IifFunc::invoke.
+            if is_sqlite_truthy(&args[0]) {
+                args[1].clone()
+            } else if args.len() >= 3 {
+                args[2].clone()
             } else {
                 SqliteValue::Null
             }
