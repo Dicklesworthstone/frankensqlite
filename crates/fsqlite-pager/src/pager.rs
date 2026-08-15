@@ -20263,16 +20263,10 @@ where
                 // bytes (which republish a consumed freelist head). Advisory
                 // freshness here; the append gate fail-closes the residual
                 // promote→append window.
-                //
-                // bd-84rh4: this also runs for PUBLISHING batches (any page-1
-                // writer) so merge_preserve_publishing_batch_frees can preserve a
-                // peer's committed-free pages the publisher would otherwise erase.
-                // The non-publishing promote below still skips publishing batches,
-                // so its behavior is unchanged.
-                if batches
-                    .iter()
-                    .any(|batch| batch.frames.iter().any(|frame| frame.page_number == 1))
-                {
+                if batches.iter().any(|batch| {
+                    batch.published_durable_freelist.is_none()
+                        && batch.frames.iter().any(|frame| frame.page_number == 1)
+                }) {
                     let frame_page_size = batches
                         .iter()
                         .flat_map(|batch| batch.frames.iter())
