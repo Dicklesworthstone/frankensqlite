@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
@@ -368,6 +369,36 @@ impl SmallText {
                     .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
                     .collect();
                 Self::from_string(decoded)
+            }
+        }
+    }
+
+    /// Encode this TEXT value as record-payload bytes for a database using the
+    /// given text encoding (bd-bld9w.7) — the inverse of
+    /// [`Self::from_record_text_bytes`].
+    ///
+    /// UTF-8 returns the value's exact bytes without copying (byte-preserving,
+    /// including invalid UTF-8). UTF-16LE/BE encode the value's characters to
+    /// 16-bit code units in the requested byte order. Invalid-UTF-8 raw TEXT is
+    /// encoded from its lossy string form under UTF-16; byte-exact preservation
+    /// of such payloads is GH #180 / bd-bld9w.8.
+    #[must_use]
+    pub fn to_record_text_bytes(&self, encoding: TextEncoding) -> Cow<'_, [u8]> {
+        match encoding {
+            TextEncoding::Utf8 => Cow::Borrowed(self.as_bytes_direct()),
+            TextEncoding::Utf16le | TextEncoding::Utf16be => {
+                let little_endian = matches!(encoding, TextEncoding::Utf16le);
+                let text = self.as_str();
+                let mut bytes = Vec::with_capacity(text.len().saturating_mul(2));
+                for unit in text.encode_utf16() {
+                    let pair = if little_endian {
+                        unit.to_le_bytes()
+                    } else {
+                        unit.to_be_bytes()
+                    };
+                    bytes.extend_from_slice(&pair);
+                }
+                Cow::Owned(bytes)
             }
         }
     }
@@ -2590,6 +2621,32 @@ mod tests {
             SmallText::from_record_text_bytes(&bytes, TextEncoding::Utf16le).as_str(),
             "\u{FFFD}"
         );
+    }
+
+    #[test]
+    fn to_record_text_bytes_round_trips_from_record_text_bytes() {
+        for text in ["", "table", "café", "日本語 mix", "😀 grin 🎉"] {
+            for encoding in [
+                TextEncoding::Utf8,
+                TextEncoding::Utf16le,
+                TextEncoding::Utf16be,
+            ] {
+                let value = SmallText::new(text);
+                let encoded = value.to_record_text_bytes(encoding);
+                let decoded = SmallText::from_record_text_bytes(&encoded, encoding);
+                assert_eq!(decoded.as_str(), text, "round-trip {text:?} via {encoding:?}");
+            }
+        }
+        // UTF-8 encoding is zero-copy (borrows the value's exact bytes).
+        let value = SmallText::new("borrow me");
+        assert!(matches!(
+            value.to_record_text_bytes(TextEncoding::Utf8),
+            Cow::Borrowed(_)
+        ));
+        // UTF-16LE of ASCII "table" is the interleaved-NUL form.
+        let table = SmallText::new("table");
+        let le = table.to_record_text_bytes(TextEncoding::Utf16le);
+        assert_eq!(&*le, &[b't', 0, b'a', 0, b'b', 0, b'l', 0, b'e', 0][..]);
     }
 
     #[test]
