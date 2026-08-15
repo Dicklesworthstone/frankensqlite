@@ -1572,6 +1572,75 @@ where
     serialize_record_iter_into_impl(values, buf);
 }
 
+/// Iterator form of [`serialize_record_with_encoding`] writing into a reusable
+/// buffer (bd-bld9w.7) — the write-side inverse of
+/// [`parse_record_into_with_encoding`] for the `MakeRecord` hot path.
+///
+/// [`TextEncoding::Utf8`] delegates to [`serialize_record_iter_into`]
+/// byte-for-byte (zero cost on the UTF-8 write hot path). For UTF-16LE/BE, TEXT
+/// columns are encoded to UTF-16 record bytes via
+/// [`SmallText::to_record_text_bytes`] and their serial types use the *encoded*
+/// byte length; each TEXT payload is encoded exactly once (cached between the
+/// header-sizing and body-writing passes). The precomputed-header and
+/// integer-SIMD fast paths are deliberately bypassed for UTF-16 because their
+/// serial types are computed from the UTF-8 byte layout.
+pub fn serialize_record_iter_into_with_encoding<'a, I>(
+    values: I,
+    encoding: TextEncoding,
+    buf: &mut Vec<u8>,
+) where
+    I: Iterator<Item = &'a SqliteValue> + Clone,
+{
+    if matches!(encoding, TextEncoding::Utf8) {
+        serialize_record_iter_into_impl(values, buf);
+        return;
+    }
+
+    let mut header_content_size = 0usize;
+    let mut body_size = 0usize;
+    let mut serial_types: SmallVec<[u64; 16]> = SmallVec::new();
+    // Cache each TEXT column's UTF-16 payload so it is encoded exactly once.
+    let mut encoded_text: SmallVec<[Option<Cow<'a, [u8]>>; 16]> = SmallVec::new();
+
+    for value in values.clone() {
+        if let SqliteValue::Text(text) = value {
+            let bytes = text.to_record_text_bytes(encoding);
+            let len = bytes.len();
+            let serial_type = serial_type_for_text(u64::try_from(len).unwrap_or(u64::MAX));
+            header_content_size += varint_len(serial_type);
+            body_size += len;
+            serial_types.push(serial_type);
+            encoded_text.push(Some(bytes));
+        } else {
+            let (serial_type, payload_len) = serialized_value_layout(value);
+            header_content_size += varint_len(serial_type);
+            body_size += payload_len;
+            serial_types.push(serial_type);
+            encoded_text.push(None);
+        }
+    }
+
+    let header_size = compute_header_size(header_content_size);
+    buf.clear();
+    buf.reserve(header_size + body_size);
+    buf.resize(header_size, 0);
+    let mut header_offset =
+        write_varint(buf.as_mut_slice(), u64::try_from(header_size).unwrap_or(u64::MAX));
+    for serial_type in &serial_types {
+        header_offset += write_varint(&mut buf[header_offset..], *serial_type);
+    }
+    debug_assert_eq!(header_offset, header_size);
+
+    for (value, encoded) in values.zip(encoded_text.iter()) {
+        if let Some(bytes) = encoded {
+            buf.extend_from_slice(bytes);
+        } else {
+            let (_serial_type, payload_len) = serialized_value_layout(value);
+            append_serialized_value(value, payload_len, buf);
+        }
+    }
+}
+
 /// Serialize a record using a compile-time precomputed header template.
 ///
 /// Returns `false` when the runtime values do not match the header contract,
@@ -3409,6 +3478,65 @@ mod tests {
         let utf16_row = vec![SqliteValue::Text(SmallText::new("ab"))];
         let record = serialize_record_with_encoding(&utf16_row, TextEncoding::Utf16le);
         assert_eq!(record, vec![2, 21, b'a', 0, b'b', 0]);
+    }
+
+    #[test]
+    fn serialize_record_iter_into_with_encoding_matches_slice_form_and_round_trips() {
+        // bd-bld9w.7: the MakeRecord-hot-path iterator serializer must produce
+        // byte-identical output to the reference serialize_record_with_encoding
+        // for every encoding, and round-trip through
+        // parse_record_into_with_encoding. This is the fsqlite-types foundation
+        // the VDBE MakeRecord write path routes through when the DB is UTF-16.
+        let rows: Vec<Vec<SqliteValue>> = vec![
+            vec![
+                SqliteValue::Text(SmallText::new("table")),
+                SqliteValue::Integer(42),
+            ],
+            vec![
+                SqliteValue::Text(SmallText::new("café ☕")),
+                SqliteValue::Null,
+                SqliteValue::Text(SmallText::new("日本")),
+            ],
+            vec![
+                SqliteValue::Blob(Arc::from(&[1_u8, 2, 3][..])),
+                SqliteValue::Text(SmallText::new("😀")),
+            ],
+            vec![],
+            vec![SqliteValue::Integer(7)],
+        ];
+        for encoding in [
+            TextEncoding::Utf8,
+            TextEncoding::Utf16le,
+            TextEncoding::Utf16be,
+        ] {
+            for row in &rows {
+                let reference = serialize_record_with_encoding(row, encoding);
+                let mut iter_buf = Vec::new();
+                serialize_record_iter_into_with_encoding(row.iter(), encoding, &mut iter_buf);
+                assert_eq!(
+                    iter_buf, reference,
+                    "iter form must match slice form via {encoding:?} for {row:?}"
+                );
+                let mut decoded = Vec::new();
+                parse_record_into_with_encoding(&iter_buf, &mut decoded, encoding)
+                    .expect("round-trip decode");
+                assert_eq!(&decoded, row, "iter round-trip via {encoding:?}");
+            }
+        }
+        // The reusable buffer is cleared (not appended to) before each write.
+        let mut buf = vec![0xAB_u8; 99];
+        serialize_record_iter_into_with_encoding(
+            [SqliteValue::Integer(7)].iter(),
+            TextEncoding::Utf16be,
+            &mut buf,
+        );
+        let mut fresh = Vec::new();
+        serialize_record_iter_into_with_encoding(
+            [SqliteValue::Integer(7)].iter(),
+            TextEncoding::Utf16be,
+            &mut fresh,
+        );
+        assert_eq!(buf, fresh, "prior buffer contents must be cleared");
     }
 
     #[test]
