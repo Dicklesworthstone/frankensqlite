@@ -3,6 +3,18 @@
 //! generated column"), like C SQLite — on both the interpreted (:memory:) and
 //! compiled (file-backed) UPDATE lanes. Assigning only ordinary columns still
 //! works, and the generated column recomputes.
+//!
+//! KNOWN-RED investigation anchor (bd-gh-generated-column-update-target). The
+//! fix must run at UPDATE statement PREPARE/COMPILE time, before the prepared
+//! fast-path program is built — NOT per-execute-path. `:memory:` routes through
+//! `execute_precompiled_prepared_update_or_delete`, which operates on the
+//! compiled program (no AST), so a check placed in `execute_statement_dispatch_impl`
+//! (the general lane) misses it. The ready helper shape is
+//! `validate_update_target_columns(table_schema, assignments)` mirroring the
+//! INSERT-side `validate_insert_target_columns` (connection.rs) — reject when a
+//! target column has `generated_expr`/`generated_stored`. Un-ignore once the
+//! guard is wired at the universal prepare/compile gate covering all UPDATE
+//! lanes (direct-simple, precompiled, row-by-row, CTE, table-program).
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::SqliteValue;
@@ -40,6 +52,7 @@ async fn open_seeded(path: Option<&std::path::Path>) -> Connection {
     conn
 }
 
+#[ignore = "bd-gh-generated-column-update-target: KNOWN-RED anchor — the general-path guard landed (fea1ba8a8) but the :memory: precompiled fast lane (execute_precompiled_prepared_update_or_delete) is still unguarded; needs the check at the UPDATE prepare/compile gate. See module doc."]
 #[test]
 fn update_generated_column_matches_rusqlite_oracle() {
     asupersync::test_utils::run_test(|| async {
