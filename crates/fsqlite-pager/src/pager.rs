@@ -31396,6 +31396,183 @@ mod tests {
     // ── Savepoint tests ────────────────────────────────────────────────
 
     #[test]
+    fn write_set_stats_track_live_transactions_not_cross_transaction_union() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            pager.set_write_set_page_limit(3);
+
+            let initial = pager.write_set_stats().expect("configured stats");
+            assert_eq!(initial.current_dirty_pages, 0);
+            assert_eq!(initial.dirty_pages_high_water, 0);
+
+            let mut first = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let first_page = first.allocate_page(&cx).await.unwrap();
+            first
+                .write_page(&cx, first_page, &sample_page(0x31))
+                .await
+                .unwrap();
+            first
+                .write_page(&cx, first_page, &sample_page(0x32))
+                .await
+                .unwrap();
+            let second_page = first.allocate_page(&cx).await.unwrap();
+            first
+                .write_page(&cx, second_page, &sample_page(0x33))
+                .await
+                .unwrap();
+
+            let active = pager.write_set_stats().expect("configured stats");
+            assert_eq!(active.current_dirty_pages, 2);
+            assert_eq!(active.dirty_pages_high_water, 2);
+            first.commit(&cx).await.unwrap();
+
+            let committed = pager.write_set_stats().expect("configured stats");
+            assert_eq!(committed.current_dirty_pages, 0);
+            assert_eq!(committed.dirty_pages_high_water, 2);
+
+            let mut second = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let third_page = second.allocate_page(&cx).await.unwrap();
+            second
+                .write_page(&cx, third_page, &sample_page(0x34))
+                .await
+                .unwrap();
+            let next_active = pager.write_set_stats().expect("configured stats");
+            assert_eq!(next_active.current_dirty_pages, 1);
+            assert_eq!(
+                next_active.dirty_pages_high_water, 2,
+                "bead_id=bd-bounded-image-api-forward-port-vcnnf.3 \
+                 case=high_water_is_maximum_live_transaction_not_page_union"
+            );
+            second.rollback(&cx).await.unwrap();
+
+            let rolled_back = pager.write_set_stats().expect("configured stats");
+            assert_eq!(rolled_back.current_dirty_pages, 0);
+            assert_eq!(rolled_back.dirty_pages_high_water, 2);
+        });
+    }
+
+    #[test]
+    fn write_set_stats_restore_savepoint_and_free_cardinality() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            pager.set_write_set_page_limit(3);
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let first_page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, first_page, &sample_page(0x41))
+                .await
+                .unwrap();
+            txn.write_page(&cx, first_page, &sample_page(0x42))
+                .await
+                .unwrap();
+            assert_eq!(
+                pager
+                    .write_set_stats()
+                    .expect("configured stats")
+                    .current_dirty_pages,
+                1,
+                "repeated writes to one page must not inflate cardinality"
+            );
+
+            txn.savepoint(&cx, "bounded").unwrap();
+            for marker in [0x43, 0x44] {
+                let page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, page, &sample_page(marker))
+                    .await
+                    .unwrap();
+            }
+            let at_limit = pager.write_set_stats().expect("configured stats");
+            assert_eq!(at_limit.current_dirty_pages, 3);
+            assert_eq!(at_limit.dirty_pages_high_water, 3);
+
+            let refused_page = txn.allocate_page(&cx).await.unwrap();
+            let refusal = txn
+                .write_page(&cx, refused_page, &sample_page(0x45))
+                .await
+                .expect_err("the fourth distinct page must be refused");
+            assert!(matches!(refusal, FrankenError::OutOfRange { .. }));
+            let refused = pager.write_set_stats().expect("configured stats");
+            assert_eq!(refused.current_dirty_pages, 3);
+            assert_eq!(refused.dirty_pages_high_water, 3);
+            assert_eq!(refused.cap_refusals, 1);
+
+            txn.rollback_to_savepoint(&cx, "bounded").unwrap();
+            let restored = pager.write_set_stats().expect("configured stats");
+            assert_eq!(restored.current_dirty_pages, 1);
+            assert_eq!(restored.dirty_pages_high_water, 3);
+
+            txn.free_page(&cx, first_page).await.unwrap();
+            let freed = pager.write_set_stats().expect("configured stats");
+            assert_eq!(freed.current_dirty_pages, 0);
+            assert_eq!(freed.dirty_pages_high_water, 3);
+            txn.rollback(&cx).await.unwrap();
+            assert_eq!(
+                pager
+                    .write_set_stats()
+                    .expect("configured stats")
+                    .current_dirty_pages,
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn write_set_stats_reset_on_retained_commit_drop_and_ceiling_reinstall() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            pager.set_write_set_page_limit(1);
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let first_page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, first_page, &sample_page(0x51))
+                .await
+                .unwrap();
+            let refused_page = txn.allocate_page(&cx).await.unwrap();
+            assert!(matches!(
+                txn.write_page(&cx, refused_page, &sample_page(0x52))
+                    .await,
+                Err(FrankenError::OutOfRange { .. })
+            ));
+            assert!(
+                txn.commit_and_retain(&cx).await.unwrap(),
+                "MemoryVfs retained commit must keep the writer handle reusable"
+            );
+
+            let retained = pager.write_set_stats().expect("configured stats");
+            assert_eq!(retained.current_dirty_pages, 0);
+            assert_eq!(retained.dirty_pages_high_water, 1);
+            assert_eq!(retained.cap_refusals, 1);
+
+            let next_page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, next_page, &sample_page(0x53))
+                .await
+                .unwrap();
+            assert_eq!(
+                pager
+                    .write_set_stats()
+                    .expect("configured stats")
+                    .current_dirty_pages,
+                1
+            );
+            drop(txn);
+            let dropped = pager.write_set_stats().expect("configured stats");
+            assert_eq!(dropped.current_dirty_pages, 0);
+            assert_eq!(dropped.dirty_pages_high_water, 1);
+            assert_eq!(dropped.cap_refusals, 1);
+
+            pager.set_write_set_page_limit(4);
+            let reinstalled = pager.write_set_stats().expect("configured stats");
+            assert_eq!(reinstalled.page_limit, 4);
+            assert_eq!(reinstalled.current_dirty_pages, 0);
+            assert_eq!(reinstalled.dirty_pages_high_water, 0);
+            assert_eq!(reinstalled.cap_refusals, 0);
+        });
+    }
+
+    #[test]
     fn test_savepoint_basic_rollback_to() {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = test_pager().await;

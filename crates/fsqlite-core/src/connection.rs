@@ -229071,11 +229071,11 @@ mod pager_routing_tests {
     /// The write-set telemetry must report real work, and must distinguish a
     /// ceiling that held from one that bit.
     ///
-    /// This is what `write_set_stats` is for downstream: proving after the fact
-    /// how much of the database a bounded build actually rewrote. An accessor
-    /// that returned plausible zeroes would satisfy the type and prove nothing,
-    /// so this asserts non-zero high water AND a non-zero refusal count on a
-    /// build that deliberately overruns.
+    /// This is what `write_set_stats` is for downstream: proving the peak live
+    /// dirty set actually reached by a bounded build. An accessor that returned
+    /// plausible zeroes would satisfy the type and prove nothing, so this
+    /// asserts non-zero high water AND a non-zero refusal count on a build that
+    /// deliberately overruns.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn write_set_stats_report_high_water_and_cap_refusals() {
@@ -229126,7 +229126,7 @@ mod pager_routing_tests {
                 }
             }
             assert!(refused, "a 3-page ceiling must refuse this build");
-            builder.execute("ROLLBACK;").await.ok();
+            builder.execute("ROLLBACK;").await.expect("rollback");
 
             let after = builder
                 .write_set_stats()
@@ -229150,7 +229150,105 @@ mod pager_routing_tests {
                 after.dirty_pages_high_water * page_size,
                 "byte high water must be derived from the page high water"
             );
+            assert_eq!(
+                after.current_dirty_pages, 0,
+                "a terminal rollback must leave no live dirty-set evidence"
+            );
             builder.close().await.ok();
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn write_set_stats_preserve_current_across_deferred_fk_commit_failure() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("deferred-fk-wss.db");
+            let mut env = ConnectionEnv::default();
+            env.set_schema_only_write_set_page_limit(64);
+            let reservation =
+                Connection::reserve_schema_only_builder_target_with_env(&target, &env)
+                    .expect("reserve");
+            let builder = Connection::initialize_reserved_schema_only_builder(&reservation, env)
+                .await
+                .expect("initialize");
+
+            builder
+                .execute("PRAGMA foreign_keys = ON;")
+                .await
+                .expect("enable foreign keys");
+            builder
+                .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .expect("create parent");
+            builder
+                .execute(
+                    "CREATE TABLE child (\
+                     id INTEGER PRIMARY KEY, \
+                     parent_id INTEGER REFERENCES parent(id) \
+                     DEFERRABLE INITIALLY DEFERRED);",
+                )
+                .await
+                .expect("create child");
+            assert_eq!(
+                builder
+                    .write_set_stats()
+                    .expect("stats readable")
+                    .expect("ceiling configured")
+                    .current_dirty_pages,
+                0,
+                "autocommit DDL must leave the builder quiescent"
+            );
+
+            builder.execute("BEGIN;").await.expect("begin");
+            builder
+                .execute("INSERT INTO child VALUES (1, 7);")
+                .await
+                .expect("deferred violation is admitted until commit");
+            let before_failure = builder
+                .write_set_stats()
+                .expect("stats readable")
+                .expect("ceiling configured");
+            assert!(before_failure.current_dirty_pages > 0);
+
+            builder
+                .execute("COMMIT;")
+                .await
+                .expect_err("deferred foreign-key violation must reject commit");
+            let after_failure = builder
+                .write_set_stats()
+                .expect("stats readable")
+                .expect("ceiling configured");
+            assert_eq!(
+                after_failure.current_dirty_pages, before_failure.current_dirty_pages,
+                "bead_id=bd-bounded-image-api-forward-port-vcnnf.3 \
+                 case=nonterminal_deferred_fk_commit_failure_preserves_current"
+            );
+
+            builder
+                .execute("INSERT INTO parent VALUES (7);")
+                .await
+                .expect("repair deferred violation");
+            let before_retry = builder
+                .write_set_stats()
+                .expect("stats readable")
+                .expect("ceiling configured");
+            assert!(
+                before_retry.current_dirty_pages >= after_failure.current_dirty_pages,
+                "repair must preserve or extend the live write set"
+            );
+            builder.execute("COMMIT;").await.expect("commit retry");
+
+            let committed = builder
+                .write_set_stats()
+                .expect("stats readable")
+                .expect("ceiling configured");
+            assert_eq!(committed.current_dirty_pages, 0);
+            assert!(
+                committed.dirty_pages_high_water >= before_retry.current_dirty_pages,
+                "the window high water must retain the successful transaction peak"
+            );
+            builder.close().await.expect("close builder");
         });
     }
 
