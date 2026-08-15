@@ -35665,6 +35665,10 @@ mod tests {
             let mut builder = ProgramBuilder::new();
             let result = builder.alloc_reg();
             emit_expr_with_fallback(&mut builder, &expr, result, &inner, Some(&outer));
+            // A finished program must terminate with Halt (V2.3 invariant); the
+            // expression-fragment emit above does not, so append it exactly as
+            // the statement codegen paths do before `finish()`.
+            builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             let program = builder
                 .finish()
                 .expect("JSON fallback program should finish");
@@ -35731,6 +35735,9 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let result = builder.alloc_reg();
         emit_expr_with_fallback(&mut builder, &expr, result, &inner, Some(&outer));
+        // A finished program must terminate with Halt (V2.3 invariant); append
+        // it exactly as the statement codegen paths do before `finish()`.
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         let program = builder
             .finish()
             .expect("JSON fallback program should finish");
