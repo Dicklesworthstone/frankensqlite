@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-wasm"
-version = "0.3.1"
+version = "0.3.2"
 description = "WebAssembly bindings for FrankenSQLite"
 edition.workspace = true
 license-file.workspace = true
