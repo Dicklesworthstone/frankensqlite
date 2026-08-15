@@ -35297,6 +35297,7 @@ fn bounded_identifier_lists_equal(left: &[String], right: &[String]) -> bool {
             .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
+
 /// Everything walker 2 needs to recompute one index key from a table row.
 ///
 /// `key_expressions` covers expression indexes; `predicate` covers partial
@@ -35364,6 +35365,7 @@ fn bounded_increment_validation_counter(counter: &mut u64) -> Result<()> {
     *counter = next;
     Ok(())
 }
+
 
 // ---------------------------------------------------------------------------
 // Gate-B (part 1): bounded expression-AST admission traversal
@@ -35983,6 +35985,7 @@ fn first_unsupported_bounded_ast(
     Ok(None)
 }
 
+
 // ---------------------------------------------------------------------------
 // Gate-B (part 2): admission policies
 //
@@ -36008,9 +36011,9 @@ fn bounded_builtin_scalar_function_supported(
             && (entry.num_args == arity || entry.num_args == -1)
     });
     declared_builtin
-        && registry
-            .find_scalar(name, arity)
-            .is_some_and(|function| function.is_deterministic() && function.arity().accepts(arity))
+        && registry.find_scalar(name, arity).is_some_and(|function| {
+            function.is_deterministic() && function.arity().accepts(arity)
+        })
 }
 
 fn bounded_check_scalar_function_supported(
@@ -36065,6 +36068,7 @@ thread_local! {
     static CURRENT_BOUNDED_CHECK_EVALUATION_BYTES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
+
 struct BoundedCheckFunctionRegistryGuard;
 
 impl BoundedCheckFunctionRegistryGuard {
@@ -36102,6 +36106,7 @@ impl Drop for BoundedCheckEvaluationBudgetGuard {
         });
     }
 }
+
 
 /// Where a page-ownership walk records the pages it claims.
 ///
@@ -41903,11 +41908,9 @@ impl Connection {
         };
         let name = &table.name;
         if let Some(ti) = self.schema_index_of(&name.name) {
-            let known = self
-                .schema
-                .borrow()
-                .get(ti)
-                .is_some_and(|t| t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(idx)));
+            let known = self.schema.borrow().get(ti).is_some_and(|t| {
+                t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(idx))
+            });
             if known {
                 Ok(())
             } else {
@@ -109038,9 +109041,9 @@ fn insert_source_is_memdb_read_free(source: &fsqlite_ast::InsertSource) -> bool 
     match source {
         fsqlite_ast::InsertSource::DefaultValues => true,
         fsqlite_ast::InsertSource::Select(_) => false,
-        fsqlite_ast::InsertSource::Values(rows) => rows
-            .iter()
-            .all(|row| row.iter().all(expr_is_memdb_read_free)),
+        fsqlite_ast::InsertSource::Values(rows) => {
+            rows.iter().all(|row| row.iter().all(expr_is_memdb_read_free))
+        }
     }
 }
 
@@ -129120,18 +129123,17 @@ pub(crate) fn fsqlite_core_test_serializer() -> std::sync::MutexGuard<'static, (
 mod tests {
     use super::{
         BoundPagerPublication, CanonicalHashJoinKey, CommitSeq, ConcurrentRegistry, Connection,
-        ConnectionEnv, DatabaseBuilderReservation, DifferentialEvent,
-        FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS, FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS,
-        FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS, FSQLITE_JOIN_EXPR_BINDING_HITS,
-        FSQLITE_JOIN_EXPR_FALLBACK_SCANS, FSQLITE_JOIN_HASH_FAST_PATH_HITS,
-        FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS, FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS,
-        FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS, FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS,
-        HashJoinKeyMode, HashJoinPair, ImplicitAutoindexSlot, InProcessPageLockTable,
-        IoPollStrategy, LiveVtabRegistryUndo, MAX_TRIGGER_DEPTH, MAX_TRIGGER_PROGRAM_DEPTH,
-        PagerBackend, PagerPublishedSnapshot, PragmaSchemaScope, Row, RuntimeConfig,
-        RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
-        TriggerDepthLimitOverrideGuard, TriggerFrame, TriggerFrameGuard, arm_trigger_stack_probe,
-        attached_schema_key, bind_placeholders_in_select_for_fallback,
+        ConnectionEnv, DifferentialEvent, FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS,
+        FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS, FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS,
+        FSQLITE_JOIN_EXPR_BINDING_HITS, FSQLITE_JOIN_EXPR_FALLBACK_SCANS,
+        FSQLITE_JOIN_HASH_FAST_PATH_HITS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
+        FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
+        FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, HashJoinKeyMode, HashJoinPair,
+        ImplicitAutoindexSlot, InProcessPageLockTable, IoPollStrategy, LiveVtabRegistryUndo,
+        MAX_TRIGGER_DEPTH, MAX_TRIGGER_PROGRAM_DEPTH, PagerBackend, PagerPublishedSnapshot,
+        PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState,
+        SimplePager, Snapshot, TriggerDepthLimitOverrideGuard, TriggerFrame, TriggerFrameGuard,
+        arm_trigger_stack_probe, attached_schema_key, bind_placeholders_in_select_for_fallback,
         build_canonical_hash_join_key, canonical_hash_join_value, canonicalize_select_placeholders,
         cmp_values_with_comparison_affinity, implicit_autoindex_layout, init_global_runtime,
         is_correlated_subquery, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
@@ -158889,9 +158891,7 @@ mod tests {
                 growth_chunk_bytes: 1,
                 max_bytes: Some(image_len),
             });
-            let imported = Connection::import_bytes_with_env(&bytes, env)
-                .await
-                .unwrap();
+            let imported = Connection::import_bytes_with_env(&bytes, env).await.unwrap();
 
             let rows = imported
                 .query("SELECT id, name FROM import_t ORDER BY id;")
@@ -165120,9 +165120,7 @@ mod tests {
             conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, value INTEGER);")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO bench VALUES (5, 1);")
-                .await
-                .unwrap();
+            conn.execute("INSERT INTO bench VALUES (5, 1);").await.unwrap();
             let after_ddl = conn.query(sql).await.unwrap();
             assert_eq!(
                 after_ddl.iter().map(row_values).collect::<Vec<_>>(),
@@ -195918,6 +195916,8 @@ mod pager_routing_tests {
     use super::*;
     use fsqlite_ast::{ColumnRef, Expr, OrderingTerm, ResultColumn, Span};
     use fsqlite_func::collation::CollationFunction;
+    #[cfg(not(target_arch = "wasm32"))]
+    use fsqlite_types::PageData;
     use tracing_subscriber::prelude::*;
 
     #[derive(Debug)]
@@ -227282,7 +227282,10 @@ mod pager_routing_tests {
             // bd-a8ygy: plain top-level shapes and the JOIN route were both
             // parsed into Agg descriptors that compute_aggregate's name table
             // does not know, silently yielding NULL. Pin all three.
-            assert_eq!(one("SELECT json_group_array(x) FROM t").await, "[3,1,1,2]");
+            assert_eq!(
+                one("SELECT json_group_array(x) FROM t").await,
+                "[3,1,1,2]"
+            );
             assert_eq!(
                 one("SELECT json_group_object(k, v) FROM kv").await,
                 r#"{"b":2,"a":1,"c":3}"#
@@ -228843,7 +228846,8 @@ mod pager_routing_tests {
             let dir = tempfile::tempdir().unwrap();
             let (source, source_receipt, source_path) =
                 seed_publication_source(dir.path(), "stale-source").await;
-            let candidate_receipt = seed_publication_candidate(dir.path(), "stale-candidate").await;
+            let candidate_receipt =
+                seed_publication_candidate(dir.path(), "stale-candidate").await;
             let candidate_path = dir.path().join("stale-candidate.db");
 
             // Naming the source as its own candidate would publish an image
@@ -228859,7 +228863,11 @@ mod pager_routing_tests {
             // CannotOpen and that is exactly when someone should look again.
             // See bd-bounded-image-api-forward-port-vcnnf.
             let self_publication = source
-                .begin_database_image_publication(&source_receipt, &source_receipt, &source_path)
+                .begin_database_image_publication(
+                    &source_receipt,
+                    &source_receipt,
+                    &source_path,
+                )
                 .await
                 .expect_err("the source is never a valid candidate for itself");
             assert!(
@@ -228898,7 +228906,8 @@ mod pager_routing_tests {
             let dir = tempfile::tempdir().unwrap();
             let (source, source_receipt, _source_path) =
                 seed_publication_source(dir.path(), "drift-source").await;
-            let candidate_receipt = seed_publication_candidate(dir.path(), "drift-candidate").await;
+            let candidate_receipt =
+                seed_publication_candidate(dir.path(), "drift-candidate").await;
             let candidate_path = dir.path().join("drift-candidate.db");
 
             corrupt_one_content_byte(
@@ -229080,10 +229089,7 @@ mod pager_routing_tests {
             // broken handle.
             let rows = validation.query("SELECT COUNT(*) FROM t;").await.unwrap();
             assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
-            validation
-                .close()
-                .await
-                .expect("close the validation handle");
+            validation.close().await.expect("close the validation handle");
 
             assert_eq!(
                 std::fs::read(&image_path).unwrap(),
@@ -229091,6 +229097,23 @@ mod pager_routing_tests {
                 "the image must be byte-identical after every refused write"
             );
         });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn retained_bounded_writer_test_dir(tag: &str) -> std::path::PathBuf {
+        static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let sequence = NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "fsqlite-vcnnf4-{tag}-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("create retained bounded-writer test directory");
+        dir
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -229137,8 +229160,8 @@ mod pager_routing_tests {
     #[test]
     fn reserved_bounded_writer_reopen_requires_exact_limit_while_ordinary_open_is_inert() {
         asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let target = dir.path().join("bounded-reopen-inputs.db");
+            let dir = retained_bounded_writer_test_dir("inputs");
+            let target = dir.join("bounded-reopen-inputs.db");
             let (reservation, env) = build_reopenable_bounded_writer_image(&target, 8, 2, 8).await;
             let before = std::fs::read(&target).expect("read seed image");
 
@@ -229186,13 +229209,13 @@ mod pager_routing_tests {
 
     /// Replacing the reserved pathname with byte-identical content does not
     /// preserve authority: the retained descriptor identity is load-bearing.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(unix)]
     #[test]
     fn reserved_bounded_writer_reopen_refuses_path_identity_drift_before_open() {
         asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let target = dir.path().join("bounded-reopen-identity.db");
-            let moved = dir.path().join("bounded-reopen-retained-inode.db");
+            let dir = retained_bounded_writer_test_dir("identity");
+            let target = dir.join("bounded-reopen-identity.db");
+            let moved = dir.join("bounded-reopen-retained-inode.db");
             let (reservation, env) = build_reopenable_bounded_writer_image(&target, 8, 2, 8).await;
 
             std::fs::rename(&target, &moved).expect("move the retained inode");
@@ -229225,8 +229248,8 @@ mod pager_routing_tests {
             const PAGE_LIMIT: usize = 8;
             const PAGE_BUFFER_MAX: usize = 2;
 
-            let dir = tempfile::tempdir().unwrap();
-            let target = dir.path().join("bounded-reopen-exact-cap.db");
+            let dir = retained_bounded_writer_test_dir("exact-cap");
+            let target = dir.join("bounded-reopen-exact-cap.db");
             let (reservation, env) =
                 build_reopenable_bounded_writer_image(&target, PAGE_LIMIT, PAGE_BUFFER_MAX, 96)
                     .await;
@@ -229235,6 +229258,11 @@ mod pager_routing_tests {
             let writer = Connection::reopen_reserved_schema_only_bounded_writer(&reservation, env)
                 .await
                 .expect("reopen bounded writer");
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                image_before,
+                "a clean bounded reopen must not mutate the database image"
+            );
             let initial = writer
                 .write_set_stats()
                 .expect("read initial stats")
@@ -229273,7 +229301,7 @@ mod pager_routing_tests {
                     .into_vec();
                 let final_byte = page.len() - 1;
                 page[final_byte] ^= u8::try_from(ordinal + 1).unwrap();
-                txn.write_page(&cx, page_no, &page)
+                txn.write_page_data(&cx, page_no, PageData::from_vec(page))
                     .await
                     .expect("the first N unique pages must be admitted");
                 assert_eq!(
@@ -229295,7 +229323,7 @@ mod pager_routing_tests {
             let final_byte = excess.len() - 1;
             excess[final_byte] ^= 0xA5;
             let refusal = txn
-                .write_page(&cx, excess_page, &excess)
+                .write_page_data(&cx, excess_page, PageData::from_vec(excess))
                 .await
                 .expect_err("N+1 must refuse before staging");
             assert!(
@@ -229310,6 +229338,10 @@ mod pager_routing_tests {
             assert_eq!(refused.current_dirty_pages, PAGE_LIMIT);
             assert_eq!(refused.dirty_pages_high_water, PAGE_LIMIT);
             assert_eq!(refused.cap_refusals, 1);
+            assert!(
+                !txn.write_set_page_numbers().contains(&excess_page),
+                "a refused N+1 owned page must not enter the transaction write set"
+            );
 
             txn.rollback(&cx)
                 .await
@@ -229342,7 +229374,7 @@ mod pager_routing_tests {
             let final_byte = page.len() - 1;
             page[final_byte] ^= 0x5A;
             later
-                .write_page(&cx, page_no, &page)
+                .write_page_data(&cx, page_no, PageData::from_vec(page))
                 .await
                 .expect("the ceiling remains active and admits later work");
             let later_active = writer
@@ -229565,9 +229597,10 @@ mod pager_routing_tests {
             // Deliberately tiny: enough to bootstrap, far too small to hold the
             // table pages the loop below writes.
             env.set_schema_only_write_set_page_limit(3);
-            let reservation =
-                Connection::reserve_schema_only_builder_target_with_env(&target, &env)
-                    .expect("reserve a fresh target");
+            let reservation = Connection::reserve_schema_only_builder_target_with_env(
+                &target, &env,
+            )
+            .expect("reserve a fresh target");
             assert_eq!(reservation.write_set_page_limit(), 3);
             assert!(
                 reservation.write_set_limit_enforced(),
@@ -229622,9 +229655,12 @@ mod pager_routing_tests {
             let mut env = ConnectionEnv::default();
             // The same tiny ceiling that refuses the build above.
             env.set_schema_only_write_set_page_limit(3);
-            let conn = Connection::open_with_env(db_path.to_string_lossy().into_owned(), env)
-                .await
-                .expect("ordinary open must ignore the builder-only ceiling");
+            let conn = Connection::open_with_env(
+                db_path.to_string_lossy().into_owned(),
+                env,
+            )
+            .await
+            .expect("ordinary open must ignore the builder-only ceiling");
 
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
                 .await
@@ -229650,9 +229686,10 @@ mod pager_routing_tests {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
 
-            let missing =
-                Connection::reserve_schema_only_builder_target(dir.path().join("no-ceiling.db"))
-                    .expect_err("an absent ceiling must refuse rather than default");
+            let missing = Connection::reserve_schema_only_builder_target(
+                dir.path().join("no-ceiling.db"),
+            )
+            .expect_err("an absent ceiling must refuse rather than default");
             assert!(
                 matches!(missing, FrankenError::NotImplemented(_)),
                 "expected NotImplemented, got {missing:?}"
@@ -229685,8 +229722,9 @@ mod pager_routing_tests {
 
             let mut env = ConnectionEnv::default();
             env.set_schema_only_write_set_page_limit(64);
-            let error = Connection::reserve_schema_only_builder_target_with_env(&occupied, &env)
-                .expect_err("an occupied path must never be claimed");
+            let error =
+                Connection::reserve_schema_only_builder_target_with_env(&occupied, &env)
+                    .expect_err("an occupied path must never be claimed");
             assert!(
                 matches!(error, FrankenError::CannotOpen { .. }),
                 "expected CannotOpen, got {error:?}"
@@ -229702,10 +229740,7 @@ mod pager_routing_tests {
     /// Build a self-contained image carrying an index and a foreign key, so the
     /// semantic walkers have something real to reconcile.
     #[cfg(not(target_arch = "wasm32"))]
-    async fn build_semantic_image(
-        dir: &Path,
-        stem: &str,
-    ) -> (std::path::PathBuf, DatabaseImageReceipt) {
+    async fn build_semantic_image(dir: &Path, stem: &str) -> (std::path::PathBuf, DatabaseImageReceipt) {
         let image_path = dir.join(format!("{stem}.db"));
         let receipt = build_self_contained_image(
             &dir.join(format!("{stem}-builder.db")),
@@ -229734,10 +229769,7 @@ mod pager_routing_tests {
             let (image_path, receipt) = build_semantic_image(dir.path(), "sem-ok").await;
 
             let owner = Connection::open(
-                dir.path()
-                    .join("sem-ok-owner.db")
-                    .to_string_lossy()
-                    .into_owned(),
+                dir.path().join("sem-ok-owner.db").to_string_lossy().into_owned(),
             )
             .await
             .unwrap();
@@ -229768,10 +229800,7 @@ mod pager_routing_tests {
                 u64::from(stats.structural.database_pages),
                 "the contained structural proof must still be one byte per page"
             );
-            snapshot
-                .finish()
-                .await
-                .expect("unchanged image recertifies");
+            snapshot.finish().await.expect("unchanged image recertifies");
         });
     }
 
@@ -229795,7 +229824,10 @@ mod pager_routing_tests {
             let surgeon = Connection::open(image_path.to_string_lossy().into_owned())
                 .await
                 .expect("reopen the image to damage concordance");
-            surgeon.execute("PRAGMA writable_schema=ON;").await.ok();
+            surgeon
+                .execute("PRAGMA writable_schema=ON;")
+                .await
+                .ok();
             let dropped = surgeon.execute("DROP INDEX child_tag;").await;
             assert!(dropped.is_ok(), "precondition: index drop must succeed");
             surgeon
@@ -229805,10 +229837,7 @@ mod pager_routing_tests {
             surgeon.close().await.expect("close the surgeon");
 
             let owner = Connection::open(
-                dir.path()
-                    .join("sem-bad-owner.db")
-                    .to_string_lossy()
-                    .into_owned(),
+                dir.path().join("sem-bad-owner.db").to_string_lossy().into_owned(),
             )
             .await
             .unwrap();
@@ -229879,10 +229908,7 @@ mod pager_routing_tests {
             .await;
 
             let owner = Connection::open(
-                dir.path()
-                    .join("trig-ok-owner.db")
-                    .to_string_lossy()
-                    .into_owned(),
+                dir.path().join("trig-ok-owner.db").to_string_lossy().into_owned(),
             )
             .await
             .unwrap();
@@ -229933,10 +229959,7 @@ mod pager_routing_tests {
             .await;
 
             let owner = Connection::open(
-                dir.path()
-                    .join("trig-bad-owner.db")
-                    .to_string_lossy()
-                    .into_owned(),
+                dir.path().join("trig-bad-owner.db").to_string_lossy().into_owned(),
             )
             .await
             .unwrap();
