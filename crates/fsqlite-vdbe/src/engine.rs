@@ -12913,6 +12913,22 @@ impl VdbeEngine {
                     }
                 }
 
+                // GH #159: skip past a RETURNING emission when the current row's
+                // `OR IGNORE` insert was suppressed by a rowid/UNIQUE conflict.
+                // Reuses the engine's own conflict decision (`conflict_skip_idx`,
+                // set by Insert/IdxInsert on an ignored+rolled-back write) so the
+                // RETURNING gate can never disagree with the actual table state.
+                Opcode::IfConflictSkip => {
+                    if self.conflict_skip_idx() {
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            pc = op.p2 as usize;
+                        }
+                    } else {
+                        pc += 1;
+                    }
+                }
+
                 // ── RowSet operations ──────────────────────────────────
                 // Used by OR-optimized queries and IN subqueries.
                 Opcode::RowSetAdd => {

@@ -583,14 +583,25 @@ pub enum Opcode {
     /// allocating the source value. Unsupported storage classes fall back to
     /// the equivalent scalar `octet_length(value)` behavior.
     ColumnOctetLength = 198,
+
+    /// Jump if the most recent row-insert was suppressed by `OE_IGNORE`.
+    ///
+    /// P1 = unused, P2 = jump target. Branches to P2 when the engine's
+    /// `conflict_skip_idx` flag is set — i.e. the preceding `Insert`/`IdxInsert`
+    /// sequence for the current row hit a rowid or UNIQUE conflict under
+    /// `INSERT/UPDATE OR IGNORE` and was rolled back. Used by `UPDATE OR IGNORE
+    /// ... RETURNING` on rowid tables to skip the `RETURNING` emission for a row
+    /// that was ignored (GH #159), reusing the engine's exact conflict decision
+    /// rather than re-deriving uniqueness in codegen.
+    IfConflictSkip = 199,
 }
 
 impl Opcode {
     /// Exclusive upper bound on valid opcode discriminants.
     ///
-    /// Discriminants run `1..=198` (there is no zero opcode), so valid bytes
+    /// Discriminants run `1..=199` (there is no zero opcode), so valid bytes
     /// are exactly `1..COUNT` and the number of opcodes defined is `COUNT - 1`.
-    pub const COUNT: usize = 199;
+    pub const COUNT: usize = 200;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -794,6 +805,7 @@ impl Opcode {
             Self::FusedLiteralResultRow => "FusedLiteralResultRow",
             Self::ColumnSubstrPrefix => "ColumnSubstrPrefix",
             Self::ColumnOctetLength => "ColumnOctetLength",
+            Self::IfConflictSkip => "IfConflictSkip",
         }
     }
 
@@ -1007,6 +1019,7 @@ impl Opcode {
             196 => Some(Self::FusedLiteralResultRow),
             197 => Some(Self::ColumnSubstrPrefix),
             198 => Some(Self::ColumnOctetLength),
+            199 => Some(Self::IfConflictSkip),
             _ => None,
         }
     }
@@ -1071,6 +1084,7 @@ impl Opcode {
                 | Self::VNext
                 | Self::Filter
                 | Self::Init
+                | Self::IfConflictSkip
         )
     }
 }
@@ -1615,8 +1629,8 @@ mod tests {
     fn opcode_count() {
         // COUNT is the exclusive upper bound on discriminants (1..COUNT), so the
         // number of opcodes actually defined is COUNT - 1.
-        assert_eq!(Opcode::COUNT, 199);
-        assert_eq!(Opcode::COUNT - 1, 198);
+        assert_eq!(Opcode::COUNT, 200);
+        assert_eq!(Opcode::COUNT - 1, 199);
     }
 
     #[test]
@@ -1641,7 +1655,8 @@ mod tests {
         assert_eq!(Opcode::from_byte(196), Some(Opcode::FusedLiteralResultRow));
         assert_eq!(Opcode::from_byte(197), Some(Opcode::ColumnSubstrPrefix));
         assert_eq!(Opcode::from_byte(198), Some(Opcode::ColumnOctetLength));
-        assert_eq!(Opcode::from_byte(199), None);
+        assert_eq!(Opcode::from_byte(199), Some(Opcode::IfConflictSkip));
+        assert_eq!(Opcode::from_byte(200), None);
         assert_eq!(Opcode::from_byte(255), None);
     }
 

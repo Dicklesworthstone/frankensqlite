@@ -21459,6 +21459,16 @@ pub fn codegen_update(
 
     // RETURNING clause: position cursor on updated row and read columns.
     if !stmt.returning.is_empty() {
+        // GH #159: UPDATE OR IGNORE ... RETURNING must NOT emit a row whose
+        // insert the engine suppressed on a rowid/UNIQUE conflict — it already
+        // rolled the write back, so re-seeking `rowid_reg` here would wrongly
+        // emit either the un-updated row (same rowid) or the CONFLICTING row's
+        // data (new rowid). `constraint_ignore_label` is `Some` iff this is an
+        // OR IGNORE update; jump past RETURNING to the row-skip label when the
+        // engine's own conflict decision (`conflict_skip_idx`) is set.
+        if let Some(skip) = constraint_ignore_label {
+            b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, skip, P4::None, 0);
+        }
         // RETURNING appears after WHERE in SQL textual order; restore the
         // post-WHERE placeholder index so RETURNING placeholders don't collide
         // with SET placeholder numbering.
@@ -22117,6 +22127,13 @@ fn codegen_update_from(
 
     // RETURNING clause (numbered after SET + ON + WHERE placeholders).
     if !stmt.returning.is_empty() {
+        // GH #159: as in the plain UPDATE path, an OR IGNORE row whose insert
+        // the engine suppressed on a rowid/UNIQUE conflict must not emit a
+        // RETURNING row. Jump past RETURNING to the loop's skip label when the
+        // engine's conflict_skip_idx is set.
+        if matches!(stmt.or_conflict.as_ref(), Some(ConflictAction::Ignore)) {
+            b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, skip_label, P4::None, 0);
+        }
         b.set_next_anon_placeholder(
             set_placeholder_count + on_placeholder_count + where_placeholder_count + 1,
         );
