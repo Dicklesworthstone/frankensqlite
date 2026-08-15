@@ -22162,9 +22162,11 @@ impl Connection {
     /// statement executes, so no later statement can observe the abandoned
     /// transaction's writes.
     ///
-    /// The flag is cleared before the rollback is attempted, so a failing
-    /// rollback cannot wedge the connection into retrying it forever; the
-    /// error surfaces to the caller of whichever statement discharged it.
+    /// The obligation is cleared only *after* the rollback succeeds (bd-wymdl
+    /// gap 2). A failed rollback leaves it pending, so every subsequent SQL
+    /// entry point fails closed until a rollback actually succeeds, rather than
+    /// silently running inside a half-rolled-back transaction; the error
+    /// surfaces to the caller of whichever statement discharged it.
     async fn settle_pending_transaction_cleanup(&self) -> Result<()> {
         if !self.pending_transaction_cleanup.get() {
             return Ok(());
