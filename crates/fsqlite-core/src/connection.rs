@@ -22727,6 +22727,64 @@ impl Connection {
             self.note_connection_statement_execution_count(1);
             return Ok(rows);
         }
+        // bd-z22mq: prepared lane for the memoized rowid-bucket SUM+GROUP BY
+        // shape. The deferred route below re-enters the full statement
+        // pipeline (structure validation, subquery rewrite, autocommit
+        // wrapping, dispatch cascade) on every execution; when the deferred
+        // select is structurally identical to the memo, those stages are
+        // provably identity/no-ops (the memoized select already passed them,
+        // and DDL / write commits / registry changes drop the memo), so jump
+        // straight to the mem-scan lane. This runs AFTER
+        // `prepare_connection_for_prepared_read` (retained-autocommit mirror
+        // rehydration) and the schema-unchanged proof, mirroring the
+        // CTE-join fast path above; the lane re-checks its dynamic guards and
+        // reads live rows, and a refusal falls through unchanged. DISTINCT
+        // and parameterized executions are excluded as in the dispatch-level
+        // short-circuit.
+        if params.is_empty()
+            && let Some(Statement::Select(select)) = stmt.deferred_query_statement.as_deref()
+            && !is_distinct_select(select)
+        {
+            let memo_rows_result = {
+                let memo_slot = self.group_by_bucket_fast_memo.borrow();
+                match memo_slot.as_ref() {
+                    Some(memo) if memo.select == *select => self
+                        .try_execute_rowid_bucket_sum_group_by_mem_scan(
+                            memo.root_page,
+                            &memo.table_schema,
+                            &memo.effective_label,
+                            &memo.group_by_exprs,
+                            &memo.result_descriptors,
+                        ),
+                    _ => Ok(None),
+                }
+            };
+            match memo_rows_result {
+                Ok(Some(rows)) => {
+                    // Preserve strict parity-cert accounting: this is the same
+                    // fallback the deferred dispatch would have taken.
+                    let log_result = self.log_mem_execution_fallback("select", "group_by_fallback");
+                    self.finish_prepared_read_autocommit(
+                        prepared_auto_read,
+                        log_result.is_ok(),
+                        &op_cx,
+                    )
+                    .await?;
+                    log_result?;
+                    if hot_path_profile_enabled() {
+                        FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    self.note_connection_statement_execution_count(1);
+                    return Ok(rows);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
+                        .await?;
+                    return Err(err);
+                }
+            }
+        }
         if let Some(statement) = &stmt.deferred_query_statement {
             if hot_path_profile_enabled() {
                 FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -33064,6 +33122,19 @@ impl Connection {
                     .materialize_update_limit_scope(&canonical_update, params)
                     .await?;
                 let table_name = &effective_update.table.name.name;
+                // Reject assigning to a generated column before routing to the
+                // compiled or row-by-row lane (bd-gh-generated-column-update-target).
+                {
+                    let schema = self.schema.borrow();
+                    if let Some(table_schema) =
+                        schema.iter().find(|t| t.name.eq_ignore_ascii_case(table_name))
+                    {
+                        Self::validate_update_target_columns(
+                            table_schema,
+                            &effective_update.assignments,
+                        )?;
+                    }
+                }
                 let targets_shadowed_main =
                     self.targets_shadowed_main(&effective_update.table.name);
                 // Collect columns being updated for UPDATE OF trigger matching.
@@ -36766,6 +36837,38 @@ impl Connection {
                 return Err(FrankenError::Internal(format!(
                     "cannot INSERT into generated column \"{column}\""
                 )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reject an UPDATE that assigns to a generated (VIRTUAL/STORED) column.
+    ///
+    /// SQLite treats generated columns as read-only and rejects
+    /// `UPDATE t SET gen = ...` with "cannot UPDATE generated column"
+    /// (bd-gh-generated-column-update-target). Unknown columns are left for the
+    /// normal execution path to report. Called on the shared UPDATE entry
+    /// before it routes to the compiled or row-by-row lane, so both are covered.
+    fn validate_update_target_columns(
+        table_schema: &TableSchema,
+        assignments: &[fsqlite_ast::Assignment],
+    ) -> Result<()> {
+        for assignment in assignments {
+            let targets: &[String] = match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => std::slice::from_ref(column),
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.as_slice(),
+            };
+            for column in targets {
+                let Some(idx) = table_schema.column_index(column) else {
+                    continue;
+                };
+                let col = &table_schema.columns[idx];
+                if col.generated_expr.is_some() || col.generated_stored.is_some() {
+                    return Err(FrankenError::Internal(format!(
+                        "cannot UPDATE generated column \"{column}\""
+                    )));
+                }
             }
         }
 
