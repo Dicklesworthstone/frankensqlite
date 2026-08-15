@@ -41612,6 +41612,26 @@ impl Connection {
                 // useful for malformed SELECT shapes in the stored AST.
                 SelectStructureResolver::new(self).validate_create_view(&create.query)
             }
+            // bd-gh-generated-column-update-target-4r7kw (GH#165): reject
+            // assigning to a generated column at PREPARE time. The
+            // execute-path guard (execute_statement's UPDATE arm) never runs
+            // for the :memory: precompiled prepared lane
+            // (execute_precompiled_prepared_update_or_delete operates on the
+            // compiled program, no AST), so this validator — which every
+            // prepare routes through — is the universal gate. Unknown tables
+            // and columns stay deferred to normal resolution, matching the
+            // execute-path guard's behavior.
+            Statement::Update(update) => {
+                let table_name = &update.table.name.name;
+                let schema = self.schema.borrow();
+                if let Some(table_schema) = schema
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                {
+                    Self::validate_update_target_columns(table_schema, &update.assignments)?;
+                }
+                Ok(())
+            }
             Statement::Explain { stmt, .. } => self.validate_statement_select_semantics(stmt),
             _ => Ok(()),
         }

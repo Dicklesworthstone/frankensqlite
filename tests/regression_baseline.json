@@ -235,18 +235,6 @@
       }
     },
     {
-      "source_path": "crates/fsqlite-core/tests/update_generated_column_oracle.rs",
-      "test_name": "update_generated_column_matches_rusqlite_oracle",
-      "reason": "bd-gh-generated-column-update-target: KNOWN-RED anchor \u2014 the general-path guard landed (fea1ba8a8) but the :memory: precompiled fast lane (execute_precompiled_prepared_update_or_delete) is still unguarded; needs the check at the UPDATE prepare/compile gate. See module doc.",
-      "cfg_condition": null,
-      "kind": "known_bug",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Guard the :memory: precompiled prepared UPDATE fast lane at the prepare/compile gate like the general path (fea1ba8a8); remove the ignore only after the oracle keeper passes three consecutive runs at the release commit (bd-gh-generated-column-update-target).",
-        "receipt": null
-      }
-    },
-    {
       "source_path": "crates/fsqlite-e2e/src/perf_runner.rs",
       "test_name": "tests::focused_disjoint_c8_release_perf_triplet_emits_results",
       "reason": "manual remote perf evidence for the flagship c8 row",
