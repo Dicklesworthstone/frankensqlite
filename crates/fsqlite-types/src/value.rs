@@ -3644,11 +3644,12 @@ mod tests {
                 .is_err()
         );
 
-        // INTEGER into TEXT column: rejected.
-        assert!(
+        // GH #272: INTEGER into a STRICT TEXT column coerces to its text form.
+        assert_eq!(
             SqliteValue::Integer(1)
                 .validate_strict(StrictColumnType::Text)
-                .is_err()
+                .unwrap(),
+            SqliteValue::Text("1".into())
         );
 
         // TEXT into BLOB column: rejected.
