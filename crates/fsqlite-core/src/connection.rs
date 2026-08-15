@@ -32139,6 +32139,41 @@ impl Connection {
                         .execute_with_materialized_sqlite_schema(select, params)
                         .await;
                 }
+                // bd-z22mq: dispatch-cascade short-circuit. When the incoming
+                // statement is structurally identical to the memoized
+                // rowid-bucket SUM+GROUP BY select, every guard walk below
+                // (aggregation classification, join/vtab routing, substrate
+                // admission), the IN-subquery rewrite, and the placeholder
+                // bind re-derive decisions the memo already proves: the
+                // memoized select passed this cascade to reach the mem-scan
+                // lane, and DDL, write commits, and registry changes all drop
+                // the memo. The lane itself re-checks its dynamic guards and
+                // reads live rows, so a refusal falls through to the full
+                // cascade unchanged. DISTINCT selects are excluded because
+                // their dedup pass runs below this point, and parameterized
+                // executions are excluded because binding rewrites the AST.
+                if params.is_none_or(<[SqliteValue]>::is_empty) && !is_distinct_select(select) {
+                    let memo_rows = {
+                        let memo_slot = self.group_by_bucket_fast_memo.borrow();
+                        match memo_slot.as_ref() {
+                            Some(memo) if memo.select == *select => self
+                                .try_execute_rowid_bucket_sum_group_by_mem_scan(
+                                    memo.root_page,
+                                    &memo.table_schema,
+                                    &memo.effective_label,
+                                    &memo.group_by_exprs,
+                                    &memo.result_descriptors,
+                                )?,
+                            _ => None,
+                        }
+                    };
+                    if let Some(rows) = memo_rows {
+                        // Preserve strict parity-cert accounting: this is the
+                        // same fallback the cascade would have taken.
+                        self.log_mem_execution_fallback("select", "group_by_fallback")?;
+                        return Ok(rows);
+                    }
+                }
                 let distinct = is_distinct_select(select);
                 let distinct_collations = if distinct {
                     let schema_snap = self.schema.borrow().clone();
@@ -164611,6 +164646,101 @@ mod tests {
         );
     }
 
+    /// bd-3ua5h: the multi-correlated-term EXISTS family
+    /// (`t3.a = t2.a AND t3.id <> t2.id`) must stay oracle-exact when nested
+    /// inside a non-correlated outer EXISTS (route a) and under a COUNT outer
+    /// shape (route b). The data is discriminating: a one-term (`a`-only)
+    /// binding would return t2 id 1 as well; the same-id-only variant returns
+    /// nothing. Strict mode forbids the interpreted fallback so a silently
+    /// wrong compiled emit cannot hide; a router refusal (strict rejection
+    /// error) is acceptable fail-closed behavior and re-verified non-strict.
+    #[test]
+    fn test_nested_multi_correlated_exists_matches_oracle() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, a INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE t3 (id INTEGER PRIMARY KEY, a INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t2 VALUES (1, 100), (2, 100), (3, 500);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t3 VALUES (1, 100), (9, 900);")
+                .await
+                .unwrap();
+
+            conn.set_reject_mem_fallback(true);
+            conn.set_strict_mem_fallback_rejection(true);
+
+            let strict_or_fallback = async |sql: &str| -> Vec<Vec<SqliteValue>> {
+                match conn.query(sql).await {
+                    Ok(rows) => rows.iter().map(row_values).collect(),
+                    Err(error) => {
+                        // Router refused the shape to the (forbidden)
+                        // fallback: fail-closed is fine — verify the
+                        // interpreted answer instead.
+                        assert!(
+                            error.to_string().contains("fallback"),
+                            "{sql}: unexpected strict-mode error: {error}"
+                        );
+                        conn.set_strict_mem_fallback_rejection(false);
+                        conn.set_reject_mem_fallback(false);
+                        let rows = conn.query(sql).await.unwrap();
+                        conn.set_reject_mem_fallback(true);
+                        conn.set_strict_mem_fallback_rejection(true);
+                        rows.iter().map(row_values).collect()
+                    }
+                }
+            };
+
+            // Direct family: only t2 id 2 qualifies (t3 id 1 has a=100 and a
+            // different id; t2 id 1's sole a-match shares its id; 500 has no
+            // match). Oracle sqlite3 3.46.1: [2].
+            let direct = strict_or_fallback(
+                "SELECT t2.id FROM t2 WHERE EXISTS \
+                 (SELECT 1 FROM t3 WHERE t3.a = t2.a AND t3.id <> t2.id) \
+                 ORDER BY t2.id;",
+            )
+            .await;
+            assert_eq!(direct, vec![vec![SqliteValue::Integer(2)]]);
+
+            // Route (b): COUNT outer shape over the same predicate. Oracle: 1.
+            let counted = strict_or_fallback(
+                "SELECT COUNT(*) FROM t2 WHERE EXISTS \
+                 (SELECT 1 FROM t3 WHERE t3.a = t2.a AND t3.id <> t2.id);",
+            )
+            .await;
+            assert_eq!(counted, vec![vec![SqliteValue::Integer(1)]]);
+
+            // Route (a): non-correlated outer EXISTS whose body nests the
+            // family — outer must hit because t2 id 2 qualifies. Oracle: one
+            // row.
+            let nested_hit = strict_or_fallback(
+                "SELECT 1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS \
+                 (SELECT 1 FROM t3 WHERE t3.a = t2.a AND t3.id <> t2.id));",
+            )
+            .await;
+            assert_eq!(nested_hit, vec![vec![SqliteValue::Integer(1)]]);
+
+            // Same-id-only variant: after removing the cross-id witness, no
+            // t2 row qualifies and the outer EXISTS must go empty. Oracle:
+            // zero rows.
+            conn.set_strict_mem_fallback_rejection(false);
+            conn.set_reject_mem_fallback(false);
+            conn.execute("DELETE FROM t2 WHERE id <> 1;").await.unwrap();
+            conn.set_reject_mem_fallback(true);
+            conn.set_strict_mem_fallback_rejection(true);
+            let nested_empty = strict_or_fallback(
+                "SELECT 1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS \
+                 (SELECT 1 FROM t3 WHERE t3.a = t2.a AND t3.id <> t2.id));",
+            )
+            .await;
+            assert!(nested_empty.is_empty(), "got {nested_empty:?}");
+        });
+    }
+
     /// bd-r02v6: the interpreter-fallback json_valid arm must mirror the
     /// registered JsonValidFunc for numeric and NULL arguments (oracle
     /// sqlite3 3.46.1: json_valid(5)=1, json_valid(2.5)=1,
@@ -164696,6 +164826,33 @@ mod tests {
             assert_eq!(
                 after_ddl.iter().map(row_values).collect::<Vec<_>>(),
                 vec![vec![SqliteValue::Integer(0), SqliteValue::Integer(1)]]
+            );
+
+            // Prepared-statement leg (bd-z22mq dispatch short-circuit): the
+            // deferred prepared route re-enters the dispatch cascade, so the
+            // memo must serve repeated prepared executions AND still see every
+            // committed write in between.
+            let prepared = conn.prepare(sql).await.unwrap();
+            let prep_first = prepared.query().await.unwrap();
+            assert_eq!(
+                prep_first.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(0), SqliteValue::Integer(1)]]
+            );
+            let prep_memo_hit = prepared.query().await.unwrap();
+            assert_eq!(
+                prep_memo_hit.iter().map(row_values).collect::<Vec<_>>(),
+                prep_first.iter().map(row_values).collect::<Vec<_>>()
+            );
+            conn.execute("INSERT INTO bench VALUES (6, 2), (15, 4);")
+                .await
+                .unwrap();
+            let prep_after_insert = prepared.query().await.unwrap();
+            assert_eq!(
+                prep_after_insert.iter().map(row_values).collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(0), SqliteValue::Integer(3)],
+                    vec![SqliteValue::Integer(1), SqliteValue::Integer(4)],
+                ]
             );
         });
     }

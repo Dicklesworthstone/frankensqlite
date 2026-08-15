@@ -14297,7 +14297,7 @@ where
         if page_limit == 0 {
             return None;
         }
-        let page_size = self.page_size.as_usize();
+        let page_size = self.page_size().as_usize();
         let current_dirty_pages = self.write_set_current_pages.load(AtomicOrdering::Relaxed);
         let dirty_pages_high_water = self.write_set_high_water_pages.load(AtomicOrdering::Relaxed);
         Some(WriteSetStats {
