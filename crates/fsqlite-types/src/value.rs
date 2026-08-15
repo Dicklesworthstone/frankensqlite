@@ -960,6 +960,23 @@ impl SqliteValue {
             StrictColumnType::Any => Ok(self),
             StrictColumnType::Integer => match self {
                 Self::Integer(_) => Ok(self),
+                // GH #272: a REAL whose value is exactly an integer stores as
+                // INTEGER in a STRICT INTEGER column (3.0 -> 3); a fractional or
+                // out-of-range REAL stays a type error. The round-trip through
+                // i64 is the lossless test SQLite applies.
+                Self::Float(fl) => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let as_int = fl as i64;
+                    #[allow(clippy::float_cmp)]
+                    if as_int as f64 == fl {
+                        Ok(Self::Integer(as_int))
+                    } else {
+                        Err(StrictTypeError {
+                            expected: col_type,
+                            actual: StorageClass::Real,
+                        })
+                    }
+                }
                 // GH #163: STRICT accepts a TEXT value that losslessly converts
                 // to the column's declared type (stock sqlite3 STRICT). For an
                 // INTEGER column only text parsing to an integer qualifies —
@@ -996,6 +1013,14 @@ impl SqliteValue {
             },
             StrictColumnType::Text => match self {
                 Self::Text(_) => Ok(self),
+                // GH #272: TEXT affinity converts INTEGER/REAL to their text form
+                // in a STRICT TEXT column (stock sqlite3): 1 -> '1', 1.5 -> '1.5'.
+                // BLOB is not convertible under TEXT affinity and stays a type
+                // error.
+                Self::Integer(i) => Ok(Self::Text(SmallText::from_string(i.to_string()))),
+                Self::Float(fl) => {
+                    Ok(Self::Text(SmallText::from_string(format_sqlite_float(fl))))
+                }
                 other => Err(StrictTypeError {
                     expected: col_type,
                     actual: other.storage_class(),
