@@ -2761,8 +2761,8 @@ pub struct ConnectionEnv {
     /// converts otherwise-silent corruption symptoms into actionable
     /// `FrankenError::MultiProcessContractViolation` errors.
     strict_multi_process: bool,
-    /// Mandatory write-set page ceiling for the reserved schema-only builder
-    /// create path, and only that path. `None` everywhere else.
+    /// Mandatory write-set page ceiling for the reserved schema-only bounded
+    /// writer family, and only that family. `None` everywhere else.
     ///
     /// Distinct from `page_buffer_max`, which caps resident buffers: that is a
     /// memory bound, not a bound on how much of the database a build may
@@ -2801,11 +2801,12 @@ impl ConnectionEnv {
     /// returns `FrankenError::MultiProcessContractViolation` instead.
     /// See frankensqlite#81.
     /// Set the mandatory write-set page ceiling for the reserved schema-only
-    /// builder create path.
+    /// bounded writer family.
     ///
     /// Honoured only by
-    /// [`Connection::initialize_reserved_schema_only_builder`], which refuses
-    /// to run without it. Setting it on any other open is inert.
+    /// [`Connection::initialize_reserved_schema_only_builder`] and
+    /// [`Connection::reopen_reserved_schema_only_bounded_writer`], which
+    /// refuse to run without it. Setting it on any other open is inert.
     pub fn set_schema_only_write_set_page_limit(&mut self, page_limit: usize) {
         self.schema_only_write_set_page_limit = Some(page_limit);
     }
@@ -2816,7 +2817,7 @@ impl ConnectionEnv {
         self.schema_only_write_set_page_limit
     }
 
-    /// Validate the builder write-set ceiling at the create boundary.
+    /// Validate the builder write-set ceiling at a reserved-writer boundary.
     ///
     /// The limit is mandatory on that path and must admit at least Page 1, so
     /// an absent limit is a typed refusal rather than a default: a build that
@@ -2829,7 +2830,7 @@ impl ConnectionEnv {
     pub fn validated_schema_only_write_set_page_limit(&self) -> Result<usize> {
         match self.schema_only_write_set_page_limit {
             None => Err(FrankenError::not_implemented(
-                "reserved schema-only builder initialization requires an explicit write-set page limit",
+                "reserved schema-only bounded writer requires an explicit write-set page limit",
             )),
             Some(0) => Err(FrankenError::OutOfRange {
                 what: "schema-only builder write-set page limit".to_owned(),
@@ -13350,13 +13351,8 @@ impl Connection {
     /// Phase 2. Revalidates the reservation at `expected_len = Some(0)`,
     /// confirms the stable path still resolves to the reserved pathname, and
     /// opens that exact identity through the existing-file writable schema-only
-    /// path with the validated write-set ceiling recorded on the environment.
-    ///
-    /// The ceiling is **recorded and validated, not enforced** — see
-    /// [`DatabaseBuilderReservation::write_set_limit_enforced`]. Callers that
-    /// need a proven bound on how much of the image a build rewrote must wait
-    /// for write-set telemetry; this method deliberately does not let them
-    /// believe otherwise.
+    /// path with the validated write-set ceiling installed on the pager before
+    /// returning the builder.
     ///
     /// # Errors
     ///
@@ -13367,38 +13363,9 @@ impl Connection {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn initialize_reserved_schema_only_builder(
         reservation: &DatabaseBuilderReservation,
-        mut env: ConnectionEnv,
+        env: ConnectionEnv,
     ) -> Result<Self> {
-        let page_limit = env.validated_schema_only_write_set_page_limit()?;
-        if page_limit != reservation.write_set_page_limit() {
-            return Err(FrankenError::OutOfRange {
-                what: "schema-only builder write-set page limit changed between reservation and initialization"
-                    .to_owned(),
-                value: page_limit.to_string(),
-            });
-        }
-        // Nothing has been written yet, so the reserved object must still be
-        // exactly zero bytes.
-        reservation.revalidate_final_target(Some(0))?;
-
-        let cx = env
-            .runtime()
-            .root_cx
-            .create_child()
-            .with_trace_context(next_trace_id(), 0, 0);
-        let path_text = reservation
-            .path()
-            .to_str()
-            .ok_or_else(|| FrankenError::CannotOpen {
-                path: reservation.path().to_owned(),
-            })?;
-        let stable = PagerBackend::resolve_stable_database_path(path_text, &cx)?;
-        if Path::new(&stable) != reservation.path() {
-            return Err(FrankenError::CannotOpen {
-                path: reservation.path().to_owned(),
-            });
-        }
-        env.set_schema_only_write_set_page_limit(page_limit);
+        let (_, stable) = reservation.validated_bounded_writer_open(&env, Some(0))?;
 
         // A reserved pathname is an EMPTY file, which is not yet a database.
         // Bootstrap page 1 through the identity-bound reserved-open path first;
@@ -13415,20 +13382,48 @@ impl Connection {
         .await?;
         bootstrap.close().await?;
 
-        // The file is now a database, so the length is no longer zero; identity
-        // and single-linkage must still hold.
-        reservation.revalidate_final_target(None)?;
+        Self::reopen_reserved_schema_only_bounded_writer(reservation, env).await
+    }
 
-        let builder = Self::open_existing_schema_only_with_expected_identity_and_env(
+    /// Reopen a reserved database image as an identity-bound, existing-only,
+    /// writable schema connection with its original write-set ceiling.
+    ///
+    /// The borrowed [`DatabaseBuilderReservation`] is the sole pathname,
+    /// identity, and limit authority. The environment must repeat the same
+    /// explicit nonzero ceiling; absence, zero, or drift is refused before any
+    /// database opener runs. The retained descriptor and the no-follow
+    /// pathname are then revalidated before the exact-identity existing-only
+    /// schema path is opened. The ceiling is installed on the pager before the
+    /// connection is returned, so callers cannot observe an unbounded writer.
+    ///
+    /// Other environment settings, including caller-rooted runtime context,
+    /// strict multi-process refusal, and `page_buffer_max`, retain their normal
+    /// meanings. `page_buffer_max` remains independent of the write-set limit.
+    /// Ordinary existing-schema opens remain unbounded even if their
+    /// environment happens to carry this reserved-writer setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the explicit-limit refusals from
+    /// [`ConnectionEnv::validated_schema_only_write_set_page_limit`],
+    /// [`FrankenError::OutOfRange`] when the limit differs from the retained
+    /// reservation, [`FrankenError::CannotOpen`] when reservation identity,
+    /// linkage, or stable-path validation fails, and any propagated open or
+    /// pager error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn reopen_reserved_schema_only_bounded_writer(
+        reservation: &DatabaseBuilderReservation,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        let (page_limit, stable) = reservation.validated_bounded_writer_open(&env, None)?;
+        let writer = Self::open_existing_schema_only_with_expected_identity_and_env(
             stable,
             reservation.identity(),
             env,
         )
         .await?;
-        // Install the ceiling on the pager itself, so it is enforced where
-        // pages actually enter the write set rather than recorded at open time.
-        builder.pager.set_write_set_page_limit(page_limit)?;
-        Ok(builder)
+        writer.pager.set_write_set_page_limit(page_limit)?;
+        Ok(writer)
     }
 
     /// Receipt an image at `image_path` **without opening a connection on it**.
@@ -35088,6 +35083,40 @@ impl DatabaseBuilderReservation {
         true
     }
 
+    /// Validate every caller-controlled input before a reserved bounded writer
+    /// invokes a database opener.
+    fn validated_bounded_writer_open(
+        &self,
+        env: &ConnectionEnv,
+        expected_len: Option<u64>,
+    ) -> Result<(usize, String)> {
+        let page_limit = env.validated_schema_only_write_set_page_limit()?;
+        if page_limit != self.write_set_page_limit {
+            return Err(FrankenError::OutOfRange {
+                what: "schema-only bounded writer write-set page limit changed from reservation"
+                    .to_owned(),
+                value: page_limit.to_string(),
+            });
+        }
+        self.revalidate_final_target(expected_len)?;
+
+        let cx = env
+            .runtime()
+            .root_cx
+            .create_child()
+            .with_trace_context(next_trace_id(), 0, 0);
+        let path_text = self.path.to_str().ok_or_else(|| FrankenError::CannotOpen {
+            path: self.path.clone(),
+        })?;
+        let stable = PagerBackend::resolve_stable_database_path(path_text, &cx)?;
+        if Path::new(&stable) != self.path {
+            return Err(FrankenError::CannotOpen {
+                path: self.path.clone(),
+            });
+        }
+        Ok((page_limit, stable))
+    }
+
     /// Fail-closed final validation of the retained create-new authority.
     ///
     /// Call after the private build and immediately before releasing the
@@ -35268,7 +35297,6 @@ fn bounded_identifier_lists_equal(left: &[String], right: &[String]) -> bool {
             .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
-
 /// Everything walker 2 needs to recompute one index key from a table row.
 ///
 /// `key_expressions` covers expression indexes; `predicate` covers partial
@@ -35336,7 +35364,6 @@ fn bounded_increment_validation_counter(counter: &mut u64) -> Result<()> {
     *counter = next;
     Ok(())
 }
-
 
 // ---------------------------------------------------------------------------
 // Gate-B (part 1): bounded expression-AST admission traversal
@@ -35956,7 +35983,6 @@ fn first_unsupported_bounded_ast(
     Ok(None)
 }
 
-
 // ---------------------------------------------------------------------------
 // Gate-B (part 2): admission policies
 //
@@ -35982,9 +36008,9 @@ fn bounded_builtin_scalar_function_supported(
             && (entry.num_args == arity || entry.num_args == -1)
     });
     declared_builtin
-        && registry.find_scalar(name, arity).is_some_and(|function| {
-            function.is_deterministic() && function.arity().accepts(arity)
-        })
+        && registry
+            .find_scalar(name, arity)
+            .is_some_and(|function| function.is_deterministic() && function.arity().accepts(arity))
 }
 
 fn bounded_check_scalar_function_supported(
@@ -36039,7 +36065,6 @@ thread_local! {
     static CURRENT_BOUNDED_CHECK_EVALUATION_BYTES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
-
 struct BoundedCheckFunctionRegistryGuard;
 
 impl BoundedCheckFunctionRegistryGuard {
@@ -36077,7 +36102,6 @@ impl Drop for BoundedCheckEvaluationBudgetGuard {
         });
     }
 }
-
 
 /// Where a page-ownership walk records the pages it claims.
 ///
@@ -41879,9 +41903,11 @@ impl Connection {
         };
         let name = &table.name;
         if let Some(ti) = self.schema_index_of(&name.name) {
-            let known = self.schema.borrow().get(ti).is_some_and(|t| {
-                t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(idx))
-            });
+            let known = self
+                .schema
+                .borrow()
+                .get(ti)
+                .is_some_and(|t| t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(idx)));
             if known {
                 Ok(())
             } else {
@@ -109012,9 +109038,9 @@ fn insert_source_is_memdb_read_free(source: &fsqlite_ast::InsertSource) -> bool 
     match source {
         fsqlite_ast::InsertSource::DefaultValues => true,
         fsqlite_ast::InsertSource::Select(_) => false,
-        fsqlite_ast::InsertSource::Values(rows) => {
-            rows.iter().all(|row| row.iter().all(expr_is_memdb_read_free))
-        }
+        fsqlite_ast::InsertSource::Values(rows) => rows
+            .iter()
+            .all(|row| row.iter().all(expr_is_memdb_read_free)),
     }
 }
 
@@ -129094,17 +129120,18 @@ pub(crate) fn fsqlite_core_test_serializer() -> std::sync::MutexGuard<'static, (
 mod tests {
     use super::{
         BoundPagerPublication, CanonicalHashJoinKey, CommitSeq, ConcurrentRegistry, Connection,
-        ConnectionEnv, DifferentialEvent, FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS,
-        FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS, FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS,
-        FSQLITE_JOIN_EXPR_BINDING_HITS, FSQLITE_JOIN_EXPR_FALLBACK_SCANS,
-        FSQLITE_JOIN_HASH_FAST_PATH_HITS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
-        FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
-        FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, HashJoinKeyMode, HashJoinPair,
-        ImplicitAutoindexSlot, InProcessPageLockTable, IoPollStrategy, LiveVtabRegistryUndo,
-        MAX_TRIGGER_DEPTH, MAX_TRIGGER_PROGRAM_DEPTH, PagerBackend, PagerPublishedSnapshot,
-        PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState,
-        SimplePager, Snapshot, TriggerDepthLimitOverrideGuard, TriggerFrame, TriggerFrameGuard,
-        arm_trigger_stack_probe, attached_schema_key, bind_placeholders_in_select_for_fallback,
+        ConnectionEnv, DatabaseBuilderReservation, DifferentialEvent,
+        FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS, FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS,
+        FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS, FSQLITE_JOIN_EXPR_BINDING_HITS,
+        FSQLITE_JOIN_EXPR_FALLBACK_SCANS, FSQLITE_JOIN_HASH_FAST_PATH_HITS,
+        FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS, FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS,
+        FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS, FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS,
+        HashJoinKeyMode, HashJoinPair, ImplicitAutoindexSlot, InProcessPageLockTable,
+        IoPollStrategy, LiveVtabRegistryUndo, MAX_TRIGGER_DEPTH, MAX_TRIGGER_PROGRAM_DEPTH,
+        PagerBackend, PagerPublishedSnapshot, PragmaSchemaScope, Row, RuntimeConfig,
+        RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
+        TriggerDepthLimitOverrideGuard, TriggerFrame, TriggerFrameGuard, arm_trigger_stack_probe,
+        attached_schema_key, bind_placeholders_in_select_for_fallback,
         build_canonical_hash_join_key, canonical_hash_join_value, canonicalize_select_placeholders,
         cmp_values_with_comparison_affinity, implicit_autoindex_layout, init_global_runtime,
         is_correlated_subquery, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
@@ -158862,7 +158889,9 @@ mod tests {
                 growth_chunk_bytes: 1,
                 max_bytes: Some(image_len),
             });
-            let imported = Connection::import_bytes_with_env(&bytes, env).await.unwrap();
+            let imported = Connection::import_bytes_with_env(&bytes, env)
+                .await
+                .unwrap();
 
             let rows = imported
                 .query("SELECT id, name FROM import_t ORDER BY id;")
@@ -165091,7 +165120,9 @@ mod tests {
             conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, value INTEGER);")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO bench VALUES (5, 1);").await.unwrap();
+            conn.execute("INSERT INTO bench VALUES (5, 1);")
+                .await
+                .unwrap();
             let after_ddl = conn.query(sql).await.unwrap();
             assert_eq!(
                 after_ddl.iter().map(row_values).collect::<Vec<_>>(),
@@ -227251,10 +227282,7 @@ mod pager_routing_tests {
             // bd-a8ygy: plain top-level shapes and the JOIN route were both
             // parsed into Agg descriptors that compute_aggregate's name table
             // does not know, silently yielding NULL. Pin all three.
-            assert_eq!(
-                one("SELECT json_group_array(x) FROM t").await,
-                "[3,1,1,2]"
-            );
+            assert_eq!(one("SELECT json_group_array(x) FROM t").await, "[3,1,1,2]");
             assert_eq!(
                 one("SELECT json_group_object(k, v) FROM kv").await,
                 r#"{"b":2,"a":1,"c":3}"#
@@ -228815,8 +228843,7 @@ mod pager_routing_tests {
             let dir = tempfile::tempdir().unwrap();
             let (source, source_receipt, source_path) =
                 seed_publication_source(dir.path(), "stale-source").await;
-            let candidate_receipt =
-                seed_publication_candidate(dir.path(), "stale-candidate").await;
+            let candidate_receipt = seed_publication_candidate(dir.path(), "stale-candidate").await;
             let candidate_path = dir.path().join("stale-candidate.db");
 
             // Naming the source as its own candidate would publish an image
@@ -228832,11 +228859,7 @@ mod pager_routing_tests {
             // CannotOpen and that is exactly when someone should look again.
             // See bd-bounded-image-api-forward-port-vcnnf.
             let self_publication = source
-                .begin_database_image_publication(
-                    &source_receipt,
-                    &source_receipt,
-                    &source_path,
-                )
+                .begin_database_image_publication(&source_receipt, &source_receipt, &source_path)
                 .await
                 .expect_err("the source is never a valid candidate for itself");
             assert!(
@@ -228875,8 +228898,7 @@ mod pager_routing_tests {
             let dir = tempfile::tempdir().unwrap();
             let (source, source_receipt, _source_path) =
                 seed_publication_source(dir.path(), "drift-source").await;
-            let candidate_receipt =
-                seed_publication_candidate(dir.path(), "drift-candidate").await;
+            let candidate_receipt = seed_publication_candidate(dir.path(), "drift-candidate").await;
             let candidate_path = dir.path().join("drift-candidate.db");
 
             corrupt_one_content_byte(
@@ -229058,13 +229080,291 @@ mod pager_routing_tests {
             // broken handle.
             let rows = validation.query("SELECT COUNT(*) FROM t;").await.unwrap();
             assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
-            validation.close().await.expect("close the validation handle");
+            validation
+                .close()
+                .await
+                .expect("close the validation handle");
 
             assert_eq!(
                 std::fs::read(&image_path).unwrap(),
                 before,
                 "the image must be byte-identical after every refused write"
             );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn build_reopenable_bounded_writer_image(
+        target: &Path,
+        page_limit: usize,
+        page_buffer_max: usize,
+        row_count: i64,
+    ) -> (DatabaseBuilderReservation, ConnectionEnv) {
+        let mut env = ConnectionEnv::default();
+        env.set_schema_only_write_set_page_limit(page_limit);
+        env.set_page_buffer_max(page_buffer_max);
+        let reservation = Connection::reserve_schema_only_builder_target_with_env(target, &env)
+            .expect("reserve bounded-writer target");
+        let writer = Connection::initialize_reserved_schema_only_builder(&reservation, env.clone())
+            .await
+            .expect("initialize bounded writer");
+        writer
+            .execute("PRAGMA journal_mode=DELETE;")
+            .await
+            .expect("use rollback journal for an image-local rollback oracle");
+        writer
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+            .await
+            .expect("create seed table");
+        let payload = "r".repeat(900);
+        for id in 1..=row_count {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({id}, '{payload}');"))
+                .await
+                .expect("grow seed image one bounded transaction at a time");
+        }
+        writer.close().await.expect("close initial bounded writer");
+        reservation
+            .revalidate_final_target(None)
+            .expect("seed image retains reserved identity");
+        (reservation, env)
+    }
+
+    /// Every caller-controlled bounded-reopen input is checked before an
+    /// opener can recover or otherwise touch the image. Ordinary identity-bound
+    /// existing-schema opens deliberately remain outside this opt-in contract.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn reserved_bounded_writer_reopen_requires_exact_limit_while_ordinary_open_is_inert() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("bounded-reopen-inputs.db");
+            let (reservation, env) = build_reopenable_bounded_writer_image(&target, 8, 2, 8).await;
+            let before = std::fs::read(&target).expect("read seed image");
+
+            let missing = Connection::reopen_reserved_schema_only_bounded_writer(
+                &reservation,
+                ConnectionEnv::default(),
+            )
+            .await
+            .expect_err("an absent reopen ceiling must refuse");
+            assert!(matches!(missing, FrankenError::NotImplemented(_)));
+            assert_eq!(std::fs::read(&target).unwrap(), before);
+
+            let mut zero_env = env.clone();
+            zero_env.set_schema_only_write_set_page_limit(0);
+            let zero =
+                Connection::reopen_reserved_schema_only_bounded_writer(&reservation, zero_env)
+                    .await
+                    .expect_err("a zero reopen ceiling must refuse");
+            assert!(matches!(zero, FrankenError::OutOfRange { .. }));
+            assert_eq!(std::fs::read(&target).unwrap(), before);
+
+            let mut drifted_env = env.clone();
+            drifted_env.set_schema_only_write_set_page_limit(9);
+            let drifted =
+                Connection::reopen_reserved_schema_only_bounded_writer(&reservation, drifted_env)
+                    .await
+                    .expect_err("a reservation-limit drift must refuse");
+            assert!(matches!(drifted, FrankenError::OutOfRange { .. }));
+            assert_eq!(std::fs::read(&target).unwrap(), before);
+
+            let ordinary = Connection::open_existing_schema_only_with_expected_identity_and_env(
+                target.to_string_lossy().into_owned(),
+                reservation.identity(),
+                env,
+            )
+            .await
+            .expect("ordinary identity-bound existing-schema open");
+            assert!(
+                ordinary.write_set_stats().unwrap().is_none(),
+                "the reserved-writer env knob must stay inert on an ordinary open"
+            );
+            ordinary.close().await.expect("close ordinary writer");
+        });
+    }
+
+    /// Replacing the reserved pathname with byte-identical content does not
+    /// preserve authority: the retained descriptor identity is load-bearing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn reserved_bounded_writer_reopen_refuses_path_identity_drift_before_open() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("bounded-reopen-identity.db");
+            let moved = dir.path().join("bounded-reopen-retained-inode.db");
+            let (reservation, env) = build_reopenable_bounded_writer_image(&target, 8, 2, 8).await;
+
+            std::fs::rename(&target, &moved).expect("move the retained inode");
+            std::fs::copy(&moved, &target).expect("place byte-identical different identity");
+            let replacement_before = std::fs::read(&target).unwrap();
+
+            let error = Connection::reopen_reserved_schema_only_bounded_writer(&reservation, env)
+                .await
+                .expect_err("path identity drift must refuse before open");
+            assert!(
+                matches!(error, FrankenError::CannotOpen { .. }),
+                "expected CannotOpen for identity drift, got {error:?}"
+            );
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                replacement_before,
+                "a pre-open identity refusal must not mutate the replacement"
+            );
+        });
+    }
+
+    /// The reopened writer admits exactly N distinct full pages, rejects N+1
+    /// before staging, rolls back byte-cleanly, and retains the same ceiling in
+    /// later transactions. A deliberately smaller page-buffer pool proves that
+    /// residency is not being mistaken for the write-set bound.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn reserved_bounded_writer_reopen_enforces_exact_ceiling_across_transactions() {
+        asupersync::test_utils::run_test(|| async {
+            const PAGE_LIMIT: usize = 8;
+            const PAGE_BUFFER_MAX: usize = 2;
+
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("bounded-reopen-exact-cap.db");
+            let (reservation, env) =
+                build_reopenable_bounded_writer_image(&target, PAGE_LIMIT, PAGE_BUFFER_MAX, 96)
+                    .await;
+            let image_before = std::fs::read(&target).expect("read seeded image");
+
+            let writer = Connection::reopen_reserved_schema_only_bounded_writer(&reservation, env)
+                .await
+                .expect("reopen bounded writer");
+            let initial = writer
+                .write_set_stats()
+                .expect("read initial stats")
+                .expect("bounded reopen must expose configured-limit evidence");
+            assert_eq!(initial.page_limit, PAGE_LIMIT);
+            assert_eq!(initial.current_dirty_pages, 0);
+            assert_eq!(initial.dirty_pages_high_water, 0);
+            assert_eq!(initial.cap_refusals, 0);
+            let page_size = initial.byte_limit / initial.page_limit;
+            assert_ne!(
+                PAGE_BUFFER_MAX, PAGE_LIMIT,
+                "the residency and write-set ceilings must be visibly distinct"
+            );
+            assert!(
+                image_before.len() / page_size > PAGE_LIMIT + 1,
+                "the seed image must provide N+1 existing data pages"
+            );
+
+            let cx = writer.op_cx().expect("derive operation context");
+            writer.invalidate_cached_write_txn(&cx).await;
+            writer.invalidate_cached_read_snapshot(&cx).await;
+            let mut txn = writer
+                .pager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .expect("begin exact-cap transaction");
+
+            for ordinal in 0..PAGE_LIMIT {
+                let page_no =
+                    PageNumber::new(u32::try_from(ordinal + 2).expect("small test page number"))
+                        .unwrap();
+                let mut page = txn
+                    .get_page(&cx, page_no)
+                    .await
+                    .expect("read existing page")
+                    .into_vec();
+                let final_byte = page.len() - 1;
+                page[final_byte] ^= u8::try_from(ordinal + 1).unwrap();
+                txn.write_page(&cx, page_no, &page)
+                    .await
+                    .expect("the first N unique pages must be admitted");
+                assert_eq!(
+                    writer
+                        .write_set_stats()
+                        .unwrap()
+                        .expect("configured stats")
+                        .current_dirty_pages,
+                    ordinal + 1
+                );
+            }
+
+            let excess_page = PageNumber::new(u32::try_from(PAGE_LIMIT + 2).unwrap()).unwrap();
+            let mut excess = txn
+                .get_page(&cx, excess_page)
+                .await
+                .expect("read N+1 page")
+                .into_vec();
+            let final_byte = excess.len() - 1;
+            excess[final_byte] ^= 0xA5;
+            let refusal = txn
+                .write_page(&cx, excess_page, &excess)
+                .await
+                .expect_err("N+1 must refuse before staging");
+            assert!(
+                matches!(&refusal, FrankenError::OutOfRange { what, .. }
+                    if what.contains("write-set page limit")),
+                "expected typed write-set refusal, got {refusal:?}"
+            );
+            let refused = writer
+                .write_set_stats()
+                .unwrap()
+                .expect("configured stats after refusal");
+            assert_eq!(refused.current_dirty_pages, PAGE_LIMIT);
+            assert_eq!(refused.dirty_pages_high_water, PAGE_LIMIT);
+            assert_eq!(refused.cap_refusals, 1);
+
+            txn.rollback(&cx)
+                .await
+                .expect("rollback capped transaction");
+            let rolled_back = writer
+                .write_set_stats()
+                .unwrap()
+                .expect("configured stats after rollback");
+            assert_eq!(rolled_back.page_limit, PAGE_LIMIT);
+            assert_eq!(rolled_back.current_dirty_pages, 0);
+            assert_eq!(rolled_back.dirty_pages_high_water, PAGE_LIMIT);
+            assert_eq!(rolled_back.cap_refusals, 1);
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                image_before,
+                "rollback must leave the prior database image intact"
+            );
+
+            let mut later = writer
+                .pager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .expect("begin later transaction");
+            let page_no = PageNumber::new(2).unwrap();
+            let mut page = later
+                .get_page(&cx, page_no)
+                .await
+                .expect("read later page")
+                .into_vec();
+            let final_byte = page.len() - 1;
+            page[final_byte] ^= 0x5A;
+            later
+                .write_page(&cx, page_no, &page)
+                .await
+                .expect("the ceiling remains active and admits later work");
+            let later_active = writer
+                .write_set_stats()
+                .unwrap()
+                .expect("configured stats in later transaction");
+            assert_eq!(later_active.page_limit, PAGE_LIMIT);
+            assert_eq!(later_active.current_dirty_pages, 1);
+            assert_eq!(later_active.dirty_pages_high_water, PAGE_LIMIT);
+            later
+                .rollback(&cx)
+                .await
+                .expect("rollback later transaction");
+            let later_rolled_back = writer
+                .write_set_stats()
+                .unwrap()
+                .expect("configured stats after later rollback");
+            assert_eq!(later_rolled_back.page_limit, PAGE_LIMIT);
+            assert_eq!(later_rolled_back.current_dirty_pages, 0);
+            assert_eq!(later_rolled_back.dirty_pages_high_water, PAGE_LIMIT);
+            assert_eq!(std::fs::read(&target).unwrap(), image_before);
+            writer.close().await.expect("close bounded writer");
         });
     }
 
@@ -229265,10 +229565,9 @@ mod pager_routing_tests {
             // Deliberately tiny: enough to bootstrap, far too small to hold the
             // table pages the loop below writes.
             env.set_schema_only_write_set_page_limit(3);
-            let reservation = Connection::reserve_schema_only_builder_target_with_env(
-                &target, &env,
-            )
-            .expect("reserve a fresh target");
+            let reservation =
+                Connection::reserve_schema_only_builder_target_with_env(&target, &env)
+                    .expect("reserve a fresh target");
             assert_eq!(reservation.write_set_page_limit(), 3);
             assert!(
                 reservation.write_set_limit_enforced(),
@@ -229323,12 +229622,9 @@ mod pager_routing_tests {
             let mut env = ConnectionEnv::default();
             // The same tiny ceiling that refuses the build above.
             env.set_schema_only_write_set_page_limit(3);
-            let conn = Connection::open_with_env(
-                db_path.to_string_lossy().into_owned(),
-                env,
-            )
-            .await
-            .expect("ordinary open must ignore the builder-only ceiling");
+            let conn = Connection::open_with_env(db_path.to_string_lossy().into_owned(), env)
+                .await
+                .expect("ordinary open must ignore the builder-only ceiling");
 
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
                 .await
@@ -229354,10 +229650,9 @@ mod pager_routing_tests {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
 
-            let missing = Connection::reserve_schema_only_builder_target(
-                dir.path().join("no-ceiling.db"),
-            )
-            .expect_err("an absent ceiling must refuse rather than default");
+            let missing =
+                Connection::reserve_schema_only_builder_target(dir.path().join("no-ceiling.db"))
+                    .expect_err("an absent ceiling must refuse rather than default");
             assert!(
                 matches!(missing, FrankenError::NotImplemented(_)),
                 "expected NotImplemented, got {missing:?}"
@@ -229390,9 +229685,8 @@ mod pager_routing_tests {
 
             let mut env = ConnectionEnv::default();
             env.set_schema_only_write_set_page_limit(64);
-            let error =
-                Connection::reserve_schema_only_builder_target_with_env(&occupied, &env)
-                    .expect_err("an occupied path must never be claimed");
+            let error = Connection::reserve_schema_only_builder_target_with_env(&occupied, &env)
+                .expect_err("an occupied path must never be claimed");
             assert!(
                 matches!(error, FrankenError::CannotOpen { .. }),
                 "expected CannotOpen, got {error:?}"
@@ -229408,7 +229702,10 @@ mod pager_routing_tests {
     /// Build a self-contained image carrying an index and a foreign key, so the
     /// semantic walkers have something real to reconcile.
     #[cfg(not(target_arch = "wasm32"))]
-    async fn build_semantic_image(dir: &Path, stem: &str) -> (std::path::PathBuf, DatabaseImageReceipt) {
+    async fn build_semantic_image(
+        dir: &Path,
+        stem: &str,
+    ) -> (std::path::PathBuf, DatabaseImageReceipt) {
         let image_path = dir.join(format!("{stem}.db"));
         let receipt = build_self_contained_image(
             &dir.join(format!("{stem}-builder.db")),
@@ -229437,7 +229734,10 @@ mod pager_routing_tests {
             let (image_path, receipt) = build_semantic_image(dir.path(), "sem-ok").await;
 
             let owner = Connection::open(
-                dir.path().join("sem-ok-owner.db").to_string_lossy().into_owned(),
+                dir.path()
+                    .join("sem-ok-owner.db")
+                    .to_string_lossy()
+                    .into_owned(),
             )
             .await
             .unwrap();
@@ -229468,7 +229768,10 @@ mod pager_routing_tests {
                 u64::from(stats.structural.database_pages),
                 "the contained structural proof must still be one byte per page"
             );
-            snapshot.finish().await.expect("unchanged image recertifies");
+            snapshot
+                .finish()
+                .await
+                .expect("unchanged image recertifies");
         });
     }
 
@@ -229492,10 +229795,7 @@ mod pager_routing_tests {
             let surgeon = Connection::open(image_path.to_string_lossy().into_owned())
                 .await
                 .expect("reopen the image to damage concordance");
-            surgeon
-                .execute("PRAGMA writable_schema=ON;")
-                .await
-                .ok();
+            surgeon.execute("PRAGMA writable_schema=ON;").await.ok();
             let dropped = surgeon.execute("DROP INDEX child_tag;").await;
             assert!(dropped.is_ok(), "precondition: index drop must succeed");
             surgeon
@@ -229505,7 +229805,10 @@ mod pager_routing_tests {
             surgeon.close().await.expect("close the surgeon");
 
             let owner = Connection::open(
-                dir.path().join("sem-bad-owner.db").to_string_lossy().into_owned(),
+                dir.path()
+                    .join("sem-bad-owner.db")
+                    .to_string_lossy()
+                    .into_owned(),
             )
             .await
             .unwrap();
@@ -229576,7 +229879,10 @@ mod pager_routing_tests {
             .await;
 
             let owner = Connection::open(
-                dir.path().join("trig-ok-owner.db").to_string_lossy().into_owned(),
+                dir.path()
+                    .join("trig-ok-owner.db")
+                    .to_string_lossy()
+                    .into_owned(),
             )
             .await
             .unwrap();
@@ -229627,7 +229933,10 @@ mod pager_routing_tests {
             .await;
 
             let owner = Connection::open(
-                dir.path().join("trig-bad-owner.db").to_string_lossy().into_owned(),
+                dir.path()
+                    .join("trig-bad-owner.db")
+                    .to_string_lossy()
+                    .into_owned(),
             )
             .await
             .unwrap();
