@@ -18597,7 +18597,8 @@ fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &m
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Collate { expr: inner, .. }
-        | Expr::Cast { expr: inner, .. } => {
+        | Expr::Cast { expr: inner, .. }
+        | Expr::In { expr: inner, .. } => {
             collect_having_bare_columns(inner, table, agg_columns);
         }
         Expr::Between {
@@ -18609,9 +18610,6 @@ fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &m
             collect_having_bare_columns(inner, table, agg_columns);
             collect_having_bare_columns(low, table, agg_columns);
             collect_having_bare_columns(high, table, agg_columns);
-        }
-        Expr::In { expr: inner, .. } => {
-            collect_having_bare_columns(inner, table, agg_columns);
         }
         Expr::Like {
             expr: inner,
@@ -18643,11 +18641,12 @@ fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &m
             }
         }
         // Non-aggregate function calls may carry bare columns in their arguments.
-        Expr::FunctionCall { args, .. } => {
-            if let FunctionArgs::List(list) = args {
-                for arg in list {
-                    collect_having_bare_columns(arg, table, agg_columns);
-                }
+        Expr::FunctionCall {
+            args: FunctionArgs::List(list),
+            ..
+        } => {
+            for arg in list {
+                collect_having_bare_columns(arg, table, agg_columns);
             }
         }
         _ => {}
