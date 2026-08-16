@@ -33374,6 +33374,25 @@ impl Connection {
                         )?;
                     }
                 }
+                // Live virtual tables (rtree, fts5, ...) apply DML through their
+                // module's xUpdate; the VDBE update program below only mutates
+                // ordinary B-tree tables, so a live UPDATE would persist to the
+                // backing storage yet leave the in-memory module instance serving
+                // same-connection scans stale (GH #208). Virtual tables carry
+                // neither triggers nor FK constraints, so route straight through
+                // the module here, mirroring the live DELETE branch.
+                if self.has_live_vtab_instance(table_name) {
+                    if !effective_update.returning.is_empty() {
+                        return Err(FrankenError::NotImplemented(
+                            "RETURNING is not supported for live virtual-table UPDATE".to_owned(),
+                        ));
+                    }
+                    let affected = self
+                        .execute_live_vtab_update(&effective_update, params)
+                        .await?;
+                    self.record_statement_changes(affected);
+                    return Ok(Vec::new());
+                }
                 let targets_shadowed_main =
                     self.targets_shadowed_main(&effective_update.table.name);
                 // Collect columns being updated for UPDATE OF trigger matching.
@@ -44570,6 +44589,82 @@ impl Connection {
 
         self.execute_live_vtab_delete_rowids(&table_name, &rowids)
             .await
+    }
+
+    /// Apply an UPDATE to a live virtual-table instance (rtree, fts5, ...).
+    ///
+    /// The VDBE update program only mutates ordinary B-tree tables, so a live
+    /// UPDATE persists to the backing storage but leaves the in-memory module
+    /// instance serving same-connection scans stale (GH #208 — the change is
+    /// only visible after reopening). A vtab `xUpdate` is a delete of the old
+    /// row followed by an insert of the new one, so recompute the post-SET row
+    /// images and replay them onto the live instance via the same delete/insert
+    /// plumbing DELETE and INSERT already use.
+    async fn execute_live_vtab_update(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<usize> {
+        let table_name = update.table.name.name.clone();
+
+        // Enumerate the affected rowids via the live scan the user sees (same
+        // table + predicate as the NEW-image collection below, so the two lists
+        // align positionally). An empty/no-WHERE update touches every row.
+        let rowid_select = Self::build_single_table_select(
+            &update.table,
+            vec![ResultColumn::Expr {
+                expr: Expr::Column(
+                    fsqlite_ast::ColumnRef::bare("rowid"),
+                    fsqlite_ast::Span::new(0, 0),
+                ),
+                alias: None,
+            }],
+            update.where_clause.as_ref(),
+            &[],
+            None,
+        );
+        let matched = self
+            .execute_statement(&Statement::Select(rowid_select), params)
+            .await?;
+        let mut old_rowids: Vec<i64> = Vec::with_capacity(matched.len());
+        for row in &matched {
+            match row.values().first() {
+                Some(SqliteValue::Integer(rowid)) => old_rowids.push(*rowid),
+                _ => {
+                    return Err(FrankenError::Internal(format!(
+                        "live virtual-table UPDATE on {table_name} produced a row without an integer rowid",
+                    )));
+                }
+            }
+        }
+        if old_rowids.is_empty() {
+            return Ok(0);
+        }
+
+        // Recompute the post-SET NEW row images (column order), same scan order.
+        let trigger_rows = self.collect_update_trigger_rows(update, params).await?;
+        if trigger_rows.len() != old_rowids.len() {
+            return Err(FrankenError::Internal(format!(
+                "live virtual-table UPDATE on {table_name}: rowid/new-image count mismatch ({} vs {})",
+                old_rowids.len(),
+                trigger_rows.len(),
+            )));
+        }
+        let new_rows: Vec<LiveVtabInsertRow> = old_rowids
+            .iter()
+            .zip(trigger_rows)
+            .map(|(rowid, (_old, new_values))| LiveVtabInsertRow {
+                explicit_rowid: Some(SqliteValue::Integer(*rowid)),
+                values: new_values,
+            })
+            .collect();
+
+        // xUpdate == delete the old rows, then insert the recomputed rows.
+        self.execute_live_vtab_delete_rowids(&table_name, &old_rowids)
+            .await?;
+        self.execute_live_vtab_insert_rows(&table_name, &new_rows)
+            .await?;
+        Ok(old_rowids.len())
     }
 
     async fn execute_live_vtab_delete_rowids(
