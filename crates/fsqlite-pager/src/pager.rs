@@ -4937,8 +4937,17 @@ async fn async_rwlock_read<'a, T>(
     cx: &Cx,
     label: &str,
 ) -> Result<asupersync::sync::RwLockReadGuard<'a, T>> {
+    // The native fast path delegates cancellation to the attached native cx's
+    // own `checkpoint()`, which does NOT observe the wrapper's `mask_depth`.
+    // Inside a masked section (a mandatory post-commit rebind, or a caller that
+    // has masked cancellation across a critical read) the acquire must still
+    // complete even if the attached native cx is cancelled, so skip the native
+    // fast path and fall through to the mask-aware loop below, whose
+    // `cx.checkpoint()` honors the mask.
     #[cfg(feature = "native")]
-    if let Some(native_cx) = cx.attached_native_cx() {
+    if cx.mask_depth() == 0
+        && let Some(native_cx) = cx.attached_native_cx()
+    {
         return lock
             .read(&native_cx)
             .await
@@ -4966,8 +4975,13 @@ async fn async_rwlock_write<'a, T>(
     cx: &Cx,
     label: &str,
 ) -> Result<asupersync::sync::RwLockWriteGuard<'a, T>> {
+    // See `async_rwlock_read`: the native fast path bypasses the wrapper's
+    // `mask_depth`, so a masked acquisition must fall through to the mask-aware
+    // loop below to complete under a cancelled-but-masked context.
     #[cfg(feature = "native")]
-    if let Some(native_cx) = cx.attached_native_cx() {
+    if cx.mask_depth() == 0
+        && let Some(native_cx) = cx.attached_native_cx()
+    {
         return lock.write(&native_cx).await.map_err(|error| {
             FrankenError::internal(format!("{label} write lock failed: {error}"))
         });
