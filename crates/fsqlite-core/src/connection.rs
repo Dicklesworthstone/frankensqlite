@@ -95773,9 +95773,43 @@ struct SharedMvccCoordinationState {
     /// this minus the reading connection's own write-commit count, so it moves
     /// only when ANOTHER connection commits (stock semantics).
     data_version_global: Arc<AtomicU64>,
+    /// File-scoped background-worker poison, shared by EVERY connection to the
+    /// same file regardless of which [`RuntimeContext`] opened it.
+    ///
+    /// The per-runtime poison on [`SharedMvccState`] alone is insufficient: two
+    /// connections to the same file opened on *different* runtimes (e.g. after
+    /// [`init_global_runtime`] swaps the process-global runtime between opens)
+    /// hold DISTINCT `SharedMvccState` instances keyed by `runtime_id`, so a
+    /// fatal poison recorded through one would never reach the other. Recording
+    /// it here — on the file-identity-keyed coordination state — makes the
+    /// failure cascade to every connection and every new open on the file.
+    ///
+    /// `is_poisoned` is the single-atomic fast path; `poison_cause` holds the
+    /// verbatim cause string, read only once the flag is set.
+    is_poisoned: AtomicBool,
+    poison_cause: Mutex<Option<String>>,
 }
 
 impl SharedMvccCoordinationState {
+    /// Record a fatal, file-scoped poison. Idempotent — the first cause wins,
+    /// matching [`SharedMvccState::poison`]'s single-shot semantics.
+    fn poison(&self, details: &str) {
+        let mut slot = lock_unpoisoned(&self.poison_cause);
+        if slot.is_none() {
+            *slot = Some(details.to_owned());
+            self.is_poisoned.store(true, AtomicOrdering::Release);
+        }
+    }
+
+    /// Fast file-scoped poison probe: a single relaxed atomic load on the hot
+    /// path, cloning the cause string only when the flag is actually set.
+    fn poison_details(&self) -> Option<String> {
+        if !self.is_poisoned.load(AtomicOrdering::Relaxed) {
+            return None;
+        }
+        lock_unpoisoned(&self.poison_cause).clone()
+    }
+
     fn new() -> Self {
         let conflict_observer = Arc::new(MetricsObserver::new(1024));
         Self {
@@ -95793,6 +95827,8 @@ impl SharedMvccCoordinationState {
             committed_schema_cookie: Arc::new(AtomicU32::new(0)),
             open_connection_count: Arc::new(AtomicUsize::new(0)),
             data_version_global: Arc::new(AtomicU64::new(0)),
+            is_poisoned: AtomicBool::new(false),
+            poison_cause: Mutex::new(None),
         }
     }
 }
@@ -95946,16 +95982,24 @@ impl SharedMvccState {
         if profile_enabled {
             FSQLITE_BACKGROUND_STATUS_CHECKS.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        // Fast path: single atomic load avoids mutex lock on every statement.
-        // is_poisoned is only set when a background worker reports a fatal
-        // error — on the normal hot path this is a single cache-line read.
-        let result = if !self.is_poisoned.load(AtomicOrdering::Relaxed) {
+        // Fast path: two relaxed atomic loads avoid any mutex lock on every
+        // statement. `is_poisoned` is only set when a background worker reports
+        // a fatal error — on the normal hot path this is a pair of cache-line
+        // reads. The coordination flag is consulted too so that a poison
+        // recorded through a sibling connection on a DIFFERENT runtime (but the
+        // same file) still short-circuits this connection's statements.
+        let result = if !self.is_poisoned.load(AtomicOrdering::Relaxed)
+            && !self._coordination.is_poisoned.load(AtomicOrdering::Relaxed)
+        {
             Ok(())
         } else {
             let state = lock_unpoisoned(&self.runtime_state);
             match &state.poisoned {
                 Some(details) => Err(FrankenError::BackgroundWorkerFailed(details.clone())),
-                None => Ok(()),
+                None => match self._coordination.poison_details() {
+                    Some(details) => Err(FrankenError::BackgroundWorkerFailed(details)),
+                    None => Ok(()),
+                },
             }
         };
         if profile_enabled {
@@ -95968,6 +96012,12 @@ impl SharedMvccState {
         let mut state = lock_unpoisoned(&self.runtime_state);
         if let Some(details) = &state.poisoned {
             return Err(FrankenError::BackgroundWorkerFailed(details.clone()));
+        }
+        // Refuse to wire up a new connection when the FILE is already poisoned,
+        // even if this open is happening on a fresh runtime whose per-runtime
+        // `SharedMvccState` has never seen the failure.
+        if let Some(details) = self._coordination.poison_details() {
+            return Err(FrankenError::BackgroundWorkerFailed(details));
         }
 
         let db_root_cx = state
@@ -96386,6 +96436,11 @@ impl SharedMvccState {
 
         state.poisoned = Some(details.clone());
         self.is_poisoned.store(true, AtomicOrdering::Release);
+        // Also poison the file-scoped coordination state so the failure
+        // cascades to connections on the same file opened under a different
+        // runtime (whose `SharedMvccState` — keyed by `runtime_id` — would
+        // otherwise carry an independent, unpoisoned flag).
+        self._coordination.poison(&details);
         if let Some(db_root_cx) = state.regions.cx(state.db_root_region) {
             db_root_cx.cancel_with_reason(CancelReason::Abort);
         }
