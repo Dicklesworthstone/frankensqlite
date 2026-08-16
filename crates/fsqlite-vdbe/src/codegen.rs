@@ -34761,11 +34761,14 @@ fn emit_expr_with_fallback(
                 b.free_temp(r_op);
             } else {
                 for (when_expr, then_expr) in whens {
-                    let r_when = b.alloc_temp();
-                    emit_expr_with_fallback(b, when_expr, r_when, inner_ctx, outer_ctx);
+                    // Searched CASE WHEN is a TRUTH context: short-circuit AND/OR
+                    // left-to-right so a would-be-skipped erroring operand is
+                    // never evaluated (bd-and-or-short-circuit-value-jump-gaps-dkswh
+                    // GAP-2). Non-AND/OR conditions emit byte-identically.
                     let next = b.emit_label();
-                    b.emit_jump_to_label(Opcode::IfNot, r_when, 1, next, P4::None, 0);
-                    b.free_temp(r_when);
+                    emit_searched_case_when_condition_with_fallback(
+                        b, when_expr, next, inner_ctx, outer_ctx,
+                    );
                     emit_expr_with_fallback(b, then_expr, reg, inner_ctx, outer_ctx);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
                     b.resolve_label(next);
@@ -35523,10 +35526,13 @@ fn emit_case_expr(
             );
             b.free_temp(r_when);
         } else {
-            // Searched CASE: each WHEN is a boolean condition.
-            emit_expr(b, when_expr, reg, ctx);
-            // If condition is false/null, skip to next WHEN.
-            b.emit_jump_to_label(Opcode::IfNot, reg, 1, next_when, P4::None, 0);
+            // Searched CASE: each WHEN is a boolean condition in a TRUTH context.
+            // Stock sqlite3 short-circuits AND/OR left-to-right here (an
+            // sqlite3ExprIfFalse analog), so a would-be-skipped operand that
+            // errors is never evaluated — matching WHERE-filter behavior
+            // (bd-and-or-short-circuit-value-jump-gaps-dkswh GAP-2). A non-AND/OR
+            // condition emits byte-identically to the prior eager sequence.
+            emit_searched_case_when_condition(b, when_expr, reg, next_when, ctx);
         }
 
         // Emit THEN expression.
@@ -35547,6 +35553,114 @@ fn emit_case_expr(
 
     if let Some(r_op) = r_operand {
         b.free_temp(r_op);
+    }
+}
+
+/// Emit a searched-CASE `WHEN` condition in TRUTH context: jump to `false_label`
+/// when the condition is NOT TRUE (i.e. FALSE or NULL), short-circuiting AND/OR
+/// left-to-right so a would-be-skipped operand is never evaluated. This mirrors
+/// stock sqlite3's `sqlite3ExprIfFalse(jumpIfNull=1)` polarity used for WHERE /
+/// CASE-WHEN — the same structure `emit_where_filter_with_ctx` already applies to
+/// WHERE conjuncts/disjuncts (bd-and-or-short-circuit-value-jump-gaps-dkswh
+/// GAP-2). `scratch` is a register the caller no longer needs after the branch
+/// (the WHEN result is transient). A non-AND/OR condition emits exactly the prior
+/// eager sequence — `emit_expr(cond, scratch); IfNot scratch,1 -> false_label` —
+/// so bytecode is unchanged for every condition except an AND/OR-topped one.
+///
+/// Three-valued correctness (seeking TRUE):
+/// - leaf: `IfNot p2=1` jumps iff cond is FALSE or NULL (i.e. not TRUE);
+/// - `A AND B`: jump if either is not TRUE -> taken iff both TRUE;
+/// - `A OR B`: if A is TRUE the whole is TRUE (skip B); else the result is B's
+///   truth value -> taken iff A TRUE or B TRUE.
+fn emit_searched_case_when_condition(
+    b: &mut ProgramBuilder,
+    cond: &Expr,
+    scratch: i32,
+    false_label: crate::Label,
+    ctx: Option<&ScanCtx<'_>>,
+) {
+    match cond {
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } => {
+            emit_searched_case_when_condition(b, left, scratch, false_label, ctx);
+            emit_searched_case_when_condition(b, right, scratch, false_label, ctx);
+        }
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::Or,
+            right,
+            ..
+        } => {
+            let left_false = b.emit_label();
+            let pass = b.emit_label();
+            emit_searched_case_when_condition(b, left, scratch, left_false, ctx);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, pass, P4::None, 0);
+            b.resolve_label(left_false);
+            emit_searched_case_when_condition(b, right, scratch, false_label, ctx);
+            b.resolve_label(pass);
+        }
+        _ => {
+            emit_expr(b, cond, scratch, ctx);
+            b.emit_jump_to_label(Opcode::IfNot, scratch, 1, false_label, P4::None, 0);
+        }
+    }
+}
+
+/// Correlation-aware (inner/outer `ScanCtx`) counterpart of
+/// [`emit_searched_case_when_condition`], for the searched-CASE arm of
+/// `emit_expr_with_fallback`. Leaves are emitted through `emit_expr_with_fallback`
+/// (each into its own temp, exactly as the prior eager code did), so outer-column
+/// correlation resolution is preserved; only AND/OR-topped conditions change,
+/// gaining left-to-right short-circuit.
+fn emit_searched_case_when_condition_with_fallback(
+    b: &mut ProgramBuilder,
+    cond: &Expr,
+    false_label: crate::Label,
+    inner_ctx: &ScanCtx<'_>,
+    outer_ctx: Option<&ScanCtx<'_>>,
+) {
+    match cond {
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } => {
+            emit_searched_case_when_condition_with_fallback(
+                b, left, false_label, inner_ctx, outer_ctx,
+            );
+            emit_searched_case_when_condition_with_fallback(
+                b, right, false_label, inner_ctx, outer_ctx,
+            );
+        }
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::Or,
+            right,
+            ..
+        } => {
+            let left_false = b.emit_label();
+            let pass = b.emit_label();
+            emit_searched_case_when_condition_with_fallback(
+                b, left, left_false, inner_ctx, outer_ctx,
+            );
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, pass, P4::None, 0);
+            b.resolve_label(left_false);
+            emit_searched_case_when_condition_with_fallback(
+                b, right, false_label, inner_ctx, outer_ctx,
+            );
+            b.resolve_label(pass);
+        }
+        _ => {
+            let r_when = b.alloc_temp();
+            emit_expr_with_fallback(b, cond, r_when, inner_ctx, outer_ctx);
+            b.emit_jump_to_label(Opcode::IfNot, r_when, 1, false_label, P4::None, 0);
+            b.free_temp(r_when);
+        }
     }
 }
 
