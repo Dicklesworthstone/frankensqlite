@@ -21873,9 +21873,26 @@ impl Connection {
             let mut modules = self.vtab_modules.borrow_mut();
             modules.insert(name.to_ascii_uppercase(), Arc::from(factory))
         };
-        // Publish invalidation before a displaced user-defined factory can
-        // re-enter and execute a prepared statement against the replacement.
-        self.note_function_registry_changed();
+        // Adding a brand-new module cannot invalidate any prepared statement or
+        // compiled program that already exists — nothing could have referenced
+        // the module before it was created. Advancing the function-registry
+        // generation for such an addition would spuriously abort an in-flight
+        // CREATE / prepare / connect whose own (deliberately reentrant) metadata
+        // or connect callback registers an *unrelated* module: the generation
+        // guard on `invoke_live_vtab_callback` and the prepare stability loop
+        // would both observe the bump and fail with `SchemaChanged`. Only a
+        // *replacement* invalidates existing dependents, so publish invalidation
+        // (bump the generation, before a displaced user-defined factory can
+        // re-enter and execute a prepared statement against the replacement)
+        // solely on replacement. An addition still evicts the compilation reuse
+        // caches — a name that previously fell back to a built-in table function
+        // now resolves to the new module — but leaves generation-scoped prepared
+        // statement identity untouched.
+        if displaced_factory.is_some() {
+            self.note_function_registry_changed();
+        } else {
+            self.clear_compilation_reuse_caches();
+        }
         // Drop only after the registry RefCell borrow has ended.
         drop(displaced_factory);
     }
