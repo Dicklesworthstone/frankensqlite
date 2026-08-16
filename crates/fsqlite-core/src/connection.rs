@@ -79509,6 +79509,17 @@ impl Connection {
         &self,
         insert: &fsqlite_ast::InsertStatement,
     ) -> Result<VdbeProgram> {
+        // GH #284: reject direct DML on the schema table with writable_schema
+        // OFF (SQLITE_ERROR), rather than the generic "no such table" the
+        // resolve below would raise (sqlite_master is not a user-schema table).
+        if is_sqlite_schema_name(&insert.table.name)
+            && !self.pragma_state.borrow().writable_schema
+        {
+            return Err(FrankenError::FunctionError(format!(
+                "table {} may not be modified",
+                insert.table.name
+            )));
+        }
         // Resolve any subqueries inside VALUES expressions before VDBE codegen,
         // because emit_expr receives None scan context for VALUES rows and
         // cannot handle Expr::Subquery/Expr::Exists.
@@ -79627,6 +79638,19 @@ impl Connection {
 
     /// Compile an UPDATE through the VDBE codegen.
     fn compile_table_update(&self, update: &fsqlite_ast::UpdateStatement) -> Result<VdbeProgram> {
+        // Direct DML on the schema table with writable_schema OFF is rejected
+        // with SQLITE_ERROR here — the resolve below would otherwise raise the
+        // generic "no such table" (sqlite_master is not a user-schema table).
+        // writable_schema=ON schema DML is handled before reaching compile.
+        // (GH #284)
+        if is_sqlite_schema_name(&update.table.name.name)
+            && !self.pragma_state.borrow().writable_schema
+        {
+            return Err(FrankenError::FunctionError(format!(
+                "table {} may not be modified",
+                update.table.name.name
+            )));
+        }
         let targets_shadowed_main = self.targets_shadowed_main(&update.table.name);
         let rowid_alias_col_idx = {
             let visible_schema = self.schema.borrow();
@@ -79677,6 +79701,17 @@ impl Connection {
 
     /// Compile a DELETE through the VDBE codegen.
     fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
+        // GH #284: reject direct DML on the schema table with writable_schema
+        // OFF (SQLITE_ERROR), rather than the generic "no such table" the
+        // resolve below would raise (sqlite_master is not a user-schema table).
+        if is_sqlite_schema_name(&delete.table.name.name)
+            && !self.pragma_state.borrow().writable_schema
+        {
+            return Err(FrankenError::FunctionError(format!(
+                "table {} may not be modified",
+                delete.table.name.name
+            )));
+        }
         let targets_shadowed_main = self.targets_shadowed_main(&delete.table.name);
         {
             let visible_schema = self.schema.borrow();
