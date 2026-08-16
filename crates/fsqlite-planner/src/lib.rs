@@ -2752,14 +2752,26 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
             op: AstBinaryOp::Lt | AstBinaryOp::Le | AstBinaryOp::Gt | AstBinaryOp::Ge,
             right,
             ..
-        } => {
-            let column = extract_where_column(left).or_else(|| extract_where_column(right));
-            WhereTerm {
+        } => match extract_where_column(left).or_else(|| extract_where_column(right)) {
+            Some(column) => WhereTerm {
                 expr,
-                column,
+                column: Some(column),
                 kind: WhereTermKind::Range,
-            }
-        }
+            },
+            // bd-rwaxp: no plain column on either side — e.g. an expression-index
+            // key range like `lower(name) >= ?1`. Classify as Other (mirroring the
+            // Eq arm above), so the expression-index-key access path in
+            // `table_local_index_probe_is_evaluable` applies. Leaving it as Range
+            // with no column made the unqualified-single-table access-term filter
+            // drop it (that filter's Range case requires a plain column), so the
+            // planner never surfaced IndexScanRange for a plain expression-index
+            // range (only the aliased/partial form, which skips that filter, did).
+            None => WhereTerm {
+                expr,
+                column: None,
+                kind: WhereTermKind::Other,
+            },
+        },
 
         // col BETWEEN low AND high
         Expr::Between {
