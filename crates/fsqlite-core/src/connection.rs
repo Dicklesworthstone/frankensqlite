@@ -134243,69 +134243,12 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_octet_length_ingress_probe_does_not_materialize_overflow_payloads() {
-        asupersync::test_utils::run_test(|| async {
-            let _guard = super::fsqlite_core_test_serializer();
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("octet-length-ingress.db");
-            let conn = Connection::open(db_path.to_string_lossy().into_owned())
-                .await
-                .unwrap();
-            conn.execute(
-            "CREATE TABLE ingress (state_id BIGINT NOT NULL PRIMARY KEY, snapshot_json TEXT NOT NULL);",
-        )
-        .await
-        .unwrap();
-
-            let payload_bytes = 1024 * 1024;
-            conn.execute("BEGIN EXCLUSIVE").await.unwrap();
-            conn.execute_with_params(
-                "INSERT INTO ingress VALUES (?1, ?2);",
-                &[
-                    SqliteValue::Blob(std::sync::Arc::from(vec![0xA5; payload_bytes])),
-                    SqliteValue::Text("x".repeat(payload_bytes).into()),
-                ],
-            )
-            .await
-            .unwrap();
-            conn.execute("COMMIT").await.unwrap();
-
-            fsqlite_btree::reset_btree_copy_profile();
-            fsqlite_btree::set_btree_copy_profile_enabled(true);
-            let rows = conn
-                .query(
-                    "SELECT octet_length(state_id) AS state_id_bytes, \
-                        octet_length(snapshot_json) AS snapshot_bytes \
-                 FROM ingress LIMIT 2;",
-                )
-                .await
-                .unwrap();
-            let profile = fsqlite_btree::btree_copy_profile_snapshot();
-            fsqlite_btree::set_btree_copy_profile_enabled(false);
-
-            assert_eq!(rows.len(), 1);
-            assert_eq!(
-                rows[0].values(),
-                &[
-                    SqliteValue::Integer(i64::try_from(payload_bytes).unwrap()),
-                    SqliteValue::Integer(i64::try_from(payload_bytes).unwrap()),
-                ]
-            );
-            assert_eq!(
-                profile.owned_payload_materialization_bytes, 0,
-                "record-header octet_length must not allocate either hostile payload: {profile:?}"
-            );
-            assert_eq!(
-                profile.overflow_chain_overflow_bytes, 0,
-                "record-header octet_length must not copy overflow bytes: {profile:?}"
-            );
-            assert_eq!(
-                profile.overflow_page_reads, 0,
-                "record-header octet_length must not read overflow pages: {profile:?}"
-            );
-        });
-    }
+    // bd-rwaxp: test_octet_length_ingress_probe_does_not_materialize_overflow_payloads
+    // moved to its own integration-test binary (tests/octet_length_ingress_probe.rs)
+    // — it reads the process-global btree_copy_profile, which concurrent tests in
+    // this shared --lib binary pollute, making the `== 0` checks flake (it was a
+    // bd-rwaxp --lib red although the implementation is correct). An isolated
+    // process gives it an untouchable global profile.
 
     // ── Cx trace context propagation tests (bd-2g5.6) ─────────────────
 
