@@ -2226,6 +2226,25 @@ where
     create_missing: bool,
     #[cfg(all(feature = "native", any(unix, windows)))]
     namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
+    /// Cached read-only descriptor for the per-commit FCW page-baseline
+    /// verification in [`Self::conflicts_after_generation_change`] (bd-smxhz).
+    ///
+    /// That verification path is hot under concurrent writers — every commit
+    /// whose snapshot generation was overtaken by a peer re-opens the main DB,
+    /// reads `page_one` plus baseline pages, and closes, once per commit. On a
+    /// contended disk this per-commit open/close storm serializes all writers
+    /// through metadata syscalls, collapsing separate-tables write scaling.
+    ///
+    /// Holding the descriptor across commits is safe: `vfs.open` acquires no
+    /// lock (locking is separate fcntl machinery), the descriptor tracks the
+    /// inode so in-place checkpoints are seen live, and inode *replacement*
+    /// (VACUUM/checkpoint-truncate to a new inode) is caught upstream by
+    /// `validate_path_identity` in [`Self::ensure_current_wal_path`] — which
+    /// runs before this path and fails the whole operation, so the cached fd is
+    /// never read against a replaced file. Any read/header anomaly on the
+    /// cached fd closes it and leaves this `None`, forcing a fresh open next
+    /// commit (self-healing invalidation).
+    cached_verification_db: Option<V::File>,
     inner: WalBackendAdapter<V::File>,
 }
 
@@ -2254,6 +2273,7 @@ where
             create_missing,
             #[cfg(all(feature = "native", any(unix, windows)))]
             namespace_binding,
+            cached_verification_db: None,
             inner: WalBackendAdapter::new(wal),
         }
     }
@@ -2389,10 +2409,21 @@ where
             }
         }
 
-        let main_db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
-        let (mut db_file, _) = match self.vfs.open(cx, Some(&self.db_path), main_db_flags) {
-            Ok(opened) => opened,
-            Err(_) => return candidates,
+        // bd-smxhz: reuse a cached read-only descriptor across commits instead
+        // of opening/closing the main DB per commit. Take it into an owned
+        // local so `self.inner.read_page` below can borrow disjointly, and so
+        // any early-return anomaly path naturally leaves the cache empty
+        // (self-healing invalidation — the fd is closed and not restored, so
+        // the next commit re-opens). The success path restores it for reuse.
+        let mut db_file = match self.cached_verification_db.take() {
+            Some(cached) => cached,
+            None => {
+                let main_db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+                match self.vfs.open(cx, Some(&self.db_path), main_db_flags) {
+                    Ok((file, _)) => file,
+                    Err(_) => return candidates,
+                }
+            }
         };
         let page_size = match usize::try_from(self.page_size) {
             Ok(page_size) if page_size > 0 => page_size,
@@ -2470,9 +2501,11 @@ where
             }
         }
 
-        if db_file.close(cx).is_err() {
-            return candidates;
-        }
+        // Success: retain the descriptor for the next commit's verification
+        // rather than closing it. Every read above is read-only, so deferring
+        // the close (to backend teardown / Drop) has no durability impact, and
+        // it eliminates the per-commit open/close syscall storm (bd-smxhz).
+        self.cached_verification_db = Some(db_file);
         conflicts.sort_unstable();
         conflicts.dedup();
         conflicts
@@ -5851,6 +5884,54 @@ mod tests {
         assert!(
             conflicts.is_empty(),
             "byte-identical checkpoint-only reset must not create a false conflict"
+        );
+    }
+
+    /// bd-smxhz regression: the per-commit FCW verification descriptor is
+    /// cached across generation-change conflict checks to eliminate the
+    /// per-commit open/close syscall storm. Prove the cached fd observes
+    /// *live* main-database content on reuse rather than serving stale bytes
+    /// from the first open — a stale cached read would wrongly clear a commit
+    /// that actually conflicts with a checkpointed external write.
+    #[test]
+    fn test_generation_change_cached_verification_fd_reads_live_main_db_content() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
+        let baseline = TransactionConflictPageBaseline {
+            page_number: 2,
+            page_hash: *blake3::hash(&page_two).as_bytes(),
+        };
+
+        // First check populates the cached verification descriptor: main-db
+        // page 2 still matches the baseline, so there is no conflict.
+        let first = backend
+            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
+            .expect("first (cache-populating) generation-change verification");
+        assert!(
+            first.is_empty(),
+            "identical baseline must not conflict on the first check"
+        );
+
+        // Mutate main-db page 2 through an independent handle after the fd was
+        // cached. The cached descriptor shares the underlying inode/storage, so
+        // reuse must observe this live write and now flag the page.
+        write_main_db_pages(
+            &vfs,
+            &cx,
+            &[
+                sqlite_page_one(u16::try_from(PAGE_SIZE).expect("page size fits u16")),
+                sample_page(0x33),
+            ],
+        );
+
+        let second = backend
+            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
+            .expect("second generation-change verification reuses the cached fd");
+        assert_eq!(
+            second,
+            vec![2],
+            "cached verification fd must read the live changed page, not stale cached bytes"
         );
     }
 
