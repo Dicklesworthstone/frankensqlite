@@ -111,18 +111,25 @@ async fn setup_mem() -> (Connection, rusqlite::Connection) {
 /// HANDBACK (Option B, connection.rs — NOT codegen). This SELECT never reaches
 /// VDBE codegen: `select_correlated_exists_where_requires_fallback` routes it to
 /// `execute_correlated_subquery_where_fallback` -> `execute_join_select`, whose
-/// WHERE filter (connection.rs ~line 78924) calls the EAGER
+/// WHERE filter (connection.rs ~line 78924) formerly called the EAGER
 /// `eval_expr_with_subqueries` on the whole predicate rather than the
 /// short-circuiting `eval_expr_truthiness`. Two connection.rs defects stack here:
-///   1. No short-circuit: the OR right arm is always evaluated.
-///   2. `substitute_outer_refs_for_current_schema` does not substitute the outer
-///      column `x` into the `json_each(x)` table-valued-function argument, so the
-///      nested `SELECT 1 FROM json_each(x)` fails with "column not found: x"
-///      (this fires on the x='{}' row, which genuinely must evaluate the EXISTS —
-///      short-circuit alone does not fix it).
-/// Fix belongs in connection.rs (IvoryFortress's lane); ignored until then.
+///   1. FIXED: the WHERE filter now routes through `eval_expr_truthiness`, so
+///      AND/OR short-circuit left-to-right. The `x='bare'` row (left disjunct
+///      TRUE) is let through without evaluating the erroring EXISTS.
+///   2. STILL OPEN (blocks this all-or-nothing single-query keeper): an
+///      UNQUALIFIED outer column `x` is not substituted into the `json_each(x)`
+///      table-valued-function argument in the correlated-EXISTS WHERE fallback,
+///      so the nested `SELECT 1 FROM json_each(x)` fails with
+///      "column not found: x". This fires on the `x='{}'` row, which genuinely
+///      must evaluate the EXISTS — short-circuit alone does not fix it. A
+///      QUALIFIED ref (`json_each(t.x)`) already substitutes correctly, so the
+///      lever is the unqualified-outer-ref binding in the TVF-arg substitution
+///      (see `probe_unqualified_external_ref` in
+///      `substitute_outer_refs_in_select_with_schema_context`).
+/// Fix belongs in connection.rs (IvoryFortress's lane); ignored until gap (2) lands.
 #[test]
-#[ignore = "Option B handback: connection.rs correlated-EXISTS WHERE fallback (short-circuit + json_each TVF correlation substitution), not codegen"]
+#[ignore = "bd-and-or-short-circuit-value-jump-gaps-dkswh: fix(1) short-circuit LANDED (execute_join_select WHERE routes through eval_expr_truthiness; the 'bare' row now passes). Still red on x='{}': gap(2) unqualified outer col `x` is not substituted into the json_each(x) TVF arg in the correlated-EXISTS WHERE fallback (errors \"column not found: x\"); qualified t.x already works. Un-ignore once gap(2) lands."]
 fn where_or_subq_short_circuits() {
     asupersync::test_utils::run_test(|| async {
         let (f, r) = setup_mem().await;

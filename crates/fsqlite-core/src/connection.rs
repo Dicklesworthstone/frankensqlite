@@ -78922,10 +78922,24 @@ impl Connection {
             let _exists_memo_guard = self.arm_exists_probe_memo();
             let mut filtered = Vec::with_capacity(combined.len());
             for row in combined {
-                let predicate = self
-                    .eval_expr_with_subqueries(where_expr, &row, &col_map, params)
-                    .await?;
-                if is_sqlite_truthy(&predicate) {
+                // WHERE is a truthiness context: stock compiles it through
+                // ExprIfTrue, so AND/OR short-circuit left-to-right and a
+                // would-be-skipped operand is never evaluated once the chain's
+                // outcome is already decided. Evaluating the whole predicate
+                // eagerly (`eval_expr_with_subqueries` + `is_sqlite_truthy`)
+                // would materialize an OR right arm even when the left disjunct
+                // is TRUE, so an erroring correlated subquery there (e.g.
+                // `EXISTS(SELECT 1 FROM json_each(x))` over a non-JSON row)
+                // would wrongly fail the whole query. `eval_expr_truthiness`
+                // mirrors stock's short-circuit while yielding the identical
+                // keep/filter decision on non-erroring rows (both map operand
+                // truth through `is_sqlite_truthy` under the same three-valued
+                // logic). bd-and-or-short-circuit-value-jump-gaps-dkswh.
+                let keep = self
+                    .eval_expr_truthiness(where_expr, true, &row, &col_map, params)
+                    .await?
+                    .unwrap_or(false);
+                if keep {
                     filtered.push(row);
                 }
             }
