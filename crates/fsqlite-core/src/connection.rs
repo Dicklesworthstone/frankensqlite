@@ -137275,14 +137275,11 @@ mod tests {
                     "VALUES (row_number() OVER ()), (row_number() OVER ());",
                     vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(1)]],
                 ),
-                (
-                    "VALUES (2, row_number() OVER ()), \
-                            (1, row_number() OVER ()) ORDER BY 1;",
-                    vec![
-                        vec![SqliteValue::Integer(1), SqliteValue::Integer(1)],
-                        vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
-                    ],
-                ),
+                // NOTE: `VALUES (..) ORDER BY 1` is intentionally NOT a success
+                // case — stock sqlite3 3.46.1 rejects `VALUES .. ORDER BY/LIMIT`
+                // as a syntax error ("near ORDER: syntax error"), and FrankenSQLite
+                // matches (parser rejects ORDER BY / LIMIT after a VALUES term).
+                // Its rejection is asserted separately after this success loop.
                 (
                     "SELECT 7 AS keep, row_number() OVER () WHERE keep;",
                     vec![vec![SqliteValue::Integer(7), SqliteValue::Integer(1)]],
@@ -137371,6 +137368,24 @@ mod tests {
                     prepared_rows.iter().map(row_values).collect::<Vec<_>>(),
                     expected,
                     "unexpected prepared FROM-less window result for `{sql}`"
+                );
+            }
+
+            // Stock parity: ORDER BY / LIMIT attaches to a SELECT, not a final
+            // VALUES term, so `VALUES (..) ORDER BY 1` / `VALUES (..) LIMIT n`
+            // are syntax errors in sqlite3 3.46.1. FrankenSQLite must reject them
+            // identically on both the direct and prepared paths.
+            for rejected in [
+                "VALUES (2, row_number() OVER ()), (1, row_number() OVER ()) ORDER BY 1;",
+                "VALUES (3), (1), (2) LIMIT 2;",
+            ] {
+                assert!(
+                    conn.query(rejected).await.is_err(),
+                    "VALUES + ORDER BY/LIMIT must be rejected like stock sqlite3: `{rejected}`"
+                );
+                assert!(
+                    conn.prepare(rejected).await.is_err(),
+                    "prepared VALUES + ORDER BY/LIMIT must be rejected like stock sqlite3: `{rejected}`"
                 );
             }
         });
