@@ -156829,22 +156829,27 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t (id INTEGER);").await.unwrap();
-            conn.execute("CREATE TRIGGER trg_bad AFTER INSERT ON t BEGIN ROLLBACK; END;")
-                .await
-                .unwrap();
 
+            // Stock SQLite rejects transaction-control statements in a trigger
+            // body at CREATE (parse) time, not fire time: `CREATE TRIGGER ...
+            // BEGIN ROLLBACK; END;` is a syntax error (verified against sqlite3
+            // 3.46.1: `near "ROLLBACK": syntax error`). So the CREATE itself
+            // must fail — the trigger is never installed.
             let err = conn
-                .execute("INSERT INTO t VALUES (1);")
+                .execute("CREATE TRIGGER trg_bad AFTER INSERT ON t BEGIN ROLLBACK; END;")
                 .await
                 .expect_err("transaction control statements inside trigger bodies must fail");
             assert!(matches!(
                 err,
                 FrankenError::ParseError { ref detail, .. }
-                    if detail.contains("transaction control statements")
+                    if detail.contains("trigger body statement")
             ));
 
+            // The rejected trigger was never installed, so ordinary DML works
+            // and nothing rolls it back.
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
             let rows = conn.query("SELECT COUNT(*) FROM t;").await.unwrap();
-            assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         });
     }
 
