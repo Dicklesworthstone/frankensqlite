@@ -157177,8 +157177,14 @@ mod tests {
             conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, v INTEGER);")
                 .await
                 .unwrap();
-            conn.execute(
-                "CREATE TRIGGER trg_returning AFTER INSERT ON src
+            // Stock parity: sqlite3 3.46.1 rejects RETURNING inside a trigger
+            // body ("cannot use RETURNING in a trigger"), so the earlier premise
+            // — that a trigger-body RETURNING binds the inner inserted row —
+            // is invalid: such a trigger cannot be created. FrankenSQLite matches
+            // by rejecting the CREATE TRIGGER at parse time.
+            let err = conn
+                .execute(
+                    "CREATE TRIGGER trg_returning AFTER INSERT ON src
              BEGIN
                INSERT INTO dst VALUES (NEW.id, NEW.v + 1)
                RETURNING CASE
@@ -157186,18 +157192,13 @@ mod tests {
                  ELSE v
                END;
              END;",
-            )
-            .await
-            .unwrap();
-
-            conn.execute("INSERT INTO src VALUES (1, 7);")
+                )
                 .await
-                .unwrap();
-
-            let rows = conn.query("SELECT id, v FROM dst;").await.unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
-            assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(8));
+                .expect_err("RETURNING in a trigger body must be rejected (stock parity)");
+            assert!(
+                matches!(&err, FrankenError::ParseError { detail, .. } if detail.contains("RETURNING")),
+                "expected a RETURNING-in-trigger rejection, got: {err:?}"
+            );
         });
     }
 
