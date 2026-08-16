@@ -2,11 +2,11 @@
 //! simple WITHOUT ROWID table (leading PK, no secondary index, no foreign key)
 //! by walking its index b-tree directly, instead of refusing every WR table.
 //!
-//! Part-1 scope (this change): the WR table-row walk. Secondary indexes
-//! (concordance probes by rowid) and foreign keys (parent/child probes by
-//! rowid) on WR tables are still refused pending parts 2/3, so this keeper also
-//! pins that a WR table carrying a secondary index remains refused rather than
-//! mis-validated.
+//! Parts 1+2 (landed): the WR table-row walk AND secondary-index concordance
+//! (entries keyed by the PK locator, not a rowid). Foreign keys on WR tables
+//! (parent/child probes by rowid) are still refused pending part-3, so this
+//! keeper also pins that a WR table in a foreign-key-declaring schema remains
+//! refused rather than mis-validated.
 //!
 //! Bounded validation only admits a self-contained rollback/DELETE-mode image,
 //! so the accept case builds one (PRAGMA journal_mode=DELETE + VACUUM INTO)
