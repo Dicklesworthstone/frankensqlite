@@ -8,20 +8,21 @@ use fsqlite_core::connection::Connection;
 use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
-// PARITY TARGET (bd-n7ypv/GH#342): un-ignore when VACUUM INTO is supported on a
-// read-only connection. It is more than an error-taxonomy fix: exempting VACUUM
-// INTO from the read-only guard is necessary but not sufficient — the vacuum
-// path then hits FrankenError::Busy because execute_vacuum_main ->
-// quiesce_pager_export_state (connection.rs) rejects any active_txn, and a
-// read-only (open_schema_only) connection retains a read snapshot in active_txn.
-// Full parity requires the vacuum quiesce to release/tolerate that retained
-// read snapshot (a connection-txn rework). Until then VACUUM INTO on a
-// read-only connection returns ReadOnly (a clear kind, but divergent from
-// sqlite3, which succeeds). See the bd-n7ypv receipt.
+// PARITY TARGET (bd-n7ypv/GH#342): sqlite3 permits VACUUM INTO on a read-only
+// source connection; fsqlite does not yet. Un-ignore when the read-only-
+// compatible VACUUM INTO path lands. This is a MULTI-STEP vacuum-machinery
+// feature, not an error-taxonomy fix: the guard exemption is only step 1, and
+// VACUUM's machinery is built for a writable/exclusive connection —
+// execute_vacuum_main runs quiesce_pager_export_state and then
+// capture_vacuum_source_image via pager with_exclusive_maintenance (an
+// exclusive fence), which conflict with a read-only (open_schema_only)
+// connection's retained reader state and surface FrankenError::Busy. Full
+// parity needs a read-only-compatible source-capture path (or a full
+// read-state release across all fences). See the bd-n7ypv receipt.
 #[test]
-#[ignore = "bd-n7ypv/GH#342: VACUUM INTO on a read-only connection needs the \
-            vacuum quiesce to release the retained read snapshot (deeper than \
-            error-taxonomy); un-ignore with that fix"]
+#[ignore = "bd-n7ypv/GH#342: VACUUM INTO on read-only is a multi-step \
+            vacuum-machinery feature (exclusive-maintenance/quiescence vs the \
+            read-only connection's retained reader state); un-ignore with it"]
 fn bd_n7ypv_vacuum_into_allowed_on_read_only_connection_plain_vacuum_still_rejected() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
