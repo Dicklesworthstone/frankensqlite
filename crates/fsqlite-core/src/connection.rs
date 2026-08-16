@@ -13939,6 +13939,21 @@ impl Connection {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        if table.without_rowid {
+            return self
+                .bounded_validate_without_rowid_table_rows(
+                    cx,
+                    txn,
+                    table,
+                    root_page,
+                    page_size,
+                    reserved_per_page,
+                    column_defaults,
+                    &check_constraints,
+                    counters,
+                )
+                .await;
+        }
         let mut after = None;
         while let Some((rowid, payload)) =
             Self::bounded_next_table_row(cx, txn, root_page, page_size, reserved_per_page, after)
@@ -14021,6 +14036,131 @@ impl Connection {
                 .checked_add(1)
                 .ok_or(FrankenError::TooBig)?;
             after = Some(rowid);
+        }
+        Ok(())
+    }
+
+    /// bd-ota5x: bounded row validation for a WITHOUT ROWID table, whose rows
+    /// live in an index b-tree keyed by the PRIMARY KEY (not a table b-tree
+    /// under a rowid). fsqlite only admits a WR table whose PK is exactly the
+    /// leading declared columns, so the stored record is already in declared
+    /// (== schema) order and needs no reordering. There is no rowid: a 1-based
+    /// position identifies rows in diagnostics, and inflation runs with
+    /// `rowid_alias_col_idx = None`. Callers gate secondary-index and
+    /// foreign-key WR shapes out in `validate_bounded_schema_support`, so this
+    /// walk only ever validates NOT NULL and CHECK on the row image itself.
+    #[allow(clippy::too_many_arguments)]
+    async fn bounded_validate_without_rowid_table_rows<T: TransactionHandle + ?Sized>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        table: &TableSchema,
+        root_page: PageNumber,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        column_defaults: Option<&[Option<SqliteValue>]>,
+        check_constraints: &[Expr],
+        counters: &mut BoundedValidationCounters,
+    ) -> Result<()> {
+        // `false` selects an index-b-tree cursor (0x0A/0x02), matching the WR
+        // storage layout; walk it with first/payload/next (no rowid).
+        let mut cursor =
+            Self::new_header_btree_cursor(txn, root_page, page_size, reserved_per_page, false);
+        let mut position = 0_i64;
+        if cursor.first(cx).await? {
+            loop {
+                position = position.checked_add(1).ok_or(FrankenError::TooBig)?;
+                let payload = cursor.payload(cx).await?;
+                if payload.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "WITHOUT ROWID table `{}` row payload {} exceeds the fixed {}-byte record bound",
+                        table.name,
+                        payload.len(),
+                        BOUNDED_VALIDATION_MAX_RECORD_BYTES
+                    )));
+                }
+                let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "WITHOUT ROWID table `{}` row {position} payload is not a valid SQLite record",
+                        table.name
+                    ),
+                })?;
+                if values.len() > table.columns.len() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "WITHOUT ROWID table `{}` row {position} stores {} columns but schema allows {}",
+                            table.name,
+                            values.len(),
+                            table.columns.len()
+                        ),
+                    });
+                }
+                let inflated = Self::inflate_table_row_values_for_integrity(
+                    table,
+                    position,
+                    &values,
+                    None,
+                    column_defaults,
+                )?;
+                if !Self::inflated_row_satisfies_notnull(table, &inflated) {
+                    let column =
+                        table
+                            .columns
+                            .iter()
+                            .zip(inflated.iter())
+                            .find_map(|(column, value)| {
+                                (column.notnull
+                                    && !column.is_ipk
+                                    && matches!(value, SqliteValue::Null))
+                                .then_some(column)
+                            });
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: column.map_or_else(
+                            || {
+                                format!(
+                                    "WITHOUT ROWID table `{}` row {position} does not satisfy its NOT NULL constraints",
+                                    table.name
+                                )
+                            },
+                            |column| {
+                                format!(
+                                    "WITHOUT ROWID table `{}` row {position} stores NULL in NOT NULL column `{}`",
+                                    table.name, column.name
+                                )
+                            },
+                        ),
+                    });
+                }
+                for (constraint_index, expression) in check_constraints.iter().enumerate() {
+                    let value = self.bounded_evaluate_check_expression(
+                        table,
+                        expression,
+                        position,
+                        &inflated,
+                        None,
+                    )?;
+                    counters.check_constraint_evaluations = counters
+                        .check_constraint_evaluations
+                        .checked_add(1)
+                        .ok_or(FrankenError::TooBig)?;
+                    if !matches!(value, SqliteValue::Null) && !is_sqlite_truthy(&value) {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "WITHOUT ROWID table `{}` row {position} violates CHECK constraint {}",
+                                table.name,
+                                constraint_index + 1
+                            ),
+                        });
+                    }
+                }
+                counters.table_rows_checked = counters
+                    .table_rows_checked
+                    .checked_add(1)
+                    .ok_or(FrankenError::TooBig)?;
+                if !cursor.next(cx).await? {
+                    break;
+                }
+            }
         }
         Ok(())
     }
@@ -15125,10 +15265,32 @@ impl Connection {
         let original_ddl = self.original_ddl_sql.borrow().clone();
         for table in &schema {
             if table.without_rowid {
-                return Err(Self::bounded_validation_refusal(format!(
-                    "WITHOUT ROWID table `{}`",
-                    table.name
-                )));
+                // bd-ota5x: bounded validation walks a WITHOUT ROWID table's
+                // index b-tree directly (bounded_validate_table_rows has a WR
+                // branch). fsqlite only admits a WR table whose PRIMARY KEY is
+                // exactly the leading declared columns, so the stored record is
+                // in declared column order == schema order — no reorder needed.
+                // What is NOT yet handled: a WR table's SECONDARY indexes (index
+                // concordance probes by rowid, but a WR index is keyed by the
+                // PK) and FOREIGN KEYS (parent/child probes resolve rows by
+                // rowid). Refuse those shapes rather than mis-validate them — a
+                // WR table carrying a secondary index, or any schema that
+                // declares a foreign key anywhere.
+                if !table.indexes.is_empty() {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "WITHOUT ROWID table `{}` with a secondary index",
+                        table.name
+                    )));
+                }
+                if schema
+                    .iter()
+                    .any(|candidate| !candidate.foreign_keys.is_empty())
+                {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "WITHOUT ROWID table `{}` in a schema that declares foreign keys",
+                        table.name
+                    )));
+                }
             }
             // A rootless table has no btree to walk, and a virtual table's rows
             // do not live in this image at all.
