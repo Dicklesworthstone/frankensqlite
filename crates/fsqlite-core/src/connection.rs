@@ -68112,6 +68112,19 @@ impl Connection {
                         name,
                         aggregate_args_len_for_lookup(args),
                     );
+                    // bd-cl854: registry-backed builtin aggregates (median,
+                    // percentile, percentile_cont, percentile_disc) live in the
+                    // aggregate registry, not the single-column compute_aggregate
+                    // chain, so route them through the application-args registry
+                    // path (like custom aggregates) when called at a supported
+                    // arity. Their multi-arg forms (e.g. percentile(Y, P)) would
+                    // otherwise be rejected as "multiple args not supported".
+                    let route_via_registry = application_aggregate
+                        || (is_registry_backed_builtin_aggregate(&func)
+                            && builtin_aggregate_accepts_arity(
+                                &func,
+                                aggregate_args_len_for_lookup(args),
+                            ));
                     let mut arg_expr = None;
                     let mut separator = None;
                     let mut separator_expr = None;
@@ -68188,7 +68201,7 @@ impl Connection {
                             idx
                         }
                         FunctionArgs::List(_) => {
-                            if application_aggregate {
+                            if route_via_registry {
                                 None
                             } else {
                                 return Err(FrankenError::NotImplemented(format!(
@@ -68206,7 +68219,7 @@ impl Connection {
                     };
                     Ok(GroupByColumn::Agg {
                         name: func,
-                        application_args: application_aggregate.then(|| args.clone()),
+                        application_args: route_via_registry.then(|| args.clone()),
                         arg_col,
                         arg_expr,
                         distinct: *is_distinct,
@@ -72482,6 +72495,19 @@ impl Connection {
                         name,
                         aggregate_args_len_for_lookup(args),
                     );
+                    // bd-cl854: registry-backed builtin aggregates (median,
+                    // percentile, percentile_cont, percentile_disc) live in the
+                    // aggregate registry, not the single-column compute_aggregate
+                    // chain, so route them through the application-args registry
+                    // path (like custom aggregates) when called at a supported
+                    // arity. Their multi-arg forms (e.g. percentile(Y, P)) would
+                    // otherwise be rejected as "multiple args not supported".
+                    let route_via_registry = application_aggregate
+                        || (is_registry_backed_builtin_aggregate(&func)
+                            && builtin_aggregate_accepts_arity(
+                                &func,
+                                aggregate_args_len_for_lookup(args),
+                            ));
                     let mut arg_expr = None;
                     let mut separator = None;
                     let mut separator_expr = None;
@@ -72557,7 +72583,7 @@ impl Connection {
                             idx
                         }
                         FunctionArgs::List(_exprs) => {
-                            if application_aggregate {
+                            if route_via_registry {
                                 None
                             } else {
                                 return Err(FrankenError::NotImplemented(format!(
@@ -72575,7 +72601,7 @@ impl Connection {
                     };
                     Ok(GroupByColumn::Agg {
                         name: func,
-                        application_args: application_aggregate.then(|| args.clone()),
+                        application_args: route_via_registry.then(|| args.clone()),
                         arg_col,
                         arg_expr,
                         distinct: *is_distinct,
@@ -77254,9 +77280,14 @@ impl Connection {
         argument_rows: &[Vec<SqliteValue>],
         num_args: i32,
     ) -> Result<Option<SqliteValue>> {
+        // bd-cl854: registry-backed builtin aggregates (median/percentile/...)
+        // are in the aggregate registry, not the `application_functions` map that
+        // `application_function_kind` consults, so admit them here too — the
+        // `find_aggregate` lookup below already resolves them.
         if !self
             .application_function_kind(name, num_args)
             .is_some_and(ApplicationFunctionKind::is_aggregate_callable)
+            && !is_registry_backed_builtin_aggregate(name)
         {
             return Ok(None);
         }
