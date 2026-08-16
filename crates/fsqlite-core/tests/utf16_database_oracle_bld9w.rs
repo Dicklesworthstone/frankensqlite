@@ -388,11 +388,6 @@ async fn assert_custom_query_parity(path: &std::path::Path, queries: &[&str], la
 }
 
 #[test]
-#[ignore = "bd-0s9bv fixed the read-path decode gap; this arm now surfaces a \
-            SEPARATE bug: `ORDER BY name COLLATE NOCASE` on a decoded UTF-16 DB \
-            diverges from stock (NOCASE ordering over decoded code points). Not a \
-            decode issue — a NOCASE-collation-on-UTF-16 ordering gap (bld9w.4 \
-            collation territory). Un-ignore when NOCASE-over-UTF-16 ordering matches."]
 fn utf16le_collation_scope_parity() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();

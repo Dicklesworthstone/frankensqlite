@@ -11513,11 +11513,33 @@ impl VdbeEngine {
                         record_blob_bytes(&record).to_vec()
                     };
                     if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        let key_values =
+                        // bd-9pi70: sort keys must be decoded in the DB storage
+                        // encoding so NOCASE/RTRIM order the canonical UTF-8 form on
+                        // a UTF-16 database, matching stock. BINARY is unaffected — it
+                        // re-encodes to the storage encoding inside the comparator
+                        // (bd-bld9w.4), but NOCASE/RTRIM fold/trim the operand bytes
+                        // directly, so a Utf8-hardcoded prefix decode fed them the raw
+                        // UTF-16 code units and mis-ordered non-ASCII BMP rows. The
+                        // UTF-8 hot path keeps the lazy prefix decode (only the first
+                        // `key_columns` values); UTF-16 databases are rare, so they
+                        // decode the full record and retain the sort-key prefix.
+                        let key_values = if matches!(sorter.text_encoding, TextEncoding::Utf8) {
                             fsqlite_types::record::parse_record_prefix(&blob, sorter.key_columns)
-                                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                                detail: "malformed record in SorterInsert".to_owned(),
-                            })?;
+                        } else {
+                            let mut all_values = Vec::new();
+                            fsqlite_types::record::parse_record_into_with_encoding(
+                                &blob,
+                                &mut all_values,
+                                sorter.text_encoding,
+                            )
+                            .map(|()| {
+                                all_values.truncate(sorter.key_columns);
+                                all_values
+                            })
+                        }
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: "malformed record in SorterInsert".to_owned(),
+                        })?;
                         sorter.insert_row(key_values, blob)?;
                     }
                     pc += 1;
@@ -18911,14 +18933,23 @@ fn cmp_values_collated(
     collation_registry: &CollationRegistry,
     enc: TextEncoding,
 ) -> Ordering {
-    if let (Some(coll), SqliteValue::Text(lt), SqliteValue::Text(rt)) = (collation, lhs, rhs) {
-        return compare_text_with_collation(
-            lt.as_bytes_direct(),
-            rt.as_bytes_direct(),
-            coll,
-            collation_registry,
-            enc,
-        );
+    if let (SqliteValue::Text(lt), SqliteValue::Text(rt)) = (lhs, rhs) {
+        return match collation {
+            Some(coll) => compare_text_with_collation(
+                lt.as_bytes_direct(),
+                rt.as_bytes_direct(),
+                coll,
+                collation_registry,
+                enc,
+            ),
+            // bd-9pi70: an absent collation is implicit BINARY, which orders in
+            // the DB storage encoding (bd-bld9w.4). Now that sort keys are decoded
+            // to canonical UTF-8 (SorterInsert), a plain `partial_cmp` here would
+            // order by UTF-8 bytes and diverge from stock on a UTF-16 database; the
+            // encoding-aware comparator re-encodes to the storage encoding. For a
+            // UTF-8 database this is byte-for-byte identical to `partial_cmp`.
+            None => binary_compare_bytes(lt.as_bytes_direct(), rt.as_bytes_direct(), enc),
+        };
     }
     lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
 }
