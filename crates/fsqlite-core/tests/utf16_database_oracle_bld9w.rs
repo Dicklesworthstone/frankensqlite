@@ -404,3 +404,45 @@ fn utf16le_collation_scope_parity() {
         assert_custom_query_parity(&path, COLLATION_QUERIES, "utf16le_collation").await;
     });
 }
+
+// bd-spsnt: verify the UTF-16 TEXT-INDEX read path. The fixture has
+// `CREATE INDEX idx_items_city ON items(city)` (city is TEXT). An index seek
+// (`WHERE city = 'Paris'`) and index scan (`ORDER BY city`) exercise the
+// index-record decode sites that still use the Utf8-default decoders
+// (engine.rs parse_record_into at ~12253/17451/17475). Those decode index
+// records only to extract the rowid + compare keys, so they should be BENIGN
+// (raw UTF-16 index bytes never surface; the returned VALUES come from the
+// encoding-aware table-row path). This asserts that: an index seek/scan on a
+// UTF-16 DB matches stock, confirming the index-key path is correct.
+const INDEX_QUERIES: &[&str] = &[
+    "SELECT id, name FROM items WHERE city = 'Paris' ORDER BY id",
+    "SELECT id, city FROM items ORDER BY city, id",
+    "SELECT city, count(*) AS n FROM items GROUP BY city ORDER BY city",
+];
+
+#[ignore = "bd-spsnt: GROUP BY over a UTF-16 TEXT column outputs the RAW UTF-16 \
+            group key ('Berlin' -> B\\0e\\0r...). Index seek + scan (queries 1-2) \
+            pass; only the GROUP BY (query 3) diverges. Un-ignore when fixed."]
+#[test]
+fn utf16le_text_index_seek_and_scan_parity() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("utf16le_index_ascii.db");
+        build_stock_db(&path, Some("UTF-16le"), ASCII_ROWS);
+        assert_eq!(header_text_encoding(&path), 2);
+        assert_custom_query_parity(&path, INDEX_QUERIES, "utf16le_index_ascii").await;
+    });
+}
+
+#[ignore = "bd-spsnt: GROUP BY over a UTF-16 TEXT column outputs raw UTF-16 group \
+            keys (see utf16le_text_index_seek_and_scan_parity). Un-ignore when fixed."]
+#[test]
+fn utf16le_text_index_seek_and_scan_parity_unicode() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("utf16le_index_unicode.db");
+        build_stock_db(&path, Some("UTF-16le"), UNICODE_ROWS);
+        assert_eq!(header_text_encoding(&path), 2);
+        assert_custom_query_parity(&path, INDEX_QUERIES, "utf16le_index_unicode").await;
+    });
+}
