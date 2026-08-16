@@ -33230,7 +33230,14 @@ impl Connection {
                     let mut skip = false;
                     for new_values in &trigger_new_rows {
                         if self
-                            .fire_before_triggers(table_name, &insert_event, None, Some(new_values))
+                            .fire_before_triggers(
+                                table_name,
+                                &insert_event,
+                                None,
+                                Some(new_values),
+                                None,
+                                None,
+                            )
                             .await?
                         {
                             skip = true;
@@ -33276,6 +33283,8 @@ impl Connection {
                                 &insert_event,
                                 None,
                                 Some(&row.values),
+                                None,
+                                None,
                             )
                             .await?;
                         }
@@ -33369,7 +33378,14 @@ impl Connection {
                 // Phase 5G.3: Fire AFTER INSERT triggers.
                 if has_after_insert {
                     for new_values in &trigger_new_rows {
-                        self.fire_after_triggers(table_name, &insert_event, None, Some(new_values))
+                        self.fire_after_triggers(
+                            table_name,
+                            &insert_event,
+                            None,
+                            Some(new_values),
+                            None,
+                            None,
+                        )
                             .await?;
                     }
                 }
@@ -33516,6 +33532,8 @@ impl Connection {
                                 &update_event,
                                 Some(old_values),
                                 Some(new_values),
+                                None,
+                                None,
                             )
                             .await?
                         {
@@ -33638,6 +33656,8 @@ impl Connection {
                             &update_event,
                             Some(old_values),
                             Some(new_values),
+                            None,
+                            None,
                         )
                         .await?;
                     }
@@ -33768,9 +33788,16 @@ impl Connection {
                 // Phase 5G.2 (bd-iqam): Fire BEFORE DELETE triggers.
                 let skip_dml = if has_before_delete {
                     let mut skip = false;
-                    for old_values in &trigger_old_rows {
+                    for (old_rowid, old_values) in &trigger_old_rows {
                         if self
-                            .fire_before_triggers(table_name, &delete_event, Some(old_values), None)
+                            .fire_before_triggers(
+                                table_name,
+                                &delete_event,
+                                Some(old_values),
+                                None,
+                                *old_rowid,
+                                None,
+                            )
                             .await?
                         {
                             skip = true;
@@ -33803,7 +33830,7 @@ impl Connection {
                             .await?
                     };
                     let mut actions = Vec::new();
-                    for row_values in &rows_to_check {
+                    for (_rowid, row_values) in &rows_to_check {
                         actions.extend(self.check_fk_on_delete(table_name, row_values).await?);
                     }
                     actions
@@ -33839,11 +33866,13 @@ impl Connection {
 
                     // Phase 5G.3: Fire AFTER DELETE triggers.
                     if has_after_delete {
-                        for old_values in &trigger_old_rows {
+                        for (old_rowid, old_values) in &trigger_old_rows {
                             self.fire_after_triggers(
                                 table_name,
                                 &delete_event,
                                 Some(old_values),
+                                None,
+                                *old_rowid,
                                 None,
                             )
                             .await?;
@@ -33892,9 +33921,16 @@ impl Connection {
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
-                    for old_values in &trigger_old_rows {
-                        self.fire_after_triggers(table_name, &delete_event, Some(old_values), None)
-                            .await?;
+                    for (old_rowid, old_values) in &trigger_old_rows {
+                        self.fire_after_triggers(
+                            table_name,
+                            &delete_event,
+                            Some(old_values),
+                            None,
+                            *old_rowid,
+                            None,
+                        )
+                        .await?;
                     }
                 }
 
@@ -46142,19 +46178,55 @@ impl Connection {
         &self,
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
-    ) -> Result<Vec<Vec<SqliteValue>>> {
+    ) -> Result<Vec<(Option<i64>, Vec<SqliteValue>)>> {
+        // Project the rowid alongside the row so OLD.rowid/oid/_rowid_ resolve in
+        // DELETE trigger bodies even on tables without an INTEGER PRIMARY KEY
+        // (GH #216). WITHOUT ROWID tables have no rowid, so fall back to `*`.
+        let is_rowid_table = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&delete.table.name.name))
+                .is_none_or(|table| !table.without_rowid)
+        };
+        let columns = if is_rowid_table {
+            vec![
+                ResultColumn::Expr {
+                    expr: Expr::Column(
+                        fsqlite_ast::ColumnRef::bare("rowid"),
+                        fsqlite_ast::Span::new(0, 0),
+                    ),
+                    alias: None,
+                },
+                ResultColumn::Star,
+            ]
+        } else {
+            vec![ResultColumn::Star]
+        };
+        let select = Self::build_single_table_select(
+            &delete.table,
+            columns,
+            delete.where_clause.as_ref(),
+            &[],
+            None,
+        );
         let matched_rows = self
-            .select_matching_rows(
-                &delete.table,
-                delete.where_clause.as_ref(),
-                &[],
-                None,
-                params,
-            )
+            .execute_statement(&Statement::Select(select), params)
             .await?;
         Ok(matched_rows
             .into_iter()
-            .map(|row| row.values().to_vec())
+            .map(|row| {
+                let values = row.values();
+                if is_rowid_table {
+                    let rowid = match values.first() {
+                        Some(SqliteValue::Integer(n)) => Some(*n),
+                        _ => None,
+                    };
+                    (rowid, values.get(1..).map(<[SqliteValue]>::to_vec).unwrap_or_default())
+                } else {
+                    (None, values.to_vec())
+                }
+            })
             .collect())
     }
 
@@ -57472,9 +57544,23 @@ impl Connection {
                 // DELETE body observing the table sees post-delete state; the
                 // OLD.* frame values below are exact. RAISE outcomes propagate
                 // as statement errors like any other trigger failure.
-                self.fire_before_triggers(table_name, &delete_event, Some(&victim.values), None)
+                self.fire_before_triggers(
+                    table_name,
+                    &delete_event,
+                    Some(&victim.values),
+                    None,
+                    None,
+                    None,
+                )
                     .await?;
-                self.fire_after_triggers(table_name, &delete_event, Some(&victim.values), None)
+                self.fire_after_triggers(
+                    table_name,
+                    &delete_event,
+                    Some(&victim.values),
+                    None,
+                    None,
+                    None,
+                )
                     .await?;
             }
         }
@@ -58355,7 +58441,7 @@ impl Connection {
         let column_names = self.view_trigger_column_names(&view_name)?;
         let old_rows = self.collect_delete_trigger_rows(delete, params).await?;
         let event = fsqlite_ast::TriggerEvent::Delete;
-        for old_values in &old_rows {
+        for (_old_rowid, old_values) in &old_rows {
             self.fire_instead_of_triggers(
                 &view_name,
                 &column_names,
@@ -58507,6 +58593,9 @@ impl Connection {
             rowid_alias_col_idx: None,
             old_row: old_values.map(<[SqliteValue]>::to_vec),
             new_row: new_values.map(<[SqliteValue]>::to_vec),
+            // Views have no rowid; INSTEAD OF triggers never resolve NEW/OLD.rowid.
+            old_rowid: None,
+            new_rowid: None,
         };
         for trigger in matching {
             if !self.pragma_state.borrow().recursive_triggers
@@ -156091,12 +156180,12 @@ mod tests {
 
             let event = fsqlite_ast::TriggerEvent::Insert;
             let positive_new = [SqliteValue::Integer(7)];
-            conn.fire_before_triggers("t", &event, None, Some(&positive_new))
+            conn.fire_before_triggers("t", &event, None, Some(&positive_new), None, None)
                 .await
                 .unwrap();
 
             let non_positive_new = [SqliteValue::Integer(0)];
-            conn.fire_before_triggers("t", &event, None, Some(&non_positive_new))
+            conn.fire_before_triggers("t", &event, None, Some(&non_positive_new), None, None)
                 .await
                 .unwrap();
 
@@ -156122,7 +156211,7 @@ mod tests {
             let event = fsqlite_ast::TriggerEvent::Update(vec!["id".to_owned()]);
             let old_row = [SqliteValue::Integer(3)];
             let new_row = [SqliteValue::Integer(9)];
-            conn.fire_after_triggers("t", &event, Some(&old_row), Some(&new_row))
+            conn.fire_after_triggers("t", &event, Some(&old_row), Some(&new_row), None, None)
                 .await
                 .unwrap();
 
@@ -157548,10 +157637,10 @@ mod tests {
             // Calls with no matching trigger do not recurse and must remain no-ops.
             set_trigger_depth_limit_override(Some(0));
             let before = conn
-                .fire_before_triggers("missing", &event, None, None)
+                .fire_before_triggers("missing", &event, None, None, None, None)
                 .await;
             let after = conn
-                .fire_after_triggers("missing", &event, None, None)
+                .fire_after_triggers("missing", &event, None, None, None, None)
                 .await;
             let instead_of = conn
                 .fire_instead_of_triggers("missing_view", &[], &event, None, None)
@@ -157930,6 +158019,8 @@ mod tests {
                 rowid_alias_col_idx: None,
                 old_row: None,
                 new_row: None,
+                old_rowid: None,
+                new_rowid: None,
             });
             assert_eq!(conn.trigger_frame_stack.borrow().len(), 1);
             let fk_guard = conn.enter_fk_cascade().unwrap();
@@ -158334,6 +158425,8 @@ mod tests {
                 rowid_alias_col_idx: None,
                 old_row: None,
                 new_row: None,
+                old_rowid: None,
+                new_rowid: None,
             });
             let fk_guard = conn.enter_fk_cascade().unwrap();
             conn.with_attached_connection("aux", |child| {
@@ -158429,6 +158522,8 @@ mod tests {
             rowid_alias_col_idx: None,
             old_row: None,
             new_row: None,
+            old_rowid: None,
+            new_rowid: None,
         })
     }
 
@@ -158537,6 +158632,8 @@ mod tests {
                 rowid_alias_col_idx: None,
                 old_row: None,
                 new_row: None,
+                old_rowid: None,
+                new_rowid: None,
             });
             let error = conn
                 .execute(&aux_sql)
@@ -267183,6 +267280,8 @@ mod pager_routing_tests {
                 rowid_alias_col_idx: None,
                 old_row: None,
                 new_row: None,
+                old_rowid: None,
+                new_rowid: None,
             });
 
             // The active trigger now consumes slot 50. Neither another trigger
