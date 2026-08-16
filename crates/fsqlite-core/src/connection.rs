@@ -11119,6 +11119,15 @@ pub struct Connection {
     /// ingestion burst instead of O(rows_written × schema objects); the GH#345
     /// regression keeper asserts it does not scale with the row count.
     schema_reload_parse_count: Cell<u64>,
+    /// bd-qteu2 (GH#345 residual): count of user-table rows this connection has
+    /// hydrated into the MemDatabase mirror via the memdb reload row-scan loop.
+    /// Pre-fix a dirty per-write reload re-scans EVERY table's rows, so an
+    /// ingestion burst costs O(rows_written × total_rows); the qteu2 regression
+    /// keeper asserts this counter stays sub-quadratic (O(total_rows + writes))
+    /// across the burst instead of scaling with their product. Per-connection
+    /// (unlike the process-global metric counters), so it is not polluted by
+    /// other tests sharing the process.
+    memdb_row_hydration_count: Cell<u64>,
     /// Whether storage-backed read fast paths may trust the current
     /// connection-local MemDatabase row mirror for exact counts and scan-based
     /// aggregation shortcuts.
@@ -12659,6 +12668,7 @@ impl Connection {
             memdb_requires_active_txn_reload: Cell::new(false),
             schema_reload_parse_cache: RefCell::new((0, HashMap::new())),
             schema_reload_parse_count: Cell::new(0),
+            memdb_row_hydration_count: Cell::new(0),
             memdb_storage_count_shortcuts_safe: Cell::new(false),
             last_local_commit_seq: RefCell::new(None),
             data_version_own_commits: Cell::new(0),
@@ -13181,6 +13191,7 @@ impl Connection {
             memdb_requires_active_txn_reload: Cell::new(false),
             schema_reload_parse_cache: RefCell::new((0, HashMap::new())),
             schema_reload_parse_count: Cell::new(0),
+            memdb_row_hydration_count: Cell::new(0),
             memdb_storage_count_shortcuts_safe: Cell::new(eager_memdb_rows),
             last_local_commit_seq: RefCell::new(None),
             data_version_own_commits: Cell::new(0),
@@ -21025,7 +21036,21 @@ impl Connection {
             ));
         }
 
-        let hydrate_rows = self.should_eagerly_hydrate_memdb_rows();
+        // bd-qteu2 (GH#345 residual): do NOT eagerly re-hydrate every table's
+        // rows on the per-write active-txn refresh. This refresh fires at every
+        // read boundary during nested-write ingestion (e.g. subquery-WHEN
+        // triggers), so eager hydration re-scanned ALL rows of ALL tables on
+        // every write -> O(writes x total_rows), the dominant term at high row
+        // counts. Row reads are authoritative through the pager/storage cursors
+        // whenever mem fallback is rejected (the default, including :memory:),
+        // and the connection-level mirror fast-paths gate on memdb_rows_loaded
+        // (self-hydrating on demand), so deferring row hydration here is
+        // correctness-neutral and removes the quadratic. Only when the caller
+        // explicitly opted into the MemDatabase as the row source of record
+        // (reject_mem_fallback == false) must the mirror stay eagerly hydrated.
+        // (`should_eagerly_hydrate_memdb_rows() && !reject_mem_fallback`
+        // simplifies to `!reject_mem_fallback` by absorption.)
+        let hydrate_rows = !*self.reject_mem_fallback.borrow();
         let bound_visible_commit_seq = self
             .active_txn
             .borrow()
@@ -57660,11 +57685,15 @@ impl Connection {
             return Ok(Some(true));
         }
         // A miss is definitive only when the mirror is authoritative for
-        // committed rows: the :memory: pager (the memdb IS the database) or a
-        // fully hydrated file-backed mirror. A lazily-hydrated file-backed
-        // mirror can miss rows that exist on disk, so fall back to the
-        // general validation SELECT rather than report a false violation.
-        if self.pager.is_memory() || self.memdb_rows_loaded.get() {
+        // committed rows: a FULLY HYDRATED mirror. bd-qteu2: a lazily-hydrated
+        // mirror only holds empty schema placeholders, so a miss there is NOT
+        // proof the parent is absent — it may exist on disk. This applies to
+        // :memory: too: since reject_mem_fallback defaults true, a :memory:
+        // connection can carry an unhydrated mirror after a per-write active-txn
+        // refresh, and treating that miss as authoritative reported a spurious
+        // FK violation. Fall back to the general (pager-backed) validation SELECT
+        // whenever the mirror is not hydrated.
+        if self.memdb_rows_loaded.get() {
             return Ok(Some(false));
         }
         Ok(None)
@@ -82265,6 +82294,25 @@ impl Connection {
         self.schema_reload_parse_count.get()
     }
 
+    /// bd-qteu2 (GH#345 residual): number of user-table rows this connection has
+    /// hydrated into the MemDatabase mirror via the memdb reload row-scan loop.
+    /// Exposed for the qteu2 regression keeper, which asserts it stays
+    /// sub-quadratic (O(total_rows + writes)) across an ingestion burst instead
+    /// of O(writes × total_rows). Per-connection (unlike the process-global
+    /// metric counters), so it is not polluted by other tests sharing the
+    /// process.
+    #[must_use]
+    pub fn memdb_row_hydration_count(&self) -> u64 {
+        self.memdb_row_hydration_count.get()
+    }
+
+    /// bd-qteu2: record that one user-table row was hydrated into the
+    /// MemDatabase mirror by the reload row-scan loop.
+    fn note_memdb_row_hydrated(&self) {
+        self.memdb_row_hydration_count
+            .set(self.memdb_row_hydration_count.get().wrapping_add(1));
+    }
+
     #[allow(clippy::too_many_lines)]
     // Row hydration can evaluate column DEFAULTs, which re-enters statement
     // execution and can reach this reload again, so the future is boxed to break
@@ -83068,6 +83116,10 @@ impl Connection {
                                     if let Some(mem_table) = new_db.tables.get_mut(&real_root_page)
                                     {
                                         mem_table.insert_row(synthetic_rowid, values);
+                                        // bd-qteu2: measure hydration cost so the
+                                        // regression keeper can assert sub-quadratic
+                                        // growth across an ingestion burst.
+                                        self.note_memdb_row_hydrated();
                                     }
                                 }
                                 synthetic_rowid = synthetic_rowid.saturating_add(1);
@@ -83110,6 +83162,10 @@ impl Connection {
                                     .await?;
                                 if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
                                     mem_table.insert_row(rowid, values);
+                                    // bd-qteu2: measure hydration cost so the
+                                    // regression keeper can assert sub-quadratic
+                                    // growth across an ingestion burst.
+                                    self.note_memdb_row_hydrated();
                                 }
                             }
                             if !cursor.next(cx).await? {
@@ -211468,12 +211524,15 @@ mod pager_routing_tests {
                 !conn.memdb_requires_active_txn_reload.get(),
                 "the first read boundary after repeated prepared UPDATEs should refresh the MemDatabase and clear the dirty bit"
             );
-            assert_eq!(
-                memdb_values(&conn),
-                vec![
-                    (1, SqliteValue::Text("alpha".into())),
-                    (2, SqliteValue::Text("beta".into())),
-                ]
+            // bd-qteu2 (GH#345 residual): the read-boundary active-txn refresh is
+            // now LAZY for :memory: — it clears the dirty bit and DEFERS row
+            // hydration instead of re-scanning every table into the mirror on each
+            // read boundary (that per-read full re-scan was the O(writes x rows)
+            // quadratic). The UPDATE results are served authoritatively from the
+            // pager (asserted just above), so the mirror stays unhydrated here.
+            assert!(
+                !conn.memdb_rows_loaded.get(),
+                "bd-qteu2: the read boundary should defer row hydration (lazy mirror), not re-hydrate every table per read"
             );
 
             conn.execute("ROLLBACK;").await.unwrap();
@@ -211666,8 +211725,6 @@ mod pager_routing_tests {
         )
         .await
         .unwrap();
-            let root_page = test_table_root_page(&conn, "lazy_dirty_update_after_insert");
-
             let stmt = conn
                 .prepare("UPDATE lazy_dirty_update_after_insert SET val = ?1 WHERE id = ?2")
                 .await
@@ -211711,10 +211768,13 @@ mod pager_routing_tests {
                 !conn.memdb_requires_active_txn_reload.get(),
                 "the read boundary should consume the deferred MemDatabase refresh"
             );
-            assert_eq!(
-                memdb_column_values(&conn, root_page, 1),
-                vec![(1, SqliteValue::Text("updated".into()))],
-                "after the read boundary refresh, the MemDatabase mirror should match the updated row"
+            // bd-qteu2 (GH#345 residual): the read-boundary refresh now DEFERS row
+            // hydration for :memory: (lazy mirror) instead of re-scanning every
+            // table per read boundary. The updated row is served from the pager
+            // (asserted just above); the mirror is not eagerly re-hydrated here.
+            assert!(
+                !conn.memdb_rows_loaded.get(),
+                "bd-qteu2: the read boundary should defer row hydration (lazy mirror)"
             );
 
             conn.execute("ROLLBACK;").await.unwrap();
@@ -211784,8 +211844,6 @@ mod pager_routing_tests {
             "CREATE TABLE lazy_dirty_insert_after_delete (id INTEGER PRIMARY KEY, val TEXT, note INTEGER);",
         ).await
         .unwrap();
-            let root_page = test_table_root_page(&conn, "lazy_dirty_insert_after_delete");
-
             let delete_stmt = conn
                 .prepare("DELETE FROM lazy_dirty_insert_after_delete WHERE id = ?1")
                 .await
@@ -211820,9 +211878,15 @@ mod pager_routing_tests {
                 !conn.memdb_requires_active_txn_reload.get(),
                 "the delete read boundary should refresh the MemDatabase mirror"
             );
+            // bd-qteu2 (GH#345 residual): the read-boundary active-txn refresh is
+            // now LAZY for :memory: — it clears the dirty bit and defers row
+            // hydration rather than re-hydrating every table into the mirror on
+            // each read boundary (the per-read full re-scan was the O(writes x
+            // rows) quadratic). Row visibility is served authoritatively from the
+            // pager, so the mirror stays unhydrated after the read boundary.
             assert!(
-                conn.memdb_rows_loaded.get() && conn.memdb_storage_count_shortcuts_safe.get(),
-                "after the delete read boundary, the MemDatabase mirror should be exact again"
+                !conn.memdb_rows_loaded.get(),
+                "bd-qteu2: the delete read boundary should defer row hydration (lazy mirror)"
             );
 
             conn.execute("INSERT INTO lazy_dirty_insert_after_delete VALUES (3, 'gamma', 30);")
@@ -211834,31 +211898,23 @@ mod pager_routing_tests {
                 pending_direct_upserts > 0 || memdb_dirty,
                 "insert after a dirty read boundary must either queue a deferred MemDatabase row delta or re-arm active-txn reload; pending={pending_direct_upserts} dirty={memdb_dirty}"
             );
+            // bd-qteu2: an explicit active-txn refresh also defers row hydration
+            // now; it flushes pending deltas and clears the dirty bit without
+            // re-scanning every table's rows into the mirror.
             let cx = conn.op_cx().unwrap();
             conn.refresh_memdb_from_active_txn_if_dirty(&cx)
                 .await
                 .unwrap();
-            assert_eq!(
-                memdb_column_values(&conn, root_page, 1),
-                vec![
-                    (1, SqliteValue::Text("alpha2".into())),
-                    (3, SqliteValue::Text("gamma".into())),
-                ],
-                "an explicit active-txn refresh after the post-delete insert must rebuild the MemDatabase mirror with the new row still visible"
-            );
 
+            // The core "keeps visibility" guarantee (unchanged by bd-qteu2):
+            // after DELETE(2) + a read boundary + INSERT(3), a later read in the
+            // same explicit transaction must observe exactly the surviving +
+            // newly-inserted rows. This is served through the pager-backed read
+            // path rather than a re-hydrated mirror image.
             let rows = conn
                 .query("SELECT id, val FROM lazy_dirty_insert_after_delete ORDER BY id")
                 .await
                 .unwrap();
-            assert_eq!(
-                memdb_column_values(&conn, root_page, 1),
-                vec![
-                    (1, SqliteValue::Text("alpha2".into())),
-                    (3, SqliteValue::Text("gamma".into())),
-                ],
-                "the later SELECT must not clobber an already-correct MemDatabase mirror"
-            );
             assert_eq!(
                 rows.iter()
                     .map(|row| row.values().to_vec())
@@ -211868,14 +211924,6 @@ mod pager_routing_tests {
                     vec![SqliteValue::Integer(3), SqliteValue::Text("gamma".into()),],
                 ],
                 "insert after a delete-triggered read boundary must remain visible to later reads in the same explicit transaction"
-            );
-            assert_eq!(
-                memdb_column_values(&conn, root_page, 1),
-                vec![
-                    (1, SqliteValue::Text("alpha2".into())),
-                    (3, SqliteValue::Text("gamma".into())),
-                ],
-                "the refreshed MemDatabase mirror should include the post-delete insert"
             );
 
             conn.execute("ROLLBACK;").await.unwrap();
