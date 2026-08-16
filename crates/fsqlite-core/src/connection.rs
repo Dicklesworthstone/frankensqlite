@@ -55848,17 +55848,38 @@ impl Connection {
         Ok(())
     }
 
+    /// Mint a fresh, fully detached context for a MANDATORY post-commit rebind.
+    ///
+    /// The rebind must complete even though the operation `Cx` — and the
+    /// connection's shared native cx it carries — were cancelled after
+    /// publication. A masked `create_child()` is insufficient: the async
+    /// db-file write lock's native fast path (`async_rwlock_write`) polls the
+    /// *attached native cx*'s own `checkpoint()`, which the wrapper's
+    /// `mask_depth` does not cover, and `create_child` both inherits that
+    /// cancelled native cx and is born cancelled (its `CxInner` records the
+    /// parent's native-cancel reason). A fresh `Cx` has its own `CxInner` — no
+    /// cancel lineage, no recorded native-cancel reason — and re-attaching the
+    /// live task's native cx keeps I/O authority while staying uncancelled.
+    fn detached_rebind_cx(&self) -> Cx {
+        let rebind_cx = Cx::new();
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if let Some(native_task_cx) = asupersync::Cx::current() {
+            rebind_cx.set_native_cx(native_task_cx);
+        }
+        rebind_cx
+    }
+
     /// Rebind every connection-local cache and schema mapping after the new
-    /// VACUUM image is already durable. Cancellation is masked because the
-    /// operation is no longer optional: exposing stale root-page bindings
-    /// after publication is more dangerous than delaying cancellation until
-    /// the connection is coherent again.
+    /// VACUUM image is already durable. The rebind runs on a fresh, detached
+    /// context because the operation is no longer optional: exposing stale
+    /// root-page bindings after publication is more dangerous than honoring a
+    /// post-publication cancellation of `parent_cx`.
     async fn rebind_after_committed_vacuum(
         &self,
-        parent_cx: &Cx,
+        _parent_cx: &Cx,
         restore_hydrated_rows: bool,
     ) -> Result<()> {
-        let rebind_cx = parent_cx.create_child();
+        let rebind_cx = self.detached_rebind_cx();
         let _rebind_mask = rebind_cx.masked();
         self.clear_compilation_reuse_caches();
         self.invalidate_cached_read_snapshot(&rebind_cx).await;
@@ -55900,10 +55921,10 @@ impl Connection {
     #[cfg(not(target_arch = "wasm32"))]
     async fn rebind_after_committed_image_publication(
         &self,
-        parent_cx: &Cx,
+        _parent_cx: &Cx,
         restore_hydrated_rows: bool,
     ) -> Result<()> {
-        let rebind_cx = parent_cx.create_child();
+        let rebind_cx = self.detached_rebind_cx();
         let _rebind_mask = rebind_cx.masked();
         self.clear_compilation_reuse_caches();
         self.invalidate_cached_read_snapshot(&rebind_cx).await;
@@ -161132,11 +161153,23 @@ mod tests {
                 .await
                 .expect("post-publication cancellation must not interrupt mandatory rebind");
             {
-                // Operation contexts clone the connection root, so the injected
-                // cancellation remains observable to later work. Mask it only for
-                // this assertion that the live connection was nevertheless fully
-                // rebound to the committed image.
-                let _inspection_mask = conn.root_cx().masked();
+                // The injected post-publication cancellation is propagated to the
+                // connection's shared native cx *asynchronously*, so masking the
+                // cancelled root and reading through it is inherently racy: the
+                // pager read path polls the attached native cx's own
+                // `checkpoint()`, which the wrapper's `mask_depth` does not cover,
+                // and whichever side of that propagation the poll lands on decides
+                // whether the read aborts (observed ~40% `Err(Abort)` under
+                // worker-thread scheduling, always `Ok` under `--test-threads=1`).
+                //
+                // Inspect the rebound live connection on a fresh, uncancelled
+                // operation context instead — the same detached-context discipline
+                // the mandatory post-publication rebind itself uses
+                // (`detached_rebind_cx`). This proves the live connection was fully
+                // rebound to the committed image without racing the injected
+                // cancellation.
+                let inspection_cx = conn.detached_rebind_cx();
+                let _inspection_bind = conn.bind_operation_cx(&inspection_cx);
                 let rows = conn
                     .query("SELECT id, value FROM items ORDER BY id;")
                     .await
