@@ -8569,10 +8569,13 @@ async fn trigger_when_matches(
     }
     let row: [SqliteValue; 0] = [];
     let col_map: [(String, String, bool); 0] = [];
+    // WHEN is a truthiness context: stock compiles it through ExprIfTrue, so
+    // the boolean skeleton short-circuits and a FALSE guard arm keeps later
+    // arms (and any error they would raise) from ever being evaluated.
     connection
-        .eval_expr_with_subqueries(&bound_expr, &row, &col_map, None)
+        .eval_expr_truthiness(&bound_expr, true, &row, &col_map, None)
         .await
-        .map(|value| is_sqlite_truthy(&value))
+        .map(|truth| truth.unwrap_or(false))
 }
 
 /// For `UPDATE OF col1, col2` triggers, ensure at least one listed column
@@ -70470,6 +70473,104 @@ impl Connection {
     //
     // AND/OR chains are special: they must not stack nested BoxFutures one per
     // operator (see `collect_same_binary_op_operands` + the BinaryOp arm).
+    /// Truthiness-context evaluation, mirroring stock's ExprIfTrue/IfFalse
+    /// compilation: the AND/OR/NOT boolean skeleton short-circuits
+    /// left-to-right, and operands past the determining one are never
+    /// evaluated, so an error they would raise — e.g. json_each over a
+    /// non-JSON value in a trigger WHEN arm — never surfaces. That is stock's
+    /// behavior in WHERE / CASE WHEN / trigger WHEN positions; VALUE contexts
+    /// stay eager (see the And/Or arm in `eval_expr_with_subqueries`), which
+    /// also matches stock.
+    ///
+    /// Determination rules, verified cell-by-cell against stock sqlite3
+    /// 3.46.1 (including under NOT):
+    /// - a FALSE operand always determines an AND chain; a TRUE operand
+    ///   always determines an OR chain;
+    /// - NULL additionally determines an AND chain only when the consumer is
+    ///   seeking TRUE (a plain WHEN: NULL AND x can never be TRUE), and an OR
+    ///   chain only when seeking FALSE (under NOT: NULL OR x can never be
+    ///   FALSE). In the opposite polarity the walk continues past NULL,
+    ///   because a later operand can still decide (NULL AND FALSE is false;
+    ///   NULL OR TRUE is true) — stock demonstrably evaluates, and errors on,
+    ///   the later operand there.
+    /// - NOT flips `seeking_true` for its operand and inverts the result;
+    ///   NULL stays NULL.
+    ///
+    /// Returns `Some(truth)` or `None` for NULL-or-undeterminable; a NULL
+    /// early-exit collapses "NULL or a value the chain would only reach by
+    /// evaluating further operands" into `None`, which is indistinguishable
+    /// through every enclosing AND/OR/NOT because polarity flips exactly
+    /// where the distinction would become observable. Chains flatten through
+    /// `collect_same_binary_op_operands` exactly like the value path, so
+    /// recursion depth is one async frame per boolean-skeleton alternation,
+    /// not per operator: a long homogeneous WHEN chain still costs O(1)
+    /// frames per leaf operand.
+    fn eval_expr_truthiness<'a>(
+        &'a self,
+        expr: &'a Expr,
+        seeking_true: bool,
+        row: &'a [SqliteValue],
+        col_map: &'a [(String, String, bool)],
+        params: Option<&'a [SqliteValue]>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<bool>>> + 'a>> {
+        Box::pin(async move {
+            match expr {
+                Expr::BinaryOp { op, .. } if matches!(op, BinaryOp::And | BinaryOp::Or) => {
+                    let mut chain = Vec::new();
+                    collect_same_binary_op_operands(expr, *op, &mut chain);
+                    debug_assert!(
+                        chain.len() >= 2,
+                        "And/Or BinaryOp must have at least two operands"
+                    );
+                    let is_and = matches!(op, BinaryOp::And);
+                    let mut saw_null = false;
+                    for operand in &chain {
+                        match self
+                            .eval_expr_truthiness(operand, seeking_true, row, col_map, params)
+                            .await?
+                        {
+                            None => {
+                                // NULL is absorbing only when the chain can no
+                                // longer reach the sought outcome.
+                                if is_and == seeking_true {
+                                    return Ok(None);
+                                }
+                                saw_null = true;
+                            }
+                            Some(truthy) => {
+                                if !truthy && is_and {
+                                    return Ok(Some(false));
+                                }
+                                if truthy && !is_and {
+                                    return Ok(Some(true));
+                                }
+                            }
+                        }
+                    }
+                    Ok(if saw_null { None } else { Some(is_and) })
+                }
+                Expr::UnaryOp {
+                    op: UnaryOp::Not,
+                    expr: inner,
+                    ..
+                } => Ok(self
+                    .eval_expr_truthiness(inner, !seeking_true, row, col_map, params)
+                    .await?
+                    .map(|truthy| !truthy)),
+                _ => {
+                    let value = self
+                        .eval_expr_with_subqueries(expr, row, col_map, params)
+                        .await?;
+                    Ok(if value.is_null() {
+                        None
+                    } else {
+                        Some(is_sqlite_truthy(&value))
+                    })
+                }
+            }
+        })
+    }
+
     fn eval_expr_with_subqueries<'a>(
         &'a self,
         expr: &'a Expr,
@@ -70593,6 +70694,14 @@ impl Connection {
                             chain.len() >= 2,
                             "And/Or BinaryOp must have at least two operands"
                         );
+                        // Value context stays EAGER, matching stock: in a
+                        // result column stock materializes both operands of
+                        // OP_And/OP_Or, so an error raised by the right
+                        // operand surfaces even when the left already
+                        // determined the result. Truth contexts (trigger
+                        // WHEN) short-circuit via eval_expr_truthiness
+                        // instead, mirroring stock's ExprIfTrue/IfFalse
+                        // split.
                         let mut acc = self
                             .eval_expr_with_subqueries(chain[0], row, col_map, params)
                             .await?;
@@ -157427,6 +157536,353 @@ mod tests {
             let rows = conn.query("SELECT msg FROM log;").await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("fired".into()));
+        });
+    }
+
+    #[test]
+    fn test_trigger_when_short_circuits_erroring_operand() {
+        // Trigger WHEN is a truthiness context: stock compiles it through
+        // ExprIfTrue, so AND/OR short-circuit left-to-right and an operand
+        // past the determining one is never evaluated. `json_each('bare')`
+        // errors with "invalid JSON input" if it ever runs. NULL determines
+        // nothing (NULL AND FALSE is false), so the walk continues past NULL
+        // to a later determining operand.
+        // NOTE: VALUE context (a result column) is eager in stock and stays
+        // eager here — see the And/Or arm of eval_expr_with_subqueries.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER);").await.unwrap();
+            conn.execute("CREATE TABLE log (msg TEXT);").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            // (name, WHEN clause, Some(expected-to-fire) or None = expect the
+            // json error to propagate). Expectations verified against stock
+            // sqlite3 3.46.1 trigger WHEN behavior, including under NOT.
+            let cases = [
+                (
+                    "and_false_determines",
+                    "0 AND (SELECT count(*) FROM json_each('bare'))",
+                    Some(false),
+                ),
+                (
+                    "or_true_determines",
+                    "1 OR (SELECT count(*) FROM json_each('bare'))",
+                    Some(true),
+                ),
+                // Seeking TRUE, NULL absorbs an AND chain (it can never
+                // become TRUE), so the erroring tail is skipped.
+                (
+                    "and_null_absorbs_seeking_true",
+                    "(SELECT NULL) AND (SELECT count(*) FROM json_each('bare'))",
+                    Some(false),
+                ),
+                // Seeking TRUE, NULL does NOT absorb an OR chain — a later
+                // TRUE still decides it.
+                (
+                    "or_null_continues_to_true",
+                    "(SELECT NULL) OR 1 OR (SELECT count(*) FROM json_each('bare'))",
+                    Some(true),
+                ),
+                // NOT flips polarity: FALSE still determines AND.
+                (
+                    "not_false_and_short_circuits",
+                    "NOT ((SELECT 0) AND (SELECT count(*) FROM json_each('bare')))",
+                    Some(true),
+                ),
+                // NOT flips polarity: seeking FALSE, NULL absorbs OR.
+                (
+                    "not_null_or_absorbs_seeking_false",
+                    "NOT ((SELECT NULL) OR (SELECT count(*) FROM json_each('bare')))",
+                    Some(false),
+                ),
+                // NOT flips polarity: seeking FALSE, NULL does NOT absorb
+                // AND, so stock evaluates — and errors on — the tail.
+                (
+                    "not_null_and_error_propagates",
+                    "NOT ((SELECT NULL) AND (SELECT count(*) FROM json_each('bare')))",
+                    None,
+                ),
+            ];
+            for (name, when_clause, expectation) in cases {
+                conn.execute(&format!(
+                    "CREATE TRIGGER trg_{name} AFTER UPDATE ON t \
+                     WHEN {when_clause} \
+                     BEGIN INSERT INTO log VALUES ('{name}'); END;"
+                ))
+                .await
+                .unwrap();
+                let update = conn.execute("UPDATE t SET id = id;").await;
+                match expectation {
+                    Some(expect_fire) => {
+                        update.unwrap_or_else(|error| {
+                            panic!("{name}: WHEN must short-circuit, got {error}")
+                        });
+                        let rows = conn
+                            .query(&format!(
+                                "SELECT count(*) FROM log WHERE msg = '{name}';"
+                            ))
+                            .await
+                            .unwrap();
+                        let fired = row_values(&rows[0])[0] == SqliteValue::Integer(1);
+                        assert_eq!(fired, expect_fire, "{name}: unexpected firing state");
+                    }
+                    None => {
+                        let error = update.expect_err(name);
+                        assert!(
+                            error.to_string().contains("invalid JSON input"),
+                            "{name}: expected the json error to propagate, got {error}"
+                        );
+                    }
+                }
+                conn.execute(&format!("DROP TRIGGER trg_{name};")).await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn test_and_or_three_valued_truth_table_both_consumers() {
+        // The SAME operand matrix must satisfy TWO different consumers:
+        //
+        // 1. VALUE-producing (`SELECT a AND b`): full SQL three-valued logic.
+        //    AND is 0 if any operand is false, else NULL if any operand is
+        //    NULL, else 1; OR dually. NULL cells MUST stay NULL — collapsing
+        //    them to 0 would corrupt every three-valued query in the engine.
+        //    Evaluation is EAGER (stock materializes both operands of a
+        //    result-column And/Or), so an erroring operand always errors.
+        //
+        // 2. WHEN-truthiness (trigger WHEN): only taken-vs-not-taken is
+        //    observable, so the walk may additionally stop on NULL in an AND
+        //    chain (it can never become TRUE). An erroring operand past the
+        //    stopping point is never evaluated.
+        //
+        // The two consumers must AGREE on taken == (value is 1) for every
+        // error-free cell, and must DIFFER exactly on the cells where the
+        // polarity shortcut skips an erroring operand: value-mode errors,
+        // WHEN-mode completes cleanly. Operands are scalar subqueries to pin
+        // the eval_expr_with_subqueries interpreter path.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER);").await.unwrap();
+            conn.execute("CREATE TABLE log (msg TEXT);").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            // T / F / N are plain truth operands; E errors if evaluated.
+            let operand_sql = |name: char| match name {
+                'T' => "(SELECT 1)",
+                'F' => "(SELECT 0)",
+                'N' => "(SELECT NULL)",
+                _ => "(SELECT count(*) FROM json_each('bare'))",
+            };
+            let alphabet = ['T', 'F', 'N', 'E'];
+            let mut divergent_cells = 0usize;
+            for len in [2usize, 3] {
+                let mut selector = vec![0usize; len];
+                loop {
+                    let chain: Vec<char> =
+                        selector.iter().map(|&pick| alphabet[pick]).collect();
+                    for op in ["AND", "OR"] {
+                        let is_and = op == "AND";
+                        let sql_chain = chain
+                            .iter()
+                            .map(|&name| operand_sql(name))
+                            .collect::<Vec<_>>()
+                            .join(&format!(" {op} "));
+
+                        // Expected VALUE-consumer outcome: eager, so any E
+                        // in the chain errors; otherwise plain 3VL.
+                        let value_expected: Option<SqliteValue> = if chain.contains(&'E') {
+                            None // error
+                        } else if is_and {
+                            if chain.contains(&'F') {
+                                Some(SqliteValue::Integer(0))
+                            } else if chain.contains(&'N') {
+                                Some(SqliteValue::Null)
+                            } else {
+                                Some(SqliteValue::Integer(1))
+                            }
+                        } else if chain.contains(&'T') {
+                            Some(SqliteValue::Integer(1))
+                        } else if chain.contains(&'N') {
+                            Some(SqliteValue::Null)
+                        } else {
+                            Some(SqliteValue::Integer(0))
+                        };
+
+                        // Expected WHEN-consumer outcome via the left-to-right
+                        // seeking-TRUE walk: AND stops on F or N (chain can
+                        // never be TRUE), OR stops on T; E errors if reached.
+                        let mut when_expected: Option<bool> = Some(is_and);
+                        for &name in &chain {
+                            match (is_and, name) {
+                                (true, 'F') | (true, 'N') => {
+                                    when_expected = Some(false);
+                                    break;
+                                }
+                                (false, 'T') => {
+                                    when_expected = Some(true);
+                                    break;
+                                }
+                                (_, 'E') => {
+                                    when_expected = None; // error
+                                    break;
+                                }
+                                _ => {
+                                    if !is_and && name != 'T' {
+                                        when_expected = Some(false);
+                                    }
+                                }
+                            }
+                        }
+
+                        // 1. VALUE consumer.
+                        let label: String = chain.iter().collect();
+                        let value_sql = format!("SELECT {sql_chain};");
+                        match (conn.query(&value_sql).await, &value_expected) {
+                            (Ok(rows), Some(expected)) => assert_eq!(
+                                &row_values(&rows[0])[0],
+                                expected,
+                                "value mismatch for {op} {label}"
+                            ),
+                            (Err(error), Some(expected)) => panic!(
+                                "value {op} {label}: expected {expected:?}, got error {error}"
+                            ),
+                            (Ok(_), None) => panic!(
+                                "value {op} {label}: eager evaluation must surface the error"
+                            ),
+                            (Err(_), None) => {}
+                        }
+
+                        // 2. WHEN consumer, same chain.
+                        conn.execute(&format!(
+                            "CREATE TRIGGER trg_matrix AFTER UPDATE ON t \
+                             WHEN {sql_chain} \
+                             BEGIN INSERT INTO log VALUES ('fired'); END;"
+                        ))
+                        .await
+                        .unwrap();
+                        let update = conn.execute("UPDATE t SET id = id;").await;
+                        match (update, when_expected) {
+                            (Ok(_), Some(expect_fire)) => {
+                                let rows = conn
+                                    .query("SELECT count(*) FROM log;")
+                                    .await
+                                    .unwrap();
+                                let fired =
+                                    row_values(&rows[0])[0] == SqliteValue::Integer(1);
+                                assert_eq!(
+                                    fired, expect_fire,
+                                    "WHEN firing mismatch for {op} {label}"
+                                );
+                                // Error-free cells: the consumers must AGREE,
+                                // taken == (value is 1).
+                                if let Some(value) = &value_expected {
+                                    assert_eq!(
+                                        fired,
+                                        *value == SqliteValue::Integer(1),
+                                        "consumer disagreement for {op} {label}"
+                                    );
+                                }
+                            }
+                            (Err(error), Some(_)) => panic!(
+                                "WHEN {op} {label}: expected clean short-circuit, got {error}"
+                            ),
+                            (Ok(_), None) => panic!(
+                                "WHEN {op} {label}: expected the error to be reached"
+                            ),
+                            (Err(_), None) => {}
+                        }
+                        conn.execute("DELETE FROM log;").await.unwrap();
+                        conn.execute("DROP TRIGGER trg_matrix;").await.unwrap();
+
+                        // The polarity shortcut is exactly the cells where
+                        // value-mode errors but WHEN-mode does not.
+                        if value_expected.is_none() && when_expected.is_some() {
+                            divergent_cells += 1;
+                        }
+                    }
+                    let mut digit = 0;
+                    loop {
+                        if digit == len {
+                            break;
+                        }
+                        selector[digit] += 1;
+                        if selector[digit] < alphabet.len() {
+                            break;
+                        }
+                        selector[digit] = 0;
+                        digit += 1;
+                    }
+                    if digit == len {
+                        break;
+                    }
+                }
+            }
+            // The two consumers MUST differ somewhere, or the WHEN path is
+            // not actually short-circuiting (and the polarity shortcut is
+            // not actually engaged).
+            assert!(
+                divergent_cells > 0,
+                "expected divergent cells between value and WHEN consumers"
+            );
+        });
+    }
+
+    #[test]
+    fn test_trigger_when_false_arm_short_circuits_nested_json_each() {
+        // Downstream shape (hfdt migration 0113): a WHEN guard whose EXISTS
+        // arm is FALSE for the row must prevent a later arm from running
+        // json_each over an element that is a bare string. Before the
+        // short-circuit fix this UPDATE failed with "invalid JSON input:
+        // expected value at line 1 column 1".
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE intents (id INTEGER PRIMARY KEY, state TEXT, handles TEXT);",
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE TABLE members (intent_id INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO intents VALUES (1, 'open', '[\"bare-string\"]');")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TRIGGER trg_guarded BEFORE UPDATE ON intents \
+                 WHEN OLD.state = 'open' AND NEW.state = 'done' \
+                   AND EXISTS (SELECT 1 FROM members WHERE intent_id = OLD.id) \
+                   AND EXISTS (SELECT 1 FROM json_each(NEW.handles) AS target \
+                                WHERE target.type IS NOT 'object' \
+                                   OR EXISTS (SELECT 1 FROM json_each(target.value))) \
+                 BEGIN SELECT RAISE(ABORT, 'guarded shape invalid'); END;",
+            )
+            .await
+            .unwrap();
+
+            // FALSE members arm: the json arms must never run.
+            conn.execute("UPDATE intents SET state = 'done' WHERE id = 1;")
+                .await
+                .unwrap();
+            let rows = conn
+                .query("SELECT state FROM intents WHERE id = 1;")
+                .await
+                .unwrap();
+            assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("done".into()));
+
+            // Positive control: with a member row the guard must still fire,
+            // otherwise the success above proves nothing.
+            conn.execute("INSERT INTO intents VALUES (2, 'open', '[\"bare-string\"]');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO members VALUES (2);").await.unwrap();
+            let error = conn
+                .execute("UPDATE intents SET state = 'done' WHERE id = 2;")
+                .await
+                .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("guarded shape invalid")
+                    || message.contains("invalid JSON input"),
+                "positive control must abort, got: {message}"
+            );
         });
     }
 
