@@ -1,4 +1,9 @@
 #![allow(clippy::future_not_send)]
+// bd-jtsn3: the async-migrated optional WASM surface nests futures deeply
+// enough that computing an async block's layout (lib.rs ~2453) overflows the
+// default 128 recursion limit under `--all-features`. Raise it so the crate
+// compiles; this only affects compile-time layout query depth, not runtime.
+#![recursion_limit = "512"]
 // wasm-bindgen drives these futures on the browser's single-threaded local
 // executor. Requiring `Send` would reject the core connection's intentional
 // `Rc`/`RefCell` state even though no future crosses a thread boundary.
