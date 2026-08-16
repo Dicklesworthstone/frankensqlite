@@ -8406,6 +8406,12 @@ struct TriggerFrame {
     rowid_alias_col_idx: Option<usize>,
     old_row: Option<Vec<SqliteValue>>,
     new_row: Option<Vec<SqliteValue>>,
+    /// Actual rowid of the OLD/NEW row, used to resolve the `rowid`/`oid`/
+    /// `_rowid_` aliases on tables that have no INTEGER PRIMARY KEY column to
+    /// carry the rowid (rowid_alias_col_idx is None). `None` when the rowid was
+    /// not captured for this event (e.g. INSERT, tracked separately). (GH #216)
+    old_rowid: Option<i64>,
+    new_rowid: Option<i64>,
 }
 
 impl TriggerFrame {
@@ -8417,7 +8423,12 @@ impl TriggerFrame {
 
     fn references_pseudo_column(&self, table_prefix: Option<&str>, column_name: &str) -> bool {
         let hidden_rowid = self.hidden_rowid_column_index(column_name);
-        if self.column_index(column_name).is_none() && hidden_rowid.is_none() {
+        // A rowid alias resolves even without an IPK column when the actual
+        // rowid was captured for the event. (GH #216)
+        let captured_rowid_alias =
+            is_rowid_alias(column_name) && (self.new_rowid.is_some() || self.old_rowid.is_some());
+        if self.column_index(column_name).is_none() && hidden_rowid.is_none() && !captured_rowid_alias
+        {
             return false;
         }
         match table_prefix {
@@ -8436,9 +8447,24 @@ impl TriggerFrame {
     }
 
     fn lookup_value(&self, table_prefix: Option<&str>, column_name: &str) -> Option<SqliteValue> {
-        let column_index = self
+        let Some(column_index) = self
             .column_index(column_name)
-            .or_else(|| self.hidden_rowid_column_index(column_name))?;
+            .or_else(|| self.hidden_rowid_column_index(column_name))
+        else {
+            // No real column and no INTEGER PRIMARY KEY column to alias the
+            // rowid. If the name is a rowid alias, resolve it from the captured
+            // rowid so NEW.rowid / OLD.rowid / oid / _rowid_ work on tables
+            // without an explicit IPK. (GH #216)
+            if is_rowid_alias(column_name) {
+                let rowid = match table_prefix {
+                    Some(prefix) if prefix.eq_ignore_ascii_case("old") => self.old_rowid,
+                    Some(prefix) if prefix.eq_ignore_ascii_case("new") => self.new_rowid,
+                    _ => self.new_rowid.or(self.old_rowid),
+                };
+                return rowid.map(SqliteValue::Integer);
+            }
+            return None;
+        };
         match table_prefix {
             Some(prefix) if prefix.eq_ignore_ascii_case("old") => {
                 Self::lookup_from_row(self.old_row.as_deref(), column_index)
@@ -56255,6 +56281,8 @@ impl Connection {
         table_name: &str,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
+        old_rowid: Option<i64>,
+        new_rowid: Option<i64>,
     ) -> Result<TriggerFrame> {
         let schema = self.schema.borrow();
         let table_schema = schema
@@ -56276,6 +56304,8 @@ impl Connection {
             rowid_alias_col_idx,
             old_row: old_values.map(ToOwned::to_owned),
             new_row: new_values.map(ToOwned::to_owned),
+            old_rowid,
+            new_rowid,
         })
     }
 
@@ -57999,6 +58029,8 @@ impl Connection {
         event: &fsqlite_ast::TriggerEvent,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
+        old_rowid: Option<i64>,
+        new_rowid: Option<i64>,
     ) -> Result<bool> {
         // NOTE: recursive_triggers guard moved into the per-trigger loop
         // below. C SQLite checks by trigger NAME (the same trigger cannot
@@ -58021,7 +58053,8 @@ impl Connection {
             return Ok(false);
         }
 
-        let base_frame = self.make_trigger_frame(table_name, old_values, new_values)?;
+        let base_frame =
+            self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid)?;
         for trigger in matching {
             // PRAGMA recursive_triggers (default OFF): when disabled, the
             // same trigger cannot re-enter itself (checked by trigger NAME,
@@ -58070,6 +58103,8 @@ impl Connection {
         event: &fsqlite_ast::TriggerEvent,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
+        old_rowid: Option<i64>,
+        new_rowid: Option<i64>,
     ) -> Result<()> {
         // F-PGM.11: Enforce trigger recursion depth limit (see fire_before_triggers).
         #[cfg(test)]
@@ -58093,7 +58128,8 @@ impl Connection {
             return Ok(());
         }
 
-        let base_frame = self.make_trigger_frame(table_name, old_values, new_values)?;
+        let base_frame =
+            self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid)?;
         for trigger in matching {
             // PRAGMA recursive_triggers (default OFF): when disabled, the
             // same trigger cannot re-enter itself (checked by trigger NAME,
