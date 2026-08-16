@@ -16,14 +16,17 @@
 //!     `ORDER BY` / `<` / `>` / `MIN` / `MAX` / `GROUP BY` match stock on a
 //!     UTF-16 database (NOCASE/RTRIM stay UTF-8, matching stock).
 //!
-//! The four UTF-16 end-to-end read arms below are `#[ignore]`d: at HEAD a
-//! UTF-16 file-backed `SELECT` returns TEXT as RAW UTF-16 bytes (the VDBE
-//! engine's `text_encoding` is not self-adopted on this read path, so
-//! `from_record_text_bytes` never decodes to canonical UTF-8) — a bld9w.2/.3
-//! decode gap upstream of collation. The bld9w.4 fix (BINARY compares in the DB
-//! encoding) landed and is proven at the VDBE level by
-//! `engine::tests::binary_compare_bytes_orders_in_db_storage_encoding`; these
-//! end-to-end arms un-ignore once the decode gap is closed. The UTF-8 control
+//! The four UTF-16 end-to-end read arms below are now ACTIVE (bd-0s9bv fixed).
+//! Previously a UTF-16 file-backed `SELECT` returned TEXT as RAW UTF-16 bytes:
+//! the VDBE engine self-adopts `text_encoding` correctly, but the SORTER
+//! column-read (`ORDER BY` pushes the raw source record through unchanged)
+//! decoded it Utf8-only, so `from_record_text_bytes` never decoded to canonical
+//! UTF-8. Fixed by threading the DB `text_encoding` into the sorter decode
+//! (`fsqlite-vdbe/engine.rs`, `cursor_column` sorter path). The bld9w.4 fix
+//! (BINARY compares in the DB encoding) landed and is proven at the VDBE level
+//! by `engine::tests::binary_compare_bytes_orders_in_db_storage_encoding`.
+//! `utf16le_collation_scope_parity` stays `#[ignore]`d — it now surfaces a
+//! separate NOCASE-ordering-on-UTF-16 gap, not the decode gap. The UTF-8 control
 //! and fixture-validation arms remain load-bearing:
 //!   * `utf8_control_*` — a UTF-8 hot-path parity guard: an identical UTF-8 stock
 //!     DB must read byte-for-byte identically, so the encoding threading provably
@@ -270,9 +273,6 @@ fn utf16_fixture_really_is_utf16_be() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "bd-bld9w.2/.3: UTF-16 file-backed SELECT returns raw UTF-16 bytes \
-            (text_encoding not self-adopted on this read path) — decode gap upstream \
-            of .4 collation. Un-ignore when the read-path decode is fixed."]
 fn utf16le_read_parity_ascii() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -289,8 +289,6 @@ fn utf16le_read_parity_ascii() {
 /// the VDBE level; this end-to-end arm stays ignored until the bld9w.2/.3
 /// read-path decode gap (raw UTF-16 bytes returned) is closed.
 #[test]
-#[ignore = "bd-bld9w.2/.3: blocked on the UTF-16 read-path decode gap (raw bytes \
-            returned); .4 ordering is unit-proven at the VDBE level."]
 fn utf16le_read_parity_unicode() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -302,7 +300,6 @@ fn utf16le_read_parity_unicode() {
 }
 
 #[test]
-#[ignore = "bd-bld9w.2/.3: blocked on the UTF-16 read-path decode gap (raw bytes returned)."]
 fn utf16be_read_parity_ascii() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -314,7 +311,6 @@ fn utf16be_read_parity_ascii() {
 }
 
 #[test]
-#[ignore = "bd-bld9w.2/.3: blocked on the UTF-16 read-path decode gap (raw bytes returned)."]
 fn utf16be_read_parity_unicode() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -392,9 +388,11 @@ async fn assert_custom_query_parity(path: &std::path::Path, queries: &[&str], la
 }
 
 #[test]
-#[ignore = "bd-bld9w.2/.3: blocked on the UTF-16 read-path decode gap (raw bytes \
-            returned) upstream of collation; .4 BINARY-only scope is unit-proven at \
-            the VDBE level (binary_compare_bytes_orders_in_db_storage_encoding)."]
+#[ignore = "bd-0s9bv fixed the read-path decode gap; this arm now surfaces a \
+            SEPARATE bug: `ORDER BY name COLLATE NOCASE` on a decoded UTF-16 DB \
+            diverges from stock (NOCASE ordering over decoded code points). Not a \
+            decode issue — a NOCASE-collation-on-UTF-16 ordering gap (bld9w.4 \
+            collation territory). Un-ignore when NOCASE-over-UTF-16 ordering matches."]
 fn utf16le_collation_scope_parity() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();

@@ -16362,13 +16362,20 @@ impl VdbeEngine {
                             .cached_value(col_idx)
                             .cloned()
                             .unwrap_or(SqliteValue::Null)
-                    } else if let Some(value) = fsqlite_types::record::decode_column_from_offset(
-                        &row.blob,
-                        cached_row_decode
-                            .column_offset(col_idx)
-                            .expect("col_idx checked against column_count"),
-                        collect_vdbe_metrics,
-                    ) {
+                    } else if let Some(value) =
+                        fsqlite_types::record::decode_column_from_offset_with_encoding(
+                            &row.blob,
+                            cached_row_decode
+                                .column_offset(col_idx)
+                                .expect("col_idx checked against column_count"),
+                            // bd-0s9bv: a sorter row blob is the raw source-table
+                            // record (ORDER BY pushes it through unchanged), so TEXT
+                            // must be decoded in the DB's storage encoding. Utf8-only
+                            // decode returned raw UTF-16 bytes for a UTF-16 database.
+                            text_encoding,
+                            collect_vdbe_metrics,
+                        )
+                    {
                         note_decode_cache_miss(collect_vdbe_metrics);
                         cached_row_decode.cache_decoded(col_idx, value.clone());
                         value
