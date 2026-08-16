@@ -81538,15 +81538,25 @@ impl Connection {
             // second standalone read transaction here would bypass the
             // publication bind required by schema-only live-WAL bootstrap.
             //
-            // bd-bld9w.3: read-only UTF-16 admission is PROVEN to work for direct
-            // opens (test_utf16_read_only_admission_reads_and_rejects_writes, kept
-            // #[ignore] until this gate lifts), but stays fail-closed here because
-            // ATTACH of a UTF-16 database is not yet write-safe: writes to an
-            // attached table dispatch through the PARENT connection's guard, which
-            // sees the parent's (UTF-8) encoding and would let UTF-8 TEXT serialize
-            // into the attached UTF-16 file. Lifting to is_read_supported() requires
-            // closing that ATTACH/import write-safety gap first.
-            if !header.text_encoding.is_runtime_supported() {
+            // bd-bld9w.3: UTF-16 databases are admitted READ-ONLY. The read path
+            // is complete (record decode .2, compare/collate .4, string funcs .6,
+            // schema/sqlite_master decode), so a UTF-16 file's schema and rows
+            // decode to canonical form end to end. Every write is still rejected:
+            // the write entry (guard_mutation_encoding_supported) consults the
+            // connection's own db_text_encoding (still is_runtime_supported), and
+            // that guard is reached by ALL opens because ATTACH
+            // (Self::open_with_env) and import (open_with_env_and_pager) reuse this
+            // very reload path -- each connection sets its own db_text_encoding
+            // from its own header. Attached-target writes are delegated to the
+            // attached connection's execute_statement (the direct,
+            // INSERT...SELECT, and WITH-clause paths all funnel through
+            // with_attached_connection -> the child's own guard), so a UTF-8
+            // parent can never serialize UTF-8 TEXT into an attached UTF-16 file.
+            // The earlier ATTACH write-safety concern was stale: the delegation
+            // architecture already closes it. Only the encode/MakeRecord write
+            // path (.7) and import/export/VACUUM (.8) stay gated -- via the write
+            // guard, not this read gate.
+            if !header.text_encoding.is_read_supported() {
                 return Err(FrankenError::Unsupported);
             }
             let page_size = header.page_size;
@@ -160888,10 +160898,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bd-bld9w.3: read-only UTF-16 admission is PROVEN by this keeper \
-                (passes when the reload admission gate uses is_read_supported), but \
-                the gate stays fail-closed until the ATTACH/import write-safety gap \
-                is closed. Un-ignore together with lifting the gate."]
     fn test_utf16_read_only_admission_reads_and_rejects_writes() {
         // bd-bld9w.3: a UTF-16LE/BE database is admitted READ-ONLY. Its TEXT
         // decodes end to end (schema + rows + index keys + ORDER BY), matching
@@ -160973,7 +160979,13 @@ mod tests {
     }
 
     #[test]
-    fn test_utf16_database_admission_fails_closed_and_preserves_main_image() {
+    fn test_utf16_admitted_read_only_across_open_modes_and_preserves_main_image() {
+        // bd-bld9w.3: a UTF-16LE/BE database is admitted READ-ONLY through every
+        // open mode that shares the reload admission gate — ordinary, existing,
+        // schema-only, in-memory import, and ATTACH. Reads decode end to end;
+        // every write fails closed (Unsupported) and the on-disk image is never
+        // mutated. Writes to an ATTACHed UTF-16 database are rejected by the
+        // attached connection's own guard, so a UTF-8 parent cannot corrupt it.
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             for encoding in ["UTF-16le", "UTF-16be"] {
@@ -160995,80 +161007,126 @@ mod tests {
                 let expected_encoding = if encoding == "UTF-16le" { 2 } else { 3 };
                 assert_eq!(header_encoding, expected_encoding);
 
-                let err = Connection::open(&db_str)
+                // Ordinary open: read decodes, write rejected, image preserved.
+                let conn = Connection::open(&db_str)
                     .await
-                    .expect_err("ordinary open must reject UTF-16");
-                assert!(matches!(err, FrankenError::Unsupported));
+                    .expect("ordinary open admits UTF-16 read-only");
+                let rows = conn.query(r#"SELECT value FROM "café";"#).await.unwrap();
+                assert_eq!(rows.len(), 1, "{encoding}: ordinary open row count");
+                assert_eq!(rows[0].values()[0], SqliteValue::Text("Καλημέρα".into()));
+                let err = conn
+                    .query(r#"INSERT INTO "café" VALUES (2, 'x');"#)
+                    .await
+                    .expect_err("write to a UTF-16 database must fail closed");
+                assert!(
+                    matches!(err, FrankenError::Unsupported),
+                    "{encoding}: ordinary-open write should be Unsupported, got {err:?}"
+                );
                 assert_eq!(std::fs::read(&db_path).unwrap(), original);
+                drop(conn);
 
-                let err = Connection::open_existing(&db_str)
+                // Existing-only open: same read-only admission.
+                let conn = Connection::open_existing(&db_str)
                     .await
-                    .expect_err("existing-only open must reject UTF-16");
-                assert!(matches!(err, FrankenError::Unsupported));
+                    .expect("existing-only open admits UTF-16 read-only");
+                assert_eq!(
+                    conn.query(r#"SELECT value FROM "café";"#).await.unwrap()[0].values()[0],
+                    SqliteValue::Text("Καλημέρα".into())
+                );
+                assert!(matches!(
+                    conn.query(r#"INSERT INTO "café" VALUES (2, 'x');"#)
+                        .await
+                        .expect_err("existing-only write must fail closed"),
+                    FrankenError::Unsupported
+                ));
                 assert_eq!(std::fs::read(&db_path).unwrap(), original);
+                drop(conn);
 
-                let err = Connection::open_schema_only(&db_str)
+                // Schema-only open: admitted; write rejected; image preserved.
+                let conn = Connection::open_schema_only(&db_str)
                     .await
-                    .expect_err("schema-only open must reject UTF-16");
-                assert!(matches!(err, FrankenError::Unsupported));
+                    .expect("schema-only open admits UTF-16 read-only");
+                assert!(matches!(
+                    conn.query(r#"INSERT INTO "café" VALUES (2, 'x');"#)
+                        .await
+                        .expect_err("schema-only write must fail closed"),
+                    FrankenError::Unsupported
+                ));
                 assert_eq!(std::fs::read(&db_path).unwrap(), original);
+                drop(conn);
 
-                let err = Connection::import_bytes(&original)
+                // In-memory import: admitted read-only; write rejected.
+                let conn = Connection::import_bytes(&original)
                     .await
-                    .expect_err("in-memory import must reject UTF-16");
-                assert!(matches!(err, FrankenError::Unsupported));
+                    .expect("import admits a UTF-16 image read-only");
+                assert_eq!(
+                    conn.query(r#"SELECT value FROM "café";"#).await.unwrap()[0].values()[0],
+                    SqliteValue::Text("Καλημέρα".into())
+                );
+                assert!(matches!(
+                    conn.query(r#"INSERT INTO "café" VALUES (2, 'x');"#)
+                        .await
+                        .expect_err("imported UTF-16 write must fail closed"),
+                    FrankenError::Unsupported
+                ));
+                drop(conn);
 
+                // ATTACH into a UTF-8 parent: attached read decodes, attached
+                // write is rejected by the child's own guard, image preserved.
                 let parent = Connection::open(":memory:").await.unwrap();
                 let attach_path = db_str.replace('\'', "''");
-                let attach_err = parent
-                    .execute(&format!(
-                        "ATTACH DATABASE '{attach_path}' AS unsupported_utf16;"
-                    ))
+                parent
+                    .execute(&format!("ATTACH DATABASE '{attach_path}' AS aux16;"))
                     .await
-                    .expect_err("ATTACH must reject a UTF-16 database");
-                assert!(matches!(attach_err, FrankenError::Unsupported));
+                    .expect("ATTACH admits a UTF-16 database read-only");
+                assert!(
+                    parent.attached_schemas.borrow().find("aux16").is_some(),
+                    "read-only UTF-16 ATTACH publishes the schema name"
+                );
                 assert!(
                     parent
-                        .attached_schemas
-                        .borrow()
-                        .find("unsupported_utf16")
-                        .is_none(),
-                    "failed UTF-16 ATTACH must not publish the schema name"
-                );
-                assert!(
-                    !parent
                         .attached_connections
                         .borrow()
-                        .contains_key(&attached_schema_key("unsupported_utf16")),
-                    "failed UTF-16 ATTACH must not retain the child connection"
+                        .contains_key(&attached_schema_key("aux16")),
+                    "read-only UTF-16 ATTACH retains the child connection"
                 );
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
-
-                let retry_err = Connection::open(&db_str)
+                let rows = parent
+                    .query(r#"SELECT value FROM aux16."café";"#)
                     .await
-                    .expect_err("rejected bootstrap must release its namespace lease");
-                // This second same-path admission reaches the encoding gate
-                // again only if the first rejected Connection dropped every
-                // namespace/bootstrap lease instead of wedging the path.
-                assert!(matches!(retry_err, FrankenError::Unsupported));
+                    .unwrap();
+                assert_eq!(rows.len(), 1, "{encoding}: attached read row count");
+                assert_eq!(rows[0].values()[0], SqliteValue::Text("Καλημέρα".into()));
+                for write in [
+                    r#"INSERT INTO aux16."café" VALUES (2, 'x');"#,
+                    r#"UPDATE aux16."café" SET value = 'x' WHERE id = 1;"#,
+                    r#"DELETE FROM aux16."café" WHERE id = 1;"#,
+                ] {
+                    let err = parent
+                        .query(write)
+                        .await
+                        .expect_err("write to an attached UTF-16 database must fail closed");
+                    assert!(
+                        matches!(err, FrankenError::Unsupported),
+                        "{encoding}: attached write `{write}` should be Unsupported, got {err:?}"
+                    );
+                }
                 assert_eq!(std::fs::read(&db_path).unwrap(), original);
             }
         });
     }
 
-    /// ASCII-only UTF-16 databases are the discriminating fail-closed case.
+    /// ASCII-only UTF-16 databases are the discriminating read-decode case
+    /// (bd-bld9w.3).
     ///
-    /// `test_utf16_database_admission_fails_closed_and_preserves_main_image`
-    /// builds its fixtures from a non-ASCII schema, whose UTF-16 encoding is
-    /// invalid UTF-8. The `parse_record`/`decode_value` TEXT paths would
-    /// therefore reject those fixtures even if the header encoding gate were
-    /// removed, so that keeper cannot tell the gate apart from downstream
-    /// UTF-8 validation. An ASCII-only `sqlite_master` encodes to byte-valid
-    /// UTF-8 with embedded NULs (`t\0a\0b\0l\0e\0`), so nothing after the
-    /// header gate can reject it on decode. This keeper fails the moment
-    /// admission stops consulting the header encoding.
+    /// An ASCII-only `sqlite_master`/row encodes to byte-valid UTF-8 with
+    /// embedded NULs (`p\0l\0a\0i\0n\0`), so a decode path that ignored the
+    /// header encoding would silently return those raw NUL-laden bytes rather
+    /// than reject them — nothing downstream can stand in for consulting the
+    /// header encoding. This keeper therefore proves the READ path consults the
+    /// encoding (SELECT returns `plain`, not the raw code units) and the write
+    /// guard still consults it (mutations fail closed), across every open mode.
     #[test]
-    fn test_utf16_ascii_only_schema_admission_fails_closed_across_all_modes() {
+    fn test_utf16_ascii_only_schema_admitted_read_only_and_decodes() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             for encoding in ["UTF-16le", "UTF-16be"] {
@@ -161090,10 +161148,10 @@ mod tests {
                 let expected_encoding = if encoding == "UTF-16le" { 2 } else { 3 };
                 assert_eq!(header_encoding, expected_encoding);
 
-                // Prove the fixture actually exercises the fail-open shape:
+                // Prove the fixture actually exercises the discriminating shape:
                 // the ASCII table name is stored as UTF-16 in `sqlite_master`
-                // and those bytes are byte-valid UTF-8, so no decode-side
-                // validation can stand in for the header encoding gate.
+                // and those bytes are byte-valid UTF-8, so a decode that ignored
+                // the header encoding would fail open rather than error.
                 let needle: Vec<u8> = "ascii_only_t"
                     .chars()
                     .flat_map(|ch| {
@@ -161116,53 +161174,75 @@ mod tests {
                     "fixture must store the ASCII table name as UTF-16 in sqlite_master"
                 );
 
-                let err = Connection::open(&db_str)
-                    .await
-                    .expect_err("ordinary open must reject ASCII-only UTF-16");
-                assert!(matches!(err, FrankenError::Unsupported));
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+                // Read decodes the ASCII-only TEXT to canonical form (not the
+                // raw NUL-laden code units) — proving the read path consults the
+                // header encoding — and the write fails closed.
+                for opener in ["open", "open_existing", "open_schema_only"] {
+                    let conn = match opener {
+                        "open" => Connection::open(&db_str).await,
+                        "open_existing" => Connection::open_existing(&db_str).await,
+                        _ => Connection::open_schema_only(&db_str).await,
+                    }
+                    .unwrap_or_else(|e| panic!("{encoding}/{opener}: admit read-only, got {e:?}"));
+                    if opener != "open_schema_only" {
+                        let rows = conn.query("SELECT value FROM ascii_only_t;").await.unwrap();
+                        assert_eq!(
+                            rows[0].values()[0],
+                            SqliteValue::Text("plain".into()),
+                            "{encoding}/{opener}: ASCII-only UTF-16 must decode to 'plain'"
+                        );
+                    }
+                    assert!(
+                        matches!(
+                            conn.query("INSERT INTO ascii_only_t VALUES (2, 'x');")
+                                .await
+                                .expect_err("write must fail closed"),
+                            FrankenError::Unsupported
+                        ),
+                        "{encoding}/{opener}: write should be Unsupported"
+                    );
+                    assert_eq!(std::fs::read(&db_path).unwrap(), original);
+                    drop(conn);
+                }
 
-                let err = Connection::open_existing(&db_str)
+                let conn = Connection::import_bytes(&original)
                     .await
-                    .expect_err("existing-only open must reject ASCII-only UTF-16");
-                assert!(matches!(err, FrankenError::Unsupported));
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
-
-                let err = Connection::open_schema_only(&db_str)
-                    .await
-                    .expect_err("schema-only open must reject ASCII-only UTF-16");
-                assert!(matches!(err, FrankenError::Unsupported));
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
-
-                let err = Connection::import_bytes(&original)
-                    .await
-                    .expect_err("in-memory import must reject ASCII-only UTF-16");
-                assert!(matches!(err, FrankenError::Unsupported));
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+                    .expect("import admits ASCII-only UTF-16 read-only");
+                assert_eq!(
+                    conn.query("SELECT value FROM ascii_only_t;").await.unwrap()[0].values()[0],
+                    SqliteValue::Text("plain".into())
+                );
+                assert!(matches!(
+                    conn.query("INSERT INTO ascii_only_t VALUES (2, 'x');")
+                        .await
+                        .expect_err("imported ASCII-only UTF-16 write must fail closed"),
+                    FrankenError::Unsupported
+                ));
+                drop(conn);
 
                 let parent = Connection::open(":memory:").await.unwrap();
                 let attach_path = db_str.replace('\'', "''");
-                let attach_err = parent
-                    .execute(&format!(
-                        "ATTACH DATABASE '{attach_path}' AS ascii_only_utf16;"
-                    ))
+                parent
+                    .execute(&format!("ATTACH DATABASE '{attach_path}' AS ascii16;"))
                     .await
-                    .expect_err("ATTACH must reject an ASCII-only UTF-16 database");
-                assert!(matches!(attach_err, FrankenError::Unsupported));
-                assert!(
+                    .expect("ATTACH admits ASCII-only UTF-16 read-only");
+                assert_eq!(
                     parent
-                        .attached_schemas
-                        .borrow()
-                        .find("ascii_only_utf16")
-                        .is_none(),
-                    "failed ASCII-only UTF-16 ATTACH must not publish the schema name"
+                        .query("SELECT value FROM ascii16.ascii_only_t;")
+                        .await
+                        .unwrap()[0]
+                        .values()[0],
+                    SqliteValue::Text("plain".into())
                 );
                 assert!(
-                    !parent
-                        .attached_connections
-                        .borrow()
-                        .contains_key(&attached_schema_key("ascii_only_utf16")),
-                    "failed ASCII-only UTF-16 ATTACH must not retain the child connection"
+                    matches!(
+                        parent
+                            .query("INSERT INTO ascii16.ascii_only_t VALUES (2, 'x');")
+                            .await
+                            .expect_err("attached ASCII-only UTF-16 write must fail closed"),
+                        FrankenError::Unsupported
+                    ),
+                    "{encoding}: attached write should be Unsupported"
                 );
                 assert_eq!(std::fs::read(&db_path).unwrap(), original);
             }
@@ -194526,39 +194606,53 @@ fts5(title, body, content=docs, content_rowid=id)'
                 SchemaOnly,
             }
 
-            for (kind, stem, rejection) in [
-                (
-                    OpenKind::Ordinary,
-                    "ordinary",
-                    "ordinary open must reject WAL-visible UTF-16",
-                ),
-                (
-                    OpenKind::Existing,
-                    "existing",
-                    "existing-only open must reject WAL-visible UTF-16",
-                ),
-                (
-                    OpenKind::SchemaOnly,
-                    "schema_only",
-                    "schema-only open must reject WAL-visible UTF-16",
-                ),
+            for (kind, stem) in [
+                (OpenKind::Ordinary, "ordinary"),
+                (OpenKind::Existing, "existing"),
+                (OpenKind::SchemaOnly, "schema_only"),
             ] {
-                // Each admission mode gets a fresh database so an earlier
-                // rejected open cannot checkpoint, refresh, or otherwise
-                // prime the pager/WAL state observed by a later mode.
+                // Each admission mode gets a fresh database so an earlier open
+                // cannot checkpoint, refresh, or otherwise prime the pager/WAL
+                // state observed by a later mode.
                 let (sqlite, db_path, original) = create_live_wal_fixture(dir.path(), stem);
                 let db_str = db_path.to_str().unwrap();
-                let err = match kind {
+                // bd-bld9w.3: admitted READ-ONLY. Admission (and the row decode)
+                // must use the AUTHORITATIVE page 1 from the live WAL, not the
+                // stale main-file page 1 (which is not UTF-16). If it consulted
+                // the stale main page 1, it would treat the database as UTF-8 and
+                // MISDECODE the UTF-16 TEXT — so a correct `Καλημέρα` read is the
+                // proof that the authoritative WAL page 1 was used.
+                let conn = match kind {
                     OpenKind::Ordinary => Connection::open(db_str).await,
                     OpenKind::Existing => Connection::open_existing(db_str).await,
                     OpenKind::SchemaOnly => Connection::open_schema_only(db_str).await,
                 }
-                .expect_err(rejection);
+                .expect("WAL-visible UTF-16 is admitted read-only");
+                if !matches!(kind, OpenKind::SchemaOnly) {
+                    let rows = conn.query(r#"SELECT value FROM "café";"#).await.unwrap();
+                    assert_eq!(
+                        rows.len(),
+                        1,
+                        "{stem}: WAL-visible row must be readable"
+                    );
+                    assert_eq!(
+                        rows[0].values()[0],
+                        SqliteValue::Text("Καλημέρα".into()),
+                        "{stem}: decode via authoritative WAL page 1, not the stale main page 1"
+                    );
+                }
+                // Writes fail closed; the on-disk main image is never mutated.
                 assert!(
-                    matches!(err, FrankenError::Unsupported),
-                    "{rejection}: expected Unsupported, got {err:?}"
+                    matches!(
+                        conn.query(r#"INSERT INTO "café" VALUES (2, 'x');"#)
+                            .await
+                            .expect_err("WAL-visible UTF-16 write must fail closed"),
+                        FrankenError::Unsupported
+                    ),
+                    "{stem}: write should be Unsupported"
                 );
                 assert_eq!(std::fs::read(&db_path).unwrap(), original);
+                drop(conn);
                 drop(sqlite);
             }
         });
