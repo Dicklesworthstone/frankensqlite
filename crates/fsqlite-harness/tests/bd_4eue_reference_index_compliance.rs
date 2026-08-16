@@ -380,10 +380,10 @@ fn test_api_mirrors_asupersync_sqlite() -> Result<(), String> {
     }
 
     for marker in [
-        "pub fn open(",
-        "pub fn prepare(",
-        "pub fn execute(",
-        "pub fn query(",
+        "pub async fn open(",
+        "pub async fn prepare(",
+        "pub async fn execute(",
+        "pub async fn query(",
     ] {
         if !connection_api.contains(marker) {
             return Err(format!(

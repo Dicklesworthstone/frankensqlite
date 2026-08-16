@@ -808,7 +808,7 @@ pub fn read_table_leaf_rowid_at_offset(page: &[u8], cell_offset: usize) -> Optio
 }
 
 /// Minimum on-page allocation for any cell, per the SQLite file format
-/// (btree.c `cellSizePtr`: "the minimum size of any cell is 4 bytes").
+/// (per SQLite's `cellSizePtr`: "the minimum size of any cell is 4 bytes").
 ///
 /// A leaf-index cell whose key record encodes in fewer bytes (e.g. a
 /// single-column WITHOUT ROWID PRIMARY KEY holding 0/1 via serial types 8/9
