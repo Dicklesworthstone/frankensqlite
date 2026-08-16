@@ -17896,10 +17896,28 @@ impl Connection {
         // `omit`, which is the module's guarantee that xFilter fully enforces
         // it. A non-positive argv_index supplies no argument (matching SQLite's
         // observable handling) and is always residual, even if `omit` was set.
+        // A live FTS5 column-restricted `<col> MATCH <q>` reaches xFilter as a
+        // bare query string that searches every column, because
+        // scan_live_fts5_rows consumes only the query text. Rewrite such a query
+        // to the column-filter form `<col> : (<q>)` — the same syntax that
+        // `<table> MATCH '<col>: <q>'` already honors — so the restriction is
+        // enforced. Whole-table matches carry no column_name and are untouched.
+        // (GH #249)
+        #[cfg(feature = "ext-fts5")]
+        let is_fts5 = self.is_live_fts5_instance(&src.table_name);
+        #[cfg(not(feature = "ext-fts5"))]
+        let is_fts5 = false;
+
         let mut indexed_args: Vec<(i32, SqliteValue)> = Vec::new();
         for (candidate, usage) in candidates.iter().zip(&info.constraint_usage) {
             if usage.argv_index > 0 {
-                indexed_args.push((usage.argv_index, candidate.value.clone()));
+                let arg = match candidate.column_name.as_deref() {
+                    Some(col) if is_fts5 => SqliteValue::Text(
+                        format!("{col} : ({})", candidate.value.to_text()).into(),
+                    ),
+                    _ => candidate.value.clone(),
+                };
+                indexed_args.push((usage.argv_index, arg));
                 if !usage.omit {
                     residual_terms.push(candidate.expr.clone());
                 }
@@ -124819,6 +124837,11 @@ struct LiveVtabConstraintCandidate {
     expr: Expr,
     constraint: IndexConstraint,
     value: SqliteValue,
+    /// For a live FTS5 column-restricted `<col> MATCH <q>`, the restricted
+    /// column's name, so the pushed query can be rewritten to the
+    /// `<col> : (<q>)` column-filter form the tokenizer already honors. `None`
+    /// for whole-table `<table> MATCH` and for non-MATCH constraints. (GH #249)
+    column_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -126259,6 +126282,7 @@ fn extract_live_vtab_constraint_candidate(
                         usable: true,
                     },
                     value,
+                    column_name: None,
                 });
             }
             if let Expr::Column(col_ref, _) = right.as_ref()
@@ -126274,6 +126298,7 @@ fn extract_live_vtab_constraint_candidate(
                         usable: true,
                     },
                     value,
+                    column_name: None,
                 });
             }
             None
@@ -126286,10 +126311,18 @@ fn extract_live_vtab_constraint_candidate(
             ..
         } => {
             let value = eval_live_vtab_constant_expr(pattern)?;
-            let column = if is_vtab_table_match_operand(inner, table_name) {
-                0
+            // Whole-table `<table> MATCH` and first-column `<col0> MATCH` both
+            // map to constraint column 0, so the column index alone cannot
+            // distinguish them. Carry the column *name* separately for the
+            // column-restricted case so the fts5 planner can rewrite the query
+            // to `<col> : (<q>)` without that ambiguity. (GH #249)
+            let (column, column_name) = if is_vtab_table_match_operand(inner, table_name) {
+                (0, None)
             } else if let Expr::Column(col_ref, _) = inner.as_ref() {
-                column_ref_to_vtab_constraint_column(col_ref, col_map)?
+                (
+                    column_ref_to_vtab_constraint_column(col_ref, col_map)?,
+                    Some(col_ref.column.to_string()),
+                )
             } else {
                 return None;
             };
@@ -126301,6 +126334,7 @@ fn extract_live_vtab_constraint_candidate(
                     usable: true,
                 },
                 value,
+                column_name,
             })
         }
         _ => None,
