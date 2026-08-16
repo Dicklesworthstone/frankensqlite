@@ -2245,6 +2245,23 @@ where
     /// cached fd closes it and leaves this `None`, forcing a fresh open next
     /// commit (self-healing invalidation).
     cached_verification_db: Option<V::File>,
+    /// Cached read-only descriptor for the per-commit durable-certificate read
+    /// in [`Self::latest_authorized_durable_certificate_record`] (bd-smxhz).
+    ///
+    /// That read runs on the pinned-read and checkpoint paths and previously
+    /// re-opened/closed the `-wal-cert` sidecar every call — part of the
+    /// per-commit file-open storm that serializes writers under disk contention.
+    /// Holding the descriptor is safe: the read is `READONLY` (no lock), the
+    /// certificate is only ever appended/truncated *in place* within a WAL
+    /// generation (never unlinked+recreated), so re-reading `file_size` each
+    /// call observes peer appends live; and the sidecar is reset only at a
+    /// generation change, where [`Self::replace_inner`] (and `checkpoint`)
+    /// invalidate this cache. A stale cross-generation read is additionally
+    /// caught by the callers' `record.wal_generation` check (fail-closed). Any
+    /// read anomaly drops the descriptor, forcing a fresh open. Interior-mutable
+    /// because the read path is `&self` (a `WalBackend` read-snapshot method);
+    /// the lock is held only for the sync take/put-back, never across `.await`.
+    cached_certificate_read: std::sync::Mutex<Option<V::File>>,
     inner: WalBackendAdapter<V::File>,
 }
 
@@ -2274,6 +2291,7 @@ where
             #[cfg(all(feature = "native", any(unix, windows)))]
             namespace_binding,
             cached_verification_db: None,
+            cached_certificate_read: std::sync::Mutex::new(None),
             inner: WalBackendAdapter::new(wal),
         }
     }
@@ -2298,6 +2316,17 @@ where
             return Err(FrankenError::Busy);
         }
         let old = std::mem::replace(&mut self.inner, WalBackendAdapter::new(wal));
+        // bd-smxhz: the WAL generation changed, so the -wal-cert sidecar is
+        // reset for the new generation and the cached certificate descriptor is
+        // stale — drop it so the next read re-opens.
+        if let Some(mut stale) = self
+            .cached_certificate_read
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = stale.close(cx);
+        }
         let old_wal = old.into_inner()?;
         let _ = old_wal.close(cx);
         Ok(())
@@ -3148,14 +3177,30 @@ where
         cx: &Cx,
     ) -> Result<Option<ParallelWalDurableCertificateRecord>> {
         let certificate_path = self.certificate_sidecar_path();
-        if !self
-            .vfs
-            .access(cx, &certificate_path, AccessFlags::EXISTS)?
+        // bd-smxhz: reuse a held read-only descriptor when the cache is warm;
+        // only consult the path (access + open) on a cold cache. Within a WAL
+        // generation the sidecar is appended/truncated in place, so a held
+        // descriptor observes changes on re-read below; generation resets
+        // invalidate the cache via replace_inner / checkpoint.
+        let mut file = match self
+            .cached_certificate_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
         {
-            return Ok(None);
-        }
-        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
-        let (mut file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
+            Some(cached) => cached,
+            None => {
+                if !self
+                    .vfs
+                    .access(cx, &certificate_path, AccessFlags::EXISTS)?
+                {
+                    return Ok(None);
+                }
+                let flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
+                let (file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
+                file
+            }
+        };
         let read_result = async {
             let file_size = file.file_size(cx)?;
             if file_size == 0 {
@@ -3409,15 +3454,26 @@ where
             }
         }
         .await;
-        let cleanup_cx = cx.create_child();
-        let _cleanup_mask = cleanup_cx.masked();
-        let close_result = file.close(&cleanup_cx);
-        match (read_result, close_result) {
-            (Ok(certificate), Ok(())) => Ok(certificate),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(read_error), Err(close_error)) => Err(FrankenError::internal(format!(
-                "parallel WAL certificate tail read failed and close also failed: read={read_error}; close={close_error}"
-            ))),
+        match read_result {
+            // Success: retain the descriptor for the next call rather than
+            // closing it. The read is read-only, so deferring the close (to
+            // Drop / generation-change invalidation) has no durability impact
+            // and eliminates the per-commit open/close storm (bd-smxhz).
+            Ok(certificate) => {
+                *self
+                    .cached_certificate_read
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(file);
+                Ok(certificate)
+            }
+            // Anomaly: close and drop the descriptor so the next call re-opens
+            // (self-healing invalidation).
+            Err(error) => {
+                let cleanup_cx = cx.create_child();
+                let _cleanup_mask = cleanup_cx.masked();
+                let _ = file.close(&cleanup_cx);
+                Err(error)
+            }
         }
     }
 }
@@ -3904,6 +3960,19 @@ where
                 .inner
                 .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
                 .await?;
+            // bd-smxhz: the checkpoint reset the WAL generation and its
+            // -wal-cert sidecar, so the cached certificate descriptor is stale;
+            // drop it so the next read re-opens against the fresh generation.
+            if let Some(mut stale) = self
+                .cached_certificate_read
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let cleanup_cx = cx.create_child();
+                let _cleanup_mask = cleanup_cx.masked();
+                let _ = stale.close(&cleanup_cx);
+            }
             Ok(result)
         })
     }
