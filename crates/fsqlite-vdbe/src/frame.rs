@@ -275,6 +275,235 @@ impl FrameStack {
     }
 }
 
+// ── bd-4uema / bd-2pyzd: async trigger trampoline scheduler ─────────────────
+//
+// The runtime trigger path in `fsqlite-core` executes trigger bodies at the AST
+// level: `fire_{before,after}_triggers` → `execute_bound_trigger_statement` →
+// `execute_statement().await`, and the executed statement fires further triggers
+// which re-enter the same chain. Because each re-entry descends the native async
+// poll stack (`execute_statement` is already `Pin<Box<dyn Future>>`; boxing the
+// re-entry moves *state* to the heap but polling still recurses natively), a
+// recursive-trigger chain consumes ~179 KiB of native stack per level and
+// SIGABRTs on a pinned 1 MiB stack long before the typed 1000-level depth cap
+// (`FrankenError::TriggerRecursionDepthExceeded`) can fire.
+//
+// `TrampolineStack<P>` is the heap data structure a single iterative driver loop
+// uses to flatten that recursion to O(1) native depth. It is deliberately
+// *payload-generic* and self-contained: the AST-carrying work item (bound body
+// statements + OLD/NEW `TriggerFrame` + body cursor) lives in `fsqlite-core`
+// (downstream of this crate, so it cannot be named here without a dependency
+// cycle) and is stored as an opaque `P`. This type owns only the scheduling
+// invariant that is subtle to get right and worth testing in isolation:
+//
+//   * LIFO push/pop so a depth-first driver runs each fired child (and its whole
+//     subtree) before the next sibling body statement — matching SQLite's
+//     recursive-CASCADE ordering;
+//   * a logical-depth cap decoupled from native stack depth, so the cap fires at
+//     exactly `max_depth` regardless of how few native frames are live;
+//   * the `PRAGMA recursive_triggers = OFF` self-recursion-by-name guard, which
+//     is a *skip* (siblings still fire), distinct from the depth cap, which is
+//     an *error*;
+//   * a Cx memory budget across all active frames.
+//
+// See `frame.rs`'s module header (bd-3lj3) for the register-file `VdbeFrame`
+// model, which targets a future OP_Program/sub-program VDBE rewrite; the
+// AST-level trampoline reuses this scheduler instead of that register model.
+
+/// Outcome of attempting to admit one more trigger invocation onto a
+/// [`TrampolineStack`].
+///
+/// The driver in `fsqlite-core` maps each variant onto existing SQLite-visible
+/// behavior; the ordering of the checks in [`TrampolineStack::try_admit`]
+/// mirrors the runtime trigger loop exactly (self-recursion skip is tested
+/// before the depth cap, matching `fire_{before,after}_triggers`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrampolineAdmission {
+    /// The invocation was admitted; its payload now sits on top of the stack.
+    Admitted,
+    /// Refused because a trigger of the same name (ASCII-case-insensitive) is
+    /// already active and `recursive_triggers` is disabled. The caller SKIPS
+    /// this trigger — it is NOT an error, and sibling triggers still fire.
+    SelfRecursionBlocked,
+    /// Refused because the stack is already at the configured depth cap. The
+    /// caller maps this to `FrankenError::TriggerRecursionDepthExceeded`
+    /// ("too many levels of trigger recursion").
+    DepthExceeded,
+    /// Refused because admitting the frame would exceed the Cx memory budget
+    /// across all active frames. The caller maps this to SQLITE_NOMEM.
+    OutOfMemory,
+}
+
+/// One active trigger invocation on the trampoline stack: the opaque driver
+/// payload plus the scheduling metadata the stack needs without having to name
+/// the payload's type.
+#[derive(Debug, Clone)]
+struct TrampolineEntry<P> {
+    /// Opaque driver payload (bound body statements + OLD/NEW frame + cursor).
+    payload: P,
+    /// Trigger name, for the self-recursion-by-name guard.
+    trigger_name: String,
+    /// Memory charged for this entry at admission time (for exact release).
+    mem_cost: usize,
+}
+
+/// Heap-allocated, payload-generic scheduler that flattens recursive trigger
+/// execution to O(1) native stack depth.
+///
+/// The AST-level trigger driver pushes a work item per fired trigger with
+/// [`try_admit`](Self::try_admit) and drains the stack from a single loop with
+/// [`pop`](Self::pop); a child fired while a body statement executes is pushed
+/// on top and therefore runs before the parent's next body statement
+/// (depth-first). Because the driver never `.await`s a nested `execute_statement`
+/// inside another, at most one trigger-execution native frame is live at a time.
+///
+/// The two limits are independent:
+/// 1. `max_depth` — logical nesting cap (default [`SQLITE_MAX_TRIGGER_DEPTH`]);
+/// 2. `mem_budget` — total memory charged across all active frames.
+#[derive(Debug)]
+pub struct TrampolineStack<P> {
+    /// Active invocations, index 0 = outermost trigger, last = currently running.
+    entries: Vec<TrampolineEntry<P>>,
+    /// Maximum logical nesting depth.
+    max_depth: usize,
+    /// Memory budget across all active frames.
+    mem_budget: usize,
+    /// Currently charged memory across all active frames.
+    current_memory: usize,
+    /// Whether self-recursive triggers are allowed (`PRAGMA recursive_triggers`).
+    recursive_triggers: bool,
+}
+
+impl<P> TrampolineStack<P> {
+    /// Create a scheduler with the given depth cap and memory budget.
+    ///
+    /// Pass `mem_budget = usize::MAX` to disable memory accounting (the runtime
+    /// trigger frame stack is currently unbudgeted; the budget is opt-in).
+    pub fn new(max_depth: usize, mem_budget: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            max_depth,
+            mem_budget,
+            current_memory: 0,
+            recursive_triggers: false,
+        }
+    }
+
+    /// Create a scheduler with SQLite's default trigger depth cap and no memory
+    /// budget (matching the current runtime, which does not budget trigger
+    /// frames).
+    pub fn with_defaults() -> Self {
+        Self::new(SQLITE_MAX_TRIGGER_DEPTH, usize::MAX)
+    }
+
+    /// Current logical nesting depth (number of active frames).
+    pub fn depth(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no trigger is currently active.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Memory currently charged across all active frames.
+    pub fn current_memory(&self) -> usize {
+        self.current_memory
+    }
+
+    /// Set the `PRAGMA recursive_triggers` policy.
+    pub fn set_recursive_triggers(&mut self, enabled: bool) {
+        self.recursive_triggers = enabled;
+    }
+
+    /// Whether self-recursive triggers are allowed.
+    pub fn recursive_triggers(&self) -> bool {
+        self.recursive_triggers
+    }
+
+    /// Whether a trigger named `trigger_name` (ASCII-case-insensitively) is
+    /// already active on the stack.
+    ///
+    /// Mirrors the runtime guard, which compares trigger names with
+    /// `eq_ignore_ascii_case`.
+    pub fn active_contains_name(&self, trigger_name: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.trigger_name.eq_ignore_ascii_case(trigger_name))
+    }
+
+    /// Attempt to admit one more trigger invocation, charging `mem_cost` bytes.
+    ///
+    /// Checks are ordered to match the runtime trigger loop exactly:
+    /// 1. self-recursion-by-name (skip) — `SelfRecursionBlocked`;
+    /// 2. depth cap (error) — `DepthExceeded`;
+    /// 3. memory budget / accounting overflow — `OutOfMemory`.
+    ///
+    /// On [`TrampolineAdmission::Admitted`] the payload is pushed; on any
+    /// refusal the stack is left unchanged, so the caller can `continue`
+    /// (skip), propagate the typed error, or unwind without a partial push.
+    pub fn try_admit(
+        &mut self,
+        trigger_name: &str,
+        mem_cost: usize,
+        payload: P,
+    ) -> TrampolineAdmission {
+        if !self.recursive_triggers && self.active_contains_name(trigger_name) {
+            return TrampolineAdmission::SelfRecursionBlocked;
+        }
+        if self.entries.len() >= self.max_depth {
+            return TrampolineAdmission::DepthExceeded;
+        }
+        let Some(new_total) = self.current_memory.checked_add(mem_cost) else {
+            return TrampolineAdmission::OutOfMemory;
+        };
+        if new_total > self.mem_budget {
+            return TrampolineAdmission::OutOfMemory;
+        }
+        self.current_memory = new_total;
+        self.entries.push(TrampolineEntry {
+            payload,
+            trigger_name: trigger_name.to_owned(),
+            mem_cost,
+        });
+        TrampolineAdmission::Admitted
+    }
+
+    /// Pop the top (most deeply nested) invocation, releasing its charged
+    /// memory. Returns its payload, or `None` if the stack is empty.
+    pub fn pop(&mut self) -> Option<P> {
+        let entry = self.entries.pop()?;
+        self.current_memory = self.current_memory.saturating_sub(entry.mem_cost);
+        Some(entry.payload)
+    }
+
+    /// Borrow the top invocation's payload without removing it.
+    pub fn top(&self) -> Option<&P> {
+        self.entries.last().map(|entry| &entry.payload)
+    }
+
+    /// Mutably borrow the top invocation's payload (e.g. to advance the body
+    /// cursor or record a RAISE outcome) without removing it.
+    pub fn top_mut(&mut self) -> Option<&mut P> {
+        self.entries.last_mut().map(|entry| &mut entry.payload)
+    }
+
+    /// The top invocation's trigger name, if any.
+    pub fn top_name(&self) -> Option<&str> {
+        self.entries.last().map(|entry| entry.trigger_name.as_str())
+    }
+
+    /// Unwind and return every active invocation, innermost first, resetting the
+    /// charged memory to zero. Used for cleanup when an error unwinds the whole
+    /// trigger program.
+    pub fn unwind_all(&mut self) -> Vec<P> {
+        let mut unwound = Vec::with_capacity(self.entries.len());
+        while let Some(payload) = self.pop() {
+            unwound.push(payload);
+        }
+        unwound
+    }
+}
+
 /// Helper to create a `VdbeFrame` for testing or simple trigger entry.
 pub fn make_frame(
     saved_pc: i32,
@@ -732,5 +961,186 @@ mod tests {
         let mem = frame.estimated_memory();
         // Should account for the 1024-byte string + 2048-byte blob.
         assert!(mem > 3000, "memory estimate too low: {mem}");
+    }
+
+    // ── TrampolineStack<P> (bd-4uema / bd-2pyzd async trigger trampoline) ────
+
+    /// A stand-in for the `fsqlite-core` driver payload: enough to prove the
+    /// scheduler carries an opaque AST-ish work item and supports the
+    /// body-cursor mutation the depth-first driver performs.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeWork {
+        table: &'static str,
+        body_len: usize,
+        cursor: usize,
+    }
+
+    fn work(table: &'static str, body_len: usize) -> FakeWork {
+        FakeWork {
+            table,
+            body_len,
+            cursor: 0,
+        }
+    }
+
+    #[test]
+    fn trampoline_depth_first_pop_order_matches_recursive_cascade() {
+        // Outer statement fires trg_a; trg_a's body fires trg_b; trg_b's body
+        // fires trg_a again. With LIFO admission the most deeply nested child is
+        // always run next, exactly like the native recursive cascade.
+        let mut stack: TrampolineStack<FakeWork> = TrampolineStack::with_defaults();
+        stack.set_recursive_triggers(true);
+
+        assert_eq!(
+            stack.try_admit("trg_a", 0, work("a", 1)),
+            TrampolineAdmission::Admitted
+        );
+        assert_eq!(stack.depth(), 1);
+        assert_eq!(
+            stack.try_admit("trg_b", 0, work("b", 1)),
+            TrampolineAdmission::Admitted
+        );
+        assert_eq!(
+            stack.try_admit("trg_a", 0, work("a", 1)),
+            TrampolineAdmission::Admitted
+        );
+        assert_eq!(stack.depth(), 3);
+
+        // Drain: innermost (last admitted) first.
+        assert_eq!(stack.pop().unwrap().table, "a");
+        assert_eq!(stack.pop().unwrap().table, "b");
+        assert_eq!(stack.pop().unwrap().table, "a");
+        assert!(stack.pop().is_none());
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn trampoline_depth_cap_is_typed_and_decoupled_from_native_stack() {
+        // The cap fires at exactly max_depth with a distinct DepthExceeded
+        // signal (mapped to TriggerRecursionDepthExceeded by the caller),
+        // regardless of native stack depth — the whole point of the trampoline.
+        let mut stack: TrampolineStack<FakeWork> = TrampolineStack::new(1000, usize::MAX);
+        stack.set_recursive_triggers(true);
+
+        for i in 0..1000 {
+            assert_eq!(
+                stack.try_admit("trg_recursive", 0, work("t", 1)),
+                TrampolineAdmission::Admitted,
+                "admission at depth {i} must succeed"
+            );
+        }
+        assert_eq!(stack.depth(), 1000);
+        // The 1001st admission is refused with the typed depth signal, not a
+        // panic or overflow, and the stack is left unchanged.
+        assert_eq!(
+            stack.try_admit("trg_recursive", 0, work("t", 1)),
+            TrampolineAdmission::DepthExceeded
+        );
+        assert_eq!(stack.depth(), 1000);
+    }
+
+    #[test]
+    fn trampoline_self_recursion_blocked_is_skip_not_error() {
+        // recursive_triggers = OFF: the same trigger name cannot re-enter
+        // itself (a SKIP), but a different sibling name still admits, and the
+        // self-recursion check takes precedence over the depth cap so the
+        // caller `continue`s rather than raising.
+        let mut stack: TrampolineStack<FakeWork> = TrampolineStack::new(1, usize::MAX);
+        assert!(!stack.recursive_triggers());
+
+        assert_eq!(
+            stack.try_admit("trg_self", 0, work("t", 1)),
+            TrampolineAdmission::Admitted
+        );
+        // Same name, and also at the depth cap: self-recursion wins (skip).
+        assert_eq!(
+            stack.try_admit("trg_self", 0, work("t", 1)),
+            TrampolineAdmission::SelfRecursionBlocked
+        );
+        // A different name at the cap surfaces the depth error instead.
+        assert_eq!(
+            stack.try_admit("trg_other", 0, work("t", 1)),
+            TrampolineAdmission::DepthExceeded
+        );
+        assert_eq!(stack.depth(), 1);
+        // Name match is ASCII-case-insensitive, matching the runtime guard.
+        assert!(stack.active_contains_name("TRG_SELF"));
+    }
+
+    #[test]
+    fn trampoline_memory_budget_stops_nesting_below_depth_cap() {
+        // A low budget refuses further nesting with OutOfMemory well before the
+        // depth cap, and released memory is reclaimed exactly on pop.
+        let mut stack: TrampolineStack<FakeWork> = TrampolineStack::new(1000, 100);
+        stack.set_recursive_triggers(true);
+
+        for _ in 0..10 {
+            assert_eq!(
+                stack.try_admit("trg_mem", 10, work("t", 1)),
+                TrampolineAdmission::Admitted
+            );
+        }
+        assert_eq!(stack.current_memory(), 100);
+        assert_eq!(stack.depth(), 10);
+        // Budget exhausted before depth 1000.
+        assert_eq!(
+            stack.try_admit("trg_mem", 10, work("t", 1)),
+            TrampolineAdmission::OutOfMemory
+        );
+        assert_eq!(stack.depth(), 10);
+        // Pop one -> memory freed -> one more admission fits.
+        stack.pop().unwrap();
+        assert_eq!(stack.current_memory(), 90);
+        assert_eq!(
+            stack.try_admit("trg_mem", 10, work("t", 1)),
+            TrampolineAdmission::Admitted
+        );
+    }
+
+    #[test]
+    fn trampoline_memory_accounting_overflow_is_refused_cleanly() {
+        let mut stack: TrampolineStack<FakeWork> = TrampolineStack::new(1000, usize::MAX);
+        stack.set_recursive_triggers(true);
+        stack.current_memory = usize::MAX - 4;
+
+        assert_eq!(
+            stack.try_admit("trg_overflow", 8, work("t", 1)),
+            TrampolineAdmission::OutOfMemory
+        );
+        assert_eq!(stack.depth(), 0);
+        assert_eq!(stack.current_memory(), usize::MAX - 4);
+    }
+
+    #[test]
+    fn trampoline_top_mut_advances_body_cursor() {
+        // The driver advances the running frame's body cursor in place between
+        // statements; top_mut must expose that without a pop/re-push.
+        let mut stack: TrampolineStack<FakeWork> = TrampolineStack::with_defaults();
+        stack.set_recursive_triggers(true);
+        stack.try_admit("trg_body", 0, work("t", 3));
+
+        assert_eq!(stack.top().unwrap().cursor, 0);
+        stack.top_mut().unwrap().cursor += 1;
+        stack.top_mut().unwrap().cursor += 1;
+        assert_eq!(stack.top().unwrap().cursor, 2);
+        assert_eq!(stack.top().unwrap().body_len, 3);
+        assert_eq!(stack.top_name(), Some("trg_body"));
+    }
+
+    #[test]
+    fn trampoline_unwind_all_cleans_up_innermost_first() {
+        let mut stack: TrampolineStack<FakeWork> = TrampolineStack::with_defaults();
+        stack.set_recursive_triggers(true);
+        for (i, name) in ["trg_0", "trg_1", "trg_2", "trg_3", "trg_4"].iter().enumerate() {
+            stack.try_admit(name, 4, work("t", i));
+        }
+        assert_eq!(stack.depth(), 5);
+
+        let unwound = stack.unwind_all();
+        assert_eq!(unwound.len(), 5);
+        assert_eq!(unwound[0].body_len, 4); // innermost admitted (trg_4)
+        assert_eq!(unwound[4].body_len, 0); // outermost admitted (trg_0)
+        assert!(stack.is_empty());
+        assert_eq!(stack.current_memory(), 0);
     }
 }
