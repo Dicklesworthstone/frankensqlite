@@ -35,19 +35,25 @@ async fn setup(conn: &Connection) {
     .unwrap();
 }
 
-// bd-76k72 ROOT CAUSE (probe-proven): this is NOT FTS5-specific — it is a
-// comparison-affinity bug. FTS5 stores every column as TEXT, so
-// `fts_messages.message_id` reads as `Text("7")`. The join predicate
-// `fts_messages.message_id = messages.id` compares that `Text("7")` against
-// `messages.id` (INTEGER PRIMARY KEY = `Integer(7)`). Stock SQLite applies
-// NUMERIC affinity to the comparison because one operand's column has INTEGER
-// affinity, coercing `Text("7")` -> `7` so `7 = 7` matches; FrankenSQLite
-// applies no affinity, so `Text("7") != Integer(7)` and the LEFT JOIN yields
-// NULL for `messages.idx`. Fix lives in codegen comparison-affinity for join
-// conditions (use numeric affinity when either operand's column carries it),
-// not in FTS5. High blast radius (affects all comparisons) — un-ignore when
-// that fix lands. Red until then.
-#[ignore = "bd-76k72: join comparison affinity not applied (FTS5 TEXT col vs INTEGER col); red until the codegen comparison-affinity fix lands"]
+// bd-76k72 ROOT CAUSE: typeless virtual-table columns (FTS5, table-valued
+// functions) are assigned NUMERIC affinity ('C') by
+// `parse_virtual_table_column_infos`, but a typeless column has NONE affinity
+// ('A') per SQLite. FTS5 stores columns as TEXT, so `fts_messages.message_id`
+// reads as `Text("7")`; the predicate `fts_messages.message_id = messages.id`
+// compares it against `messages.id` (INTEGER PK). With the column wrongly
+// NUMERIC, `join_comparison_affinity_p5('C','D')` returns 0 = no coercion, so
+// `Text("7")` is never coerced and the LEFT JOIN yields NULL. The fix gives
+// typeless vtab columns NONE affinity, which combines to NUMERIC against an
+// integer column and coerces "7" -> 7. (Plain non-vtab TEXT=INTEGER joins were
+// always correct — see bd_76k72_affinity_probe.rs.)
+//
+// The fix lives in TWO sites (there are two copies of the parser):
+//   * crates/fsqlite-core/src/compat_persist.rs (reload path) — DONE.
+//   * crates/fsqlite-core/src/connection.rs:90181 (`parse_declared_...`) and
+//     :90201 (`default_virtual_table_column_info`) — the LIVE `:memory:`
+//     CREATE path (FTS5's generic factory doesn't override `column_info`).
+// `#[ignore]` stays until the connection.rs half lands; un-ignore then.
+#[ignore = "bd-76k72: green once connection.rs:90181/90201 vtab affinity 'C'->'A' lands (compat_persist half done)"]
 #[test]
 fn bd_76k72_probe_fts5_column_standalone_vs_join() {
     asupersync::test_utils::run_test(|| async {
@@ -114,5 +120,101 @@ fn bd_76k72_probe_fts5_column_standalone_vs_join() {
             Some(&SqliteValue::Text("Auth failure".into()))
         );
         assert_eq!(p4[0].get(1), Some(&SqliteValue::Integer(2)));
+    });
+}
+
+// bd-76k72 MECHANISM EXPERIMENTS (prints, no hard asserts on the vtab arms):
+// isolate WHY the vtab-driven inner INTEGER-PK lookup drops numeric coercion.
+#[test]
+fn bd_76k72_experiment_cast_and_nonpk_inner() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        setup(&conn).await;
+
+        // E1: explicit CAST of the vtab TEXT key to INTEGER. If this matches,
+        // the bug is purely comparison-affinity/coercion (value + plan are fine).
+        let e1 = conn
+            .query(
+                "SELECT fts_messages.title, messages.idx \
+                 FROM fts_messages LEFT JOIN messages \
+                 ON CAST(fts_messages.message_id AS INTEGER) = messages.id \
+                 WHERE fts_messages MATCH 'auth'",
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "E1 CAST key to INTEGER (expect 'Auth failure',2): {:?}",
+            e1.iter().map(|r| r.values().to_vec()).collect::<Vec<_>>()
+        );
+
+        // E2: INNER JOIN variant (not LEFT) — does the driver being a vtab still
+        // drop the match when the join is inner?
+        let e2 = conn
+            .query(
+                "SELECT fts_messages.title, messages.idx \
+                 FROM fts_messages JOIN messages \
+                 ON fts_messages.message_id = messages.id \
+                 WHERE fts_messages MATCH 'auth'",
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "E2 INNER JOIN (expect one row 'Auth failure',2): {:?}",
+            e2.iter().map(|r| r.values().to_vec()).collect::<Vec<_>>()
+        );
+
+        // E3: reversed ON operand order (messages.id = fts.message_id).
+        let e3 = conn
+            .query(
+                "SELECT fts_messages.title, messages.idx \
+                 FROM fts_messages LEFT JOIN messages \
+                 ON messages.id = fts_messages.message_id \
+                 WHERE fts_messages MATCH 'auth'",
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "E3 reversed operands (expect 'Auth failure',2): {:?}",
+            e3.iter().map(|r| r.values().to_vec()).collect::<Vec<_>>()
+        );
+    });
+}
+
+// E4: inner join column is a NON-PK indexed/plain INTEGER (not the rowid).
+// Distinguishes a rowid-seek-specific coercion gap from a general vtab-join
+// comparison gap.
+#[test]
+fn bd_76k72_experiment_nonpk_integer_inner() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE meta (mid INTEGER, idx INTEGER)")
+            .await
+            .unwrap();
+        conn.execute(
+            "CREATE VIRTUAL TABLE fts_m USING fts5(content, message_id)",
+        )
+        .await
+        .unwrap();
+        conn.execute("INSERT INTO meta(mid, idx) VALUES (7, 2)")
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO fts_m(rowid, content, message_id) VALUES (1, 'auth token', 7)",
+        )
+        .await
+        .unwrap();
+
+        let e4 = conn
+            .query(
+                "SELECT fts_m.message_id, meta.idx \
+                 FROM fts_m LEFT JOIN meta ON fts_m.message_id = meta.mid \
+                 WHERE fts_m MATCH 'auth'",
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "E4 non-PK INTEGER inner (expect 7,2): {:?}",
+            e4.iter().map(|r| r.values().to_vec()).collect::<Vec<_>>()
+        );
     });
 }
