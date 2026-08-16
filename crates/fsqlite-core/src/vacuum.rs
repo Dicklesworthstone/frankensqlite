@@ -331,6 +331,71 @@ mod tests {
         reserve_temp_rebuild_target, resolve_vacuum_into_target,
     };
 
+    // GH#340 / bd-m0e3b: VACUUM INTO must produce valid WITHOUT ROWID table
+    // roots. A WITHOUT ROWID table's primary structure is an index b-tree, not a
+    // table b-tree; the vacuumed image must record/serialize that root correctly
+    // so stock sqlite3 reads it as `ok` and the rows survive.
+    #[test]
+    fn vacuum_into_preserves_without_rowid_table_roots() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("wor-vacuum-source.db");
+            let target_path = dir.path().join("wor-vacuum-target.db");
+            let source = source_path.to_string_lossy().into_owned();
+            let target = target_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&source).await.unwrap();
+            conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES ('a', '1'), ('b', '2'), ('c', '3');")
+                .await
+                .unwrap();
+            conn.execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target.clone().into())],
+            )
+            .await
+            .unwrap();
+            drop(conn);
+
+            // Stock sqlite3 must accept the vacuumed WITHOUT ROWID image.
+            let copied = rusqlite::Connection::open(&target_path).unwrap();
+            let integrity_check: String = copied
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                integrity_check, "ok",
+                "GH#340: VACUUM INTO produced a WITHOUT ROWID image stock sqlite3 rejects: {integrity_check}"
+            );
+            let rows: Vec<(String, String)> = {
+                let mut stmt = copied.prepare("SELECT k, v FROM t ORDER BY k;").unwrap();
+                let mapped = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .unwrap();
+                mapped.map(Result::unwrap).collect()
+            };
+            assert_eq!(
+                rows,
+                vec![
+                    ("a".to_string(), "1".to_string()),
+                    ("b".to_string(), "2".to_string()),
+                    ("c".to_string(), "3".to_string()),
+                ]
+            );
+
+            // fsqlite must also read the vacuumed image back.
+            let reopened = Connection::open_schema_only(&target).await.unwrap();
+            let frows = reopened
+                .query("SELECT k, v FROM t ORDER BY k;")
+                .await
+                .unwrap();
+            assert_eq!(frows.len(), 3);
+            assert_eq!(frows[0].values()[0], SqliteValue::Text("a".into()));
+            reopened.close().await.unwrap();
+        });
+    }
+
     #[test]
     fn test_vacuum_rebuilds_file_backed_database_and_preserves_header_metadata() {
         asupersync::test_utils::run_test(|| async {
