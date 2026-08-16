@@ -1073,7 +1073,10 @@ impl MemTable {
                 return false;
             }
             let collation = collations.get(position).and_then(|c| c.as_deref());
-            if cmp_values_collated(existing_value, new_value, collation, registry)
+            // UNIQUE-constraint duplicate detection is an equality test, which is
+            // encoding-invariant (a == b in UTF-8 iff in UTF-16), so the DB
+            // encoding is irrelevant here (bd-bld9w.4).
+            if cmp_values_collated(existing_value, new_value, collation, registry, TextEncoding::Utf8)
                 != Ordering::Equal
             {
                 return false;
@@ -1230,6 +1233,10 @@ struct SorterCursor {
     collations: Vec<Option<String>>,
     /// Shared collation registry consulted during comparison.
     collation_registry: Arc<Mutex<CollationRegistry>>,
+    /// Database text encoding, so BINARY collation orders in the DB storage
+    /// encoding (UTF-16 code-unit order on a UTF-16 database) — bd-bld9w.4.
+    /// `Utf8` (the default) keeps the previous canonical-UTF-8 byte order.
+    text_encoding: TextEncoding,
     /// Inserted records.
     rows: Vec<SorterRow>,
     /// Current position after `SorterSort`/`SorterNext`.
@@ -1367,6 +1374,7 @@ impl SorterCursor {
             collations,
             Arc::new(Mutex::new(CollationRegistry::new())),
             None,
+            TextEncoding::Utf8,
         )
     }
 
@@ -1376,6 +1384,7 @@ impl SorterCursor {
         collations: Vec<Option<String>>,
         collation_registry: Arc<Mutex<CollationRegistry>>,
         top_n_limit: Option<usize>,
+        text_encoding: TextEncoding,
     ) -> Self {
         let key_columns = key_columns.max(1);
         if sort_key_orders.len() < key_columns {
@@ -1387,6 +1396,7 @@ impl SorterCursor {
             sort_key_orders,
             collations,
             collation_registry,
+            text_encoding,
             rows: Vec::new(),
             position: None,
             cached_row_position: None,
@@ -1414,6 +1424,7 @@ impl SorterCursor {
             &self.sort_key_orders,
             &self.collations,
             collation_registry,
+            self.text_encoding,
         );
         if key_ordering == Ordering::Equal {
             lhs.source_sequence.cmp(&rhs.source_sequence)
@@ -1490,6 +1501,7 @@ impl SorterCursor {
                 &self.sort_key_orders,
                 &self.collations,
                 collation_registry,
+                self.text_encoding,
             ) == Ordering::Less
         })
     }
@@ -1589,6 +1601,7 @@ impl SorterCursor {
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
+        let text_encoding = self.text_encoding;
         let coll_guard = self
             .collation_registry
             .lock()
@@ -1601,6 +1614,7 @@ impl SorterCursor {
                 &orders,
                 &colls,
                 &coll_guard,
+                text_encoding,
             )
         });
         drop(coll_guard);
@@ -1691,6 +1705,7 @@ impl SorterCursor {
                 let key_columns = self.key_columns;
                 let orders = self.sort_key_orders.clone();
                 let colls = self.collations.clone();
+                let text_encoding = self.text_encoding;
                 self.rows.sort_by(|lhs, rhs| {
                     let key_ordering = compare_sorter_rows(
                         &lhs.values,
@@ -1699,6 +1714,7 @@ impl SorterCursor {
                         &orders,
                         &colls,
                         &coll_guard,
+                        text_encoding,
                     );
                     if key_ordering == Ordering::Equal {
                         lhs.source_sequence.cmp(&rhs.source_sequence)
@@ -1714,6 +1730,7 @@ impl SorterCursor {
             let key_columns = self.key_columns;
             let orders = self.sort_key_orders.clone();
             let colls = self.collations.clone();
+            let text_encoding = self.text_encoding;
             self.rows.sort_by(|lhs, rhs| {
                 compare_sorter_rows(
                     &lhs.values,
@@ -1722,6 +1739,7 @@ impl SorterCursor {
                     &orders,
                     &colls,
                     &coll_guard,
+                    text_encoding,
                 )
             });
             self.rows_sorted_total += self.rows.len() as u64;
@@ -1732,6 +1750,7 @@ impl SorterCursor {
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
+        let text_encoding = self.text_encoding;
         self.rows.sort_by(|lhs, rhs| {
             compare_sorter_rows(
                 &lhs.values,
@@ -1740,6 +1759,7 @@ impl SorterCursor {
                 &orders,
                 &colls,
                 &coll_guard,
+                text_encoding,
             )
         });
 
@@ -1778,6 +1798,7 @@ impl SorterCursor {
                             &orders,
                             &colls,
                             &coll_guard,
+                            text_encoding,
                         ) == Ordering::Less
                         {
                             best_idx = Some(i);
@@ -6526,6 +6547,9 @@ struct AggStepCall<'a> {
     agg_collation: Option<&'a str>,
     execution_cx: &'a Cx,
     args: &'a [SqliteValue],
+    /// DB storage encoding so collated MIN/MAX order BINARY in the DB encoding
+    /// on a UTF-16 database (bd-bld9w.4).
+    text_encoding: TextEncoding,
 }
 
 /// Original-row state captured for UPDATE's delete+insert rewrite so the old
@@ -9240,7 +9264,7 @@ impl VdbeEngine {
                         // NUMERIC P5 must attempt to coerce each TEXT value.
                         let cmp = if !builtins_overridden
                             && let Some(cmp) =
-                                fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5)
+                                fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5, self.text_encoding)
                         {
                             cmp
                         } else {
@@ -9256,7 +9280,7 @@ impl VdbeEngine {
                                     _ => "BINARY",
                                 };
                                 let coll = self.lock_collation();
-                                collate_compare(&cmp_lhs, &cmp_rhs, coll_name, &coll)
+                                collate_compare(&cmp_lhs, &cmp_rhs, coll_name, &coll, self.text_encoding)
                             } else {
                                 cmp_lhs.partial_cmp(&cmp_rhs)
                             }
@@ -9724,6 +9748,7 @@ impl VdbeEngine {
                             collations,
                             Arc::clone(&self.collation_registry),
                             top_n_limit,
+                            self.text_encoding,
                         ),
                     );
                     // A cursor id cannot be both table and sorter cursor.
@@ -11192,6 +11217,11 @@ impl VdbeEngine {
                                                             &index_desc_flags,
                                                             &index_collations,
                                                             &BUILTIN_COLLATION_REGISTRY,
+                                                            // Unique-index prefix fast-path ordering;
+                                                            // BINARY-on-UTF-16 index-key order is
+                                                            // bld9w.5 (index keys). Utf8 keeps today's
+                                                            // behavior on this admission-gated path.
+                                                            TextEncoding::Utf8,
                                                         ) == Ordering::Less)
                                                             .then_some(new_prefix)
                                                     })
@@ -11681,6 +11711,7 @@ impl VdbeEngine {
                                     sorter.key_columns,
                                     &sorter.collations,
                                     &coll,
+                                    sorter.text_encoding,
                                 )
                             } else {
                                 true
@@ -11954,7 +11985,7 @@ impl VdbeEngine {
                             // values.  When partial_cmp returns None (NULL vs
                             // non-NULL or NaN), apply NULL-first ordering.
                             let ord = if let Some(coll_name) = coll_name {
-                                collate_compare(val_a, val_b, coll_name, &coll)
+                                collate_compare(val_a, val_b, coll_name, &coll, self.text_encoding)
                             } else {
                                 val_a.partial_cmp(val_b)
                             };
@@ -12278,6 +12309,7 @@ impl VdbeEngine {
                             &desc_flags,
                             &collations,
                             &coll_guard,
+                            sc.text_encoding,
                         );
                         drop(coll_guard);
 
@@ -12312,6 +12344,7 @@ impl VdbeEngine {
                                 &desc_flags,
                                 &collations,
                                 &coll_guard,
+                                self.text_encoding,
                             );
                             drop(coll_guard);
                             let condition_met = idx_compare_condition_met(op.opcode, cmp);
@@ -12507,10 +12540,12 @@ impl VdbeEngine {
                                 agg_collation,
                                 execution_cx: &execution_cx,
                                 args,
+                                text_encoding: self.text_encoding,
                             },
                         )?;
                     } else {
                         let args = self.collect_reg_range(op.p2, arg_count);
+                        let text_encoding = self.text_encoding;
                         Self::agg_step_with_args(
                             &mut self.cold_state,
                             &mut self.statement_cold_state,
@@ -12522,6 +12557,7 @@ impl VdbeEngine {
                                 agg_collation,
                                 execution_cx: &execution_cx,
                                 args: &args,
+                                text_encoding,
                             },
                         )?;
                     }
@@ -14967,7 +15003,7 @@ impl VdbeEngine {
         }
 
         let cmp = if !builtins_overridden
-            && let Some(cmp) = fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5)
+            && let Some(cmp) = fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5, self.text_encoding)
         {
             cmp
         } else {
@@ -14981,7 +15017,7 @@ impl VdbeEngine {
                     _ => "BINARY",
                 };
                 let coll = self.lock_collation();
-                collate_compare(&cmp_lhs, &cmp_rhs, coll_name, &coll)
+                collate_compare(&cmp_lhs, &cmp_rhs, coll_name, &coll, self.text_encoding)
             } else {
                 cmp_lhs.partial_cmp(&cmp_rhs)
             }
@@ -15518,6 +15554,7 @@ impl VdbeEngine {
                     &step.args[0],
                     step.func_name.eq_ignore_ascii_case("max"),
                     collation,
+                    step.text_encoding,
                 );
             } else {
                 ctx.func.step(&mut ctx.state, step.args)?;
@@ -17171,6 +17208,7 @@ fn collate_compare(
     rhs: &SqliteValue,
     coll_name: &str,
     collation_registry: &CollationRegistry,
+    enc: TextEncoding,
 ) -> Option<std::cmp::Ordering> {
     match (lhs, rhs) {
         (SqliteValue::Text(l), SqliteValue::Text(r)) => Some(compare_text_with_collation(
@@ -17178,6 +17216,7 @@ fn collate_compare(
             r.as_bytes_direct(),
             coll_name,
             collation_registry,
+            enc,
         )),
         _ => lhs.partial_cmp(rhs),
     }
@@ -17188,22 +17227,77 @@ fn compare_text_with_collation(
     right: &[u8],
     coll_name: &str,
     collation_registry: &CollationRegistry,
+    enc: TextEncoding,
 ) -> Ordering {
+    // BINARY compares in the DB storage encoding (bd-bld9w.4); NOCASE/RTRIM and
+    // user-defined collations operate on canonical UTF-8 as before. An unknown
+    // collation falls back to BINARY, which is likewise encoding-aware.
+    if coll_name.eq_ignore_ascii_case("BINARY") {
+        return binary_compare_bytes(left, right, enc);
+    }
     collation_registry
         .find(coll_name)
         .map(|collation| collation.compare(left, right))
-        .unwrap_or_else(|| left.cmp(right))
+        .unwrap_or_else(|| binary_compare_bytes(left, right, enc))
+}
+
+/// BINARY collation byte comparison that honors the database storage encoding
+/// (GH #... bd-bld9w.4). Stock SQLite's BINARY collation compares TEXT in the
+/// database's storage encoding, so on a UTF-16 database `ORDER BY`, `<`/`>`,
+/// `MIN`/`MAX`, `DISTINCT`, and `GROUP BY` order by the UTF-16 code-unit byte
+/// sequence — which differs from canonical-UTF-8 byte order for non-ASCII BMP
+/// characters on UTF-16LE (e.g. `名`=U+540D encodes LE as `0D 54`, whose low
+/// byte `0x0D` sorts before ASCII, but whose UTF-8 `E5 90 8D` sorts after).
+///
+/// NOCASE and RTRIM are `SQLITE_UTF8`-registered collations in stock SQLite (it
+/// transcodes operands to UTF-8 before applying them), so they already match on
+/// canonical UTF-8 and are NOT routed here.
+///
+/// For UTF-8 databases this is a plain `memcmp` — byte-for-byte the previous
+/// behavior, so the common hot path pays nothing.
+fn binary_compare_bytes(left: &[u8], right: &[u8], enc: TextEncoding) -> Ordering {
+    match enc {
+        TextEncoding::Utf8 => left.cmp(right),
+        TextEncoding::Utf16le | TextEncoding::Utf16be => {
+            let big_endian = matches!(enc, TextEncoding::Utf16be);
+            // Canonical TEXT is valid UTF-8; transcode both sides to the DB
+            // encoding and memcmp. Raw (byte-preserved non-UTF-8) TEXT is the
+            // bd-6y0jd concern — fall back to comparing its stored bytes.
+            match (std::str::from_utf8(left), std::str::from_utf8(right)) {
+                (Ok(ls), Ok(rs)) => {
+                    encode_utf16_sortkey(ls, big_endian).cmp(&encode_utf16_sortkey(rs, big_endian))
+                }
+                _ => left.cmp(right),
+            }
+        }
+    }
+}
+
+/// Encode `s` to its UTF-16 (LE or BE) byte sequence — the exact bytes stock
+/// SQLite `memcmp`s for BINARY collation on a UTF-16 database.
+fn encode_utf16_sortkey(s: &str, big_endian: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() * 2);
+    for unit in s.encode_utf16() {
+        let bytes = if big_endian {
+            unit.to_be_bytes()
+        } else {
+            unit.to_le_bytes()
+        };
+        out.extend_from_slice(&bytes);
+    }
+    out
 }
 
 fn builtin_collation_compare_text(
     left: &SmallText,
     right: &SmallText,
     coll_name: &str,
+    enc: TextEncoding,
 ) -> Option<Ordering> {
     let left = left.as_bytes_direct();
     let right = right.as_bytes_direct();
     if coll_name.eq_ignore_ascii_case("BINARY") {
-        return Some(left.cmp(right));
+        return Some(binary_compare_bytes(left, right, enc));
     }
     if coll_name.eq_ignore_ascii_case("NOCASE") {
         return Some(compare_ascii_nocase_bytes(left, right));
@@ -17214,10 +17308,18 @@ fn builtin_collation_compare_text(
     None
 }
 
-fn cmp_sqlite_values_collated(a: &SqliteValue, b: &SqliteValue, coll: &str) -> Ordering {
+fn cmp_sqlite_values_collated(
+    a: &SqliteValue,
+    b: &SqliteValue,
+    coll: &str,
+    enc: TextEncoding,
+) -> Ordering {
     match (a, b) {
-        (SqliteValue::Text(l), SqliteValue::Text(r)) => builtin_collation_compare_text(l, r, coll)
-            .unwrap_or_else(|| l.as_bytes_direct().cmp(r.as_bytes_direct())),
+        (SqliteValue::Text(l), SqliteValue::Text(r)) => {
+            builtin_collation_compare_text(l, r, coll, enc).unwrap_or_else(|| {
+                binary_compare_bytes(l.as_bytes_direct(), r.as_bytes_direct(), enc)
+            })
+        }
         _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
     }
 }
@@ -17227,6 +17329,7 @@ fn agg_step_min_max_collated(
     candidate: &SqliteValue,
     is_max: bool,
     coll: &str,
+    enc: TextEncoding,
 ) {
     let current: &mut Option<SqliteValue> = state
         .downcast_mut()
@@ -17234,7 +17337,7 @@ fn agg_step_min_max_collated(
     match current {
         None => *current = Some(candidate.clone()),
         &mut Some(ref cur) => {
-            let ord = cmp_sqlite_values_collated(candidate, cur, coll);
+            let ord = cmp_sqlite_values_collated(candidate, cur, coll, enc);
             if (is_max && ord == Ordering::Greater) || (!is_max && ord == Ordering::Less) {
                 *current = Some(candidate.clone());
             }
@@ -17260,6 +17363,7 @@ fn fast_compare_same_storage_class(
     rhs: &SqliteValue,
     p4: &P4,
     p5: u16,
+    enc: TextEncoding,
 ) -> Option<Option<Ordering>> {
     let affinity = p5 & SQLITE_AFF_MASK;
     match (lhs, rhs) {
@@ -17270,8 +17374,15 @@ fn fast_compare_same_storage_class(
             Some(a.partial_cmp(b))
         }
         (SqliteValue::Text(a), SqliteValue::Text(b)) if affinity < SQLITE_AFF_NUMERIC => match p4 {
-            P4::Collation(coll_name) => builtin_collation_compare_text(a, b, coll_name).map(Some),
-            _ => Some(Some(a.as_bytes_direct().cmp(b.as_bytes_direct()))),
+            P4::Collation(coll_name) => {
+                builtin_collation_compare_text(a, b, coll_name, enc).map(Some)
+            }
+            // No collation named ⇒ implicit BINARY, which is encoding-aware.
+            _ => Some(Some(binary_compare_bytes(
+                a.as_bytes_direct(),
+                b.as_bytes_direct(),
+                enc,
+            ))),
         },
         (SqliteValue::Blob(a), SqliteValue::Blob(b)) if !matches!(p4, P4::Collation(_)) => {
             Some(Some(a.as_ref().cmp(b.as_ref())))
@@ -17439,6 +17550,7 @@ async fn storage_cursor_no_conflict_prefix_match_collated(
                 desc_flags,
                 collations,
                 collation_registry,
+                cursor.text_encoding,
             ) == Ordering::Equal
         {
             return Ok(true);
@@ -17479,6 +17591,7 @@ async fn storage_cursor_exact_match_collated(
                 desc_flags,
                 collations,
                 collation_registry,
+                cursor.text_encoding,
             ) == Ordering::Equal
         {
             return Ok(true);
@@ -17598,6 +17711,7 @@ async fn storage_cursor_current_first_index_key_compare_at_current_row(
         desc,
         collation,
         collation_registry,
+        text_encoding: cursor.text_encoding,
     };
     if cursor.row_decode.cached_value_ready(0) {
         note_decode_cache_hit(collect_vdbe_metrics);
@@ -17829,15 +17943,24 @@ fn storage_cursor_first_index_key_equals_probe(
         return values_equal_without_collation(current_value, probe_value);
     };
 
+    // This is an equality probe, which is encoding-invariant; the cursor's DB
+    // encoding is threaded through for consistency (bd-bld9w.4).
     if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (current_value, probe_value)
-        && let Some(ordering) = builtin_collation_compare_text(left, right, collation)
+        && let Some(ordering) =
+            builtin_collation_compare_text(left, right, collation, cursor.text_encoding)
     {
         return ordering == Ordering::Equal;
     }
 
     let registry = cursor.cursor.collation_registry();
     let guard = registry.lock().unwrap_or_else(|err| err.into_inner());
-    cmp_values_collated(current_value, probe_value, Some(collation), &guard) == Ordering::Equal
+    cmp_values_collated(
+        current_value,
+        probe_value,
+        Some(collation),
+        &guard,
+        cursor.text_encoding,
+    ) == Ordering::Equal
 }
 
 #[derive(Clone, Copy)]
@@ -17845,6 +17968,9 @@ struct FirstIndexKeyCompareContext<'a> {
     desc: bool,
     collation: Option<&'a str>,
     collation_registry: &'a CollationRegistry,
+    /// DB storage encoding so BINARY index-key ordering matches stock on a
+    /// UTF-16 database (bd-bld9w.4/.5). Sourced from the `StorageCursor`.
+    text_encoding: TextEncoding,
 }
 
 fn compare_first_index_key_values(
@@ -17857,6 +17983,7 @@ fn compare_first_index_key_values(
         probe_value,
         compare_ctx.collation,
         compare_ctx.collation_registry,
+        compare_ctx.text_encoding,
     );
     if compare_ctx.desc {
         cmp = cmp.reverse();
@@ -18266,6 +18393,7 @@ async fn find_conflicting_rowid_in_index_collated(
                 desc_flags,
                 collations,
                 collation_registry,
+                sc.text_encoding,
             ) == Ordering::Equal
         {
             let rowid = index_entry_rowid_at(
@@ -18677,8 +18805,10 @@ fn sorter_keys_equal(
     key_columns: usize,
     collations: &[Option<String>],
     collation_registry: &CollationRegistry,
+    enc: TextEncoding,
 ) -> bool {
-    compare_sorter_keys(lhs, rhs, key_columns, collations, collation_registry) == Ordering::Equal
+    compare_sorter_keys(lhs, rhs, key_columns, collations, collation_registry, enc)
+        == Ordering::Equal
 }
 
 fn compare_sorter_keys(
@@ -18687,6 +18817,7 @@ fn compare_sorter_keys(
     key_columns: usize,
     collations: &[Option<String>],
     collation_registry: &CollationRegistry,
+    enc: TextEncoding,
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
@@ -18702,7 +18833,7 @@ fn compare_sorter_keys(
         };
 
         let coll = collations.get(idx).and_then(|c| c.as_deref());
-        match cmp_values_collated(lhs_value, rhs_value, coll, collation_registry) {
+        match cmp_values_collated(lhs_value, rhs_value, coll, collation_registry, enc) {
             Ordering::Equal => {}
             non_equal => return non_equal,
         }
@@ -18725,6 +18856,7 @@ fn compare_index_prefix_keys(
     desc_flags: &[bool],
     collations: &[Option<String>],
     collation_registry: &CollationRegistry,
+    enc: TextEncoding,
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
@@ -18740,7 +18872,7 @@ fn compare_index_prefix_keys(
         };
 
         let coll = collations.get(idx).and_then(|c| c.as_deref());
-        let mut ord = cmp_values_collated(lhs_value, rhs_value, coll, collation_registry);
+        let mut ord = cmp_values_collated(lhs_value, rhs_value, coll, collation_registry, enc);
         if desc_flags.get(idx).copied().unwrap_or(false) {
             ord = ord.reverse();
         }
@@ -18770,6 +18902,7 @@ fn cmp_values_collated(
     rhs: &SqliteValue,
     collation: Option<&str>,
     collation_registry: &CollationRegistry,
+    enc: TextEncoding,
 ) -> Ordering {
     if let (Some(coll), SqliteValue::Text(lt), SqliteValue::Text(rt)) = (collation, lhs, rhs) {
         return compare_text_with_collation(
@@ -18777,6 +18910,7 @@ fn cmp_values_collated(
             rt.as_bytes_direct(),
             coll,
             collation_registry,
+            enc,
         );
     }
     lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
@@ -18789,6 +18923,7 @@ fn compare_sorter_rows(
     sort_key_orders: &[SortKeyOrder],
     collations: &[Option<String>],
     collation_registry: &CollationRegistry,
+    enc: TextEncoding,
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
@@ -18836,7 +18971,7 @@ fn compare_sorter_rows(
         }
 
         let coll = collations.get(idx).and_then(|c| c.as_deref());
-        let mut ord = cmp_values_collated(lhs_value, rhs_value, coll, collation_registry);
+        let mut ord = cmp_values_collated(lhs_value, rhs_value, coll, collation_registry, enc);
         if ord == Ordering::Equal {
             continue;
         }
@@ -31539,17 +31674,17 @@ mod tests {
         let coll_guard = registry.lock().unwrap();
 
         assert_eq!(
-            compare_index_prefix_keys(&lhs, &rhs, 1, &[true], &[], &coll_guard),
+            compare_index_prefix_keys(&lhs, &rhs, 1, &[true], &[], &coll_guard, TextEncoding::Utf8),
             Ordering::Less,
             "descending index comparison should treat the larger key as earlier"
         );
         assert_eq!(
-            compare_index_prefix_keys(&lhs, &rhs, 1, &[false], &[], &coll_guard),
+            compare_index_prefix_keys(&lhs, &rhs, 1, &[false], &[], &coll_guard, TextEncoding::Utf8),
             Ordering::Greater,
             "ascending index comparison should keep natural integer ordering"
         );
         assert_eq!(
-            compare_index_prefix_keys(&lhs, &rhs, 0, &[true], &[], &coll_guard),
+            compare_index_prefix_keys(&lhs, &rhs, 0, &[true], &[], &coll_guard, TextEncoding::Utf8),
             Ordering::Less,
             "zero key_columns should still compare the leading term"
         );
@@ -33060,6 +33195,53 @@ mod tests {
         assert_eq!(sorter.memory_used, 0, "memory_used should be 0");
     }
 
+    /// bd-bld9w.4: BINARY collation compares in the DB storage encoding. These
+    /// orders were verified against stock C SQLite (sqlite3 3.46.1, `PRAGMA
+    /// encoding='UTF-16le'`): BINARY on a UTF-16LE DB orders by UTF-16LE bytes;
+    /// UTF-16BE and UTF-8 order by code point (identical for the BMP); NOCASE and
+    /// RTRIM stay on canonical UTF-8 and are unaffected.
+    #[test]
+    fn binary_compare_bytes_orders_in_db_storage_encoding() {
+        let bytes = |s: &str| s.as_bytes().to_vec();
+
+        // Single-char pivots. `名` = U+540D → UTF-16LE `0D 54` (low byte 0x0D
+        // sorts before ASCII 'A'=0x41); UTF-16BE `54 0D` and UTF-8 `E5 90 8D`
+        // sort after 'A'.
+        assert_eq!(
+            binary_compare_bytes(&bytes("名"), &bytes("A"), TextEncoding::Utf16le),
+            Ordering::Less,
+        );
+        assert_eq!(
+            binary_compare_bytes(&bytes("名"), &bytes("A"), TextEncoding::Utf16be),
+            Ordering::Greater,
+        );
+        assert_eq!(
+            binary_compare_bytes(&bytes("名"), &bytes("A"), TextEncoding::Utf8),
+            Ordering::Greater,
+        );
+
+        // The full stock fixture. Sorting decoded canonical-UTF-8 names by
+        // `binary_compare_bytes` must reproduce stock's per-encoding order.
+        let fixture = ["Élise", "apple", "名前", "Zoë", "Apple", "Børge"];
+
+        let mut le = fixture;
+        le.sort_by(|a, b| binary_compare_bytes(a.as_bytes(), b.as_bytes(), TextEncoding::Utf16le));
+        assert_eq!(
+            le,
+            ["名前", "Apple", "Børge", "Zoë", "apple", "Élise"],
+            "UTF-16LE BINARY must match stock UTF-16LE memcmp order"
+        );
+
+        // UTF-16BE and UTF-8 order all-BMP text identically (by code point).
+        let expect_codepoint = ["Apple", "Børge", "Zoë", "apple", "Élise", "名前"];
+        let mut be = fixture;
+        be.sort_by(|a, b| binary_compare_bytes(a.as_bytes(), b.as_bytes(), TextEncoding::Utf16be));
+        assert_eq!(be, expect_codepoint, "UTF-16BE BINARY == code-point order for the BMP");
+        let mut u8s = fixture;
+        u8s.sort_by(|a, b| binary_compare_bytes(a.as_bytes(), b.as_bytes(), TextEncoding::Utf8));
+        assert_eq!(u8s, expect_codepoint, "UTF-8 BINARY == code-point order (unchanged hot path)");
+    }
+
     #[test]
     fn test_sorter_desc_key_order_with_external_merge() {
         // Verify that DESC sort order works correctly through the external
@@ -33175,6 +33357,7 @@ mod tests {
             Vec::new(),
             Arc::new(Mutex::new(CollationRegistry::new())),
             Some(3),
+            TextEncoding::Utf8,
         );
 
         for value in [9i64, 1, 7, 3, 2] {
@@ -33206,6 +33389,7 @@ mod tests {
             Vec::new(),
             Arc::new(Mutex::new(CollationRegistry::new())),
             Some(3),
+            TextEncoding::Utf8,
         );
 
         for value in [1i64, 2, 3, 4, 5] {
@@ -33239,6 +33423,7 @@ mod tests {
             Vec::new(),
             Arc::new(Mutex::new(CollationRegistry::new())),
             Some(2),
+            TextEncoding::Utf8,
         );
 
         for payload in [10i64, 20, 30] {
@@ -33273,6 +33458,7 @@ mod tests {
             Vec::new(),
             Arc::new(Mutex::new(CollationRegistry::new())),
             Some(10),
+            TextEncoding::Utf8,
         );
         sorter.spill_threshold = usize::MAX;
 
@@ -33350,6 +33536,7 @@ mod tests {
             Vec::new(),
             Arc::new(Mutex::new(CollationRegistry::new())),
             Some(2),
+            TextEncoding::Utf8,
         );
         sorter.spill_threshold = 1;
 
@@ -33384,6 +33571,7 @@ mod tests {
             vec![None, Some("NOCASE".to_owned())],
             Arc::clone(&registry),
             Some(1),
+            TextEncoding::Utf8,
         );
         sorter
             .insert_row(

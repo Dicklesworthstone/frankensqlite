@@ -6,26 +6,30 @@
 //! `SELECT` / `WHERE` / `ORDER BY` / `sqlite_master` against a fresh C-SQLite
 //! reopen of the same file.
 //!
-//! ## Status / why some arms are `#[ignore]`d
+//! ## Status
 //!
-//! The UTF-16 read path is being wired across bd-bld9w:
+//! The UTF-16 read path is wired across bd-bld9w:
 //!   * bld9w.2 — record TEXT decode + VDBE caller-threading of the DB encoding,
-//!   * bld9w.3 — UTF-16 `sqlite_master` schema load + lifting the read-side
-//!     fail-closed admission gate,
-//!   * bld9w.4 — TEXT comparison / BINARY collation on the decoded code points.
+//!   * bld9w.3 — UTF-16 `sqlite_master` schema load + read-only admission lift
+//!     (`is_read_supported`, commit 0ab5be8c5),
+//!   * bld9w.4 — BINARY collation compares in the DB storage encoding, so
+//!     `ORDER BY` / `<` / `>` / `MIN` / `MAX` / `GROUP BY` match stock on a
+//!     UTF-16 database (NOCASE/RTRIM stay UTF-8, matching stock).
 //!
-//! Until those land, FrankenSQLite fails *closed* on UTF-16 opens (the
-//! release-safe admission bridge, commit 1faf13504), so the UTF-16 arms below
-//! are `#[ignore]`d. **Un-ignore them when the corresponding slice lands** — they
-//! are the green gate for bd-bld9w.2/.3/.4.
-//!
-//! Two things run *now* and are load-bearing regardless:
+//! The four UTF-16 end-to-end read arms below are `#[ignore]`d: at HEAD a
+//! UTF-16 file-backed `SELECT` returns TEXT as RAW UTF-16 bytes (the VDBE
+//! engine's `text_encoding` is not self-adopted on this read path, so
+//! `from_record_text_bytes` never decodes to canonical UTF-8) — a bld9w.2/.3
+//! decode gap upstream of collation. The bld9w.4 fix (BINARY compares in the DB
+//! encoding) landed and is proven at the VDBE level by
+//! `engine::tests::binary_compare_bytes_orders_in_db_storage_encoding`; these
+//! end-to-end arms un-ignore once the decode gap is closed. The UTF-8 control
+//! and fixture-validation arms remain load-bearing:
 //!   * `utf8_control_*` — a UTF-8 hot-path parity guard: an identical UTF-8 stock
-//!     DB must read byte-for-byte identically, so the bld9w.2 caller-threading
-//!     provably does not regress the default (UTF-8) path.
+//!     DB must read byte-for-byte identically, so the encoding threading provably
+//!     does not regress the default (UTF-8) path.
 //!   * `utf16_fixture_really_is_utf16_*` — proves the rusqlite fixtures actually
-//!     produce UTF-16 databases (header text-encoding byte + `PRAGMA encoding`),
-//!     so the ignored arms are meaningful the moment they are enabled.
+//!     produce UTF-16 databases (header text-encoding byte + `PRAGMA encoding`).
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -250,26 +254,25 @@ fn utf16_fixture_really_is_utf16_be() {
 }
 
 // ---------------------------------------------------------------------------
-// UTF-16 read parity — the acceptance gate. `#[ignore]`d today.
+// UTF-16 read parity — the acceptance gate. `#[ignore]`d: BLOCKED on a UTF-16
+// TEXT decode gap upstream of collation.
 //
-// bld9w.2 (record decode + VDBE caller-threading) landed and the decode is
-// PROVEN: in a transient window where the bld9w.3 read admission gate was open,
-// all three non-collation arms below passed against HEAD (SageBluff probe
-// 2026-08-15). But the admission gate is currently toggled *closed* again —
-// FrankenSQLite returns "unsupported operation" on a UTF-16 open — while the
-// bld9w.3 write-safety/admission-activation design settles. So the arms stay
-// `#[ignore]`d to keep this file green; un-ignore each as bld9w.3 stably lands.
-//
-// One arm additionally encodes a real bld9w.4 (compare+collate) finding: BINARY
-// collation on a UTF-16 database must order by the *stored* encoding's bytes,
-// like stock SQLite — not FrankenSQLite's decoded UTF-8 form. This diverges only
-// for UTF-16**LE** non-ASCII text (LE byte order != code-point order); UTF-16BE
-// matches because BE byte order == code-point order == UTF-8 order for the BMP.
+// bld9w.3 admitted UTF-16 databases read-only (0ab5be8c5), and bld9w.4 makes
+// BINARY collation compare in the DB storage encoding (proven at the VDBE level
+// by `engine::tests::binary_compare_bytes_orders_in_db_storage_encoding`). But
+// at HEAD these end-to-end arms FAIL for a reason ORTHOGONAL to collation: a
+// UTF-16 file-backed `SELECT` returns TEXT as the RAW UTF-16 bytes (e.g. `Alice`
+// comes back as `A\0l\0i\0c\0e\0`), i.e. the VDBE engine's `text_encoding` is not
+// self-adopted from the page-1 header for this read path, so `from_record_text_bytes`
+// never decodes UTF-16 → canonical UTF-8. That is a bld9w.2/.3 read-path decode
+// gap, not a .4 collation issue; the .4 ordering fix cannot be exercised until
+// decoded values reach the comparator. Un-ignore once the decode gap is closed.
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "bd-bld9w.3: un-ignore when the UTF-16 read admission-lift stably lands \
-            (record decode proven; admission currently gated closed pending write-safety)"]
+#[ignore = "bd-bld9w.2/.3: UTF-16 file-backed SELECT returns raw UTF-16 bytes \
+            (text_encoding not self-adopted on this read path) — decode gap upstream \
+            of .4 collation. Un-ignore when the read-path decode is fixed."]
 fn utf16le_read_parity_ascii() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -280,11 +283,14 @@ fn utf16le_read_parity_ascii() {
     });
 }
 
+/// bd-bld9w.4 evidence: BINARY collation on a UTF-16LE DB orders by the stored
+/// UTF-16LE bytes like stock (名前<Apple<Børge<Zoë<Élise via low-byte order),
+/// not the decoded UTF-8 form. The .4 ordering fix landed and is unit-proven at
+/// the VDBE level; this end-to-end arm stays ignored until the bld9w.2/.3
+/// read-path decode gap (raw UTF-16 bytes returned) is closed.
 #[test]
-#[ignore = "bd-bld9w.4 (compare+collate): BINARY collation on a UTF-16LE DB must \
-            order by the stored UTF-16LE bytes like stock (名前<Børge<Zoë<Élise via \
-            0x0D<0x42<0x5A<0xC9), but FrankenSQLite orders by the decoded UTF-8 form \
-            (Børge<Zoë<Élise<名前). Un-ignore when .4 makes BINARY compare in the DB encoding."]
+#[ignore = "bd-bld9w.2/.3: blocked on the UTF-16 read-path decode gap (raw bytes \
+            returned); .4 ordering is unit-proven at the VDBE level."]
 fn utf16le_read_parity_unicode() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -296,8 +302,7 @@ fn utf16le_read_parity_unicode() {
 }
 
 #[test]
-#[ignore = "bd-bld9w.3: un-ignore when the UTF-16 read admission-lift stably lands \
-            (record decode proven; admission currently gated closed pending write-safety)"]
+#[ignore = "bd-bld9w.2/.3: blocked on the UTF-16 read-path decode gap (raw bytes returned)."]
 fn utf16be_read_parity_ascii() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -309,8 +314,7 @@ fn utf16be_read_parity_ascii() {
 }
 
 #[test]
-#[ignore = "bd-bld9w.3: un-ignore when the UTF-16 read admission-lift stably lands \
-            (record decode proven; admission currently gated closed pending write-safety)"]
+#[ignore = "bd-bld9w.2/.3: blocked on the UTF-16 read-path decode gap (raw bytes returned)."]
 fn utf16be_read_parity_unicode() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
@@ -318,5 +322,87 @@ fn utf16be_read_parity_unicode() {
         build_stock_db(&path, Some("UTF-16be"), UNICODE_ROWS);
         assert_eq!(header_text_encoding(&path), 3);
         assert_read_parity(&path, "utf16be_unicode").await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// bd-bld9w.4 collation-scope guard: on a UTF-16LE DB, BINARY orders in the DB
+// storage encoding, while NOCASE and RTRIM stay on canonical UTF-8 (matching
+// stock, which registers NOCASE/RTRIM as UTF-8 collations and transcodes
+// operands to UTF-8 before applying them). All three must match stock on the
+// SAME UTF-16LE file — pinning that the .4 fix touches BINARY ONLY.
+// ---------------------------------------------------------------------------
+
+const COLLATION_QUERIES: &[&str] = &[
+    "SELECT name FROM items ORDER BY name COLLATE BINARY",
+    "SELECT name FROM items ORDER BY name COLLATE NOCASE",
+    "SELECT name FROM items ORDER BY name COLLATE RTRIM",
+];
+
+/// Run an arbitrary `queries` list against a fresh C-SQLite reopen of `path`.
+fn oracle_read_custom(path: &std::path::Path, queries: &[&str]) -> Vec<Vec<Vec<String>>> {
+    let conn = rusqlite::Connection::open(path).expect("reopen stock SQLite oracle");
+    queries
+        .iter()
+        .map(|query| {
+            let mut stmt = conn.prepare(query).expect("prepare oracle query");
+            let col_count = stmt.column_count();
+            stmt.query_map([], |row| {
+                let mut vals = Vec::new();
+                for i in 0..col_count {
+                    let v: rusqlite::types::Value = row.get_unwrap(i);
+                    vals.push(match v {
+                        rusqlite::types::Value::Null => "NULL".to_owned(),
+                        rusqlite::types::Value::Integer(n) => n.to_string(),
+                        rusqlite::types::Value::Real(f) => format!("{f}"),
+                        rusqlite::types::Value::Text(s) => format!("'{s}'"),
+                        rusqlite::types::Value::Blob(b) => format!(
+                            "X'{}'",
+                            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                        ),
+                    });
+                }
+                Ok(vals)
+            })
+            .expect("run oracle query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect oracle rows")
+        })
+        .collect()
+}
+
+/// Diff an arbitrary `queries` list on a FrankenSQLite reopen of `path` against
+/// a fresh C-SQLite reopen of the same file.
+async fn assert_custom_query_parity(path: &std::path::Path, queries: &[&str], label: &str) {
+    let expected = oracle_read_custom(path, queries);
+    let fconn = Connection::open(path.to_str().unwrap())
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] FrankenSQLite failed to open the database: {e}"));
+    for (query, want) in queries.iter().zip(expected.iter()) {
+        let got_rows = fconn
+            .query(query)
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] FrankenSQLite query error: {query}: {e}"));
+        let got = frank_rows_to_strings(&got_rows);
+        assert_eq!(
+            &got, want,
+            "[{label}] result divergence on `{query}`\n  frank: {got:?}\n  csql:  {want:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "bd-bld9w.2/.3: blocked on the UTF-16 read-path decode gap (raw bytes \
+            returned) upstream of collation; .4 BINARY-only scope is unit-proven at \
+            the VDBE level (binary_compare_bytes_orders_in_db_storage_encoding)."]
+fn utf16le_collation_scope_parity() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("utf16le_collation.db");
+        build_stock_db(&path, Some("UTF-16le"), UNICODE_ROWS);
+        assert_eq!(header_text_encoding(&path), 2);
+        // BINARY must order in UTF-16LE bytes (the .4 fix); NOCASE and RTRIM must
+        // stay UTF-8 (untouched). All three match stock on the same file.
+        assert_custom_query_parity(&path, COLLATION_QUERIES, "utf16le_collation").await;
     });
 }
