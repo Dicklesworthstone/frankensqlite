@@ -1794,17 +1794,21 @@ fn emit_upsert_expr(
                     );
                     b.free_temp(r_when);
                 } else {
-                    emit_upsert_expr(
+                    // Searched CASE WHEN is a TRUTH context: short-circuit AND/OR
+                    // left-to-right so a would-be-skipped erroring operand is never
+                    // evaluated (bd-and-or-short-circuit GAP-2, ON CONFLICT DO
+                    // UPDATE path). Non-AND/OR conditions emit byte-identically.
+                    emit_upsert_case_when_condition(
                         b,
                         when_expr,
                         reg,
+                        next_when,
                         existing_ctx,
                         excluded_ctx,
                         _table,
                         existing_hidden_rowid_reg,
                         excluded_hidden_rowid_reg,
                     );
-                    b.emit_jump_to_label(Opcode::IfNot, reg, 1, next_when, P4::None, 0);
                 }
                 emit_upsert_expr(
                     b,
@@ -35660,6 +35664,70 @@ fn emit_searched_case_when_condition_with_fallback(
             emit_expr_with_fallback(b, cond, r_when, inner_ctx, outer_ctx);
             b.emit_jump_to_label(Opcode::IfNot, r_when, 1, false_label, P4::None, 0);
             b.free_temp(r_when);
+        }
+    }
+}
+
+/// Upsert-context (`ON CONFLICT DO UPDATE`) counterpart of
+/// [`emit_searched_case_when_condition`]. Leaves emit through `emit_upsert_expr`
+/// (preserving existing/excluded pseudo-table + hidden-rowid dispatch); only
+/// AND/OR-topped WHEN conditions change, gaining left-to-right short-circuit so a
+/// would-be-skipped erroring operand is never evaluated. Byte-identical for every
+/// non-AND/OR condition (bd-and-or-short-circuit GAP-2).
+#[allow(clippy::too_many_arguments)]
+fn emit_upsert_case_when_condition(
+    b: &mut ProgramBuilder,
+    cond: &Expr,
+    scratch: i32,
+    false_label: crate::Label,
+    existing_ctx: &ScanCtx<'_>,
+    excluded_ctx: &ScanCtx<'_>,
+    table: &TableSchema,
+    existing_hidden_rowid_reg: Option<i32>,
+    excluded_hidden_rowid_reg: i32,
+) {
+    match cond {
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } => {
+            emit_upsert_case_when_condition(
+                b, left, scratch, false_label, existing_ctx, excluded_ctx, table,
+                existing_hidden_rowid_reg, excluded_hidden_rowid_reg,
+            );
+            emit_upsert_case_when_condition(
+                b, right, scratch, false_label, existing_ctx, excluded_ctx, table,
+                existing_hidden_rowid_reg, excluded_hidden_rowid_reg,
+            );
+        }
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::Or,
+            right,
+            ..
+        } => {
+            let left_false = b.emit_label();
+            let pass = b.emit_label();
+            emit_upsert_case_when_condition(
+                b, left, scratch, left_false, existing_ctx, excluded_ctx, table,
+                existing_hidden_rowid_reg, excluded_hidden_rowid_reg,
+            );
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, pass, P4::None, 0);
+            b.resolve_label(left_false);
+            emit_upsert_case_when_condition(
+                b, right, scratch, false_label, existing_ctx, excluded_ctx, table,
+                existing_hidden_rowid_reg, excluded_hidden_rowid_reg,
+            );
+            b.resolve_label(pass);
+        }
+        _ => {
+            emit_upsert_expr(
+                b, cond, scratch, existing_ctx, excluded_ctx, table,
+                existing_hidden_rowid_reg, excluded_hidden_rowid_reg,
+            );
+            b.emit_jump_to_label(Opcode::IfNot, scratch, 1, false_label, P4::None, 0);
         }
     }
 }

@@ -215,3 +215,33 @@ fn case_and_scalar_short_circuits() {
         .await;
     });
 }
+
+/// GAP-2 (codegen ON CONFLICT DO UPDATE searched-CASE-WHEN): the searched-CASE in
+/// an upsert SET clause is a TRUTH context too — left TRUE must skip the erroring
+/// right disjunct (emit_upsert_expr path, distinct from emit_case_expr).
+#[test]
+fn upsert_case_or_scalar_short_circuits() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let ddl = [
+            "CREATE TABLE u(id INTEGER PRIMARY KEY, x TEXT, note TEXT)",
+            "INSERT INTO u VALUES (1, '{}', 'orig')",
+            "INSERT INTO u(id, x, note) VALUES (1, 'bare', 'ignored') \
+             ON CONFLICT(id) DO UPDATE SET note = \
+             CASE WHEN (excluded.x IS NOT '{}' OR json_extract(excluded.x,'$.a') IS NOT NULL) \
+             THEN 'matched' ELSE 'nomatch' END",
+        ];
+        for s in ddl {
+            f.execute(s).await.unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+            r.execute_batch(s).unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
+        }
+        check(
+            &f,
+            &r,
+            &["SELECT note FROM u WHERE id = 1"],
+            "upsert_case_or_scalar_short_circuits",
+        )
+        .await;
+    });
+}
