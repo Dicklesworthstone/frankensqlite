@@ -20,7 +20,7 @@
     clippy::similar_names
 )]
 
-use fsqlite_ast::{Expr, Literal, Span};
+use fsqlite_ast::{BinaryOp, ColumnRef, Expr, Literal, Span};
 use fsqlite_planner::{
     AccessPathKind, IndexInfo, IndexUsability, PushedPredicate, StatsSource, TableStats,
     WhereColumn, WhereTerm, WhereTermKind, analyze_index_usability, best_access_path,
@@ -35,6 +35,26 @@ fn ds() -> Span {
 
 fn dummy_expr() -> Expr {
     Expr::Literal(Literal::Integer(1), ds())
+}
+
+/// Build a full `table.column <op> <literal>` comparison expression.
+///
+/// The planner's `best_access_path` derives seek operands by pattern-matching
+/// `WhereTerm.expr` as a `BinaryOp` and extracting the non-column side, so the
+/// stored `.expr` must be the whole comparison (not a bare literal).
+fn cmp_expr(table: &str, column: &str, op: BinaryOp) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(Expr::Column(
+            ColumnRef {
+                table: Some(table.into()),
+                column: column.into(),
+            },
+            ds(),
+        )),
+        op,
+        right: Box::new(dummy_expr()),
+        span: ds(),
+    }
 }
 
 fn eq_term<'a>(table: &str, column: &str, expr: &'a Expr) -> WhereTerm<'a> {
@@ -323,8 +343,8 @@ fn test_access_path_selection() {
     );
 
     // WHERE user_id = ? -> index equality
-    let expr = dummy_expr();
-    let eq = eq_term("orders", "user_id", &expr);
+    let orders_user_id_eq = cmp_expr("orders", "user_id", BinaryOp::Eq);
+    let eq = eq_term("orders", "user_id", &orders_user_id_eq);
     let path = best_access_path(&table, std::slice::from_ref(&idx), &[eq], None);
     assert!(
         matches!(path.kind, AccessPathKind::IndexScanEquality),
@@ -334,7 +354,8 @@ fn test_access_path_selection() {
     assert_eq!(path.index.as_deref(), Some("idx_orders_user_id"));
 
     // WHERE user_id > ? -> index range scan
-    let rng = range_term("orders", "user_id", &expr);
+    let orders_user_id_rng = cmp_expr("orders", "user_id", BinaryOp::Gt);
+    let rng = range_term("orders", "user_id", &orders_user_id_rng);
     let path = best_access_path(&table, std::slice::from_ref(&idx), &[rng], None);
     assert!(
         matches!(path.kind, AccessPathKind::IndexScanRange { .. }),
@@ -343,7 +364,7 @@ fn test_access_path_selection() {
     );
 
     // Index equality should be cheaper than full scan
-    let eq2 = eq_term("orders", "user_id", &expr);
+    let eq2 = eq_term("orders", "user_id", &orders_user_id_eq);
     let scan_path = best_access_path(&table, std::slice::from_ref(&idx), &[], None);
     let idx_path = best_access_path(&table, &[idx], &[eq2], None);
     assert!(
@@ -365,7 +386,8 @@ fn test_predicate_pushdown() {
     let expr = dummy_expr();
 
     // Single-table predicate -> should be pushed down
-    let single = eq_term("users", "status", &expr);
+    let users_status_eq = cmp_expr("users", "status", BinaryOp::Eq);
+    let single = eq_term("users", "status", &users_status_eq);
 
     // Join-spanning predicate -> should NOT be pushed down
     let join = join_term(&expr);
@@ -465,10 +487,9 @@ fn test_index_usability() {
         expression_columns: vec![],
     };
 
-    let expr = dummy_expr();
-
     // Equality on indexed column -> usable
-    let eq = eq_term("users", "email", &expr);
+    let users_email_eq = cmp_expr("users", "email", BinaryOp::Eq);
+    let eq = eq_term("users", "email", &users_email_eq);
     let usability = analyze_index_usability(&idx, &[eq]);
     assert!(
         !matches!(usability, IndexUsability::NotUsable),
@@ -476,7 +497,8 @@ fn test_index_usability() {
     );
 
     // Equality on different column -> not usable
-    let other_eq = eq_term("users", "name", &expr);
+    let users_name_eq = cmp_expr("users", "name", BinaryOp::Eq);
+    let other_eq = eq_term("users", "name", &users_name_eq);
     let usability = analyze_index_usability(&idx, &[other_eq]);
     assert!(
         matches!(usability, IndexUsability::NotUsable),
@@ -496,7 +518,8 @@ fn test_index_usability() {
     };
 
     // Equality on first column of composite -> usable
-    let eq_first = eq_term("orders", "customer_id", &expr);
+    let orders_customer_id_eq = cmp_expr("orders", "customer_id", BinaryOp::Eq);
+    let eq_first = eq_term("orders", "customer_id", &orders_customer_id_eq);
     let usability = analyze_index_usability(&composite_idx, &[eq_first]);
     assert!(
         !matches!(usability, IndexUsability::NotUsable),
@@ -617,8 +640,8 @@ fn test_conformance_summary() {
             partial_where: None,
             expression_columns: vec![],
         };
-        let expr = dummy_expr();
-        let eq = eq_term("t", "a", &expr);
+        let t_a_eq = cmp_expr("t", "a", BinaryOp::Eq);
+        let eq = eq_term("t", "a", &t_a_eq);
         let path = best_access_path(&table, &[idx], &[eq], None);
         results.push(TestResult {
             name: "access_path_index_eq",
@@ -648,8 +671,8 @@ fn test_conformance_summary() {
 
     // 7. Predicate pushdown: single-table predicate
     {
-        let expr = dummy_expr();
-        let single = eq_term("t1", "a", &expr);
+        let t1_a_eq = cmp_expr("t1", "a", BinaryOp::Eq);
+        let single = eq_term("t1", "a", &t1_a_eq);
         let terms = vec![single];
         let names = vec!["t1".to_owned(), "t2".to_owned()];
         let (pushed, _): (Vec<PushedPredicate<'_>>, Vec<&WhereTerm<'_>>) =
