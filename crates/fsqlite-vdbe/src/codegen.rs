@@ -4565,6 +4565,7 @@ fn codegen_select_index_equality_scan(
         // leaves the cursor on the matching row).
         emit_without_rowid_index_to_table_seek(
             b,
+            table,
             cursor,
             idx_cursor,
             idx_schema,
@@ -5669,7 +5670,7 @@ fn codegen_select_index_range_scan(
         // and position the table b-tree on it (prefix probe; fall-through
         // leaves the cursor on the matching row).
         emit_without_rowid_index_to_table_seek(
-            b, cursor, idx_cursor, idx_schema, pk_indices, skip_label,
+            b, table, cursor, idx_cursor, idx_schema, pk_indices, skip_label,
         );
         if let Some(off_r) = offset_reg {
             b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
@@ -8186,6 +8187,7 @@ fn codegen_select_index_ordered_scan(
         if needs_table_lookup {
             emit_without_rowid_index_to_table_seek(
                 b,
+                table,
                 cursor,
                 index_cursor,
                 &index_plan.index,
@@ -23028,6 +23030,62 @@ pub fn codegen_delete(
 // leading declared columns in declared order; other shapes are rejected with a
 // clear "not yet supported" error rather than silently mis-ordering.
 
+/// Table-column index for each plain-column key term of `index` (leftmost
+/// first). Expression key terms — and any term whose name does not resolve to a
+/// declared column — map to `None`, which never dedups against a PK column.
+fn without_rowid_index_key_columns(table: &TableSchema, index: &IndexSchema) -> Vec<Option<usize>> {
+    (0..index.key_term_count())
+        .map(|p| index.columns.get(p).and_then(|name| table.column_index(name)))
+        .collect()
+}
+
+/// SQLite WITHOUT ROWID rule (bd-5ava1 / GH #353): a secondary/auto index
+/// stores the index key terms followed only by the primary-key columns that are
+/// **not already** part of the index. Returns the subset of `pk_indices` (in
+/// PRIMARY KEY order) to append to this index's on-disk key. A PK column that
+/// coincides with an index key term is elided from the suffix, so an index like
+/// `UNIQUE(pk_leading, x)` on `PRIMARY KEY(pk_leading, ...)` stores each PK
+/// column exactly once — matching stock sqlite3's on-disk layout.
+fn without_rowid_index_appended_pk(
+    table: &TableSchema,
+    index: &IndexSchema,
+    pk_indices: &[usize],
+) -> Vec<usize> {
+    let key_cols = without_rowid_index_key_columns(table, index);
+    pk_indices
+        .iter()
+        .copied()
+        .filter(|pk| !key_cols.contains(&Some(*pk)))
+        .collect()
+}
+
+/// Index-record column position from which to read each primary-key column, in
+/// PRIMARY KEY order, given the deduplicated WITHOUT ROWID key layout
+/// (`[key terms..., appended PK...]`). A PK column that is also an index key
+/// term is read from that leading key-term slot; the remaining PK columns are
+/// read from the trailing appended region in PRIMARY KEY order.
+fn without_rowid_index_pk_read_positions(
+    table: &TableSchema,
+    index: &IndexSchema,
+    pk_indices: &[usize],
+) -> Vec<usize> {
+    let n_idx_key = index.key_term_count();
+    let key_cols = without_rowid_index_key_columns(table, index);
+    let mut next_trailing = n_idx_key;
+    pk_indices
+        .iter()
+        .map(|&pk_col| {
+            if let Some(p) = key_cols.iter().position(|kc| *kc == Some(pk_col)) {
+                p
+            } else {
+                let pos = next_trailing;
+                next_trailing += 1;
+                pos
+            }
+        })
+        .collect()
+}
+
 /// Position a WITHOUT ROWID table cursor on the row referenced by the current
 /// entry of a secondary-index cursor (bd-rjaff).
 ///
@@ -23040,20 +23098,24 @@ pub fn codegen_delete(
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_without_rowid_index_to_table_seek(
     b: &mut ProgramBuilder,
+    table: &TableSchema,
     table_cursor: i32,
     idx_cursor: i32,
     idx_schema: &IndexSchema,
     pk_indices: &[usize],
     miss_label: crate::Label,
 ) {
-    let n_idx_key = idx_schema.key_term_count();
     let n_pk = pk_indices.len();
+    // Deduplicated layout: a PK column that is also an index key term lives in
+    // its leading key-term slot, not the trailing suffix. Read each PK column
+    // from its true index-record position.
+    let read_positions = without_rowid_index_pk_read_positions(table, idx_schema, pk_indices);
     let pk_regs = b.alloc_regs(n_pk as i32);
-    for j in 0..n_pk {
+    for (j, &pos) in read_positions.iter().enumerate() {
         b.emit_op(
             Opcode::Column,
             idx_cursor,
-            (n_idx_key + j) as i32,
+            pos as i32,
             pk_regs + j as i32,
             P4::None,
             0,
@@ -23146,7 +23208,6 @@ fn emit_without_rowid_index_inserts(
     stmt_conflict: Option<ConflictAction>,
     unique_conflicts_preflighted: bool,
 ) {
-    let n_pk = pk_indices.len();
     for (idx_offset, index) in table.indexes.iter().enumerate() {
         // When the caller has already resolved every UNIQUE victim in clustered
         // terms, hand the engine ABORT: its OE_REPLACE branch resolves victims
@@ -23158,6 +23219,10 @@ fn emit_without_rowid_index_inserts(
         };
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
+        // GH #353: append only the PK columns not already covered by this
+        // index's key terms (stock sqlite3's WITHOUT ROWID on-disk layout).
+        let appended_pk = without_rowid_index_appended_pk(table, index, pk_indices);
+        let n_pk = appended_pk.len();
         let skip_label = b.emit_label();
         let scan_ctx = ScanCtx {
             cursor: table_cursor,
@@ -23173,7 +23238,7 @@ fn emit_without_rowid_index_inserts(
         for key_pos in 0..n_idx_cols {
             emit_index_key_term(b, index, key_pos, idx_key_regs + key_pos as i32, &scan_ctx);
         }
-        for (j, &pk_col) in pk_indices.iter().enumerate() {
+        for (j, &pk_col) in appended_pk.iter().enumerate() {
             b.emit_op(
                 Opcode::Copy,
                 col_regs + pk_col as i32,
@@ -23227,10 +23292,13 @@ fn emit_without_rowid_index_deletes(
     col_regs: Option<i32>,
     pk_indices: &[usize],
 ) {
-    let n_pk = pk_indices.len();
     for (idx_offset, index) in table.indexes.iter().enumerate() {
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
+        // GH #353: the delete key must match the deduplicated insert layout —
+        // only PK columns not already in this index's key terms are appended.
+        let appended_pk = without_rowid_index_appended_pk(table, index, pk_indices);
+        let n_pk = appended_pk.len();
         let skip_label = b.emit_label();
         let scan_ctx = ScanCtx {
             cursor: table_cursor,
@@ -23246,7 +23314,7 @@ fn emit_without_rowid_index_deletes(
         for key_pos in 0..n_idx_cols {
             emit_index_key_term(b, index, key_pos, idx_key_regs + key_pos as i32, &scan_ctx);
         }
-        for (j, &pk_col) in pk_indices.iter().enumerate() {
+        for (j, &pk_col) in appended_pk.iter().enumerate() {
             let dst = idx_key_regs + (n_idx_cols + j) as i32;
             if let Some(cr) = col_regs {
                 b.emit_op(Opcode::Copy, cr + pk_col as i32, dst, 0, P4::None, 0);
@@ -23441,6 +23509,11 @@ fn emit_without_rowid_update_rewrite(
         let idx_oe = effective_oe(stmt_level, index.conflict_action);
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
+        // GH #353: deduplicated WITHOUT ROWID key layout — the victim PK is read
+        // from these per-column positions, and the raise key appends only the
+        // non-overlapping PK suffix.
+        let read_positions = without_rowid_index_pk_read_positions(table, index, pk_indices);
+        let appended_pk = without_rowid_index_appended_pk(table, index, pk_indices);
         let idx_done = b.emit_label();
 
         // A partial index only constrains rows its predicate admits: when NEW
@@ -23499,12 +23572,13 @@ fn emit_without_rowid_update_rewrite(
         );
 
         // A conflicting entry exists and `idx_cursor` is positioned on it. Its
-        // trailing terms are the victim's PRIMARY KEY.
-        for j in 0..n_pk {
+        // key terms plus non-overlapping suffix reconstruct the victim's
+        // PRIMARY KEY — read each PK column from its true index-record slot.
+        for (j, &pos) in read_positions.iter().enumerate() {
             b.emit_op(
                 Opcode::Column,
                 idx_cursor,
-                (n_idx_cols + j) as i32,
+                pos as i32,
                 victim_pk_regs + j as i32,
                 P4::None,
                 0,
@@ -23548,7 +23622,8 @@ fn emit_without_rowid_update_rewrite(
             // [key || pk] record is what the engine's unique check expects;
             // `NoConflict` fell through, so a conflicting entry provably exists
             // and this cannot silently succeed.
-            let raise_regs = b.alloc_regs((n_idx_cols + n_pk) as i32);
+            let n_pk_app = appended_pk.len();
+            let raise_regs = b.alloc_regs((n_idx_cols + n_pk_app) as i32);
             for key_pos in 0..n_idx_cols {
                 b.emit_op(
                     Opcode::Copy,
@@ -23559,7 +23634,7 @@ fn emit_without_rowid_update_rewrite(
                     0,
                 );
             }
-            for (j, &pk_col) in pk_indices.iter().enumerate() {
+            for (j, &pk_col) in appended_pk.iter().enumerate() {
                 b.emit_op(
                     Opcode::Copy,
                     new_regs + pk_col as i32,
@@ -23573,7 +23648,7 @@ fn emit_without_rowid_update_rewrite(
             b.emit_op(
                 Opcode::MakeRecord,
                 raise_regs,
-                (n_idx_cols + n_pk) as i32,
+                (n_idx_cols + n_pk_app) as i32,
                 raise_rec,
                 P4::None,
                 0,
@@ -23857,6 +23932,8 @@ fn emit_without_rowid_row_insert(
         let idx_oe = effective_oe(stmt_level, index.conflict_action);
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
+        // GH #353: reconstruct the victim PK from the deduplicated key layout.
+        let read_positions = without_rowid_index_pk_read_positions(table, index, pk_indices);
         let idx_clear = b.emit_label();
         let scan_ctx = ScanCtx {
             cursor: table_cursor,
@@ -23897,11 +23974,11 @@ fn emit_without_rowid_row_insert(
             P4::None,
             0,
         );
-        for j in 0..n_pk {
+        for (j, &pos) in read_positions.iter().enumerate() {
             b.emit_op(
                 Opcode::Column,
                 idx_cursor,
-                (n_idx_cols + j) as i32,
+                pos as i32,
                 victim_pk_regs + j as i32,
                 P4::None,
                 0,
