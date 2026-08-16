@@ -153,9 +153,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "asupersync"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c53eee30b6bef44faeabf2ca88e98680e81e3527452bb811491161377de17a35"
+checksum = "58465f2cbc04317c79f29b2a595901c935deccdbe6bb9c9268280ea6e289385d"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -1004,9 +1004,9 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ea97cf32e8847a084dccfb4f29332e4351aadb3f8685b50b1144ecee9d0a4b5"
+checksum = "f9aa607e90a50cac071cc5f1548bc8febfdc01f895155282d17de30f94c94849"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -1015,9 +1015,9 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4832bb8c44a6ec2a58bae9349353eed8ad0cfb6330f2616a05279ac5d7f6146"
+checksum = "08518a6466664a9169423794f1a9fd197776662f375d472a0a1203f340dcfe7b"
 dependencies = [
  "serde",
  "serde_json",
@@ -1025,16 +1025,16 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a327f092ec1ad7d17692fbcd490a9b53e5659ede88abd2351443a38723fe0ce"
+checksum = "6b059747003a68b67e635acfc348578b801c3f95323d4094d0ef81034b281fd5"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "fsqlite"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "fsqlite-ast",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fsqlite-types",
  "smallvec",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "foldhash",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-c-api"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "fsqlite",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "fsqlite",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-e2e"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1190,14 +1190,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts3"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "fsqlite-error",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-session"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-harness"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "argon2",
  "asupersync",
@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "bitflags",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wasm"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "asupersync",
  "console_error_panic_hook",
@@ -3421,7 +3421,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",

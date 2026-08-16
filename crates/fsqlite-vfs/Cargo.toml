@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-vfs"
-version = "0.3.2"
+version = "0.3.3"
 description = "Virtual filesystem abstraction layer"
 edition.workspace = true
 license-file.workspace = true

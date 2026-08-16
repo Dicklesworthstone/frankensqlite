@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-wal"
-version = "0.3.2"
+version = "0.3.3"
 description = "Write-ahead logging"
 edition.workspace = true
 license-file.workspace = true
