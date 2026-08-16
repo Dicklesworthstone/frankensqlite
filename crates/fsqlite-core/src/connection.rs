@@ -3712,6 +3712,62 @@ impl PagerBackend {
         }
     }
 
+    /// Rewrite a valid empty-database page 1 for the in-memory pager after a
+    /// committed all-zero page 1 invalidated the header magic, so subsequent
+    /// header-validating `begin`s succeed again.
+    ///
+    /// This mirrors the image the pager itself writes when bootstrapping a
+    /// brand-new database: a valid 100-byte header describing a single-page
+    /// database, followed by an empty `sqlite_master` leaf, with the file
+    /// truncated to exactly one page. The committed change counter is preserved
+    /// (it equals the committed commit sequence for an in-memory rollback pager)
+    /// so the pager's begin-time visibility probe computes a zero delta and
+    /// never moves the visible commit sequence backward. Because in-memory
+    /// committed reads consult the file directly and the truncation flips the
+    /// pager's durable-identity fingerprint, the next `begin` re-derives a
+    /// consistent single-page committed state and clears any stale page cache.
+    async fn reinitialize_empty_memory_page_one(&self, cx: &Cx) -> Result<()> {
+        let Self::Memory(pager) = self else {
+            return Err(FrankenError::Unsupported);
+        };
+        let page_size = pager.page_size();
+        let page_len = page_size.as_usize();
+        let change_counter = u32::try_from(
+            pager.published_snapshot().visible_commit_seq.get() & u64::from(u32::MAX),
+        )
+        .unwrap_or(0);
+        let header = DatabaseHeader {
+            page_size,
+            page_count: 1,
+            change_counter,
+            ..DatabaseHeader::default()
+        };
+        let header_bytes = header.to_bytes().map_err(|err| {
+            FrankenError::Internal(format!("failed to encode empty-reset database header: {err}"))
+        })?;
+        let mut page1 = vec![0_u8; page_len];
+        page1[..DATABASE_HEADER_SIZE].copy_from_slice(&header_bytes);
+        let usable = page_size.usable(header.reserved_per_page);
+        BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, usable);
+
+        let vfs = pager.vfs_handle();
+        let db_path = pager.db_path().to_path_buf();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _) = vfs.open(cx, Some(db_path.as_path()), flags)?;
+        let page_len_u64 = u64::try_from(page_len).expect("page size fits in u64");
+        let write_result = async {
+            db_file.write(cx, &page1, 0).await?;
+            db_file.truncate(cx, page_len_u64)?;
+            db_file.sync(cx, fsqlite_types::flags::SyncFlags::NORMAL)?;
+            Ok::<(), FrankenError>(())
+        }
+        .await;
+        let close_result = db_file.close(cx);
+        write_result?;
+        close_result?;
+        Ok(())
+    }
+
     fn journal_mode(&self) -> JournalMode {
         match self {
             Self::Memory(p) => p.journal_mode(),
@@ -81428,6 +81484,40 @@ impl Connection {
             .await
     }
 
+    /// Begin the reload read transaction, repairing an uninitialized (zeroed)
+    /// committed page 1 first when the pager rejects it.
+    ///
+    /// A committed all-zero page 1 (e.g. an explicit whole-database wipe, or a
+    /// rollback that reverts the very first table creation) leaves the page-1
+    /// header magic invalid. The pager surfaces that as a corruption error from
+    /// `begin`'s committed-state refresh — before any read transaction exists —
+    /// and would keep rejecting every later read AND write `begin` on the same
+    /// connection, so even a subsequent `CREATE TABLE` could never proceed. A
+    /// zeroed page 1 is the empty-database signature, not durable corruption:
+    /// durable bad-magic files are rejected at open, so on a live connection
+    /// this only arises after the connection's own storage was reset. For an
+    /// in-memory pager, re-establish a valid empty-database page 1 (exactly the
+    /// image the pager writes when bootstrapping a fresh database) and retry the
+    /// begin so the reload observes an empty schema and later writes succeed.
+    /// File-backed pagers keep propagating the error rather than risk erasing a
+    /// recoverable on-disk image.
+    async fn begin_reload_txn_repairing_empty_page_one(
+        &self,
+        cx: &Cx,
+    ) -> Result<TransactionKind> {
+        match self.pager.begin(cx, TransactionMode::ReadOnly).await {
+            Ok(txn) => Ok(txn),
+            Err(error)
+                if self.pager.is_memory()
+                    && Self::is_uninitialized_page_one_header_error(&error) =>
+            {
+                self.pager.reinitialize_empty_memory_page_one(cx).await?;
+                self.pager.begin(cx, TransactionMode::ReadOnly).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// bd-db300.4.5.2: Reload memdb using an already-bound publication, avoiding
     /// a redundant `bind_pager_publication` call on the hot path.
     async fn reload_memdb_from_pager_with_prebound_publication(
@@ -81450,24 +81540,7 @@ impl Connection {
         hydrate_rows: bool,
     ) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
-        // A reverted-to-empty page 1 surfaces as an invalid-header-magic
-        // corruption error from `begin`'s committed-state refresh; treat that
-        // empty-database signature as an empty reset on the prebound
-        // publication's sequence rather than propagating it as corruption.
-        // (See `reload_memdb_from_pager_with_mode` for the full rationale.)
-        let mut txn = match self.pager.begin(cx, TransactionMode::ReadOnly).await {
-            Ok(txn) => txn,
-            Err(error) if Self::is_uninitialized_page_one_header_error(&error) => {
-                self.publish_empty_database_reset(
-                    cx,
-                    publication.snapshot.visible_commit_seq,
-                    hydrate_rows,
-                );
-                self.publish_committed_schema_cookie(self.schema_cookie());
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+        let mut txn = self.begin_reload_txn_repairing_empty_page_one(cx).await?;
         let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
             let _ = txn.rollback(cx).await;
             return Err(FrankenError::Internal(
@@ -81515,27 +81588,7 @@ impl Connection {
         let bound_publication = self.bind_pager_publication(cx, "memdb_reload").await?;
 
         // Open a read transaction to see the committed state.
-        //
-        // A reverted-to-empty page 1 (e.g. rollback of the first table
-        // creation, or an explicit whole-database wipe) leaves the page-1
-        // header magic invalid, which the pager surfaces as a corruption error
-        // from `begin`'s committed-state refresh before any read transaction
-        // exists. That is the empty-database signature, not durable corruption
-        // (durable bad-magic files are rejected at open), so publish the
-        // empty reset directly on the bound publication's visibility sequence.
-        let mut txn = match self.pager.begin(cx, TransactionMode::ReadOnly).await {
-            Ok(txn) => txn,
-            Err(error) if Self::is_uninitialized_page_one_header_error(&error) => {
-                self.publish_empty_database_reset(
-                    cx,
-                    bound_publication.snapshot.visible_commit_seq,
-                    hydrate_rows,
-                );
-                self.publish_committed_schema_cookie(self.schema_cookie());
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+        let mut txn = self.begin_reload_txn_repairing_empty_page_one(cx).await?;
         let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
             let _ = txn.rollback(cx).await;
             return Err(FrankenError::Internal(
@@ -170326,6 +170379,43 @@ mod tests {
                 );
             }
 
+            // bd-2dgf5: a parameterized IN subquery that matches the native
+            // probe-source shape is kept live (InSet::Subquery) so VDBE lowers
+            // its `?` to Opcode::Variable and rebinds fresh each run rather than
+            // being folded into a literal list. The statement-global bind slot
+            // must still be preserved on the subquery's own placeholder.
+            fn assert_in_subquery_bind_slot(expr: &fsqlite_ast::Expr, expected: u32) {
+                let fsqlite_ast::Expr::In {
+                    set: fsqlite_ast::InSet::Subquery(sub),
+                    ..
+                } = expr
+                else {
+                    panic!(
+                        "expected parameterized IN subquery kept live for native probe lowering"
+                    );
+                };
+                let fsqlite_ast::SelectCore::Select {
+                    where_clause: Some(where_clause),
+                    ..
+                } = &sub.body.select
+                else {
+                    panic!("expected subquery WHERE clause");
+                };
+                let fsqlite_ast::Expr::BinaryOp { right, .. } = where_clause.as_ref() else {
+                    panic!("expected subquery WHERE comparison");
+                };
+                assert!(
+                    matches!(
+                        right.as_ref(),
+                        fsqlite_ast::Expr::Placeholder(
+                            fsqlite_ast::PlaceholderType::Numbered(index),
+                            _
+                        ) if *index == expected
+                    ),
+                    "subquery placeholder must retain statement-global slot {expected}"
+                );
+            }
+
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE issues (id TEXT PRIMARY KEY, issue_type TEXT);")
                 .await
@@ -170373,16 +170463,7 @@ mod tests {
             else {
                 panic!("expected conjunctive WHERE clause");
             };
-            assert!(
-                matches!(
-                    left.as_ref(),
-                    fsqlite_ast::Expr::In {
-                        set: fsqlite_ast::InSet::List(_),
-                        ..
-                    }
-                ),
-                "parameterized subquery should be materialized at execution time"
-            );
+            assert_in_subquery_bind_slot(left, 1);
             assert_in_list_placeholder(right, 2);
 
             let swapped_params = [
@@ -170419,16 +170500,7 @@ mod tests {
                 panic!("expected conjunctive WHERE clause");
             };
             assert_in_list_placeholder(left, 1);
-            assert!(
-                matches!(
-                    right.as_ref(),
-                    fsqlite_ast::Expr::In {
-                        set: fsqlite_ast::InSet::List(_),
-                        ..
-                    }
-                ),
-                "subquery should retain slot two before materialization"
-            );
+            assert_in_subquery_bind_slot(right, 2);
 
             let numbered = conn
                 .query_with_params(
