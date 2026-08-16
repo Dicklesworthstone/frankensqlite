@@ -138,19 +138,32 @@ fn scalar_is_query_constant_for_codegen(name: &str, num_args: i32) -> bool {
     })
 }
 
+/// Builtin scalar functions that consume (and therefore require) their
+/// arguments' collation even when no custom registry entry covers them:
+/// `NULLIF/2` and the `MIN`/`MAX` scalar forms (2+ arguments).
+fn builtin_scalar_consumes_argument_collation(name: &str, num_args: i32) -> bool {
+    matches!(
+        (name.to_ascii_uppercase().as_str(), num_args),
+        ("NULLIF", 2) | ("MIN" | "MAX", 2..)
+    )
+}
+
 fn scalar_consumes_argument_collation_for_codegen(name: &str, num_args: i32) -> bool {
     FUNCTION_REGISTRY.with(|registry| {
         registry.borrow().as_ref().map_or_else(
-            || {
-                matches!(
-                    (name.to_ascii_uppercase().as_str(), num_args),
-                    ("NULLIF", 2) | ("MIN" | "MAX", 2..)
-                )
-            },
+            || builtin_scalar_consumes_argument_collation(name, num_args),
             |registry| {
+                // bd-rwaxp: when the registry does not cover this (name, arity)
+                // -- e.g. a partial custom registration shadowing `min/2` but
+                // not `min/3` -- the BUILTIN is still used at that arity, so the
+                // builtin NEEDCOLL requirement must survive. `unwrap_or(false)`
+                // silently dropped it; fall back to the builtin table instead
+                // (matching the no-registry branch above).
                 registry
                     .scalar_consumes_argument_collation(name, num_args)
-                    .unwrap_or(false)
+                    .unwrap_or_else(|| {
+                        builtin_scalar_consumes_argument_collation(name, num_args)
+                    })
             },
         )
     })
