@@ -53,8 +53,8 @@ use crate::connection::{
 use crate::connection::{eval_join_expr, is_sqlite_truthy};
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{
-    CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema, bind_explicit_index,
-    without_rowid_pk_indices,
+    CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
+    bind_explicit_index, without_rowid_pk_indices,
 };
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
