@@ -90178,7 +90178,14 @@ fn parse_declared_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo>
         }
         columns.push(ColumnInfo {
             name: raw_name.to_owned(),
-            affinity: 'C',
+            // bd-76k72: a typeless vtab column (FTS5, table-valued fns — all bare
+            // names here) has NONE affinity per SQLite, not NUMERIC. 'C' made
+            // join_comparison_affinity_p5('C','D'-INTEGER) return 0 (no coercion),
+            // so a TEXT vtab key like an FTS5 message_id "7" never coerced to match
+            // an INTEGER PK in a join (FTS5-vtab-as-JOIN-RHS returned NULL). 'A'
+            // combines to NUMERIC vs an integer col (coerces "7"->7) and is a no-op
+            // numeric-vs-numeric. rtree is unaffected (it overrides column_info).
+            affinity: 'A',
             is_ipk: false,
             type_name: None,
             notnull: false,
@@ -90198,7 +90205,9 @@ fn parse_declared_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo>
 fn default_virtual_table_column_info() -> ColumnInfo {
     ColumnInfo {
         name: "content".to_owned(),
-        affinity: 'C',
+        // bd-76k72: typeless vtab column -> NONE affinity (see
+        // parse_declared_virtual_table_column_infos above).
+        affinity: 'A',
         is_ipk: false,
         type_name: None,
         notnull: false,

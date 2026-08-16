@@ -52,8 +52,8 @@ async fn setup(conn: &Connection) {
 //   * crates/fsqlite-core/src/connection.rs:90181 (`parse_declared_...`) and
 //     :90201 (`default_virtual_table_column_info`) — the LIVE `:memory:`
 //     CREATE path (FTS5's generic factory doesn't override `column_info`).
-// `#[ignore]` stays until the connection.rs half lands; un-ignore then.
-#[ignore = "bd-76k72: green once connection.rs:90181/90201 vtab affinity 'C'->'A' lands (compat_persist half done)"]
+// Fixed at both sites (compat_persist.rs reload path + connection.rs:90181/90201
+// live path) — this keeper now asserts the corrected LEFT JOIN behavior.
 #[test]
 fn bd_76k72_probe_fts5_column_standalone_vs_join() {
     asupersync::test_utils::run_test(|| async {
