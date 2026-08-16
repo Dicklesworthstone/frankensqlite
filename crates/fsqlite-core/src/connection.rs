@@ -33618,6 +33618,16 @@ impl Connection {
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
+                // Reached only with writable_schema OFF: direct DML on the schema
+                // table is rejected with SQLITE_ERROR, not the generic
+                // "no such table" the interpreted path would otherwise raise.
+                // (GH #284)
+                if is_sqlite_schema_name(&delete.table.name.name) {
+                    return Err(FrankenError::FunctionError(format!(
+                        "table {} may not be modified",
+                        delete.table.name.name
+                    )));
+                }
                 // CTE (WITH clause): materialize CTEs as temporary tables,
                 // then execute the DELETE with the WITH clause stripped.
                 if delete.with.is_some() {
