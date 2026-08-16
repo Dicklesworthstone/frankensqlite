@@ -2804,24 +2804,26 @@ pub fn codegen_select(
         return codegen_grouped_inner_join_count_sum_select(b, &plan, ctx);
     }
 
-    let (table_name, table_alias, time_travel, from_index_hint) = match &from_clause.source {
-        fsqlite_ast::TableOrSubquery::Table {
-            name,
-            alias,
-            time_travel,
-            index_hint,
-        } => (
-            &name.name,
-            alias.as_deref(),
-            time_travel.as_ref(),
-            index_hint.as_ref(),
-        ),
-        _ => {
-            return Err(CodegenError::Unsupported(
-                "non-table FROM source".to_owned(),
-            ));
-        }
-    };
+    let (table_name, table_alias, from_schema, time_travel, from_index_hint) =
+        match &from_clause.source {
+            fsqlite_ast::TableOrSubquery::Table {
+                name,
+                alias,
+                time_travel,
+                index_hint,
+            } => (
+                &name.name,
+                alias.as_deref(),
+                name.schema.as_deref(),
+                time_travel.as_ref(),
+                index_hint.as_ref(),
+            ),
+            _ => {
+                return Err(CodegenError::Unsupported(
+                    "non-table FROM source".to_owned(),
+                ));
+            }
+        };
     let join_has_time_travel = from_clause.joins.iter().any(|join| {
         matches!(
             &join.table,
@@ -2896,7 +2898,7 @@ pub fn codegen_select(
     // Re-bind with the original `&Option<Box<Expr>>` shape so the downstream
     // `.as_deref()` call sites keep their meaning (and avoid no-op derefs).
     let where_clause = &where_clause_rewritten;
-    validate_single_table_result_columns(columns, table, table_alias)?;
+    validate_single_table_result_columns(columns, table, table_alias, from_schema)?;
     if let Some(where_expr) = where_clause.as_deref() {
         validate_single_table_expr_columns(where_expr, table, table_alias)?;
     }
@@ -21108,7 +21110,12 @@ pub fn codegen_update(
     if let Some(where_expr) = &stmt.where_clause {
         validate_single_table_expr_columns(where_expr, table, stmt.table.alias.as_deref())?;
     }
-    validate_single_table_result_columns(&stmt.returning, table, stmt.table.alias.as_deref())?;
+    validate_single_table_result_columns(
+        &stmt.returning,
+        table,
+        stmt.table.alias.as_deref(),
+        stmt.table.name.schema.as_deref(),
+    )?;
 
     // Init.
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -22040,7 +22047,12 @@ fn codegen_update_from(
     if let Some(where_expr) = &stmt.where_clause {
         validate_scan_expr_columns(where_expr, &scan)?;
     }
-    validate_single_table_result_columns(&stmt.returning, target, stmt.table.alias.as_deref())?;
+    validate_single_table_result_columns(
+        &stmt.returning,
+        target,
+        stmt.table.alias.as_deref(),
+        stmt.table.name.schema.as_deref(),
+    )?;
 
     // OpenWrite for target table.
     b.emit_op(
@@ -22652,7 +22664,12 @@ pub fn codegen_delete(
     if let Some(where_expr) = &stmt.where_clause {
         validate_single_table_expr_columns(where_expr, table, stmt.table.alias.as_deref())?;
     }
-    validate_single_table_result_columns(&stmt.returning, table, stmt.table.alias.as_deref())?;
+    validate_single_table_result_columns(
+        &stmt.returning,
+        table,
+        stmt.table.alias.as_deref(),
+        stmt.table.name.schema.as_deref(),
+    )?;
 
     // Init.
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -25225,7 +25242,12 @@ fn codegen_update_from_without_rowid(
     if let Some(where_expr) = &stmt.where_clause {
         validate_scan_expr_columns(where_expr, &scan)?;
     }
-    validate_single_table_result_columns(&stmt.returning, table, stmt.table.alias.as_deref())?;
+    validate_single_table_result_columns(
+        &stmt.returning,
+        table,
+        stmt.table.alias.as_deref(),
+        stmt.table.name.schema.as_deref(),
+    )?;
 
     // Open target (write) + its index cursors, then the FROM read cursors.
     emit_without_rowid_open_write(b, table, target_cursor);
@@ -26495,7 +26517,11 @@ fn emit_returning(
     table_alias: Option<&str>,
     rowid_reg: i32,
 ) -> Result<(), CodegenError> {
-    validate_single_table_result_columns(returning, table, table_alias)?;
+    // RETURNING is validated against the DML target, which in these single-table
+    // codegen paths is always a main (or implicit) binding: attached-schema DML
+    // is delegated or rejected upstream, so a `None` (implicit `main`) FROM
+    // schema is the correct reconciliation base here.
+    validate_single_table_result_columns(returning, table, table_alias, None)?;
 
     let skip_returning = b.emit_label();
     b.emit_jump_to_label(
@@ -26529,7 +26555,11 @@ fn emit_returning_from_regs(
     schema: &[TableSchema],
     col_regs: i32,
 ) -> Result<(), CodegenError> {
-    validate_single_table_result_columns(returning, table, table_alias)?;
+    // RETURNING is validated against the DML target, which in these single-table
+    // codegen paths is always a main (or implicit) binding: attached-schema DML
+    // is delegated or rejected upstream, so a `None` (implicit `main`) FROM
+    // schema is the correct reconciliation base here.
+    validate_single_table_result_columns(returning, table, table_alias, None)?;
     let ret_count = result_column_count(returning, table);
     let ret_regs = b.alloc_regs(ret_count);
     let mut reg = ret_regs;
@@ -27121,6 +27151,43 @@ fn comparison_affinity_p5_resolved(
 fn is_hidden_rowid_alias_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == "rowid" || lower == "_rowid_" || lower == "oid"
+}
+
+/// Normalize an explicit `main` schema qualifier to the implicit (`None`) form.
+///
+/// SQLite treats the `main` database name as equivalent to an unqualified
+/// reference, so `main.t` and a bare `t` name the same object. This mirrors
+/// `connection.rs::normalized_attached_schema_name` so codegen reconciles a
+/// schema-qualified result-column star against a bare FROM binding without
+/// collapsing a genuine cross-database qualifier (e.g. `aux`).
+fn normalized_schema_qualifier(schema: Option<&str>) -> Option<&str> {
+    match schema {
+        Some(name) if name.eq_ignore_ascii_case("main") => None,
+        other => other,
+    }
+}
+
+/// Decide whether a `qualifier.*` table-star names the single FROM/DML binding.
+///
+/// `from_schema` is the schema qualifier written on the binding itself
+/// (`None` for a bare `t`, `Some("main")` for `main.t`, `Some("aux")` for an
+/// attached `aux.t`). An aliased binding is addressable only by its alias, with
+/// no schema qualifier. Otherwise the star's database and the binding's database
+/// must agree after `main`/implicit normalization, so `main.t.*` matches a bare
+/// `FROM t` while `aux.t.*` does not.
+fn table_star_qualifier_matches_binding(
+    qualifier: &QualifiedName,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    from_schema: Option<&str>,
+) -> bool {
+    if table_alias.is_some() {
+        return qualifier.schema.is_none()
+            && matches_table_or_alias(&qualifier.name, table, table_alias);
+    }
+    normalized_schema_qualifier(qualifier.schema.as_deref())
+        == normalized_schema_qualifier(from_schema)
+        && matches_table_or_alias(&qualifier.name, table, table_alias)
 }
 
 fn matches_table_or_alias(qualifier: &str, table: &TableSchema, table_alias: Option<&str>) -> bool {
@@ -27717,14 +27784,18 @@ fn validate_single_table_result_columns(
     columns: &[ResultColumn],
     table: &TableSchema,
     table_alias: Option<&str>,
+    from_schema: Option<&str>,
 ) -> Result<(), CodegenError> {
     for column in columns {
         match column {
             ResultColumn::Star => {}
             ResultColumn::TableStar(qualifier) => {
-                if qualifier.schema.is_some()
-                    || !matches_table_or_alias(&qualifier.name, table, table_alias)
-                {
+                if !table_star_qualifier_matches_binding(
+                    qualifier,
+                    table,
+                    table_alias,
+                    from_schema,
+                ) {
                     return Err(CodegenError::TableNotFound(qualifier.to_string()));
                 }
             }
@@ -30424,7 +30495,7 @@ fn scalar_in_operand_metadata(
         return None;
     }
     let table = find_table(schema, &qualified_table_name.name).ok()?;
-    if validate_single_table_result_columns(columns, table, table_alias).is_err()
+    if validate_single_table_result_columns(columns, table, table_alias, None).is_err()
         || where_clause.as_deref().is_some_and(|expr| {
             validate_single_table_expr_columns(expr, table, table_alias).is_err()
         })
@@ -30777,7 +30848,7 @@ fn resolve_in_probe_source<'a>(
                 return None;
             }
             let table = find_table(schema, &qualified_table_name.name).ok()?;
-            if validate_single_table_result_columns(columns, table, table_alias).is_err()
+            if validate_single_table_result_columns(columns, table, table_alias, None).is_err()
                 || where_clause.as_deref().is_some_and(|expr| {
                     validate_single_table_expr_columns(expr, table, table_alias).is_err()
                 })
@@ -30942,7 +31013,7 @@ fn try_emit_complex_in_subquery(
         .iter()
         .map(|term| rewrite_having_select_aliases(&term.expr, columns, table))
         .collect();
-    if validate_single_table_result_columns(columns, table, table_alias).is_err()
+    if validate_single_table_result_columns(columns, table, table_alias, None).is_err()
         || where_clause.is_some_and(|expr| {
             validate_single_table_expr_columns(expr, table, table_alias).is_err()
         })
