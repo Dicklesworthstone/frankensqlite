@@ -33036,6 +33036,16 @@ impl Connection {
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
+                // Reached only with writable_schema OFF: direct DML on the schema
+                // table is rejected with SQLITE_ERROR, not the generic
+                // "no such table" the interpreted path would otherwise raise.
+                // (GH #284)
+                if is_sqlite_schema_name(&insert.table.name) {
+                    return Err(FrankenError::FunctionError(format!(
+                        "table {} may not be modified",
+                        insert.table.name
+                    )));
+                }
                 if self.execute_fts5_maintenance_insert(insert).await? {
                     return Ok(Vec::new());
                 }
@@ -33349,6 +33359,16 @@ impl Connection {
                     let affected = self.execute_writable_schema_update(update, params).await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
+                }
+                // Reached only with writable_schema OFF: direct DML on the schema
+                // table is rejected with SQLITE_ERROR, not the generic
+                // "no such table" the interpreted path would otherwise raise.
+                // (GH #284)
+                if is_sqlite_schema_name(&update.table.name.name) {
+                    return Err(FrankenError::FunctionError(format!(
+                        "table {} may not be modified",
+                        update.table.name.name
+                    )));
                 }
                 // CTE (WITH clause): materialize CTEs as temporary tables,
                 // then execute the UPDATE with the WITH clause stripped.
