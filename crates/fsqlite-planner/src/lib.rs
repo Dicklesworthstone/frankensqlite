@@ -6363,6 +6363,20 @@ fn fold_ordering_comparison(op: AstBinaryOp, ordering: Option<std::cmp::Ordering
 }
 
 fn fold_binary_literals(op: AstBinaryOp, left: FoldResult, right: FoldResult) -> FoldResult {
+    // bd-and-or-short-circuit GAP-3: FALSE absorbs AND in every context. Stock
+    // sqlite3 3.46.1 folds `0 AND E` / `E AND 0` -> 0 even when E is a
+    // non-constant, erroring operand — it short-circuits and never evaluates E.
+    // Only the integer literal 0 triggers this parse-time fold: `0.0 AND E`,
+    // `'0' AND E`, `NULL AND E`, and `1 AND E` all evaluate eagerly (verified vs
+    // 3.46.1), and OR never folds against a non-literal operand. So fold to FALSE
+    // iff op is AND and either operand is the integer literal 0, before requiring
+    // both operands to be literals.
+    if op == AstBinaryOp::And
+        && (matches!(&left, FoldResult::Literal(Literal::Integer(0)))
+            || matches!(&right, FoldResult::Literal(Literal::Integer(0))))
+    {
+        return FoldResult::Literal(Literal::False);
+    }
     let (FoldResult::Literal(left), FoldResult::Literal(right)) = (left, right) else {
         return FoldResult::NotConstant;
     };
@@ -14549,6 +14563,56 @@ mod tests {
     fn test_fold_column_ref_not_constant() {
         let expr = Expr::Column(ColumnRef::bare("id"), Span::ZERO);
         assert_eq!(try_constant_fold(&expr), FoldResult::NotConstant);
+    }
+
+    #[test]
+    fn test_fold_and_false_absorbs_short_circuit_gap3_dkswh() {
+        // bd-and-or-short-circuit GAP-3: stock sqlite3 3.46.1 folds `0 AND E` /
+        // `E AND 0` to 0 even when E is non-constant (short-circuit — E is never
+        // evaluated), but ONLY for the integer literal 0; `0.0`/`NULL`/`1 AND E`
+        // and OR all stay eager (verified vs 3.46.1).
+        fn bin(left: Expr, op: fsqlite_ast::BinaryOp, right: Expr) -> Expr {
+            Expr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+                span: Span::ZERO,
+            }
+        }
+        let col = || Expr::Column(ColumnRef::bare("x"), Span::ZERO);
+        let lit = |l| Expr::Literal(l, Span::ZERO);
+        use fsqlite_ast::BinaryOp::{And, Or};
+
+        // FALSE absorbs AND, either side -> folds to false (short-circuits E).
+        assert_eq!(
+            try_constant_fold(&bin(lit(Literal::Integer(0)), And, col())),
+            FoldResult::Literal(Literal::False)
+        );
+        assert_eq!(
+            try_constant_fold(&bin(col(), And, lit(Literal::Integer(0)))),
+            FoldResult::Literal(Literal::False)
+        );
+        // Everything else stays eager (NotConstant -> evaluated at runtime).
+        assert_eq!(
+            try_constant_fold(&bin(lit(Literal::Integer(1)), And, col())),
+            FoldResult::NotConstant,
+            "1 AND E must stay eager"
+        );
+        assert_eq!(
+            try_constant_fold(&bin(lit(Literal::Integer(0)), Or, col())),
+            FoldResult::NotConstant,
+            "OR must not fold against a non-literal operand"
+        );
+        assert_eq!(
+            try_constant_fold(&bin(lit(Literal::Float(0.0)), And, col())),
+            FoldResult::NotConstant,
+            "only the integer literal 0 folds; 0.0 AND E stays eager"
+        );
+        assert_eq!(
+            try_constant_fold(&bin(lit(Literal::Null), And, col())),
+            FoldResult::NotConstant,
+            "NULL AND E stays eager"
+        );
     }
 
     #[test]
