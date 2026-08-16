@@ -145,7 +145,21 @@ impl EvidenceRecordMetricsSnapshot {
 
 fn ssi_evidence_ledger() -> &'static SsiEvidenceLedger {
     static LEDGER: OnceLock<SsiEvidenceLedger> = OnceLock::new();
-    LEDGER.get_or_init(SsiEvidenceLedger::default)
+    LEDGER.get_or_init(|| {
+        // bd-giosk: this evidence ledger is process-global. Under `cargo test
+        // -j16`, 30+ concurrent recording tests fill it past its default
+        // retention, so a test's evidence row is evicted before it queries it
+        // (the empty-`rows.last()` flake). Give the ledger a large retention in
+        // test builds so no eviction occurs during the suite; production keeps
+        // the bounded default. (Budget-based compaction is still exercised via
+        // the per-test thread-local budget config, which is independent of this
+        // retention bound.)
+        if cfg!(test) {
+            SsiEvidenceLedger::new(1_000_000)
+        } else {
+            SsiEvidenceLedger::default()
+        }
+    })
 }
 
 /// Read the shared SSI decision-evidence store.
@@ -1578,11 +1592,24 @@ mod tests {
         }
     }
 
+    /// bd-giosk: serialize all SSI-evidence tests. The recording mode/budget is
+    /// thread-local (isolated per test), but the evidence LEDGER
+    /// (`ssi_evidence_ledger()`, a process-global `OnceLock`) and the evidence
+    /// mode/budget GLOBALS are process-wide. Under `-j16`, concurrent
+    /// `with_ssi_evidence_test_config` tests interleave records into the shared
+    /// ledger, so a test's `ssi_evidence_query(txn_id)` observes cross-test rows
+    /// and its row-content assertions flake (bd-giosk). Holding a shared lock for
+    /// each test's whole body restores isolation without weakening any assertion.
+    static SSI_EVIDENCE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn with_ssi_evidence_test_config<T>(
         mode: SsiEvidenceRecordingMode,
         budget: SsiEvidenceBudgetConfig,
         f: impl FnOnce() -> T,
     ) -> T {
+        let _serial = SSI_EVIDENCE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let restore = EvidenceConfigRestore {
             previous: SSI_EVIDENCE_TEST_CONFIG.with(|config| config.replace(Some((mode, budget)))),
         };
@@ -3298,7 +3325,9 @@ mod tests {
             },
             || {
                 reset_ssi_evidence_test_ledger_enqueue_count();
-                let txn = TxnToken::new(TxnId::new(90_202).unwrap(), TxnEpoch::new(0));
+                // bd-giosk: unique txn_id (was 90_202, colliding with
+                // test_default_abort_only's commit_txn in the process-global ledger).
+                let txn = TxnToken::new(TxnId::new(90_905).unwrap(), TxnEpoch::new(0));
                 let result = ssi_validate_and_publish(
                     txn,
                     CommitSeq::new(3),
@@ -3353,7 +3382,10 @@ mod tests {
                     commit_evidence_detail_level(&[], &[], &[], ""),
                     (false, "budget_full")
                 );
-                let txn = TxnToken::new(TxnId::new(90_203).unwrap(), TxnEpoch::new(0));
+                // bd-giosk: unique txn_id (was 90_203, which collides with
+                // test_default_abort_only's abort_txn in the process-global
+                // evidence ledger -> cross-test AbortCycle contamination under -j16).
+                let txn = TxnToken::new(TxnId::new(90_903).unwrap(), TxnEpoch::new(0));
                 let result = ssi_validate_and_publish(
                     txn,
                     CommitSeq::new(5),
@@ -3404,7 +3436,9 @@ mod tests {
                     commit_evidence_detail_level(&[], &[page_key(941)], &[], "commit allowed"),
                     (true, "budget_compact_size")
                 );
-                let txn = TxnToken::new(TxnId::new(90_204).unwrap(), TxnEpoch::new(0));
+                // bd-giosk: unique txn_id (was 90_204, colliding with another
+                // test's txn in the process-global evidence ledger under -j16).
+                let txn = TxnToken::new(TxnId::new(90_904).unwrap(), TxnEpoch::new(0));
                 let result = ssi_validate_and_publish(
                     txn,
                     CommitSeq::new(7),
