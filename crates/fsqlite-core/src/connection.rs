@@ -99214,7 +99214,19 @@ fn rewrite_in_expr<'a>(
                     // must be evaluated per-row; skip eager rewrite.
                     let vdbe_supported = in_subquery_supported_by_vdbe(sub, conn);
                     let is_correlated = rewrite_probe_is_correlated(conn, sub);
+                    // bd-rwaxp: a multi-column scalar-subquery LHS forms a valid
+                    // vector IN only against a subquery RHS — never a literal list
+                    // (validate_in_list_lhs_shape). Materializing the RHS subquery
+                    // into a list would manufacture the `(SELECT a, b) IN (list)`
+                    // shape SQLite rejects as "row value misused" / "sub-select
+                    // returns N columns", which prepare's post-rewrite semantic
+                    // validation would then reject even though the original query
+                    // is valid. The multi-column IN evaluator materializes such a
+                    // subquery itself, so keep it intact for the semantic path.
+                    let lhs_is_vector_subquery = matches!(inner.as_ref(), Expr::Subquery(_, _))
+                        && conn.in_lhs_column_count(inner) > 1;
                     let should_eager_rewrite = !is_correlated
+                        && !lhs_is_vector_subquery
                         && (!vdbe_supported
                             || (rewrite_in_subqueries
                                 && !conn.skip_statement_memdb_refresh.get()))
