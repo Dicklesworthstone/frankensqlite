@@ -123,33 +123,33 @@ unnecessary_literal_bound = { level = "allow", priority = 1 }
 
 [workspace.dependencies]
 # Internal crates
-fsqlite-types = { version = "0.3.3", path = "crates/fsqlite-types", default-features = false }
-fsqlite-error = { version = "0.3.3", path = "crates/fsqlite-error" }
-fsqlite-vfs = { version = "0.3.3", path = "crates/fsqlite-vfs" }
-fsqlite-pager = { version = "0.3.3", path = "crates/fsqlite-pager" }
-fsqlite-wal = { version = "0.3.3", path = "crates/fsqlite-wal" }
-fsqlite-mvcc = { version = "0.3.3", path = "crates/fsqlite-mvcc" }
-fsqlite-btree = { version = "0.3.3", path = "crates/fsqlite-btree" }
-fsqlite-ast = { version = "0.3.3", path = "crates/fsqlite-ast" }
-fsqlite-parser = { version = "0.3.3", path = "crates/fsqlite-parser" }
-fsqlite-planner = { version = "0.3.3", path = "crates/fsqlite-planner" }
-fsqlite-vdbe = { version = "0.3.3", path = "crates/fsqlite-vdbe" }
-fsqlite-func = { version = "0.3.3", path = "crates/fsqlite-func" }
-fsqlite-ext-fts3 = { version = "0.3.3", path = "crates/fsqlite-ext-fts3" }
-fsqlite-ext-fts5 = { version = "0.3.3", path = "crates/fsqlite-ext-fts5" }
-fsqlite-ext-rtree = { version = "0.3.3", path = "crates/fsqlite-ext-rtree" }
-fsqlite-ext-json = { version = "0.3.3", path = "crates/fsqlite-ext-json" }
-fsqlite-ext-session = { version = "0.3.3", path = "crates/fsqlite-ext-session" }
-fsqlite-ext-icu = { version = "0.3.3", path = "crates/fsqlite-ext-icu" }
-fsqlite-ext-misc = { version = "0.3.3", path = "crates/fsqlite-ext-misc" }
-fsqlite-core = { version = "0.3.3", path = "crates/fsqlite-core" }
-fsqlite = { version = "0.3.3", path = "crates/fsqlite" }
-fsqlite-cli = { version = "0.3.3", path = "crates/fsqlite-cli" }
-fsqlite-harness = { version = "0.3.3", path = "crates/fsqlite-harness" }
-fsqlite-e2e = { version = "0.3.3", path = "crates/fsqlite-e2e" }
-fsqlite-observability = { version = "0.3.3", path = "crates/fsqlite-observability" }
-fsqlite-c-api = { version = "0.3.3", path = "crates/fsqlite-c-api" }
-fsqlite-wasm = { version = "0.3.3", path = "crates/fsqlite-wasm" }
+fsqlite-types = { version = "0.3.4", path = "crates/fsqlite-types", default-features = false }
+fsqlite-error = { version = "0.3.4", path = "crates/fsqlite-error" }
+fsqlite-vfs = { version = "0.3.4", path = "crates/fsqlite-vfs" }
+fsqlite-pager = { version = "0.3.4", path = "crates/fsqlite-pager" }
+fsqlite-wal = { version = "0.3.4", path = "crates/fsqlite-wal" }
+fsqlite-mvcc = { version = "0.3.4", path = "crates/fsqlite-mvcc" }
+fsqlite-btree = { version = "0.3.4", path = "crates/fsqlite-btree" }
+fsqlite-ast = { version = "0.3.4", path = "crates/fsqlite-ast" }
+fsqlite-parser = { version = "0.3.4", path = "crates/fsqlite-parser" }
+fsqlite-planner = { version = "0.3.4", path = "crates/fsqlite-planner" }
+fsqlite-vdbe = { version = "0.3.4", path = "crates/fsqlite-vdbe" }
+fsqlite-func = { version = "0.3.4", path = "crates/fsqlite-func" }
+fsqlite-ext-fts3 = { version = "0.3.4", path = "crates/fsqlite-ext-fts3" }
+fsqlite-ext-fts5 = { version = "0.3.4", path = "crates/fsqlite-ext-fts5" }
+fsqlite-ext-rtree = { version = "0.3.4", path = "crates/fsqlite-ext-rtree" }
+fsqlite-ext-json = { version = "0.3.4", path = "crates/fsqlite-ext-json" }
+fsqlite-ext-session = { version = "0.3.4", path = "crates/fsqlite-ext-session" }
+fsqlite-ext-icu = { version = "0.3.4", path = "crates/fsqlite-ext-icu" }
+fsqlite-ext-misc = { version = "0.3.4", path = "crates/fsqlite-ext-misc" }
+fsqlite-core = { version = "0.3.4", path = "crates/fsqlite-core" }
+fsqlite = { version = "0.3.4", path = "crates/fsqlite" }
+fsqlite-cli = { version = "0.3.4", path = "crates/fsqlite-cli" }
+fsqlite-harness = { version = "0.3.4", path = "crates/fsqlite-harness" }
+fsqlite-e2e = { version = "0.3.4", path = "crates/fsqlite-e2e" }
+fsqlite-observability = { version = "0.3.4", path = "crates/fsqlite-observability" }
+fsqlite-c-api = { version = "0.3.4", path = "crates/fsqlite-c-api" }
+fsqlite-wasm = { version = "0.3.4", path = "crates/fsqlite-wasm" }
 
 # External dependencies
 ftui = { version = "0.5.0", default-features = false }

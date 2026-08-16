@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-btree"
-version = "0.3.3"
+version = "0.3.4"
 description = "B-tree storage engine"
 edition.workspace = true
 license-file.workspace = true

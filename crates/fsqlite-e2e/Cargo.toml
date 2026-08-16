@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-e2e"
-version = "0.3.3"
+version = "0.3.4"
 publish = false
 edition.workspace = true
 autobins = false
