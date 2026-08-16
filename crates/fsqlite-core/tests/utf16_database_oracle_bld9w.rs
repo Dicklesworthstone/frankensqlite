@@ -415,9 +415,6 @@ const INDEX_QUERIES: &[&str] = &[
     "SELECT city, count(*) AS n FROM items GROUP BY city ORDER BY city",
 ];
 
-#[ignore = "bd-spsnt: GROUP BY over a UTF-16 TEXT column outputs the RAW UTF-16 \
-            group key ('Berlin' -> B\\0e\\0r...). Index seek + scan (queries 1-2) \
-            pass; only the GROUP BY (query 3) diverges. Un-ignore when fixed."]
 #[test]
 fn utf16le_text_index_seek_and_scan_parity() {
     asupersync::test_utils::run_test(|| async {
@@ -429,8 +426,6 @@ fn utf16le_text_index_seek_and_scan_parity() {
     });
 }
 
-#[ignore = "bd-spsnt: GROUP BY over a UTF-16 TEXT column outputs raw UTF-16 group \
-            keys (see utf16le_text_index_seek_and_scan_parity). Un-ignore when fixed."]
 #[test]
 fn utf16le_text_index_seek_and_scan_parity_unicode() {
     asupersync::test_utils::run_test(|| async {
