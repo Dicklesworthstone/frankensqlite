@@ -105,22 +105,41 @@ fn bd_84rh4_freelist_hole_is_deterministically_reproducible() {
 /// pass on) the crafted image must re-free the in-range unreachable pages so
 /// `integrity_check` is `ok`. Un-ignore together with the repair.
 #[test]
-#[ignore = "bd-84rh4: un-ignore when the reachability repair (Option B) lands"]
 fn bd_84rh4_reachability_repair_heals_freelist_hole() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
-        let (db, _freed) = craft_freelist_hole_db(dir.path()).await;
+        let (db, freed) = craft_freelist_hole_db(dir.path()).await;
 
         let conn = Connection::open(&db).await.expect("reopen crafted image");
-        // TODO(bd-84rh4): invoke the reachability repair here once it lands.
-        let integrity = conn
+
+        // Sanity: the hole is present before the repair.
+        let before = conn
             .query("PRAGMA integrity_check;")
             .await
             .expect("integrity_check");
         assert!(
-            matches!(integrity[0].values()[0], SqliteValue::Text(ref s) if s.as_ref() == "ok"),
-            "bd-84rh4: after repair integrity_check must be ok, got {:?}",
-            integrity[0].values()[0]
+            before.iter().any(|row| matches!(&row.values()[0],
+                SqliteValue::Text(s) if s.to_ascii_lowercase().contains("never used"))),
+            "precondition: the crafted hole must be present, got {before:?}"
+        );
+
+        // Option-B reachability repair re-frees the in-range unreachable pages.
+        let repaired = conn
+            .repair_orphaned_pages()
+            .await
+            .expect("repair_orphaned_pages");
+        assert!(
+            repaired >= freed as usize,
+            "repair must re-free at least the {freed} erased pages, re-freed {repaired}"
+        );
+
+        let after = conn
+            .query("PRAGMA integrity_check;")
+            .await
+            .expect("integrity_check");
+        assert!(
+            matches!(after[0].values()[0], SqliteValue::Text(ref s) if s.as_ref() == "ok"),
+            "bd-84rh4: after repair integrity_check must be ok, got {after:?}"
         );
         conn.close().await.expect("close");
     });

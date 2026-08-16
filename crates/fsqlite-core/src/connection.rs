@@ -11102,6 +11102,20 @@ pub struct Connection {
     /// mirror inside an explicit transaction, so the next query/fallback path
     /// must rebuild MemDatabase from the live transaction view.
     memdb_requires_active_txn_reload: Cell<bool>,
+    /// bd-420r8 (GH#345): per-schema-generation memoization of parsed stored
+    /// schema statements. A prior write can leave the row mirror dirty so that
+    /// an in-transaction rehydration — e.g. from a subquery-`WHEN` trigger
+    /// evaluated during ingestion — re-runs the full `sqlite_master` rebuild on
+    /// every write; re-lexing/-parsing the entire schema text each time is the
+    /// pegged-core leaf GH#345 reported as an unbounded hang. Keyed by the
+    /// schema cookie the cache was built for and dropped when the cookie
+    /// advances (any CREATE/ALTER/DROP), so a stale definition is never served.
+    schema_reload_parse_cache: RefCell<(u32, HashMap<String, Statement>)>,
+    /// bd-420r8: count of ACTUAL stored-schema statement parses (cache misses)
+    /// the memdb reload path has performed. Stays O(schema objects) across an
+    /// ingestion burst instead of O(rows_written × schema objects); the GH#345
+    /// regression keeper asserts it does not scale with the row count.
+    schema_reload_parse_count: Cell<u64>,
     /// Whether storage-backed read fast paths may trust the current
     /// connection-local MemDatabase row mirror for exact counts and scan-based
     /// aggregation shortcuts.
@@ -12640,6 +12654,8 @@ impl Connection {
             // Never hydrate rows — this is the whole point of schema-only.
             memdb_rows_loaded: Cell::new(false),
             memdb_requires_active_txn_reload: Cell::new(false),
+            schema_reload_parse_cache: RefCell::new((0, HashMap::new())),
+            schema_reload_parse_count: Cell::new(0),
             memdb_storage_count_shortcuts_safe: Cell::new(false),
             last_local_commit_seq: RefCell::new(None),
             data_version_own_commits: Cell::new(0),
@@ -13160,6 +13176,8 @@ impl Connection {
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             memdb_rows_loaded: Cell::new(eager_memdb_rows),
             memdb_requires_active_txn_reload: Cell::new(false),
+            schema_reload_parse_cache: RefCell::new((0, HashMap::new())),
+            schema_reload_parse_count: Cell::new(0),
             memdb_storage_count_shortcuts_safe: Cell::new(eager_memdb_rows),
             last_local_commit_seq: RefCell::new(None),
             data_version_own_commits: Cell::new(0),
@@ -61720,6 +61738,103 @@ impl Connection {
         .await
     }
 
+    /// bd-84rh4: reachability-based freelist-hole repair. Frees any in-range
+    /// page reachable from neither a b-tree (walked from `sqlite_master`) nor
+    /// the durable freelist — the "Page N is never used" orphan class caused by
+    /// a free (or abandoned EOF reservation) that never reached the durable
+    /// freelist.
+    ///
+    /// The caller MUST run this at a quiescent point (no concurrent writers):
+    /// it enumerates holes in a read snapshot, then re-frees them through a
+    /// normal write commit (the correct `serialize_freelist_to_write_set`
+    /// publication path — never a hand-rolled trunk write). It adds NO
+    /// writer-blocking contention (it is a maintenance-time commit) and is
+    /// double-grant-safe by construction: "hole" is exactly integrity_check's
+    /// not-reachable-and-not-free definition, so a live page is never freed.
+    ///
+    /// Auto-vacuum images are skipped: their pointer-map pages are not marked by
+    /// this ownership walk, so enumerating orphans would be unsafe (this matches
+    /// integrity_check, which skips its orphan scan for auto-vacuum images).
+    /// Returns the number of pages re-freed.
+    pub async fn repair_orphaned_pages(&self) -> Result<usize> {
+        // Phase 1 (read snapshot): enumerate in-range pages owned by neither a
+        // b-tree nor the durable freelist.
+        let orphans: Vec<PageNumber> = self
+            .with_integrity_txn(async |cx, txn| {
+                let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+                let page1_bytes = page1.as_ref();
+                if page1_bytes.iter().all(|&b| b == 0)
+                    || page1_bytes.len() < DATABASE_HEADER_SIZE
+                {
+                    return Ok(Vec::new());
+                }
+                let header = parse_database_header_checked(page1_bytes)?;
+                if header.largest_root_page != 0 {
+                    // Auto-vacuum: pointer-map pages are unmarked by this walk.
+                    return Ok(Vec::new());
+                }
+                let total_pages = self.pager.refresh_published_snapshot(cx).await?.db_size;
+                if total_pages == 0 {
+                    return Ok(Vec::new());
+                }
+
+                // Ownership set from the connection's authoritative schema —
+                // exactly the roots integrity_check walks.
+                let mut schema = self.schema.borrow().clone();
+                let temp_table_names = self.temp_table_names.borrow();
+                schema.retain(|table| {
+                    !temp_table_names.contains(&table.name.to_ascii_lowercase())
+                });
+                drop(temp_table_names);
+                schema.extend(self.shadowed_main_tables.borrow().values().cloned());
+
+                let mut owner_map = HashMap::new();
+                let mut owners = PageOwnershipSink::Resident(&mut owner_map);
+                Self::validate_page_ownership_in_txn(
+                    cx,
+                    txn,
+                    header.page_size,
+                    header.reserved_per_page,
+                    total_pages,
+                    header.freelist_trunk,
+                    header.freelist_count,
+                    // Mark all owners; enumerate the holes ourselves below.
+                    true,
+                    &schema,
+                    None,
+                    &mut owners,
+                )
+                .await?;
+
+                let mut orphans = Vec::new();
+                for raw in 2..=total_pages {
+                    if let Some(page) = PageNumber::new(raw)
+                        && !owner_map.contains_key(&page)
+                    {
+                        orphans.push(page);
+                    }
+                }
+                Ok(orphans)
+            })
+            .await?;
+
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 2 (write commit): re-free the holes through the normal
+        // publication path so they land on the durable freelist.
+        let count = orphans.len();
+        self.with_pager_write_txn(async |cx, txn| {
+            for orphan in &orphans {
+                txn.free_page(cx, *orphan).await?;
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(count)
+    }
+
     async fn read_sqlite_master_rows_in_txn(
         cx: &Cx,
         txn: &mut TransactionKind,
@@ -81580,6 +81695,63 @@ impl Connection {
         }
     }
 
+    /// bd-420r8 (GH#345): parse a stored schema `create_sql` for a memdb
+    /// reload, memoized per schema generation. A prior write can leave the row
+    /// mirror dirty so that an in-transaction rehydration (e.g. from a
+    /// subquery-`WHEN` trigger evaluated during ingestion) re-runs the full
+    /// `sqlite_master` rebuild below on every write. Re-lexing/-parsing the
+    /// entire schema text each time is the pegged-core leaf the GH#345 reporter
+    /// observed as an unbounded hang (O(rows_written × schema)). Parsing is a
+    /// pure text→AST function, so a cached clone is byte-for-byte the same AST a
+    /// fresh parse would produce; row hydration and every root-page/autoindex
+    /// validation below still run on each reload. The cache is keyed by
+    /// `schema_cookie` and dropped whenever the cookie advances, so any
+    /// CREATE/ALTER/DROP forces a fresh parse and a stale definition can never
+    /// be served.
+    fn parse_stored_schema_statement_cached(
+        &self,
+        sql: &str,
+        schema_cookie: u32,
+    ) -> Result<Statement> {
+        let cached = {
+            let cache = self.schema_reload_parse_cache.borrow();
+            if cache.0 == schema_cookie {
+                cache.1.get(sql).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(statement) = cached {
+            return Ok(statement);
+        }
+        // Cache miss (or the schema generation advanced): perform the real parse
+        // and record it, so the regression keeper can assert parses stay
+        // O(schema) rather than O(rows_written × schema).
+        let statement = parse_single_statement(sql)?;
+        self.schema_reload_parse_count
+            .set(self.schema_reload_parse_count.get().wrapping_add(1));
+        {
+            let mut cache = self.schema_reload_parse_cache.borrow_mut();
+            if cache.0 != schema_cookie {
+                cache.0 = schema_cookie;
+                cache.1.clear();
+            }
+            cache.1.insert(sql.to_owned(), statement.clone());
+        }
+        Ok(statement)
+    }
+
+    /// bd-420r8 (GH#345): number of ACTUAL stored-schema statement parses
+    /// (cache misses) the memdb reload path has performed on this connection.
+    /// Exposed for the GH#345 regression keeper, which asserts it stays
+    /// O(schema objects) across an ingestion burst instead of scaling with the
+    /// row count. Per-connection (unlike the process-global metric counters), so
+    /// it is not polluted by other tests sharing the process.
+    #[must_use]
+    pub fn schema_reload_parse_count(&self) -> u64 {
+        self.schema_reload_parse_count.get()
+    }
+
     #[allow(clippy::too_many_lines)]
     // Row hydration can evaluate column DEFAULTs, which re-enters statement
     // execution and can reach this reload again, so the future is boxed to break
@@ -81969,7 +82141,9 @@ impl Connection {
                         SqliteValue::Text(name) => name,
                         _ => unreachable!("sqlite_master binder validates trigger parents"),
                     };
-                    let Ok(mut parsed_trigger) = parse_single_statement(&create_sql) else {
+                    let Ok(mut parsed_trigger) =
+                        self.parse_stored_schema_statement_cached(&create_sql, schema_cookie)
+                    else {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "schema reload cannot reconstruct trigger `{trigger_name}`"
@@ -82031,7 +82205,7 @@ impl Connection {
                     new_original_ddl_sql
                         .insert(index_name.to_ascii_lowercase(), create_sql.to_string());
                     let Ok(Statement::CreateIndex(create_stmt)) =
-                        parse_single_statement(create_sql)
+                        self.parse_stored_schema_statement_cached(create_sql, schema_cookie)
                     else {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -82064,7 +82238,9 @@ impl Connection {
                         SqliteValue::Text(name) => name,
                         _ => unreachable!("sqlite_master binder validates view parents"),
                     };
-                    let Ok(mut parsed_view) = parse_single_statement(&create_sql) else {
+                    let Ok(mut parsed_view) =
+                        self.parse_stored_schema_statement_cached(&create_sql, schema_cookie)
+                    else {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!("schema reload cannot reconstruct view `{view_name}`"),
                         });
@@ -82135,7 +82311,9 @@ impl Connection {
                         continue;
                     }
 
-                    let columns = match parse_single_statement(&create_sql) {
+                    let parsed_vtab =
+                        self.parse_stored_schema_statement_cached(&create_sql, schema_cookie);
+                    let columns = match parsed_vtab {
                         Ok(Statement::CreateVirtualTable(create_stmt)) => {
                             parse_virtual_table_column_infos(&create_stmt.args)
                         }
@@ -82158,7 +82336,9 @@ impl Connection {
                     crate::compat_persist::validate_sqlite_master_root_page(&name, root_page_num)?;
 
                 // Parse the CREATE TABLE to extract column info.
-                let parsed_create_table = match parse_single_statement(&create_sql) {
+                let parsed_table =
+                    self.parse_stored_schema_statement_cached(&create_sql, schema_cookie);
+                let parsed_create_table = match parsed_table {
                     Ok(Statement::CreateTable(create_stmt)) => Some(create_stmt),
                     _ => None,
                 };
