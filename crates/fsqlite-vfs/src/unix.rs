@@ -410,6 +410,24 @@ const DARWIN_F_OFD_SETLK: libc::c_int = 90;
 #[cfg(target_os = "macos")]
 const DARWIN_F_OFD_GETLK: libc::c_int = 92;
 
+/// Which advisory-lock primitive [`fcntl_setlk`] actually used to satisfy a
+/// request.
+///
+/// Byte-range / OFD `fcntl` locking is the norm. On some filesystems — network
+/// mounts (AFP/SMB/NFS on Darwin) and pre-10.12 kernels — it is rejected with
+/// `EINVAL`/`ENOTSUP` and the Unix backend drops to coarse whole-file
+/// `flock(2)`. That downgrade is otherwise invisible above the VFS: acquisition
+/// returns success identically in both modes. Surfacing it (GH #343 / bd-qll76)
+/// lets a caller that requires real cross-host exclusion detect a degraded
+/// handle and refuse it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FileLockStyle {
+    /// Byte-range advisory lock: Linux `F_SETLK` or Darwin `F_OFD_SETLK`.
+    ByteRange,
+    /// Coarse whole-file `flock(2)` fallback (C SQLite's flock locking style).
+    WholeFileFlock,
+}
+
 /// Issue an `F_SETLK`-family request for `flock` on `file`.
 ///
 /// Linux keeps its proven classic per-process `F_SETLK` path (via `nix`), so
@@ -425,10 +443,11 @@ const DARWIN_F_OFD_GETLK: libc::c_int = 92;
 /// we drop to coarse whole-file `flock(2)` (C SQLite's flock locking style):
 /// correct, but it collapses the per-byte SHARED/RESERVED/PENDING/EXCLUSIVE
 /// regions to one whole-file lock, forfeiting byte-range writer concurrency.
-fn fcntl_setlk(file: &impl AsFd, flock: &libc::flock) -> nix::Result<()> {
+fn fcntl_setlk(file: &impl AsFd, flock: &libc::flock) -> nix::Result<FileLockStyle> {
     #[cfg(target_os = "linux")]
     {
-        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_SETLK(flock)).map(|_| ())
+        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_SETLK(flock))
+            .map(|_| FileLockStyle::ByteRange)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -441,7 +460,7 @@ fn fcntl_setlk(file: &impl AsFd, flock: &libc::flock) -> nix::Result<()> {
         // that outlives the call.
         let ret = unsafe { libc::fcntl(file.as_fd().as_raw_fd(), cmd, std::ptr::from_ref(flock)) };
         if ret != -1 {
-            return Ok(());
+            return Ok(FileLockStyle::ByteRange);
         }
         let err = nix::errno::Errno::last();
         // Some Darwin filesystems (AFP/SMB and other network mounts) and
@@ -450,7 +469,8 @@ fn fcntl_setlk(file: &impl AsFd, flock: &libc::flock) -> nix::Result<()> {
         // degraded locking style C SQLite uses (SQLITE_ENABLE_LOCKING_STYLE).
         // Contention still surfaces as EAGAIN, so posix_lock reports Ok(false).
         if matches!(err, nix::errno::Errno::EINVAL | nix::errno::Errno::ENOTSUP) {
-            return flock_whole_file_fallback(file, flock.l_type);
+            return flock_whole_file_fallback(file, flock.l_type)
+                .map(|()| FileLockStyle::WholeFileFlock);
         }
         Err(err)
     }
@@ -522,6 +542,22 @@ fn flock_whole_file_fallback(file: &impl AsFd, l_type: libc::c_short) -> nix::Re
 /// (`i32` on Linux, `i16` on macOS) via `Into<i32>`.
 #[allow(clippy::cast_possible_wrap)]
 fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64) -> Result<bool> {
+    posix_lock_styled(file, lock_type, start, len).map(|(acquired, _style)| acquired)
+}
+
+/// Like [`posix_lock`], but also reports which advisory-lock primitive actually
+/// satisfied the request (byte-range/OFD vs the coarse whole-file `flock(2)`
+/// fallback). The style is only meaningful when the lock was acquired; on a
+/// would-block (`Ok((false, _))`) it defaults to `ByteRange`. Used at the
+/// lock-acquisition choke points that record the degradation on the inode
+/// (GH #343 / bd-qll76).
+#[allow(clippy::cast_possible_wrap)]
+fn posix_lock_styled(
+    file: &impl AsFd,
+    lock_type: impl Into<i32>,
+    start: u64,
+    len: u64,
+) -> Result<(bool, FileLockStyle)> {
     let lock_type_i32: i32 = lock_type.into();
     #[allow(clippy::cast_possible_truncation)]
     let lock_type_short = lock_type_i32 as libc::c_short;
@@ -542,9 +578,11 @@ fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64)
 
     loop {
         match fcntl_setlk(file, &flock) {
-            Ok(()) => return Ok(true),
+            Ok(style) => return Ok((true, style)),
             Err(nix::errno::Errno::EINTR) => {}
-            Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => return Ok(false),
+            Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => {
+                return Ok((false, FileLockStyle::ByteRange));
+            }
             Err(e) => return Err(FrankenError::Io(e.into())),
         }
     }
@@ -567,14 +605,31 @@ fn posix_lock_with_timeout(
     len: u64,
     timeout: Duration,
 ) -> Result<bool> {
+    posix_lock_with_timeout_styled(file, lock_type, start, len, timeout)
+        .map(|(acquired, _style)| acquired)
+}
+
+/// Like [`posix_lock_with_timeout`], but also reports which advisory-lock
+/// primitive satisfied the request (see [`posix_lock_styled`]). The reported
+/// style is that of the acquiring attempt; on timeout (`Ok((false, _))`) it is
+/// `ByteRange`. Used by the SHARED-acquisition choke point to record a
+/// whole-file `flock(2)` downgrade on the inode (GH #343 / bd-qll76).
+fn posix_lock_with_timeout_styled(
+    file: &impl AsFd,
+    lock_type: impl Into<i32> + Copy,
+    start: u64,
+    len: u64,
+    timeout: Duration,
+) -> Result<(bool, FileLockStyle)> {
     // Fast path: no timeout configured -- fail immediately on contention.
     if timeout.is_zero() {
-        return posix_lock(file, lock_type, start, len);
+        return posix_lock_styled(file, lock_type, start, len);
     }
 
     // First attempt -- no sleeping.
-    if posix_lock(file, lock_type, start, len)? {
-        return Ok(true);
+    let first = posix_lock_styled(file, lock_type, start, len)?;
+    if first.0 {
+        return Ok(first);
     }
 
     let started = Instant::now();
@@ -584,14 +639,15 @@ fn posix_lock_with_timeout(
     loop {
         let elapsed = started.elapsed();
         let Some(remaining) = timeout.checked_sub(elapsed) else {
-            return Ok(false);
+            return Ok((false, FileLockStyle::ByteRange));
         };
 
         // Sleep for the lesser of `backoff` and the remaining budget.
         std::thread::sleep(backoff.min(remaining));
 
-        if posix_lock(file, lock_type, start, len)? {
-            return Ok(true);
+        let attempt = posix_lock_styled(file, lock_type, start, len)?;
+        if attempt.0 {
+            return Ok(attempt);
         }
 
         // Exponential backoff, capped at 100 ms.
@@ -687,6 +743,14 @@ struct InodeInfo {
     /// held by the process. These descriptors therefore remain open until the
     /// last coalesced lock claim has been released.
     deferred_close_files: Vec<Arc<File>>,
+    /// Set once byte-range/OFD `fcntl` locking on this inode was rejected and
+    /// the backend dropped to the coarse whole-file `flock(2)` fallback. This
+    /// is a permanent property of the underlying filesystem (network mounts,
+    /// pre-10.12 Darwin), so it is recorded on the shared inode state and
+    /// surfaced via [`UnixFile::locking_downgraded_to_whole_file_flock`] so a
+    /// caller can detect the silent downgrade (GH #343 / bd-qll76). Always
+    /// `false` on Linux, which never falls back.
+    flock_fallback_engaged: bool,
 }
 
 impl InodeInfo {
@@ -700,6 +764,7 @@ impl InodeInfo {
             n_transient_shared_pending: 0,
             n_exclusive: 0,
             deferred_close_files: Vec::new(),
+            flock_fallback_engaged: false,
         }
     }
 
@@ -2648,7 +2713,7 @@ impl VfsFile for UnixFile {
                     }
                 }
 
-                let shared_result = posix_lock_with_timeout(
+                let shared_result = posix_lock_with_timeout_styled(
                     &*info.file,
                     libc::F_RDLCK,
                     SHARED_FIRST,
@@ -2656,8 +2721,17 @@ impl VfsFile for UnixFile {
                     timeout,
                 );
                 match shared_result {
-                    Ok(true) => {}
-                    Ok(false) => {
+                    Ok((true, style)) => {
+                        // The SHARED lock is the first lock every connection
+                        // takes on the inode; if byte-range/OFD locking was
+                        // rejected here it is rejected for the whole inode.
+                        // Record the coarse whole-file flock(2) downgrade so it
+                        // is observable above the VFS (GH #343 / bd-qll76).
+                        if style == FileLockStyle::WholeFileFlock {
+                            info.flock_fallback_engaged = true;
+                        }
+                    }
+                    Ok((false, _)) => {
                         return Self::return_after_main_lock_failure(
                             &mut info,
                             &mut self.lock_level,
@@ -3036,6 +3110,20 @@ impl VfsFile for UnixFile {
         #[allow(clippy::cast_possible_truncation)]
         let unlocked: libc::c_short = libc::F_UNLCK as libc::c_short;
         Ok(flock.l_type != unlocked)
+    }
+
+    fn locking_downgraded_to_whole_file_flock(&self) -> bool {
+        // A permanent property of the inode's filesystem, recorded on the shared
+        // inode state when the SHARED acquisition first dropped to the coarse
+        // whole-file flock(2) fallback. Safe on a closed handle (no inode state
+        // => no lock was ever taken => false). Always false on Linux, which
+        // never falls back (GH #343 / bd-qll76).
+        self.inode_info.as_ref().is_some_and(|inode_info| {
+            inode_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .flock_fallback_engaged
+        })
     }
 
     fn shm_map(
@@ -5030,6 +5118,34 @@ mod tests {
         file.unlock(&cx, LockLevel::None).unwrap();
         assert_eq!(file.lock_level, LockLevel::None);
 
+        file.close(&cx).unwrap();
+    }
+
+    /// GH #343 / bd-qll76: on a local filesystem (Linux `F_SETLK`, Darwin
+    /// `F_OFD_SETLK`) byte-range locking succeeds, so the whole-file `flock(2)`
+    /// fallback is never taken and the handle reports no downgrade. This pins
+    /// the accessor plumbing end-to-end for the non-degraded case (the degraded
+    /// case is only reachable on a network mount that rejects OFD locks, which
+    /// no local test host can synthesize).
+    #[test]
+    fn test_local_file_reports_no_whole_file_flock_downgrade() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("flock_downgrade.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        // Before any lock, the observation conservatively reports false.
+        assert!(!file.locking_downgraded_to_whole_file_flock());
+
+        // A SHARED acquisition on a local file uses byte-range / OFD locking.
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        assert!(
+            !file.locking_downgraded_to_whole_file_flock(),
+            "local byte-range/OFD locking must not report a whole-file flock downgrade"
+        );
+
+        file.unlock(&cx, LockLevel::None).unwrap();
         file.close(&cx).unwrap();
     }
 

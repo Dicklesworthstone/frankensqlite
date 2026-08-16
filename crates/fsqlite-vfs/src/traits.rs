@@ -1098,6 +1098,30 @@ pub trait VfsFile: Send + Sync {
     /// Returns true if a RESERVED or higher lock is held by another connection.
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool>;
 
+    /// Whether this handle's byte-range / OFD advisory locking silently
+    /// degraded to a coarse whole-file `flock(2)` fallback.
+    ///
+    /// Some filesystems — network mounts (AFP/SMB/NFS on Darwin) and pre-10.12
+    /// kernels — reject byte-range / OFD `fcntl` locks with `EINVAL`/`ENOTSUP`.
+    /// The Unix backend then falls back to whole-file `flock(2)`, which is
+    /// correct where `flock` is actually enforced but forfeits byte-range
+    /// writer concurrency — and, on the network mounts where the fallback is
+    /// *selected*, may not exclude across hosts at all. The downgrade is
+    /// otherwise invisible: acquisition returns success identically in both
+    /// modes.
+    ///
+    /// This accessor lets a caller that requires real cross-host exclusion
+    /// detect the degraded handle and refuse it (or warn the user). The
+    /// observation is only meaningful after at least one lock has been acquired
+    /// on the handle; before that it conservatively reports `false`.
+    ///
+    /// Returns `false` for backends that never fall back: Linux keeps
+    /// byte-range locks, and in-memory / other custom backends do not use
+    /// `flock`. Only the Unix backend overrides this (GH #343 / bd-qll76).
+    fn locking_downgraded_to_whole_file_flock(&self) -> bool {
+        false
+    }
+
     /// Return the sector size for this file.
     ///
     /// The sector size is the minimum write granularity for the underlying
