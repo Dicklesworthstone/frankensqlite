@@ -22549,6 +22549,21 @@ impl Connection {
             {
                 return Err(FrankenError::ReadOnly);
             }
+            // bd-bld9w.3/.7: the precompiled/deferred DML fast paths below bypass
+            // the statement dispatcher's guard_mutation_encoding_supported (that
+            // guard has a single call site, in
+            // execute_statement_dispatch_with_fk_scope, which this prepared fast
+            // path does not traverse). A UTF-16 database is admitted READ-ONLY —
+            // the record-encode write path is not fully wired across every write
+            // site (bd-bld9w.7) — so a prepared mutation must fail closed here
+            // too, or a direct-simple write would serialize UTF-8 TEXT into a
+            // UTF-16 file (silent corruption). The write guard stays keyed to
+            // is_runtime_supported (Utf8 only) until the full write path lands.
+            if !self.db_text_encoding.get().is_runtime_supported()
+                && (stmt.precompiled_dml().is_some() || stmt.deferred_dml_statement().is_some())
+            {
+                return Err(FrankenError::Unsupported);
+            }
             if let Some(dispatch) = stmt.precompiled_dml() {
                 // bd-6eyrg.1: FAST PATH — precompiled DML with valid schema.
                 if hot_path_profile_enabled() {
@@ -161108,6 +161123,59 @@ mod tests {
                     assert!(
                         matches!(err, FrankenError::Unsupported),
                         "{encoding}: attached write `{write}` should be Unsupported, got {err:?}"
+                    );
+                }
+                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+            }
+        });
+    }
+
+    /// bd-bld9w.3/.7 regression: the prepared/precompiled-DML fast path
+    /// (execute_prepared_with_params_after_background_status) bypasses the
+    /// statement dispatcher's guard_mutation_encoding_supported, so a *prepared*
+    /// write on a read-only-admitted UTF-16 database must still fail closed —
+    /// otherwise a direct-simple write serializes UTF-8 TEXT into the UTF-16
+    /// file (silent corruption). `conn.query`-based keepers do not exercise this
+    /// lane; this one does.
+    #[test]
+    fn test_utf16_prepared_dml_fast_path_rejects_writes() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            for encoding in ["UTF-16le", "UTF-16be"] {
+                let db_path = dir.path().join(format!("prepared_{encoding}.db"));
+                let db_str = db_path.to_string_lossy().into_owned();
+                {
+                    let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                    sqlite
+                        .execute_batch(&format!(
+                            r#"PRAGMA encoding = '{encoding}';
+                               CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT);
+                               INSERT INTO items VALUES (1, 'café');"#
+                        ))
+                        .unwrap();
+                }
+                let original = std::fs::read(&db_path).unwrap();
+                let conn = Connection::open(&db_str)
+                    .await
+                    .expect("UTF-16 database is admitted read-only");
+
+                for sql in [
+                    "INSERT INTO items VALUES (2, 'x');",
+                    "UPDATE items SET name = 'y' WHERE id = 1;",
+                    "DELETE FROM items WHERE id = 1;",
+                ] {
+                    // Fail-closed at either prepare or execute is acceptable; the
+                    // write must never reach the on-disk image.
+                    let err = match conn.prepare(sql).await {
+                        Ok(stmt) => stmt
+                            .execute()
+                            .await
+                            .expect_err("prepared write to a UTF-16 db must fail closed"),
+                        Err(err) => err,
+                    };
+                    assert!(
+                        matches!(err, FrankenError::Unsupported),
+                        "{encoding}: prepared `{sql}` should be Unsupported, got {err:?}"
                     );
                 }
                 assert_eq!(std::fs::read(&db_path).unwrap(), original);
