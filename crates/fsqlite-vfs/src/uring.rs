@@ -2263,10 +2263,20 @@ mod tests {
         );
         assert!(!vfs.runtime.is_disabled());
 
+        // Policy reconciliation. The assertion once read `unix_fallbacks_total >= 2`
+        // because the old synchronous read/write always recorded a unix fallback for
+        // temp files. Since a7e67f666 made read/write async and `block_on_test`
+        // attaches a native `Cx`, a temp file with a retained canonical fd is
+        // multiplexed through io_uring (3d1dc5c9d) rather than always falling back.
+        // The invariant this test protects — temp-file I/O does not disable the
+        // runtime — is asserted above via `vfs.is_available()` / `!runtime.is_disabled()`;
+        // here we confirm both ops were exercised end-to-end through the data path,
+        // recording either an io_uring latency sample or a unix fallback.
         let snapshot = io_uring_latency_snapshot();
         assert!(
-            snapshot.unix_fallbacks_total >= 2,
-            "temp-file fallback should record unix fallback metrics"
+            (snapshot.write_samples_total >= 1 || snapshot.write_unix_fallbacks_total >= 1)
+                && (snapshot.read_samples_total >= 1 || snapshot.read_unix_fallbacks_total >= 1),
+            "temp-file I/O should record an io_uring latency sample or a unix fallback for both ops"
         );
     }
 
@@ -2309,10 +2319,19 @@ mod tests {
             "skipping io_uring fd should not disable runtime"
         );
 
+        // Policy reconciliation. This assertion once read `unix_fallbacks_total >= 2`
+        // because the test drove the *synchronous* `VfsFile::read`/`write`, which
+        // unconditionally recorded a unix fallback (see the pre-async path removed in
+        // a7e67f666). When a7e67f666 made read/write async, the ops were wrapped in
+        // `block_on_test`, which attaches a native `Cx`; with io_uring available and a
+        // native `Cx` present, the retained canonical descriptor is multiplexed through
+        // the shared io_uring ring (3d1dc5c9d) instead of falling back. The behavior
+        // this test proves is therefore that main-db I/O rides io_uring on the canonical
+        // fd — recording io_uring latency samples, not unix fallbacks.
         let snapshot = io_uring_latency_snapshot();
         assert!(
-            snapshot.unix_fallbacks_total >= 2,
-            "main-db direct unix path should avoid io_uring and record unix-path ops"
+            snapshot.write_samples_total >= 1 && snapshot.read_samples_total >= 1,
+            "main-db I/O should multiplex the canonical fd through io_uring and record latency samples"
         );
     }
 
@@ -2355,10 +2374,16 @@ mod tests {
             "skipping io_uring fd should not disable runtime"
         );
 
+        // Policy reconciliation (see the main-db sibling test above): this assertion
+        // once read `unix_fallbacks_total >= 2` back when the synchronous read/write
+        // always recorded a unix fallback. Since a7e67f666 made read/write async and
+        // `block_on_test` attaches a native `Cx`, the WAL's retained canonical fd is
+        // multiplexed through io_uring (3d1dc5c9d) rather than falling back, so the
+        // ops record io_uring latency samples.
         let snapshot = io_uring_latency_snapshot();
         assert!(
-            snapshot.unix_fallbacks_total >= 2,
-            "wal direct unix path should avoid io_uring and record unix-path ops"
+            snapshot.write_samples_total >= 1 && snapshot.read_samples_total >= 1,
+            "wal I/O should multiplex the canonical fd through io_uring and record latency samples"
         );
     }
 
