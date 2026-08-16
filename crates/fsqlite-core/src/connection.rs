@@ -156659,6 +156659,8 @@ mod tests {
                 SqliteValue::Integer(1),
                 SqliteValue::Text("outer".into()),
             ]),
+            old_rowid: None,
+            new_rowid: None,
         };
 
         super::bind_trigger_columns_in_statement(&mut stmt, &frame);
