@@ -123627,11 +123627,76 @@ fn fromless_comparison_metadata(left: &Expr, right: &Expr) -> (P4, u16) {
     (collation, affinity)
 }
 
+/// bd-ydi23: an IN-list element that DONATES right-hand comparison metadata. A
+/// materialized `IN (SELECT ...)` / `IN <view>` row is a `BoundOuterValue`
+/// (optionally under an explicit COLLATE wrapper) carrying the source column's
+/// affinity + collation. Ordinary literal list elements are NOT donors — SQLite
+/// treats an explicit value list as affinity-less. Mirrors the scan-context
+/// emitters' `in_list_bound_donor` in `fsqlite-vdbe`.
+fn fromless_in_list_bound_donor(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::BoundOuterValue { .. } => Some(expr),
+        Expr::Collate { expr: inner, .. }
+            if matches!(inner.as_ref(), Expr::BoundOuterValue { .. }) =>
+        {
+            Some(expr)
+        }
+        _ => None,
+    }
+}
+
+/// bd-ydi23: the declared source affinity a bound IN-list donor contributes,
+/// unwrapping an explicit COLLATE wrapper to reach the inner `BoundOuterValue`.
+fn fromless_in_donor_affinity(expr: &Expr) -> Option<TypeAffinity> {
+    match expr {
+        Expr::BoundOuterValue { affinity, .. } => *affinity,
+        Expr::Collate { expr: inner, .. } => fromless_in_donor_affinity(inner),
+        _ => None,
+    }
+}
+
+/// bd-ydi23: the inherited source collation a bound IN-list donor contributes.
+/// Mirrors `bound_outer_declared_collation` in `fsqlite-vdbe`: unwrap COLLATE
+/// wrappers to the inner `BoundOuterValue` and read its declared collation.
+fn fromless_in_donor_collation(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Collate { expr: inner, .. } => fromless_in_donor_collation(inner),
+        Expr::BoundOuterValue { collation, .. } => collation.as_name(),
+        _ => None,
+    }
+}
+
 fn fromless_in_comparison_metadata(
     operand: &Expr,
     list_expr: &Expr,
     singleton_constant: bool,
 ) -> (P4, u16) {
+    // bd-ydi23: a materialized `IN (SELECT ...)` / `IN <view>` list element is a
+    // `BoundOuterValue` carrying the source column's affinity + collation. The
+    // table-less IN emitter (`compile_expression_select` -> `emit_in_expr`)
+    // otherwise resolves comparison metadata from the LHS operand alone, dropping
+    // the donor's TEXT affinity / NOCASE collation and evaluating e.g.
+    // `1 IN view_number_metadata` (a bound '1') as 0 and
+    // `'A' IN view_collation_metadata` (a NOCASE-bound 'a') as 0. Honor the donor
+    // here, mirroring the scan-context IN-list emitters in `fsqlite-vdbe`. An
+    // explicit COLLATE on the LHS still wins; literal list elements are not
+    // donors and keep the LHS-only rules below.
+    if let Some(donor) = fromless_in_list_bound_donor(list_expr) {
+        let collation = extract_collation(operand)
+            .or_else(|| fromless_in_donor_collation(donor))
+            .map_or(P4::None, |name| P4::Collation(name.to_owned()));
+        let operand_affinity = resolve_operand_affinity(operand, &[]);
+        let combined = match fromless_in_donor_affinity(donor) {
+            // A BLOB/NONE donor affinity does not donate (matches SQLite's
+            // affinity-less comparison for such columns).
+            Some(donor_affinity) if donor_affinity != TypeAffinity::Blob => {
+                TypeAffinity::comparison_affinity(operand_affinity, donor_affinity)
+            }
+            _ => (operand_affinity != TypeAffinity::Blob).then_some(operand_affinity),
+        };
+        let affinity = combined.map_or(0, |affinity| u16::from(affinity as u8));
+        return (collation, affinity);
+    }
     let collation = if singleton_constant {
         join_comparison_collation(operand, list_expr, &[])
     } else {
