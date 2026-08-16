@@ -123278,6 +123278,25 @@ fn compile_expression_select(
     let init_target = builder.emit_label();
     builder.emit_jump_to_label(Opcode::Init, 0, 0, init_target, P4::None, 0);
 
+    // bd-kjroi: a FROM-less expression-only SELECT with a static `LIMIT 0`
+    // yields zero rows, so its projection (which may invoke user scalar
+    // functions via OP_Function/PureFunc) must never execute. LIMIT is only
+    // applied post-execution in `build_expression_postprocess`, so without a
+    // short-circuit the projection opcodes would run and invoke the functions
+    // before the row is truncated away. We still emit the projection opcodes
+    // below for bytecode parity, but jump straight to the trailing Halt at
+    // runtime so none of them execute. Collation/NEEDCOLL resolution happens
+    // independently at PREPARE time in `validate_select_collation_consumers`,
+    // so a bad `COLLATE` still errors regardless of this runtime Goto.
+    let static_limit_zero = matches!(
+        select.limit.as_ref(),
+        Some(clause) if matches!(&clause.limit, Expr::Literal(Literal::Integer(0), _))
+    );
+    let halt_target = builder.emit_label();
+    if static_limit_zero {
+        builder.emit_jump_to_label(Opcode::Goto, 0, 0, halt_target, P4::None, 0);
+    }
+
     match &select.body.select {
         SelectCore::Select {
             columns,
@@ -123470,6 +123489,7 @@ fn compile_expression_select(
         }
     }
 
+    builder.resolve_label(halt_target);
     builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     builder.resolve_label(init_target);
     builder.finish()
