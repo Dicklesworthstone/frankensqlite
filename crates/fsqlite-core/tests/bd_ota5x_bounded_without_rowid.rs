@@ -46,6 +46,9 @@ fn bounded_integrity_accepts_simple_without_rowid_tables() {
             .execute("INSERT INTO t(k, v) VALUES ('a','1'),('b','2'),('c','3');")
             .await
             .unwrap();
+        // A secondary index on the WR table exercises the WR index concordance:
+        // its entries are keyed by (v, PK columns...), not a trailing rowid.
+        builder.execute("CREATE INDEX t_v ON t(v);").await.unwrap();
         // Leading composite PK in declared order.
         builder
             .execute(
@@ -55,6 +58,10 @@ fn bounded_integrity_accepts_simple_without_rowid_tables() {
             .unwrap();
         builder
             .execute("INSERT INTO u(a, b, payload) VALUES (1,10,'x'),(2,20,'y');")
+            .await
+            .unwrap();
+        builder
+            .execute("CREATE INDEX u_payload ON u(payload);")
             .await
             .unwrap();
         builder
@@ -90,28 +97,31 @@ fn bounded_integrity_accepts_simple_without_rowid_tables() {
 }
 
 #[test]
-fn bounded_integrity_still_refuses_without_rowid_with_secondary_index() {
+fn bounded_integrity_still_refuses_without_rowid_in_fk_schema() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("wri.db").to_string_lossy().into_owned();
+        let db = dir.path().join("wrfk.db").to_string_lossy().into_owned();
         let conn = Connection::open(&db).await.unwrap();
 
+        // A WR table plus a rowid table that declares a FOREIGN KEY. WR foreign
+        // key parent/child probes (part-3) are not implemented, so the
+        // schema-support gate refuses the whole image before any structural walk.
         conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;")
             .await
             .unwrap();
-        conn.execute("CREATE INDEX t_v ON t(v);").await.unwrap();
-        conn.execute("INSERT INTO t(k, v) VALUES ('a','1');")
+        conn.execute("CREATE TABLE child(id INTEGER PRIMARY KEY, ref TEXT REFERENCES t(k));")
             .await
             .unwrap();
 
-        // The schema-support gate refuses this shape before any structural walk.
         let err = conn
             .validate_database_integrity_bounded(dir.path())
             .await
-            .expect_err("WITHOUT ROWID + secondary index is not yet bounded-validatable");
+            .expect_err(
+                "WITHOUT ROWID in a schema with foreign keys is not yet bounded-validatable",
+            );
         assert!(
-            matches!(&err, FrankenError::NotImplemented(msg) if msg.contains("secondary index")),
-            "expected a WR-secondary-index refusal, got: {err:?}"
+            matches!(&err, FrankenError::NotImplemented(msg) if msg.contains("foreign keys")),
+            "expected a WR-in-FK-schema refusal, got: {err:?}"
         );
     });
 }

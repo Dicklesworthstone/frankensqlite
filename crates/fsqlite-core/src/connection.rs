@@ -14336,7 +14336,26 @@ impl Connection {
                 rowid_alias_col_idx,
             )?
         };
-        values.push(SqliteValue::Integer(rowid));
+        // Row-locator suffix. A rowid table appends its integer rowid; a
+        // WITHOUT ROWID table's secondary index is keyed by (index terms...,
+        // PRIMARY KEY columns...) instead — mirror emit_without_rowid_index_inserts
+        // (fsqlite-vdbe codegen). The PK columns are the leading declared columns
+        // (only shape fsqlite admits), read from the schema-ordered row image.
+        if table.without_rowid {
+            for pk_position in without_rowid_pk_indices(table).map_err(codegen_error_to_franken)? {
+                let value = row_values.get(pk_position).cloned().ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "WITHOUT ROWID table `{}` row is missing primary-key column at position {pk_position}",
+                            table.name
+                        ),
+                    }
+                })?;
+                values.push(value);
+            }
+        } else {
+            values.push(SqliteValue::Integer(rowid));
+        }
         let value_bytes = values.iter().try_fold(0_usize, |total, value| {
             let bytes = match value {
                 SqliteValue::Text(value) => value.len(),
@@ -14398,6 +14417,20 @@ impl Connection {
         column_defaults: Option<&[Option<SqliteValue>]>,
         counters: &mut BoundedValidationCounters,
     ) -> Result<()> {
+        if table.without_rowid {
+            return self
+                .bounded_validate_without_rowid_index_concordance(
+                    cx,
+                    txn,
+                    table,
+                    index,
+                    page_size,
+                    reserved_per_page,
+                    column_defaults,
+                    counters,
+                )
+                .await;
+        }
         let spec = Self::bounded_index_spec(table, index)?;
         let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
         let index_root = page_number_from_schema_root(index.root_page, &index.name, "index")?;
@@ -14560,6 +14593,221 @@ impl Connection {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "index `{}` contains {actual_count} entries but table `{}` requires exactly {expected_count}",
+                    index.name, table.name
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// bd-r7ytr (ota5x part-2): index concordance for a WITHOUT ROWID table.
+    /// The table root is an index b-tree keyed by the PK, so it is walked as an
+    /// index cursor (not a rowid table cursor), and every secondary-index entry
+    /// is keyed by `(index terms..., PRIMARY KEY columns...)` rather than a
+    /// trailing integer rowid. The forward walk holds a cursor over `txn`, so
+    /// the expected keys are collected first and probed after that cursor is
+    /// dropped (a second live cursor over the same `txn` is not allowed).
+    #[allow(clippy::too_many_arguments)]
+    async fn bounded_validate_without_rowid_index_concordance<T: TransactionHandle + ?Sized>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        table: &TableSchema,
+        index: &IndexSchema,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        column_defaults: Option<&[Option<SqliteValue>]>,
+        counters: &mut BoundedValidationCounters,
+    ) -> Result<()> {
+        let spec = Self::bounded_index_spec(table, index)?;
+        let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
+        let index_root = page_number_from_schema_root(index.root_page, &index.name, "index")?;
+        let descending = (0..index.key_term_count())
+            .map(|position| index.key_term_descending(position))
+            .collect::<Vec<_>>();
+        let collations = (0..index.key_term_count())
+            .map(|position| index.key_term_collation(position).map(str::to_owned))
+            .collect::<Vec<_>>();
+        let pk_count = without_rowid_pk_indices(table)
+            .map_err(codegen_error_to_franken)?
+            .len();
+
+        // Phase 1: walk the WR table's index b-tree (no rowid) and collect the
+        // expected secondary-index key for every row that satisfies the
+        // (partial) index. `bounded_index_key` appends the PK columns as the
+        // row locator for a WITHOUT ROWID table.
+        let mut expected_keys: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut walk = Self::new_header_btree_cursor(
+                txn,
+                table_root,
+                page_size,
+                reserved_per_page,
+                false,
+            );
+            let mut position = 0_i64;
+            if walk.first(cx).await? {
+                loop {
+                    position = position.checked_add(1).ok_or(FrankenError::TooBig)?;
+                    let payload = walk.payload(cx).await?;
+                    let payload_values =
+                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "WITHOUT ROWID table `{}` row {position} payload is not a valid SQLite record",
+                                table.name
+                            ),
+                        })?;
+                    let row_values = Self::inflate_table_row_values_for_integrity(
+                        table,
+                        position,
+                        &payload_values,
+                        None,
+                        column_defaults,
+                    )?;
+                    counters.table_rows_checked = counters
+                        .table_rows_checked
+                        .checked_add(1)
+                        .ok_or(FrankenError::TooBig)?;
+                    if Self::row_matches_partial_index_for_integrity(
+                        table,
+                        spec.predicate.as_ref(),
+                        position,
+                        &row_values,
+                        None,
+                    )? {
+                        expected_keys.push(self.bounded_index_key(
+                            table,
+                            index,
+                            &spec,
+                            position,
+                            &row_values,
+                            None,
+                        )?);
+                    }
+                    if !walk.next(cx).await? {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: every expected key must be present byte-exact in the index.
+        let mut expected_count = 0_u64;
+        for expected in &expected_keys {
+            let mut cursor = Self::new_header_btree_index_cursor(
+                txn,
+                index_root,
+                page_size,
+                reserved_per_page,
+                descending.clone(),
+                collations.clone(),
+                Arc::clone(&self.collation_registry),
+            );
+            let found = cursor.index_move_to(cx, expected).await?;
+            counters.index_point_probes = counters
+                .index_point_probes
+                .checked_add(1)
+                .ok_or(FrankenError::TooBig)?;
+            if !found.is_found() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "a row of WITHOUT ROWID table `{}` is missing from index `{}`",
+                        table.name, index.name
+                    ),
+                });
+            }
+            let actual = cursor.payload(cx).await?;
+            if actual.as_slice() != expected.as_slice() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "index `{}` entry for WITHOUT ROWID table `{}` is not byte-exact",
+                        index.name, table.name
+                    ),
+                });
+            }
+            expected_count = expected_count.checked_add(1).ok_or(FrankenError::TooBig)?;
+        }
+
+        // Reverse scan: validate each index entry's shape (key terms + PK
+        // columns, not a trailing integer rowid), collation/direction order, and
+        // uniqueness, and require exactly `expected_count` entries.
+        let expected_entry_len = index.key_term_count().saturating_add(pk_count);
+        let mut actual_count = 0_u64;
+        let mut cursor = Self::new_header_btree_index_cursor(
+            txn,
+            index_root,
+            page_size,
+            reserved_per_page,
+            descending,
+            collations,
+            Arc::clone(&self.collation_registry),
+        );
+        let mut previous_payload: Option<Vec<u8>> = None;
+        let mut previous_values: Option<Vec<SqliteValue>> = None;
+        if cursor.first(cx).await? {
+            loop {
+                let payload = cursor.payload(cx).await?;
+                if payload.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "index `{}` entry exceeds the fixed record bound",
+                        index.name
+                    )));
+                }
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("index `{}` contains an invalid record", index.name),
+                    })?;
+                if values.len() != expected_entry_len {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "index `{}` entry does not contain exactly {} key term(s) plus {} primary-key column(s)",
+                            index.name,
+                            index.key_term_count(),
+                            pk_count
+                        ),
+                    });
+                }
+                if let (Some(previous_payload), Some(previous_values)) =
+                    (previous_payload.as_ref(), previous_values.as_ref())
+                {
+                    let ordering = self
+                        .compare_index_key_values_for_integrity(index, previous_values, &values)
+                        .unwrap_or_else(|| previous_payload.as_slice().cmp(payload.as_slice()));
+                    if ordering != std::cmp::Ordering::Less {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` entries are duplicate or out of declared collation/direction order",
+                                index.name
+                            ),
+                        });
+                    }
+                    if index.is_unique
+                        && self.bounded_unique_terms_equal(index, previous_values, &values)
+                    {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "UNIQUE index `{}` contains duplicate non-NULL logical keys",
+                                index.name
+                            ),
+                        });
+                    }
+                }
+                previous_payload = Some(payload);
+                previous_values = Some(values);
+                actual_count = actual_count.checked_add(1).ok_or(FrankenError::TooBig)?;
+                counters.index_entries_checked = counters
+                    .index_entries_checked
+                    .checked_add(1)
+                    .ok_or(FrankenError::TooBig)?;
+                if !cursor.next(cx).await? {
+                    break;
+                }
+            }
+        }
+        if actual_count != expected_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "index `{}` contains {actual_count} entries but WITHOUT ROWID table `{}` requires exactly {expected_count}",
                     index.name, table.name
                 ),
             });
@@ -15265,23 +15513,17 @@ impl Connection {
         let original_ddl = self.original_ddl_sql.borrow().clone();
         for table in &schema {
             if table.without_rowid {
-                // bd-ota5x: bounded validation walks a WITHOUT ROWID table's
-                // index b-tree directly (bounded_validate_table_rows has a WR
-                // branch). fsqlite only admits a WR table whose PRIMARY KEY is
-                // exactly the leading declared columns, so the stored record is
-                // in declared column order == schema order — no reorder needed.
-                // What is NOT yet handled: a WR table's SECONDARY indexes (index
-                // concordance probes by rowid, but a WR index is keyed by the
-                // PK) and FOREIGN KEYS (parent/child probes resolve rows by
-                // rowid). Refuse those shapes rather than mis-validate them — a
-                // WR table carrying a secondary index, or any schema that
-                // declares a foreign key anywhere.
-                if !table.indexes.is_empty() {
-                    return Err(Self::bounded_validation_refusal(format!(
-                        "WITHOUT ROWID table `{}` with a secondary index",
-                        table.name
-                    )));
-                }
+                // bd-ota5x/bd-r7ytr: bounded validation walks a WITHOUT ROWID
+                // table's index b-tree directly — both its rows
+                // (bounded_validate_table_rows WR branch) and its secondary-index
+                // concordance (bounded_validate_without_rowid_index_concordance,
+                // whose entries are keyed by the PK locator). fsqlite only admits
+                // a WR table whose PRIMARY KEY is exactly the leading declared
+                // columns, so the stored record is in declared == schema order —
+                // no reorder needed. What is NOT yet handled: FOREIGN KEYS, whose
+                // bounded parent/child probes resolve rows by rowid. Refuse a WR
+                // table in any schema that declares a foreign key rather than
+                // mis-validate it.
                 if schema
                     .iter()
                     .any(|candidate| !candidate.foreign_keys.is_empty())
