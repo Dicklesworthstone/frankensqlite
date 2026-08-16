@@ -143,7 +143,7 @@ use fsqlite_types::record::{
     parse_record_into_with_encoding, parse_record_projected_column_offsets, record_profile_enabled,
     record_profile_snapshot,
     reset_record_profile, serialize_record, serialize_record_iter_into,
-    serialize_record_iter_with_precomputed_header_into,
+    serialize_record_iter_with_precomputed_header_into, serialize_record_with_encoding,
     try_build_runtime_precomputed_record_header,
 };
 use fsqlite_types::serial_type::{
@@ -50260,13 +50260,21 @@ impl Connection {
                 chosen
             };
 
-            let record = serialize_record(&[
-                SqliteValue::Text(type_.into()),
-                SqliteValue::Text(name.into()),
-                SqliteValue::Text(tbl_name.into()),
-                SqliteValue::Integer(i64::from(rootpage)),
-                sql.map_or(SqliteValue::Null, |s| SqliteValue::Text(s.into())),
-            ]);
+            // bd-bld9w.7: encode sqlite_master TEXT columns in the database
+            // text encoding (UTF-16LE/BE) so a UTF-16 database's schema row is
+            // byte-correct. Byte-identical to serialize_record for UTF-8; inert
+            // until the write-admission guard lifts (writes to a non-UTF-8 db
+            // are still rejected).
+            let record = serialize_record_with_encoding(
+                &[
+                    SqliteValue::Text(type_.into()),
+                    SqliteValue::Text(name.into()),
+                    SqliteValue::Text(tbl_name.into()),
+                    SqliteValue::Integer(i64::from(rootpage)),
+                    sql.map_or(SqliteValue::Null, |s| SqliteValue::Text(s.into())),
+                ],
+                self.db_text_encoding.get(),
+            );
             cursor.table_insert(cx, rowid, &record).await
         })
         .await?;
@@ -50397,7 +50405,9 @@ impl Connection {
                 chosen
             };
 
-            let record = serialize_record(&row);
+            // bd-bld9w.7: encode raw sqlite_master row TEXT in the DB encoding
+            // (byte-identical for UTF-8; inert until write-admission lifts).
+            let record = serialize_record_with_encoding(&row, self.db_text_encoding.get());
             cursor.table_insert(cx, rowid, &record).await
         })
         .await?;
@@ -50451,7 +50461,10 @@ impl Connection {
                         });
                     }
                     cursor.delete(cx).await?;
-                    let record = serialize_record(&updated);
+                    // bd-bld9w.7: encode updated sqlite_master TEXT in the DB
+                    // encoding (byte-identical for UTF-8; inert until lift).
+                    let record =
+                        serialize_record_with_encoding(&updated, self.db_text_encoding.get());
                     cursor.table_insert(cx, rowid, &record).await?;
                     cache_updates.push((old, updated));
                 }
@@ -50814,7 +50827,10 @@ impl Connection {
                         updated.resize(5, SqliteValue::Null);
                     }
                     updated[4] = SqliteValue::Text(new_sql.into());
-                    let record = serialize_record(&updated);
+                    // bd-bld9w.7: encode in the DB text encoding (byte-identical
+                    // for UTF-8; inert until write-admission lifts).
+                    let record =
+                        serialize_record_with_encoding(&updated, self.db_text_encoding.get());
 
                     cursor.delete(cx).await?;
                     cursor.table_insert(cx, original_rowid, &record).await?;
@@ -50873,7 +50889,10 @@ impl Connection {
                     updated[2] = SqliteValue::Text(new_tbl_name.into());
                     updated[4] =
                         new_sql.map_or(SqliteValue::Null, |sql| SqliteValue::Text(sql.into()));
-                    let record = serialize_record(&updated);
+                    // bd-bld9w.7: encode in the DB text encoding (byte-identical
+                    // for UTF-8; inert until write-admission lifts).
+                    let record =
+                        serialize_record_with_encoding(&updated, self.db_text_encoding.get());
 
                     cursor.delete(cx).await?;
                     cursor.table_insert(cx, original_rowid, &record).await?;
@@ -50935,7 +50954,10 @@ impl Connection {
                     updated[1] = SqliteValue::Text(new_name.into());
                     updated[2] = SqliteValue::Text(new_tbl_name.into());
                     updated[4] = SqliteValue::Text(new_sql.into());
-                    let record = serialize_record(&updated);
+                    // bd-bld9w.7: encode in the DB text encoding (byte-identical
+                    // for UTF-8; inert until write-admission lifts).
+                    let record =
+                        serialize_record_with_encoding(&updated, self.db_text_encoding.get());
 
                     cursor.delete(cx).await?;
                     cursor.table_insert(cx, rowid, &record).await?;
