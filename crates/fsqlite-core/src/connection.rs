@@ -81450,7 +81450,24 @@ impl Connection {
         hydrate_rows: bool,
     ) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
-        let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
+        // A reverted-to-empty page 1 surfaces as an invalid-header-magic
+        // corruption error from `begin`'s committed-state refresh; treat that
+        // empty-database signature as an empty reset on the prebound
+        // publication's sequence rather than propagating it as corruption.
+        // (See `reload_memdb_from_pager_with_mode` for the full rationale.)
+        let mut txn = match self.pager.begin(cx, TransactionMode::ReadOnly).await {
+            Ok(txn) => txn,
+            Err(error) if Self::is_uninitialized_page_one_header_error(&error) => {
+                self.publish_empty_database_reset(
+                    cx,
+                    publication.snapshot.visible_commit_seq,
+                    hydrate_rows,
+                );
+                self.publish_committed_schema_cookie(self.schema_cookie());
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
             let _ = txn.rollback(cx).await;
             return Err(FrankenError::Internal(
@@ -81498,7 +81515,27 @@ impl Connection {
         let bound_publication = self.bind_pager_publication(cx, "memdb_reload").await?;
 
         // Open a read transaction to see the committed state.
-        let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
+        //
+        // A reverted-to-empty page 1 (e.g. rollback of the first table
+        // creation, or an explicit whole-database wipe) leaves the page-1
+        // header magic invalid, which the pager surfaces as a corruption error
+        // from `begin`'s committed-state refresh before any read transaction
+        // exists. That is the empty-database signature, not durable corruption
+        // (durable bad-magic files are rejected at open), so publish the
+        // empty reset directly on the bound publication's visibility sequence.
+        let mut txn = match self.pager.begin(cx, TransactionMode::ReadOnly).await {
+            Ok(txn) => txn,
+            Err(error) if Self::is_uninitialized_page_one_header_error(&error) => {
+                self.publish_empty_database_reset(
+                    cx,
+                    bound_publication.snapshot.visible_commit_seq,
+                    hydrate_rows,
+                );
+                self.publish_committed_schema_cookie(self.schema_cookie());
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
             let _ = txn.rollback(cx).await;
             return Err(FrankenError::Internal(
@@ -82361,6 +82398,114 @@ impl Connection {
             .set(self.memdb_row_hydration_count.get().wrapping_add(1));
     }
 
+    /// Publish the empty-database reset used when a reload observes an
+    /// uninitialized (zeroed) page 1: no user schema, so every schema/registry/
+    /// identity/visibility field is reset to its fresh-database value.
+    ///
+    /// Extracted from `reload_memdb_from_txn_with_mode` so the pager-backed
+    /// reload entrypoints can reuse it when `SimplePager::begin` rejects a
+    /// zeroed page-1 header as invalid magic before a read transaction can be
+    /// opened. A deliberately zeroed page 1 is the empty-database
+    /// representation (e.g. a rollback that reverts the first table creation, or
+    /// an explicit whole-database wipe), not durable corruption — durable
+    /// bad-magic files are rejected at open, so they never reach a reload on a
+    /// live connection. Consistent with the just-landed no-hydrator custom-vtab
+    /// preservation on the full-reload path: an empty schema matches no DDL
+    /// identity, so no live instance is preserved — all are dropped.
+    ///
+    /// Reset state is derived entirely from connection-local fields plus the
+    /// supplied visibility sequence, so no transaction is required; `cx` is only
+    /// forwarded to the displaced-vtab destructors. All work below is
+    /// synchronous (no `.await`), which is what lets the begin-error path invoke
+    /// it without an open transaction.
+    fn publish_empty_database_reset(
+        &self,
+        cx: &Cx,
+        bound_visible_commit_seq: CommitSeq,
+        hydrate_rows: bool,
+    ) {
+        let force_full_schema_reload = self.force_full_schema_reload_once.get();
+        // bd-wjrs0: capture connection-local TEMP tables before the reset so
+        // they (and their rows) survive — they are never in sqlite_master.
+        let captured_temp_tables = self.snapshot_temp_tables();
+        *self.db.borrow_mut() = MemDatabase::new();
+        self.schema.borrow_mut().clear();
+        self.views.borrow_mut().retain(|view| view.temporary);
+        // Preserve TEMP triggers even when the database is empty — they are
+        // connection-local and must survive memdb reloads.
+        self.triggers.borrow_mut().retain(|t| t.temporary);
+        // bd-wjrs0: re-insert TEMP tables (the empty main DB has no main
+        // tables to shadow, so this only restores the TEMP entries + rows).
+        {
+            let mut new_schema = self.schema.borrow_mut();
+            let mut new_db = self.db.borrow_mut();
+            self.restore_temp_tables_into(&mut new_schema, &mut new_db, captured_temp_tables);
+        }
+        self.rebuild_schema_indices();
+        self.rowid_alias_columns.borrow_mut().clear();
+        self.autoincrement_tables.borrow_mut().clear();
+        self.sqlite_sequence_cache.borrow_mut().clear();
+        self.original_ddl_sql.borrow_mut().clear();
+        let displaced_live_vtabs = {
+            let mut registry = self.vtab_instances.borrow_mut();
+            std::mem::take(&mut *registry)
+        };
+        let displaced_dropped_live_vtabs = {
+            let mut registry = self.dropped_vtab_instances.borrow_mut();
+            std::mem::take(&mut *registry)
+        };
+        self.live_vtab_transactions.borrow_mut().clear();
+        self.live_vtab_registry_undo.borrow_mut().clear();
+        self.live_vtab_failed_begin_cleanup.borrow_mut().clear();
+        *self.next_master_rowid.borrow_mut() = 1;
+        *self.schema_cookie.borrow_mut() = 0;
+        self.schema_generation
+            .set(self.schema_generation.get().wrapping_add(1));
+        *self.change_counter.borrow_mut() = 0;
+        // bd-#70 wedge extension: raise the finalized commit clock floor.
+        self.set_memdb_visible_commit_seq_from_publication(bound_visible_commit_seq);
+        self.memdb_rows_loaded.set(hydrate_rows);
+        self.memdb_requires_active_txn_reload.set(false);
+        self.memdb_storage_count_shortcuts_safe.set(hydrate_rows);
+        self.clear_pending_local_live_vtab_preservation();
+        if force_full_schema_reload {
+            self.force_full_schema_reload_once.set(false);
+        }
+        // User vtab callbacks and destructors may re-enter this
+        // connection. Disconnect them only after the empty schema,
+        // registries, identity, and visibility state have all been
+        // published. A staged DROP still present during recovery is
+        // not known durable, so it is disconnected rather than
+        // destroying backing storage.
+        self.cleanup_live_vtab_instances_best_effort(
+            cx,
+            displaced_live_vtabs,
+            LiveVtabCleanupAction::Disconnect,
+            "empty schema reload displacement",
+        );
+        self.cleanup_live_vtab_instances_best_effort(
+            cx,
+            displaced_dropped_live_vtabs,
+            LiveVtabCleanupAction::Disconnect,
+            "empty schema reload staged-drop displacement",
+        );
+    }
+
+    /// True for the `SimplePager::begin` refresh error raised when page 1's
+    /// header magic does not validate — the observable signature of a zeroed
+    /// (empty-database) page 1 that the reload must treat as an empty reset
+    /// rather than propagating as corruption. Durable bad-magic files are
+    /// rejected at open, so on a live connection this only occurs after the
+    /// connection itself reverts/zeros page 1.
+    fn is_uninitialized_page_one_header_error(error: &FrankenError) -> bool {
+        matches!(
+            error,
+            FrankenError::DatabaseCorrupt { detail }
+                if detail.contains("invalid database header")
+                    && detail.contains("magic")
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     // Row hydration can evaluate column DEFAULTs, which re-enters statement
     // execution and can reach this reload again, so the future is boxed to break
@@ -82398,74 +82543,10 @@ impl Connection {
             // If page 1 is all zeros or doesn't have a valid B-tree header, the
             // database is empty. Reset to a fresh state.
             if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < 100 {
-                // bd-wjrs0: capture connection-local TEMP tables before the reset so
-                // they (and their rows) survive — they are never in sqlite_master.
-                let captured_temp_tables = self.snapshot_temp_tables();
-                *self.db.borrow_mut() = MemDatabase::new();
-                self.schema.borrow_mut().clear();
-                self.views.borrow_mut().retain(|view| view.temporary);
-                // Preserve TEMP triggers even when the database is empty — they are
-                // connection-local and must survive memdb reloads.
-                self.triggers.borrow_mut().retain(|t| t.temporary);
-                // bd-wjrs0: re-insert TEMP tables (the empty main DB has no main
-                // tables to shadow, so this only restores the TEMP entries + rows).
-                {
-                    let mut new_schema = self.schema.borrow_mut();
-                    let mut new_db = self.db.borrow_mut();
-                    self.restore_temp_tables_into(
-                        &mut new_schema,
-                        &mut new_db,
-                        captured_temp_tables,
-                    );
-                }
-                self.rebuild_schema_indices();
-                self.rowid_alias_columns.borrow_mut().clear();
-                self.autoincrement_tables.borrow_mut().clear();
-                self.sqlite_sequence_cache.borrow_mut().clear();
-                self.original_ddl_sql.borrow_mut().clear();
-                let displaced_live_vtabs = {
-                    let mut registry = self.vtab_instances.borrow_mut();
-                    std::mem::take(&mut *registry)
-                };
-                let displaced_dropped_live_vtabs = {
-                    let mut registry = self.dropped_vtab_instances.borrow_mut();
-                    std::mem::take(&mut *registry)
-                };
-                self.live_vtab_transactions.borrow_mut().clear();
-                self.live_vtab_registry_undo.borrow_mut().clear();
-                self.live_vtab_failed_begin_cleanup.borrow_mut().clear();
-                *self.next_master_rowid.borrow_mut() = 1;
-                *self.schema_cookie.borrow_mut() = 0;
-                self.schema_generation
-                    .set(self.schema_generation.get().wrapping_add(1));
-                *self.change_counter.borrow_mut() = 0;
-                // bd-#70 wedge extension: raise the finalized commit clock floor.
-                self.set_memdb_visible_commit_seq_from_publication(bound_visible_commit_seq);
-                self.memdb_rows_loaded.set(hydrate_rows);
-                self.memdb_requires_active_txn_reload.set(false);
-                self.memdb_storage_count_shortcuts_safe.set(hydrate_rows);
-                self.clear_pending_local_live_vtab_preservation();
-                if force_full_schema_reload {
-                    self.force_full_schema_reload_once.set(false);
-                }
-                // User vtab callbacks and destructors may re-enter this
-                // connection. Disconnect them only after the empty schema,
-                // registries, identity, and visibility state have all been
-                // published. A staged DROP still present during recovery is
-                // not known durable, so it is disconnected rather than
-                // destroying backing storage.
-                self.cleanup_live_vtab_instances_best_effort(
-                    cx,
-                    displaced_live_vtabs,
-                    LiveVtabCleanupAction::Disconnect,
-                    "empty schema reload displacement",
-                );
-                self.cleanup_live_vtab_instances_best_effort(
-                    cx,
-                    displaced_dropped_live_vtabs,
-                    LiveVtabCleanupAction::Disconnect,
-                    "empty schema reload staged-drop displacement",
-                );
+                // The empty reset consumes `force_full_schema_reload_once`
+                // itself; the local `force_full_schema_reload` copy read above
+                // stays valid for the full-rebuild path below.
+                self.publish_empty_database_reset(cx, bound_visible_commit_seq, hydrate_rows);
                 return Ok(());
             }
 
@@ -119281,6 +119362,7 @@ impl<'a> SelectStructureResolver<'a> {
         let is_aggregate_query = match &select.body.select {
             SelectCore::Select {
                 columns,
+                from,
                 group_by,
                 having,
                 ..
@@ -119293,6 +119375,20 @@ impl<'a> SelectStructureResolver<'a> {
                         }
                         ResultColumn::Star | ResultColumn::TableStar(_) => false,
                     })
+                    // A FROM-less SELECT whose only aggregate sits in ORDER BY is
+                    // still an aggregate query in SQLite: the aggregate collapses
+                    // the implicit single row, so `SELECT (SELECT 1) ORDER BY
+                    // count(*)` is valid and returns one row, not a misuse. The
+                    // FROM-less evaluator (execute_expression_only_with_subqueries)
+                    // resolves such an ORDER BY aggregate correctly, so admit it
+                    // here instead of failing closed. The FROM-full lane still
+                    // fails closed below because it does not yet collapse the scan
+                    // to the aggregate's single group.
+                    || (from.is_none()
+                        && select.order_by.iter().any(|term| {
+                            self.connection
+                                .expr_contains_aggregate_with_registry(&term.expr)
+                        }))
             }
             SelectCore::Values(_) => false,
         };
