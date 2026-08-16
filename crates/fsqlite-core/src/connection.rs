@@ -32479,11 +32479,14 @@ impl Connection {
             }
             let execution_started = (statement_reuse_enabled || compat_trace_profile_enabled)
                 .then(fsqlite_types::sync_primitives::Instant::now);
-            let derived_storage_log_select = match statement {
+            // bd-7mnz8 Phase 1: box the owned SELECT clone so only a pointer
+            // (not a full `SelectStatement`) lives on this frame across the
+            // recursive trigger-dispatch await below.
+            let derived_storage_log_select: Option<Box<SelectStatement>> = match statement {
                 Statement::Select(select)
                     if flatten_simple_from_subquery_select(select).is_some() =>
                 {
-                    Some(select.clone())
+                    Some(Box::new(select.clone()))
                 }
                 _ => None,
             };
@@ -32669,31 +32672,39 @@ impl Connection {
             let rollback_on_constraint_violation =
                 statement_rolls_back_transaction_on_constraint(statement.as_ref());
             let execute_body_start = hot_path_profile_enabled().then(Instant::now);
+            // bd-7mnz8 Phase 1: heap-indirect the recursive trigger-dispatch
+            // future. `execute_statement_dispatch_with_fk_scope` is a plain
+            // `async fn` whose future (carrying the giant dispatch state
+            // machine) would otherwise be materialized inline on this frame,
+            // dominating the per-level native stack cost. `Box::pin` moves that
+            // state to the heap so only a pointer sits on the recursive frame.
+            // This is NOT the previously-reverted box at the already-boxed
+            // `execute_statement` edge; this boxes a distinct, un-boxed future.
             let result = if use_statement_savepoint {
                 self.with_internal_statement_savepoint_and_cx(
                     &op_cx,
                     statement_kind,
                     statement_preserves_prior_changes_on_constraint(statement.as_ref()),
                     async || {
-                        self.execute_statement_dispatch_with_fk_scope(
+                        Box::pin(self.execute_statement_dispatch_with_fk_scope(
                             &op_cx,
                             statement.as_ref(),
                             params,
                             precompiled,
-                            derived_storage_log_select.as_ref(),
-                        )
+                            derived_storage_log_select.as_deref(),
+                        ))
                         .await
                     },
                 )
                 .await
             } else {
-                self.execute_statement_dispatch_with_fk_scope(
+                Box::pin(self.execute_statement_dispatch_with_fk_scope(
                     &op_cx,
                     statement.as_ref(),
                     params,
                     precompiled,
-                    derived_storage_log_select.as_ref(),
-                )
+                    derived_storage_log_select.as_deref(),
+                ))
                 .await
             };
             record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
