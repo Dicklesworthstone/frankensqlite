@@ -83332,13 +83332,22 @@ impl Connection {
                                 && existing_live_vtabs.contains_key(key)
                         }),
                 );
-                let isolated_memory_fallback_keys = if self.pager.is_memory() {
-                    // A custom materialized vtab may have no persisted-row
-                    // hydrator. On an isolated :memory: pager there is no peer
-                    // writer to make its in-process object stale. Record exact
-                    // SQL-identity candidates now, but let supported FTS/RTree
-                    // hydrators rebuild first; only truly unsupported keys may
-                    // fall back to their old object below.
+                // A custom materialized vtab may have no persisted-row hydrator,
+                // so its rows live only inside the in-process instance rather
+                // than in the pager. Rebuilding such a table from disk would
+                // silently discard those rows, and dropping it entirely (the
+                // former file-backed behavior) loses the connection's own live
+                // table across an unrelated reload — e.g. an autocommit
+                // `CREATE VIRTUAL TABLE` followed by opening a transaction.
+                // Record exact SQL-identity candidates now, restricted to
+                // instances THIS connection already holds; supported FTS/RTree
+                // hydrators still rebuild first (the `!reloaded.contains_key`
+                // filter below), so only truly unsupported keys fall back to
+                // their old object. This is safe on a file-backed pager too: a
+                // no-hydrator vtab persists nothing, so no peer writer can make
+                // the in-process object stale, and the DDL-identity guard forces
+                // a rebuild if the definition changed.
+                let no_hydrator_fallback_keys = {
                     let original_ddl_sql = self.original_ddl_sql.borrow();
                     pending_materialized_live_vtabs
                         .iter()
@@ -83351,8 +83360,6 @@ impl Connection {
                             .then_some(key)
                         })
                         .collect::<HashSet<_>>()
-                } else {
-                    HashSet::new()
                 };
                 drop(existing_live_vtabs);
                 let mut reloaded = self
@@ -83381,7 +83388,7 @@ impl Connection {
                     .await?;
                 reloaded.merge(rootpage_zero_live_vtabs)?;
                 preserved_live_vtab_keys.extend(
-                    isolated_memory_fallback_keys
+                    no_hydrator_fallback_keys
                         .into_iter()
                         .filter(|key| !reloaded.contains_key(key)),
                 );
