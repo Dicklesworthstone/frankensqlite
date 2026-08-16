@@ -190,19 +190,15 @@ fn bd_76k72_experiment_nonpk_integer_inner() {
         conn.execute("CREATE TABLE meta (mid INTEGER, idx INTEGER)")
             .await
             .unwrap();
-        conn.execute(
-            "CREATE VIRTUAL TABLE fts_m USING fts5(content, message_id)",
-        )
-        .await
-        .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE fts_m USING fts5(content, message_id)")
+            .await
+            .unwrap();
         conn.execute("INSERT INTO meta(mid, idx) VALUES (7, 2)")
             .await
             .unwrap();
-        conn.execute(
-            "INSERT INTO fts_m(rowid, content, message_id) VALUES (1, 'auth token', 7)",
-        )
-        .await
-        .unwrap();
+        conn.execute("INSERT INTO fts_m(rowid, content, message_id) VALUES (1, 'auth token', 7)")
+            .await
+            .unwrap();
 
         let e4 = conn
             .query(

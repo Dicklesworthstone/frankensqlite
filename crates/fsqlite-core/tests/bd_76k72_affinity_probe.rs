@@ -21,7 +21,9 @@ fn probe_plain_text_int_pk_affinity_where_and_join() {
             .await
             .unwrap();
         conn.execute("CREATE TABLE child(txt TEXT);").await.unwrap();
-        conn.execute("INSERT INTO child VALUES ('7');").await.unwrap();
+        conn.execute("INSERT INTO child VALUES ('7');")
+            .await
+            .unwrap();
 
         let where_rows = conn
             .query("SELECT v FROM parent WHERE id = '7';")
@@ -36,7 +38,9 @@ fn probe_plain_text_int_pk_affinity_where_and_join() {
         );
 
         let left = conn
-            .query("SELECT child.txt, parent.v FROM child LEFT JOIN parent ON child.txt = parent.id;")
+            .query(
+                "SELECT child.txt, parent.v FROM child LEFT JOIN parent ON child.txt = parent.id;",
+            )
             .await
             .unwrap();
         eprintln!(
@@ -50,11 +54,18 @@ fn probe_plain_text_int_pk_affinity_where_and_join() {
             .unwrap();
         eprintln!(
             "PROBE INNER JOIN txt=id (expect [(\"7\",\"seven\")]): {:?}",
-            inner.iter().map(|r| r.values().to_vec()).collect::<Vec<_>>()
+            inner
+                .iter()
+                .map(|r| r.values().to_vec())
+                .collect::<Vec<_>>()
         );
 
         // Stock-parity assertions.
-        assert_eq!(where_rows.len(), 1, "WHERE id='7' must match via numeric affinity");
+        assert_eq!(
+            where_rows.len(),
+            1,
+            "WHERE id='7' must match via numeric affinity"
+        );
         assert_eq!(where_rows[0].values()[0], SqliteValue::Text("seven".into()));
         assert_eq!(left.len(), 1);
         assert_eq!(
@@ -62,6 +73,10 @@ fn probe_plain_text_int_pk_affinity_where_and_join() {
             Some(&SqliteValue::Text("seven".into())),
             "LEFT JOIN text=int-PK must match via affinity"
         );
-        assert_eq!(inner.len(), 1, "INNER JOIN text=int-PK must match via affinity");
+        assert_eq!(
+            inner.len(),
+            1,
+            "INNER JOIN text=int-PK must match via affinity"
+        );
     });
 }
