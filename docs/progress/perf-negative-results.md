@@ -48,6 +48,32 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-17 - DEFERRED (no A/B data): Row values SmallVec-backed to kill the per-row Row Vec malloc (bd-el6ax, bd-rr46j companion)
+
+- Lever: make `Row { values: Vec<SqliteValue> }` (connection.rs:5372) a
+  `SmallVec<[SqliteValue; N]>` so narrow rows store columns inline (no per-row
+  Row-Vec malloc). Deferred WITHOUT an A/B verdict — recorded so it is not
+  naively re-attempted.
+- CRUX finding (why it is not a clean swap): `Row { values: some_vec.into() }`
+  keeps the heap Vec **spilled** — `SmallVec::from_vec` never inlines an existing
+  heap buffer — so a type-swap + `.into()` at the construction sites saves ZERO
+  mallocs. Realizing the win requires the HOT per-row result construction (the
+  VDBE->core result bridge, `take_reg_range`->Row, NOT the memdb helpers) to build
+  the `SmallVec` DIRECTLY. Blast radius: 25 `Row{values:...}` construction sites +
+  mutation (`get_mut`/`as_mut_slice`/index) + move-out (`row.values` ->
+  `.into_vec()`, connection.rs:5388) across the CONTESTED connection.rs.
+- Two-sided (why a clean impl is still a coin-flip): eliminating one small per-row
+  Row-Vec malloc is ~2-4% of the ~900 ns/row streaming path (may clear the gate),
+  but the inline bloat (N x ~32 B larger `Row`) risks REGRESSING the Vec `query()`
+  accumulation arm (more bytes per Vec<Row> growth). Needs an A/B on BOTH arms.
+- Status: a delegated worktree attempt over-scoped to 949 lines (SmallVec-ified
+  join keys / prepared-insert scratch far beyond Row) and never completed the A/B;
+  discarded. Deferred in favor of the banked bd-rr46j +7-8% KEEP. Retry condition:
+  a tight hot-path-only impl (build SmallVec directly at the one result-bridge
+  site + mechanical `.into()`/`.into_vec()` at cold sites, <=~80 lines) + gated
+  A/B on both arms — ONLY if a future profile shows the per-row Row Vec malloc
+  dominates and a connection.rs window is cleanly available.
+
 ## 2026-08-17 - KEEP: wide-TEXT SELECT decodes into a shared Arc<str>, removing a redundant per-row cache-clone alloc (bd-rr46j)
 
 - Lever: `column_to_reg_direct` (fsqlite-vdbe/src/engine.rs) decoded a wide TEXT
