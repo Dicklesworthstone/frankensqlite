@@ -21173,7 +21173,44 @@ impl Connection {
         let txn = active_txn.as_mut().ok_or_else(|| {
             FrankenError::internal("memdb refresh from active transaction requires active_txn")
         })?;
-        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, false)
+        // hfdt-r24co: this is the per-write-statement in-txn refresh --
+        // exactly the call site the PERF-B2 schema-only fast path
+        // (reload_memdb_from_txn_with_mode's `schema_cookie == cached`
+        // branch) exists to serve, but it was excluded from that fast path
+        // by passing `allow_dirty_schema_only_fast_path=false`, forcing a
+        // full sqlite_master rescan + reparse (parse_all,
+        // columns_from_create_table_statement,
+        // infer_implicit_index_definition_from_master_entries) on EVERY
+        // write statement inside an explicit transaction, even when no DDL
+        // ran and the schema is provably unchanged.
+        //
+        // schema_cookie is SQLite's own authoritative, transactional
+        // signal for "the schema changed": it lives in the page-1 header
+        // this function reads via `txn.get_page` (so it reflects this same
+        // transaction's own in-progress writes, including any DDL executed
+        // earlier in this same transaction) and is bumped on every
+        // CREATE/ALTER/DROP, never on plain DML. A cookie match therefore
+        // proves sqlite_master's content -- and so the parsed schema --
+        // is byte-identical to what is already cached; skipping the
+        // reparse cannot observe stale schema.
+        //
+        // The row-hydration half of this refresh is unaffected either way:
+        // when hydrate_rows=false (the default -- see bd-qteu2 above),
+        // BOTH the fast and full paths already skip scanning user table
+        // rows, so this change only removes the redundant schema reparse,
+        // never row data. The dirty flag being set here reflects rows
+        // written in this txn, not a schema change; the schema-only fast
+        // path already special-cases AUTOINCREMENT (re-reads
+        // sqlite_sequence unconditionally when any autoincrement table
+        // exists) so last_insert_rowid stays correct.
+        //
+        // Applies the same rule the two from-pager reload call sites
+        // (reload_memdb_from_pager_with_prebound_publication_and_mode,
+        // reload_memdb_rows_from_txn_preserving_schema) already rely on
+        // with `allow_dirty_schema_only_fast_path=true` -- this is that
+        // same, already-proven invariant, extended to the one call site
+        // that was still hard-excluded from it.
+        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, true)
             .await
     }
 
@@ -36237,9 +36274,36 @@ impl DatabaseBuilderReservation {
                 }
             })?;
             match (header.write_version, header.read_version) {
+                // bd-h5oaj / GH#355 (live Windows measurement,
+                // hfdt-win0117-fsqlite-handle-collision-fw8gk): this ran with
+                // `RejectAll` unconditionally, but the only caller that
+                // reaches this branch with `expected_len.is_none()` is
+                // `reopen_reserved_schema_only_bounded_writer`'s
+                // `validated_bounded_writer_open(&env, None)` -- i.e. every
+                // reopen of an already-bootstrapped reservation, called right
+                // after `initialize_reserved_schema_only_builder`'s own
+                // bootstrap connection closed. That bootstrap's
+                // `WindowsOsLockFiles::open` legitimately created (and, being
+                // ordinary advisory-lock sidecars, did not remove on close)
+                // this exact reservation's own `-lock-{shared,reserved,
+                // pending}` companions moments earlier, so `RejectAll` here
+                // rejected the reopen's own just-created artifacts as if they
+                // were a stranger's stale debris -- deterministically, not a
+                // timing race (observed on both wlap and oldsurface,
+                // identical `RESERVE: Ok` / `INITIALIZE: Err(CannotOpen)`
+                // citing `<path>-lock-shared` "already present", 0.03s, one
+                // pass, no retry). `self.revalidate_final_target(expected_len)`
+                // just above already re-confirmed this reservation's own
+                // retained descriptor matches its recorded identity before
+                // this call runs, so by this point we already know we are
+                // reopening our own accepted reservation, not admitting a
+                // foreign one -- the same condition `AllowExpected` already
+                // encodes for the bootstrap's own file_size==0 branch
+                // (`fsqlite-pager/src/pager.rs`'s
+                // `open_readwrite_with_cx_and_page_buffer_max`).
                 (1, 1) => fsqlite_vfs::validate_reserved_database_artifacts(
                     &self.path,
-                    fsqlite_vfs::WindowsLockSidecarPolicy::RejectAll,
+                    fsqlite_vfs::WindowsLockSidecarPolicy::AllowExpected,
                 ),
                 (2, 2) => Ok(()),
                 (write_version, read_version) => Err(FrankenError::DatabaseCorrupt {
