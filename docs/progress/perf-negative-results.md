@@ -48,6 +48,59 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-17 - NO-GO: batch/hoist the VDBE per-row/per-statement async bridge (bd-hggxz) — the "~333ns/row + ~700ns/statement" is not a live product cost
+
+- Target: bd-i9sov's before-profile "located" a ~333 ns/row bridge + ~700 ns/
+  statement as the real Arc-free floor; bd-hggxz = batch/hoist that sync<->async
+  crossing, Cx cancel-correct. Disentangled against the ledger, the target is
+  NOT a hoistable product cost.
+- Measured (release-perf: opt-level 3 + lto + cgu=1 + panic=abort + strip;
+  self-SHA-printing bench, Threadripper-class box, taskset -c 8-11, 2 runs):
+  - Empty-future `block_on` floor (pure crossing/op): `futures_lite::block_on`
+    = **3.2 ns** (the AsyncConnection facade path); `asupersync rt.block_on`
+    (reused rt) = **653 ns** (paid by NO shipping path — CLI = one entry/session,
+    facade uses the 3.2 ns futures_lite path); per-op `RuntimeBuilder::build()`
+    = 106,000 ns (nothing constructs per-op — ruled out by timing).
+  - Wide SELECT (2000 rows/stmt) three ways: one-entry/whole-loop (direct-async
+    default) = 1126-1250 ns/row; per-stmt `fl_block_on` (facade) = **-0.58%**
+    (sub-noise); per-stmt `rt.block_on` = +4.1%. **Hoistable-bridge fraction ~= 0%**
+    on both product paths (facade crossing 3.2 ns = 0.16% of a 1961 ns INSERT) —
+    below the >=1% floor and the 2x KEEP gate.
+  - The 1126-1250 ns/row is INHERENT per-row engine work (decode + VDBE step-loop
+    + result Vec) under ONE runtime entry; under `:memory:` every internal `await`
+    is Ready-on-first-poll (no per-row scheduler round-trip) -> there is no
+    "async-per-row bridge crossing," only the cost of the engine being written
+    async. Owned by **bd-dqdoe**.
+- CORRECTION to the 2026-08-17 bd-i9sov entry below: its "redirect to the decode
+  + async-per-row bridge (~333/~700)" line MISLABELED the 1021 ns/row floor.
+  ~333 ns/row = the RESOLVED bd-zavyn benchmark-harness artifact (no product
+  path); ~700 ns/statement = the 653 ns asupersync per-op re-entry paid by NO
+  shipping path; the 1021 floor is 100% inherent per-row engine (bd-dqdoe) AND was
+  profiler-inflated (`hot_path_profile` was ON; un-instrumented = 1126-1250 ns/row).
+  The bd-i9sov Arc verdict (1.4-3.4%, below floor) is UNAFFECTED — only its redirect
+  framing was wrong. Correct redirect = bd-dqdoe engine-side per-row cost, NOT a bridge.
+- Feasibility (for the record): the ledger's retry-condition restructure ALREADY
+  EXISTS and is cancel-correct — durable native Cx at open (bd-fo6xw/bd-q8501;
+  `RuntimeContext.io_native_cx: OnceLock` via `attach_io_native_cx_if_missing`,
+  connection.rs ~2510/2651/12605) + runtime-spans-transaction
+  (`async_api.rs:1248` `execute_many_..._in_transaction` = one worker `block_on`
+  over N param-sets, one `operation_cx` spanning the batch, two-phase
+  `reserve()/send()` with Drop-unregister). It delivers ~0 on ns/row because the
+  facade crossing is 3.2 ns.
+- Files that WOULD change (not touched): `crates/fsqlite/src/async_api.rs`,
+  `crates/fsqlite-core/src/connection.rs`.
+- Evidence artifacts: session scratchpad `e2ebench` (disentangle.rs, self-SHA,
+  A/A+A/B) + `hggxz_disentangle_results.txt`.
+- Retry condition: NONE for a block_on-batching restructure (crossing is 3.2 ns).
+  Two adjacent REAL costs if ever needed: (a) the CONSUMER anti-pattern of one
+  `asupersync rt.block_on` per statement = 8.5-9% on small stmts — fixable today
+  with zero engine change (wrap the txn in one `block_on` / use
+  `execute_many_..._in_transaction`); (b) the facade's ~20% single-row-INSERT
+  penalty vs direct-async = executor-design cost (bd-fo6xw io_uring/actor-lane
+  line), not a bridge. The honest residual = bd-dqdoe inherent per-row engine cost
+  (prior attacks bd-uzq54/bd-i9sov failed the gate; the single-lever seam is dry
+  per the 2026-07-16 ledger note).
+
 ## 2026-08-17 - NO-GO: Track S union-style borrowed register file to kill Arc refcounting (bd-i9sov P0 / bd-b3yw2)
 
 - Target workload: eliminate Arc atomic refcounting from the VDBE register hot
