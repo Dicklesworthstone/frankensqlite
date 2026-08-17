@@ -10570,6 +10570,31 @@ impl Drop for OperationCxGuard<'_> {
     }
 }
 
+/// A database connection.
+///
+/// # Lifecycle & quiescence contract (bd-1is5z)
+///
+/// An **awaited** `close()` (or a `close_*` variant) is the only path that
+/// guarantees strict *quiescence*. It drains this connection's region tree via
+/// `RegionTree::close_and_drain`, which spin-waits until every region-registered
+/// background task (spawned through `try_spawn_in_region`) has exited and — on the
+/// last connection to a path — the shared write-coordinator service task under the
+/// database-root region has joined. After an awaited close, no task spawned by this
+/// connection is still live, so an `asupersync::lab` quiescence oracle settles.
+///
+/// **`Drop` is cancel-only, by design.** Shutdown I/O is async and `Drop` cannot
+/// await; this crate never builds its own runtime (`Cx` flows down from the
+/// consumer, per AGENTS.md), and `close_and_drain`'s spin-wait would deadlock if
+/// run on a runtime thread inside `Drop`. So dropping a `Connection` without
+/// awaiting `close()` *cancels* every region `Cx` (tasks exit at their next
+/// `checkpoint()`) but does not wait for them: at `Drop` return the write-
+/// coordinator task may still be live and a quiescence oracle would not yet settle.
+/// A `drop_close` warning is emitted for this case, and open transactions are left
+/// unrolled-back with no checkpoint (committed bytes stay durable in the WAL and the
+/// next open recovers them). Callers that need prompt rollback + checkpoint +
+/// quiescence MUST await `close()`.
+///
+/// See `docs/concurrency-contract.md` and `docs/concurrency-recovery.md`.
 // bd-081hj: this god-object carries many intentionally domain-prefixed fields
 // (e.g. `connection_registry_differs_from_base`); a targeted rename across all
 // call sites isn't worth the churn, so the struct-field-names lint is allowed here.
@@ -16464,11 +16489,6 @@ impl Connection {
                     SqliteValue::Text(text) => text.to_string(),
                     _ => return None,
                 };
-                if entry_type.eq_ignore_ascii_case("table")
-                    || entry_type.eq_ignore_ascii_case("index")
-                {
-                    return None;
-                }
                 let name = match &row[1] {
                     SqliteValue::Text(text) => text.to_string(),
                     _ => return None,
@@ -16486,6 +16506,23 @@ impl Connection {
                     Some(SqliteValue::Null) => None,
                     _ => return None,
                 };
+                // bd-o01lp / GH#357: the VACUUM INTO b-tree rebuild reconstructs
+                // every real table and index from its own root, so re-carrying
+                // those as "extra" master entries would duplicate them — hence
+                // the skip. But a VIRTUAL table has no b-tree of its own: its
+                // sqlite_master row records `root_page == 0` and a
+                // `CREATE VIRTUAL TABLE ...` statement, so the rebuild never
+                // re-emits it. Dropping it (as the blanket `table`/`index` skip
+                // did) left the vtab's real shadow tables orphaned in the output.
+                // Keep virtual-table rows; still drop real tables and all indexes.
+                if entry_type.eq_ignore_ascii_case("index") {
+                    return None;
+                }
+                if entry_type.eq_ignore_ascii_case("table")
+                    && !(root_page == 0 && sql.as_deref().is_some_and(is_virtual_table_sql))
+                {
+                    return None;
+                }
                 Some((entry_type, name, tbl_name, root_page, sql))
             })
             .collect()
@@ -96807,31 +96844,55 @@ impl SharedMvccState {
         Ok(())
     }
 
+    /// Register a background task in `region` and hand back its RAII
+    /// [`TaskHandle`] plus a child [`Cx`] of that region.
+    ///
+    /// The handle keeps the region's `active_tasks` count non-zero until it is
+    /// dropped, so [`RegionTree::close_and_drain`] accounts for the task; the
+    /// child `Cx` makes the work cancel-correct (the region's `begin_close`
+    /// cancels it). This is the low-level half of [`Self::try_spawn_in_region`].
     #[cfg_attr(not(test), allow(dead_code))]
-    fn register_write_coordinator_task(&self) -> Result<(TaskHandle, Cx)> {
+    fn register_task_in_region(&self, region: Region) -> Result<(TaskHandle, Cx)> {
         let state = lock_unpoisoned(&self.runtime_state);
         if let Some(details) = &state.poisoned {
             return Err(FrankenError::BackgroundWorkerFailed(details.clone()));
         }
-
-        let region = state.write_coordinator_region;
         let task = state.regions.register_task(region)?;
         let cx = state
             .regions
             .cx(region)
-            .ok_or_else(|| FrankenError::internal("write coordinator region missing Cx"))?
+            .ok_or_else(|| FrankenError::internal("region missing Cx for task registration"))?
             .create_child();
         Ok((task, cx))
     }
 
-    fn try_spawn_write_coordinator_task<F, Fut>(&self, task: F) -> Result<bool>
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn register_write_coordinator_task(&self) -> Result<(TaskHandle, Cx)> {
+        let region = lock_unpoisoned(&self.runtime_state).write_coordinator_region;
+        self.register_task_in_region(region)
+    }
+
+    /// The single blessed way to spawn a per-Connection background task.
+    ///
+    /// The region [`TaskHandle`] is moved into the spawned future so the region's
+    /// quiescence drain accounts for the task's whole lifetime, and the task runs
+    /// under a child [`Cx`] of `region` so `begin_close`/`close_and_drain` cancel
+    /// it. Returns `Ok(false)` when no native asupersync runtime is active
+    /// (wasm / non-`native` builds).
+    ///
+    /// INVARIANT (bd-54ulg / bd-1is5z): per-Connection background work MUST go
+    /// through this helper — never a raw `RuntimeHandle::try_spawn`,
+    /// `std::thread::spawn`, or `spawn_blocking` outside `#[cfg(test)]`. A task
+    /// that does not hold a region `TaskHandle` is invisible to `close_and_drain`
+    /// and silently breaks quiescence-on-Connection-close.
+    fn try_spawn_in_region<F, Fut>(&self, region: Region, task: F) -> Result<bool>
     where
         F: FnOnce(Cx) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
         {
-            let _ = task;
+            let _ = (region, task);
             return Ok(false);
         }
 
@@ -96840,7 +96901,7 @@ impl SharedMvccState {
             let Some(runtime_handle) = self._runtime.native_runtime_handle() else {
                 return Ok(false);
             };
-            let (region_task, task_cx) = self.register_write_coordinator_task()?;
+            let (region_task, task_cx) = self.register_task_in_region(region)?;
             runtime_handle
                 .try_spawn(async move {
                     let _region_task = region_task;
@@ -96854,11 +96915,20 @@ impl SharedMvccState {
                 })
                 .map_err(|err| {
                     FrankenError::internal(format!(
-                        "failed to spawn write coordinator task on active asupersync runtime: {err}"
+                        "failed to spawn task in region on active asupersync runtime: {err}"
                     ))
                 })?;
             Ok(true)
         }
+    }
+
+    fn try_spawn_write_coordinator_task<F, Fut>(&self, task: F) -> Result<bool>
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let region = lock_unpoisoned(&self.runtime_state).write_coordinator_region;
+        self.try_spawn_in_region(region, task)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -96927,10 +96997,20 @@ impl SharedMvccState {
                     "could not request database-root region cancellation during drop"
                 );
             }
-            if state.key.path_key != ":memory:"
-                && let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get()
-            {
-                lock_unpoisoned(state_map).remove(&state.key);
+            if state.key.path_key != ":memory:" {
+                // bd-fs32r (bd-1is5z): mirror close_internal's last-connection per-path
+                // cleanup so an unawaited Drop of the final connection does not leak the
+                // per-path group-commit / parallel-WAL coordinator map entries (and the
+                // parallel-WAL ticker thread, if that ticker is ever wired). Both are a
+                // sync map-drop + BlockingTaskHandle::wait() on a separate thread that
+                // never touches this Connection's runtime_state, so they are Drop-safe.
+                let db_path = PathBuf::from(&state.key.path_key);
+                fsqlite_pager::remove_group_commit_queue(&db_path);
+                #[cfg(not(target_arch = "wasm32"))]
+                fsqlite_wal::remove_parallel_wal_coordinator(&db_path);
+                if let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get() {
+                    lock_unpoisoned(state_map).remove(&state.key);
+                }
             }
         }
     }

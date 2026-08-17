@@ -13233,7 +13233,15 @@ where
     #[cfg(all(feature = "native", any(unix, windows)))]
     pub fn validate_namespace_binding(&self) -> Result<()> {
         if let Some(binding) = &self.namespace_binding {
-            binding.validate_path_identity()?;
+            // bd-9hp58 (ask #3): `guard_generation` is `validate_path_identity`
+            // when the bound generation is still installed (identical Err, no
+            // side effect), but when it PROVES the main file was quarantined /
+            // renamed (a new inode now occupies the path) it also releases this
+            // binding's retained `-ns-gate`/`-ns-use` descriptors — so a
+            // recovery flow that supersedes the generation cannot leave a
+            // retained fd writing to the old inode. Every caller here already
+            // propagates the Err via `?`, so error semantics are unchanged.
+            binding.guard_generation()?;
         }
         Ok(())
     }
