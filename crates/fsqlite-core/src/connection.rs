@@ -80755,14 +80755,15 @@ impl Connection {
                 &insert.columns,
             )?;
             self.validate_table_index_runtime_dependencies(table_schema)?;
-            if targets_shadowed_main {
-                table_schema.columns.iter().position(|column| column.is_ipk)
-            } else {
-                self.rowid_alias_columns
-                    .borrow()
-                    .get(&insert.table.name.to_ascii_lowercase())
-                    .copied()
-            }
+            // bd-rwaxp: derive the rowid-alias (INTEGER PRIMARY KEY) column from
+            // the resolved schema — the same source the SELECT read path and the
+            // shadowed-main branch already use. The connection-local
+            // `rowid_alias_columns` name map can lag the schema for TEMP tables,
+            // which made a multi-row parameterized INSERT auto-generate rowids
+            // (dropping the bound IPK, e.g. VALUES(?1),(?2) → [1,2] instead of
+            // [1,1000000]) while the read still returned rowids
+            // (test_temp_sparse_ipk_driver_join_preserves_all_parameterized_values).
+            table_schema.columns.iter().position(|column| column.is_ipk)
         };
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
