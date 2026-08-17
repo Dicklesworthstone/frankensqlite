@@ -1,0 +1,35 @@
+# select.samply.json.gz total_samples=49299
+
+## TOP SELF
+ 21.87%   10784  __memcpy_avx_unaligned_erms                                                      ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:554
+ 20.90%   10305  _int_malloc                                                                      ./malloc/./malloc/malloc.c:4596
+  4.48%    2207  __brk                                                                            ./misc/../sysdeps/unix/sysv/linux/brk.c:37 (discriminator 1)
+  3.71%    1830  <fsqlite_vdbe::engine::VdbeEngine>::column_to_reg_direct::{closure#0}            /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:16027
+  3.36%    1654  fsqlite_types::serial_type::read_varint                                          /data/projects/frankensqlite/crates/fsqlite-types/src/serial_type.rs:?
+  3.34%    1649  _int_free_create_chunk                                                           ./malloc/./malloc/malloc.c:4823
+  3.33%    1643  fsqlite_vdbe::engine::ensure_storage_cursor_row_layout::{closure#0}              /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:18693
+  2.64%    1300  __GI_munmap                                                                      ./misc/../sysdeps/unix/syscall-template.S:117
+  2.27%    1117  __memcpy_avx_unaligned                                                           ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:221
+  1.93%     953  <fsqlite_vdbe::engine::VdbeEngine>::execute_with_borrowed_bindings_internal::{cl /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:8871
+  1.92%     949  core::mem::replace::<fsqlite_types::value::SqliteValue>                          /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/mem/mod.rs:975
+  1.81%     893  malloc_consolidate                                                               ./malloc/./malloc/malloc.c:4960
+  1.43%     703  <alloc::sync::Arc<[u8]> as core::clone::Clone>::clone                            /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/alloc/src/sync.rs:2432
+  1.02%     505  <fsqlite_vdbe::engine::VdbeEngine>::try_execute_hot_opcode::{closure#0}          /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:14448
+  1.00%     492  <fsqlite_vdbe::engine::VdbeEngine>::execute_column_hot::{closure#0}              /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:14539
+  0.96%     471  fsqlite_types::record::decode_value_with_encoding                                /data/projects/frankensqlite/crates/fsqlite-types/src/record.rs:2706
+  0.95%     468  __libc_malloc2                                                                   ./malloc/./malloc/malloc.c:3456 (discriminator 4)
+  0.78%     385  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::advanc /data/projects/frankensqlite/crates/fsqlite-btree/src/cursor.rs:4940
+  0.78%     383  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::local_ /data/projects/frankensqlite/crates/fsqlite-btree/src/cursor.rs:10592
+  0.72%     357  <fsqlite_vdbe::engine::VdbeEngine>::set_reg_fast                                 /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:15685
+  0.68%     337  core::intrinsics::likely                                                         /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/intrinsics/mod.rs:455
+  0.67%     330  _int_free_chunk                                                                  ./malloc/./malloc/malloc.c:4717
+  0.62%     308  __memset_avx2_unaligned_erms                                                     ./string/../sysdeps/x86_64/multiarch/memset-vec-unaligned-erms.S:292
+  0.55%     273  sysmalloc                                                                        ./malloc/./malloc/malloc.c:2947
+  0.54%     265  <fsqlite_vdbe::engine::VdbeEngine>::take_reg                                     /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:15626
+  0.52%     256  <fsqlite_vdbe::engine::CursorBackend>::position_stamp                            /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/slice/mod.rs:?
+  0.40%     199  <alloc::sync::Arc<str> as core::ops::drop::Drop>::drop                           /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/alloc/src/sync.rs:2858
+  0.39%     194  __internal_syscall_cancel                                                        ./nptl/./nptl/cancellation.c:40
+  0.39%     192  <fsqlite_vdbe::engine::CursorBackend>::next::{closure#0}                         /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:4004
+  0.37%     183  unlink_chunk                                                                     ./malloc/./malloc/malloc.c:1621
+  0.37%     180  simdutf8::implementation::x86::avx2::validate_utf8_basic                         /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/simdutf8-0.1.5/src/implementation/algorithm.rs:226
+  0.35%     173  <core::option::Option<fsqlite_types::value::SqliteValue>>::ok_or_else::<fsqlite_ /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/option.rs:1364

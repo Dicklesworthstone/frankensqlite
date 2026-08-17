@@ -1,0 +1,75 @@
+# select.samply.json.gz  thread total_samples=49299
+
+## TOP SELF
+ 62.13%   30631  [libc.so.6]                                                                               
+  3.71%    1830  <fsqlite_vdbe::engine::VdbeEngine>::column_to_reg_direct::{closure#0}                     /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:16027
+  3.36%    1654  fsqlite_types::serial_type::read_varint                                                   /data/projects/frankensqlite/crates/fsqlite-types/src/serial_type.rs:?
+  3.33%    1643  fsqlite_vdbe::engine::ensure_storage_cursor_row_layout::{closure#0}                       /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:18693
+  1.93%     953  <fsqlite_vdbe::engine::VdbeEngine>::execute_with_borrowed_bindings_internal::{closure#0}  /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:8871
+  1.92%     949  core::mem::replace::<fsqlite_types::value::SqliteValue>                                   /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/mem/mod.rs:975
+  1.43%     703  <alloc::sync::Arc<[u8]> as core::clone::Clone>::clone                                     /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/alloc/src/sync.rs:2432
+  1.02%     505  <fsqlite_vdbe::engine::VdbeEngine>::try_execute_hot_opcode::{closure#0}                   /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:14448
+  1.00%     492  <fsqlite_vdbe::engine::VdbeEngine>::execute_column_hot::{closure#0}                       /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:14539
+  0.96%     471  fsqlite_types::record::decode_value_with_encoding                                         /data/projects/frankensqlite/crates/fsqlite-types/src/record.rs:2706
+  0.78%     385  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::advance_next_i  /data/projects/frankensqlite/crates/fsqlite-btree/src/cursor.rs:4940
+  0.78%     383  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::local_leaf_tab  /data/projects/frankensqlite/crates/fsqlite-btree/src/cursor.rs:10592
+  0.72%     357  <fsqlite_vdbe::engine::VdbeEngine>::set_reg_fast                                          /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:15685
+  0.68%     337  core::intrinsics::likely                                                                  /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/intrinsics/mod.rs:455
+  0.54%     265  <fsqlite_vdbe::engine::VdbeEngine>::take_reg                                              /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:15626
+  0.52%     256  <fsqlite_vdbe::engine::CursorBackend>::position_stamp                                     /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/slice/mod.rs:?
+  0.40%     199  <alloc::sync::Arc<str> as core::ops::drop::Drop>::drop                                    /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/alloc/src/sync.rs:2858
+  0.39%     192  <fsqlite_vdbe::engine::CursorBackend>::next::{closure#0}                                  /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:4004
+  0.37%     180  simdutf8::implementation::x86::avx2::validate_utf8_basic                                  /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/simdutf8-0.1.5/src/implementation/algorithm.rs:226
+  0.35%     173  <core::option::Option<fsqlite_types::value::SqliteValue>>::ok_or_else::<fsqlite_error::F  /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/option.rs:1364
+  0.33%     164  fsqlite_vdbe::engine::ensure_storage_cursor_payload_prefix::{closure#0}                   /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:?
+  0.32%     159  <alloc::sync::Arc<[u8]> as core::ops::drop::Drop>::drop                                   /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/alloc/src/sync.rs:2858
+  0.30%     148  fsqlite_types::record::clear_value_slots                                                  /data/projects/frankensqlite/crates/fsqlite-types/src/record.rs:915
+  0.30%     147  core::core_arch::x86::sse2::_mm_add_epi32                                                 /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs:111
+  0.28%     140  core::sync::atomic::atomic_add::<usize, usize>                                            /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/sync/atomic.rs:4029
+  0.28%     140  simdutf8::implementation::x86::validate_utf8_basic_avx2                                   /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/simdutf8-0.1.5/src/implementation/x86/mod.rs:69
+  0.28%     140  <fsqlite_btree::cursor::CursorPositionStamp as core::cmp::PartialEq>::eq                  /data/projects/frankensqlite/crates/fsqlite-btree/src/cursor.rs:1201
+  0.28%     140  <fsqlite_vdbe::engine::VdbeEngine>::replace_register_value                                /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:13724
+  0.28%     138  <std::sys::sync::once::futex::CompletionGuard as core::ops::drop::Drop>::drop             /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/std/src/sys/sync/once/futex.rs:62
+  0.26%     128  <fsqlite_types::value::SqliteValue as core::clone::Clone>::clone                          /data/projects/frankensqlite/crates/fsqlite-types/src/value.rs:853
+
+## TOP INCLUSIVE
+113.28%   55847  [libc.so.6]                                                                               
+ 75.41%   37176  <fsqlite_core::connection::PreparedStatement>::execute_table_program_with_reuse_mode::{c  /data/projects/frankensqlite/crates/fsqlite-core/src/connection.rs:8095
+ 72.03%   35508  <fsqlite_vdbe::engine::VdbeEngine>::execute_with_borrowed_bindings_internal::{closure#0}  /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:8871
+ 68.96%   33998  <fsqlite_vdbe::engine::VdbeEngine>::execute_with_borrowed_bindings::{closure#0}           /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:8550
+ 48.51%   23914  <fsqlite_vdbe::engine::VdbeEngine>::execute_column_hot::{closure#0}                       /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:14539
+ 33.98%   16751  <fsqlite_vdbe::engine::VdbeEngine>::column_to_reg_direct::{closure#0}                     /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:16027
+ 22.77%   11223  std::sys::alloc::unix::alloc                                                              /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/std/src/sys/alloc/unix.rs:31
+ 14.71%    7254  fsqlite_types::record::decode_value_with_encoding                                         /data/projects/frankensqlite/crates/fsqlite-types/src/record.rs:2706
+ 13.51%    6660  fsqlite_vdbe::engine::ensure_storage_cursor_row_layout::{closure#0}                       /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:18693
+ 11.11%    5479  core::ptr::write::<smallvec::SmallVec<[fsqlite_types::value::SqliteValue; 16]>>           /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/ptr/mod.rs:1963
+ 10.64%    5245  std::sys::alloc::unix::dealloc                                                            /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/std/src/sys/alloc/unix.rs:65
+ 10.42%    5139  core::ptr::drop_in_place::<[fsqlite_core::connection::Row]>                               /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/ptr/mod.rs:842
+ 10.32%    5088  <fsqlite_types::value::SqliteValue as core::clone::Clone>::clone                          /data/projects/frankensqlite/crates/fsqlite-types/src/value.rs:853
+ 10.13%    4993  fsqlite_types::record::decode_value_into                                                  /data/projects/frankensqlite/crates/fsqlite-types/src/record.rs:2722
+ 10.04%    4948  <std::sync::once_lock::OnceLock<alloc::sync::Arc<str>>>::get_or_try_init::<<std::sync::o  /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/std/src/sync/once_lock.rs:?
+ 10.00%    4930  <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<alloc::sync::  /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/std/src/sync/once.rs:?
+  9.67%    4769  <std::sys::sync::once::futex::Once>::call                                                 /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/std/src/sys/sync/once/futex.rs:146
+  7.08%    3490  <fsqlite_vdbe::engine::VdbeEngine>::execute_next_hot::{closure#0}                         /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:14483
+  7.05%    3478  zzz_execute_loop_profile_THROWAWAY::run_select::{closure#0}                               /data/projects/frankensqlite/crates/fsqlite-harness/src/bin/zzz_execute_loop_profile_THROWAWAY.rs:131
+  6.46%    3187  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::advance_next::  /data/projects/frankensqlite/crates/fsqlite-btree/src/cursor.rs:5116
+  6.02%    2966  <fsqlite_core::connection::PreparedStatement>::query::{closure#0}                         /data/projects/frankensqlite/crates/fsqlite-core/src/connection.rs:8235
+  6.01%    2965  <fsqlite_core::connection::PreparedStatement>::execute_table_program_with_reuse::{closur  /data/projects/frankensqlite/crates/fsqlite-core/src/connection.rs:7592
+  5.92%    2917  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::advance_next_i  /data/projects/frankensqlite/crates/fsqlite-btree/src/cursor.rs:4940
+  5.36%    2644  <fsqlite_vdbe::engine::CursorBackend>::payload_prefix_into::{closure#0}                   /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:?
+  4.56%    2247  fsqlite_core::connection::execute_table_program_with_db::{closure#0}::{closure#5}         /data/projects/frankensqlite/crates/fsqlite-core/src/connection.rs:113312
+  4.17%    2058  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::local_leaf_tab  /data/projects/frankensqlite/crates/fsqlite-btree/src/cursor.rs:10662
+  4.16%    2052  <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl::{closure#0}      /data/projects/frankensqlite/crates/fsqlite-core/src/connection.rs:33058
+  4.16%    2049  <fsqlite_core::connection::Connection>::execute_commit_with_cx::{closure#0}               /data/projects/frankensqlite/crates/fsqlite-core/src/connection.rs:61156
+  3.96%    1952  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::move_to_leftmo  /data/projects/frankensqlite/crates/fsqlite-btree/src/cursor.rs:3587
+  3.67%    1810  core::ptr::copy_nonoverlapping::<u8>                                                      /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/ptr/mod.rs:573
+  3.36%    1654  fsqlite_types::serial_type::read_varint                                                   /data/projects/frankensqlite/crates/fsqlite-types/src/serial_type.rs:?
+  3.10%    1528  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::load_page::{cl  /data/projects/frankensqlite/crates/fsqlite-btree/src/cursor.rs:?
+  2.74%    1350  <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageReader>::read_btree  /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:3358
+  2.28%    1126  core::ptr::drop_glue::<fsqlite_types::value::SmallTextRepr>                               /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/ptr/mod.rs:847
+  2.10%    1035  <fsqlite_vdbe::engine::VdbeEngine>::execute_result_row_hot                                /data/projects/frankensqlite/crates/fsqlite-vdbe/src/engine.rs:?
+  1.92%     949  core::mem::replace::<fsqlite_types::value::SqliteValue>                                   /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/mem/mod.rs:975
+  1.87%     923  core::ptr::read::<smallvec::SmallVec<[fsqlite_types::value::SqliteValue; 16]>>            /rustc/504869653f510b279c542e65ccd1ea9710c119ba/library/core/src/ptr/mod.rs:1755
+  1.65%     813  <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandle>::ge  /data/projects/frankensqlite/crates/fsqlite-pager/src/traits.rs:1743
+  1.63%     803  [unknown]                                                                                 
+  1.53%     752  <fsqlite_core::connection::Connection>::flush_pending_direct_insert_page_run::{closure#0  /data/projects/frankensqlite/crates/fsqlite-core/src/connection.rs:49947

@@ -1,0 +1,10 @@
+utc_timestamp=20260817T043017Z
+host=superserver
+uname=Linux superserver 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux
+cpu=AMD EPYC 7282 16-Core Processor
+nproc=64
+rustc=rustc 1.99.0-nightly (504869653 2026-08-03)
+rustflags=-C target-cpu=native (+ profile env: CARGO_PROFILE_RELEASE_PERF_DEBUG=2 STRIP=false)
+cargo_profile=release-perf (opt-level=3, debug=2, strip=false via env override)
+samply=samply 0.13.1
+loadavg_at_setup=10.89 10.40 8.64 25/3968 1097370

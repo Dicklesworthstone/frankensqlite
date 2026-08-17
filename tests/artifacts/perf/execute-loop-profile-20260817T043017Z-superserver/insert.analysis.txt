@@ -1,0 +1,53 @@
+# insert.samply.json.gz total_samples=41142
+## SELF CATEGORY ROLLUP
+   36.01%  memcpy/memmove/memset
+   24.14%  alloc(malloc/free/brk/munmap)
+    0.67%  smalltext_shared_arc(OnceLock)
+    0.54%  varint/record_decode
+    0.26%  utf8_validate
+## TOP SELF
+   26.82%  __memcpy_avx_unaligned_erms
+    8.90%  _int_malloc
+    5.08%  __memset_avx2_unaligned_erms
+    4.11%  __memcpy_avx_unaligned
+    2.59%  __GI_munmap
+    2.33%  <fsqlite_types::value::SqliteValue as core::clone::Clone>::clone
+    2.27%  _int_free_merge_chunk
+    2.18%  _int_free_create_chunk
+    1.75%  unlink_chunk
+    1.26%  zzz_execute_loop_profile_THROWAWAY::wide_blob
+    1.24%  __libc_malloc2
+    1.21%  _int_free_chunk
+    0.98%  __GI___libc_free
+    0.97%  malloc_consolidate
+    0.93%  <alloc::sync::Arc<[u8]> as core::ops::drop::Drop>::drop
+    0.86%  <alloc::sync::Arc<str> as core::ops::drop::Drop>::drop
+    0.82%  <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert::{cl
+    0.80%  core::ptr::drop_glue::<[fsqlite_types::value::SqliteValue]>
+    0.77%  core::ptr::write::<fsqlite_types::value::SqliteValue>
+    0.73%  core::ptr::copy_nonoverlapping::<u8>
+    0.72%  core::intrinsics::likely
+    0.71%  __GI___libc_malloc
+## TOP INCLUSIVE (engine/app funcs only, excl libc/alloc leaves)
+   35.07%  zzz_execute_loop_profile_THROWAWAY::run_insert::{closure#0}
+   23.75%  <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs> as fsqlit
+   23.72%  <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandl
+   18.06%  zzz_execute_loop_profile_THROWAWAY::insert_round::{closure#0}
+   15.13%  __GI___libc_realloc
+   15.02%  <fsqlite_vfs::memory::MemoryFile as fsqlite_vfs::traits::VfsFile>::write_page_batc
+   14.21%  __GI_memcpy
+    8.05%  <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<fsqlite_
+    6.65%  <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<fsqlite_
+    5.88%  <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<fsqlite_
+    5.78%  <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::unix::UnixVfs>>::drain_commi
+    5.16%  <fsqlite_btree::cursor::TransactionPageIo<fsqlite_pager::traits::TransactionKind> 
+    5.02%  <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs> as fsqlit
+    3.72%  <fsqlite_pager::page_cache::FastPageArray>::get_shared
+    3.26%  fsqlite_types::record::parse_record_into
+    2.81%  <fsqlite_pager::pager::StagedPage>::into_cache_buf
+    2.74%  fsqlite_pager::pager::acquire_page_buf_with_clean_cache_recovery
+    2.66%  <std::sys::sync::once::futex::Once>::call
+    2.15%  fsqlite_types::record::parse_record_into_with_encoding
+    1.78%  fsqlite_types::record::decode_value_with_encoding
+    1.75%  unlink_chunk
+    1.26%  zzz_execute_loop_profile_THROWAWAY::wide_blob

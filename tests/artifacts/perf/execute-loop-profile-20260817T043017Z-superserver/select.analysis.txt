@@ -1,0 +1,53 @@
+# select.samply.json.gz total_samples=49299
+## SELF CATEGORY ROLLUP
+   36.69%  alloc(malloc/free/brk/munmap)
+   24.77%  memcpy/memmove/memset
+    4.66%  varint/record_decode
+    0.73%  utf8_validate
+    0.66%  smalltext_shared_arc(OnceLock)
+## TOP SELF
+   21.87%  __memcpy_avx_unaligned_erms
+   20.90%  _int_malloc
+    4.48%  __brk
+    3.71%  <fsqlite_vdbe::engine::VdbeEngine>::column_to_reg_direct::{closure#0}
+    3.36%  fsqlite_types::serial_type::read_varint
+    3.34%  _int_free_create_chunk
+    3.33%  fsqlite_vdbe::engine::ensure_storage_cursor_row_layout::{closure#0}
+    2.64%  __GI_munmap
+    2.27%  __memcpy_avx_unaligned
+    1.93%  <fsqlite_vdbe::engine::VdbeEngine>::execute_with_borrowed_bindings_internal::{clos
+    1.92%  core::mem::replace::<fsqlite_types::value::SqliteValue>
+    1.81%  malloc_consolidate
+    1.43%  <alloc::sync::Arc<[u8]> as core::clone::Clone>::clone
+    1.02%  <fsqlite_vdbe::engine::VdbeEngine>::try_execute_hot_opcode::{closure#0}
+    1.00%  <fsqlite_vdbe::engine::VdbeEngine>::execute_column_hot::{closure#0}
+    0.96%  fsqlite_types::record::decode_value_with_encoding
+    0.95%  __libc_malloc2
+    0.78%  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::advance_
+    0.78%  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::local_le
+    0.72%  <fsqlite_vdbe::engine::VdbeEngine>::set_reg_fast
+    0.68%  core::intrinsics::likely
+    0.67%  _int_free_chunk
+## TOP INCLUSIVE (engine/app funcs only, excl libc/alloc leaves)
+   72.03%  <fsqlite_vdbe::engine::VdbeEngine>::execute_with_borrowed_bindings_internal::{clos
+   68.96%  <fsqlite_vdbe::engine::VdbeEngine>::execute_with_borrowed_bindings::{closure#0}
+   48.51%  <fsqlite_vdbe::engine::VdbeEngine>::execute_column_hot::{closure#0}
+   33.98%  <fsqlite_vdbe::engine::VdbeEngine>::column_to_reg_direct::{closure#0}
+   14.71%  fsqlite_types::record::decode_value_with_encoding
+   13.51%  fsqlite_vdbe::engine::ensure_storage_cursor_row_layout::{closure#0}
+   10.13%  fsqlite_types::record::decode_value_into
+    9.67%  <std::sys::sync::once::futex::Once>::call
+    7.08%  <fsqlite_vdbe::engine::VdbeEngine>::execute_next_hot::{closure#0}
+    7.05%  zzz_execute_loop_profile_THROWAWAY::run_select::{closure#0}
+    6.46%  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::advance_
+    5.92%  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::advance_
+    5.36%  <fsqlite_vdbe::engine::CursorBackend>::payload_prefix_into::{closure#0}
+    4.50%  __glibc_morecore
+    4.49%  __GI___sbrk
+    4.17%  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::local_le
+    3.96%  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::move_to_
+    3.51%  systrim
+    3.36%  fsqlite_types::serial_type::read_varint
+    3.10%  <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::load_pag
+    2.74%  <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageReader>::read
+    2.10%  <fsqlite_vdbe::engine::VdbeEngine>::execute_result_row_hot

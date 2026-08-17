@@ -1,0 +1,225 @@
+//! THROWAWAY profiling harness (profiling task only — delete after use).
+//!
+//! Isolates the VDBE per-row execute-loop cost under ONE asupersync runtime
+//! entry (no per-op block_on, no hot_path_profile instrumentation). Two
+//! workloads:
+//!   * `select`         — prepared `SELECT n,s,w,b FROM t` (Vec<Row> path) over a
+//!                        large :memory: table, looped ITER times.
+//!   * `select_foreach` — same SELECT via streaming `query_with_params_for_each`
+//!                        (no outer Vec<Row>), to isolate result-Vec cost.
+//!   * `insert`         — prepared param INSERT into a no-secondary-index table,
+//!                        single txn, ROUNDS fresh tables.
+//!
+//! Prints its own SHA-256 as the FIRST stdout line (e2ebench convention).
+//! Args: <mode> [artifact_json_path]
+//! Env:  N (rows), ITER (select loops), ROUNDS (insert rounds).
+
+#![allow(clippy::cast_precision_loss, clippy::large_futures)]
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use fsqlite::{Connection, SqliteValue};
+use sha2::Digest as _;
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    runtime.block_on(future)
+}
+
+fn self_sha256() -> (String, u64) {
+    let path = std::env::current_exe().expect("current_exe");
+    let bytes = std::fs::read(&path).expect("read self");
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    (hex, bytes.len() as u64)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// A ~1 KB text value with the row id embedded (distinct per row).
+fn wide_text(i: i64) -> String {
+    let mut s = String::with_capacity(1024);
+    s.push_str(&format!("row-{i:08}-"));
+    while s.len() < 1024 {
+        s.push_str("abcdefghijklmnopqrstuvwxyz0123456789-");
+    }
+    s.truncate(1024);
+    s
+}
+
+/// A ~100 B blob with the row id embedded.
+fn wide_blob(i: i64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(100);
+    b.extend_from_slice(&i.to_le_bytes());
+    while b.len() < 100 {
+        b.push((b.len() as u8).wrapping_mul(31));
+    }
+    b.truncate(100);
+    b
+}
+
+async fn build_table(conn: &Connection, n: usize) {
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, s TEXT, w TEXT, b BLOB)")
+        .await
+        .expect("create");
+    conn.execute("BEGIN").await.expect("begin");
+    let stmt = conn
+        .prepare("INSERT INTO t VALUES (?1,?2,?3,?4,?5)")
+        .await
+        .expect("prepare insert");
+    for i in 0..n as i64 {
+        let params = [
+            SqliteValue::Integer(i),
+            SqliteValue::Integer(i.wrapping_mul(2_654_435_761)),
+            SqliteValue::from(format!("r{i}")),
+            SqliteValue::from(wide_text(i)),
+            SqliteValue::from(wide_blob(i)),
+        ];
+        stmt.execute_with_params(&params).await.expect("insert");
+    }
+    conn.execute("COMMIT").await.expect("commit");
+}
+
+fn run_select(n: usize, iter: usize, artifact: Option<String>, foreach: bool) {
+    let (ns_per_row, checksum) = block_on(async {
+        let conn = Connection::open(":memory:").await.expect("open");
+        build_table(&conn, n).await;
+        let stmt = conn
+            .prepare("SELECT n, s, w, b FROM t")
+            .await
+            .expect("prepare select");
+
+        // Warmup (untimed): first-touch allocator/page effects out of the window.
+        for _ in 0..2 {
+            if foreach {
+                stmt.query_with_params_for_each(&[], |_r| Ok(()))
+                    .await
+                    .expect("warm foreach");
+            } else {
+                let _ = stmt.query().await.expect("warm query");
+            }
+        }
+
+        let mut checksum: u64 = 0;
+        let start = Instant::now();
+        if foreach {
+            for _ in 0..iter {
+                stmt.query_with_params_for_each(&[], |row| {
+                    if let Some(SqliteValue::Integer(v)) = row.get(0) {
+                        checksum = checksum.wrapping_add(*v as u64);
+                    }
+                    Ok(())
+                })
+                .await
+                .expect("foreach");
+            }
+        } else {
+            for _ in 0..iter {
+                let rows = stmt.query().await.expect("query");
+                // Touch each row so the result Vec cannot be optimized away.
+                for row in &rows {
+                    if let Some(SqliteValue::Integer(v)) = row.get(0) {
+                        checksum = checksum.wrapping_add(*v as u64);
+                    }
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        let total_rows = (n as u128) * (iter as u128);
+        let ns_per_row = elapsed.as_nanos() as f64 / total_rows as f64;
+        (ns_per_row, checksum)
+    });
+
+    let mode = if foreach { "select_foreach" } else { "select" };
+    println!("mode={mode} n={n} iter={iter} ns_per_row={ns_per_row:.2} checksum={checksum}");
+    write_artifact(artifact, mode, n, iter, ns_per_row);
+}
+
+fn run_insert(n: usize, rounds: usize, artifact: Option<String>) {
+    let ns_per_row = block_on(async {
+        // Warmup round (untimed).
+        {
+            let conn = Connection::open(":memory:").await.expect("open warm");
+            insert_round(&conn, n.min(2000)).await;
+        }
+        let start = Instant::now();
+        for _ in 0..rounds {
+            let conn = Connection::open(":memory:").await.expect("open");
+            insert_round(&conn, n).await;
+        }
+        let elapsed = start.elapsed();
+        let total_rows = (n as u128) * (rounds as u128);
+        elapsed.as_nanos() as f64 / total_rows as f64
+    });
+    println!("mode=insert n={n} rounds={rounds} ns_per_row={ns_per_row:.2}");
+    write_artifact(artifact, "insert", n, rounds, ns_per_row);
+}
+
+async fn insert_round(conn: &Connection, n: usize) {
+    // No secondary index: a plain rowid table.
+    conn.execute("CREATE TABLE ins (id INTEGER PRIMARY KEY, n INTEGER, s TEXT, w TEXT, b BLOB)")
+        .await
+        .expect("create ins");
+    conn.execute("BEGIN").await.expect("begin");
+    let stmt = conn
+        .prepare("INSERT INTO ins VALUES (?1,?2,?3,?4,?5)")
+        .await
+        .expect("prepare insert");
+    for i in 0..n as i64 {
+        let params = [
+            SqliteValue::Integer(i),
+            SqliteValue::Integer(i.wrapping_mul(2_654_435_761)),
+            SqliteValue::from(format!("r{i}")),
+            SqliteValue::from(wide_text(i)),
+            SqliteValue::Blob(Arc::from(wide_blob(i).into_boxed_slice())),
+        ];
+        stmt.execute_with_params(&params).await.expect("insert");
+    }
+    conn.execute("COMMIT").await.expect("commit");
+}
+
+fn write_artifact(path: Option<String>, mode: &str, n: usize, reps: usize, ns_per_row: f64) {
+    let Some(path) = path else { return };
+    let (sha, bytes) = self_sha256();
+    let json = serde_json::json!({
+        "mode": mode,
+        "n_rows": n,
+        "reps": reps,
+        "ns_per_row": ns_per_row,
+        "elf_sha256": sha,
+        "elf_bytes": bytes,
+        "exe": std::env::current_exe().ok().map(|p| p.display().to_string()),
+        "loadavg": std::fs::read_to_string("/proc/loadavg").ok().map(|s| s.trim().to_owned()),
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&json).expect("json")).expect("write");
+    println!("artifact_written={path}");
+}
+
+fn main() {
+    let (sha, bytes) = self_sha256();
+    // FIRST stdout line: the binary's own SHA-256 (e2ebench provenance convention).
+    println!("{sha}");
+    eprintln!("elf_sha256={sha} elf_bytes={bytes}");
+
+    let mode = std::env::args().nth(1).unwrap_or_else(|| "select".to_owned());
+    let artifact = std::env::args().nth(2);
+    let n = env_usize("N", 300_000);
+    let iter = env_usize("ITER", 40);
+    let rounds = env_usize("ROUNDS", 33);
+
+    match mode.as_str() {
+        "select" => run_select(n, iter, artifact, false),
+        "select_foreach" => run_select(n, iter, artifact, true),
+        "insert" => run_insert(env_usize("N", 200_000), rounds, artifact),
+        other => panic!("unknown mode {other}"),
+    }
+}

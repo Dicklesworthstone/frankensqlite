@@ -1,0 +1,86 @@
+{
+  "title": "VDBE per-row execute-loop profile (wide SELECT + bulk INSERT)",
+  "provenance": {
+    "binary": "/data/tmp/cargo-target/release-perf/zzz_execute_loop_profile_THROWAWAY",
+    "binary_sha256": "c77db77b8528d281f4659a08c9324e91c4e4cce60a38539e6c7c33d09c28b32a",
+    "binary_bytes": 267275272,
+    "build_git_head": "95926f6c1e297a1c706e7d96d055a6ab7fd37da0",
+    "build_git_dirty": "crates/fsqlite-core/src/connection.rs modified (pre-existing, not from this task)",
+    "cargo_profile": "release-perf (opt-level=3) + CARGO_PROFILE_RELEASE_PERF_DEBUG=2 + STRIP=false (env overrides, no committed-config change)",
+    "rustflags": "-C target-cpu=native",
+    "rustc": "rustc 1.99.0-nightly (504869653 2026-08-03)",
+    "host": "superserver, Linux 6.17.0-41-generic x86_64",
+    "cpu": "AMD EPYC 7282 16-Core (64 logical)",
+    "pinning": "taskset -c 3 (workload)",
+    "sampler": "samply 0.13.1 (perf_event)",
+    "sysctl_note": "perf_event_paranoid temporarily 4->1 and perf_event_mlock_kb 516->8192 via sudo; both RESTORED to 4/516 afterward",
+    "host_load_during_runs": "loadavg ~2.7-11 (shared box); absolute ns/row approximate, attribution percentages are the deliverable"
+  },
+  "workloads": {
+    "wide_select": {
+      "schema": "t(id INTEGER PRIMARY KEY, n INTEGER, s TEXT, w TEXT ~1KB, b BLOB ~100B)",
+      "rows": 300000, "loop_iters": 40, "timed_sql": "SELECT n, s, w, b FROM t",
+      "path_confirmed": "real pager+VDBE (execute_with_borrowed_bindings_internal, BtCursor::advance_next, decode_value_with_encoding) - NOT the memdb SimpleFullTableScan shortcut",
+      "ns_per_row_query_vec_clean": 3479.06,
+      "ns_per_row_query_vec_sampled": 3596.26,
+      "ns_per_row_for_each_stream_clean": 1689.29,
+      "stream_speedup_vs_vec": 2.06
+    },
+    "bulk_insert": {
+      "schema": "ins(id INTEGER PRIMARY KEY, n INTEGER, s TEXT, w TEXT ~1KB, b BLOB ~100B) no secondary index",
+      "rows_per_round": 200000, "rounds": 33, "single_txn_per_round": true,
+      "ns_per_row_clean": 6025.43, "ns_per_row_sampled": 6138.78
+    }
+  },
+  "self_time_category_rollup_pct": {
+    "select_query_vec":   {"allocator": 36.69, "memcpy": 24.77, "varint_record_decode": 4.66, "smalltext_shared_arc_oncelock": 0.66, "utf8_validate": 0.73},
+    "select_for_each":    {"allocator": 9.62,  "memcpy": 20.33, "varint_record_decode": 8.21, "smalltext_shared_arc_oncelock": 1.17, "utf8_validate": 1.37},
+    "insert":             {"allocator": 24.14, "memcpy": 36.01, "varint_record_decode": 0.54, "smalltext_shared_arc_oncelock": 0.67, "utf8_validate": 0.26}
+  },
+  "select_top_self_pct": [
+    {"pct": 21.87, "sym": "__memcpy_avx_unaligned_erms", "lib": "libc"},
+    {"pct": 20.90, "sym": "_int_malloc", "lib": "libc"},
+    {"pct": 4.48,  "sym": "__brk", "lib": "libc"},
+    {"pct": 3.71,  "sym": "VdbeEngine::column_to_reg_direct", "loc": "engine.rs:16027"},
+    {"pct": 3.36,  "sym": "serial_type::read_varint", "loc": "fsqlite-types/src/serial_type.rs"},
+    {"pct": 3.34,  "sym": "_int_free_create_chunk", "lib": "libc"},
+    {"pct": 3.33,  "sym": "ensure_storage_cursor_row_layout", "loc": "engine.rs:18693"},
+    {"pct": 2.64,  "sym": "__GI_munmap", "lib": "libc"},
+    {"pct": 2.27,  "sym": "__memcpy_avx_unaligned", "lib": "libc"},
+    {"pct": 1.92,  "sym": "core::mem::replace::<SqliteValue>", "lib": "rust-std"},
+    {"pct": 1.43,  "sym": "Arc<[u8]>::clone", "lib": "rust-std", "note": "blob cache-clone = O(1) Arc bump, no memcpy"}
+  ],
+  "select_top_inclusive_pct": [
+    {"pct": 72.03, "sym": "VdbeEngine::execute_with_borrowed_bindings_internal (VDBE opcode loop)", "loc": "engine.rs:8871"},
+    {"pct": 48.51, "sym": "VdbeEngine::execute_column_hot", "loc": "engine.rs:14539"},
+    {"pct": 33.98, "sym": "VdbeEngine::column_to_reg_direct", "loc": "engine.rs:16027"},
+    {"pct": 14.71, "sym": "record::decode_value_with_encoding", "loc": "record.rs:2706"},
+    {"pct": 13.51, "sym": "ensure_storage_cursor_row_layout", "loc": "engine.rs:18693"},
+    {"pct": 9.67,  "sym": "std::..::Once::call (OnceLock::get_or_init for the wide-text cache-clone Arc<str>)", "note": "THE redundant per-row alloc"},
+    {"pct": 7.08,  "sym": "VdbeEngine::execute_next_hot", "loc": "engine.rs:14483"},
+    {"pct": 6.46,  "sym": "BtCursor::advance_next", "loc": "cursor.rs:5116"}
+  ],
+  "biggest_optimizable_hotspot": {
+    "name": "Redundant per-row Arc<str> allocation from the wide-column cache-clone in column_to_reg_direct",
+    "chain": [
+      "engine.rs:16139 decode_column_from_offset_reuse_with_encoding -> hint-miss on distinct-per-row text -> HeapOwned{String, OnceLock::new()} (value.rs:281); String buffer is pool-reused so decode is ~alloc-free",
+      "engine.rs:16159 cache_decoded(payload_idx, val.clone()) -> SmallTextRepr::clone (value.rs:254) runs Arc::clone(shared.get_or_init(|| Arc::from(text))) = fresh ~1KB Arc<str> malloc + 1KB memcpy EVERY row",
+      "record.rs:1016 cache_decoded pool-returns the prior slot; the cached Arc<str> is never read by a single-pass scan and is freed next row"
+    ],
+    "why_optimizable": "returning 1KB text needs ONE owned copy (irreducible); engine currently makes TWO (pooled decode String + defensive cache-clone Arc<str>). BLOB columns are unaffected (Arc<[u8]> clone is O(1) bump).",
+    "evidence": "Once::call inclusive 9.67% (Vec) / 3.66% (stream); feeds top self leaves __memcpy_avx_unaligned_erms and _int_malloc"
+  },
+  "second_lever_result_set_accumulation": {
+    "finding": "query() keeps all 300K wide rows (~330MB) live before return -> glibc arena grow/return churn (brk 4.5%, munmap 2.6%, sbrk/systrim/morecore ~12% incl). Allocator self-time collapses 36.7%->9.6% when streaming.",
+    "classification": "API-shaped, not engine-shaped: streaming for_each already avoids it and is 2.06x faster (1689 vs 3479 ns/row)."
+  },
+  "artifacts": {
+    "select.samply.json.gz": "raw samply profile - wide SELECT query() (1.0 MB)",
+    "select_foreach.samply.json.gz": "raw samply profile - streaming for_each (252 KB)",
+    "insert.samply.json.gz": "raw samply profile - bulk INSERT (399 KB)",
+    "*.analysis.txt": "symbolicated self+inclusive + category rollup per profile",
+    "select.self-libc.txt / select.self-incl.txt": "libc-resolved self / full self+incl tables",
+    "*-timing.json / clean-timings.txt": "ns/row + loadavg",
+    "total_size_note": "~1.65 MB total; raw Firefox-Profiler captures kept as primary evidence"
+  }
+}

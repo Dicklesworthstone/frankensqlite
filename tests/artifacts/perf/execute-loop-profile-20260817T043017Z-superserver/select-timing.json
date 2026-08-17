@@ -1,0 +1,10 @@
+{
+  "mode": "select",
+  "n_rows": 300000,
+  "reps": 40,
+  "ns_per_row": 3596.2557748333334,
+  "elf_sha256": "c77db77b8528d281f4659a08c9324e91c4e4cce60a38539e6c7c33d09c28b32a",
+  "elf_bytes": 267275272,
+  "exe": "/data/tmp/cargo-target/release-perf/zzz_execute_loop_profile_THROWAWAY",
+  "loadavg": "7.50 9.20 8.56 3/3957 1117957"
+}

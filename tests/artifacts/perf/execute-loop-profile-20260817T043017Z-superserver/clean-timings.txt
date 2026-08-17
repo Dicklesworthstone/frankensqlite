@@ -1,0 +1,5 @@
+-- run 1, loadavg=5.39 --
+mode=select n=300000 iter=40 ns_per_row=3479.06 checksum=261728094660131456
+mode=select_foreach n=300000 iter=40 ns_per_row=1689.29 checksum=261728094660131456
+mode=insert n=200000 rounds=33 ns_per_row=6025.43
+-- run 2, loadavg=2.69 --
