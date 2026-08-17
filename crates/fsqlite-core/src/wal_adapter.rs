@@ -3182,12 +3182,16 @@ where
         // generation the sidecar is appended/truncated in place, so a held
         // descriptor observes changes on re-read below; generation resets
         // invalidate the cache via replace_inner / checkpoint.
-        let mut file = match self
+        // Release the cached_certificate_read lock BEFORE the match: neither arm
+        // reads the cache, and the None arm performs blocking VFS access/open, so
+        // holding the MutexGuard across the match would needlessly serialize
+        // certificate readers across that I/O (clippy::significant_drop_in_scrutinee).
+        let cached_reader = self
             .cached_certificate_read
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        let mut file = match cached_reader {
             Some(cached) => cached,
             None => {
                 if !self

@@ -50,10 +50,11 @@ pub const PRE_MIGRATION_BACKUP_SUFFIX: &str = ".pre-migration-bak";
 /// (for users who prefer to handle migration themselves). Set it to `1`.
 pub const SKIP_MIGRATION_ENV: &str = "FRANKENSQLITE_SKIP_MIGRATION";
 
-/// Version of the migration *logic*. A database whose marker records a smaller
-/// value (or has no marker at all) is (re)migrated; a database already at this
-/// version is left untouched. Bump this when a new repairable corruption class
-/// is added so upgraders re-run the pass.
+/// Version of the migration *logic*.
+///
+/// A database whose marker records a smaller value (or has no marker at all) is
+/// (re)migrated; a database already at this version is left untouched. Bump this
+/// when a new repairable corruption class is added so upgraders re-run the pass.
 pub const CURRENT_MIGRATION_VERSION: u32 = 1;
 
 /// Companion suffixes copied alongside the main file into the pre-migration
