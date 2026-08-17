@@ -7,8 +7,13 @@ license-file.workspace = true
 repository.workspace = true
 
 [features]
-default = ["native", "linux-asupersync-uring"]
+default = ["native", "linux-asupersync-uring", "extensions"]
 bench-internals = []
+# `native` deliberately does NOT imply `extensions` (fsqlite#356): downstream
+# consumers embedding the engine (e.g. pi_agent_rust session storage) can
+# build `default-features = false, features = ["native"]` without linking
+# every extension vtab. The default feature set still includes `extensions`,
+# so plain `fsqlite-core` builds are unchanged.
 native = [
     "fsqlite-types/native",
     "fsqlite-vfs/native",
@@ -19,7 +24,6 @@ native = [
     "fsqlite-planner/native",
     "fsqlite-vdbe/native",
     "diagnostic-pragmas",
-    "extensions",
 ]
 wasm = [
     "fsqlite-types/wasm",

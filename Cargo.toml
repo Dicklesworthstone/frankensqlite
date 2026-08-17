@@ -155,7 +155,12 @@ fsqlite-wasm = { version = "0.3.4", path = "crates/fsqlite-wasm" }
 ftui = { version = "0.5.0", default-features = false }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
-serde_json = { version = "1.0", features = ["preserve_order"] }
+# No `preserve_order` here (fsqlite#356): the workspace-wide feature leaked
+# into every downstream consumer via feature unification, silently switching
+# serde_json maps to insertion order across their whole build. Crates whose
+# semantics genuinely need insertion order (fsqlite-ext-json for SQLite JSON1
+# key-order parity) declare their own serde_json spec with the feature.
+serde_json = { version = "1.0" }
 itoa = "1.0"
 tracing = "0.1"
 simdutf8 = "0.1"
