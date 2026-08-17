@@ -450,7 +450,7 @@ pub enum ErrorCode {
 /// never collide with them. Returned by
 /// [`FrankenError::extended_error_code`] for [`FrankenError::NewerFormat`],
 /// whose primary code is [`ErrorCode::CantOpen`].
-pub const SQLITE_OPEN_NEWER_FORMAT: i32 = 14 | (0x7F << 8);
+pub const SQLITE_OPEN_NEWER_FORMAT: i32 = 0x0E | (0x7F << 8);
 
 impl FrankenError {
     /// Map this error to a SQLite error code for compatibility.
