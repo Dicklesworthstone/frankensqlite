@@ -15,22 +15,29 @@
 //! fsync across the bucket: throughput scales with batch size, and the
 //! bounded epoch window caps tail latency.
 //!
-//! # Scope
+//! # Status: ABANDONED SCAFFOLD — do not wire (bd-rh3sr)
 //!
-//! This is an MVP scaffold: the primitive is self-contained and tested,
-//! but it is **not yet wired** into the real commit paths. A follow-up
-//! will invoke [`EpochGroupCommit::submit`] from the commit routine and
-//! replace the dummy flush callback with the real WAL fsync.
+//! This primitive was never wired into a real commit path and, per the
+//! bd-rh3sr findings, it will not be. The live commit path
+//! (`SimpleTransaction::commit`) already amortizes fsyncs across concurrent
+//! committers through `fsqlite_pager::GroupCommitQueue` /
+//! `fsqlite_wal::group_commit::GroupCommitConsolidator`, which additionally
+//! carries the fairness budget and starvation guards this scaffold lacks.
+//! Wiring Silo would either stack a second group-commit controller on top of
+//! that (forbidden) or replace a richer controller with a poorer one.
 //!
-//! **Wiring decision is deferred**: a separate same-process group-commit
-//! controller, `fsqlite_pager::GroupCommitQueue`, is already wired into
-//! `SimpleTransaction::commit` via `GroupCommitConsolidator`. Stacking
-//! Silo on top of it would duplicate batching. See `bd-rh3sr` for the
-//! investigation, the 2026-04-23 8-thread profile evidence that the
-//! 1→2-thread cliff is dominated by off-CPU page-lock waits (not
-//! WAL-append fsync), and the decision tree — tune GroupCommitQueue,
-//! replace it with Silo, or delete this scaffold — that a follow-up
-//! must resolve *before* wiring.
+//! Crucially, the problem Silo was meant to solve is misattributed: the
+//! 2026-04-23 8-thread profile shows the 1→2-thread throughput cliff is
+//! dominated by *off-CPU lock wait* (the rightmost-leaf page-lock, or a
+//! mis-tuned commit-path `inner.lock()`), not by per-transaction WAL fsync —
+//! the only thing Silo amortizes. Silo therefore addresses neither plausible
+//! cause. The real work is tracked as **bd-5fnex** (off-CPU cliff attribution
+//! → GroupCommitQueue tuning / steal-on-same-page); the page-lock fast path is
+//! **bd-77l3t**.
+//!
+//! The module is retained as a reference implementation of the Silo epoch
+//! scheme and is marked `#[deprecated]` so any accidental wiring attempt fails
+//! the build; its tests still exercise the primitive in isolation.
 //!
 //! # Shape
 //!
@@ -54,6 +61,11 @@
 //! - Dropping an `EpochGroupCommit` signals the advancer to exit, drains
 //!   any outstanding waiters (marking them ready so no one blocks
 //!   forever), and joins the task.
+
+// This module IS the deprecated scaffold; its own constructor, impls, and tests
+// intentionally use the deprecated `EpochGroupCommit`. Silence the self-use here
+// while callers in other modules still hit the `#[deprecated]` wiring warning.
+#![allow(deprecated)]
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
 use fsqlite_types::glossary::TxnId;
@@ -101,6 +113,14 @@ struct PendingEntry {
 type FlushFn = Box<dyn Fn() + Send + Sync + 'static>;
 
 /// Silo-style epoch group commit controller.
+///
+/// Abandoned scaffold — see the module docs. Superseded by
+/// `fsqlite_pager::GroupCommitQueue`.
+#[deprecated(
+    note = "abandoned scaffold (bd-rh3sr): never wired; the live commit path \
+            batches fsyncs via GroupCommitQueue, and the 1->2-thread cliff is \
+            off-CPU lock wait, not per-txn fsync (bd-5fnex). Do not wire."
+)]
 pub struct EpochGroupCommit {
     /// Monotonically increasing epoch counter. Writers observe this at
     /// submit time; the advancer bumps it at each boundary.
