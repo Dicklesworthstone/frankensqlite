@@ -21951,3 +21951,79 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   timed-loop hoist lands, and separately after any product-side sync-facade
   change; expect the 10K-row rows to move by several ms if the attribution
   is right.
+
+## 2026-08-17 - NEGATIVE RESULT (bd-8euyp): lock-free MVCC version-arena alloc removes the arena write-lock but regresses single-thread publish ~48% with no net peak gain; the arena lock is NOT the dominant cost of the publish bench
+
+- Workload: `version_publish/concurrent_writers` in
+  `crates/fsqlite-mvcc/benches/mvcc_bench.rs`
+  (`bench_concurrent_version_publish`): N threads x 2000 `VersionStore::publish`
+  to DISJOINT page ranges. The only cross-thread shared resource in the
+  baseline is `VersionStore::arena` (`RwLock<VersionArena>`), taken `.write()`
+  across `alloc()` + prev-link + chain-head CAS, so disjoint-page publishers
+  serialize on one exclusive lock.
+- Change (implemented, correct, all tests green — but NOT landed): made
+  `VersionArena::alloc` lock-free `&self` and dropped the exclusive arena hold
+  on the publish hot path. `VersionStore::publish` now allocates under a SHARED
+  `arena.read()`; reclamation keeps the exclusive `arena.write()`. Arena
+  internals rewritten to safe atomics only (`#![forbid(unsafe_code)]`
+  preserved): a two-level lazily-initialized chunk directory of
+  `OnceLock<Box<[ArenaSlot]>>` (stable addresses so `get()` still returns
+  `&PageVersion`), an `AtomicU64` bump cursor, per-slot `OnceLock<PageVersion>`
+  write-once cells, and an intrusive lock-free Treiber free stack
+  (`next_free: AtomicU64` per slot; push-under-write-lock / pop-under-read-lock
+  separation makes the pop ABA-free). Chain-head install became a load->link->
+  CAS with a `#[cold]` exclusive-relink fallback for the rare same-page CAS
+  race (per-page publishes are already serialized by INV-2 page locks, so the
+  fast-path CAS wins on the first attempt in the disjoint-page bench).
+- Files touched (reverted to HEAD in the working tree; full change preserved as
+  the artifact patch): `crates/fsqlite-mvcc/src/core_types.rs`,
+  `crates/fsqlite-mvcc/src/invariants.rs`.
+- Correctness: `cargo test -p fsqlite-mvcc --lib -j16` = **1517 passed;
+  0 failed; 15 ignored** with the change in place. EBR two-phase retirement,
+  per-slot generation (no ABA / use-after-retire), `VersionIdx`
+  (chunk,slot,generation) stability, `get()` allocation-free correctness, and
+  concurrent-writer defaults all hold. The lock-free change is SAFE; it is
+  simply not a win on this workload.
+- Measured result (criterion median aggregate throughput, same host,
+  back-to-back, disposable criterion baseline):
+  | threads | HEAD baseline | lock-free (mine) | delta  |
+  |---------|---------------|------------------|--------|
+  | 1       | 686 K/s       | 358 K/s          | -48%   |
+  | 2       | 326 K/s       | 334 K/s          | +2%    |
+  | 4       | 421 K/s       | 416 K/s          | -1%    |
+  | 8       | 432 K/s       | 525 K/s          | +22%   |
+  Confirmed stable across two runs (criterion self-delta: 1T -33%, 8T +20%).
+  Peak throughput does NOT improve: baseline best is 686 K/s (at 1T), mine is
+  525 K/s (at 8T) — 24% below baseline peak. It also still dips below its own
+  1T at 2T (334 < 358), i.e. it does not satisfy the bd-8euyp acceptance bar
+  ("aggregate throughput rises with threads / does not collapse below 1T").
+- Why (attribution): the baseline's worse-than-serial 2T collapse
+  (686 -> 326) IS arena write-lock contention. But removing that lock does NOT
+  recover 2T (334 ~= 326): a SECOND super-linear bottleneck dominates — the
+  per-publish `PageData::zeroed(4096)` 4 KiB heap allocation inside the timed
+  loop (global-allocator contention), plus the single shared `AtomicU64` bump
+  cursor cache line. Neither is the version-arena lock, so lock-freeing the
+  arena cannot move the ceiling. Meanwhile the safe lock-free machinery
+  (OnceLock write-once set/get, two-level directory nav, atomic bump/free
+  stack, and moving the first-chunk allocation from untimed setup into the
+  timed routine) adds ~1.3 us/op that, with no contention to amortize at 1T,
+  surfaces as the 48% single-thread regression. Trading a 48% single-writer
+  regression for a 22% 8-writer gain that still trails the single-writer peak
+  is a bad trade for an MVCC engine where single-writer is a common case.
+- Artifacts:
+  - `docs/progress/bd-8euyp-lockfree-arena.patch` (full diff of the two
+    reverted files; re-appliable with `git apply`).
+  - Session scratch copies of the modified sources (session-scoped, may be
+    GC'd): `.../scratchpad/core_types.mine.rs`, `.../invariants.mine.rs`.
+- Retry condition: do NOT re-attempt the lock-free arena against this bench
+  until the per-publish 4 KiB `PageData` allocation is removed from the timed
+  path (e.g. a reused/pooled page buffer, or a bench that publishes
+  pre-allocated `PageVersion`s) AND the shared bump cursor is sharded per
+  writer to kill the cursor cache-line ping-pong. Only then can the arena's
+  own contribution be isolated. Separately, before re-landing, the 1T
+  regression must be closed (recover the write-once/directory per-op overhead,
+  e.g. keep the fast single-chunk path branch-light and pre-allocate the first
+  chunk in `new()` as the old arena did). If a future workload is shown to be
+  genuinely arena-lock-bound (many concurrent disjoint-page publishers with
+  cheap/pooled page data), re-measure this patch there — it is correct and the
+  design is sound; it just lost on an allocation-bound benchmark.
