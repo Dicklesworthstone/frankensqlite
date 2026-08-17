@@ -1520,10 +1520,38 @@ pub struct WalFecRepairPipeline {
     max_pending_jobs: Arc<AtomicUsize>,
     worker_failure: Arc<Mutex<Option<String>>>,
     worker: Option<AsyncJoinHandle<()>>,
+    /// Retained clone of the worker's child cancellation scope.
+    ///
+    /// bd-gwoi0: the worker's `AsyncJoinHandle` is await-only and cannot be
+    /// sync-joined in `Drop`, and the builder `JoinHandle` exposes no `abort()`
+    /// (dropping it merely detaches). To request structured cancellation from
+    /// the synchronous `Drop` path we keep a clone of the child `Cx` that was
+    /// moved into the worker. Because `Cx` clones share their `Arc<CxInner>`,
+    /// `cancel()` here propagates to the worker's copy (and, via the worker's
+    /// attached native cx, wakes an idle `recv`), mirroring the retained
+    /// `ticker_cx` cancellation pattern in `ParallelWalCoordinator`.
+    worker_cx: Option<Cx>,
 }
 
 impl WalFecRepairPipeline {
     /// Start the pipeline worker on an existing asupersync runtime.
+    ///
+    /// # Quiescence contract (bd-gwoi0 / bd-1is5z)
+    ///
+    /// The worker is spawned here as an awaitable `AsyncJoinHandle` because the
+    /// pipeline's own [`Self::shutdown`] must `await` it to drain the queue,
+    /// return final stats, and surface a worker failure. Its quiescence model is
+    /// therefore the awaited async `shutdown()` (analogous to `Connection::close`),
+    /// while [`Drop`] is cancel-only.
+    ///
+    /// This standalone pipeline is not yet owned by a `Connection`, so the raw
+    /// `RuntimeHandle::try_spawn` below is not (yet) "per-Connection background
+    /// work". When the FEC pipeline is wired into a `Connection`, its worker MUST
+    /// be routed through the blessed `Connection::try_spawn_in_region` helper
+    /// (bd-54ulg, 795b91cc0) — or the pipeline restructured so a region
+    /// `TaskHandle` tracks the worker — so that `close_and_drain` accounts for it
+    /// and quiescence-on-Connection-close holds by construction. A task without a
+    /// region `TaskHandle` is invisible to the drain. Tracked as bd-ewwia.
     pub fn start(
         runtime: &RuntimeHandle,
         parent_cx: &Cx,
@@ -1552,12 +1580,20 @@ impl WalFecRepairPipeline {
             worker_failure: Arc::clone(&worker_failure),
         };
 
-        let worker_cx = parent_cx.create_child();
+        // bd-gwoi0: `create_child_for_spawn` is the spawn-correct primitive for a
+        // child `Cx` moved into a newly spawned task — it inherits the
+        // cancellation lineage, budget, and tracing metadata but deliberately
+        // omits the parent thread's native/inline-blocking affinity, since the
+        // worker attaches its own native context after it starts (below, via
+        // `set_native_cx(NativeCx::current())`). We retain a clone so the sync
+        // `Drop` path can request structured cancellation of the worker.
+        let worker_cx = parent_cx.create_child_for_spawn();
+        let worker_loop_cx = worker_cx.clone();
         let worker_handle = runtime
             .try_spawn(run_repair_pipeline_worker(
                 rx,
                 worker_state,
-                worker_cx,
+                worker_loop_cx,
                 config.per_symbol_delay,
             ))
             .map_err(|err| FrankenError::WalCorrupt {
@@ -1574,6 +1610,7 @@ impl WalFecRepairPipeline {
             max_pending_jobs,
             worker_failure,
             worker: Some(worker_handle),
+            worker_cx: Some(worker_cx),
         })
     }
 
@@ -1661,6 +1698,10 @@ impl WalFecRepairPipeline {
         if let Some(worker) = self.worker.take() {
             worker.await;
         }
+        // Graceful shutdown drains on channel-disconnect; the worker has now
+        // exited, so release the retained cancellation handle without firing it
+        // (force-cancel is `Drop`/`cancel()` only, per the doc contract above).
+        self.worker_cx.take();
         let worker_failure_detail = lock_unpoisoned(&self.worker_failure).clone();
         if let Some(detail) = worker_failure_detail {
             return Err(FrankenError::WalCorrupt { detail });
@@ -1671,12 +1712,40 @@ impl WalFecRepairPipeline {
 
 impl Drop for WalFecRepairPipeline {
     fn drop(&mut self) {
-        if self.worker.is_some() {
+        if let Some(worker) = self.worker.take() {
+            // bd-gwoi0: request cancellation from the synchronous Drop path.
+            //
+            // The worker's `AsyncJoinHandle` is await-only, and the builder
+            // `JoinHandle` exposes no `abort()` and no cancel-on-drop — dropping
+            // it merely DETACHES (verified: asupersync 0.4.5
+            // `runtime::builder::JoinHandle` has only `is_finished()` + `Future`;
+            // see the `runtime_three_way_drop_vs_abort_distinction_audit` /
+            // `runtime_join_handle_no_separable_abort_handle_audit` tests). So we
+            // cannot join or abort via the handle here. Instead we cancel the
+            // three application-level channels the worker observes:
+            //   1. `cancel_flag` (polled inside `process_repair_work_item`),
+            //   2. the queue sender drop (idle `recv` returns `Disconnected`),
+            //   3. the retained child `Cx` (`cancel()` propagates over the shared
+            //      `Arc<CxInner>` to the worker's clone and — via its attached
+            //      native cx — wakes an idle `recv` with `Cancelled`; it also
+            //      propagates to every per-work `work_cx` descendant).
+            // This mirrors `ParallelWalCoordinator`, which retains `ticker_cx`
+            // and calls `ticker_cx.cancel()`; that sibling can additionally
+            // `handle.wait()` because it uses a blocking task, which we cannot.
+            //
+            // This is cancel-only: awaiting the worker's exit (quiescence) still
+            // requires the graceful async `shutdown()` (or the parent region's
+            // awaited close/drain) — exactly the Connection Drop contract, which
+            // is cancel-only with quiescence via awaited `close()` (bd-2lwkg).
             self.cancel();
             self.sender.take();
+            if let Some(worker_cx) = self.worker_cx.take() {
+                worker_cx.cancel();
+            }
+            drop(worker);
             warn!(
                 pending_jobs = self.pending_jobs.load(Ordering::SeqCst),
-                "dropping wal-fec repair pipeline without awaiting shutdown"
+                "dropping wal-fec repair pipeline without awaiting shutdown; worker cancellation requested"
             );
         }
     }
