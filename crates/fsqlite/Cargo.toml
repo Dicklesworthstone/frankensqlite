@@ -24,17 +24,22 @@ fsqlite-parser = { workspace = true }
 tracing = { workspace = true }
 
 [features]
-default = ["native", "linux-asupersync-uring", "json", "fts5", "rtree"]
+# `native` no longer transitively links every extension vtab (fsqlite#356):
+# fsqlite-core's `native` stopped implying `extensions`, and each facade ext
+# feature now forwards to the matching core registration feature. The default
+# set adds `icu` + `misc` so a default facade build keeps the exact same
+# engine capabilities it had when core's `native` force-enabled everything.
+default = ["native", "linux-asupersync-uring", "json", "fts5", "rtree", "icu", "misc"]
 native = ["dep:asupersync", "fsqlite-types/native", "fsqlite-core/native", "fsqlite-vfs/native"]
 wasm = ["fsqlite-types/wasm", "fsqlite-core/wasm", "fsqlite-vfs/wasm"]
 linux-asupersync-uring = ["native", "fsqlite-core/linux-asupersync-uring", "fsqlite-vfs/linux-asupersync-uring"]
-json = ["dep:fsqlite-ext-json"]
-fts5 = ["dep:fsqlite-ext-fts5"]
+json = ["dep:fsqlite-ext-json", "fsqlite-core/ext-json"]
+fts5 = ["dep:fsqlite-ext-fts5", "fsqlite-core/ext-fts5"]
 fts3 = ["dep:fsqlite-ext-fts3"]
-rtree = ["dep:fsqlite-ext-rtree"]
+rtree = ["dep:fsqlite-ext-rtree", "fsqlite-core/ext-rtree"]
 session = ["dep:fsqlite-ext-session"]
-icu = ["dep:fsqlite-ext-icu"]
-misc = ["dep:fsqlite-ext-misc"]
+icu = ["dep:fsqlite-ext-icu", "fsqlite-core/ext-icu"]
+misc = ["dep:fsqlite-ext-misc", "fsqlite-core/ext-misc"]
 async-api = ["dep:asupersync", "dep:futures-lite", "fsqlite-types/native"]
 raptorq = []
 mvcc = []
