@@ -4,6 +4,7 @@ pub mod memory;
 pub mod metrics;
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub mod namespace;
+pub mod process;
 pub mod shm;
 pub mod traits;
 #[cfg(all(feature = "native", unix))]
