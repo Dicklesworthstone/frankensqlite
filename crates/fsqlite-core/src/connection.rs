@@ -22706,17 +22706,27 @@ impl Connection {
         // Preserve the verbatim CREATE text for a single top-level CREATE so it
         // persists into sqlite_master exactly as written (matching stock SQLite),
         // rather than a re-serialized AST form that can drop semantically necessary
-        // parentheses. Guarded to CreateTable only so an internal ALTER->CREATE
-        // rewrite can never mistake an ALTER's text for a table definition;
-        // multi-statement batches fall back to AST serialization.
+        // parentheses. Covers CREATE TABLE / INDEX / VIEW / TRIGGER — every object
+        // whose definition round-trips through sqlite_master.sql. An internal
+        // ALTER->CREATE rewrite never reaches here (those paths re-render via
+        // render_create_* and write sqlite_master directly, without going through
+        // execute()); multi-statement batches fall back to AST serialization.
         //
-        // bd-lgolw: the captured text must begin at the statement's first
-        // token. Stock sqlite3 stores the CREATE from its first keyword; a
+        // bd-lgolw / bd-xfmv9: the captured text must begin at the statement's
+        // first token. Stock sqlite3 stores the CREATE from its first keyword; a
         // leading `-- comment` (which parses as part of a one-statement
         // script) persisted into sqlite_master makes canonical SQLite fail
-        // the whole schema load with "malformed database schema (<table>)".
+        // the whole schema load with "malformed database schema (<table>)". For
+        // CREATE TRIGGER the AST re-render also collapsed redundant `WHEN`
+        // parentheses (GH#350), so triggers likewise need the verbatim capture.
         *self.pending_ddl_source.borrow_mut() = (statements.len() == 1
-            && matches!(statements[0].as_ref(), Statement::CreateTable(_)))
+            && matches!(
+                statements[0].as_ref(),
+                Statement::CreateTable(_)
+                    | Statement::CreateIndex(_)
+                    | Statement::CreateView(_)
+                    | Statement::CreateTrigger(_)
+            ))
         .then(|| {
             // Both boundaries mirror stock sqlite3's stored text: begin at the
             // statement's first token, end at its last (no terminator, no
@@ -56668,8 +56678,15 @@ impl Connection {
             }
         }
 
-        // Phase 5: Persist to sqlite_master
-        let create_sql = stmt.to_string();
+        // Phase 5: Persist to sqlite_master. bd-xfmv9: reuse the verbatim CREATE
+        // text captured in execute() (byte-faithful to what the user issued,
+        // e.g. redundant parens in a partial-index WHERE) when present; fall back
+        // to AST re-render for multi-statement batches / internal rewrites.
+        let create_sql = self
+            .pending_ddl_source
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| stmt.to_string());
         if !target_is_temp {
             self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)
                 .await?;
@@ -56892,7 +56909,14 @@ impl Connection {
         if !target_is_temp {
             validate_persistent_view_schema_references(&stmt.query, view_name, "main")?;
         }
-        let create_sql = stmt.to_string();
+        // bd-xfmv9: prefer the verbatim CREATE VIEW text captured in execute()
+        // (byte-faithful to the issued statement, incl. redundant parens in the
+        // view's SELECT) over an AST re-render; fall back for batches / rewrites.
+        let create_sql = self
+            .pending_ddl_source
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| stmt.to_string());
         self.views.borrow_mut().push(ViewDef {
             name: view_name.clone(),
             columns: stmt.columns.clone(),
@@ -56961,7 +56985,16 @@ impl Connection {
         }
         drop(triggers);
 
-        let create_sql = stmt.to_string();
+        // bd-xfmv9 (GH#350): prefer the verbatim CREATE TRIGGER text captured in
+        // execute() over an AST re-render. The re-render collapsed redundant
+        // `WHEN (((a) AND (b)))` parentheses, so a trigger could not round-trip
+        // through sqlite_master byte-for-byte (breaking schema-digest consumers
+        // and stock sqlite3 tooling). Fall back for batches / internal rewrites.
+        let create_sql = self
+            .pending_ddl_source
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| stmt.to_string());
         self.triggers
             .borrow_mut()
             .push(TriggerDef::from_create_statement(stmt, create_sql.clone()));
@@ -66019,6 +66052,93 @@ impl Connection {
                             return Ok(rows);
                         }
                     }
+                }
+                // bd-btdr7 (GH#352): a WITHOUT ROWID table's PRIMARY KEY *is* the
+                // table b-tree, so no sqlite_autoindex_<t>_<N> schema row exists
+                // for it — yet PRAGMA index_list reports it (bd-sn184 / #344).
+                // Complete that pair here: when the requested index is that
+                // synthesized PK auto-index, enumerate its key columns from the
+                // declared PRIMARY KEY (key=1) followed — for index_xinfo — by the
+                // remaining table columns (key=0), matching stock. Reporting only:
+                // no schema row, no root page, and no trailing rowid entry (a
+                // WITHOUT ROWID table has no rowid). Per-column PK sort order is
+                // not retained in the schema, so key terms report ASC (desc=0);
+                // collation comes from each column's declared COLLATE.
+                for table in &tables {
+                    if !table.without_rowid {
+                        continue;
+                    }
+                    let Some(pk_cols) = table.primary_key_constraints.first() else {
+                        continue;
+                    };
+                    if pk_cols.is_empty() {
+                        continue;
+                    }
+                    // The PK auto-index ordinal is the one number missing from the
+                    // persisted auto-index set — the same choice index_list makes.
+                    let persisted: std::collections::BTreeSet<usize> = table
+                        .indexes
+                        .iter()
+                        .filter_map(|idx| parse_autoindex_ordinal(&idx.name, &table.name))
+                        .collect();
+                    let Some(pk_ordinal) =
+                        (1..=persisted.len() + 1).find(|n| !persisted.contains(n))
+                    else {
+                        continue;
+                    };
+                    let pk_name = format!("sqlite_autoindex_{}_{pk_ordinal}", table.name);
+                    if !pk_name.eq_ignore_ascii_case(&index_name) {
+                        continue;
+                    }
+                    // PK columns (in declaration order) resolved to storage cids.
+                    let pk_cids: Vec<usize> = pk_cols
+                        .iter()
+                        .filter_map(|name| {
+                            table
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(name))
+                        })
+                        .collect();
+                    // index_info reports only the key columns; index_xinfo appends
+                    // the remaining (covered) table columns with key=0.
+                    let mut entries: Vec<(usize, bool)> =
+                        pk_cids.iter().map(|&cid| (cid, true)).collect();
+                    if is_xinfo {
+                        for cid in 0..table.columns.len() {
+                            if !pk_cids.contains(&cid) {
+                                entries.push((cid, false));
+                            }
+                        }
+                    }
+                    let rows = entries
+                        .into_iter()
+                        .enumerate()
+                        .map(|(seq, (cid, is_key))| {
+                            let col = &table.columns[cid];
+                            let seqno = SqliteValue::Integer(i64::try_from(seq).unwrap_or(0));
+                            let cid_val = SqliteValue::Integer(i64::try_from(cid).unwrap_or(-1));
+                            let name = SqliteValue::Text(col.name.clone().into());
+                            if is_xinfo {
+                                let coll = col.collation.as_deref().unwrap_or("BINARY");
+                                Row {
+                                    values: vec![
+                                        seqno,
+                                        cid_val,
+                                        name,
+                                        SqliteValue::Integer(0),
+                                        SqliteValue::Text(coll.into()),
+                                        SqliteValue::Integer(i64::from(is_key)),
+                                    ],
+                                }
+                            } else {
+                                Row {
+                                    values: vec![seqno, cid_val, name],
+                                }
+                            }
+                        })
+                        .collect();
+                    return Ok(rows);
                 }
                 Ok(Vec::new())
             }

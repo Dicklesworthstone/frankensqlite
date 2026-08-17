@@ -328,3 +328,35 @@ fn pragma_index_list_rowid_composite_pk() {
         .await;
     });
 }
+
+/// GH #352 (bd-btdr7) -- the residual half of #344. `index_list` now reports the
+/// WITHOUT ROWID PRIMARY KEY auto-index (bd-sn184), but `index_xinfo` on that
+/// slot returned NO ROWS, so a consumer reading key columns saw a PK that
+/// "exists but has no columns". Stock enumerates the PK columns (key=1) followed
+/// by the remaining table columns (key=0):
+///
+///     index_xinfo(sqlite_autoindex_w_1) -> a|1, b|1, c|0, d|0
+///
+/// `index_info` on the same slot reports only the key columns (a, b). Both are
+/// compared against the C-SQLite oracle on the identical DDL used by the #344
+/// sibling above.
+#[test]
+fn pragma_index_xinfo_without_rowid_pk_gh352() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE w (a TEXT NOT NULL, b INTEGER NOT NULL, c TEXT NOT NULL, d TEXT NOT NULL, \
+             PRIMARY KEY(a,b), UNIQUE(a,c), UNIQUE(d)) WITHOUT ROWID",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                "PRAGMA index_xinfo(sqlite_autoindex_w_1)",
+                "PRAGMA index_info(sqlite_autoindex_w_1)",
+            ],
+            "pragma_index_xinfo_without_rowid_pk",
+        )
+        .await;
+    });
+}
