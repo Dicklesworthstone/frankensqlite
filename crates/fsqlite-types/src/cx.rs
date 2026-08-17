@@ -3723,16 +3723,19 @@ mod tests {
                     // The sanctioned detached-root constructor is
                     // `Cx::detached_rebind()` (fsqlite-types), which the forbidden
                     // scan never matches, so every routed site passes with no
-                    // allowlist. The one remaining bare `Cx::new()` is inside
-                    // `Connection::detached_rebind_cx` itself — the documented
-                    // canonical detached-rebind site (bd-gzyk1 / GH#348, VACUUM
-                    // rebind). It is pending conversion to `Cx::detached_rebind()`
-                    // (blocked on an exclusive lease on connection.rs); until then
-                    // its single documented line is allowed.
+                    // allowlist (e.g. the pager drop-cleanup path). The remaining
+                    // bare `Cx::new()` sites are connection.rs's two documented
+                    // detached-root constructors — `RuntimeContext::detached_root_cx`
+                    // (`Cx::new().with_trace_context(...)`) and
+                    // `Connection::detached_rebind_cx` (`let rebind_cx = Cx::new();`,
+                    // bd-gzyk1 / GH#348, VACUUM rebind). Both are pending conversion
+                    // to `Cx::detached_rebind()` (blocked on an exclusive lease on
+                    // connection.rs); until then their documented lines are allowed.
                     let allowed_detached_root_constructor = rel_path
                         == Path::new("crates/fsqlite-core/src/connection.rs")
                         && pat == "Cx::new("
-                        && line_text.contains("let rebind_cx = Cx::new();");
+                        && (line_text.contains("Cx::new().with_trace_context(")
+                            || line_text.contains("let rebind_cx = Cx::new();"));
 
                     if allowed_detached_root_constructor {
                         continue;
