@@ -33,7 +33,30 @@ use crate::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion, VfsWriteComp
 const SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN: u32 = 0x0000_0800;
 const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
 const WINDOWS_FILE_SHARE_WRITE: u32 = 0x0000_0002;
-const WINDOWS_SHARE_READ_WRITE: u32 = WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE;
+const WINDOWS_FILE_SHARE_DELETE: u32 = 0x0000_0004;
+// bd-h5oaj / GH#355: stock SQLite's winOpen always includes
+// FILE_SHARE_DELETE alongside READ|WRITE. Omitting it here was a
+// deliberate deviation to close a preflight-to-final-open TOCTOU window,
+// but the reserved-builder path holds two overlapping handles on the same
+// path (fsqlite-core's `DatabaseBuilderReservation` retains the first for
+// the reservation's whole lifetime while the pager opens a second), and an
+// external delete-access opener (AV real-time scanning, indexing, backup
+// software commonly requests DELETE access even for a read) racing either
+// handle can hit NTFS's mandatory share-mode arbitration and fail with a
+// sharing violation -- observed as a flaky (not deterministic)
+// `CannotOpen`/`store.disk` refusal, Windows-only. FILE_SHARE_DELETE does
+// NOT make the file deletable-while-open in the POSIX sense: Windows still
+// enters "delete pending" on a `DeleteFile`/`FILE_DISPOSITION_INFO` call
+// against an open handle, which blocks reopening the same name until the
+// last handle closes -- exactly what `SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN`
+// (below) already declares to callers, so that contract is unaffected.
+// The TOCTOU the omission guarded is already covered independently by the
+// `FileIdentity` re-checks after every final open (see
+// `open_with_expected_identity` / `open_reserved_with_expected_identity`
+// below and `pager.rs`'s post-open identity verification), so matching
+// stock SQLite's share mode here is safe.
+const WINDOWS_SHARE_READ_WRITE_DELETE: u32 =
+    WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE | WINDOWS_FILE_SHARE_DELETE;
 
 // Stock SQLite's Windows VFS coordinates main-database access through these
 // byte ranges on the *database file itself*. They intentionally match the
@@ -297,7 +320,7 @@ fn lock_poisoned(name: &str) -> FrankenError {
 
 fn windows_open_options() -> OpenOptions {
     let mut options = OpenOptions::new();
-    options.share_mode(WINDOWS_SHARE_READ_WRITE);
+    options.share_mode(WINDOWS_SHARE_READ_WRITE_DELETE);
     options
 }
 
@@ -1331,9 +1354,10 @@ impl Vfs for WindowsVfs {
 
         // Query through a read-only handle before `open` reaches
         // `WindowsOsLockFiles::open`, which creates the advisory sidecars.
-        // Our share mode deliberately omits FILE_SHARE_DELETE, so retaining
-        // this guard also prevents a pathname replacement between the
-        // preflight and the final read-write handle verification.
+        // Our share mode now matches stock SQLite (READ|WRITE|DELETE, see
+        // bd-h5oaj / GH#355 above `windows_open_options`); the pathname
+        // -replacement TOCTOU this guard also used to lean on is covered
+        // independently by the `final_identity` re-check below.
         let mut options = windows_open_options();
         let identity_guard = options.read(true).open(&resolved).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
@@ -1449,8 +1473,11 @@ impl Vfs for WindowsVfs {
         }
 
         // Only an accepted reservation may create the Windows advisory-lock
-        // sidecars. The live main handle above omits FILE_SHARE_DELETE, so the
-        // pathname cannot be replaced between verification and construction.
+        // sidecars. The main handle above now shares FILE_SHARE_DELETE like
+        // stock SQLite (bd-h5oaj / GH#355); the identity and zero-length
+        // checks just above already re-verify against the live handle, so a
+        // pathname replacement between verification and construction is
+        // still caught rather than silently admitted.
         let os_locks = WindowsOsLockFiles::open(&resolved)?;
         let owner_id = next_owner_id();
         let shm_path = sqlite_shm_path(&resolved);
