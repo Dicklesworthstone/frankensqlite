@@ -25425,15 +25425,20 @@ where
                 && !inner.abandoned_eof_reservations.is_empty()
             {
                 let db_size = inner.db_size;
-                let pool = std::mem::take(&mut inner.abandoned_eof_reservations);
-                let mut reconciled: Vec<PageNumber> = Vec::new();
-                {
-                    let mut wal_guard = async_rwlock_write(&wal, cx, "WAL backend").await?;
+                // Best-effort under the checkpoint fence: on a transient
+                // WAL-lock or refresh error, leave the pool untouched for the
+                // guard to handle rather than failing the checkpoint or dropping
+                // entries (mirrors the reverted fold's best-effort intent, but
+                // via the pool + commit-fold machinery instead of a direct
+                // page-1 write).
+                if let Ok(mut wal_guard) = async_rwlock_write(&wal, cx, "WAL backend").await {
                     let wal_ref = wal_guard.as_mut();
                     // A connection-local backend view can lag peers' commits;
                     // the no-committed-frame test is only meaningful against the
                     // refreshed publication horizon (bd-vnxjd/bd-dw8oe).
-                    let _ = wal_ref.refresh_published_snapshot(cx).await?;
+                    let _ = wal_ref.refresh_published_snapshot(cx).await;
+                    let pool = std::mem::take(&mut inner.abandoned_eof_reservations);
+                    let mut reconciled: Vec<PageNumber> = Vec::new();
                     for page in pool {
                         if page.get() > db_size {
                             // Above the durable extent: reissuable from EOF.
@@ -25446,16 +25451,17 @@ where
                             Err(_) => inner.abandoned_eof_reservations.push(page),
                         }
                     }
-                }
-                if !reconciled.is_empty() {
-                    if std::env::var_os("IOQ6X_TRACE").is_some() {
-                        eprintln!(
-                            "IOQ6X CKPT-FOLD reconciled={} pool_remaining={}",
-                            reconciled.len(),
-                            inner.abandoned_eof_reservations.len(),
-                        );
+                    drop(wal_guard);
+                    if !reconciled.is_empty() {
+                        if std::env::var_os("IOQ6X_TRACE").is_some() {
+                            eprintln!(
+                                "IOQ6X CKPT-FOLD reconciled={} pool_remaining={}",
+                                reconciled.len(),
+                                inner.abandoned_eof_reservations.len(),
+                            );
+                        }
+                        return_pages_to_freelist(&mut inner.freelist, reconciled);
                     }
-                    return_pages_to_freelist(&mut inner.freelist, reconciled);
                 }
             }
         }
@@ -28942,28 +28948,29 @@ mod tests {
         });
     }
 
-    // GH#348 / bd-gzyk1 wedge-reproduction probe.
+    // GH#348 / bd-gzyk1 exit-path counter-hygiene guard (NOT a reproducer).
     //
     // The reporter's permanent per-connection BusySnapshot roots in a stuck
     // `PagerInner.active_transactions > 0`, which pins
     // `refresh_published_snapshot` on its stale-skip early return (every
     // autocommit read then binds a stale visibility and fails BusySnapshot
-    // forever). The inferred mechanism is a cancelled autocommit statement whose
+    // forever). The inferred trigger is a cancelled autocommit statement whose
     // transaction-exit external unlock aborts before the `active_transactions`
     // decrement.
     //
-    // This test drives that exact mechanism at the pager level: a read
-    // transaction is begun (active_transactions -> 1), the owning cx is
-    // cancelled, and the handle is dropped — running the mandatory external
-    // unlock under a cancelled lineage through the checkpoint-enforced-unlock
-    // harness (whose `unlock`/`restore` abort on a cancelled, mask-honoring cx).
-    // It then asserts the reporter's ROOT invariant directly (the counter must
-    // return to 0) and proves there is no *permanent* wedge by running a fresh
-    // read boundary afterward: `refresh_published_snapshot` must succeed and a
-    // fresh begin must be admitted. If the exit leaks the counter, the fresh
-    // `refresh_published_snapshot` returns the stale-skip snapshot and the
-    // counter assertion fails — i.e. this test goes RED whenever the leak the
-    // wedge depends on is present.
+    // IMPORTANT: this is a non-regression guard for exit-path counter hygiene,
+    // NOT a reproducer of the reporter's wedge. It begins a read
+    // (active_transactions -> 1), cancels the owning WRAPPER cx, drops the handle
+    // so the mandatory external unlock runs under a cancelled lineage, then
+    // asserts the counter returns to 0 and a fresh read boundary
+    // (`refresh_published_snapshot` + begin) is admitted. It stays GREEN even
+    // BEFORE the fixes (506c2a193 mask-aware native rwlock; 956d1c584 detached
+    // cleanup cx), because the wrapper-cancel path is already masked and the
+    // synchronous `SimpleTransaction::Drop` net cures a transient exit leak
+    // regardless — so it cannot go red on the reporter's mechanism. The actual
+    // wedge needs a cancelled NATIVE task cx (dropped future / native timeout),
+    // which the single-process MemoryVfs harness cannot model. Confirm the wedge
+    // itself via a real-runtime retest (see bd-gzyk1).
     #[test]
     fn test_gh348_cancelled_readonly_exit_does_not_leak_active_transactions_or_wedge() {
         asupersync::test_utils::run_test(|| async {
@@ -29041,7 +29048,11 @@ mod tests {
     // bypassed the `.masked()` guard. This probe cancels the owning cx and then
     // drives the async readonly-commit exit, asserting the counter is not left
     // stuck (`active_transactions` must be 0 immediately after commit returns,
-    // before any drop safety net can mask a real leak).
+    // before any drop safety net can mask a real leak). Like its drop-based
+    // sibling above, this is a counter-hygiene guard, NOT a true reproducer: it
+    // stays green even before 506c2a193/956d1c584 (the wrapper-cancel is masked
+    // and 506c2a193 makes async_rwlock honor mask_depth), because the harness
+    // cannot model the native-task cancellation the real wedge needs.
     #[test]
     fn test_gh348_cancelled_readonly_async_commit_exit_does_not_leak() {
         asupersync::test_utils::run_test(|| async {
