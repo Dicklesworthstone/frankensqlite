@@ -356,14 +356,27 @@ mod tests {
     #[test]
     fn test_vacuum_into_many_schema_objects_stays_compact_gh347() {
         asupersync::test_utils::run_test(|| async {
-            let tables = env_usize("FSQ347_TABLES", 360);
-            let indexes = env_usize("FSQ347_INDEXES", 3);
-            let rows = env_usize("FSQ347_ROWS", 8);
+            // GH#347 default shape: few tables, MANY rows, at least one
+            // non-monotonic index (the TEXT column `a` and the UNIQUE TEXT
+            // column `u` sort differently from rowid). Enough rows per index that
+            // its b-tree spans multiple pages is what forces the unsorted per-row
+            // bulk-load to insert at random b-tree positions, leaving grossly
+            // sparse pages (~14x the compact source at this shape). A few-rows /
+            // many-tables shape keeps every index b-tree single-page and does NOT
+            // reproduce, so the defaults must stay row-heavy. 2000 rows/table is
+            // the fastest shape (~12s) that still reproduces with a wide margin;
+            // FSQ347_ROWS=40000 additionally surfaces the freed-scratch freelist
+            // *trunk* symptom (trunk=17073 at HEAD) at the cost of a ~6-min run.
+            let tables = env_usize("FSQ347_TABLES", 8);
+            let indexes = env_usize("FSQ347_INDEXES", 2);
+            let rows = env_usize("FSQ347_ROWS", 2_000);
             let payload = env_usize("FSQ347_PAYLOAD", 0);
             let add_unique = env_usize("FSQ347_UNIQUE", 1) != 0;
             let without_rowid = env_usize("FSQ347_WITHOUT_ROWID", 0) != 0;
             let stock_compact = env_usize("FSQ347_STOCK_COMPACT", 1) != 0;
-            let strict = env_usize("FSQ347_STRICT", 0) != 0;
+            // Strict compaction is the regression guard by default; env override
+            // stays so the built binary can still be swept without recompiling.
+            let strict = env_usize("FSQ347_STRICT", 1) != 0;
 
             let dir = tempfile::tempdir().unwrap();
             let source_path = dir.path().join("gh347-source.db");
@@ -476,9 +489,12 @@ mod tests {
                 .unwrap();
             drop(oracle_out);
 
+            // Mirror the strict assertion's tolerance so the diagnostic label
+            // agrees with pass/fail: a compact output within 15% of source is
+            // NOT a reproduction, even though it is a few pages over stock.
             let reproduced = out_freelist_count != 0
                 || out_freelist_trunk != 0
-                || i64::from(out_page_count) > img_page_count;
+                || i64::from(out_page_count) * 100 > img_page_count * 115;
 
             eprintln!(
                 "GH#347[tables={tables} idx={indexes} rows={rows} payload={payload} \
@@ -497,6 +513,11 @@ mod tests {
                 "stock sqlite3 VACUUM INTO must be compact"
             );
             if strict {
+                // Canonical compaction signals: stock VACUUM leaves the freelist
+                // empty. The pre-fix unsorted bulk-load freed balance-scratch
+                // pages that serialized as a non-empty freelist trunk (trunk=17073
+                // freelist=144 at the 40000-row shape); the fix must drive both to
+                // zero.
                 assert_eq!(
                     out_freelist_count, 0,
                     "GH#347: VACUUM INTO output must have an empty freelist (count={out_freelist_count} trunk={out_freelist_trunk})"
@@ -505,9 +526,19 @@ mod tests {
                     out_freelist_trunk, 0,
                     "GH#347: VACUUM INTO output must not invent a freelist trunk"
                 );
+                // Compaction: the pre-fix output is 2.7x-14x the compact source
+                // (random-position index inserts leave grossly sparse pages). The
+                // fix inserts index keys in sorted b-tree order, collapsing that to
+                // within ~3% of source — the residual is fsqlite's slightly looser
+                // index-page fill vs stock's balance-quick, a distinct packing
+                // matter, not the GH#347 non-compaction defect. Bound at 1.15x so
+                // the assertion isolates the defect (fails at 2.7x-14x) without
+                // demanding byte-for-byte parity with stock's packing.
                 assert!(
-                    i64::from(out_page_count) <= img_page_count,
-                    "GH#347: VACUUM INTO output ({out_page_count}) must not exceed source ({img_page_count})"
+                    i64::from(out_page_count) * 100 <= img_page_count * 115,
+                    "GH#347: VACUUM INTO output ({out_page_count}) must stay within 15% of the \
+                     compact source ({img_page_count}); a larger image means the index bulk-load \
+                     is not inserting keys in sorted b-tree order"
                 );
             }
         });

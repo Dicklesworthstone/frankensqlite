@@ -33,6 +33,8 @@ use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+use fsqlite_func::collation::{CollationFunction, CollationRegistry};
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_parser::Parser;
 use fsqlite_types::StrictColumnType;
@@ -75,6 +77,69 @@ const DEFAULT_PAGE_SIZE: PageSize = PageSize::DEFAULT;
 /// Owned sqlite_master row payload used when persistence must preserve
 /// non-table entries such as views and triggers during file rebuilds.
 pub type SqliteMasterEntry = (String, String, String, u32, Option<String>);
+
+/// GH#347: resolve each index-key column's collation name to its comparator
+/// once, up front, so the bulk-load sort below can call it without re-locking
+/// the registry per comparison. `None` (no `COLLATE`) and an unresolved name
+/// both leave the slot empty, which makes the sort fall back to the plain
+/// SQLite value ordering — exactly what the cursor's comparator does.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn resolve_index_collations(
+    collations: &[Option<String>],
+    registry: &Arc<std::sync::Mutex<CollationRegistry>>,
+) -> Vec<Option<Arc<dyn CollationFunction>>> {
+    let guard = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    collations
+        .iter()
+        .map(|coll| coll.as_deref().and_then(|name| guard.find(name)))
+        .collect()
+}
+
+/// GH#347: order two serialized-record key tuples the way the b-tree's own
+/// index comparator does, so a bulk rebuild can insert them in ascending
+/// b-tree order (dense sequential appends) instead of random rowid order
+/// (sparse pages + a freelist trunk).
+///
+/// This is a faithful reconstruction of `BtCursor::compare_index_key_values`
+/// (private to `fsqlite-btree`): per-column SQLite value ordering, replaced by
+/// a resolved collation only when *both* operands are TEXT, then reversed for
+/// DESC columns, with the first non-equal column deciding and ties falling
+/// through to key arity. `SqliteValue`'s `Ord` never yields "incomparable", so
+/// the cursor's value path never falls back to raw bytes and this mirror is
+/// exact. `index_insert` re-seeks on every insert, so even a divergent order
+/// could only change page layout, never corrupt the index; matching the
+/// comparator is what makes the rebuilt b-tree dense.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn compare_rebuilt_index_key(
+    lhs: &[SqliteValue],
+    rhs: &[SqliteValue],
+    desc_flags: &[bool],
+    collations: &[Option<Arc<dyn CollationFunction>>],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let shared = lhs.len().min(rhs.len());
+    for idx in 0..shared {
+        let mut ord = match (
+            collations.get(idx).and_then(|slot| slot.as_ref()),
+            &lhs[idx],
+            &rhs[idx],
+        ) {
+            (Some(coll), SqliteValue::Text(left), SqliteValue::Text(right)) => {
+                coll.compare(left.as_bytes(), right.as_bytes())
+            }
+            _ => lhs[idx].cmp(&rhs[idx]),
+        };
+        if desc_flags.get(idx).copied().unwrap_or(false) {
+            ord = ord.reverse();
+        }
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    lhs.len().cmp(&rhs.len())
+}
 
 /// Select the SQL text persisted for an index entry in `sqlite_master`.
 ///
@@ -1213,7 +1278,22 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             cursor.set_index_collation_context(pk.collations.clone(), collation_registry);
             configure_btree_cursor_page_size(&mut cursor, usable_size, full_page_size);
 
-            for (_synthetic_rowid, values) in mem_table.iter_rows() {
+            // GH#347: sort the primary-key records into ascending b-tree order
+            // before bulk-inserting, so this WITHOUT ROWID index b-tree is built
+            // by dense sequential appends instead of random-position inserts in
+            // rowid order (which leaves sparse pages and a freed-scratch freelist
+            // trunk — a non-compact image). The b-tree orders by the leading pk
+            // columns; sort with the SAME comparator the cursor uses on lookup.
+            let pk_sort_collations =
+                resolve_index_collations(&pk.collations, &cursor.collation_registry());
+            let mut pk_rows: Vec<Vec<SqliteValue>> = mem_table
+                .iter_rows()
+                .map(|(_synthetic_rowid, values)| values.to_vec())
+                .collect();
+            pk_rows.sort_by(|a, b| {
+                compare_rebuilt_index_key(a, b, &pk.desc_flags, &pk_sort_collations)
+            });
+            for values in &pk_rows {
                 // The stored record is the FULL row in declared column order;
                 // the b-tree key is its leading `pk.indices.len()` columns.
                 // `MemDatabase` keys WITHOUT ROWID rows under a synthetic
@@ -1365,6 +1445,9 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                     index_collations.push(None);
                 }
 
+                // GH#347: keep the key semantics for the bulk-load sort below,
+                // before they are moved into the cursor.
+                let sort_desc_flags = index_desc_flags.clone();
                 let mut idx_cursor = fsqlite_btree::BtCursor::new_with_index_desc(
                     TransactionPageIo::new(&mut txn),
                     idx_root,
@@ -1424,9 +1507,23 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                         }
                     }
                 }
+                // GH#347: resolve the key collations for the bulk-load sort
+                // before `index_collations` is moved into the cursor.
+                let sort_collations =
+                    resolve_index_collations(&index_collations, &collation_registry);
                 idx_cursor.set_index_collation_context(index_collations, collation_registry);
                 configure_btree_cursor_page_size(&mut idx_cursor, usable_size, full_page_size);
                 if let Some(mem_table) = db.get_table(table.root_page) {
+                    // GH#347: collect every index key, then sort into ascending
+                    // b-tree order before bulk-inserting. Iterating rows in rowid
+                    // order and inserting per row makes each insert a random-
+                    // position b-tree insert whenever the indexed column's order
+                    // differs from rowid order (any non-monotonic index), which
+                    // leaves ~30% sparse pages plus freed balance-scratch pages
+                    // that serialize as a freelist trunk — a non-compact image
+                    // larger than stock's. Stock SQLite's VACUUM sorts index
+                    // entries first; mirror that with the cursor's own comparator.
+                    let mut index_keys: Vec<Vec<SqliteValue>> = Vec::new();
                     for (rowid, values) in mem_table.iter_rows() {
                         // For partial indexes, skip rows that don't match
                         // the WHERE predicate. If evaluation fails, include
@@ -1474,8 +1571,15 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                         } else {
                             key_values.push(SqliteValue::Integer(rowid));
                         }
-                        let key = serialize_record(&key_values);
-                        idx_cursor.index_insert(cx, &key).await?;
+                        index_keys.push(key_values);
+                    }
+                    index_keys.sort_by(|a, b| {
+                        compare_rebuilt_index_key(a, b, &sort_desc_flags, &sort_collations)
+                    });
+                    for key_values in &index_keys {
+                        idx_cursor
+                            .index_insert(cx, &serialize_record(key_values))
+                            .await?;
                     }
                 }
             }
