@@ -373,6 +373,60 @@ impl SmallText {
         }
     }
 
+    /// Like [`Self::from_record_text_bytes`] but materializes a wide, valid
+    /// UTF-8 TEXT payload directly as a shared `Arc<str>` ([`SmallTextRepr::HeapShared`])
+    /// instead of an owned `String` ([`SmallTextRepr::HeapOwned`]) (bd-rr46j).
+    ///
+    /// Short (inline) text and byte-preserving raw (non-UTF-8) text are
+    /// unchanged. This lets a caller that must both cache and register a freshly
+    /// decoded wide TEXT column pay a single `Arc<str>` allocation and share it
+    /// via an O(1) refcount bump, instead of one owned `String` (for the
+    /// register) plus a separate lazy `Arc::from` clone (for the decode cache).
+    #[must_use]
+    pub fn from_record_text_bytes_shared(bytes: &[u8], encoding: TextEncoding) -> Self {
+        match encoding {
+            TextEncoding::Utf8 => Self::from_bytes_shared(bytes),
+            TextEncoding::Utf16le | TextEncoding::Utf16be => {
+                let little_endian = matches!(encoding, TextEncoding::Utf16le);
+                let (pairs, _trailing_odd_byte) = bytes.as_chunks::<2>();
+                let units = pairs.iter().map(|pair| {
+                    if little_endian {
+                        u16::from_le_bytes(*pair)
+                    } else {
+                        u16::from_be_bytes(*pair)
+                    }
+                });
+                let decoded: String = char::decode_utf16(units)
+                    .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect();
+                Self::from_str_shared(&decoded)
+            }
+        }
+    }
+
+    /// UTF-8 byte payload variant of [`Self::from_record_text_bytes_shared`]:
+    /// valid UTF-8 becomes inline (short) or `HeapShared` (wide); invalid UTF-8
+    /// keeps the byte-preserving raw representation.
+    #[inline]
+    fn from_bytes_shared(bytes: &[u8]) -> Self {
+        match simdutf8::basic::from_utf8(bytes) {
+            Ok(text) => Self::from_str_shared(text),
+            Err(_) => Self::from_raw_bytes(Arc::from(bytes)),
+        }
+    }
+
+    /// Build directly into a shared `Arc<str>` for wide text; inline otherwise.
+    #[inline]
+    fn from_str_shared(s: &str) -> Self {
+        if s.len() <= SMALL_TEXT_INLINE_CAP {
+            Self::new(s)
+        } else {
+            Self {
+                repr: SmallTextRepr::HeapShared(Arc::from(s)),
+            }
+        }
+    }
+
     /// Encode this TEXT value as record-payload bytes for a database using the
     /// given text encoding (bd-bld9w.7) — the inverse of
     /// [`Self::from_record_text_bytes`].

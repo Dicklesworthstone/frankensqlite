@@ -874,6 +874,66 @@ pub fn decode_column_from_offset_reuse_with_encoding(
     decode_value_with_encoding(col.serial_type, bytes, encoding, profile_enabled)
 }
 
+/// Shared-materializing variant of
+/// [`decode_column_from_offset_reuse_with_encoding`] (bd-rr46j).
+///
+/// Identical hint fast path (repeated payloads still return an O(1)
+/// `Arc::clone`), but a freshly decoded wide TEXT column is materialized
+/// directly as a shared `Arc<str>` ([`SmallText::from_record_text_bytes_shared`])
+/// rather than a pool-slot owned `String`. Callers that must both populate the
+/// lazy-decode cache and write the destination register (the SELECT projection
+/// hot path) then pay a single allocation shared via O(1) refcount bumps,
+/// instead of one owned `String` plus a separate lazy `Arc::from` cache clone.
+///
+/// Inline (short) text, BLOBs, and scalar values are byte-for-byte identical to
+/// the non-shared variant.
+pub fn decode_column_from_offset_reuse_with_encoding_shared(
+    data: &[u8],
+    col: &ColumnOffset,
+    hint: Option<&SqliteValue>,
+    encoding: TextEncoding,
+    profile_enabled: bool,
+) -> Option<SqliteValue> {
+    let start = col.body_offset as usize;
+    let end = start.checked_add(col.value_len as usize)?;
+    if end > data.len() {
+        return None;
+    }
+    let bytes = &data[start..end];
+
+    // Fast path: if the hint's raw bytes match, reuse its Arc allocation.
+    if let Some(hint) = hint {
+        match (classify_serial_type(col.serial_type), hint) {
+            (SerialTypeClass::Text, SqliteValue::Text(arc)) if arc.as_bytes_direct() == bytes => {
+                if profile_enabled {
+                    note_decoded_value(hint);
+                }
+                return Some(SqliteValue::Text(arc.clone()));
+            }
+            (SerialTypeClass::Blob, SqliteValue::Blob(arc)) if arc.as_ref() == bytes => {
+                if profile_enabled {
+                    note_decoded_value(hint);
+                }
+                return Some(SqliteValue::Blob(Arc::clone(arc)));
+            }
+            _ => {}
+        }
+    }
+
+    // Fall-through: materialize a freshly decoded wide TEXT column as a shared
+    // Arc<str> so the caller's cache clone is an O(1) refcount bump. All other
+    // classes route through the standard (pool-reusing) decode unchanged.
+    if matches!(classify_serial_type(col.serial_type), SerialTypeClass::Text) {
+        let value = SqliteValue::Text(SmallText::from_record_text_bytes_shared(bytes, encoding));
+        if profile_enabled {
+            note_decoded_value(&value);
+        }
+        return Some(value);
+    }
+
+    decode_value_with_encoding(col.serial_type, bytes, encoding, profile_enabled)
+}
+
 /// Caller-owned scratch for lazy record decode and row materialization.
 ///
 /// This scratch is intended to be owned by a single cursor-like object and

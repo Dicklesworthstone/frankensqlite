@@ -16136,7 +16136,14 @@ impl VdbeEngine {
             // If raw bytes match, reuse the existing Arc (skip malloc+memcpy).
             note_decode_cache_miss(collect_vdbe_metrics);
             let hint = cursor.row_decode.cached_value(payload_idx);
-            let val = fsqlite_types::record::decode_column_from_offset_reuse_with_encoding(
+            // bd-rr46j: materialize a freshly decoded wide TEXT column directly
+            // as a shared `Arc<str>` so the lazy-decode cache entry below and the
+            // destination register share one allocation via O(1) refcount bumps,
+            // rather than one owned `String` (register) plus a separate lazy
+            // `Arc::from` cache clone (a redundant ~1KB malloc+memcpy per row on
+            // a single-pass wide-TEXT scan). The hint fast path is unchanged, so
+            // repeated payloads still reuse the previous row's Arc.
+            let val = fsqlite_types::record::decode_column_from_offset_reuse_with_encoding_shared(
                 &cursor.payload_buf,
                 cursor
                     .row_decode
@@ -16155,10 +16162,13 @@ impl VdbeEngine {
                 record_decoded_value_metrics(&val);
             }
 
-            // Cache the decoded value with buffer reuse.
+            // Cache the decoded value for repeat Column reads at this row. For a
+            // wide TEXT value this clone is now an O(1) `Arc::clone` (the shared
+            // decode above produced `HeapShared`), so the cache stays populated
+            // without a second per-row allocation.
             cursor.row_decode.cache_decoded(payload_idx, val.clone());
 
-            // Write freshly decoded value to register (owned, no clone needed).
+            // Write freshly decoded value to register (shares the cache's Arc).
             self.set_reg_fast(target, val);
             return Ok(true);
         }
