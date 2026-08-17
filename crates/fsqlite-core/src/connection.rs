@@ -76404,9 +76404,19 @@ impl Connection {
             let bound = bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
             return self.execute_join_select(&bound, None).await;
         }
+        // bd-rwaxp: SQLite never codes or materializes a CTE the consuming query
+        // does not reference (directly, or transitively through another referenced
+        // CTE), so a broken-but-unused CTE body must not surface an arity / ORDER
+        // BY / missing-relation error. materialize_with_clause re-executes each CTE
+        // body through the self-validating execute_statement, so pruning the
+        // unreachable CTEs first is what keeps `WITH unused AS (<broken>) SELECT 1`
+        // succeeding while referenced CTEs stay fully validated
+        // (test_select_structure_follows_sqlite_depth_first_precedence).
+        let pruned_with = prune_unreferenced_ctes(select);
+        let with_for_materialize = pruned_with.as_ref().or(select.with.as_ref());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         let result = async {
-            self.materialize_with_clause(select.with.as_ref(), params, &mut temp_tables.tables)
+            self.materialize_with_clause(with_for_materialize, params, &mut temp_tables.tables)
                 .await?;
             // CTE temp tables have dynamically allocated root pages. Do not
             // reuse compiled bytecode keyed only by stripped SQL text, but also
@@ -91872,6 +91882,60 @@ fn select_references_table(select: &SelectStatement, table_name: &str) -> bool {
             .compounds
             .iter()
             .any(|(_, core)| select_core_references_table(core, table_name))
+}
+
+/// Return a pruned copy of `select`'s WITH clause containing only the CTEs the
+/// consuming query references — directly, or transitively through another
+/// referenced CTE. Returns `None` when there is no WITH clause or when every CTE
+/// is already reachable (the caller then keeps the original borrow).
+///
+/// bd-rwaxp: SQLite never codes an unreferenced CTE, so its body is never
+/// validated: `WITH unused AS (<arity-broken / ORDER BY 0 / missing relation>)
+/// SELECT 1` must succeed. FrankenSQLite materializes CTEs by re-executing each
+/// body through the self-validating `execute_statement`, so an unreferenced CTE
+/// would otherwise raise that body's error. Pruning matches SQLite and leaves
+/// every referenced CTE (`WITH used AS (...) SELECT * FROM used`) fully validated.
+fn prune_unreferenced_ctes(select: &SelectStatement) -> Option<fsqlite_ast::WithClause> {
+    let with = select.with.as_ref()?;
+
+    // Names referenced by the consuming body only (not this WITH's own CTE
+    // definitions). A schema-qualified name (`main.t`) never resolves to a CTE,
+    // so it is not a CTE reference (mirrors `visible_cte`'s `schema.is_none()`).
+    let collect = |sink: &mut Vec<String>, stmt: &SelectStatement| {
+        let _ = visit_select_qualified_names(stmt, &mut |name| {
+            if name.schema.is_none() {
+                sink.push(name.name.to_ascii_lowercase());
+            }
+            Ok(())
+        });
+    };
+
+    let mut body = select.clone();
+    body.with = None;
+    let mut worklist: Vec<String> = Vec::new();
+    collect(&mut worklist, &body);
+
+    let mut used = vec![false; with.ctes.len()];
+    while let Some(name) = worklist.pop() {
+        for (index, cte) in with.ctes.iter().enumerate() {
+            if !used[index] && cte.name.eq_ignore_ascii_case(&name) {
+                used[index] = true;
+                collect(&mut worklist, &cte.query);
+            }
+        }
+    }
+
+    if used.iter().all(|&reachable| reachable) {
+        return None;
+    }
+    let mut pruned = with.clone();
+    let mut index = 0;
+    pruned.ctes.retain(|_| {
+        let keep = used[index];
+        index += 1;
+        keep
+    });
+    Some(pruned)
 }
 
 /// Recursively resolve column names for a subquery that uses `SELECT *`.
