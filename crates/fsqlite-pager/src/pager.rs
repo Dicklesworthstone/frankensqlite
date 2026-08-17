@@ -29031,6 +29031,62 @@ mod tests {
         });
     }
 
+    // GH#348 / bd-gzyk1 wedge probe via the ASYNC transaction-exit path.
+    //
+    // Unlike the drop-based probe above (drop uses a synchronous `try_write()`
+    // + mask-honoring `cleanup_cx.checkpoint()` and is a universal safety net),
+    // an autocommit read's reload transaction is retired through the ASYNC
+    // `coordinated_transaction_exit`, which acquires the db-file write lock via
+    // `async_rwlock_write` — the exact acquire whose native fast path historically
+    // bypassed the `.masked()` guard. This probe cancels the owning cx and then
+    // drives the async readonly-commit exit, asserting the counter is not left
+    // stuck (`active_transactions` must be 0 immediately after commit returns,
+    // before any drop safety net can mask a real leak).
+    #[test]
+    fn test_gh348_cancelled_readonly_async_commit_exit_does_not_leak() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _observed_lock_level, _observed_unlock_trace_ids) =
+                observed_lock_pager_with_checkpoint_enforced_unlock().await;
+            let cx = Cx::new().with_trace_context(41, 0, 0);
+
+            let mut txn = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                pager.inner.lock().unwrap().active_transactions,
+                1,
+                "bead_id=bd-gzyk1 case=async_begin_increments_active_transactions"
+            );
+
+            // Cancel the owning cx, then retire the read through the async exit.
+            // The result may be Ok or a transient cancellation Err; what matters
+            // for the wedge is the counter state afterward.
+            cx.cancel();
+            let _ = txn.commit(&cx).await;
+
+            // Counter measured BEFORE dropping the handle: a leaked
+            // active_transactions here is the wedge's root cause (a later drop
+            // would otherwise mask it). If the async exit's unlock aborted before
+            // the decrement, this is 1 (RED); a completed exit leaves 0.
+            let after_commit = pager.inner.lock().unwrap().active_transactions;
+            drop(txn);
+            assert_eq!(
+                after_commit, 0,
+                "bead_id=bd-gzyk1 case=async_cancelled_commit_exit_must_not_leak_active_transactions (observed={after_commit})"
+            );
+
+            // And no permanent wedge: a fresh read boundary converges.
+            let fresh = Cx::new().with_trace_context(99, 0, 0);
+            pager
+                .refresh_published_snapshot(&fresh)
+                .await
+                .expect("bead_id=bd-gzyk1 case=async_post_cancel_refresh_must_converge");
+            assert_eq!(
+                pager.inner.lock().unwrap().active_transactions,
+                0,
+                "bead_id=bd-gzyk1 case=async_fresh_boundary_zero_active_transactions"
+            );
+        });
+    }
+
     #[test]
     fn test_reader_exit_preserves_shared_lock_for_other_reader() {
         asupersync::test_utils::run_test(|| async {
