@@ -237,7 +237,6 @@ fn wr_non_leading_pk_omitted_target_upsert_parity() {
 /// must produce an image the C-SQLite oracle reads as `integrity_check == ok`
 /// with identical rows, and fsqlite must round-trip it on reopen.
 #[test]
-#[ignore = "bd-v6pjf: non-leading-PK WITHOUT ROWID VACUUM/file-format parity not yet landed"]
 fn wr_non_leading_pk_vacuum_into_oracle_readable() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");

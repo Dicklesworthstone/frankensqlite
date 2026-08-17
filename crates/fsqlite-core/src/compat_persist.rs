@@ -53,7 +53,9 @@ use crate::connection::{
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::connection::{eval_join_expr, is_sqlite_truthy};
-use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
+use fsqlite_types::{
+    DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize, without_rowid_storage_order,
+};
 use fsqlite_vdbe::codegen::{
     CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
     bind_explicit_index, without_rowid_pk_indices,
@@ -1286,19 +1288,35 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             // columns; sort with the SAME comparator the cursor uses on lookup.
             let pk_sort_collations =
                 resolve_index_collations(&pk.collations, &cursor.collation_registry());
+            // bd-v6pjf: a non-leading / reordered PRIMARY KEY stores the record
+            // physically PK-leading (PK columns in PK order, then the remaining
+            // columns in declared order) to match C SQLite's on-disk layout.
+            // `MemDatabase` holds the row in DECLARED order, so reorder each row
+            // to physical order before it becomes the b-tree key and the
+            // serialized record. Leading-PK tables give the identity permutation
+            // (physical == declared), so this is a no-op for them.
+            let storage_order = without_rowid_storage_order(&pk.indices, table.columns.len());
             let mut pk_rows: Vec<Vec<SqliteValue>> = mem_table
                 .iter_rows()
-                .map(|(_synthetic_rowid, values)| values.to_vec())
+                .map(|(_synthetic_rowid, values)| {
+                    storage_order
+                        .iter()
+                        .map(|&declared_idx| {
+                            values.get(declared_idx).cloned().unwrap_or(SqliteValue::Null)
+                        })
+                        .collect()
+                })
                 .collect();
             pk_rows.sort_by(|a, b| {
                 compare_rebuilt_index_key(a, b, &pk.desc_flags, &pk_sort_collations)
             });
             for values in &pk_rows {
-                // The stored record is the FULL row in declared column order;
-                // the b-tree key is its leading `pk.indices.len()` columns.
-                // `MemDatabase` keys WITHOUT ROWID rows under a synthetic
-                // counter assigned at load purely to index the map — it is not
-                // part of the row and must not reach the image.
+                // Rows are already physical PK-leading (reordered above), so the
+                // b-tree key is the leading `pk.indices.len()` columns and the
+                // serialized record matches C SQLite's on-disk WITHOUT ROWID
+                // layout. `MemDatabase` keys these rows under a synthetic counter
+                // assigned at load purely to index the map — not part of the row,
+                // and it never reaches the image.
                 cursor.index_insert(cx, &serialize_record(values)).await?;
             }
         } else {
