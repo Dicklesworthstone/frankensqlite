@@ -16015,10 +16015,12 @@ impl VdbeEngine {
         target: i32,
     ) -> Result<bool> {
         let text_encoding = self.text_encoding;
-        // bd-v6pjf: WITHOUT ROWID non-leading-PK column remap. Clone the map Arc
-        // up front so the `payload_idx` remap below does not re-borrow `self`
-        // while `cursor` is held. Empty map (leading-PK/rowid) => identity.
-        let wr_storage_order = Arc::clone(&self.wr_storage_order_by_root_page);
+        // bd-v6pjf: WITHOUT ROWID non-leading-PK column remap. Only clone the map
+        // Arc when a non-leading-PK table is actually registered; the common case
+        // (empty map) keeps this general column-read path allocation-free. Cloning
+        // up front also avoids re-borrowing `self` while `cursor` is held.
+        let wr_storage_order = (!self.wr_storage_order_by_root_page.is_empty())
+            .then(|| Arc::clone(&self.wr_storage_order_by_root_page));
         let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
             return Ok(false);
         };
@@ -16064,9 +16066,11 @@ impl VdbeEngine {
             col_idx
         };
         // bd-v6pjf: declared column -> physical record slot for a non-leading-PK
-        // WITHOUT ROWID table (identity when the root page is absent from the map).
+        // WITHOUT ROWID table (identity when the map is empty or the root page is
+        // absent from it).
         let payload_idx = wr_storage_order
-            .get(&cursor.root_page)
+            .as_ref()
+            .and_then(|map| map.get(&cursor.root_page))
             .and_then(|inv| inv.get(payload_idx).copied())
             .unwrap_or(payload_idx);
 
@@ -16192,10 +16196,12 @@ impl VdbeEngine {
     async fn cursor_column(&mut self, cursor_id: i32, col_idx: usize) -> Result<SqliteValue> {
         let collect_vdbe_metrics = self.collect_vdbe_metrics;
         let text_encoding = self.text_encoding;
-        // bd-v6pjf: WITHOUT ROWID non-leading-PK column remap. Clone the map Arc
-        // up front so the `payload_idx` remap below does not re-borrow `self`
-        // while `cursor` is held. Empty map (leading-PK/rowid) => identity.
-        let wr_storage_order = Arc::clone(&self.wr_storage_order_by_root_page);
+        // bd-v6pjf: WITHOUT ROWID non-leading-PK column remap. Only clone the map
+        // Arc when a non-leading-PK table is actually registered; the common case
+        // (empty map) keeps this general column-read path allocation-free. Cloning
+        // up front also avoids re-borrowing `self` while `cursor` is held.
+        let wr_storage_order = (!self.wr_storage_order_by_root_page.is_empty())
+            .then(|| Arc::clone(&self.wr_storage_order_by_root_page));
         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
@@ -16234,10 +16240,11 @@ impl VdbeEngine {
                 col_idx
             };
             // bd-v6pjf: declared column -> physical record slot for a
-            // non-leading-PK WITHOUT ROWID table (identity when the root page is
-            // absent from the map).
+            // non-leading-PK WITHOUT ROWID table (identity when the map is empty
+            // or the root page is absent from it).
             let payload_idx = wr_storage_order
-                .get(&cursor.root_page)
+                .as_ref()
+                .and_then(|map| map.get(&cursor.root_page))
                 .and_then(|inv| inv.get(payload_idx).copied())
                 .unwrap_or(payload_idx);
 
