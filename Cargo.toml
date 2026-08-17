@@ -29,6 +29,7 @@ members = [
     "crates/fsqlite-observability",
     "crates/fsqlite-c-api",
     "crates/fsqlite-wasm",
+    "crates/beads-doctor",
 ]
 
 [workspace.package]

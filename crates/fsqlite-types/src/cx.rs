@@ -3788,6 +3788,11 @@ mod tests {
         // - pager (pager/page-cache latency metrics + shared_file_state_key
         //   canonicalize; the one control-flow time use — eviction shard-probe
         //   start — was replaced with a deterministic round-robin, bd-w4yc9)
+        // - beads-doctor (standalone CLI monitoring tool: std::fs for config /
+        //   rolling-log / OS-unit-file I/O, and a single SystemTime::now —
+        //   quarantined behind a `Clock` trait — for calendar-age log rotation,
+        //   which asupersync's process-monotonic `wall_now` cannot express; the
+        //   rotation *decision* is a pure, clock-free function — bd-316l0)
         //
         // The gate still guards the extension crates (fts3/fts5/rtree/json/
         // session/icu/misc), ast, error, and wasm, where ambient authority must
@@ -3810,6 +3815,7 @@ mod tests {
             "fsqlite-btree",
             "fsqlite-c-api",
             "fsqlite-pager",
+            "beads-doctor",
         ];
 
         let mut violations: Vec<String> = Vec::new();

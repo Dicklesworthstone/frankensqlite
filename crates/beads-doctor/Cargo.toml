@@ -1,0 +1,34 @@
+[package]
+name = "beads-doctor"
+version = "0.3.5"
+description = "Cross-platform periodic beads-doctor probe (asupersync-native)"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+# A library target holds the testable core (parsing, severity filtering, log
+# rotation, installer generation, the probe cycle). The binary is a thin runtime
+# owner that boots the asupersync runtime and dispatches subcommands.
+[lib]
+name = "beads_doctor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beads-doctor"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+# beads-doctor is a top-level runtime owner: it builds the asupersync runtime in
+# `main` and threads the resulting `Cx` through every async fn (AGENTS.md —
+# FrankenSQLite crates never build a runtime; only the leaf binaries do).
+asupersync = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
