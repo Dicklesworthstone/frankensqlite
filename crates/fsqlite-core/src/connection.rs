@@ -22427,10 +22427,26 @@ impl Connection {
                 if profile_enabled {
                     FSQLITE_REWRITE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
                 }
+                // bd-rwaxp: mirror the direct execute path — resolve the outer
+                // statement's names/ordinals on the ORIGINAL parsed AST *before*
+                // subquery rewriting. `rewrite_subquery_statement` eagerly folds an
+                // ORDER BY / LIMIT scalar subquery by *executing* it, which surfaces
+                // a nested compound's arity ParseError ahead of a sibling operand's
+                // NoSuchColumn / positional-ordinal error — breaking SQLite's
+                // depth-first, left-to-right precedence (test_select_structure...).
+                // The direct path validates semantics before any fold; do the same
+                // here and skip the rewrite when the original is already invalid.
+                let pre_rewrite_semantics = self.with_fallback_function_registry(|| {
+                    self.validate_statement_select_semantics(statement_snapshot.as_ref())
+                });
                 let start = profile_enabled.then(Instant::now);
-                let rewrite_result = self
-                    .rewrite_subquery_statement(statement_snapshot.as_ref(), None)
-                    .await;
+                let rewrite_result = match pre_rewrite_semantics {
+                    Ok(()) => {
+                        self.rewrite_subquery_statement(statement_snapshot.as_ref(), None)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
                 if let Some(start) = start {
                     FSQLITE_REWRITE_TIME_NS.fetch_add(
                         u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -118116,6 +118132,22 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                             && column.table.is_none()
                             && scope.output_alias(&column.column).is_some()
                         {
+                            continue;
+                        }
+                        // bd-rwaxp: an ORDER BY term embedding a sub-SELECT must
+                        // resolve its operands strictly left-to-right against BOTH
+                        // name and compound-arity errors. That unified depth-first
+                        // walk lives in SelectStructureResolver::validate_order_expr.
+                        // This name-only lexical pass would otherwise resolve a
+                        // sibling name before a leading subquery's arity error
+                        // (e.g. `(SELECT 1 UNION SELECT 2,3) + nope`), so defer
+                        // subquery-bearing terms to the structure resolver
+                        // (test_select_structure_follows_sqlite_depth_first_precedence).
+                        if expr_contains_subquery_matching_deep(
+                            &term.expr,
+                            self.connection,
+                            |_, _| true,
+                        ) {
                             continue;
                         }
                         self.validate_expr(&term.expr, &scope, SelectOutputAliasUse::OrderBy)?;
