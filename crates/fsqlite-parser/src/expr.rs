@@ -65,11 +65,13 @@ fn vector_in_list_arity_error(lhs: &Expr, items: &[ParsedExpr]) -> Option<String
     for item in items {
         let actual = match &item.expr {
             Expr::RowValue(element_terms, _) => element_terms.len(),
-            // Exactly one bare parenthesized subquery is a set-valued RHS, for
-            // example `(a, b) IN ((SELECT 1, 2))`. In a multi-item list the
-            // same syntax is one scalar-shaped element, so normal list arity
-            // validation applies.
-            Expr::Subquery(..) if items.len() == 1 => continue,
+            // A parenthesized subquery element carries an unknown result width
+            // until name resolution, so its IN-list arity is deferred to the
+            // semantic resolver: `(a, b) IN ((SELECT 1), (SELECT 2))` becomes a
+            // FunctionError there, not a parse error. A single bare subquery is
+            // the ordinary set-valued RHS `(a, b) IN ((SELECT 1, 2))`, which the
+            // resolver also validates for width.
+            Expr::Subquery(..) => continue,
             _ => 1,
         };
         if actual == expected {
@@ -5233,6 +5235,7 @@ mod tests {
             "(SELECT 1, 2) IN ((1, 2))",
             "(a, b) IN ((SELECT 1))",
             "(a, b) IN ((SELECT 1, 2, 3))",
+            "(a, b) IN ((SELECT 1), (SELECT 2))",
             "(SELECT * FROM t) IN (1)",
             "x IN (SELECT y FROM t WHERE z > 0 ORDER BY y LIMIT 1)",
             "EXISTS (SELECT 1 FROM t WHERE x = y)",
@@ -5266,7 +5269,6 @@ mod tests {
             "a IN (1,)",
             "(a, b) IN (1)",
             "(a, b) IN (+(SELECT 1, 2))",
-            "(a, b) IN ((SELECT 1), (SELECT 2))",
             "(a, b) IN ((1, 2), 3)",
             "(a, b) NOT IN ((1, 2, 3))",
             "(SELECT 1, 2) IN (1)",
@@ -6235,10 +6237,6 @@ mod tests {
                 "(a, b) IN (+(SELECT 1, 2))",
                 "IN(...) element has 1 term - expected 2",
             ),
-            (
-                "(a, b) IN ((SELECT 1), (SELECT 2))",
-                "IN(...) element has 1 term - expected 2",
-            ),
         ] {
             let error = parse_expr(sql).expect_err("mismatched vector IN arity must fail parsing");
             assert_eq!(
@@ -6282,6 +6280,11 @@ mod tests {
             "(a, b) IN ((SELECT 1, 2))",
             "(a, b) IN ((SELECT 1))",
             "(a, b) IN ((SELECT 1, 2, 3))",
+            // Multi-element subquery lists defer their arity to the semantic
+            // resolver (subquery widths need name resolution), so the parser
+            // accepts them; `(a, b) IN ((SELECT 1), (SELECT 2))` then fails as a
+            // FunctionError, not a parse error.
+            "(a, b) IN ((SELECT 1), (SELECT 2))",
             "(SELECT 1, 2) IN ((1, 2), (3, 4))",
             "(VALUES (1, 2), (3, 4)) NOT IN ((1, 2))",
             "(SELECT 1, 2 UNION ALL SELECT 3, 4) IN ((1, 2))",
