@@ -96743,31 +96743,55 @@ impl SharedMvccState {
         Ok(())
     }
 
+    /// Register a background task in `region` and hand back its RAII
+    /// [`TaskHandle`] plus a child [`Cx`] of that region.
+    ///
+    /// The handle keeps the region's `active_tasks` count non-zero until it is
+    /// dropped, so [`RegionTree::close_and_drain`] accounts for the task; the
+    /// child `Cx` makes the work cancel-correct (the region's `begin_close`
+    /// cancels it). This is the low-level half of [`Self::try_spawn_in_region`].
     #[cfg_attr(not(test), allow(dead_code))]
-    fn register_write_coordinator_task(&self) -> Result<(TaskHandle, Cx)> {
+    fn register_task_in_region(&self, region: Region) -> Result<(TaskHandle, Cx)> {
         let state = lock_unpoisoned(&self.runtime_state);
         if let Some(details) = &state.poisoned {
             return Err(FrankenError::BackgroundWorkerFailed(details.clone()));
         }
-
-        let region = state.write_coordinator_region;
         let task = state.regions.register_task(region)?;
         let cx = state
             .regions
             .cx(region)
-            .ok_or_else(|| FrankenError::internal("write coordinator region missing Cx"))?
+            .ok_or_else(|| FrankenError::internal("region missing Cx for task registration"))?
             .create_child();
         Ok((task, cx))
     }
 
-    fn try_spawn_write_coordinator_task<F, Fut>(&self, task: F) -> Result<bool>
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn register_write_coordinator_task(&self) -> Result<(TaskHandle, Cx)> {
+        let region = lock_unpoisoned(&self.runtime_state).write_coordinator_region;
+        self.register_task_in_region(region)
+    }
+
+    /// The single blessed way to spawn a per-Connection background task.
+    ///
+    /// The region [`TaskHandle`] is moved into the spawned future so the region's
+    /// quiescence drain accounts for the task's whole lifetime, and the task runs
+    /// under a child [`Cx`] of `region` so `begin_close`/`close_and_drain` cancel
+    /// it. Returns `Ok(false)` when no native asupersync runtime is active
+    /// (wasm / non-`native` builds).
+    ///
+    /// INVARIANT (bd-54ulg / bd-1is5z): per-Connection background work MUST go
+    /// through this helper — never a raw `RuntimeHandle::try_spawn`,
+    /// `std::thread::spawn`, or `spawn_blocking` outside `#[cfg(test)]`. A task
+    /// that does not hold a region `TaskHandle` is invisible to `close_and_drain`
+    /// and silently breaks quiescence-on-Connection-close.
+    fn try_spawn_in_region<F, Fut>(&self, region: Region, task: F) -> Result<bool>
     where
         F: FnOnce(Cx) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
         {
-            let _ = task;
+            let _ = (region, task);
             return Ok(false);
         }
 
@@ -96776,7 +96800,7 @@ impl SharedMvccState {
             let Some(runtime_handle) = self._runtime.native_runtime_handle() else {
                 return Ok(false);
             };
-            let (region_task, task_cx) = self.register_write_coordinator_task()?;
+            let (region_task, task_cx) = self.register_task_in_region(region)?;
             runtime_handle
                 .try_spawn(async move {
                     let _region_task = region_task;
@@ -96790,11 +96814,20 @@ impl SharedMvccState {
                 })
                 .map_err(|err| {
                     FrankenError::internal(format!(
-                        "failed to spawn write coordinator task on active asupersync runtime: {err}"
+                        "failed to spawn task in region on active asupersync runtime: {err}"
                     ))
                 })?;
             Ok(true)
         }
+    }
+
+    fn try_spawn_write_coordinator_task<F, Fut>(&self, task: F) -> Result<bool>
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let region = lock_unpoisoned(&self.runtime_state).write_coordinator_region;
+        self.try_spawn_in_region(region, task)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
