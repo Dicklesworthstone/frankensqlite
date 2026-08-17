@@ -251,6 +251,13 @@ fn connection_open_refuses_newer_format_db() {
             msg.contains("newer fsqlite"),
             "refusal must name the newer-format cause; got: {msg}"
         );
+        // NOTE: the refusal currently surfaces via a DatabaseCorrupt-class site
+        // in the pager/open path (extended code SQLITE_CORRUPT), which still
+        // carries the newer-format message. Upgrading that to the dedicated
+        // SQLITE_OPEN_NEWER_FORMAT (32526) code across all header-mapping sites
+        // (connection.rs / compat_persist.rs / pager.rs) is tracked by bd-3j2c5;
+        // the end-to-end REFUSAL guarantee asserted here is what matters for
+        // rollback safety.
 
         // The refused file's page-1 header is untouched: we rejected it, we did
         // not rewrite or "repair" it (the stamp survives byte-for-byte).
