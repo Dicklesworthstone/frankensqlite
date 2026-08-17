@@ -126590,8 +126590,15 @@ fn emit_case_expr(
             builder.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, collation, affinity);
             builder.free_temp(r_when);
         } else {
-            emit_expr(builder, when_expr, target_reg, bind_state)?;
-            builder.emit_jump_to_label(Opcode::IfNot, target_reg, 1, next_when, P4::None, 0);
+            // bd-lryih: the WHEN condition of a searched CASE is a truth
+            // context, so `1 OR E` must short-circuit to TRUE without evaluating
+            // `E` (matching stock sqlite3 and the FROM-bearing codegen path).
+            // Emitting the whole condition eagerly here made
+            // `CASE WHEN 1 OR <erroring>` error; route AND/OR-topped conditions
+            // through the jump-based short-circuit instead.
+            emit_searched_case_when_condition(
+                builder, when_expr, target_reg, next_when, bind_state,
+            )?;
         }
 
         emit_expr(builder, then_expr, target_reg, bind_state)?;
@@ -126612,6 +126619,64 @@ fn emit_case_expr(
     }
 
     Ok(())
+}
+
+/// Emit a searched-CASE `WHEN` condition with left-to-right AND/OR
+/// short-circuit, jumping to `false_label` when the condition is not TRUE.
+///
+/// bd-lryih: the WHEN condition of a searched CASE is a *truth context*, so
+/// stock sqlite3 short-circuits `1 OR E` to TRUE and never evaluates `E`. This
+/// mirrors fsqlite-vdbe codegen's `emit_searched_case_when_condition`, so the
+/// FROM-less scalar path (`compile_expression_select`) matches both stock and
+/// the FROM-bearing codegen path. Only AND/OR-topped conditions gain
+/// short-circuit; a leaf is still evaluated eagerly into `scratch` and tested
+/// with `IfNot`, so value contexts (THEN/ELSE, comparison/function operands)
+/// stay eager. `scratch` is the caller's `target_reg`, reused exactly as the
+/// prior eager code did before the THEN value overwrites it.
+fn emit_searched_case_when_condition(
+    builder: &mut ProgramBuilder,
+    cond: &Expr,
+    scratch: i32,
+    false_label: fsqlite_vdbe::Label,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
+    match cond {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+            ..
+        } => {
+            // A AND B fails the WHEN if either operand is not TRUE; both jump to
+            // the same `false_label`, so a false/NULL left short-circuits B.
+            emit_searched_case_when_condition(builder, left, scratch, false_label, bind_state)?;
+            emit_searched_case_when_condition(builder, right, scratch, false_label, bind_state)?;
+            Ok(())
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Or,
+            right,
+            ..
+        } => {
+            // A OR B: a TRUE left short-circuits B (jumps past it to `pass`, i.e.
+            // straight to the THEN body). B is evaluated only when the left is
+            // not TRUE.
+            let left_false = builder.emit_label();
+            let pass = builder.emit_label();
+            emit_searched_case_when_condition(builder, left, scratch, left_false, bind_state)?;
+            builder.emit_jump_to_label(Opcode::Goto, 0, 0, pass, P4::None, 0);
+            builder.resolve_label(left_false);
+            emit_searched_case_when_condition(builder, right, scratch, false_label, bind_state)?;
+            builder.resolve_label(pass);
+            Ok(())
+        }
+        _ => {
+            emit_expr(builder, cond, scratch, bind_state)?;
+            builder.emit_jump_to_label(Opcode::IfNot, scratch, 1, false_label, P4::None, 0);
+            Ok(())
+        }
+    }
 }
 
 /// Compile `expr [NOT] BETWEEN low AND high` into comparison opcodes.

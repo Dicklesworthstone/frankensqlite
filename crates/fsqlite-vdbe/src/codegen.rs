@@ -22258,8 +22258,20 @@ fn codegen_update_from(
         P4::Affinity(target.affinity_string()),
         0,
     );
-    emit_check_constraints(b, target, col_regs, None);
-    emit_not_null_constraints(b, target, col_regs, stmt.or_conflict, None);
+    // For UPDATE OR IGNORE ... FROM ..., a failing CHECK / NOT NULL constraint
+    // must skip this row silently (C SQLite semantics) rather than aborting the
+    // statement. Route the skip to the innermost loop's Next (`skip_label`),
+    // mirroring the plain `codegen_update` path's `constraint_ignore_label`
+    // (bd-xoixz). The FROM-path uniqueness/RETURNING conflict skip already uses
+    // this same `skip_label` (IfConflictSkip below).
+    let constraint_ignore_label =
+        if matches!(stmt.or_conflict.as_ref(), Some(ConflictAction::Ignore)) {
+            Some(skip_label)
+        } else {
+            None
+        };
+    emit_check_constraints(b, target, col_regs, constraint_ignore_label);
+    emit_not_null_constraints(b, target, col_regs, stmt.or_conflict, constraint_ignore_label);
     let aff_str = target.affinity_string();
     let rec_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
