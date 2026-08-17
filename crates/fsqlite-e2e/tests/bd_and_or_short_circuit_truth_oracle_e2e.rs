@@ -297,14 +297,22 @@ fn and_false_folds_before_uncorrelated_subquery_hoist() {
 fn and_or_fold_does_not_over_fold_value_context() {
     asupersync::test_utils::run_test(|| async {
         let (f, r) = setup_mem().await;
+        // NB: use json_extract('bare','$.a') as the erroring operand — it raises
+        // "malformed JSON" in BOTH engines (rusqlite's bundled sqlite is laxer than
+        // 3.46.1 about `json_each('bare')`, which it treats as zero rows, so a
+        // subquery operand would diverge on JSON strictness, not on folding).
         check(
             &f,
             &r,
             &[
-                "SELECT 1 OR (SELECT count(*) FROM json_each('bare'))",
-                "SELECT 1 AND (SELECT count(*) FROM json_each('bare'))",
-                "SELECT 0.0 AND (SELECT count(*) FROM json_each('bare'))",
-                "SELECT '0' AND (SELECT count(*) FROM json_each('bare'))",
+                // TRUE-absorbs-OR is truth-context-only; in a VALUE context stock is
+                // eager, so this must ERROR, not silently fold to 1 (guards over-fold):
+                "SELECT 1 OR json_extract('bare','$.a')",
+                // 1 AND E is never folded (only literal 0 AND-absorbs):
+                "SELECT 1 AND json_extract('bare','$.a')",
+                // only the *integer* literal 0 folds — 0.0 / '0' stay eager:
+                "SELECT 0.0 AND json_extract('bare','$.a')",
+                "SELECT '0' AND json_extract('bare','$.a')",
             ],
             "and_or_fold_does_not_over_fold_value_context",
         )
