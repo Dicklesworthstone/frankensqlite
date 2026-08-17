@@ -2534,7 +2534,7 @@ impl std::fmt::Debug for RuntimeContext {
 
 impl RuntimeContext {
     fn detached_root_cx() -> Cx {
-        Cx::new().with_trace_context(next_trace_id(), 0, 0)
+        Cx::detached_rebind().with_trace_context(next_trace_id(), 0, 0)
     }
 
     fn derived_root_cx(parent: &Cx) -> Cx {
@@ -56025,7 +56025,7 @@ impl Connection {
     /// cancel lineage, no recorded native-cancel reason — and re-attaching the
     /// live task's native cx keeps I/O authority while staying uncancelled.
     fn detached_rebind_cx(&self) -> Cx {
-        let rebind_cx = Cx::new();
+        let rebind_cx = Cx::detached_rebind();
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if let Some(native_task_cx) = asupersync::Cx::current() {
             rebind_cx.set_native_cx(native_task_cx);
@@ -123595,8 +123595,16 @@ fn parse_database_header_checked(page1_bytes: &[u8]) -> Result<DatabaseHeader> {
     }
     let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
     header_bytes.copy_from_slice(&page1_bytes[..DATABASE_HEADER_SIZE]);
-    DatabaseHeader::from_bytes(&header_bytes).map_err(|err| FrankenError::DatabaseCorrupt {
-        detail: format!("database header invalid: {err}"),
+    DatabaseHeader::from_bytes(&header_bytes).map_err(|err| match err {
+        // bd-e9hws: a database written by a newer FrankenSQLite format is a
+        // rollback-safety refusal, not corruption — surface the dedicated
+        // SQLITE_OPEN_NEWER_FORMAT code (and message) rather than SQLITE_CORRUPT.
+        fsqlite_types::DatabaseHeaderError::NewerFormat { on_disk, supported } => {
+            FrankenError::NewerFormat { on_disk, supported }
+        }
+        other => FrankenError::DatabaseCorrupt {
+            detail: format!("database header invalid: {other}"),
+        },
     })
 }
 

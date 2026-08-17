@@ -2657,6 +2657,51 @@ mod tests {
     }
 
     #[test]
+    fn test_format_version_forward_compat_ignores_reserved_tail() {
+        // bd-yaomh.6 bidirectional compatibility: `from_bytes` reads only the
+        // format-version slot (72..76) and MUST ignore the rest of SQLite's
+        // reserved-for-expansion region (76..92). A future FrankenSQLite that
+        // populates those bytes for a new field must still be openable by this
+        // (older) reader whenever the on-disk `format_version` is compatible —
+        // otherwise a forward-compatible field addition would break rollback.
+        // This guards against `from_bytes` ever regressing into enforcing zero
+        // on 76..92 (which the current implementation deliberately does not).
+        for version in [0, CURRENT_FSQLITE_FORMAT_VERSION] {
+            let mut hdr = make_header_for_tests();
+            hdr.set_format_version(version);
+            let mut buf = hdr.to_bytes().unwrap();
+            // Simulate a future writer using the reserved tail (bytes 76..92).
+            for byte in &mut buf[76..92] {
+                *byte = 0x5A;
+            }
+            let parsed = DatabaseHeader::from_bytes(&buf).expect(
+                "a compatible format_version must parse despite a populated reserved tail",
+            );
+            assert_eq!(parsed.format_version, version);
+            // The reserved tail is not surfaced through any header field; the
+            // documented version fields past it still read correctly.
+            assert_eq!(parsed.version_valid_for, hdr.version_valid_for);
+            assert_eq!(parsed.sqlite_version, hdr.sqlite_version);
+        }
+    }
+
+    #[test]
+    fn test_format_version_u32_max_is_refused() {
+        // Boundary: an absurdly-new on-disk format is still cleanly refused
+        // (exact NewerFormat verdict, no wraparound), not accepted or panicked.
+        let mut hdr = make_header_for_tests();
+        hdr.set_format_version(u32::MAX);
+        let buf = hdr.to_bytes().unwrap();
+        assert_eq!(
+            DatabaseHeader::from_bytes(&buf).unwrap_err(),
+            DatabaseHeaderError::NewerFormat {
+                on_disk: u32::MAX,
+                supported: CURRENT_FSQLITE_FORMAT_VERSION,
+            }
+        );
+    }
+
+    #[test]
     fn test_version_valid_for_stale() {
         let mut hdr = make_header_for_tests();
         hdr.change_counter = 7;
