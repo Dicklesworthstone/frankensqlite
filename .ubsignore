@@ -1,17 +1,21 @@
-# ubs ignore globs (read by default as PROJECT/.ubsignore).
+# Files that hang UBS Meta-Runner v5.3.11 — the source-of-truth skip list.
 #
-# bd-yxsqo: UBS Meta-Runner v5.3.11 hangs (>10 min, superlinear) on very large
-# Rust files — even a single explicit file, and even with --skip-type-narrowing.
-# Measured 2026-08-17: connection.rs (270k lines) and pager.rs (55k lines) both
-# time out at >90s; the pathology kicks in somewhere below 55k lines. A `git diff`
-# that touches any of these makes `ubs $(git diff --name-only)` hang and blocks the
-# agent. These files are excluded here so ubs skips them in every mode (`ubs .`,
-# `ubs --diff`, `ubs --staged`, and explicit-file scans — all verified to skip).
+# bd-yxsqo: ubs hangs (>10 min, superlinear) on large Rust files. Measured
+# 2026-08-17: connection.rs (270k lines) and pager.rs (55k lines) both time out at
+# >90s; codegen.rs (55k) is the same class. The pathology triggers somewhere below
+# 55k lines, on a single explicit file, and even with --skip-type-narrowing.
 #
+# IMPORTANT: ubs v5.3.11 does NOT actually honor this file as ignore globs —
+# verified that explicit-file scans AND directory walks still hang with it present.
+# It is instead the machine-readable filter list for the AGENTS.md-documented
+# invocation, which strips these paths BEFORE ubs sees them:
+#
+#     ubs $(git diff --name-only --cached | grep -vxFf .ubsignore)
+#
+# Entries are exact repo-relative paths (as `git diff --name-only` prints them).
 # Coverage note: these files still get clippy + `cargo check` + the test suites;
-# only the ubs pass is skipped. Shrinking them (esp. the connection.rs god-object,
-# bd-oxw4d) restores ubs coverage. If a NEW ubs scan hangs, the file is likely too
-# big — add it here.
+# only the ubs pass is skipped. Shrinking the connection.rs god-object (bd-oxw4d)
+# restores ubs coverage. If a NEW ubs scan hangs, the file is too big — add it here.
 crates/fsqlite-core/src/connection.rs
 crates/fsqlite-pager/src/pager.rs
 crates/fsqlite-vdbe/src/codegen.rs

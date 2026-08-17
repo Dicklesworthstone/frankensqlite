@@ -636,17 +636,32 @@ bv --robot-insights | jq '.Cycles'                         # Circular deps (must
 
 ## UBS — Ultimate Bug Scanner
 
-**Golden Rule:** `ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
+**Golden Rule:** run ubs on your changed files before every commit — but ALWAYS
+filter out the known-hanging large files. Exit 0 = safe. Exit >0 = fix & re-run.
+
+> ⚠️ **ubs v5.3.11 hangs (>10 min, superlinear) on large Rust files** — ≥~50k
+> lines: `connection.rs` (270k), `pager.rs`/`codegen.rs` (55k). The hang triggers on
+> a *single explicit file*, even with `--skip-type-narrowing`, and ubs does **not**
+> honor `.ubsignore` to skip them (all verified, bd-yxsqo). So never let ubs see
+> these files. They are listed in `.ubsignore`; strip them from any file list with
+> `grep -vxFf .ubsignore` before invoking ubs.
 
 ### Commands
 
 ```bash
-ubs file.rs file2.rs                    # Specific files (< 1s) — USE THIS
-ubs $(git diff --name-only --cached)    # Staged files — before commit
-ubs --only=rust,toml src/               # Language filter (3-5x faster)
-ubs --ci --fail-on-warning .            # CI mode — before PR
-ubs .                                   # Whole project (ignores target/, Cargo.lock)
+# Staged changed files, big-file-safe — USE THIS before every commit:
+ubs $(git diff --name-only --cached | grep -vxFf .ubsignore)
+# Working-tree changes not yet staged:
+ubs $(git diff --name-only | grep -vxFf .ubsignore)
+ubs file.rs file2.rs                    # Specific SMALL files (< 1s) — never a >50k-line file
+ubs --only=rust,toml src/               # Language filter (3-5x) — but a dir containing a big file still hangs
+# Do NOT run `ubs .` or `ubs --ci … .` here: the whole-project walk hits connection.rs and hangs.
 ```
+
+If a scan hangs, its input includes a too-big file — add that path to `.ubsignore`
+and re-run. Coverage on the excluded god-objects comes from clippy + `cargo check` +
+the test suites until they are split (`bd-oxw4d`). The superlinear-hang repro is
+captured in `bd-yxsqo` for filing against the UBS Meta-Runner upstream tracker.
 
 ### Output Format
 
