@@ -120415,8 +120415,40 @@ impl<'a> SelectStructureResolver<'a> {
             | Expr::Column(_, _)
             | Expr::Raise { .. }
             | Expr::Placeholder(_, _) => Ok(()),
-            Expr::BinaryOp { left, right, .. }
-            | Expr::JsonAccess {
+            Expr::BinaryOp { left, right, .. } => {
+                // A comparison operand faces a row value only when the other
+                // side is an explicit tuple or a multi-column subquery; only
+                // then may a multi-column subquery keep its width. Elsewhere
+                // `x = (SELECT a, b)` stays a scalar-arity error. Mirrors the
+                // execution-time row-value handling in `rewrite_in_expr`.
+                let connection = self.connection;
+                let operand_width = |operand: &Expr| -> usize {
+                    match operand {
+                        Expr::RowValue(values, _) => values.len(),
+                        Expr::Subquery(sub, _) => {
+                            connection.select_result_column_count(sub, &[], &mut Vec::new())
+                        }
+                        _ => 1,
+                    }
+                };
+                let left_faces_row_value =
+                    matches!(left.as_ref(), Expr::Subquery(_, _)) && operand_width(right) > 1;
+                let right_faces_row_value =
+                    matches!(right.as_ref(), Expr::Subquery(_, _)) && operand_width(left) > 1;
+                {
+                    let _row_value_guard = BoolCellRestoreGuard::new(
+                        &connection.scalar_subquery_row_value_context,
+                        left_faces_row_value,
+                    );
+                    self.validate_expr(left, named_windows)?;
+                }
+                let _row_value_guard = BoolCellRestoreGuard::new(
+                    &connection.scalar_subquery_row_value_context,
+                    right_faces_row_value,
+                );
+                self.validate_expr(right, named_windows)
+            }
+            Expr::JsonAccess {
                 expr: left,
                 path: right,
                 ..
@@ -120443,7 +120475,18 @@ impl<'a> SelectStructureResolver<'a> {
                     self.connection
                         .validate_in_list_early_row_misuse(expr, values)?;
                 }
-                self.validate_expr(expr, named_windows)?;
+                {
+                    // A bare subquery LHS is a row value; its width is validated
+                    // against the RHS below, so suppress the scalar
+                    // single-column rule while validating it. A RowValue LHS
+                    // stays scalar so its subquery fields are still checked.
+                    let connection = self.connection;
+                    let _row_value_guard = BoolCellRestoreGuard::new(
+                        &connection.scalar_subquery_row_value_context,
+                        matches!(expr.as_ref(), Expr::Subquery(_, _)),
+                    );
+                    self.validate_expr(expr, named_windows)?;
+                }
                 let singleton_subquery = match set {
                     InSet::List(values) => match values.as_slice() {
                         [Expr::Subquery(query, _)] => Some(query.as_ref()),
@@ -120511,7 +120554,19 @@ impl<'a> SelectStructureResolver<'a> {
                 }
                 Ok(())
             }
-            Expr::Subquery(query, _) => self.validate_select(query),
+            Expr::Subquery(query, _) => {
+                self.validate_select(query)?;
+                // SQLite diagnoses a scalar (non-row-value) subquery's result
+                // width at prepare, not only at execution. Row-value positions
+                // (an IN left-hand side, a row-value comparison operand)
+                // suppress this via the context flag their handlers set, so a
+                // bare scalar subquery reaching here must return one column.
+                if !self.connection.scalar_subquery_row_value_context.get() {
+                    self.connection
+                        .validate_scalar_subquery_column_count(query)?;
+                }
+                Ok(())
+            }
             Expr::Exists { subquery, .. } => self.validate_select(subquery),
             Expr::FunctionCall {
                 name,
