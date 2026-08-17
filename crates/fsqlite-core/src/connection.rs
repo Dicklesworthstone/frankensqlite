@@ -4646,6 +4646,7 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
                 | "auto_vacuum"
                 | "user_version"
                 | "application_id"
+                | "default_cache_size"
                 | "schema_version"
                 | "encoding"
                 | "foreign_keys"
@@ -4666,6 +4667,11 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
         return &["synchronous"];
     }
     if name_is("cache_size") {
+        return &["cache_size"];
+    }
+    // Stock's `PRAGMA default_cache_size` bare-query column is named `cache_size`
+    // (bd-n7eih / GH#354).
+    if name_is("default_cache_size") {
         return &["cache_size"];
     }
     if name_is("page_size") {
@@ -21384,6 +21390,7 @@ impl Connection {
             let mut pragma_state = self.pragma_state.borrow_mut();
             pragma_state.user_version = i64::from(header.user_version);
             pragma_state.application_id = i64::from(header.application_id);
+            pragma_state.default_cache_size = i64::from(header.default_cache_size);
         }
         *self.change_counter.borrow_mut() = header.change_counter;
         // bd-#70 wedge extension: raise the connection's finalized commit
@@ -64407,8 +64414,13 @@ impl Connection {
                     let user_version = self.pragma_state.borrow().user_version;
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     {
-                        self.update_database_header_metadata(None, Some(user_version as u32), None)
-                            .await?;
+                        self.update_database_header_metadata(
+                            None,
+                            Some(user_version as u32),
+                            None,
+                            None,
+                        )
+                        .await?;
                     }
                 }
                 "application_id" => {
@@ -64419,9 +64431,25 @@ impl Connection {
                             None,
                             None,
                             Some(application_id as u32),
+                            None,
                         )
                         .await?;
                     }
+                }
+                "default_cache_size" => {
+                    // bd-n7eih (GH#354): persist the header-backed default cache
+                    // size (abs(N), stashed by apply_default_cache_size) into
+                    // header bytes 48..52 so an explicit set survives reopen.
+                    let default_cache_size = self.pragma_state.borrow().default_cache_size;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let default_cache_size = default_cache_size as i32;
+                    self.update_database_header_metadata(
+                        None,
+                        None,
+                        None,
+                        Some(default_cache_size),
+                    )
+                    .await?;
                 }
                 "schema_version" => {
                     let raw = parse_pragma_nonnegative_usize(pragma_value, "schema_version")?;
@@ -81401,8 +81429,13 @@ impl Connection {
         schema_cookie: Option<u32>,
         user_version: Option<u32>,
         application_id: Option<u32>,
+        default_cache_size: Option<i32>,
     ) -> Result<()> {
-        if schema_cookie.is_none() && user_version.is_none() && application_id.is_none() {
+        if schema_cookie.is_none()
+            && user_version.is_none()
+            && application_id.is_none()
+            && default_cache_size.is_none()
+        {
             return Ok(());
         }
         self.with_pager_write_txn(async |cx, txn| {
@@ -81426,6 +81459,9 @@ impl Connection {
             }
             if let Some(app_id) = application_id {
                 header.application_id = app_id;
+            }
+            if let Some(dcs) = default_cache_size {
+                header.default_cache_size = dcs;
             }
             let encoded = header
                 .to_bytes()
@@ -81494,7 +81530,7 @@ impl Connection {
         // the end of this function once the DDL state is fully consistent.
         self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, false);
         if let Err(error) = self
-            .update_database_header_metadata(Some(new_cookie), None, None)
+            .update_database_header_metadata(Some(new_cookie), None, None, None)
             .await
         {
             self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, true);
@@ -82992,6 +83028,16 @@ impl Connection {
             } else {
                 0
             };
+            let default_cache_size = if page1_bytes.len() >= 52 {
+                i32::from_be_bytes([
+                    page1_bytes[48],
+                    page1_bytes[49],
+                    page1_bytes[50],
+                    page1_bytes[51],
+                ])
+            } else {
+                0
+            };
             let eligible_preserved_live_vtab_keys = self
                 .pending_local_live_vtab_keys_for_reload(bound_visible_commit_seq, schema_cookie);
 
@@ -83918,6 +83964,7 @@ impl Connection {
                 let mut pragma_state = self.pragma_state.borrow_mut();
                 pragma_state.user_version = i64::from(user_version);
                 pragma_state.application_id = i64::from(application_id);
+                pragma_state.default_cache_size = i64::from(default_cache_size);
             }
             let old_schema_cookie = *self.schema_cookie.borrow();
             *self.schema_cookie.borrow_mut() = schema_cookie;

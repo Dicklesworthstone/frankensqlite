@@ -1559,6 +1559,11 @@ pub mod pragma {
         pub user_version: i64,
         /// Application ID (`PRAGMA application_id`).
         pub application_id: i64,
+        /// Persistent suggested default page-cache size, header bytes 48..52
+        /// (`PRAGMA default_cache_size`). `0` means unset — a bare query then
+        /// reports the compiled default (`-2000`). Stock stores `abs(N)` as a
+        /// page count (legacy `sqlite3AbsInt32`); loaded from the header at open.
+        pub default_cache_size: i64,
         /// Foreign key enforcement toggle (`PRAGMA foreign_keys`).
         pub foreign_keys: bool,
         /// Recursive trigger toggle (`PRAGMA recursive_triggers`).
@@ -1619,6 +1624,7 @@ pub mod pragma {
                 wal_autocheckpoint: 1000,
                 user_version: 0,
                 application_id: 0,
+                default_cache_size: 0,
                 foreign_keys: false,
                 recursive_triggers: false,
                 query_only: false,
@@ -1720,6 +1726,9 @@ pub mod pragma {
         }
         if name.eq_ignore_ascii_case("application_id") {
             return apply_application_id(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("default_cache_size") {
+            return apply_default_cache_size(state, stmt);
         }
         if name.eq_ignore_ascii_case("foreign_keys") {
             return apply_foreign_keys(state, stmt);
@@ -2128,6 +2137,30 @@ pub mod pragma {
                 let val = parse_integer_expr(expr)?;
                 state.application_id = val;
                 Ok(PragmaOutput::Int(val))
+            }
+        }
+    }
+
+    /// `PRAGMA default_cache_size [= N]` — the persistent, header-backed cache
+    /// size (header bytes 48..52). Stock stores `abs(N)` as a page count (legacy
+    /// `sqlite3AbsInt32`); `0` means "unset", for which a bare query reports the
+    /// compiled default `-2000`. Assigning also updates the connection's runtime
+    /// `cache_size`, matching stock. The header write itself is performed by the
+    /// caller (`Connection::update_database_header_metadata`), which reads the
+    /// value stashed here.
+    fn apply_default_cache_size(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        // Header 0 ("unset") is reported to the caller as the compiled default.
+        let report = |stored: i64| if stored == 0 { -2000 } else { stored };
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(report(state.default_cache_size))),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let stored = parse_integer_expr(expr)?.saturating_abs();
+                state.default_cache_size = stored;
+                state.cache_size = stored;
+                Ok(PragmaOutput::Int(report(stored)))
             }
         }
     }
