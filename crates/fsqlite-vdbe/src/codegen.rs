@@ -25,7 +25,10 @@ use fsqlite_types::opcode::{
 };
 use fsqlite_types::record::{PrecomputedRecordHeader, PrecomputedSerialTypeKind};
 use fsqlite_types::value::classify_sql_like_fast_path;
-use fsqlite_types::{SmallText, SqliteValue, StrictColumnType, TypeAffinity};
+use fsqlite_types::{
+    SmallText, SqliteValue, StrictColumnType, TypeAffinity, without_rowid_pk_is_leading,
+    without_rowid_storage_order,
+};
 
 // ---------------------------------------------------------------------------
 // Thread-local custom aggregate keys for UDF support (bd-2wt.3)
@@ -23187,6 +23190,63 @@ pub fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, Codeg
     Ok(indices)
 }
 
+/// Emit the WITHOUT ROWID row record for `val_regs..val_regs+n_cols` (declared
+/// order), physically reordered PK-leading — the PRIMARY KEY columns in PK
+/// order, then the remaining columns in declared order — to match C SQLite's
+/// on-disk WITHOUT ROWID record layout. Returns the record register.
+///
+/// For a leading-PK table the permutation is the identity, so this emits a
+/// plain `MakeRecord` with no extra ops — byte-identical to the pre-reorder
+/// path, keeping golden bytecode snapshots unchanged for the common shape.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_wr_record(
+    b: &mut ProgramBuilder,
+    pk_indices: &[usize],
+    val_regs: i32,
+    n_cols: usize,
+    aff_str: &str,
+) -> i32 {
+    let rec_reg = b.alloc_reg();
+    if without_rowid_pk_is_leading(pk_indices, n_cols) {
+        b.emit_op(
+            Opcode::MakeRecord,
+            val_regs,
+            n_cols as i32,
+            rec_reg,
+            P4::Affinity(aff_str.to_owned()),
+            0,
+        );
+        return rec_reg;
+    }
+    // Non-leading PK: copy the declared-order value registers into a fresh
+    // contiguous block in physical (PK-leading) order, and reorder the
+    // per-column affinity string to match, before serializing.
+    let perm = without_rowid_storage_order(pk_indices, n_cols);
+    let phys_regs = b.alloc_regs(n_cols as i32);
+    let aff_bytes = aff_str.as_bytes();
+    let mut phys_aff = String::with_capacity(n_cols);
+    for (phys_slot, &decl_col) in perm.iter().enumerate() {
+        b.emit_op(
+            Opcode::Copy,
+            val_regs + decl_col as i32,
+            phys_regs + phys_slot as i32,
+            0,
+            P4::None,
+            0,
+        );
+        phys_aff.push(aff_bytes.get(decl_col).map_or('A', |&c| c as char));
+    }
+    b.emit_op(
+        Opcode::MakeRecord,
+        phys_regs,
+        n_cols as i32,
+        rec_reg,
+        P4::Affinity(phys_aff),
+        0,
+    );
+    rec_reg
+}
+
 /// Human-readable PK label for UNIQUE-violation error messages.
 fn without_rowid_pk_label(table: &TableSchema, pk_indices: &[usize]) -> String {
     pk_indices
@@ -23753,15 +23813,7 @@ fn emit_without_rowid_update_rewrite(
 
     // PHASE C: insert NEW. Every conflicting row has been resolved above, so
     // this insert must not itself REPLACE.
-    let rec_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        new_regs,
-        n_cols as i32,
-        rec_reg,
-        P4::Affinity(aff_str),
-        0,
-    );
+    let rec_reg = emit_wr_record(b, pk_indices, new_regs, n_cols, &aff_str);
     b.emit_op(
         Opcode::IdxInsert,
         table_cursor,
@@ -24041,15 +24093,7 @@ fn emit_without_rowid_row_insert(
         emit_victim_delete(b, victim_flag, victim_pk_regs);
     }
 
-    let rec_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        val_regs,
-        n_cols as i32,
-        rec_reg,
-        P4::Affinity(aff_str),
-        0,
-    );
+    let rec_reg = emit_wr_record(b, pk_indices, val_regs, n_cols, &aff_str);
     b.emit_op(
         Opcode::IdxInsert,
         table_cursor,
@@ -24241,15 +24285,7 @@ fn emit_without_rowid_upsert_row(
         P4::Affinity(aff_str.clone()),
         0,
     );
-    let rec_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        existing_regs,
-        n_cols as i32,
-        rec_reg,
-        P4::Affinity(aff_str),
-        0,
-    );
+    let rec_reg = emit_wr_record(b, pk_indices, existing_regs, n_cols, &aff_str);
     b.emit_op(
         Opcode::IdxInsert,
         table_cursor,

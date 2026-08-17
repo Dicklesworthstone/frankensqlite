@@ -6296,6 +6296,12 @@ pub struct VdbeEngine {
     index_desc_flags_by_root_page: Arc<HashMap<i32, Vec<bool>>>,
     /// Per-index collation sequences keyed by index root page number.
     index_collations_by_root_page: Arc<HashMap<i32, Vec<Option<String>>>>,
+    /// WITHOUT ROWID declared->physical column order (inverse permutation)
+    /// keyed by *table* root page. Present only for non-leading-PK tables;
+    /// absent (empty) for leading-PK / rowid tables, so the column-read remap
+    /// in `cursor_column` / `column_to_reg_direct` is a zero-cost identity for
+    /// the common shape (bd-v6pjf).
+    wr_storage_order_by_root_page: Arc<HashMap<i32, Vec<usize>>>,
     /// Mapping from cursor_id to root_page for default value lookup.
     cursor_root_pages: HashMap<i32, i32>,
     /// Virtual table instances keyed by cursor number (for transaction ops).
@@ -6839,6 +6845,7 @@ impl VdbeEngine {
             column_defaults_by_root_page: Arc::new(HashMap::new()),
             index_desc_flags_by_root_page: Arc::new(HashMap::new()),
             index_collations_by_root_page: Arc::new(HashMap::new()),
+            wr_storage_order_by_root_page: Arc::new(HashMap::new()),
             cursor_root_pages: HashMap::new(),
             vtab_instances: SwissIndex::new(),
             time_travel_cursors: HashMap::new(),
@@ -8480,6 +8487,18 @@ impl VdbeEngine {
     /// Reuse shared per-index descending flags keyed by index root page.
     pub fn set_shared_index_desc_flags_by_root_page(&mut self, map: Arc<HashMap<i32, Vec<bool>>>) {
         self.index_desc_flags_by_root_page = map;
+    }
+
+    /// Provide the WITHOUT ROWID declared->physical column order keyed by table
+    /// root page (bd-v6pjf). Non-leading-PK tables only; leading-PK tables are
+    /// left out so the read remap stays identity.
+    pub fn set_wr_storage_order_by_root_page(&mut self, map: HashMap<i32, Vec<usize>>) {
+        self.wr_storage_order_by_root_page = Arc::new(map);
+    }
+
+    /// Reuse a shared WITHOUT ROWID declared->physical column-order map.
+    pub fn set_shared_wr_storage_order_by_root_page(&mut self, map: Arc<HashMap<i32, Vec<usize>>>) {
+        self.wr_storage_order_by_root_page = map;
     }
 
     /// Provide per-index collation sequences keyed by index root page.
@@ -15996,6 +16015,10 @@ impl VdbeEngine {
         target: i32,
     ) -> Result<bool> {
         let text_encoding = self.text_encoding;
+        // bd-v6pjf: WITHOUT ROWID non-leading-PK column remap. Clone the map Arc
+        // up front so the `payload_idx` remap below does not re-borrow `self`
+        // while `cursor` is held. Empty map (leading-PK/rowid) => identity.
+        let wr_storage_order = Arc::clone(&self.wr_storage_order_by_root_page);
         let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
             return Ok(false);
         };
@@ -16040,6 +16063,12 @@ impl VdbeEngine {
         } else {
             col_idx
         };
+        // bd-v6pjf: declared column -> physical record slot for a non-leading-PK
+        // WITHOUT ROWID table (identity when the root page is absent from the map).
+        let payload_idx = wr_storage_order
+            .get(&cursor.root_page)
+            .and_then(|inv| inv.get(payload_idx).copied())
+            .unwrap_or(payload_idx);
 
         // ── Lazy decode + zero-clone register write ────────────────
         let collect_vdbe_metrics = self.collect_vdbe_metrics;
@@ -16163,6 +16192,10 @@ impl VdbeEngine {
     async fn cursor_column(&mut self, cursor_id: i32, col_idx: usize) -> Result<SqliteValue> {
         let collect_vdbe_metrics = self.collect_vdbe_metrics;
         let text_encoding = self.text_encoding;
+        // bd-v6pjf: WITHOUT ROWID non-leading-PK column remap. Clone the map Arc
+        // up front so the `payload_idx` remap below does not re-borrow `self`
+        // while `cursor` is held. Empty map (leading-PK/rowid) => identity.
+        let wr_storage_order = Arc::clone(&self.wr_storage_order_by_root_page);
         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
@@ -16200,6 +16233,13 @@ impl VdbeEngine {
             } else {
                 col_idx
             };
+            // bd-v6pjf: declared column -> physical record slot for a
+            // non-leading-PK WITHOUT ROWID table (identity when the root page is
+            // absent from the map).
+            let payload_idx = wr_storage_order
+                .get(&cursor.root_page)
+                .and_then(|inv| inv.get(payload_idx).copied())
+                .unwrap_or(payload_idx);
 
             // ── Lazy column decode: decode on demand ─────────────────
             if payload_idx < cursor.row_decode.column_count() {
