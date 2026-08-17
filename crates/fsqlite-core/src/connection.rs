@@ -71733,12 +71733,15 @@ impl Connection {
                         None
                     };
                     for (when_expr, then_expr) in whens {
-                        let when_val = self
-                            .eval_expr_with_subqueries(when_expr, row, col_map, params)
-                            .await?;
                         let matched = if let (Some(operand_expr), Some(b)) =
                             (operand.as_deref(), base.as_ref())
                         {
+                            // Simple `CASE operand WHEN value`: the WHEN is a value
+                            // compared against the operand (NOT a truth context), so
+                            // evaluate it eagerly.
+                            let when_val = self
+                                .eval_expr_with_subqueries(when_expr, row, col_map, params)
+                                .await?;
                             !b.is_null()
                                 && !when_val.is_null()
                                 && compare_join_expr_values(
@@ -71749,7 +71752,17 @@ impl Connection {
                                     col_map,
                                 ) == std::cmp::Ordering::Equal
                         } else {
-                            is_sqlite_truthy(&when_val)
+                            // bd-lryih: searched `CASE WHEN <cond>` is a TRUTH context,
+                            // so short-circuit AND/OR left-to-right through
+                            // eval_expr_truthiness instead of eager-evaluating both
+                            // operands — `WHEN 1 OR E` must take the branch without ever
+                            // evaluating an erroring `E` (the FROM-less/interpreter path;
+                            // VDBE codegen's emit_searched_case_when_condition already
+                            // does this). A NULL condition is not-true and falls through,
+                            // matching stock's three-valued CASE.
+                            self.eval_expr_truthiness(when_expr, true, row, col_map, params)
+                                .await?
+                                == Some(true)
                         };
                         if matched {
                             return self
