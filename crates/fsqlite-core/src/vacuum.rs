@@ -331,6 +331,188 @@ mod tests {
         reserve_temp_rebuild_target, resolve_vacuum_into_target,
     };
 
+    fn header_u32_be(path: &std::path::Path, offset: usize) -> u32 {
+        let bytes = std::fs::read(path).unwrap();
+        u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    }
+
+    fn env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    // GH#347 / bd-6sscx: VACUUM INTO of an already-compact source must stay
+    // COMPACT: freelist_count == 0, freelist_trunk == 0, page_count <= source.
+    // Env-parameterized so the shape can be swept WITHOUT recompiling (the
+    // shared target is a 12-minute CARGO_INCREMENTAL=0 rebuild): re-run the
+    // built test binary directly with FSQ347_* set.
+    #[test]
+    fn test_vacuum_into_many_schema_objects_stays_compact_gh347() {
+        asupersync::test_utils::run_test(|| async {
+            let tables = env_usize("FSQ347_TABLES", 360);
+            let indexes = env_usize("FSQ347_INDEXES", 3);
+            let rows = env_usize("FSQ347_ROWS", 8);
+            let payload = env_usize("FSQ347_PAYLOAD", 0);
+            let add_unique = env_usize("FSQ347_UNIQUE", 1) != 0;
+            let without_rowid = env_usize("FSQ347_WITHOUT_ROWID", 0) != 0;
+            let stock_compact = env_usize("FSQ347_STOCK_COMPACT", 1) != 0;
+            let strict = env_usize("FSQ347_STRICT", 0) != 0;
+
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("gh347-source.db");
+            let image_path = dir.path().join("gh347-image.db"); // triggering image (compact)
+            let fsq_copy_path = dir.path().join("gh347-fsq-copy.db"); // fresh path fsqlite opens
+            let target_path = dir.path().join("gh347-target.db");
+            let oracle_target_path = dir.path().join("gh347-oracle-target.db");
+            let source = source_path.to_string_lossy().into_owned();
+            let fsq_copy = fsq_copy_path.to_string_lossy().into_owned();
+            let target = target_path.to_string_lossy().into_owned();
+
+            // 1. Build the synthetic source through an ordinary fsqlite connection.
+            let conn = Connection::open(&source).await.unwrap();
+            let mut batch = String::from("BEGIN;");
+            for i in 0..tables {
+                let wor = if without_rowid { " WITHOUT ROWID" } else { "" };
+                let uniq = if add_unique { ", u TEXT UNIQUE" } else { "" };
+                let pk = if without_rowid {
+                    "id INTEGER, a TEXT, b INTEGER, c TEXT, PRIMARY KEY(id)"
+                } else {
+                    "id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c TEXT"
+                };
+                batch.push_str(&format!("CREATE TABLE t{i}({pk}{uniq}){wor};"));
+                for k in 0..indexes {
+                    match k {
+                        0 => batch.push_str(&format!("CREATE INDEX ix{i}_a ON t{i}(a);")),
+                        1 => batch.push_str(&format!("CREATE INDEX ix{i}_b ON t{i}(b);")),
+                        _ => batch.push_str(&format!(
+                            "CREATE INDEX ix{i}_{k} ON t{i}(c, b, a);"
+                        )),
+                    }
+                }
+                for r in 1..=rows {
+                    let pad = if payload > 0 {
+                        "x".repeat(payload)
+                    } else {
+                        String::new()
+                    };
+                    if add_unique {
+                        batch.push_str(&format!(
+                            "INSERT INTO t{i}(id, a, b, c, u) VALUES ({r}, 'a{i}_{r}{pad}', {r}, 'c{i}_{r}', 'u{i}_{r}');"
+                        ));
+                    } else {
+                        batch.push_str(&format!(
+                            "INSERT INTO t{i}(id, a, b, c) VALUES ({r}, 'a{i}_{r}{pad}', {r}, 'c{i}_{r}');"
+                        ));
+                    }
+                }
+            }
+            batch.push_str("COMMIT;");
+            conn.execute_batch(&batch).await.unwrap();
+            drop(conn);
+
+            // 2. Produce the triggering IMAGE. To mirror GH#347 (an already
+            // stock-compact image, freelist 0), optionally run stock VACUUM.
+            if stock_compact {
+                let c = rusqlite::Connection::open(&source_path).unwrap();
+                c.execute("VACUUM INTO ?1;", [image_path.to_string_lossy().as_ref()])
+                    .unwrap();
+            } else {
+                let c = rusqlite::Connection::open(&source_path).unwrap();
+                c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+                drop(c);
+                std::fs::copy(&source_path, &image_path).unwrap();
+            }
+
+            // 3. Copy the image to a fresh path an ordinary connection opens.
+            std::fs::copy(&image_path, &fsq_copy_path).unwrap();
+
+            // Image (source) numbers, authoritative via stock sqlite3.
+            let oracle_img = rusqlite::Connection::open(&image_path).unwrap();
+            let img_page_count: i64 = oracle_img
+                .query_row("PRAGMA page_count;", [], |row| row.get(0))
+                .unwrap();
+            let img_freelist: i64 = oracle_img
+                .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+                .unwrap();
+            // Cross-check: stock sqlite3 VACUUM INTO of the SAME image is compact.
+            oracle_img
+                .execute(
+                    "VACUUM INTO ?1;",
+                    [oracle_target_path.to_string_lossy().as_ref()],
+                )
+                .unwrap();
+            drop(oracle_img);
+            let oracle_out_freelist: i64 = {
+                let c = rusqlite::Connection::open(&oracle_target_path).unwrap();
+                c.query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+                    .unwrap()
+            };
+
+            // 4. fsqlite VACUUM INTO on the copied image.
+            let conn = Connection::open(&fsq_copy).await.unwrap();
+            conn.execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target.clone().into())],
+            )
+            .await
+            .unwrap();
+            drop(conn);
+
+            // 5. Measure the fsqlite output header directly from disk.
+            let out_page_count = header_u32_be(&target_path, 28);
+            let out_freelist_trunk = header_u32_be(&target_path, 32);
+            let out_freelist_count = header_u32_be(&target_path, 36);
+
+            let oracle_out = rusqlite::Connection::open(&target_path).unwrap();
+            let out_integrity: String = oracle_out
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            drop(oracle_out);
+
+            let reproduced = out_freelist_count != 0
+                || out_freelist_trunk != 0
+                || i64::from(out_page_count) > img_page_count;
+
+            eprintln!(
+                "GH#347[tables={tables} idx={indexes} rows={rows} payload={payload} \
+                 unique={add_unique} wor={without_rowid} stock_compact={stock_compact}] \
+                 image: page_count={img_page_count} freelist={img_freelist} | \
+                 stock_out_freelist={oracle_out_freelist} | \
+                 fsqlite_out: page_count={out_page_count} trunk={out_freelist_trunk} \
+                 freelist={out_freelist_count} integrity={out_integrity} => \
+                 {}",
+                if reproduced { "BUG REPRODUCED" } else { "compact-ok" }
+            );
+
+            assert_eq!(out_integrity, "ok", "output must stay sound");
+            assert_eq!(
+                oracle_out_freelist, 0,
+                "stock sqlite3 VACUUM INTO must be compact"
+            );
+            if strict {
+                assert_eq!(
+                    out_freelist_count, 0,
+                    "GH#347: VACUUM INTO output must have an empty freelist (count={out_freelist_count} trunk={out_freelist_trunk})"
+                );
+                assert_eq!(
+                    out_freelist_trunk, 0,
+                    "GH#347: VACUUM INTO output must not invent a freelist trunk"
+                );
+                assert!(
+                    i64::from(out_page_count) <= img_page_count,
+                    "GH#347: VACUUM INTO output ({out_page_count}) must not exceed source ({img_page_count})"
+                );
+            }
+        });
+    }
+
     // GH#340 / bd-m0e3b: VACUUM INTO must produce valid WITHOUT ROWID table
     // roots. A WITHOUT ROWID table's primary structure is an index b-tree, not a
     // table b-tree; the vacuumed image must record/serialize that root correctly
