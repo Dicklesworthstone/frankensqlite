@@ -13417,6 +13417,16 @@ impl Connection {
             // schema, and MemDB initialization. Publish the generation only at
             // this final successful Connection boundary.
             conn.pager.finish_namespace_bootstrap()?;
+            // bd-zywqc.5: one-time idempotent repair pass on the first open of a
+            // database created by a version predating the issue-#70 recovery
+            // work. No-op for :memory:, freshly-created databases (stamped at
+            // birth), opt-out, and databases already migrated to the current
+            // version. Infallible: internal errors are logged rather than failing
+            // the open, and the original is preserved at `<db>.pre-migration-bak`.
+            #[cfg(feature = "native")]
+            if !pager_is_memory {
+                crate::migration::run_first_open_migration(&conn, storage_was_empty).await;
+            }
             Ok(())
         }
         .await;
@@ -62373,7 +62383,7 @@ impl Connection {
         result
     }
 
-    async fn validate_database_integrity(&self, quick: bool) -> Result<()> {
+    pub(crate) async fn validate_database_integrity(&self, quick: bool) -> Result<()> {
         // GH#113: when a write transaction is active, `with_integrity_txn`
         // reuses it, so the integrity walk reads uncommitted btree pages. But
         // frank's on-disk freelist trunk pages and the page-1 header (offsets
@@ -99862,6 +99872,38 @@ fn rewrite_in_expr<'a>(
     params: Option<&'a [SqliteValue]>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
+        // bd-and-or-short-circuit-value-jump-gaps-dkswh (root cause A): the eager
+        // prepare-time subquery hoist in the Exists/Subquery arms below runs BEFORE
+        // the planner's GAP-3 fold (planner::fold_binary_literals), so a FROM-bearing
+        // or HAVING `0 AND E` / `E AND 0` executed the erroring operand `E` even
+        // though FALSE absorbs AND and stock sqlite3 3.46.1 never evaluates it
+        // (verified: `SELECT (0 AND (SELECT count(*) FROM json_each('bare'))) FROM t`
+        // and `... HAVING 0 AND (...)` both fold to false in stock, all positions and
+        // polarities). Mirror the GAP-3 fold here, one phase earlier, so the dead
+        // operand — and any subquery it carries — is never hoisted/executed. Only the
+        // *integer literal 0* triggers this (matches stock exactly: `0.0 AND E`,
+        // `'0' AND E`, `0*1 AND E`, `NULL AND E`, and every OR form stay eager).
+        let and_false_span = if let Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+            span,
+        } = &*expr
+        {
+            if matches!(left.as_ref(), Expr::Literal(Literal::Integer(0), _))
+                || matches!(right.as_ref(), Expr::Literal(Literal::Integer(0), _))
+            {
+                Some(*span)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(span) = and_false_span {
+            *expr = Expr::Literal(Literal::False, span);
+            return Ok(());
+        }
         match expr {
             Expr::In {
                 set,

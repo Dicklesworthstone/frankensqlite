@@ -45,6 +45,8 @@ pub mod epoch;
 pub mod explain;
 pub mod inter_object_coding;
 pub mod lrc;
+#[cfg(feature = "native")]
+pub mod migration;
 pub mod native_index;
 pub mod permeation_map;
 pub mod por;
