@@ -1,12 +1,17 @@
-# UBS ignore patterns (globs), applied in addition to gitignore.
+# ubs ignore globs (read by default as PROJECT/.ubsignore).
 #
-# This repository contains large Markdown specs with embedded pseudocode in
-# multiple languages. UBS is a source scanner and produces high-noise findings
-# when run on these documents.
-COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md
-
-# Beads issue store is JSONL with embedded code blocks and is not "source" for UBS.
-.beads/*
-
-# Agent-specific build output dirs (large; non-source).
-target_*
+# bd-yxsqo: UBS Meta-Runner v5.3.11 hangs (>10 min, superlinear) on very large
+# Rust files — even a single explicit file, and even with --skip-type-narrowing.
+# Measured 2026-08-17: connection.rs (270k lines) and pager.rs (55k lines) both
+# time out at >90s; the pathology kicks in somewhere below 55k lines. A `git diff`
+# that touches any of these makes `ubs $(git diff --name-only)` hang and blocks the
+# agent. These files are excluded here so ubs skips them in every mode (`ubs .`,
+# `ubs --diff`, `ubs --staged`, and explicit-file scans — all verified to skip).
+#
+# Coverage note: these files still get clippy + `cargo check` + the test suites;
+# only the ubs pass is skipped. Shrinking them (esp. the connection.rs god-object,
+# bd-oxw4d) restores ubs coverage. If a NEW ubs scan hangs, the file is likely too
+# big — add it here.
+crates/fsqlite-core/src/connection.rs
+crates/fsqlite-pager/src/pager.rs
+crates/fsqlite-vdbe/src/codegen.rs
