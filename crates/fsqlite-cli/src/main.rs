@@ -993,13 +993,22 @@ fn write_delimited_rows<W>(
 where
     W: Write,
 {
+    // bd-dx29q: `.mode csv` terminates every record with CRLF (RFC 4180 /
+    // sqlite3), so scripts diffing against sqlite3 CSV output parse correctly.
+    // `list` and `tabs` keep the bare LF terminator sqlite3 uses for them.
+    let line_ending = if output_options.mode == OutputMode::Csv {
+        "\r\n"
+    } else {
+        "\n"
+    };
+
     if output_options.headers && !column_names.is_empty() {
         let header = column_names
             .iter()
             .map(|name| render_output_header(name, output_options.mode))
             .collect::<Vec<_>>()
             .join(separator);
-        writeln!(out, "{header}")?;
+        write!(out, "{header}{line_ending}")?;
     }
 
     for row in rows {
@@ -1009,7 +1018,7 @@ where
             .map(|value| render_output_value(value, output_options.mode))
             .collect::<Vec<_>>()
             .join(separator);
-        writeln!(out, "{rendered}")?;
+        write!(out, "{rendered}{line_ending}")?;
     }
     Ok(())
 }
@@ -2296,8 +2305,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, ShellOptions, format_row,
-        highlight_sql, parse_args, render_prompt, run, run_with_shell_options, statement_complete,
+        ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, OutputMode, OutputOptions,
+        ShellOptions, format_row, highlight_sql, parse_args, render_prompt, run,
+        run_with_shell_options, statement_complete, write_delimited_rows,
     };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
@@ -3256,6 +3266,60 @@ SELECT id FROM keep WHERE name = 'k3';\n"
                 .expect("query_row should succeed");
             let rendered = format_row(&row);
             assert_eq!(rendered, "10 | 'abc' | NULL");
+        });
+    }
+
+    #[test]
+    fn test_csv_mode_terminates_records_with_crlf_dx29q() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(":memory:")
+                .await
+                .expect("connection should open");
+            conn.execute("CREATE TABLE t(a, b)")
+                .await
+                .expect("create table");
+            conn.execute("INSERT INTO t VALUES (1, 'x'), (2, 'has,comma')")
+                .await
+                .expect("insert rows");
+            let rows = conn.query("SELECT a, b FROM t").await.expect("query rows");
+            let column_names = vec!["a".to_owned(), "b".to_owned()];
+
+            // bd-dx29q: `.mode csv` must terminate every record with CRLF
+            // (RFC 4180 / sqlite3), quoting the comma-bearing field.
+            let mut csv_out = Vec::new();
+            write_delimited_rows(
+                &rows,
+                &column_names,
+                OutputOptions {
+                    mode: OutputMode::Csv,
+                    headers: false,
+                },
+                OutputMode::Csv.separator(),
+                &mut csv_out,
+            )
+            .expect("write csv rows");
+            assert_eq!(
+                String::from_utf8(csv_out).expect("utf-8"),
+                "1,x\r\n2,\"has,comma\"\r\n",
+                "CSV mode must emit RFC 4180 CRLF record terminators"
+            );
+
+            // `list` mode keeps the bare LF terminator sqlite3 uses.
+            let mut list_out = Vec::new();
+            write_delimited_rows(
+                &rows,
+                &column_names,
+                OutputOptions {
+                    mode: OutputMode::List,
+                    headers: false,
+                },
+                OutputMode::List.separator(),
+                &mut list_out,
+            )
+            .expect("write list rows");
+            let list = String::from_utf8(list_out).expect("utf-8");
+            assert!(!list.contains('\r'), "list mode must not use CRLF: {list:?}");
+            assert!(list.ends_with('\n'), "list mode uses a bare LF terminator");
         });
     }
 
