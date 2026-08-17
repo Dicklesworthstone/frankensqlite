@@ -21637,7 +21637,33 @@ async fn coordinated_transaction_exit<F: VfsFile>(
             FrankenError::internal("transaction exit would underflow active transactions")
         })?;
     let writer_active_after_exit = inner.writer_active && !releases_writer_baton;
-    let cleanup_cx = cleanup_child_cx(cx);
+    // bd-gzyk1 / GH#348: this exit's external unlock / snapshot-restore is
+    // MANDATORY cleanup — it must run to completion even when `cx` is being
+    // cancelled, because the `active_transactions` decrement below (21699) is
+    // gated on it, and a stuck `active_transactions > 0` permanently pins
+    // `refresh_published_snapshot` on its stale-skip early return (14538) →
+    // every autocommit read binds a stale visibility and fails BusySnapshot
+    // forever. `cleanup_child_cx` = `cx.create_child()` inherits BOTH the
+    // caller's local cancel state and its attached native cx, and the db-file
+    // write lock's native fast path (`async_rwlock_write`) polls that inherited
+    // native cx directly, bypassing the `.masked()` guard below — so a cancelled
+    // autocommit statement aborted the unlock `?` before the decrement, leaking
+    // the counter and re-inheriting the same cancelled lineage on every retry
+    // (non-converging). Build a genuinely detached context (fresh cancel
+    // lineage, re-attached to the live native task) so cleanup always completes,
+    // mirroring Connection::detached_rebind_cx.
+    let cleanup_cx = {
+        // Preserve the caller's trace lineage (asserted by
+        // test_drop_cleanup_unlock_preserves_lineage_and_masks_cancellation) while
+        // shedding its cancel lineage.
+        let detached =
+            Cx::new().with_trace_context(cx.trace_id(), cx.decision_id(), cx.policy_id());
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if let Some(native_task_cx) = asupersync::Cx::current() {
+            detached.set_native_cx(native_task_cx);
+        }
+        detached
+    };
     let _cleanup_mask = cleanup_cx.masked();
     if remaining_active_transactions == 0 {
         shared_db_restore_external_snapshot_attempt(&inner.db_file, &cleanup_cx).await?;
