@@ -21701,8 +21701,11 @@ async fn coordinated_transaction_exit<F: VfsFile>(
         // Preserve the caller's trace lineage (asserted by
         // test_drop_cleanup_unlock_preserves_lineage_and_masks_cancellation) while
         // shedding its cancel lineage.
-        let detached =
-            Cx::new().with_trace_context(cx.trace_id(), cx.decision_id(), cx.policy_id());
+        let detached = Cx::detached_rebind().with_trace_context(
+            cx.trace_id(),
+            cx.decision_id(),
+            cx.policy_id(),
+        );
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if let Some(native_task_cx) = asupersync::Cx::current() {
             detached.set_native_cx(native_task_cx);

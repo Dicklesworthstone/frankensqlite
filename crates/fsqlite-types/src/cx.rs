@@ -1124,6 +1124,27 @@ impl Cx<FullCaps> {
     pub fn new() -> Self {
         Self::with_budget(Budget::INFINITE)
     }
+
+    /// Mint a fresh, fully **detached** root context for MANDATORY post-cancel
+    /// cleanup (VACUUM rebind, drop-time external unlock / snapshot-restore).
+    ///
+    /// This is the SANCTIONED direct constructor for runtime crates. The audit
+    /// gate `test_no_direct_cx_constructors_in_runtime_production_code` forbids
+    /// a bare `Cx::new()` / `Cx::default()` in runtime crates precisely so this
+    /// documented path is the only way to obtain a detached root context — one
+    /// with its own `CxInner`, no cancel lineage, and no recorded native-cancel
+    /// reason. Unlike a masked `create_child()`, such a context keeps running
+    /// even when the operation `Cx` (and its attached native cx) were cancelled
+    /// after publication: the db-file write lock's native fast path polls the
+    /// attached native cx directly, bypassing `masked()`, so a masked child is
+    /// insufficient. Callers re-attach the live task's native cx via
+    /// [`Cx::set_native_cx`] and, where trace continuity matters, chain
+    /// [`Cx::with_trace_context`]. See `Connection::detached_rebind_cx` and the
+    /// pager drop-cleanup path (bd-gzyk1 / GH#348, VACUUM rebind).
+    #[must_use]
+    pub fn detached_rebind() -> Self {
+        Self::new()
+    }
 }
 
 impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
@@ -3699,10 +3720,19 @@ mod tests {
 
                 for (line, pat) in scan_file_outside_cfg_test_items(&src, &forbidden) {
                     let line_text = src.lines().nth(line - 1).unwrap_or("").trim();
+                    // The sanctioned detached-root constructor is
+                    // `Cx::detached_rebind()` (fsqlite-types), which the forbidden
+                    // scan never matches, so every routed site passes with no
+                    // allowlist. The one remaining bare `Cx::new()` is inside
+                    // `Connection::detached_rebind_cx` itself — the documented
+                    // canonical detached-rebind site (bd-gzyk1 / GH#348, VACUUM
+                    // rebind). It is pending conversion to `Cx::detached_rebind()`
+                    // (blocked on an exclusive lease on connection.rs); until then
+                    // its single documented line is allowed.
                     let allowed_detached_root_constructor = rel_path
                         == Path::new("crates/fsqlite-core/src/connection.rs")
                         && pat == "Cx::new("
-                        && line_text.contains("Cx::new().with_trace_context(");
+                        && line_text.contains("let rebind_cx = Cx::new();");
 
                     if allowed_detached_root_constructor {
                         continue;
