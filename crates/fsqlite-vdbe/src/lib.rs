@@ -1555,6 +1555,12 @@ pub mod pragma {
         pub auto_vacuum: i64,
         /// WAL auto-checkpoint threshold in pages.
         pub wal_autocheckpoint: i64,
+        /// Soft cap on the WAL/journal file size in bytes
+        /// (`PRAGMA journal_size_limit`). Default `-1` (no limit). A negative
+        /// value disables the limit (stored as-is, not clamped). When set to a
+        /// non-negative `N`, a checkpoint truncates the WAL back down to at most
+        /// `N` bytes instead of leaving it grown.
+        pub journal_size_limit: i64,
         /// User schema version (`PRAGMA user_version`).
         pub user_version: i64,
         /// Application ID (`PRAGMA application_id`).
@@ -1622,6 +1628,7 @@ pub mod pragma {
                 mmap_size: 0,
                 auto_vacuum: 0,
                 wal_autocheckpoint: 1000,
+                journal_size_limit: -1,
                 user_version: 0,
                 application_id: 0,
                 default_cache_size: 0,
@@ -1720,6 +1727,9 @@ pub mod pragma {
         }
         if name.eq_ignore_ascii_case("wal_autocheckpoint") {
             return apply_wal_autocheckpoint(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("journal_size_limit") {
+            return apply_journal_size_limit(state, stmt);
         }
         if name.eq_ignore_ascii_case("user_version") {
             return apply_user_version(state, stmt);
@@ -2109,6 +2119,23 @@ pub mod pragma {
                 let val = parse_integer_expr(expr)?;
                 state.wal_autocheckpoint = val.max(0);
                 Ok(PragmaOutput::Int(state.wal_autocheckpoint))
+            }
+        }
+    }
+
+    fn apply_journal_size_limit(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.journal_size_limit)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_integer_expr(expr)?;
+                // Unlike page-count limits, a NEGATIVE journal_size_limit is
+                // meaningful (SQLite: "no limit"), so store the value as-is
+                // rather than clamping to 0. The pragma reports the new limit.
+                state.journal_size_limit = val;
+                Ok(PragmaOutput::Int(state.journal_size_limit))
             }
         }
     }
@@ -3484,6 +3511,40 @@ mod tests {
             pragma::apply_connection_pragma(&mut state, &query).expect("query pragma"),
             pragma::PragmaOutput::Int(1)
         );
+    }
+
+    #[test]
+    fn test_connection_pragma_journal_size_limit_set_and_query() {
+        let mut state = pragma::ConnectionPragmaState::default();
+
+        // bd-yoa57: default is -1 (no limit), and the pragma is RECOGNIZED
+        // (not silently Unsupported).
+        let query = parse_pragma("PRAGMA journal_size_limit").expect("parse pragma");
+        assert_eq!(
+            pragma::apply_connection_pragma(&mut state, &query).expect("query pragma"),
+            pragma::PragmaOutput::Int(-1)
+        );
+
+        // Setting a non-negative byte limit stores and reports it.
+        let set = parse_pragma("PRAGMA journal_size_limit = 32768").expect("parse pragma");
+        assert_eq!(
+            pragma::apply_connection_pragma(&mut state, &set).expect("set pragma"),
+            pragma::PragmaOutput::Int(32768)
+        );
+        assert_eq!(state.journal_size_limit, 32768);
+        assert_eq!(
+            pragma::apply_connection_pragma(&mut state, &query).expect("query pragma"),
+            pragma::PragmaOutput::Int(32768)
+        );
+
+        // A negative value means "no limit" and is stored verbatim (NOT clamped
+        // to 0, unlike page-count limits like wal_autocheckpoint).
+        let set_neg = parse_pragma("PRAGMA journal_size_limit = -1").expect("parse pragma");
+        assert_eq!(
+            pragma::apply_connection_pragma(&mut state, &set_neg).expect("set pragma"),
+            pragma::PragmaOutput::Int(-1)
+        );
+        assert_eq!(state.journal_size_limit, -1);
     }
 
     #[test]
