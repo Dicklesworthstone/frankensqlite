@@ -21273,9 +21273,22 @@ impl Connection {
         mode: TransactionMode,
         refresh_memdb_during_busy_wait: bool,
     ) -> Result<TransactionKind> {
+        // `Busy` AND `BusyRecovery` are both transient, retryable members of
+        // the SQLITE_BUSY family (`FrankenError::is_transient`), so the read /
+        // transaction-begin admission budget must honor `busy_timeout` for
+        // both. A bare WAL read can transiently observe `BusyRecovery` when a
+        // concurrent single writer's checkpoint / group-commit finalization is
+        // momentarily in flight (an identity-wide process-root finalization is
+        // registered while the writer's maintenance/EXCLUSIVE-lock restoration
+        // is briefly deferred) — the recovery fence itself only gates actual
+        // rollback-journal recovery, which WAL reads never enter. Retrying
+        // within the budget lets the reader wait that window out instead of
+        // failing, matching `retry_busy_connection_bootstrap` (which already
+        // retries both on the open path) and every downstream busy handler.
+        // bd-dhhxp.
         match pager.begin(cx, mode).await {
             Ok(txn) => return Ok(txn),
-            Err(FrankenError::Busy) => {}
+            Err(FrankenError::Busy | FrankenError::BusyRecovery) => {}
             Err(err) => return Err(err),
         }
 
@@ -21303,7 +21316,7 @@ impl Connection {
             }
             match pager.begin(cx, mode).await {
                 Ok(txn) => return Ok(txn),
-                Err(FrankenError::Busy) => {}
+                Err(FrankenError::Busy | FrankenError::BusyRecovery) => {}
                 Err(err) => return Err(err),
             }
         }
