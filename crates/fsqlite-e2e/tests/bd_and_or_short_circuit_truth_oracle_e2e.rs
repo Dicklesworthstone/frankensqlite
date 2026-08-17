@@ -252,3 +252,62 @@ fn upsert_case_or_scalar_short_circuits() {
         .await;
     });
 }
+
+// ── GAP-3 / root-cause-A: `0 AND E` folds BEFORE the eager subquery hoist ───────
+// An UNCORRELATED subquery `(SELECT count(*) FROM json_each('bare'))` errors if
+// evaluated. It was eager-executed at PREPARE time (connection.rs rewrite_in_expr
+// Exists/Subquery arms) BEFORE the planner GAP-3 fold, so `0 AND E` / `E AND 0`
+// errored in the FROM-bearing result-column / HAVING / nested-comparison paths
+// where stock sqlite3 3.46.1 folds to FALSE and never evaluates E (verified). The
+// fix folds `0 AND E` -> FALSE at the top of rewrite_in_expr, one phase earlier,
+// so the dead operand's subquery is never hoisted. FALSE absorbs AND in every
+// context/position/polarity.
+#[test]
+fn and_false_folds_before_uncorrelated_subquery_hoist() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup_mem().await;
+        check(
+            &f,
+            &r,
+            &[
+                // value context, FROM-bearing (defeats the no-FROM fast path):
+                "SELECT (0 AND (SELECT count(*) FROM json_each('bare'))) FROM t ORDER BY x",
+                // literal 0 on the RIGHT arm:
+                "SELECT ((SELECT count(*) FROM json_each('bare')) AND 0) FROM t ORDER BY x",
+                // HAVING truth context:
+                "SELECT count(*) FROM t HAVING 0 AND (SELECT count(*) FROM json_each('bare'))",
+                // nested inside a comparison operand — still folds (context-independent):
+                "SELECT x FROM t WHERE (0 AND (SELECT count(*) FROM json_each('bare'))) = 0 ORDER BY x",
+                // under NOT — polarity-independent:
+                "SELECT x FROM t WHERE NOT(0 AND (SELECT count(*) FROM json_each('bare'))) ORDER BY x",
+            ],
+            "and_false_folds_before_uncorrelated_subquery_hoist",
+        )
+        .await;
+    });
+}
+
+/// Guard against OVER-folding: only the *integer literal 0* AND-absorbs. Every
+/// other value-context form stays EAGER and must ERROR exactly as stock does
+/// (`check` treats both-error as parity, so a spurious fold surfaces as an
+/// Ok-vs-Err mismatch). `1 OR E` in a VALUE context is eager in stock too — the
+/// TRUE-absorbs-OR short-circuit is truth-context-only and is NOT yet implemented
+/// here (tracked separately); it must keep erroring, not silently fold.
+#[test]
+fn and_or_fold_does_not_over_fold_value_context() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup_mem().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT 1 OR (SELECT count(*) FROM json_each('bare'))",
+                "SELECT 1 AND (SELECT count(*) FROM json_each('bare'))",
+                "SELECT 0.0 AND (SELECT count(*) FROM json_each('bare'))",
+                "SELECT '0' AND (SELECT count(*) FROM json_each('bare'))",
+            ],
+            "and_or_fold_does_not_over_fold_value_context",
+        )
+        .await;
+    });
+}
