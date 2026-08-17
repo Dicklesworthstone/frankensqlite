@@ -71465,6 +71465,21 @@ impl Connection {
                     // chain and fold left-to-right so recursion depth stays O(1)
                     // async frames per leaf operand, not O(N) per operator.
                     if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                        // bd-select-structure-multifacet-hrkoq facet 3: stock SQLite
+                        // folds a constant-integer-zero AND subtree to the literal 0 at
+                        // PARSE time (sqlite3ExprAnd / exprAlwaysFalse), discarding —
+                        // and never evaluating or name-resolving — the other operand.
+                        // The relation/column/structure validators already skip such a
+                        // subtree via expr_folds_to_integer_zero_via_and; mirror that
+                        // fold here so the eager both-operands materialization below
+                        // never executes a dead subquery. `SELECT 0 AND (SELECT 1 FROM
+                        // missing)` and `... AND 0` then return 0 instead of surfacing
+                        // the dead relation's NoSuchTable. Only an exact integer 0
+                        // folds (FALSE / 0.0 / (0 COLLATE ...) / +0 stay live), and the
+                        // predicate recurses through And only, so an OR expr never folds.
+                        if expr_folds_to_integer_zero_via_and(expr) {
+                            return Ok(SqliteValue::Integer(0));
+                        }
                         let mut chain = Vec::new();
                         collect_same_binary_op_operands(expr, *op, &mut chain);
                         debug_assert!(
