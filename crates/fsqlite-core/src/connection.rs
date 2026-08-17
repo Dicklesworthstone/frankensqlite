@@ -10570,6 +10570,10 @@ impl Drop for OperationCxGuard<'_> {
     }
 }
 
+// bd-081hj: this god-object carries many intentionally domain-prefixed fields
+// (e.g. `connection_registry_differs_from_base`); a targeted rename across all
+// call sites isn't worth the churn, so the struct-field-names lint is allowed here.
+#[allow(clippy::struct_field_names)]
 pub struct Connection {
     path: String,
     /// In-memory execution image shared with the VDBE engine.
@@ -37518,6 +37522,11 @@ fn bounded_check_scalar_function_supported(
     }
 }
 
+// bd-081hj: `op: &LikeOp` is required to match the `Option<&dyn Fn(&LikeOp, &Expr,
+// Option<&Expr>) -> bool>` predicate contract (see `supported_like`), so the
+// trivially-copy-pass-by-ref lint is a false positive — passing by value would not
+// unify with the expected fn-pointer type at its call site.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn bounded_check_like_supported(op: &LikeOp, pattern: &Expr, escape: Option<&Expr>) -> bool {
     escape.is_none()
         && matches!(op, LikeOp::Glob)
