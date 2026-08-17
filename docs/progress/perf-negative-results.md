@@ -48,6 +48,44 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-17 - KEEP: wide-TEXT SELECT decodes into a shared Arc<str>, removing a redundant per-row cache-clone alloc (bd-rr46j)
+
+- Lever: `column_to_reg_direct` (fsqlite-vdbe/src/engine.rs) decoded a wide TEXT
+  column into a pool-owned `String` and then cloned it into a separate `Arc<str>`
+  for the lazy-decode cache — a redundant ~1KB malloc+memcpy+free per row on a
+  single-pass wide-TEXT scan. Fix: decode wide valid-UTF-8 TEXT directly into
+  `HeapShared(Arc<str>)` (`SmallText::from_record_text_bytes_shared` in value.rs +
+  `decode_column_from_offset_reuse_with_encoding_shared` in record.rs) so the
+  cache entry and the destination register share ONE allocation via O(1)
+  `Arc::clone`. The hint fast-path (repeated payloads) is unchanged -> bd-db300
+  Arc-reuse preserved; inline/short/BLOB/raw-non-UTF-8 byte-identical.
+- Gated release-perf A/B (RUSTFLAGS=`-C target-cpu=native`, self-SHA binary, 300
+  rounds/variant, randomized A/A/B/B, fixed-seed pairs-bootstrap 4000 resamples,
+  EPYC superserver, python-cross-checked):
+  - streaming `for_each`: **+7.85%** (run1) / **+8.19%** (run2), delta ~= -80 ns/row,
+    95% CI excludes 0, >= 2x A/A radius (~5-11 ns) by 4-14x.
+  - Vec `query()`: **+7.21% / +6.31%**. Clears the KEEP gate (>=1% AND >=2x A/A
+    radius) on BOTH arms across TWO runs. ~80 ns/row = exactly one 1KB `Arc`
+    malloc+memcpy+free removed.
+  - Disproved the profile's "already pool-reused -> likely a wash" risk BY
+    MEASUREMENT: the streaming projection runs a COLD value pool (registers are
+    moved via `take_reg`, never returned), so the cache-clone was a genuine
+    SECOND alloc, not a shift.
+- Correctness (full --lib, at HEAD): fsqlite-vdbe 1155/0; fsqlite-core 3750 passed
+  / 5 failed — all 5 PRE-EXISTING and unrelated to TEXT decode (3x fts5 bd-dk9ra
+  new-feature, vector-IN bd-lvfyp, recursive-trigger bd-4uema), 0 new. Decode-cache
+  repeat-read + wide-row-reuse tests green.
+- Files: `crates/fsqlite-types/src/{record.rs,value.rs}`,
+  `crates/fsqlite-vdbe/src/engine.rs` (+127/-3). Profile artifact:
+  tests/artifacts/perf/execute-loop-profile-20260817T043017Z-superserver/.
+- This is the FIRST perf KEEP after two data-backed NO-GOs (bd-i9sov register file,
+  bd-hggxz async bridge) — profile-first + gated-A/B found a real lever where the
+  reason-from-code single-lever seam was declared dry. Retry/adjacent: the Vec
+  `query()` result-set accumulation (allocator 36.7% vs 9.6% streaming) is
+  API-shaped (the streaming for_each API is already 2x faster) — not an engine
+  lever; and Row `Vec<SqliteValue>` -> `SmallVec` is an independent unmeasured
+  companion lever (per-row Row Vec malloc).
+
 ## 2026-08-17 - NO-GO: batch/hoist the VDBE per-row/per-statement async bridge (bd-hggxz) — the "~333ns/row + ~700ns/statement" is not a live product cost
 
 - Target: bd-i9sov's before-profile "located" a ~333 ns/row bridge + ~700 ns/
