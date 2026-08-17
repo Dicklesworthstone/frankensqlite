@@ -35,7 +35,8 @@ pub enum ProcessLiveness {
 /// Top-bit tag for a Linux procfs start-ticks birth token (unchanged for
 /// on-disk compatibility with pre-bd-4dr7g lock tables).
 pub const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
-/// Top-bit tag for a macOS `sysctl` `p_starttime` (microseconds) birth token.
+/// Top-bit tag for a macOS process start-time (microseconds) birth token, read
+/// via `proc_pidinfo(PROC_PIDTBSDINFO)`.
 pub const PID_BIRTH_SYSCTL_TAG: u64 = 1_u64 << 62;
 /// Top-bit tag for a Windows process-creation `FILETIME` (100 ns) birth token.
 pub const PID_BIRTH_FILETIME_TAG: u64 = 1_u64 << 61;
@@ -103,47 +104,45 @@ mod macos {
         Error,
     }
 
-    /// Read `kinfo_proc.kp_proc.p_starttime` for `pid` via
-    /// `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)`.
+    /// Read a process's start time (microseconds) via
+    /// `proc_pidinfo(pid, PROC_PIDTBSDINFO)` -> `proc_bsdinfo.pbi_start_tv*`.
+    /// (`libc` does not expose `kinfo_proc` on Darwin, so this uses libproc.)
     fn read_start_time_usec(pid: u32) -> StartTime {
-        let mut mib: [libc::c_int; 4] = [
-            libc::CTL_KERN,
-            libc::KERN_PROC,
-            libc::KERN_PROC_PID,
-            pid as libc::c_int,
-        ];
-        // ubs:ignore - kinfo_proc is a plain-old-data C struct; a zeroed output
-        // buffer is the standard `sysctl` idiom, not an uninitialized-read hazard.
-        // SAFETY: `mem::zeroed()` is valid for `kinfo_proc` (a plain C struct of
-        // integers/timevals with no invalid bit patterns).
-        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<libc::kinfo_proc>();
-        // SAFETY: `mib` has exactly 4 valid entries (`namelen = 4`); `info` is a
-        // live, correctly-sized `kinfo_proc` and `size` its byte length; the
-        // new-value pointer is null (a read). All per the `sysctl(3)` contract.
-        let ret = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                4,
-                std::ptr::from_mut(&mut info).cast(),
-                &mut size,
-                std::ptr::null_mut(),
+        // ubs:ignore - proc_bsdinfo is a plain-old-data C struct; a zeroed output
+        // buffer is the standard `proc_pidinfo` idiom, not an uninitialized read.
+        // SAFETY: `mem::zeroed()` is valid for `proc_bsdinfo` (all integer fields).
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: `proc_pidinfo` writes at most `size` bytes into `info`, a live
+        // and correctly-sized `proc_bsdinfo`; it returns the byte count, or <= 0
+        // on error / no such process.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
                 0,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
             )
         };
-        if ret != 0 {
-            // ESRCH here would still surface as a non-zero return on some
-            // releases; a zero-length success (below) is the canonical
-            // "no such process". Treat other failures as ambiguous.
+        if written <= 0 {
+            // `proc_pidinfo` returns 0 or -1 (errno `ESRCH`) for a process that
+            // no longer exists; other errno values are ambiguous.
+            return if written == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                StartTime::Absent
+            } else {
+                StartTime::Error
+            };
+        }
+        if written < size {
             return StartTime::Error;
         }
-        if size == 0 {
-            return StartTime::Absent;
-        }
-        let tv = info.kp_proc.p_starttime;
-        let usec = (tv.tv_sec as u64)
+        let usec = info
+            .pbi_start_tvsec
             .wrapping_mul(1_000_000)
-            .wrapping_add(tv.tv_usec as u64);
+            .wrapping_add(info.pbi_start_tvusec);
         StartTime::Present(usec)
     }
 
