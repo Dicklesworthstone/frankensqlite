@@ -17261,7 +17261,17 @@ fn compare_text_with_collation(
     // BINARY compares in the DB storage encoding (bd-bld9w.4); NOCASE/RTRIM and
     // user-defined collations operate on canonical UTF-8 as before. An unknown
     // collation falls back to BINARY, which is likewise encoding-aware.
-    if coll_name.eq_ignore_ascii_case("BINARY") {
+    //
+    // bd-4nuqo/bd-rwaxp: an application may override the built-in BINARY with a
+    // custom comparator. The storage-encoding shortcut is only valid for the
+    // *built-in* BINARY; when BINARY is overridden the compare must resolve
+    // through the registry so the custom comparator governs equality. bd-bld9w.4's
+    // unconditional BINARY shortcut re-broke that override (it returned a memcmp
+    // before ever consulting the registry), regressing
+    // test_custom_binary_override_disables_binary_hash_and_exists_memos.
+    if coll_name.eq_ignore_ascii_case("BINARY")
+        && collation_registry.uses_builtin_implementation("BINARY")
+    {
         return binary_compare_bytes(left, right, enc);
     }
     collation_registry
