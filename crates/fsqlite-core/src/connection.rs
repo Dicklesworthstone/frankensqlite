@@ -96863,10 +96863,20 @@ impl SharedMvccState {
                     "could not request database-root region cancellation during drop"
                 );
             }
-            if state.key.path_key != ":memory:"
-                && let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get()
-            {
-                lock_unpoisoned(state_map).remove(&state.key);
+            if state.key.path_key != ":memory:" {
+                // bd-fs32r (bd-1is5z): mirror close_internal's last-connection per-path
+                // cleanup so an unawaited Drop of the final connection does not leak the
+                // per-path group-commit / parallel-WAL coordinator map entries (and the
+                // parallel-WAL ticker thread, if that ticker is ever wired). Both are a
+                // sync map-drop + BlockingTaskHandle::wait() on a separate thread that
+                // never touches this Connection's runtime_state, so they are Drop-safe.
+                let db_path = PathBuf::from(&state.key.path_key);
+                fsqlite_pager::remove_group_commit_queue(&db_path);
+                #[cfg(not(target_arch = "wasm32"))]
+                fsqlite_wal::remove_parallel_wal_coordinator(&db_path);
+                if let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get() {
+                    lock_unpoisoned(state_map).remove(&state.key);
+                }
             }
         }
     }
