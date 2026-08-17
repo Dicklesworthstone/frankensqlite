@@ -78598,7 +78598,27 @@ impl Connection {
         for (_op, core) in &mut result.body.compounds {
             rewrite_in_select_core(core, self, false, params).await?;
         }
-        rewrite_in_ordering_terms(&mut result.order_by, self, false, params).await?;
+        // bd-rwaxp / bd-2fong regression (31243f227): a top-level ORDER BY scalar
+        // subquery is eagerly folded here by *executing* it. If that fold errors
+        // — a nested compound's UNION/EXCEPT/INTERSECT arity ParseError, or a
+        // `(SELECT a, b)` scalar-arity mismatch — raising it now breaks SQLite's
+        // depth-first, left-to-right precedence: a sibling ORDER operand's
+        // NoSuchColumn / positional-ordinal error must win first. Leave the clause
+        // UNFOLDED on error; the post-rewrite validate_statement_select_semantics
+        // pass (prepared path) and the executor (direct path) then re-raise the
+        // correct error in depth-first order — exactly as the direct execute path
+        // already does (it validates before folding). A *valid* ORDER BY subquery
+        // never errors here (it folds to a literal, or stays intact when
+        // correlated / parameter-dependent), and any runtime error resurfaces when
+        // the executor evaluates the restored subquery, so this only defers a
+        // genuine error to its canonical site — it never suppresses one.
+        let order_by_snapshot = result.order_by.clone();
+        if rewrite_in_ordering_terms(&mut result.order_by, self, false, params)
+            .await
+            .is_err()
+        {
+            result.order_by = order_by_snapshot;
+        }
         if let Some(limit) = result.limit.as_mut() {
             rewrite_in_limit_clause(limit, self, false, params).await?;
         }
@@ -118117,6 +118137,23 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                             && column.table.is_none()
                             && scope.output_alias(&column.column).is_some()
                         {
+                            continue;
+                        }
+                        // bd-rwaxp: an ORDER BY term embedding a sub-SELECT must
+                        // resolve its operands strictly left-to-right against BOTH
+                        // name and compound-arity errors. That unified depth-first
+                        // walk lives in SelectStructureResolver::validate_order_expr.
+                        // This name-only preflight would otherwise resolve a sibling
+                        // name before a LEADING subquery's arity error — e.g.
+                        // `(SELECT 1 UNION SELECT 2,3) + nope` must yield the UNION
+                        // ParseError (left operand first), not NoSuchColumn(nope).
+                        // Defer subquery-bearing terms to the structure resolver
+                        // (test_select_structure_follows_sqlite_depth_first_precedence).
+                        if expr_contains_subquery_matching_deep(
+                            &term.expr,
+                            self.connection,
+                            |_, _| true,
+                        ) {
                             continue;
                         }
                         self.validate_expr(&term.expr, &scope, SelectOutputAliasUse::OrderBy)?;
