@@ -58,11 +58,27 @@ pub mod host_fs {
     /// existing final path component: regular files, directories, and both
     /// live and dangling symlinks all make `create_new` fail. On Unix the
     /// initial mode is owner-only; the process umask may narrow it further.
+    ///
+    /// On Windows this handle is retained open for the lifetime of a caller's
+    /// reservation (see `fsqlite-core`'s `DatabaseBuilderReservation`) while a
+    /// second, independent open against the same path is made through the
+    /// `windows` VFS module. Rust's default Windows share mode is
+    /// `FILE_SHARE_READ | FILE_SHARE_WRITE` (no `FILE_SHARE_DELETE`); this
+    /// explicitly matches stock SQLite's `FILE_SHARE_READ | FILE_SHARE_WRITE
+    /// | FILE_SHARE_DELETE` instead, for the same bd-h5oaj / GH#355 reason
+    /// documented next to `windows_open_options` in `windows.rs`.
     pub fn reserve_new_file(path: &Path) -> Result<File> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o600);
+        #[cfg(windows)]
+        {
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+            const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        }
         Ok(options.open(path)?)
     }
 
