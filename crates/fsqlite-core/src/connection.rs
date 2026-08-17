@@ -484,6 +484,31 @@ const FUNCTION_REGISTRY_STABILITY_ATTEMPTS: usize = 4;
 /// the two program kinds must still share this semantic admission budget.
 pub const MAX_TRIGGER_PROGRAM_DEPTH: usize = 50;
 
+/// bd-7mnz8 Phase 1: values produced by the pre-dispatch preparation phase of
+/// `execute_statement_impl_after_background_status`, returned by the hoisted
+/// [`Connection::plan_statement_execution`] helper. Bundling these lets the
+/// preparation phase (memdb refreshes, retained-batch flushes, and autocommit
+/// acquisition — roughly eight `.await` points) run on a SEPARATE async frame
+/// that returns before the recursive trigger-dispatch descends, shrinking the
+/// per-recursion-level native stack cost without reordering any operation.
+#[allow(clippy::struct_excessive_bools)]
+struct StatementExecutionPlan {
+    /// Operation context minted for this statement (drives dispatch + resolve).
+    op_cx: Cx,
+    /// Whether the statement is a data/DDL write (governs autocommit + resolve).
+    is_write: bool,
+    /// Whether the statement manages its own transaction (BEGIN/COMMIT/…).
+    is_txn_control: bool,
+    /// Whether a fresh time-travel snapshot should be captured on resolve.
+    capture_time_travel_snapshot: bool,
+    /// Whether the statement is `PRAGMA writable_schema` DML on page-1 rows.
+    writable_schema_dml: bool,
+    /// Whether the statement begins a fresh schema-change boundary.
+    schema_change_boundary: bool,
+    /// Whether this dispatcher opened the implicit autocommit transaction.
+    was_auto: bool,
+}
+
 static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Opt-in for the per-column INSERT preserialize sub-timers.
@@ -32385,6 +32410,166 @@ impl Connection {
         }
     }
 
+    /// bd-7mnz8 Phase 1: pre-dispatch preparation for
+    /// `execute_statement_impl_after_background_status`, hoisted into its own
+    /// `async fn`. Its ~8 `.await` points (memdb refreshes, retained-batch
+    /// flushes, autocommit acquisition) execute on a SEPARATE async frame that
+    /// returns before the recursive trigger-dispatch descends, so their
+    /// resume-state stack no longer inflates the per-recursion-level native
+    /// stack cost. Behavior is byte-for-byte unchanged: the same operations run
+    /// in the same order, and the `PRAGMA query_only` write rejection still
+    /// fails closed here. This helper is inline-`.await`ed (never `Box::pin`ned)
+    /// so its future stays in the caller's heap-boxed state without being
+    /// re-materialized on the recursive stack.
+    #[allow(clippy::too_many_lines)]
+    async fn plan_statement_execution(
+        &self,
+        statement: &Statement,
+    ) -> Result<StatementExecutionPlan> {
+        // 5B.5 + 5B.2 (bd-1yi8): autocommit wrapping — ensure a pager
+        // transaction is active for data/DDL operations outside an
+        // explicit BEGIN.  Writes use Immediate mode; reads use Deferred.
+        // Transaction-control statements manage their own transactions.
+        let is_write = matches!(
+            statement,
+            Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::CreateTable(_)
+                | Statement::CreateVirtualTable(_)
+                | Statement::CreateView(_)
+                | Statement::CreateTrigger(_)
+                | Statement::Drop(_)
+                | Statement::AlterTable(_)
+                | Statement::CreateIndex(_)
+                | Statement::Analyze(_)
+                | Statement::Reindex(_)
+        );
+        // Issue #110: any statement that may delete or alter a parent row
+        // invalidates a cached "parent present" result. Plain INSERTs only add
+        // rows (safe), but UPDATE/DELETE, DDL, and INSERT OR REPLACE / upsert
+        // (which can delete or mutate an existing — possibly parent — row)
+        // must drop the transaction-scoped FK parent-validation cache. The
+        // prepared UPDATE/DELETE fast lanes bypass this dispatcher and clear
+        // the cache at their own entry point.
+        if Self::statement_may_invalidate_fk_parent_cache(statement) {
+            self.clear_fk_parent_validation_cache();
+        }
+        let is_txn_control = matches!(
+            statement,
+            Statement::Begin(_)
+            | Statement::Commit
+            | Statement::Rollback(_)
+            | Statement::Savepoint(_)
+            | Statement::Release(_)
+            // VACUUM INTO needs the pager quiescent, so it cannot run
+            // inside the implicit autocommit read transaction used for
+            // ordinary statement dispatch.
+            | Statement::Vacuum(_)
+            // PRAGMA handlers that need pager access (for example
+            // `PRAGMA wal_checkpoint`) manage their own pager operations.
+            | Statement::Pragma(_)
+        );
+        let capture_time_travel_snapshot = !matches!(
+            statement,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        );
+        let op_cx = self.op_cx_after_background_status();
+        let should_refresh_active_txn_memdb = !self.skip_statement_memdb_refresh.get()
+            && (self.memdb_requires_active_txn_reload.get()
+                || !self.pending_memdb_direct_upserts.borrow().is_empty())
+            && !matches!(statement, Statement::Commit)
+            && !matches!(statement, Statement::Rollback(_));
+        let writable_schema_dml = self.statement_is_writable_schema_dml(statement);
+        let schema_change_boundary =
+            statement_starts_fresh_schema_change_boundary(statement) || writable_schema_dml;
+        if self.pragma_state.borrow().query_only
+            && (statement_writes_under_query_only(statement) || writable_schema_dml)
+        {
+            return Err(FrankenError::ReadOnly);
+        }
+        // `PRAGMA writable_schema` DML edits page-1 schema rows directly and
+        // may be repairing malformed rows. Do not refresh the normal MemDB
+        // schema image before the raw edit has had a chance to run.
+        if should_refresh_active_txn_memdb && !writable_schema_dml {
+            // bd-33sht: a read-free INSERT ... VALUES streak must not pay a
+            // full O(rows) MemDatabase reload per statement. Flush pending
+            // direct writes (the insert's own uniqueness/rowid checks read
+            // the txn b-tree) but skip the mirror reload — the mirror stays
+            // stale and is rebuilt once at the next actual read boundary.
+            if matches!(statement, Statement::Insert(ins)
+                if insert_source_is_memdb_read_free(&ins.source))
+            {
+                self.flush_pending_direct_write_runs(&op_cx).await?;
+            } else {
+                self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
+            }
+        }
+        if !self.skip_statement_memdb_refresh.get() && !is_txn_control && !is_write {
+            self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
+                .await?;
+        }
+        if !self.skip_statement_memdb_refresh.get()
+            && schema_change_boundary
+            && self.cached_write_txn.borrow().is_some()
+        {
+            self.invalidate_cached_write_txn(&op_cx).await;
+        }
+        let retained_boundary_flush_required = self.retained_autocommit_txn.borrow().is_some()
+            && (schema_change_boundary
+                || matches!(
+                    statement,
+                    Statement::Pragma(_)
+                        | Statement::Vacuum(_)
+                        | Statement::Attach(_)
+                        | Statement::Detach(_)
+                ));
+        if retained_boundary_flush_required {
+            // Schema/pager boundaries must not reuse a parked retained
+            // autocommit batch because they need a fresh durable view.
+            self.flush_retained_autocommit_txn(&op_cx).await?;
+        }
+        // bd-otbu1 / I1: Flush retained autocommit if read touches dirty tables.
+        // This preserves read-after-write semantics for any retained batch.
+        if !is_txn_control
+            && !is_write
+            && self.retained_autocommit_txn.borrow().is_some()
+            && matches!(statement, Statement::Select(select) if {
+                // Extract table names from the SELECT's FROM clause.
+                let read_tables = Self::extract_table_names_from_select(select);
+                self.retained_autocommit_has_dirty_overlap(&read_tables)
+            })
+        {
+            self.flush_retained_autocommit_txn_for_read(&op_cx).await?;
+        }
+        let was_auto = if is_txn_control {
+            false // transaction-control manages its own transactions
+        } else if is_write {
+            self.ensure_autocommit_txn_with_cx(&op_cx).await?
+        } else {
+            self.ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, &op_cx, None)
+                .await?
+        };
+        if !self.skip_statement_memdb_refresh.get()
+            && !writable_schema_dml
+            && schema_change_boundary
+            && (self.memdb_requires_active_txn_reload.get()
+                || !self.pending_memdb_direct_upserts.borrow().is_empty()
+                || !self.memdb_rows_loaded.get())
+        {
+            self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
+        }
+        Ok(StatementExecutionPlan {
+            op_cx,
+            is_write,
+            is_txn_control,
+            capture_time_travel_snapshot,
+            writable_schema_dml,
+            schema_change_boundary,
+            was_auto,
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     // Dispatch re-enters itself (triggers, view INSTEAD OF bodies, subquery
     // materialization, FK cascades), so the future is boxed to break the
@@ -32490,6 +32675,24 @@ impl Connection {
                 }
                 _ => None,
             };
+            // bd-7mnz8 Phase 1: keep the (possibly rewritten) statement
+            // heap-indirect for its owned variant so only a pointer — not a full
+            // inline `Statement` — sits on this recursive frame. Borrowed inputs
+            // stay borrowed (no allocation on the common path). `AsRef` (not an
+            // inherent `as_ref`) keeps the ~20 downstream `statement.as_ref()`
+            // call sites unchanged and avoids `clippy::should_implement_trait`.
+            enum RewrittenStatement<'s> {
+                Borrowed(&'s Statement),
+                Owned(Box<Statement>),
+            }
+            impl AsRef<Statement> for RewrittenStatement<'_> {
+                fn as_ref(&self) -> &Statement {
+                    match self {
+                        RewrittenStatement::Borrowed(statement) => statement,
+                        RewrittenStatement::Owned(statement) => statement,
+                    }
+                }
+            }
             let statement = {
                 let parse_span = parse_trace_enabled.then(|| {
                     let span = tracing::span!(
@@ -32504,7 +32707,10 @@ impl Connection {
                     span
                 });
                 let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
-                self.rewrite_subquery_statement(statement, params).await?
+                match self.rewrite_subquery_statement(statement, params).await? {
+                    Cow::Borrowed(borrowed) => RewrittenStatement::Borrowed(borrowed),
+                    Cow::Owned(owned) => RewrittenStatement::Owned(Box::new(owned)),
+                }
             };
             // 5B.5 + 5B.2 (bd-1yi8): autocommit wrapping — ensure a pager
             // transaction is active for data/DDL operations outside an
@@ -32672,39 +32878,31 @@ impl Connection {
             let rollback_on_constraint_violation =
                 statement_rolls_back_transaction_on_constraint(statement.as_ref());
             let execute_body_start = hot_path_profile_enabled().then(Instant::now);
-            // bd-7mnz8 Phase 1: heap-indirect the recursive trigger-dispatch
-            // future. `execute_statement_dispatch_with_fk_scope` is a plain
-            // `async fn` whose future (carrying the giant dispatch state
-            // machine) would otherwise be materialized inline on this frame,
-            // dominating the per-level native stack cost. `Box::pin` moves that
-            // state to the heap so only a pointer sits on the recursive frame.
-            // This is NOT the previously-reverted box at the already-boxed
-            // `execute_statement` edge; this boxes a distinct, un-boxed future.
             let result = if use_statement_savepoint {
                 self.with_internal_statement_savepoint_and_cx(
                     &op_cx,
                     statement_kind,
                     statement_preserves_prior_changes_on_constraint(statement.as_ref()),
                     async || {
-                        Box::pin(self.execute_statement_dispatch_with_fk_scope(
+                        self.execute_statement_dispatch_with_fk_scope(
                             &op_cx,
                             statement.as_ref(),
                             params,
                             precompiled,
                             derived_storage_log_select.as_deref(),
-                        ))
+                        )
                         .await
                     },
                 )
                 .await
             } else {
-                Box::pin(self.execute_statement_dispatch_with_fk_scope(
+                self.execute_statement_dispatch_with_fk_scope(
                     &op_cx,
                     statement.as_ref(),
                     params,
                     precompiled,
                     derived_storage_log_select.as_deref(),
-                ))
+                )
                 .await
             };
             record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
