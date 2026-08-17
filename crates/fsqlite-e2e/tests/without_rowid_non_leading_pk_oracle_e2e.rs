@@ -215,19 +215,49 @@ fn wr_non_leading_pk_secondary_unique_parity() {
 }
 
 #[test]
-#[ignore = "bd-xe3nb: omitted-target DO UPDATE with UNIQUE secondaries on WITHOUT ROWID not yet landed"]
 fn wr_non_leading_pk_omitted_target_upsert_parity() {
     asupersync::test_utils::run_test(|| async {
+        // An omitted conflict target must probe the PRIMARY KEY and every UNIQUE
+        // secondary index, firing DO UPDATE on whichever row conflicts.
         assert_parity(
             &[
                 "CREATE TABLE t(v TEXT, k INTEGER PRIMARY KEY, u TEXT UNIQUE) WITHOUT ROWID",
-                "INSERT INTO t VALUES('a', 1, 'x')",
-                // Omitted conflict target must probe PK and every UNIQUE index.
+                "INSERT INTO t VALUES('a', 1, 'x'), ('b', 2, 'y')",
+                // Conflict on the PRIMARY KEY (k=1): DO UPDATE fires on that row.
                 "INSERT INTO t VALUES('a2', 1, 'x2') ON CONFLICT DO UPDATE SET v = excluded.v",
-                "INSERT INTO t VALUES('a3', 2, 'x') ON CONFLICT DO NOTHING",
+                // Conflict on the SECONDARY UNIQUE (u='y', k=3 is a new PK): DO
+                // UPDATE must fire on the existing (b,2,y) row, k unchanged.
+                "INSERT INTO t VALUES('c', 3, 'y') ON CONFLICT DO UPDATE SET v = excluded.v",
+                // Secondary conflict under DO NOTHING skips the insert.
+                "INSERT INTO t VALUES('z', 9, 'y') ON CONFLICT DO NOTHING",
             ],
-            &["SELECT v, k, u FROM t"],
+            &["SELECT v, k, u FROM t ORDER BY k"],
             "wr_non_leading_pk_omitted_target_upsert_parity",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn wr_non_leading_pk_omitted_target_cross_and_multi_unique_parity() {
+    asupersync::test_utils::run_test(|| async {
+        // PK-vs-secondary precedence across different rows, plus a second UNIQUE
+        // index, all under an omitted conflict target.
+        assert_parity(
+            &[
+                "CREATE TABLE t(v TEXT, k INTEGER PRIMARY KEY, u TEXT UNIQUE, w TEXT UNIQUE) \
+                 WITHOUT ROWID",
+                "INSERT INTO t VALUES('a', 1, 'x', 'p'), ('b', 2, 'y', 'q')",
+                // Conflicts on the PRIMARY KEY (k=1, rowA) AND secondary u='y'
+                // (rowB): SQLite fires on the first-checked constraint (the PK),
+                // updating rowA only.
+                "INSERT INTO t VALUES('c', 1, 'y', 'r') ON CONFLICT DO UPDATE SET v = excluded.v",
+                // Conflict only on the SECOND UNIQUE index (w='q', k=3/u='z' new):
+                // fires on rowB.
+                "INSERT INTO t VALUES('d', 3, 'z', 'q') ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            &["SELECT v, k, u, w FROM t ORDER BY k"],
+            "wr_non_leading_pk_omitted_target_cross_and_multi_unique_parity",
         )
         .await;
     });
