@@ -320,3 +320,25 @@ fn and_or_fold_does_not_over_fold_value_context() {
         .await;
     });
 }
+
+// ── bd-lryih: `N OR E` -> TRUE folds in a TRUTH context only ────────────────────
+/// A truthy constant on the left of an OR inside a CASE-WHEN *condition* is a
+/// TRUTH context — stock short-circuits `1 OR E` to TRUE without evaluating E, so
+/// `json_extract('bare','$.a')` (which raises "malformed JSON" in BOTH engines if
+/// reached) is never touched and the CASE returns 1. This proves the truth-context
+/// OR fold: if the fold did NOT fire, fsqlite would eager-evaluate the erroring
+/// operand and diverge from stock's 1. (`check` treats both-error as parity, so a
+/// missing fold surfaces here as an Ok-vs-Err mismatch, not a false pass.)
+#[test]
+fn case_when_const_true_or_short_circuits() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup_mem().await;
+        check(
+            &f,
+            &r,
+            &["SELECT CASE WHEN 1 OR json_extract('bare','$.a') THEN 1 ELSE 0 END"],
+            "case_when_const_true_or_short_circuits",
+        )
+        .await;
+    });
+}
