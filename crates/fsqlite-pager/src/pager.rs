@@ -8716,6 +8716,43 @@ impl<F: VfsFile> PagerInner<F> {
         // bd-r82et: this freelist was just read from durable committed state,
         // so it is the exact current durable freelist content.
         self.durable_freelist_view = freelist.iter().map(|page| page.get()).collect();
+        // bd-ioq6x / GH#346: `self.freelist = freelist` below wholesale-replaces
+        // the volatile freelist with durable state. In-memory-only freed pages
+        // that are now within `[2..=effective_db_size]` but ABSENT from the
+        // durable freelist are pages that were freed while ABOVE
+        // committed_db_size (so `serialize_freelist_to_write_set` filtered them
+        // out of page-1 metadata) which a later grow has since brought in range.
+        // Silently dropping them here (the pre-fix behavior) makes them
+        // "page N is never used" orphans. Re-park them into
+        // `abandoned_eof_reservations` — the one pool that SURVIVES refresh — so
+        // the next WAL commit / checkpoint fold reconciles them into the durable
+        // freelist under the same no-committed-frame double-grant guard the
+        // commit-fold already trusts (a peer may have made the page live since
+        // we freed it, so we must NOT blindly return it to the freelist here).
+        // Durable entries are preserved exactly by the assignment below. Only in
+        // WAL mode: rollback-journal mode has no commit-fold to drain the pool
+        // (see restore_uncommitted_allocations_for_clean_commit), and its
+        // single-connection shapes do not hit this wholesale-replace path.
+        if self.journal_mode == JournalMode::Wal && effective_db_size >= 2 {
+            let mut reparked = 0_usize;
+            for page in std::mem::take(&mut self.freelist) {
+                let raw = page.get();
+                if raw > 1
+                    && raw <= effective_db_size
+                    && !self.durable_freelist_view.contains(&raw)
+                {
+                    self.abandoned_eof_reservations.push(page);
+                    reparked += 1;
+                }
+            }
+            if reparked > 0 && std::env::var_os("IOQ6X_TRACE").is_some() {
+                eprintln!(
+                    "IOQ6X REFRESH-REPARK reparked={reparked} pool={} durable={}",
+                    self.abandoned_eof_reservations.len(),
+                    self.durable_freelist_view.len(),
+                );
+            }
+        }
         self.freelist = freelist;
         // Only clear the cache if the database was modified by another
         // connection. In WAL mode this uses the latest visible page-1
@@ -25357,6 +25394,71 @@ where
             }
             _ => mode,
         };
+
+        // bd-ioq6x / GH#346: reconcile the abandonment pool into the freelist
+        // BEFORE the checkpoint truncates/resets the WAL. The CheckpointGuard's
+        // drop clears `abandoned_eof_reservations` unconditionally, orphaning
+        // any still-unreconciled entry that a later grow brings within
+        // `[2..=db_size]` ("page N is never used"). Mirror the commit-time fold
+        // (~L22632): under this checkpoint's exclusive maintenance fence
+        // (active_transactions == 0) and the WAL backend WRITE lock (stable
+        // appended tail), an entry `<= db_size` that carries NO committed WAL
+        // frame is a provable hole and is promoted into `inner.freelist` — a
+        // confirmed-free assertion that outlives the WAL-generation boundary
+        // (unlike the pool's frame-scoped membership, which is why the guard
+        // must clear the remainder). The next commit's
+        // serialize_freelist_to_write_set publishes it durably. An entry WITH a
+        // frame is a committed peer's live page (two-growers loser's stale
+        // number) and is left for the guard to drop; above-db_size entries are
+        // reissuable via next_page and are also left for the guard. Lock order
+        // is inner -> WAL, matching the commit-fold, and the WAL guard is
+        // released before the checkpoint re-acquires it. This never touches the
+        // durable page-1 directly (unlike the reverted zeroed-page content-fold
+        // fe99bf9b9) — it rides the existing pool + commit-fold machinery only.
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.journal_mode == JournalMode::Wal
+                && inner.db_size >= 2
+                && !inner.abandoned_eof_reservations.is_empty()
+            {
+                let db_size = inner.db_size;
+                let pool = std::mem::take(&mut inner.abandoned_eof_reservations);
+                let mut reconciled: Vec<PageNumber> = Vec::new();
+                {
+                    let mut wal_guard = async_rwlock_write(&wal, cx, "WAL backend").await?;
+                    let wal_ref = wal_guard.as_mut();
+                    // A connection-local backend view can lag peers' commits;
+                    // the no-committed-frame test is only meaningful against the
+                    // refreshed publication horizon (bd-vnxjd/bd-dw8oe).
+                    let _ = wal_ref.refresh_published_snapshot(cx).await?;
+                    for page in pool {
+                        if page.get() > db_size {
+                            // Above the durable extent: reissuable from EOF.
+                            inner.abandoned_eof_reservations.push(page);
+                            continue;
+                        }
+                        match wal_ref.read_page_at_appended_tail(cx, page.get()).await {
+                            Ok(None) => reconciled.push(page),
+                            Ok(Some(_)) => { /* framed peer page: drop permanently */ }
+                            Err(_) => inner.abandoned_eof_reservations.push(page),
+                        }
+                    }
+                }
+                if !reconciled.is_empty() {
+                    if std::env::var_os("IOQ6X_TRACE").is_some() {
+                        eprintln!(
+                            "IOQ6X CKPT-FOLD reconciled={} pool_remaining={}",
+                            reconciled.len(),
+                            inner.abandoned_eof_reservations.len(),
+                        );
+                    }
+                    return_pages_to_freelist(&mut inner.freelist, reconciled);
+                }
+            }
+        }
 
         // Run the checkpoint from the beginning. Reader-aware incremental
         // checkpointing requires exposing oldest-reader tracking from pager.
