@@ -42,6 +42,11 @@ pub const PID_BIRTH_SYSCTL_TAG: u64 = 1_u64 << 62;
 pub const PID_BIRTH_FILETIME_TAG: u64 = 1_u64 << 61;
 
 /// Mask isolating the payload bits (all three platform tags cleared).
+///
+/// Only the macOS/Windows probes and the unit tests read this; a Linux
+/// non-test build (whose procfs probe lives in `fsqlite-mvcc`) never does, so
+/// gate it to avoid a `dead_code` warning under `-D warnings`.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 const PAYLOAD_MASK: u64 = !(PID_BIRTH_PROCFS_TAG | PID_BIRTH_SYSCTL_TAG | PID_BIRTH_FILETIME_TAG);
 
 /// The platform-tagged birth token for the current process, or `None` when the
@@ -67,7 +72,9 @@ pub fn current_process_birth_token() -> Option<u64> {
 }
 
 /// Probe whether `pid` (with the reuse-safe `pid_birth` token) is still the same
-/// live process. Only macOS and Windows are implemented here; every other target
+/// live process.
+///
+/// Only macOS and Windows are implemented here; every other target
 /// (including Linux, whose procfs probe stays in `fsqlite-mvcc`) returns
 /// `Unknown` so the caller keeps its own logic.
 #[must_use]
