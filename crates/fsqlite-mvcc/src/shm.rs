@@ -157,7 +157,7 @@ fn next_snapshot_publisher_generation_counter() -> &'static AtomicU64 {
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
     let stat_path = std::path::Path::new("/proc")
         .join(pid.to_string())
@@ -171,11 +171,17 @@ fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
 fn current_process_birth_marker() -> u64 {
     static FALLBACK_BIRTH: OnceLock<u64> = OnceLock::new();
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if std::path::Path::new("/proc").exists()
         && let Some(start_ticks) = read_proc_start_time_ticks(std::process::id())
     {
         return PID_BIRTH_PROCFS_TAG | (start_ticks & !PID_BIRTH_PROCFS_TAG);
+    }
+
+    // bd-4dr7g: macOS/Windows mint a platform-tagged birth token via fsqlite-vfs.
+    #[cfg(any(target_os = "macos", windows))]
+    if let Some(token) = fsqlite_vfs::process::current_process_birth_token() {
+        return token;
     }
 
     *FALLBACK_BIRTH.get_or_init(|| {
@@ -187,7 +193,7 @@ fn current_process_birth_marker() -> u64 {
 }
 
 fn snapshot_publisher_alive_os(pid: u32, pid_birth: u64) -> bool {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         if pid == 0 {
             return false;
@@ -205,7 +211,16 @@ fn snapshot_publisher_alive_os(pid: u32, pid_birth: u64) -> bool {
         let expected_ticks = pid_birth & !PID_BIRTH_PROCFS_TAG;
         read_proc_start_time_ticks(pid).is_none_or(|start_ticks| start_ticks == expected_ticks)
     }
-    #[cfg(not(unix))]
+    // bd-4dr7g: macOS/Windows liveness via the fsqlite-vfs FFI probe. `Unknown`
+    // (an ambiguous OS error) is treated as alive, matching the prior stub.
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        !matches!(
+            fsqlite_vfs::process::process_alive(pid, pid_birth),
+            fsqlite_vfs::process::ProcessLiveness::Dead
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (pid, pid_birth);
         true
