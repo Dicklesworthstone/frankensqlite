@@ -10570,6 +10570,31 @@ impl Drop for OperationCxGuard<'_> {
     }
 }
 
+/// A database connection.
+///
+/// # Lifecycle & quiescence contract (bd-1is5z)
+///
+/// An **awaited** `close()` (or a `close_*` variant) is the only path that
+/// guarantees strict *quiescence*. It drains this connection's region tree via
+/// `RegionTree::close_and_drain`, which spin-waits until every region-registered
+/// background task (spawned through `try_spawn_in_region`) has exited and — on the
+/// last connection to a path — the shared write-coordinator service task under the
+/// database-root region has joined. After an awaited close, no task spawned by this
+/// connection is still live, so an `asupersync::lab` quiescence oracle settles.
+///
+/// **`Drop` is cancel-only, by design.** Shutdown I/O is async and `Drop` cannot
+/// await; this crate never builds its own runtime (`Cx` flows down from the
+/// consumer, per AGENTS.md), and `close_and_drain`'s spin-wait would deadlock if
+/// run on a runtime thread inside `Drop`. So dropping a `Connection` without
+/// awaiting `close()` *cancels* every region `Cx` (tasks exit at their next
+/// `checkpoint()`) but does not wait for them: at `Drop` return the write-
+/// coordinator task may still be live and a quiescence oracle would not yet settle.
+/// A `drop_close` warning is emitted for this case, and open transactions are left
+/// unrolled-back with no checkpoint (committed bytes stay durable in the WAL and the
+/// next open recovers them). Callers that need prompt rollback + checkpoint +
+/// quiescence MUST await `close()`.
+///
+/// See `docs/concurrency-contract.md` and `docs/concurrency-recovery.md`.
 // bd-081hj: this god-object carries many intentionally domain-prefixed fields
 // (e.g. `connection_registry_differs_from_base`); a targeted rename across all
 // call sites isn't worth the churn, so the struct-field-names lint is allowed here.
