@@ -154,11 +154,17 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
         Value::Number(number) => {
             if number.is_i64() || number.is_u64() {
                 out.push_str(&number.to_string());
-            } else {
-                let float = number.as_f64().ok_or_else(|| {
-                    FrankenError::function_error("cannot render non-finite JSON number")
-                })?;
+            } else if let Some(float) = number.as_f64().filter(|value| value.is_finite()) {
                 out.push_str(&format!("{float:?}"));
+            } else {
+                // Non-finite JSON number (only reachable with the
+                // `arbitrary_precision` Number backing). SQLite renders
+                // +Inf/-Inf as a numeric literal and preserves the source
+                // text of a parsed value: a constructed value carries the
+                // canonical `9.0e+999`, a parsed value carries its source
+                // (`9e999`) — stock's construct-vs-preserve asymmetry
+                // (GH#212, bd-t75hg).
+                out.push_str(&render_non_finite_number(number));
             }
         }
         Value::String(text) => {
@@ -458,8 +464,15 @@ pub fn json_quote(value: &SqliteValue) -> Result<String> {
         v @ SqliteValue::Float(f) => {
             if f.is_finite() {
                 Ok(v.to_text())
-            } else {
+            } else if f.is_nan() {
+                // Only NaN maps to JSON null (SQLite stores NaN as NULL).
                 Ok("null".to_owned())
+            } else if *f > 0.0 {
+                // +Inf/-Inf render as the numeric literal 9.0e+999 / -9.0e+999
+                // (stock `json_quote(1e999)` -> `9.0e+999`, GH#212).
+                Ok("9.0e+999".to_owned())
+            } else {
+                Ok("-9.0e+999".to_owned())
             }
         }
         SqliteValue::Text(text) => {
@@ -497,8 +510,11 @@ pub fn json_array(values: &[SqliteValue]) -> Result<String> {
     for value in values {
         out.push(sqlite_to_json(value)?);
     }
-    serde_json::to_string(&Value::Array(out))
-        .map_err(|error| FrankenError::function_error(format!("json_array encode failed: {error}")))
+    // Route through the canonical writer (not `serde_json::to_string`) so floats
+    // render in stock-canonical form and non-finite numbers are handled — the
+    // `arbitrary_precision` Number backing serializes an exponent as `e+NNN`
+    // and would diverge here (GH#212, bd-t75hg).
+    encode_json_text("json_array encode failed", &Value::Array(out))
 }
 
 /// Build a JSON array from SQL values, embedding JSON-subtyped arguments as
@@ -509,8 +525,7 @@ pub fn json_array_with_subtypes(values: &[SqliteValue], subtypes: &[u32]) -> Res
         let subtype = subtypes.get(i).copied().unwrap_or(0);
         out.push(sqlite_to_json_with_subtype(value, subtype)?);
     }
-    serde_json::to_string(&Value::Array(out))
-        .map_err(|error| FrankenError::function_error(format!("json_array encode failed: {error}")))
+    encode_json_text("json_array encode failed", &Value::Array(out))
 }
 
 /// Serialize an ordered key/value list as JSON object text.
@@ -530,10 +545,9 @@ fn encode_json_object_members(members: &[(String, Value)]) -> Result<String> {
         })?;
         out.push_str(&key_json);
         out.push(':');
-        let value_json = serde_json::to_string(value).map_err(|error| {
-            FrankenError::function_error(format!("json_object value encode failed: {error}"))
-        })?;
-        out.push_str(&value_json);
+        // Canonical writer (not `serde_json::to_string`): stock-canonical floats
+        // and correct non-finite rendering under `arbitrary_precision` (GH#212).
+        write_canonical_json_text(value, &mut out)?;
     }
     out.push('}');
     Ok(out)
@@ -1024,20 +1038,21 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
             // stored bytes whenever the source text was canonical.
             if number.is_i64() || number.is_u64() {
                 append_jsonb_node(JSONB_INT_TYPE, number.to_string().as_bytes(), out)
-            } else {
-                let float = number.as_f64().ok_or_else(|| {
-                    FrankenError::function_error("failed to encode non-finite JSON number")
-                })?;
-                if !float.is_finite() {
-                    return Err(FrankenError::function_error(
-                        "failed to encode non-finite JSON number",
-                    ));
-                }
+            } else if let Some(float) = number.as_f64().filter(|value| value.is_finite()) {
                 // `{:?}` is Rust's shortest round-trip float text ("1e300",
                 // "-0.0", "0.1"), matching stock's stored bytes for
                 // canonical-form inputs; `Number::to_string` inserts a
                 // non-canonical '+' in exponents ("1e+300").
                 append_jsonb_node(JSONB_FLOAT_TYPE, format!("{float:?}").as_bytes(), out)
+            } else {
+                // Non-finite REAL (+Inf/-Inf as 9.0e+999 / 9e999): store the
+                // stock-rendered numeric text so the payload round-trips
+                // (GH#212).
+                append_jsonb_node(
+                    JSONB_FLOAT_TYPE,
+                    render_non_finite_number(number).as_bytes(),
+                    out,
+                )
             }
         }
         Value::String(text) => append_jsonb_string(text, out),
@@ -1195,10 +1210,15 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
             let float = normalized.parse::<f64>().map_err(|error| {
                 FrankenError::function_error(format!("invalid JSONB float payload text: {error}"))
             })?;
-            let number = Number::from_f64(float).ok_or_else(|| {
-                FrankenError::function_error("invalid non-finite JSONB float payload")
-            })?;
-            Value::Number(number)
+            if float.is_finite() {
+                Value::Number(Number::from_f64(float).ok_or_else(|| {
+                    FrankenError::function_error("invalid JSONB float payload")
+                })?)
+            } else {
+                // Non-finite payload (e.g. `9e999` +Inf): preserve the raw
+                // source text so the JSONB value round-trips (GH#212).
+                json_number_from_raw(normalized)?
+            }
         }
         JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE => {
             let text = String::from_utf8(payload.to_vec()).map_err(|error| {
@@ -1738,11 +1758,12 @@ fn append_array_path(base: &str, index: usize) -> String {
 
 fn json_value_column(value: &Value) -> Result<SqliteValue> {
     match value {
-        Value::Array(_) | Value::Object(_) => serde_json::to_string(value)
-            .map(|s| SqliteValue::Text(s.into()))
-            .map_err(|error| {
-                FrankenError::function_error(format!("json table value encode failed: {error}"))
-            }),
+        // Canonical writer keeps floats stock-canonical and renders non-finite
+        // numbers correctly under `arbitrary_precision` (GH#212).
+        Value::Array(_) | Value::Object(_) => {
+            encode_json_text("json table value encode failed", value)
+                .map(|encoded| SqliteValue::Text(encoded.into()))
+        }
         _ => Ok(json_to_sqlite_scalar(value)),
     }
 }
@@ -1827,16 +1848,10 @@ fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(Value, Option<&
         // A bare SQL numeric is a JSON number (C SQLite convention), mirroring
         // the scalar `json_arg_value` path: json_each(1.5) yields a single row
         // with type='real', atom=1.5; json_tree(7) yields type='integer'. A
-        // non-finite REAL is not representable as JSON and falls through to the
-        // error arm below.
+        // non-finite REAL renders as the numeric literal 9.0e+999 / -9.0e+999
+        // (NaN -> null), so json_each(9e999) yields a single row (GH#212).
         SqliteValue::Integer(i) => Value::Number((*i).into()),
-        SqliteValue::Float(f) if f.is_finite() => serde_json::Number::from_f64(*f)
-            .map(Value::Number)
-            .ok_or_else(|| {
-                FrankenError::function_error(
-                    "json table-valued input is not representable as JSON",
-                )
-            })?,
+        SqliteValue::Float(f) => float_to_json(*f)?,
         _ => {
             return Err(FrankenError::function_error(
                 "json table-valued input must be TEXT or BLOB JSON",
@@ -1904,31 +1919,89 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
                     SqliteValue::Float(u as f64)
                 }
             } else {
-                SqliteValue::Float(number.as_f64().unwrap_or(0.0))
+                // `as_f64` parses the raw stored text, yielding +Inf/-Inf for a
+                // non-finite literal such as `9e999` (GH#212: json_extract of a
+                // non-finite JSON number reads back as a REAL Inf); fall back to
+                // an explicit parse of the raw text if the accessor declines.
+                let float = number
+                    .as_f64()
+                    .or_else(|| number.to_string().parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                SqliteValue::Float(float)
             }
         }
         Value::String(text) => SqliteValue::Text(text.as_str().into()),
         Value::Array(_) | Value::Object(_) => {
-            let encoded = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
+            // Canonical writer (not `serde_json::to_string`): stock-canonical
+            // floats and correct non-finite rendering under `arbitrary_precision`
+            // (GH#212). Falls back to `null` on the (unreachable) encode error.
+            let encoded =
+                encode_json_text("json scalar encode", value).unwrap_or_else(|_| "null".to_owned());
             SqliteValue::Text(encoded.into())
         }
     }
+}
+
+/// Build a JSON `Value::Number` from raw numeric source text (e.g. `9.0e+999`).
+///
+/// Non-finite numbers cannot be held by a plain `serde_json` `Number`; the
+/// crate's `arbitrary_precision` backing stores the raw text verbatim, so this
+/// keeps the exact bytes that must round-trip (GH#212).
+fn json_number_from_raw(raw: &str) -> Result<Value> {
+    serde_json::from_str::<Number>(raw)
+        .map(Value::Number)
+        .map_err(|error| {
+            FrankenError::function_error(format!("failed to build JSON number `{raw}`: {error}"))
+        })
+}
+
+/// Render a non-finite JSON number (a `Value::Number` whose `as_f64` is not a
+/// finite double) the way stock SQLite prints it.
+///
+/// SQLite copies a number's source text verbatim, so `json('[9e999]')` yields
+/// `[9e999]` while a constructed `+Inf` yields `[9.0e+999]`. The crate's
+/// `arbitrary_precision` backing cannot preserve the exact source bytes — it
+/// canonicalizes a parsed exponent to `e+NNN` (`9e999` is stored as `9e+999`).
+/// To reproduce stock's construct-vs-preserve forms for the literals JSON
+/// callers actually produce, drop that inserted `+` when the mantissa has no
+/// fractional part (`9e+999` -> `9e999`) while keeping it otherwise (the
+/// constructed `9.0e+999`, or a source that already wrote `9.0e+999`). Exotic
+/// forms that serde also normalizes (a fractional non-finite mantissa, or an
+/// uppercase `E`) cannot be recovered and keep serde's canonical form (GH#212).
+fn render_non_finite_number(number: &Number) -> String {
+    let raw = number.to_string();
+    let Some(exp) = raw.find(['e', 'E']) else {
+        return raw;
+    };
+    if raw[..exp].contains('.') {
+        return raw;
+    }
+    let mut rendered = String::with_capacity(raw.len());
+    rendered.push_str(&raw[..=exp]);
+    rendered.push_str(raw[exp + 1..].trim_start_matches('+'));
+    rendered
+}
+
+/// Convert a SQL REAL to a JSON value exactly as stock SQLite does:
+/// finite floats become JSON numbers; +Inf/-Inf render as the numeric literal
+/// `9.0e+999` / `-9.0e+999`; NaN becomes JSON null (SQLite stores NaN as NULL).
+fn float_to_json(f: f64) -> Result<Value> {
+    if f.is_nan() {
+        return Ok(Value::Null);
+    }
+    if f.is_infinite() {
+        return json_number_from_raw(if f > 0.0 { "9.0e+999" } else { "-9.0e+999" });
+    }
+    Number::from_f64(f).map(Value::Number).ok_or_else(|| {
+        FrankenError::function_error("failed to convert floating-point value to JSON")
+    })
 }
 
 fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
     match value {
         SqliteValue::Null => Ok(Value::Null),
         SqliteValue::Integer(i) => Ok(Value::Number(Number::from(*i))),
-        SqliteValue::Float(f) => {
-            if !f.is_finite() {
-                return Err(FrankenError::function_error(
-                    "non-finite float is not representable in JSON",
-                ));
-            }
-            Number::from_f64(*f).map(Value::Number).ok_or_else(|| {
-                FrankenError::function_error("failed to convert floating-point value to JSON")
-            })
-        }
+        SqliteValue::Float(f) => float_to_json(*f),
         SqliteValue::Text(text) => Ok(Value::String(text.to_string())),
         SqliteValue::Blob(_) => Err(FrankenError::function_error("JSON cannot hold BLOB values")),
     }
@@ -1984,11 +2057,10 @@ fn write_pretty_value(value: &Value, indent: &str, depth: usize, out: &mut Strin
             Ok(())
         }
         _ => {
-            let encoded = serde_json::to_string(value).map_err(|error| {
-                FrankenError::function_error(format!("json_pretty value-encode failed: {error}"))
-            })?;
-            out.push_str(&encoded);
-            Ok(())
+            // Scalars pretty-print identically to their minified form; the
+            // canonical writer keeps floats stock-canonical and renders
+            // non-finite numbers correctly under `arbitrary_precision` (GH#212).
+            write_canonical_json_text(value, out)
         }
     }
 }
@@ -2323,17 +2395,11 @@ fn json_arg_value(name: &str, args: &[SqliteValue], index: usize) -> Result<Valu
         Some(SqliteValue::Blob(bytes)) => parse_json_input_blob(bytes),
         // A bare SQL numeric value is interpreted as a JSON number (C SQLite's
         // JSON-argument convention): e.g. json_type(123) -> 'integer',
-        // json_type(1.5) -> 'real'. A non-finite REAL cannot be represented as a
-        // serde_json number and falls through to the error arm below.
+        // json_type(1.5) -> 'real', json_type(9e999) -> 'real'. A non-finite
+        // REAL renders as the numeric literal 9.0e+999 / -9.0e+999 (NaN -> null),
+        // matching stock (GH#212).
         Some(SqliteValue::Integer(i)) => Ok(Value::Number((*i).into())),
-        Some(SqliteValue::Float(f)) if f.is_finite() => serde_json::Number::from_f64(*f)
-            .map(Value::Number)
-            .ok_or_else(|| {
-                FrankenError::function_error(format!(
-                    "{name} argument {} is not representable as JSON",
-                    index + 1
-                ))
-            }),
+        Some(SqliteValue::Float(f)) => float_to_json(*f),
         Some(other) => Err(FrankenError::function_error(format!(
             "{name} argument {} must be TEXT or BLOB, got {}",
             index + 1,
@@ -3512,12 +3578,11 @@ impl ScalarFunction for JsonErrorPositionFunc {
         let position = match &args[0] {
             SqliteValue::Text(text) => json_error_position(text),
             SqliteValue::Blob(bytes) => json_error_position_blob(bytes),
-            // A bare finite SQL numeric is valid JSON (a JSON number), so there
-            // is no parse error: json_error_position(1) = json_error_position(1.5)
-            // = 0 (C SQLite convention, matching the scalar json_arg_value path).
-            // Non-finite REAL is not representable as JSON and stays an error.
-            SqliteValue::Integer(_) => 0,
-            SqliteValue::Float(f) if f.is_finite() => 0,
+            // A bare SQL numeric is valid JSON (a JSON number), so there is no
+            // parse error: json_error_position(1) = json_error_position(1.5)
+            // = json_error_position(9e999) = 0 (C SQLite convention; a
+            // non-finite REAL renders as the numeric literal 9.0e+999, GH#212).
+            SqliteValue::Integer(_) | SqliteValue::Float(_) => 0,
             other => {
                 return Err(FrankenError::function_error(format!(
                     "{} argument 1 must be TEXT or BLOB, got {}",
@@ -5039,8 +5104,12 @@ mod tests {
         let (v_int, _) =
             super::parse_json_table_filter_args(&[SqliteValue::Integer(7)]).unwrap();
         assert_eq!(v_int, Value::from(7_i64));
-        // A non-finite REAL is not representable as JSON and is still rejected.
-        assert!(super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)]).is_err());
+        // GH#212 (verified against sqlite3 3.46.1): json_each(9e999) yields a
+        // single row (type='real', atom=Inf), so a bare +Inf renders as the
+        // numeric literal 9.0e+999 rather than erroring.
+        let (v_inf, _) =
+            super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)]).unwrap();
+        assert_eq!(v_inf, super::json_number_from_raw("9.0e+999").unwrap());
     }
 
     #[test]
@@ -5056,9 +5125,14 @@ mod tests {
             f.invoke(&[SqliteValue::Float(1.5)]).unwrap(),
             SqliteValue::Integer(0)
         );
-        // NULL still short-circuits to NULL, and a non-finite REAL stays an error.
+        // NULL still short-circuits to NULL. GH#212 (verified against sqlite3
+        // 3.46.1): json_error_position(9e999) = 0 — a bare +Inf renders as a
+        // valid JSON numeric literal (9.0e+999), so there is no parse error.
         assert_eq!(f.invoke(&[SqliteValue::Null]).unwrap(), SqliteValue::Null);
-        assert!(f.invoke(&[SqliteValue::Float(f64::INFINITY)]).is_err());
+        assert_eq!(
+            f.invoke(&[SqliteValue::Float(f64::INFINITY)]).unwrap(),
+            SqliteValue::Integer(0)
+        );
     }
 
     #[test]
@@ -5302,15 +5376,187 @@ mod tests {
 
     #[test]
     fn test_json_quote_float_infinity() {
+        // GH#212 (verified against sqlite3 3.46.1): stock renders +Inf/-Inf as
+        // the numeric literal 9.0e+999 / -9.0e+999; only NaN maps to `null`.
         assert_eq!(
             json_quote(&SqliteValue::Float(f64::INFINITY)).unwrap(),
-            "null"
+            "9.0e+999"
         );
         assert_eq!(
             json_quote(&SqliteValue::Float(f64::NEG_INFINITY)).unwrap(),
-            "null"
+            "-9.0e+999"
         );
         assert_eq!(json_quote(&SqliteValue::Float(f64::NAN)).unwrap(), "null");
+    }
+
+    // -----------------------------------------------------------------------
+    // GH#212: non-finite REALs (±Inf -> 9.0e+999 / -9.0e+999, NaN -> null).
+    // Every expected string below was captured from stock sqlite3 3.46.1.
+    // -----------------------------------------------------------------------
+
+    fn text(value: &str) -> SqliteValue {
+        SqliteValue::Text(SmallText::from_string(value))
+    }
+
+    #[test]
+    fn test_json_array_non_finite_reals() {
+        // SELECT json_array(1e999)         -> [9.0e+999]
+        assert_eq!(
+            json_array(&[SqliteValue::Float(f64::INFINITY)]).unwrap(),
+            "[9.0e+999]"
+        );
+        // SELECT json_array(-1e999)        -> [-9.0e+999]
+        assert_eq!(
+            json_array(&[SqliteValue::Float(f64::NEG_INFINITY)]).unwrap(),
+            "[-9.0e+999]"
+        );
+        // SELECT json_array(1.0, 2e308*10) -> [1.0,9.0e+999]
+        assert_eq!(
+            json_array(&[SqliteValue::Float(1.0), SqliteValue::Float(f64::INFINITY)]).unwrap(),
+            "[1.0,9.0e+999]"
+        );
+        // SELECT json_array( (SELECT 1e999 - 1e999) ) -> [null]  (NaN)
+        assert_eq!(
+            json_array(&[SqliteValue::Float(f64::NAN)]).unwrap(),
+            "[null]"
+        );
+    }
+
+    #[test]
+    fn test_json_object_non_finite_real() {
+        // SELECT json_object('k', 1e999)   -> {"k":9.0e+999}
+        assert_eq!(
+            json_object(&[text("k"), SqliteValue::Float(f64::INFINITY)]).unwrap(),
+            r#"{"k":9.0e+999}"#
+        );
+        // NaN value -> null.
+        assert_eq!(
+            json_object(&[text("k"), SqliteValue::Float(f64::NAN)]).unwrap(),
+            r#"{"k":null}"#
+        );
+    }
+
+    #[test]
+    fn test_json_quote_non_finite_reals() {
+        // SELECT json_quote(1e999)  -> 9.0e+999   (NOT null: only NaN is null)
+        assert_eq!(
+            json_quote(&SqliteValue::Float(f64::INFINITY)).unwrap(),
+            "9.0e+999"
+        );
+        assert_eq!(
+            json_quote(&SqliteValue::Float(f64::NEG_INFINITY)).unwrap(),
+            "-9.0e+999"
+        );
+        // SELECT json_quote(1e999 - 1e999) -> null  (NaN)
+        assert_eq!(json_quote(&SqliteValue::Float(f64::NAN)).unwrap(), "null");
+    }
+
+    #[test]
+    fn test_json_parse_preserves_non_finite_source_text() {
+        // SELECT json('[9e999]')      -> [9e999]      (source text PRESERVED)
+        assert_eq!(json("[9e999]").unwrap(), "[9e999]");
+        // SELECT json('[9.0e+999]')   -> [9.0e+999]
+        assert_eq!(json("[9.0e+999]").unwrap(), "[9.0e+999]");
+        // SELECT json('[-9e999]')     -> [-9e999]
+        assert_eq!(json("[-9e999]").unwrap(), "[-9e999]");
+    }
+
+    #[test]
+    fn test_json_valid_accepts_non_finite_literal_text() {
+        // SELECT json_valid('[9e999]') -> 1
+        assert_eq!(json_valid("[9e999]", None), 1);
+        assert_eq!(json_valid("[9.0e+999]", None), 1);
+        assert_eq!(json_valid("[-9e999]", None), 1);
+    }
+
+    #[test]
+    fn test_json_extract_non_finite_reads_back_as_infinity() {
+        // SELECT json_extract('[9.0e+999]','$[0]') -> Inf (REAL +Inf)
+        let value = json_extract("[9.0e+999]", &["$[0]"]).unwrap();
+        match value {
+            SqliteValue::Float(f) => {
+                assert!(f.is_infinite() && f.is_sign_positive(), "expected +Inf, got {f}");
+            }
+            other => panic!("expected REAL +Inf, got {other:?}"),
+        }
+        // A parsed `9e999` (minimal source) also reads back as +Inf.
+        let value = json_extract("[9e999]", &["$[0]"]).unwrap();
+        assert!(matches!(value, SqliteValue::Float(f) if f.is_infinite() && f.is_sign_positive()));
+        // Negative literal -> -Inf.
+        let value = json_extract("[-9e999]", &["$[0]"]).unwrap();
+        assert!(matches!(value, SqliteValue::Float(f) if f.is_infinite() && f.is_sign_negative()));
+    }
+
+    #[test]
+    fn test_json_type_non_finite_literal_is_real() {
+        // SELECT json_type('[9.0e+999]','$[0]') -> real
+        assert_eq!(json_type("[9.0e+999]", Some("$[0]")).unwrap(), Some("real"));
+        assert_eq!(json_type("[9e999]", Some("$[0]")).unwrap(), Some("real"));
+    }
+
+    #[test]
+    fn test_jsonb_round_trip_preserves_non_finite() {
+        // SELECT json(jsonb('[9e999]')) -> [9e999]  (JSONB payload round-trips)
+        let blob = jsonb("[9e999]").unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), "[9e999]");
+
+        // Constructed via jsonb_array: +Inf stored canonically -> [9.0e+999].
+        let blob = jsonb_array(&[SqliteValue::Float(f64::INFINITY)]).unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), "[9.0e+999]");
+
+        // -Inf and NaN through the JSONB construct path.
+        let blob = jsonb_array(&[SqliteValue::Float(f64::NEG_INFINITY)]).unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), "[-9.0e+999]");
+        let blob = jsonb_array(&[SqliteValue::Float(f64::NAN)]).unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), "[null]");
+    }
+
+    #[test]
+    fn test_json_array_embeds_parsed_non_finite_preserving_source() {
+        // SELECT json_array(json('9e999'))    -> [9e999]      (source preserved)
+        assert_eq!(
+            json_array_with_subtypes(&[text("9e999")], &[JSON_SUBTYPE]).unwrap(),
+            "[9e999]"
+        );
+        // SELECT json_array(json('9.0e+999')) -> [9.0e+999]
+        assert_eq!(
+            json_array_with_subtypes(&[text("9.0e+999")], &[JSON_SUBTYPE]).unwrap(),
+            "[9.0e+999]"
+        );
+        // SELECT json_object('k', json('9e999')) -> {"k":9e999}
+        assert_eq!(
+            json_object_with_subtypes(&[text("k"), text("9e999")], &[0, JSON_SUBTYPE]).unwrap(),
+            r#"{"k":9e999}"#
+        );
+    }
+
+    #[test]
+    fn test_json_extract_nested_container_preserves_non_finite() {
+        // SELECT json_extract('{"a":[1e999]}','$.a') -> [1e999]
+        assert_eq!(
+            json_extract(r#"{"a":[1e999]}"#, &["$.a"]).unwrap(),
+            text("[1e999]")
+        );
+    }
+
+    #[test]
+    fn test_json_pretty_preserves_non_finite() {
+        // SELECT json_pretty('[9e999]') -> "[\n    9e999\n]"
+        assert_eq!(json_pretty("[9e999]", None).unwrap(), "[\n    9e999\n]");
+    }
+
+    #[test]
+    fn test_json_group_array_non_finite() {
+        // Aggregate construct path shares the scalar rendering.
+        assert_eq!(
+            json_group_array(&[
+                SqliteValue::Float(f64::INFINITY),
+                SqliteValue::Float(f64::NAN),
+                SqliteValue::Float(f64::NEG_INFINITY),
+            ])
+            .unwrap(),
+            "[9.0e+999,null,-9.0e+999]"
+        );
     }
 
     #[test]
