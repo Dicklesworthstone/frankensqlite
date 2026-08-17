@@ -109,5 +109,47 @@ fn wr_composite_unique_index_scan_and_constraint_bd_scbx6() {
         let ok = "INSERT INTO members VALUES ('shared', 3, 103)";
         assert!(f.execute(ok).await.is_ok(), "frank must accept a distinct (a,c)");
         assert!(r.execute_batch(ok).is_ok(), "stock must accept a distinct (a,c)");
+
+        // (3) UPDATE must maintain the composite-UNIQUE auto-index: move c 101 -> 200.
+        let upd = "UPDATE members SET c = 200 WHERE a = 'shared' AND b = 1";
+        f.execute(upd).await.unwrap_or_else(|e| panic!("frank update: {e:?}"));
+        r.execute_batch(upd).unwrap_or_else(|e| panic!("stock update: {e}"));
+        let mut upd_mismatch = Vec::new();
+        for q in [
+            "SELECT b FROM members WHERE a = 'shared' AND c = 200", // new value -> b=1
+            "SELECT b FROM members WHERE a = 'shared' AND c = 101", // old value -> gone
+        ] {
+            match (frank_rows(&f, q).await, stock_rows(&r, q)) {
+                (Ok(a), Ok(b)) if a == b => {}
+                (fa, sb) => upd_mismatch.push(format!("`{q}` -> frank={fa:?} stock={sb:?}")),
+            }
+        }
+        assert!(upd_mismatch.is_empty(), "bd-scbx6 UPDATE auto-index divergence:\n{}", upd_mismatch.join("\n"));
+        // phantom after UPDATE: c=200 now occupied, a fresh dup must fail in both.
+        let dup2 = "INSERT INTO members VALUES ('shared', 4, 200)";
+        assert_eq!(
+            f.execute(dup2).await.is_err(),
+            r.execute_batch(dup2).is_err(),
+            "bd-scbx6 phantom UNIQUE after UPDATE"
+        );
+
+        // (4) DELETE must remove the auto-index entry: after deleting b=1 (c=200),
+        // c=200 becomes free and its index scan is empty in both.
+        let del = "DELETE FROM members WHERE a = 'shared' AND b = 1";
+        f.execute(del).await.unwrap_or_else(|e| panic!("frank delete: {e:?}"));
+        r.execute_batch(del).unwrap_or_else(|e| panic!("stock delete: {e}"));
+        let q = "SELECT b FROM members WHERE a = 'shared' AND c = 200";
+        assert_eq!(
+            frank_rows(&f, q).await.unwrap(),
+            stock_rows(&r, q).unwrap(),
+            "bd-scbx6 DELETE auto-index divergence (stale index entry?): `{q}`"
+        );
+        // c=200 is now free: re-insert must succeed in both.
+        let reins = "INSERT INTO members VALUES ('shared', 5, 200)";
+        assert_eq!(
+            f.execute(reins).await.is_ok(),
+            r.execute_batch(reins).is_ok(),
+            "bd-scbx6 re-insert after DELETE freed (a,c)"
+        );
     });
 }
