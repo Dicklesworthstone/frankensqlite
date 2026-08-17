@@ -1,0 +1,13 @@
+commit: efaf0ceb2adf3c352f5b7ef6350299698f3d562d
+date_utc: 2026-08-17T18:53:31Z
+host: superserver
+cpu: AMD EPYC 7282 16-Core Processor
+nproc: 64
+rustc: rustc 1.99.0-nightly (504869653 2026-08-03)
+loadavg_at_start: 9.87 7.71 6.60
+taskset: -c 32-47 (16 cores, high range to avoid low-core lane contention)
+matched_sync: both engines synchronous=NORMAL (F default NORMAL; C set explicitly by harness)
+rows_per_thread: 1000  iters: 21  threads: 1,2,4,8  shape: shared-table
+release-perf sha256: 4b0e7416f9b85453d54443d1c0d237ab05da5ae37a621b54fbaf2516a23fd2d6
+release sha256: 7e914e78d5aadb0893b5964dd63d1b39690d5028cb4d511e7091bfcf0993c860
+loadavg_at_end: 9.81 8.93 8.01
