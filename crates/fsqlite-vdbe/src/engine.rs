@@ -11651,6 +11651,17 @@ impl VdbeEngine {
                     if deleted && let Some(replace_victim) = replace_victim {
                         self.replace_victims.push(replace_victim);
                     }
+                    // P5 bit 0 = OPFLAG_NCHANGE: count a standalone DELETE of a
+                    // WITHOUT ROWID row (the PK-index-as-table entry). Index
+                    // maintenance, the UPDATE rewrite's old-entry delete, and
+                    // REPLACE-victim deletes all clear bit 0, so only the
+                    // standalone DELETE counts — mirroring Opcode::Delete, whose
+                    // rowid path already counts this way (bd-cmu04). Without this
+                    // every WITHOUT ROWID DELETE deleted the row but reported
+                    // rows-affected = 0.
+                    if deleted && op.p5 & 1 != 0 {
+                        self.changes += 1;
+                    }
                     // No MemDatabase fallback for indexes.
                     pc += 1;
                 }

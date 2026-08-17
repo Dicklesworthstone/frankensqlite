@@ -24897,6 +24897,11 @@ fn emit_without_rowid_collect_matches(
     schema: &[TableSchema],
     where_clause: Option<&Expr>,
     table_alias: Option<&str>,
+    // Anon-placeholder number the WHERE filter starts from. For DELETE this is
+    // the current counter (1); for UPDATE it is `set_placeholder_count + 1`,
+    // because the SET assignments (Pass 2) appear first in the SQL text but are
+    // emitted *after* this collect pass (bd-q3hu3).
+    where_placeholder_base: u32,
 ) -> i32 {
     let n_cols = table.columns.len();
     let sorter_cursor = table.indexes.len() as i32 + 1;
@@ -24915,6 +24920,7 @@ fn emit_without_rowid_collect_matches(
 
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
+        b.set_next_anon_placeholder(where_placeholder_base);
         emit_where_filter(
             b,
             where_expr,
@@ -24987,6 +24993,9 @@ fn codegen_delete_without_rowid(
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
     emit_without_rowid_open_write(b, table, table_cursor);
 
+    // DELETE has no SET clause, so the WHERE placeholders keep their natural
+    // numbering (the current counter, 1).
+    let where_placeholder_base = b.current_anon_placeholder();
     let sorter_cursor = emit_without_rowid_collect_matches(
         b,
         table,
@@ -24994,6 +25003,7 @@ fn codegen_delete_without_rowid(
         schema,
         stmt.where_clause.as_ref(),
         stmt.table.alias.as_deref(),
+        where_placeholder_base,
     );
 
     // Pass 2: re-seek each collected row by primary key and delete it.
@@ -25122,6 +25132,18 @@ fn codegen_update_without_rowid(
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
     emit_without_rowid_open_write(b, table, table_cursor);
 
+    // The WHERE filter (Pass 1) is emitted before the SET assignments (Pass 2),
+    // but the SET placeholders come first in the SQL text. Number the WHERE anon
+    // placeholders from `set_placeholder_count + 1` so a bound `UPDATE ... SET
+    // a=?, b=? WHERE k1=? AND k2=?` reads slots 3,4 in the WHERE — not 1,2, which
+    // silently seeked a non-existent key and matched 0 rows (bd-q3hu3). Mirrors
+    // the rowid `codegen_update` two-pass numbering.
+    let set_placeholder_count: u32 = stmt
+        .assignments
+        .iter()
+        .map(|a| count_anon_placeholders(&a.value))
+        .sum();
+
     let sorter_cursor = emit_without_rowid_collect_matches(
         b,
         table,
@@ -25129,6 +25151,7 @@ fn codegen_update_without_rowid(
         schema,
         stmt.where_clause.as_ref(),
         stmt.table.alias.as_deref(),
+        set_placeholder_count + 1,
     );
 
     // Pass 2: for each collected row, delete the old entry then insert the
@@ -25224,6 +25247,10 @@ fn codegen_update_without_rowid(
         register_base: Some(col_regs),
         secondaries: &[],
     };
+    // Reset the placeholder counter to 1 for the SET expressions (Pass 2): they
+    // appear first in the SQL text, so their anon placeholders are slots 1..N
+    // (bd-q3hu3).
+    b.set_next_anon_placeholder(1);
     emit_update_assignments(b, &stmt.assignments, table, col_regs, &update_ctx)?;
     emit_stored_generated_columns(b, table, col_regs);
     emit_strict_type_check(b, table, col_regs);
