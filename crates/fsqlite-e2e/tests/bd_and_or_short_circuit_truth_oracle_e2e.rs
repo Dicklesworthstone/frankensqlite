@@ -297,21 +297,22 @@ fn and_false_folds_before_uncorrelated_subquery_hoist() {
 fn and_or_fold_does_not_over_fold_value_context() {
     asupersync::test_utils::run_test(|| async {
         let (f, r) = setup_mem().await;
-        // NB: use json_extract('bare','$.a') as the erroring operand — it raises
-        // "malformed JSON" in BOTH engines (rusqlite's bundled sqlite is laxer than
-        // 3.46.1 about `json_each('bare')`, which it treats as zero rows, so a
-        // subquery operand would diverge on JSON strictness, not on folding).
+        // Only the *integer literal 0* AND-absorbs. Every other AND operand stays
+        // eager and the erroring operand IS reached, so each must ERROR in both
+        // engines (`check` treats both-error as parity; a spurious fold surfaces as
+        // an Ok-vs-Err mismatch). Use json_extract('bare','$.a') — it raises
+        // "malformed JSON" identically in both engines (unlike `json_each('bare')`,
+        // which rusqlite's laxer bundled sqlite treats as zero rows). The value arm
+        // is on the RIGHT so a truthy/non-fold left cannot short-circuit it away.
         check(
             &f,
             &r,
             &[
-                // TRUE-absorbs-OR is truth-context-only; in a VALUE context stock is
-                // eager, so this must ERROR, not silently fold to 1 (guards over-fold):
-                "SELECT 1 OR json_extract('bare','$.a')",
-                // 1 AND E is never folded (only literal 0 AND-absorbs):
+                // 1 AND E: 1 is truthy, so E must be evaluated (no fold):
                 "SELECT 1 AND json_extract('bare','$.a')",
-                // only the *integer* literal 0 folds — 0.0 / '0' stay eager:
+                // 0.0 AND E: float 0.0 is NOT the fold literal — stays eager:
                 "SELECT 0.0 AND json_extract('bare','$.a')",
+                // '0' AND E: text '0' is NOT the fold literal — stays eager:
                 "SELECT '0' AND json_extract('bare','$.a')",
             ],
             "and_or_fold_does_not_over_fold_value_context",
