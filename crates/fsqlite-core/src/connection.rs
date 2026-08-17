@@ -62601,6 +62601,14 @@ impl Connection {
                 detail: format!("page 1 freeblock chain invalid: {err}"),
             })?;
 
+        // bd-1v1pl: decode sqlite_master TEXT (type/name/tbl_name/sql) under the
+        // DB's own text encoding, not Utf8-hardcoded. On a UTF-16 database the
+        // Utf8 decode garbled the names (e.g. `idx` -> `i\0d\0x\0`), so
+        // validate_sqlite_master_rows false-flagged "missing expected entry" and
+        // fired a spurious first-open migration/repair (WARN + .pre-migration-bak).
+        // Byte-identical to the old path for Utf8 DBs.
+        let text_encoding = parse_database_header_checked(page1.as_ref())?.text_encoding;
+
         let mut rows = Vec::new();
         let mut cursor =
             Self::new_header_btree_cursor(txn, PageNumber::ONE, page_size, reserved_per_page, true);
@@ -62608,12 +62616,14 @@ impl Connection {
             loop {
                 let rowid = cursor.rowid(cx).await?;
                 let payload = cursor.payload(cx).await?;
-                let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                let mut values = Vec::new();
+                parse_record_into_with_encoding(&payload, &mut values, text_encoding).ok_or_else(
+                    || FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "sqlite_master row {rowid} payload is not a valid SQLite record"
                         ),
-                    })?;
+                    },
+                )?;
                 if values.len() < 5 {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
