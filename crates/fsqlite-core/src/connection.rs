@@ -16489,11 +16489,6 @@ impl Connection {
                     SqliteValue::Text(text) => text.to_string(),
                     _ => return None,
                 };
-                if entry_type.eq_ignore_ascii_case("table")
-                    || entry_type.eq_ignore_ascii_case("index")
-                {
-                    return None;
-                }
                 let name = match &row[1] {
                     SqliteValue::Text(text) => text.to_string(),
                     _ => return None,
@@ -16511,6 +16506,23 @@ impl Connection {
                     Some(SqliteValue::Null) => None,
                     _ => return None,
                 };
+                // bd-o01lp / GH#357: the VACUUM INTO b-tree rebuild reconstructs
+                // every real table and index from its own root, so re-carrying
+                // those as "extra" master entries would duplicate them — hence
+                // the skip. But a VIRTUAL table has no b-tree of its own: its
+                // sqlite_master row records `root_page == 0` and a
+                // `CREATE VIRTUAL TABLE ...` statement, so the rebuild never
+                // re-emits it. Dropping it (as the blanket `table`/`index` skip
+                // did) left the vtab's real shadow tables orphaned in the output.
+                // Keep virtual-table rows; still drop real tables and all indexes.
+                if entry_type.eq_ignore_ascii_case("index") {
+                    return None;
+                }
+                if entry_type.eq_ignore_ascii_case("table")
+                    && !(root_page == 0 && sql.as_deref().is_some_and(is_virtual_table_sql))
+                {
+                    return None;
+                }
                 Some((entry_type, name, tbl_name, root_page, sql))
             })
             .collect()
