@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use fsqlite_e2e::block_on;
 use fsqlite_harness::fault_vfs::FaultSpec;
 use fsqlite_harness::fault_vfs::FaultInjectingVfs;
-use fsqlite_pager::{SimplePager, TransactionHandle, TransactionMode};
+use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vfs::MemoryVfs;
