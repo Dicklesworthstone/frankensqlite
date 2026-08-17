@@ -716,6 +716,25 @@ If rch or its workers are unavailable, it fails open — builds run locally as n
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
+### ⚠ Background-command wedge — never background a long rch/script command (bd-17uo0)
+
+rch's fail-open covers *admission* (no worker ⇒ local build), but it does **not**
+bound the **local wrapper wait** once a remote job is already done/absent — and a
+**background terminal has no tty**, so the interrupt/acknowledge path is inert.
+Result: the TUI waits on "Waiting for background terminal" **indefinitely** while
+`rch status` shows the queue idle (observed 25 min and 1h 54m).
+
+Avoid it:
+- Run long/verification commands in the **foreground** with a reaper: `timeout <N>s <command>`.
+- Bypass the wrapper for long or background compiles: `RCH_CARGO_WRAPPER_BYPASS=1 <command>` (returns immediately, no wrapper wait to strand) — the default in this repo's build guidance.
+- Or bound the wait: `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=<N> <command>`.
+
+If already wedged: `rch status`/`rch queue` to confirm the remote is idle, then
+stop the background terminal (`Esc` → `/stop`) or kill **only the stale local
+`rch` wrapper** (`pgrep -af rch`, never the remote job) and rerun foreground.
+Full diagnosis, recovery ladder, and a verification harness:
+`docs/rch-background-wedge-runbook.md` + `scripts/bd_17uo0_rch_background_wedge_repro.sh`.
+
 ---
 
 ## ast-grep vs ripgrep
