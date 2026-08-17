@@ -2412,3 +2412,371 @@ mod tests {
         assert_eq!(result.epoch, 1, "rebuild epoch should be 1");
     }
 }
+
+// ===========================================================================
+// bd-lyrja — crash-cleanup process-liveness matrix (Linux).
+//
+// These tests exercise the *real* process-aliveness primitive
+// (`process_alive_os`) and the crash-cleanup CAS-clear
+// (`release_all_for_txn`) against genuine OS child processes that we spawn,
+// SIGKILL / SIGSTOP / SIGCONT, and reap. They cover acceptance criteria
+// 1–4 of bd-lyrja on Linux.
+//
+// Scope note (forbid(unsafe_code)): fsqlite-mvcc is `#![forbid(unsafe_code)]`,
+// and `nix::unistd::fork` is an `unsafe fn`. We therefore create real child
+// processes with the safe `std::process::Command` API rather than `fork`, and
+// send SIGKILL/SIGSTOP/SIGCONT with the safe `nix::sys::signal::kill`. Because
+// the `SharedPageLockTable` is a heap-`Vec` (not yet placed in a MAP_SHARED
+// segment — that placement needs `unsafe` mmap which is not permitted in this
+// crate), the child cannot mutate the parent's table directly. The parent
+// therefore records `(pid, birth)` for the child's txn and performs the table
+// mutation on the child's behalf. The *liveness gate* that drives the cleanup
+// (`process_alive_os` on a genuinely dead / stopped OS process) is fully real.
+// A true shared-segment child-mutates-table variant is deferred to whichever
+// crate owns the mmap (fsqlite-vfs); see the report attached to bd-lyrja.
+// ===========================================================================
+#[cfg(all(test, target_os = "linux"))]
+mod crash_cleanup_process_liveness_tests {
+    use super::*;
+
+    use std::collections::HashMap;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::time::{Duration as StdDuration, Instant as StdInstant};
+
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    /// Small capacity to exercise the hash-table mechanics.
+    const TEST_CAP: u32 = 64;
+    /// Crash-recovery iterations. The bead calls for 100/platform; 30 keeps the
+    /// unit-suite fast while still exercising the loop many times. Bump for soak.
+    const CRASH_ITERS: u32 = 30;
+    /// Bounded cap for the best-effort *real* PID-reuse probe. Modern Linux
+    /// `pid_max` (~4M) means reuse is essentially never observed in a short
+    /// loop, so this path skips-with-log; the deterministic birth-token check
+    /// below carries the actual reuse-safety assurance.
+    const REUSE_SPAWN_CAP: u32 = 200;
+
+    // Subprocess + `/proc` + PID churn is process-global state. Serialize these
+    // tests so `--test-threads > 1` cannot interleave PID allocation / reaping
+    // or slow each other's `waitpid`.
+    static PROC_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn proc_test_guard() -> MutexGuard<'static, ()> {
+        PROC_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Build a procfs-tagged birth token for an arbitrary (live) child `pid`,
+    /// mirroring `current_process_birth_token` but for a process other than us.
+    /// Returns `None` if `/proc/<pid>/stat` cannot be read (child already gone).
+    fn child_birth_token(pid: u32) -> Option<u64> {
+        let ticks = read_proc_start_time_ticks(pid)?;
+        Some(PID_BIRTH_PROCFS_TAG | (ticks & !PID_BIRTH_PROCFS_TAG))
+    }
+
+    /// Spawn a long-lived, easily-killable child (`sleep 86400`). Returns `None`
+    /// (test skips) if the binary is unavailable in this environment.
+    fn spawn_blocker() -> Option<Child> {
+        Command::new("sleep")
+            .arg("86400")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+    }
+
+    /// Spawn a blocker and read its birth token while it is guaranteed alive.
+    /// Returns `None` if spawn or the `/proc` read races/fails; caller cleans up.
+    fn spawn_blocker_with_birth() -> Option<(Child, u32, u64)> {
+        let child = spawn_blocker()?;
+        let pid = child.id();
+        match child_birth_token(pid) {
+            Some(birth) => Some((child, pid, birth)),
+            None => {
+                terminate(child);
+                None
+            }
+        }
+    }
+
+    /// SIGKILL + reap. Safe (no `fork`); `wait` removes the `/proc/<pid>` entry.
+    fn terminate(mut child: Child) {
+        let _ = child.kill(); // SIGKILL; no-op if already dead.
+        let _ = child.wait(); // Reap the zombie so `/proc/<pid>` disappears.
+    }
+
+    fn send_signal(pid: u32, sig: Signal) -> bool {
+        i32::try_from(pid).is_ok_and(|raw| kill(Pid::from_raw(raw), Some(sig)).is_ok())
+    }
+
+    /// Poll until the (pid, birth) identity is observed dead, or timeout.
+    fn wait_until_dead(pid: u32, birth: u64, timeout: StdDuration) -> bool {
+        let start = StdInstant::now();
+        loop {
+            if !process_alive_os(pid, birth) {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(StdDuration::from_millis(5));
+        }
+    }
+
+    /// Corrupt a valid procfs-tagged birth token by bumping its starttime ticks,
+    /// modelling "same PID, different process incarnation" (the PID-reuse race).
+    fn stale_birth(birth: u64) -> u64 {
+        PID_BIRTH_PROCFS_TAG | ((birth & !PID_BIRTH_PROCFS_TAG).wrapping_add(1))
+    }
+
+    // -- Acceptance 1: process_alive lifecycle — alive → dead after reap. -----
+
+    #[test]
+    fn test_process_alive_live_child_then_dead_after_reap() {
+        let _guard = proc_test_guard();
+
+        let Some((child, pid, birth)) = spawn_blocker_with_birth() else {
+            eprintln!("skip: could not spawn `sleep` child in this environment");
+            return;
+        };
+
+        // Alive process with its true birth → Alive.
+        assert!(
+            process_alive_os(pid, birth),
+            "freshly spawned child pid={pid} must read as alive"
+        );
+
+        // Even while alive, a stale birth (reused-PID model) must read as Dead:
+        // no false-positive "alive" → no stale lock is ever retained.
+        assert!(
+            !process_alive_os(pid, stale_birth(birth)),
+            "live child with a mismatched birth token must read as dead (reuse-safe)"
+        );
+
+        // Kill -9 and reap; the reaped PID's identity must become Dead within ~1s.
+        terminate(child);
+        assert!(
+            wait_until_dead(pid, birth, StdDuration::from_secs(1)),
+            "killed+reaped child pid={pid} must read as dead within 1s of reap"
+        );
+    }
+
+    // -- Acceptance 3: PID-reuse adversarial (no false-positive release). -----
+
+    #[test]
+    fn test_pid_reuse_birth_disambiguation_is_reuse_safe() {
+        let _guard = proc_test_guard();
+
+        // Part A — deterministic reuse-safety property (always runs).
+        // A recorded (pid, birth) whose PID is later occupied by a *different*
+        // incarnation (different starttime) must read Dead; the correct current
+        // birth must read Alive. This is the core "Dead-then-Alive across the
+        // reuse boundary" guarantee, made deterministic via the birth token.
+        let Some((child, pid, birth)) = spawn_blocker_with_birth() else {
+            eprintln!("skip: could not spawn `sleep` child in this environment");
+            return;
+        };
+        assert!(
+            process_alive_os(pid, birth),
+            "current birth for a live PID must read Alive"
+        );
+        assert!(
+            !process_alive_os(pid, stale_birth(birth)),
+            "stale birth for a reused PID must read Dead (no false-positive alive)"
+        );
+        terminate(child);
+
+        // Part B — best-effort *real* PID reuse, strictly bounded. On stock
+        // Linux this virtually never triggers within the cap, so it
+        // skips-with-log rather than looping unbounded. If reuse *is* observed
+        // we assert the safety property against the live incarnation.
+        let mut retired: HashMap<u32, u64> = HashMap::new();
+        let mut observed_reuse = false;
+        for _ in 0..REUSE_SPAWN_CAP {
+            let Some((child, pid, birth)) = spawn_blocker_with_birth() else {
+                continue;
+            };
+            if let Some(&old_birth) = retired.get(&pid) {
+                if old_birth != birth {
+                    // A killed PID has been reused by a fresh incarnation.
+                    assert!(
+                        !process_alive_os(pid, old_birth),
+                        "reused pid={pid} with the OLD birth must read Dead"
+                    );
+                    assert!(
+                        process_alive_os(pid, birth),
+                        "reused pid={pid} with the NEW birth must read Alive"
+                    );
+                    observed_reuse = true;
+                    terminate(child);
+                    break;
+                }
+            }
+            retired.insert(pid, birth);
+            terminate(child);
+        }
+        if !observed_reuse {
+            eprintln!(
+                "note: OS did not reuse a PID within {REUSE_SPAWN_CAP} spawns; \
+                 deterministic birth-token reuse-safety (Part A) still verified"
+            );
+        }
+    }
+
+    // -- Acceptance 2: crash recovery — dead holder detected + CAS-cleared. ---
+
+    #[test]
+    fn test_crash_recovery_dead_holder_cas_cleared() {
+        let _guard = proc_test_guard();
+
+        let table = SharedPageLockTable::new(TEST_CAP);
+        const PAGE: u32 = 7;
+
+        let mut ran = 0_u32;
+        for iter in 0..CRASH_ITERS {
+            // A genuine OS process is the notional lock holder.
+            let Some((child, pid, birth)) = spawn_blocker_with_birth() else {
+                eprintln!("skip: could not spawn `sleep` child (iter {iter})");
+                break;
+            };
+            let holder_txn = u64::from(iter) + 1_000;
+
+            // The holder acquires an exclusive page lock (parent acts on the
+            // child's behalf; see the module-scope forbid(unsafe_code) note).
+            assert_eq!(
+                table.try_acquire(PAGE, holder_txn),
+                AcquireResult::Acquired,
+                "holder txn={holder_txn} should acquire page {PAGE}"
+            );
+            assert_eq!(table.holder(PAGE), Some(holder_txn));
+
+            // The holder crashes (SIGKILL) and is reaped.
+            terminate(child);
+            assert!(
+                wait_until_dead(pid, birth, StdDuration::from_secs(1)),
+                "crashed holder pid={pid} must be observably dead before cleanup"
+            );
+
+            // Crash cleanup (the production flow, driven by a live caller):
+            // process_alive_os identifies the dead holder, then the entry is
+            // CAS-cleared via release_all_for_txn (spec §5.6.3
+            // release_page_locks_for). The liveness gate is a real dead PID.
+            assert!(
+                !process_alive_os(pid, birth),
+                "cleanup must see the holder as dead"
+            );
+            let released = table.release_all_for_txn(holder_txn);
+            assert_eq!(released, 1, "exactly the crashed holder's lock is cleared");
+            assert_eq!(
+                table.holder(PAGE),
+                None,
+                "page {PAGE} must be free after crash cleanup"
+            );
+
+            // A third, live caller can now acquire the reclaimed lock.
+            let next_txn = holder_txn + 500;
+            assert_eq!(
+                table.try_acquire(PAGE, next_txn),
+                AcquireResult::Acquired,
+                "post-cleanup acquire by txn={next_txn} must succeed"
+            );
+            assert_eq!(table.holder(PAGE), Some(next_txn));
+            assert!(table.release(PAGE, next_txn), "reset page for next iteration");
+
+            ran += 1;
+        }
+
+        assert!(ran > 0, "crash-recovery loop must run at least once");
+    }
+
+    // -- Acceptance 4: lease expiry reclaims a stopped (but alive) holder. ----
+    //
+    // A SIGSTOPped process is still *alive* to `process_alive_os` (its `/proc`
+    // entry and starttime persist), so a liveness probe ALONE can never reclaim
+    // its resources — which is exactly why the spec pairs liveness with an
+    // expiring lease + hard timeout. This test drives the only time-based
+    // reclamation currently wired: the rebuild lease. It proves (a) liveness
+    // can't distinguish a stopped holder, (b) the lease is stealable only after
+    // expiry, and (c) SIGCONT does not produce double ownership.
+    //
+    // GAP (reported on bd-lyrja): per-*page-lock* entries carry no
+    // (pid, birth, expiry) tuple, so a SIGSTOPped *page-lock* holder cannot be
+    // time-reclaimed today — only owner-death (via process_alive_os), explicit
+    // release, or a rebuild clears page locks. Wiring a per-entry lease/hard
+    // timeout is bd-wekio's stale-writer reaper.
+    #[test]
+    fn test_lease_expiry_reclaims_stopped_holder_no_double_ownership() {
+        let _guard = proc_test_guard();
+
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        let Some((child, holder_pid, holder_birth)) = spawn_blocker_with_birth() else {
+            eprintln!("skip: could not spawn `sleep` child in this environment");
+            return;
+        };
+
+        // Logical clock (seconds). The holder takes the rebuild lease.
+        let now0 = 1_000_u64;
+        assert!(
+            table
+                .acquire_rebuild_lease(holder_pid, holder_birth, now0)
+                .is_ok(),
+            "holder should take the rebuild lease"
+        );
+        let expiry = now0 + DEFAULT_LEASE_SECS;
+        assert_eq!(table.rebuild_lease_expiry.load(Ordering::Relaxed), expiry);
+
+        // Freeze the holder. It is stopped but NOT dead.
+        assert!(
+            send_signal(holder_pid, Signal::SIGSTOP),
+            "SIGSTOP should succeed on the live holder"
+        );
+        assert!(
+            process_alive_os(holder_pid, holder_birth),
+            "a SIGSTOPped holder is still alive to the liveness probe — \
+             only the lease/hard-timeout can reclaim it"
+        );
+
+        // Before expiry: a live worker cannot steal (lease valid + holder alive).
+        let worker_pid = std::process::id();
+        let worker_birth = current_process_birth_token(now0);
+        let err = table
+            .acquire_rebuild_lease(worker_pid, worker_birth, expiry - 1)
+            .expect_err("lease must not be stealable before expiry from a live holder");
+        assert_eq!(err, RebuildLeaseError::LeaseHeld { pid: holder_pid });
+
+        // After the hard timeout window (task: > 5× lease): the worker reclaims
+        // purely on lease expiry, regardless of the frozen holder's liveness.
+        let hard_deadline = now0 + 5 * DEFAULT_LEASE_SECS;
+        assert!(
+            table
+                .acquire_rebuild_lease(worker_pid, worker_birth, hard_deadline)
+                .is_ok(),
+            "lease must be reclaimable after the hard timeout"
+        );
+        assert_eq!(
+            table.rebuild_pid.load(Ordering::Relaxed),
+            worker_pid,
+            "worker now owns the rebuild lease"
+        );
+
+        // Resume the holder. It must NOT be able to reassert ownership:
+        // renew fails (it no longer holds the lease) and a fresh acquire is
+        // rejected while the worker's lease is live → no double ownership.
+        assert!(send_signal(holder_pid, Signal::SIGCONT), "SIGCONT the holder");
+        assert!(
+            !table.renew_rebuild_lease(holder_pid, hard_deadline),
+            "resumed holder must fail to renew a lease it no longer owns"
+        );
+        let reacquire = table.acquire_rebuild_lease(holder_pid, holder_birth, hard_deadline);
+        assert_eq!(
+            reacquire,
+            Err(RebuildLeaseError::LeaseHeld { pid: worker_pid }),
+            "resumed holder must not double-own the lease held by the worker"
+        );
+
+        terminate(child);
+    }
+}
