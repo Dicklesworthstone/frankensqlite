@@ -662,55 +662,70 @@ impl VersionStore {
         let pgno = version.pgno;
         let begin_ts = version.commit_seq;
 
-        // Step 0: Ensure slot exists BEFORE acquiring arena lock, because
-        // ensure_slot may take its own write locks (directory + slots) on the
-        // slow path, and we don't want to hold the arena write lock during
-        // that potentially slower allocation.
+        // Step 0: Ensure the chain-head slot exists BEFORE touching the arena,
+        // because ensure_slot may take its own write locks (directory + slots)
+        // on the slow path and we do not want to nest those under the arena
+        // lock.
         let shard = &self.chain_heads.shards[ChainHeadTable::shard_index(pgno)];
         let slot_idx = shard.ensure_slot(pgno);
 
-        // Step 1: Arena alloc (brief write lock — kept open for prev-link in step 2).
-        let mut arena = self.arena.write();
-        let idx = arena.alloc(version);
-        let new_raw = ChainHeadTable::pack_idx(idx);
-
-        // `publish` is the only production path that installs a new chain
-        // head (`ChainHeadTable::{install,install_with_retry,remove}` are
-        // test-only), and it holds `arena.write()` exclusively across
-        // the load + link + swap sequence. No other thread can mutate
-        // this slot in that window, so `compare_exchange` (strong) must
-        // succeed on the first attempt — the prior `compare_exchange_weak`
-        // loop existed only to recover from spurious weak-CAS failures
-        // that this path never needed to tolerate. Consequently the CAS
-        // attempt histogram sample is always 1; record it through the
-        // observability gate so production keeps the hot path cheap while
-        // diagnostics can still verify the invariant.
-        let previous_head = {
+        // Step 1 (fast path, bd-8euyp): publish under the SHARED arena read
+        // lock. `VersionArena::alloc` is now lock-free, so concurrent
+        // publishers to disjoint pages no longer serialize on an exclusive
+        // arena lock — the only contended shared write on the fast path is the
+        // arena's bump cursor and this page's own chain-head slot.
+        //
+        // The chain-head install is a CAS from the observed head. Per-page
+        // publishes are serialized by the page write lock (INV-2), so the CAS
+        // almost always succeeds on the first attempt; if it loses a race with
+        // a concurrent same-page publisher we fall through to the exclusive
+        // relink path (which fixes the now-stale `prev` under the write lock).
+        let (idx, previous_head, attempts) = {
+            let arena = self.arena.read();
             let slots = shard.slots.read();
-            let current_raw = slots[slot_idx].load(Ordering::Acquire);
+            let head_atomic = &slots[slot_idx];
+            let current_raw = head_atomic.load(Ordering::Acquire);
             let prev = ChainHeadTable::unpack_idx(current_raw);
 
-            // Link the new version to the current head BEFORE the swap.
-            let v = arena.get_mut(idx).expect("just allocated");
-            v.prev = prev.map(idx_to_version_pointer);
+            // Link the new version to the observed head BEFORE storing it. The
+            // slot is not reachable from any chain head until the CAS below
+            // succeeds, so no reader can observe it mid-construction; INV-3
+            // (strictly descending commit_seq) holds because the new version's
+            // commit_seq exceeds the head it links behind.
+            let mut linked = version;
+            linked.prev = prev.map(idx_to_version_pointer);
+            let new_idx = arena.alloc(linked);
+            let new_raw = ChainHeadTable::pack_idx(new_idx);
 
-            slots[slot_idx]
-                .compare_exchange(current_raw, new_raw, Ordering::AcqRel, Ordering::Acquire)
-                .expect(
-                    "chain-head CAS must succeed under arena.write() exclusive hold: \
-                     no other writer can mutate this slot in the window",
-                );
-            record_cas_attempt(1);
-            prev
+            match head_atomic.compare_exchange(
+                current_raw,
+                new_raw,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => (new_idx, prev, 1_u32),
+                Err(_) => {
+                    // Lost the head race. The version is stored at `new_idx`
+                    // with a now-stale `prev`; re-link it under the exclusive
+                    // arena lock and retry. Release the read locks first to
+                    // avoid a read→write deadlock on the arena RwLock.
+                    drop(slots);
+                    drop(arena);
+                    let (prev, attempts) =
+                        self.publish_relink_exclusive(shard, slot_idx, new_idx);
+                    (new_idx, prev, attempts)
+                }
+            }
         };
-        drop(arena);
 
-        // Step 3: Visibility-ranges side-index update. Gated off by default
+        // CAS attempt histogram sample: 1 on the (dominant) first-attempt fast
+        // path, or the retry count on the rare exclusive relink. Recorded via
+        // the observability gate so production keeps the hot path cheap.
+        record_cas_attempt(attempts);
+
+        // Step 2: Visibility-ranges side-index update. Gated off by default
         // because the diagnostic `visibility_range()` getter and the Debug
-        // impl are the only consumers; the old unconditional
-        // `visibility_ranges.write()` cost one `RwLock<HashMap>` exclusive
-        // acquire + 1-2 HashMap mutations on every version publish, which
-        // is on the write hot path. The conditional is a single relaxed
+        // impl are the only consumers; the conditional is a single relaxed
         // bool load in the common (disabled) case.
         if MVCC_VISIBILITY_RANGES_TRACKING_ENABLED.load(Ordering::Relaxed) {
             publish_record_visibility_range(&self.visibility_ranges, idx, begin_ts, previous_head);
@@ -718,6 +733,46 @@ impl VersionStore {
 
         tracing::debug!(pgno = pgno.get(), "version published to chain head");
         idx
+    }
+
+    /// Re-link an already-allocated version at the head of its page chain after
+    /// the lock-free fast path lost a CAS race with a concurrent same-page
+    /// publisher (bd-8euyp).
+    ///
+    /// Runs under the exclusive arena write lock so `get_mut` is available to
+    /// fix the new version's now-stale `prev` between attempts. The write lock
+    /// excludes every lock-free allocator (they hold the read lock), so the
+    /// head is stable while held and the CAS converges immediately. Returns the
+    /// head the version was ultimately linked behind and the total CAS attempts
+    /// (including the failed fast-path attempt).
+    #[cold]
+    #[inline(never)]
+    fn publish_relink_exclusive(
+        &self,
+        shard: &ChainHeadShard,
+        slot_idx: usize,
+        new_idx: VersionIdx,
+    ) -> (Option<VersionIdx>, u32) {
+        let mut arena = self.arena.write();
+        let slots = shard.slots.read();
+        let head_atomic = &slots[slot_idx];
+        let new_raw = ChainHeadTable::pack_idx(new_idx);
+        // The failed fast-path attempt already counts as one.
+        let mut attempts = 1_u32;
+        loop {
+            attempts = attempts.saturating_add(1);
+            let current_raw = head_atomic.load(Ordering::Acquire);
+            let prev = ChainHeadTable::unpack_idx(current_raw);
+            if let Some(v) = arena.get_mut(new_idx) {
+                v.prev = prev.map(idx_to_version_pointer);
+            }
+            if head_atomic
+                .compare_exchange(current_raw, new_raw, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return (prev, attempts);
+            }
+        }
     }
 
     /// Resolve the newest committed version of `page` visible to `snapshot`.

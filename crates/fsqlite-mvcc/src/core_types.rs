@@ -83,8 +83,107 @@ impl VersionIdx {
     }
 }
 
-/// Number of page versions per arena chunk.
+/// Number of page versions per arena chunk (matches the 12-bit `VersionIdx`
+/// offset field, `0..4095`).
 const ARENA_CHUNK: usize = 4096;
+
+/// Number of chunk slots per level-2 directory block.
+const CHUNK_L2: usize = 1024;
+/// Number of level-1 directory entries. `CHUNK_L1 * CHUNK_L2 == 1_048_576`
+/// exactly covers the 20-bit `VersionIdx` chunk field.
+const CHUNK_L1: usize = 1024;
+/// Sentinel for "no next slot" in the intrusive lock-free free stack.
+///
+/// A packed slot node is `(chunk << 12) | offset` which is at most a 32-bit
+/// value, so `u64::MAX` never collides with a real node.
+const FREE_NIL: u64 = u64::MAX;
+
+/// Number of independent bump-cursor shards (bd-5kgie step 3).
+///
+/// Power of two so the writer-to-shard hash is a mask. With one shard per
+/// concurrent writer, the per-op bump allocation touches only that writer's own
+/// cache line, so disjoint-page publishers no longer ping-pong a single shared
+/// `fetch_add` cursor line. 16 covers the common concurrent-writer fan-out;
+/// beyond 16 writers, shards are shared and fall back to CAS-retry (still
+/// correct, just contended).
+const CURSOR_SHARDS: usize = 16;
+
+/// Sentinel packed cursor state meaning "this shard owns no chunk yet".
+///
+/// A live state packs `(chunk << 32) | next_offset` with `next_offset` in
+/// `0..=ARENA_CHUNK` and `chunk` bounded by the 20-bit `VersionIdx` chunk
+/// field, so `u64::MAX` never collides with a real state.
+const CURSOR_EMPTY: u64 = u64::MAX;
+
+/// Pack a per-shard bump cursor: the chunk this shard is filling and the next
+/// free offset within it.
+#[inline]
+fn pack_cursor(chunk: u32, next_offset: u32) -> u64 {
+    (u64::from(chunk) << 32) | u64::from(next_offset)
+}
+
+/// Unpack a per-shard bump cursor into `(chunk, next_offset)`.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn unpack_cursor(state: u64) -> (u32, u32) {
+    ((state >> 32) as u32, (state & 0xFFFF_FFFF) as u32)
+}
+
+/// One bump-cursor shard, isolated on its own cache line (via the enclosing
+/// [`CacheAligned`]) so concurrent writers on different shards never invalidate
+/// each other's line.
+///
+/// `state` packs `(chunk << 32) | next_offset` for the chunk this shard is
+/// currently filling, or [`CURSOR_EMPTY`] before the shard has claimed a chunk.
+/// `count` is the shard's total bump allocations (summed for `high_water`);
+/// it lives on the same line and is written only via this shard, so it adds no
+/// cross-shard coherence traffic.
+struct CursorShard {
+    state: AtomicU64,
+    count: AtomicU64,
+}
+
+impl CursorShard {
+    const fn empty() -> Self {
+        Self {
+            state: AtomicU64::new(CURSOR_EMPTY),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Global rotor handing each thread a stable cursor-shard index on first use.
+static CURSOR_SHARD_ROTOR: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Per-thread cursor-shard assignment, claimed once from the rotor. Stable
+    /// for the thread's life so a writer's allocations stay on one shard line
+    /// (good locality; no cross-shard CAS contention with distinct writers).
+    static CURSOR_SHARD_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// This thread's cursor-shard index (`0..CURSOR_SHARDS`), assigned on first use.
+#[inline]
+fn cursor_shard_index() -> usize {
+    CURSOR_SHARD_HINT.with(|hint| {
+        let current = hint.get();
+        if current == usize::MAX {
+            let assigned = CURSOR_SHARD_ROTOR.fetch_add(1, Ordering::Relaxed) & (CURSOR_SHARDS - 1);
+            hint.set(assigned);
+            assigned
+        } else {
+            current
+        }
+    })
+}
+
+/// Advance a slot generation, skipping `u32::MAX` so a packed `VersionIdx`
+/// never collides with `CHAIN_HEAD_EMPTY` (`u64::MAX`).
+#[inline]
+fn next_generation(generation: u32) -> u32 {
+    let next = generation.wrapping_add(1);
+    if next == u32::MAX { 0 } else { next }
+}
 
 #[inline]
 fn generation_counter_matches(left: u32, right: u32) -> bool {
@@ -96,16 +195,44 @@ fn txn_ids_differ(left: TxnId, right: TxnId) -> bool {
     left.get().cmp(&right.get()).is_ne()
 }
 
+/// One arena slot.
+///
+/// # Concurrency contract (bd-8euyp)
+///
+/// The arena lives behind `RwLock<VersionArena>` in [`crate::VersionStore`].
+/// Publish-time allocation now runs under a **shared** read lock via
+/// [`VersionArena::alloc`] (`&self`); reclamation (`take`,
+/// `take_for_retirement`, `recycle_slots`, `free`) runs under the **exclusive**
+/// write lock (`&mut self`). Read and write lock holders are mutually
+/// exclusive, so:
+///
+/// - `generation` is a plain `u32`: it is written only under the write lock
+///   (retirement bumps it) and read only under the read lock (`alloc`/`get`).
+///   The two never overlap, so no atomic is required — synchronization is
+///   provided by the `RwLock` acquire/release edges.
+/// - `version` is a [`OnceLock`]: `alloc` performs the single `set` under the
+///   read lock (the slot's `VersionIdx` is not published to any chain head
+///   until *after* `alloc` returns, so no reader can observe an in-progress
+///   slot); `get` reads it via `&self`; retirement clears it with `take` under
+///   the write lock, after which a future `alloc` may `set` it again.
+/// - `next_free` is the intrusive link of the lock-free free stack. Pushes
+///   happen under the write lock (`recycle_slots`/`take`); pops happen under
+///   the read lock (`alloc`). Because a push can never overlap a pop, the
+///   Treiber-stack pop is ABA-free (no element can be re-pushed during a pop).
 struct ArenaSlot {
     generation: u32,
-    version: Option<PageVersion>,
+    /// Intrusive free-stack link: a packed `(chunk << 12) | offset` slot node,
+    /// or [`FREE_NIL`].
+    next_free: AtomicU64,
+    version: OnceLock<PageVersion>,
 }
 
 impl ArenaSlot {
-    fn new(version: PageVersion) -> Self {
+    fn empty() -> Self {
         Self {
             generation: 0,
-            version: Some(version),
+            next_free: AtomicU64::new(FREE_NIL),
+            version: OnceLock::new(),
         }
     }
 }
@@ -130,45 +257,239 @@ impl ArenaSlot {
 /// This allows GC to hold the write lock only briefly for extraction, while
 /// the free_list update is deferred and batched.
 pub struct VersionArena {
-    chunks: Vec<Vec<ArenaSlot>>,
-    free_list: Vec<VersionIdx>,
-    high_water: u64,
+    /// Two-level chunk directory. `l1[c / CHUNK_L2]` lazily initializes a
+    /// level-2 block, and `block[c % CHUNK_L2]` lazily initializes a chunk of
+    /// `ARENA_CHUNK` slots. Every level is a [`OnceLock`], so once a chunk is
+    /// created its slots have stable addresses and can be borrowed as
+    /// `&PageVersion` under a shared read lock while other threads allocate
+    /// into different slots.
+    l1: Box<[OnceLock<Box<[OnceLock<Box<[ArenaSlot]>>]>>]>,
+    /// Per-writer bump-cursor shards (bd-5kgie step 3). Each shard fills whole
+    /// chunks it owns exclusively, so concurrent writers on distinct shards
+    /// bump-allocate without touching a shared cursor cache line. Cache-line
+    /// isolated to prevent false sharing between shards.
+    cursors: Box<[CacheAligned<CursorShard>]>,
+    /// Monotonically handed-out chunk ids. A shard claims a fresh chunk from
+    /// here (once per `ARENA_CHUNK` allocations), so this line is contended only
+    /// at chunk boundaries, not per allocation. Also the arena's chunk count.
+    next_chunk: AtomicU64,
+    /// Head of the intrusive lock-free free stack (packed slot node or
+    /// [`FREE_NIL`]).
+    free_head: AtomicU64,
+    /// Number of slots currently on the free stack.
+    free_len: AtomicUsize,
 }
 
 impl VersionArena {
     /// Create an empty arena.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            chunks: vec![Vec::with_capacity(ARENA_CHUNK)],
-            free_list: Vec::new(),
-            high_water: 0,
+        let l1 = (0..CHUNK_L1)
+            .map(|_| OnceLock::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let cursors = (0..CURSOR_SHARDS)
+            .map(|_| CacheAligned::new(CursorShard::empty()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let arena = Self {
+            l1,
+            cursors,
+            next_chunk: AtomicU64::new(0),
+            free_head: AtomicU64::new(FREE_NIL),
+            free_len: AtomicUsize::new(0),
+        };
+        // Eagerly materialize chunk 0 (bd-5kgie). The legacy arena
+        // pre-allocated its first chunk in `new()`; the first lock-free
+        // revision moved that allocation into the timed `alloc()` fast path,
+        // which was part of the earlier single-thread publish regression.
+        // Pre-initializing here keeps the common single-writer path from
+        // paying lazy `OnceLock::get_or_init` chunk allocation on its first
+        // publish.
+        arena.get_or_init_chunk(0);
+        arena
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk-directory navigation (bd-8euyp)
+    // -----------------------------------------------------------------------
+
+    /// Borrow an initialized slot, or `None` if its chunk was never allocated.
+    #[inline]
+    fn slot_ref(&self, chunk: u32, offset: u32) -> Option<&ArenaSlot> {
+        let c = chunk as usize;
+        let block = self.l1.get(c / CHUNK_L2)?.get()?;
+        let chunk_slots = block.get(c % CHUNK_L2)?.get()?;
+        chunk_slots.get(offset as usize)
+    }
+
+    /// Borrow an initialized slot mutably (write-lock paths only).
+    #[inline]
+    fn slot_mut(&mut self, chunk: u32, offset: u32) -> Option<&mut ArenaSlot> {
+        let c = chunk as usize;
+        let block = self.l1.get_mut(c / CHUNK_L2)?.get_mut()?;
+        let chunk_slots = block.get_mut(c % CHUNK_L2)?.get_mut()?;
+        chunk_slots.get_mut(offset as usize)
+    }
+
+    /// Get or lazily initialize the chunk holding `chunk`, returning its slots.
+    ///
+    /// Runs under a shared read lock: chunk/block creation is a lock-free
+    /// [`OnceLock::get_or_init`], so concurrent allocators racing on the same
+    /// fresh chunk agree on one allocation without a global write lock.
+    #[inline]
+    fn get_or_init_chunk(&self, chunk: u32) -> &[ArenaSlot] {
+        let c = chunk as usize;
+        let block = self.l1[c / CHUNK_L2].get_or_init(|| {
+            (0..CHUNK_L2)
+                .map(|_| OnceLock::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        block[c % CHUNK_L2].get_or_init(|| {
+            (0..ARENA_CHUNK)
+                .map(|_| ArenaSlot::empty())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Intrusive lock-free free stack (bd-8euyp)
+    // -----------------------------------------------------------------------
+
+    #[inline]
+    fn pack_free(chunk: u32, offset: u32) -> u64 {
+        (u64::from(chunk) << 12) | u64::from(offset)
+    }
+
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    fn unpack_free(node: u64) -> (u32, u32) {
+        ((node >> 12) as u32, (node & 0xFFF) as u32)
+    }
+
+    /// Push a retired slot onto the free stack. Callable under `&self` so both
+    /// write-lock reclamation and internal `take` can reuse it. Pushes are
+    /// serialized by the arena write lock, so they never race a pop.
+    fn push_free(&self, chunk: u32, offset: u32) {
+        let node = Self::pack_free(chunk, offset);
+        let slot = self
+            .slot_ref(chunk, offset)
+            .expect("push_free: slot chunk must be initialized");
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            slot.next_free.store(head, Ordering::Relaxed);
+            if self
+                .free_head
+                .compare_exchange_weak(head, node, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        self.free_len.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Pop a recycled slot from the free stack (lock-free Treiber pop under the
+    /// shared read lock). ABA-free because pushes cannot overlap pops.
+    fn pop_free(&self) -> Option<(u32, u32)> {
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            if head == FREE_NIL {
+                return None;
+            }
+            let (chunk, offset) = Self::unpack_free(head);
+            let slot = self
+                .slot_ref(chunk, offset)
+                .expect("pop_free: free slot chunk must be initialized");
+            let next = slot.next_free.load(Ordering::Acquire);
+            if self
+                .free_head
+                .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.free_len.fetch_sub(1, Ordering::Relaxed);
+                return Some((chunk, offset));
+            }
+        }
+    }
+
+    /// Claim a fresh chunk id from the shared counter.
+    ///
+    /// Contended only once per `ARENA_CHUNK` allocations per shard (at chunk
+    /// boundaries), never on the per-op fast path.
+    #[inline]
+    fn claim_chunk(&self) -> u32 {
+        let raw = self.next_chunk.fetch_add(1, Ordering::AcqRel);
+        u32::try_from(raw).expect("arena chunk index overflow")
+    }
+
+    /// Bump-allocate a fresh `(chunk, offset)` from this writer's cursor shard
+    /// (bd-5kgie step 3).
+    ///
+    /// Each shard owns whole chunks (claimed from `next_chunk`) and hands out
+    /// contiguous offsets within them via a CAS on its own cache line. With one
+    /// shard per writer the CAS is uncontended (single-attempt); shared shards
+    /// simply retry. A CAS lost at a chunk boundary may discard an already
+    /// claimed chunk id — harmless: that chunk is never initialized (no memory)
+    /// and the id space is 20 bits.
+    fn bump_alloc_slot(&self) -> (u32, u32) {
+        let shard = &self.cursors[cursor_shard_index()];
+        loop {
+            let current = shard.state.load(Ordering::Acquire);
+            let (chunk, offset) = if current == CURSOR_EMPTY {
+                (self.claim_chunk(), 0_u32)
+            } else {
+                let (chunk, next_offset) = unpack_cursor(current);
+                if next_offset < ARENA_CHUNK as u32 {
+                    (chunk, next_offset)
+                } else {
+                    // This shard's chunk is full — claim the next one.
+                    (self.claim_chunk(), 0_u32)
+                }
+            };
+            let new_state = pack_cursor(chunk, offset + 1);
+            if shard
+                .state
+                .compare_exchange_weak(current, new_state, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                shard.count.fetch_add(1, Ordering::Relaxed);
+                return (chunk, offset);
+            }
         }
     }
 
     /// Allocate a slot for `version`, returning its index.
-    pub fn alloc(&mut self, version: PageVersion) -> VersionIdx {
-        if let Some(idx) = self.free_list.pop() {
-            let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
-            slot.version = Some(version);
-            // Generation was incremented on free to invalidate old pointers.
-            // We use the current generation for the new allocation.
-            return VersionIdx::new(idx.chunk, idx.offset, slot.generation);
+    ///
+    /// Lock-free (bd-8euyp): called under the arena **read** lock so concurrent
+    /// publishers to disjoint pages no longer serialize on an exclusive arena
+    /// lock. The only shared write is this writer's per-shard bump cursor
+    /// (bd-5kgie) — or a lock-free free-stack pop when reusing a recycled slot.
+    pub fn alloc(&self, version: PageVersion) -> VersionIdx {
+        // Reuse a recycled slot if one is available.
+        if let Some((chunk, offset)) = self.pop_free() {
+            let slot = self
+                .slot_ref(chunk, offset)
+                .expect("alloc: recycled slot chunk must be initialized");
+            // Retirement bumped `generation` and cleared the OnceLock, so the
+            // slot is empty here and `set` cannot fail. Reuse the current
+            // (bumped) generation for the new handle.
+            slot.version
+                .set(version)
+                .unwrap_or_else(|_| panic!("alloc: recycled slot must be empty"));
+            return VersionIdx::new(chunk, offset, slot.generation);
         }
 
-        let last_chunk = self.chunks.len() - 1;
-        if self.chunks[last_chunk].len() >= ARENA_CHUNK {
-            self.chunks.push(Vec::with_capacity(ARENA_CHUNK));
-        }
-
-        let chunk_idx = self.chunks.len() - 1;
-        let offset = self.chunks[chunk_idx].len();
-        self.chunks[chunk_idx].push(ArenaSlot::new(version));
-        self.high_water += 1;
-
-        let chunk_u32 = u32::try_from(chunk_idx).unwrap_or(u32::MAX);
-        let offset_u32 = u32::try_from(offset).unwrap_or(u32::MAX);
-        VersionIdx::new(chunk_u32, offset_u32, 0)
+        // Bump-allocate a fresh slot from this writer's cursor shard.
+        let (chunk, offset) = self.bump_alloc_slot();
+        let chunk_slots = self.get_or_init_chunk(chunk);
+        let slot = &chunk_slots[offset as usize];
+        slot.version
+            .set(version)
+            .unwrap_or_else(|_| panic!("alloc: fresh slot must be empty"));
+        VersionIdx::new(chunk, offset, slot.generation)
     }
 
     /// Remove and return the version at `idx`, making the slot available
@@ -179,26 +500,26 @@ impl VersionArena {
     /// Asserts that the slot is currently occupied (catches double-free)
     /// and that the generation matches (catches stale pointer access).
     pub fn take(&mut self, idx: VersionIdx) -> PageVersion {
-        let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
-        assert!(
-            generation_counter_matches(slot.generation, idx.generation),
-            "VersionArena::take: generation mismatch for {idx:?} (slot generation {})",
-            slot.generation
-        );
-        let version = slot
-            .version
-            .take()
-            .expect("VersionArena::take: slot must be occupied");
-
-        // Increment generation on free so that any dangling VersionIdx becomes invalid.
-        // We skip u32::MAX to prevent collision with CHAIN_HEAD_EMPTY (u64::MAX) when packed.
-        let mut next_gen = slot.generation.wrapping_add(1);
-        if next_gen == u32::MAX {
-            next_gen = 0;
-        }
-        slot.generation = next_gen;
-
-        self.free_list.push(idx);
+        let version = {
+            let slot = self
+                .slot_mut(idx.chunk(), idx.offset())
+                .expect("VersionArena::take: slot must exist");
+            assert!(
+                generation_counter_matches(slot.generation, idx.generation()),
+                "VersionArena::take: generation mismatch for {idx:?} (slot generation {})",
+                slot.generation
+            );
+            let version = slot
+                .version
+                .take()
+                .expect("VersionArena::take: slot must be occupied");
+            // Increment generation on free so that any dangling VersionIdx
+            // becomes invalid. We skip u32::MAX to prevent collision with
+            // CHAIN_HEAD_EMPTY (u64::MAX) when packed.
+            slot.generation = next_generation(slot.generation);
+            version
+        };
+        self.push_free(idx.chunk(), idx.offset());
         version
     }
 
@@ -230,9 +551,11 @@ impl VersionArena {
     ///
     /// Asserts that the slot is currently occupied and generation matches.
     pub fn take_for_retirement(&mut self, idx: VersionIdx) -> PageVersion {
-        let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
+        let slot = self
+            .slot_mut(idx.chunk(), idx.offset())
+            .expect("VersionArena::take_for_retirement: slot must exist");
         assert!(
-            generation_counter_matches(slot.generation, idx.generation),
+            generation_counter_matches(slot.generation, idx.generation()),
             "VersionArena::take_for_retirement: generation mismatch for {idx:?} (slot generation {})",
             slot.generation
         );
@@ -241,15 +564,10 @@ impl VersionArena {
             .take()
             .expect("VersionArena::take_for_retirement: slot must be occupied");
 
-        // Bump generation to invalidate stale pointers, but do NOT add to free_list.
-        let mut next_gen = slot.generation.wrapping_add(1);
-        if next_gen == u32::MAX {
-            next_gen = 0;
-        }
-        slot.generation = next_gen;
-
-        // Note: free_list.push() is intentionally skipped — the slot will be
-        // recycled via recycle_slots() after epoch advancement.
+        // Bump generation to invalidate stale pointers, but do NOT push onto the
+        // free stack — the slot is recycled via recycle_slots() after epoch
+        // advancement.
+        slot.generation = next_generation(slot.generation);
         version
     }
 
@@ -271,14 +589,11 @@ impl VersionArena {
     pub fn recycle_slots(&mut self, indices: impl IntoIterator<Item = VersionIdx>) {
         // Note: We don't verify generation here because take_for_retirement
         // already bumped it. The idx stored in the retire queue has the OLD
-        // generation, but that's fine — we just need the (chunk, offset) to
-        // identify the slot.
+        // generation, but that's fine — we only need the (chunk, offset) to
+        // identify the slot. `alloc` reads the slot's CURRENT (post-retirement)
+        // generation when it reuses the slot.
         for idx in indices {
-            // Create a fresh idx with the CURRENT generation (post-retirement bump).
-            // This is what alloc() will return when this slot is reused.
-            let slot = &self.chunks[idx.chunk as usize][idx.offset as usize];
-            let recycled_idx = VersionIdx::new(idx.chunk, idx.offset, slot.generation);
-            self.free_list.push(recycled_idx);
+            self.push_free(idx.chunk(), idx.offset());
         }
     }
 
@@ -299,46 +614,46 @@ impl VersionArena {
     /// (stale pointer).
     #[must_use]
     pub fn get(&self, idx: VersionIdx) -> Option<&PageVersion> {
-        let slot = self
-            .chunks
-            .get(idx.chunk as usize)?
-            .get(idx.offset as usize)?;
-
-        if !generation_counter_matches(slot.generation, idx.generation) {
+        let slot = self.slot_ref(idx.chunk(), idx.offset())?;
+        if !generation_counter_matches(slot.generation, idx.generation()) {
             return None;
         }
-        slot.version.as_ref()
+        slot.version.get()
     }
 
     /// Look up a version mutably by index.
     pub fn get_mut(&mut self, idx: VersionIdx) -> Option<&mut PageVersion> {
-        let slot = self
-            .chunks
-            .get_mut(idx.chunk as usize)?
-            .get_mut(idx.offset as usize)?;
-
-        if !generation_counter_matches(slot.generation, idx.generation) {
+        let generation = idx.generation();
+        let slot = self.slot_mut(idx.chunk(), idx.offset())?;
+        if !generation_counter_matches(slot.generation, generation) {
             return None;
         }
-        slot.version.as_mut()
+        slot.version.get_mut()
     }
 
-    /// Total versions ever allocated (including freed).
+    /// Total versions ever bump-allocated (recycled reuse does not increment).
+    ///
+    /// Summed across the per-writer cursor shards (bd-5kgie).
     #[must_use]
     pub fn high_water(&self) -> u64 {
-        self.high_water
+        self.cursors
+            .iter()
+            .map(|shard| shard.count.load(Ordering::Acquire))
+            .sum()
     }
 
-    /// Number of chunks currently allocated.
+    /// Number of chunks currently allocated (at least 1, matching the legacy
+    /// single-pre-allocated-chunk arena which pre-allocates chunk 0 in `new()`).
     #[must_use]
     pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
+        let handed_out = self.next_chunk.load(Ordering::Acquire);
+        usize::try_from(handed_out.max(1)).unwrap_or(usize::MAX)
     }
 
-    /// Number of slots on the free list.
+    /// Number of slots on the free stack.
     #[must_use]
     pub fn free_count(&self) -> usize {
-        self.free_list.len()
+        self.free_len.load(Ordering::Relaxed)
     }
 }
 
@@ -352,9 +667,9 @@ impl Default for VersionArena {
 impl std::fmt::Debug for VersionArena {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VersionArena")
-            .field("chunk_count", &self.chunks.len())
-            .field("free_count", &self.free_list.len())
-            .field("high_water", &self.high_water)
+            .field("chunk_count", &self.chunk_count())
+            .field("free_count", &self.free_count())
+            .field("high_water", &self.high_water())
             .finish_non_exhaustive()
     }
 }
@@ -3452,7 +3767,7 @@ mod tests {
 
     #[test]
     fn test_version_arena_chunk_growth() {
-        let mut arena = VersionArena::new();
+        let arena = VersionArena::new();
         assert_eq!(arena.chunk_count(), 1);
 
         let upper = u32::try_from(ARENA_CHUNK + 1).unwrap();
@@ -3475,7 +3790,7 @@ mod tests {
 
     #[test]
     fn test_page_version_chain_traversal() {
-        let mut arena = VersionArena::new();
+        let arena = VersionArena::new();
 
         let v1 = PageVersion {
             pgno: PageNumber::new(1).unwrap(),
@@ -4922,8 +5237,8 @@ mod tests {
     #[test]
     fn test_arena_get_no_alloc() {
         // bd-22n.8: VersionArena::get() is allocation-free.
-        // Just a bounds-checked Vec index — no allocation.
-        let mut arena = VersionArena::new();
+        // Just a bounds-checked directory index — no allocation.
+        let arena = VersionArena::new();
         let v = make_page_version(1, 5);
         let idx = arena.alloc(v.clone());
 

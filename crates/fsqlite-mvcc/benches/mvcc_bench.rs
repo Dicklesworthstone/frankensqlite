@@ -295,19 +295,52 @@ const PUBLISH_OPS_PER_THREAD: u32 = 2000;
 /// fast-array range 1..=65536 with 8 threads x 2000 ops).
 const PUBLISH_PAGE_STRIDE: u32 = 8192;
 
-/// Publish `ops` versions to the disjoint page range owned by thread `t`.
-fn publish_disjoint_range(store: &VersionStore, t: u32, ops: u32) {
-    let base = t * PUBLISH_PAGE_STRIDE + 1;
-    for i in 0..ops {
-        let pgno = base + i;
-        // Distinct page per publish => distinct chain-head slot => the only
-        // shared contended resource is the arena write lock.
-        let version = make_page_version(pgno, u64::from(i) + 1);
+/// Pre-build every `PageVersion` each writer will publish, OUT of the timed
+/// path (bd-5kgie bench-faithfulness fix).
+///
+/// The previous version of this bench built a fresh `PageData::zeroed(4 KiB)`
+/// per publish INSIDE the timed loop (via `make_page_version`), so the timed
+/// measurement was dominated by global-allocator contention on the 4 KiB heap
+/// allocation — a BENCH ARTIFACT that masked (and mis-attributed) the true
+/// arena-alloc + chain-head cost. In production, `VersionStore::publish` takes
+/// an ALREADY-BUILT `PageVersion` (the writer already holds the committed page
+/// bytes; `lifecycle.rs` moves them out of the write-set), so the real publish
+/// path does NOT allocate a page buffer per call. Building the versions in the
+/// untimed setup closure makes the timed routine call ONLY `store.publish()`,
+/// matching production.
+///
+/// Returns one `Vec<PageVersion>` per thread; each holds `ops` versions for
+/// that thread's disjoint page range (distinct page per publish => distinct
+/// chain-head slot => the only shared contended resource is the arena alloc).
+fn prebuild_publish_versions(threads: u32, ops: u32) -> Vec<Vec<PageVersion>> {
+    (0..threads)
+        .map(|t| {
+            let base = t * PUBLISH_PAGE_STRIDE + 1;
+            (0..ops)
+                .map(|i| make_page_version(base + i, u64::from(i) + 1))
+                .collect()
+        })
+        .collect()
+}
+
+/// Publish already-built versions. The timed routine calls ONLY
+/// `store.publish(prebuilt_version)` — this is the true arena-alloc +
+/// chain-head-append cost, matching production.
+fn publish_prebuilt(store: &VersionStore, versions: Vec<PageVersion>) {
+    for version in versions {
         black_box(store.publish(black_box(version)));
     }
 }
 
 /// Benchmark: N concurrent writers publishing versions (arena-alloc contention).
+///
+/// Faithful variant (bd-5kgie): all `PageVersion`/`PageData::zeroed`
+/// construction happens in the untimed `iter_batched` setup closure, so the
+/// timed routine measures only `VersionStore::publish` (arena alloc + chain
+/// head CAS), matching the production publish path. `BatchSize::PerIteration`
+/// keeps exactly one pre-built input set live at a time (each set is up to
+/// `8 * 2000 * 4 KiB` of page bytes), and excludes both the pre-build and the
+/// per-iteration store teardown from the timing.
 fn bench_concurrent_version_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("version_publish/concurrent_writers");
     group.sample_size(20);
@@ -322,21 +355,31 @@ fn bench_concurrent_version_publish(c: &mut Criterion) {
             &n_threads,
             |b, &threads| {
                 b.iter_batched(
-                    || Arc::new(VersionStore::new(PageSize::DEFAULT)),
-                    |store| {
+                    || {
+                        // SETUP (untimed): fresh store + all PageVersions
+                        // pre-built so the timed routine only calls publish().
+                        (
+                            Arc::new(VersionStore::new(PageSize::DEFAULT)),
+                            prebuild_publish_versions(threads, PUBLISH_OPS_PER_THREAD),
+                        )
+                    },
+                    |(store, mut per_thread)| {
                         if threads == 1 {
                             // Single-thread baseline: no thread-spawn overhead.
-                            publish_disjoint_range(&store, 0, PUBLISH_OPS_PER_THREAD);
+                            let versions =
+                                per_thread.pop().expect("one thread's versions prebuilt");
+                            publish_prebuilt(&store, versions);
                             return;
                         }
                         let barrier = Arc::new(Barrier::new(threads as usize));
-                        let handles: Vec<_> = (0..threads)
-                            .map(|t| {
+                        let handles: Vec<_> = per_thread
+                            .into_iter()
+                            .map(|versions| {
                                 let store = Arc::clone(&store);
                                 let bar = Arc::clone(&barrier);
                                 std::thread::spawn(move || {
                                     bar.wait();
-                                    publish_disjoint_range(&store, t, PUBLISH_OPS_PER_THREAD);
+                                    publish_prebuilt(&store, versions);
                                 })
                             })
                             .collect();
@@ -344,7 +387,7 @@ fn bench_concurrent_version_publish(c: &mut Criterion) {
                             h.join().unwrap();
                         }
                     },
-                    BatchSize::SmallInput,
+                    BatchSize::PerIteration,
                 );
             },
         );
