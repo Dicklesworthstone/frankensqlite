@@ -1337,6 +1337,12 @@ impl Vfs for WindowsVfs {
         let mut options = windows_open_options();
         let identity_guard = options.read(true).open(&resolved).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
+                // GH#355 (bd-h5oaj) diagnostic (identity-bound reopen path).
+                warn!(
+                    target: "fsqlite_vfs::reserved",
+                    path = %resolved.display(),
+                    "identity-bound open: main file not found (CannotOpen)"
+                );
                 FrankenError::CannotOpen {
                     path: resolved.clone(),
                 }
@@ -1344,14 +1350,28 @@ impl Vfs for WindowsVfs {
                 FrankenError::Io(err)
             }
         })?;
-        if FileIdentity::from_file(&identity_guard)? != Some(expected_identity) {
+        let guard_identity = FileIdentity::from_file(&identity_guard)?;
+        if guard_identity != Some(expected_identity) {
+            warn!(
+                target: "fsqlite_vfs::reserved",
+                path = %resolved.display(),
+                actual_present = guard_identity.is_some(),
+                "identity-bound open: preflight identity mismatch (CannotOpen)"
+            );
             return Err(FrankenError::CannotOpen { path: resolved });
         }
 
         let mut existing_flags = flags;
         existing_flags.remove(VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE);
         let (file, actual_flags) = self.open(cx, Some(&resolved), existing_flags)?;
-        if file.file_identity()? != Some(expected_identity) {
+        let final_identity = file.file_identity()?;
+        if final_identity != Some(expected_identity) {
+            warn!(
+                target: "fsqlite_vfs::reserved",
+                path = %resolved.display(),
+                actual_present = final_identity.is_some(),
+                "identity-bound open: final handle identity mismatch (CannotOpen)"
+            );
             return Err(FrankenError::CannotOpen { path: resolved });
         }
         drop(identity_guard);
@@ -1380,6 +1400,15 @@ impl Vfs for WindowsVfs {
         }
         let file = options.open(&resolved).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
+                // GH#355 (bd-h5oaj) diagnostic: the reserved bootstrap returns an
+                // unsourced CannotOpen, which forced a black-box elimination
+                // sweep on Windows. Name each failing stage so an instrumented
+                // run pinpoints the site.
+                warn!(
+                    target: "fsqlite_vfs::reserved",
+                    path = %resolved.display(),
+                    "reserved open: main file not found (CannotOpen)"
+                );
                 FrankenError::CannotOpen {
                     path: resolved.clone(),
                 }
@@ -1387,12 +1416,34 @@ impl Vfs for WindowsVfs {
                 FrankenError::Io(err)
             }
         })?;
-        if FileIdentity::from_file(&file)? != Some(expected_identity) || file.metadata()?.len() != 0
-        {
+        let actual_identity = FileIdentity::from_file(&file)?;
+        if actual_identity != Some(expected_identity) {
+            warn!(
+                target: "fsqlite_vfs::reserved",
+                path = %resolved.display(),
+                actual_present = actual_identity.is_some(),
+                "reserved open: file identity mismatch vs the reservation (CannotOpen)"
+            );
+            return Err(FrankenError::CannotOpen { path: resolved });
+        }
+        let actual_len = file.metadata()?.len();
+        if actual_len != 0 {
+            warn!(
+                target: "fsqlite_vfs::reserved",
+                path = %resolved.display(),
+                len = actual_len,
+                "reserved open: reserved target is not a 0-byte file (CannotOpen)"
+            );
             return Err(FrankenError::CannotOpen { path: resolved });
         }
         for artifact_path in reserved_database_artifact_paths(&resolved) {
             if filesystem_entry_exists(&artifact_path)? {
+                warn!(
+                    target: "fsqlite_vfs::reserved",
+                    path = %resolved.display(),
+                    artifact = %artifact_path.display(),
+                    "reserved open: reserved-database artifact present (CannotOpen)"
+                );
                 return Err(FrankenError::CannotOpen { path: resolved });
             }
         }

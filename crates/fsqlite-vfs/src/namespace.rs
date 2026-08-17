@@ -1783,6 +1783,14 @@ pub fn validate_reserved_database_artifacts(
             .to_string_lossy()
             .starts_with(&segment_prefix)
         {
+            // GH#355 (bd-h5oaj) diagnostic: name the WAL-segment leftover that
+            // blocked the reserved open.
+            tracing::warn!(
+                target: "fsqlite_vfs::reserved",
+                database = %database_path.display(),
+                wal_segment = %entry.file_name().to_string_lossy(),
+                "reserved-database WAL segment present; refusing reserved open (CannotOpen)"
+            );
             return Err(cannot_open(database_path));
         }
     }
@@ -1791,7 +1799,19 @@ pub fn validate_reserved_database_artifacts(
 
 fn reject_existing_entry(database_path: &Path, candidate: &Path) -> Result<()> {
     match std::fs::symlink_metadata(candidate) {
-        Ok(_) => Err(cannot_open(database_path)),
+        Ok(_) => {
+            // GH#355 (bd-h5oaj) diagnostic: the reserved-builder bootstrap
+            // returns an unsourced `CannotOpen`, which forced a black-box
+            // elimination sweep on Windows. Name the exact artifact that blocked
+            // the reserved open so an instrumented run is self-diagnosing.
+            tracing::warn!(
+                target: "fsqlite_vfs::reserved",
+                database = %database_path.display(),
+                artifact = %candidate.display(),
+                "reserved-database artifact already present; refusing reserved open (CannotOpen)"
+            );
+            Err(cannot_open(database_path))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
