@@ -8716,6 +8716,43 @@ impl<F: VfsFile> PagerInner<F> {
         // bd-r82et: this freelist was just read from durable committed state,
         // so it is the exact current durable freelist content.
         self.durable_freelist_view = freelist.iter().map(|page| page.get()).collect();
+        // bd-ioq6x / GH#346: `self.freelist = freelist` below wholesale-replaces
+        // the volatile freelist with durable state. In-memory-only freed pages
+        // that are now within `[2..=effective_db_size]` but ABSENT from the
+        // durable freelist are pages that were freed while ABOVE
+        // committed_db_size (so `serialize_freelist_to_write_set` filtered them
+        // out of page-1 metadata) which a later grow has since brought in range.
+        // Silently dropping them here (the pre-fix behavior) makes them
+        // "page N is never used" orphans. Re-park them into
+        // `abandoned_eof_reservations` — the one pool that SURVIVES refresh — so
+        // the next WAL commit / checkpoint fold reconciles them into the durable
+        // freelist under the same no-committed-frame double-grant guard the
+        // commit-fold already trusts (a peer may have made the page live since
+        // we freed it, so we must NOT blindly return it to the freelist here).
+        // Durable entries are preserved exactly by the assignment below. Only in
+        // WAL mode: rollback-journal mode has no commit-fold to drain the pool
+        // (see restore_uncommitted_allocations_for_clean_commit), and its
+        // single-connection shapes do not hit this wholesale-replace path.
+        if self.journal_mode == JournalMode::Wal && effective_db_size >= 2 {
+            let mut reparked = 0_usize;
+            for page in std::mem::take(&mut self.freelist) {
+                let raw = page.get();
+                if raw > 1
+                    && raw <= effective_db_size
+                    && !self.durable_freelist_view.contains(&raw)
+                {
+                    self.abandoned_eof_reservations.push(page);
+                    reparked += 1;
+                }
+            }
+            if reparked > 0 && std::env::var_os("IOQ6X_TRACE").is_some() {
+                eprintln!(
+                    "IOQ6X REFRESH-REPARK reparked={reparked} pool={} durable={}",
+                    self.abandoned_eof_reservations.len(),
+                    self.durable_freelist_view.len(),
+                );
+            }
+        }
         self.freelist = freelist;
         // Only clear the cache if the database was modified by another
         // connection. In WAL mode this uses the latest visible page-1
@@ -25358,6 +25395,77 @@ where
             _ => mode,
         };
 
+        // bd-ioq6x / GH#346: reconcile the abandonment pool into the freelist
+        // BEFORE the checkpoint truncates/resets the WAL. The CheckpointGuard's
+        // drop clears `abandoned_eof_reservations` unconditionally, orphaning
+        // any still-unreconciled entry that a later grow brings within
+        // `[2..=db_size]` ("page N is never used"). Mirror the commit-time fold
+        // (~L22632): under this checkpoint's exclusive maintenance fence
+        // (active_transactions == 0) and the WAL backend WRITE lock (stable
+        // appended tail), an entry `<= db_size` that carries NO committed WAL
+        // frame is a provable hole and is promoted into `inner.freelist` — a
+        // confirmed-free assertion that outlives the WAL-generation boundary
+        // (unlike the pool's frame-scoped membership, which is why the guard
+        // must clear the remainder). The next commit's
+        // serialize_freelist_to_write_set publishes it durably. An entry WITH a
+        // frame is a committed peer's live page (two-growers loser's stale
+        // number) and is left for the guard to drop; above-db_size entries are
+        // reissuable via next_page and are also left for the guard. Lock order
+        // is inner -> WAL, matching the commit-fold, and the WAL guard is
+        // released before the checkpoint re-acquires it. This never touches the
+        // durable page-1 directly (unlike the reverted zeroed-page content-fold
+        // fe99bf9b9) — it rides the existing pool + commit-fold machinery only.
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.journal_mode == JournalMode::Wal
+                && inner.db_size >= 2
+                && !inner.abandoned_eof_reservations.is_empty()
+            {
+                let db_size = inner.db_size;
+                // Best-effort under the checkpoint fence: on a transient
+                // WAL-lock or refresh error, leave the pool untouched for the
+                // guard to handle rather than failing the checkpoint or dropping
+                // entries (mirrors the reverted fold's best-effort intent, but
+                // via the pool + commit-fold machinery instead of a direct
+                // page-1 write).
+                if let Ok(mut wal_guard) = async_rwlock_write(&wal, cx, "WAL backend").await {
+                    let wal_ref = wal_guard.as_mut();
+                    // A connection-local backend view can lag peers' commits;
+                    // the no-committed-frame test is only meaningful against the
+                    // refreshed publication horizon (bd-vnxjd/bd-dw8oe).
+                    let _ = wal_ref.refresh_published_snapshot(cx).await;
+                    let pool = std::mem::take(&mut inner.abandoned_eof_reservations);
+                    let mut reconciled: Vec<PageNumber> = Vec::new();
+                    for page in pool {
+                        if page.get() > db_size {
+                            // Above the durable extent: reissuable from EOF.
+                            inner.abandoned_eof_reservations.push(page);
+                            continue;
+                        }
+                        match wal_ref.read_page_at_appended_tail(cx, page.get()).await {
+                            Ok(None) => reconciled.push(page),
+                            Ok(Some(_)) => { /* framed peer page: drop permanently */ }
+                            Err(_) => inner.abandoned_eof_reservations.push(page),
+                        }
+                    }
+                    drop(wal_guard);
+                    if !reconciled.is_empty() {
+                        if std::env::var_os("IOQ6X_TRACE").is_some() {
+                            eprintln!(
+                                "IOQ6X CKPT-FOLD reconciled={} pool_remaining={}",
+                                reconciled.len(),
+                                inner.abandoned_eof_reservations.len(),
+                            );
+                        }
+                        return_pages_to_freelist(&mut inner.freelist, reconciled);
+                    }
+                }
+            }
+        }
+
         // Run the checkpoint from the beginning. Reader-aware incremental
         // checkpointing requires exposing oldest-reader tracking from pager.
         let mut wal = async_rwlock_write(&wal, cx, "WAL backend").await?;
@@ -28840,28 +28948,29 @@ mod tests {
         });
     }
 
-    // GH#348 / bd-gzyk1 wedge-reproduction probe.
+    // GH#348 / bd-gzyk1 exit-path counter-hygiene guard (NOT a reproducer).
     //
     // The reporter's permanent per-connection BusySnapshot roots in a stuck
     // `PagerInner.active_transactions > 0`, which pins
     // `refresh_published_snapshot` on its stale-skip early return (every
     // autocommit read then binds a stale visibility and fails BusySnapshot
-    // forever). The inferred mechanism is a cancelled autocommit statement whose
+    // forever). The inferred trigger is a cancelled autocommit statement whose
     // transaction-exit external unlock aborts before the `active_transactions`
     // decrement.
     //
-    // This test drives that exact mechanism at the pager level: a read
-    // transaction is begun (active_transactions -> 1), the owning cx is
-    // cancelled, and the handle is dropped — running the mandatory external
-    // unlock under a cancelled lineage through the checkpoint-enforced-unlock
-    // harness (whose `unlock`/`restore` abort on a cancelled, mask-honoring cx).
-    // It then asserts the reporter's ROOT invariant directly (the counter must
-    // return to 0) and proves there is no *permanent* wedge by running a fresh
-    // read boundary afterward: `refresh_published_snapshot` must succeed and a
-    // fresh begin must be admitted. If the exit leaks the counter, the fresh
-    // `refresh_published_snapshot` returns the stale-skip snapshot and the
-    // counter assertion fails — i.e. this test goes RED whenever the leak the
-    // wedge depends on is present.
+    // IMPORTANT: this is a non-regression guard for exit-path counter hygiene,
+    // NOT a reproducer of the reporter's wedge. It begins a read
+    // (active_transactions -> 1), cancels the owning WRAPPER cx, drops the handle
+    // so the mandatory external unlock runs under a cancelled lineage, then
+    // asserts the counter returns to 0 and a fresh read boundary
+    // (`refresh_published_snapshot` + begin) is admitted. It stays GREEN even
+    // BEFORE the fixes (506c2a193 mask-aware native rwlock; 956d1c584 detached
+    // cleanup cx), because the wrapper-cancel path is already masked and the
+    // synchronous `SimpleTransaction::Drop` net cures a transient exit leak
+    // regardless — so it cannot go red on the reporter's mechanism. The actual
+    // wedge needs a cancelled NATIVE task cx (dropped future / native timeout),
+    // which the single-process MemoryVfs harness cannot model. Confirm the wedge
+    // itself via a real-runtime retest (see bd-gzyk1).
     #[test]
     fn test_gh348_cancelled_readonly_exit_does_not_leak_active_transactions_or_wedge() {
         asupersync::test_utils::run_test(|| async {
@@ -28925,6 +29034,66 @@ mod tests {
                 pager.inner.lock().unwrap().active_transactions,
                 0,
                 "bead_id=bd-gzyk1 case=fresh_read_boundary_leaves_zero_active_transactions"
+            );
+        });
+    }
+
+    // GH#348 / bd-gzyk1 wedge probe via the ASYNC transaction-exit path.
+    //
+    // Unlike the drop-based probe above (drop uses a synchronous `try_write()`
+    // + mask-honoring `cleanup_cx.checkpoint()` and is a universal safety net),
+    // an autocommit read's reload transaction is retired through the ASYNC
+    // `coordinated_transaction_exit`, which acquires the db-file write lock via
+    // `async_rwlock_write` — the exact acquire whose native fast path historically
+    // bypassed the `.masked()` guard. This probe cancels the owning cx and then
+    // drives the async readonly-commit exit, asserting the counter is not left
+    // stuck (`active_transactions` must be 0 immediately after commit returns,
+    // before any drop safety net can mask a real leak). Like its drop-based
+    // sibling above, this is a counter-hygiene guard, NOT a true reproducer: it
+    // stays green even before 506c2a193/956d1c584 (the wrapper-cancel is masked
+    // and 506c2a193 makes async_rwlock honor mask_depth), because the harness
+    // cannot model the native-task cancellation the real wedge needs.
+    #[test]
+    fn test_gh348_cancelled_readonly_async_commit_exit_does_not_leak() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _observed_lock_level, _observed_unlock_trace_ids) =
+                observed_lock_pager_with_checkpoint_enforced_unlock().await;
+            let cx = Cx::new().with_trace_context(41, 0, 0);
+
+            let mut txn = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                pager.inner.lock().unwrap().active_transactions,
+                1,
+                "bead_id=bd-gzyk1 case=async_begin_increments_active_transactions"
+            );
+
+            // Cancel the owning cx, then retire the read through the async exit.
+            // The result may be Ok or a transient cancellation Err; what matters
+            // for the wedge is the counter state afterward.
+            cx.cancel();
+            let _ = txn.commit(&cx).await;
+
+            // Counter measured BEFORE dropping the handle: a leaked
+            // active_transactions here is the wedge's root cause (a later drop
+            // would otherwise mask it). If the async exit's unlock aborted before
+            // the decrement, this is 1 (RED); a completed exit leaves 0.
+            let after_commit = pager.inner.lock().unwrap().active_transactions;
+            drop(txn);
+            assert_eq!(
+                after_commit, 0,
+                "bead_id=bd-gzyk1 case=async_cancelled_commit_exit_must_not_leak_active_transactions (observed={after_commit})"
+            );
+
+            // And no permanent wedge: a fresh read boundary converges.
+            let fresh = Cx::new().with_trace_context(99, 0, 0);
+            pager
+                .refresh_published_snapshot(&fresh)
+                .await
+                .expect("bead_id=bd-gzyk1 case=async_post_cancel_refresh_must_converge");
+            assert_eq!(
+                pager.inner.lock().unwrap().active_transactions,
+                0,
+                "bead_id=bd-gzyk1 case=async_fresh_boundary_zero_active_transactions"
             );
         });
     }
