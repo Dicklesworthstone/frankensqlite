@@ -1768,6 +1768,68 @@ impl BTreePageType {
     }
 }
 
+/// Physical storage column order for a `WITHOUT ROWID` table record.
+///
+/// C SQLite lays out a `WITHOUT ROWID` row record as the PRIMARY KEY columns
+/// (in PRIMARY KEY declaration order) followed by the remaining columns in
+/// declared order — the leading `pk_indices.len()` physical fields are the
+/// b-tree key. `pk_indices` gives the declared column positions of the PRIMARY
+/// KEY columns in PK order; `n_cols` is the table's total column count.
+///
+/// Returns a permutation `perm` of length `n_cols` where physical slot `i`
+/// holds the value of declared column `perm[i]`. When the PRIMARY KEY is
+/// exactly the leading declared columns (the common case), `perm` is the
+/// identity — so callers that reorder against this permutation are a no-op for
+/// leading-PK tables.
+///
+/// Any `pk_indices` entry that is out of range (`>= n_cols`) or duplicated is
+/// skipped, so the result is always a valid permutation of `0..n_cols`.
+#[must_use]
+pub fn without_rowid_storage_order(pk_indices: &[usize], n_cols: usize) -> Vec<usize> {
+    let mut in_pk = vec![false; n_cols];
+    let mut perm = Vec::with_capacity(n_cols);
+    for &idx in pk_indices {
+        if idx < n_cols && !in_pk[idx] {
+            in_pk[idx] = true;
+            perm.push(idx);
+        }
+    }
+    for (idx, &is_pk) in in_pk.iter().enumerate() {
+        if !is_pk {
+            perm.push(idx);
+        }
+    }
+    perm
+}
+
+/// Inverse of [`without_rowid_storage_order`]: `inv[d]` is the physical slot
+/// that holds declared column `d`. To read declared column `d` out of a
+/// physical (PK-leading) `WITHOUT ROWID` record, read field `inv[d]`.
+///
+/// Like the forward permutation, this is the identity for a leading-PK table.
+#[must_use]
+pub fn without_rowid_declared_to_physical(pk_indices: &[usize], n_cols: usize) -> Vec<usize> {
+    let perm = without_rowid_storage_order(pk_indices, n_cols);
+    let mut inv = vec![0_usize; n_cols];
+    for (physical, &declared) in perm.iter().enumerate() {
+        inv[declared] = physical;
+    }
+    inv
+}
+
+/// Whether a `WITHOUT ROWID` table's PRIMARY KEY is exactly the leading
+/// declared columns — i.e. the storage permutation is the identity and no
+/// column reordering is needed on the read/write paths. This is the currently
+/// fast, always-supported shape.
+#[must_use]
+pub fn without_rowid_pk_is_leading(pk_indices: &[usize], n_cols: usize) -> bool {
+    pk_indices.len() <= n_cols
+        && pk_indices
+            .iter()
+            .enumerate()
+            .all(|(position, &idx)| position == idx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1777,6 +1839,92 @@ mod tests {
     fn page_number_zero_is_invalid() {
         assert!(PageNumber::new(0).is_none());
         assert!(PageNumber::try_from(0u32).is_err());
+    }
+
+    #[test]
+    fn wr_storage_order_leading_pk_is_identity() {
+        // Leading single PK and leading composite PK both map to identity —
+        // the currently-supported fast path.
+        assert_eq!(without_rowid_storage_order(&[0], 3), vec![0, 1, 2]);
+        assert_eq!(without_rowid_storage_order(&[0, 1], 3), vec![0, 1, 2]);
+        assert_eq!(
+            without_rowid_declared_to_physical(&[0, 1], 3),
+            vec![0, 1, 2]
+        );
+        assert!(without_rowid_pk_is_leading(&[0], 3));
+        assert!(without_rowid_pk_is_leading(&[0, 1], 3));
+    }
+
+    #[test]
+    fn wr_storage_order_non_leading_single_pk() {
+        // CREATE TABLE t(v, k PRIMARY KEY) WITHOUT ROWID -> declared [v,k],
+        // physical record [k,v] (oracle-verified). perm slot0=col1(k), slot1=col0(v).
+        assert_eq!(without_rowid_storage_order(&[1], 2), vec![1, 0]);
+        // Read declared v(0) at physical slot 1, k(1) at physical slot 0.
+        assert_eq!(without_rowid_declared_to_physical(&[1], 2), vec![1, 0]);
+        assert!(!without_rowid_pk_is_leading(&[1], 2));
+    }
+
+    #[test]
+    fn wr_storage_order_reordered_composite_pk() {
+        // CREATE TABLE u(a,b,c, PRIMARY KEY(b,a)) WITHOUT ROWID -> physical
+        // record [b,a,c] (oracle-verified): perm = [1,0,2].
+        assert_eq!(without_rowid_storage_order(&[1, 0], 3), vec![1, 0, 2]);
+        assert_eq!(
+            without_rowid_declared_to_physical(&[1, 0], 3),
+            vec![1, 0, 2]
+        );
+        assert!(!without_rowid_pk_is_leading(&[1, 0], 3));
+    }
+
+    #[test]
+    fn wr_storage_order_single_trailing_pk() {
+        // CREATE TABLE w(a,b,c, PRIMARY KEY(c)) WITHOUT ROWID -> physical
+        // record [c,a,b]: perm = [2,0,1], inverse = [1,2,0].
+        assert_eq!(without_rowid_storage_order(&[2], 3), vec![2, 0, 1]);
+        assert_eq!(without_rowid_declared_to_physical(&[2], 3), vec![1, 2, 0]);
+        assert!(!without_rowid_pk_is_leading(&[2], 3));
+    }
+
+    #[test]
+    fn wr_storage_order_perm_and_inverse_round_trip() {
+        // For any (pk_indices, n_cols), perm and inverse compose to identity,
+        // and perm is a valid permutation of 0..n_cols.
+        for (pk, n) in [
+            (vec![0usize], 1usize),
+            (vec![1], 2),
+            (vec![2], 3),
+            (vec![1, 0], 3),
+            (vec![2, 0], 4),
+            (vec![3, 1], 4),
+            (vec![0, 1, 2], 3),
+        ] {
+            let perm = without_rowid_storage_order(&pk, n);
+            let inv = without_rowid_declared_to_physical(&pk, n);
+            assert_eq!(perm.len(), n);
+            let mut sorted = perm.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (0..n).collect::<Vec<_>>(),
+                "perm must be a permutation"
+            );
+            for declared in 0..n {
+                assert_eq!(perm[inv[declared]], declared, "inverse must undo perm");
+            }
+            // PK columns occupy the leading slots, in PK order.
+            for (slot, &pk_col) in pk.iter().enumerate() {
+                assert_eq!(perm[slot], pk_col, "PK columns must lead in PK order");
+            }
+        }
+    }
+
+    #[test]
+    fn wr_storage_order_ignores_out_of_range_and_duplicate_pk() {
+        // Defensive: out-of-range or duplicated PK indices are skipped so the
+        // result stays a valid permutation.
+        assert_eq!(without_rowid_storage_order(&[5], 3), vec![0, 1, 2]);
+        assert_eq!(without_rowid_storage_order(&[1, 1], 3), vec![1, 0, 2]);
     }
 
     #[test]
