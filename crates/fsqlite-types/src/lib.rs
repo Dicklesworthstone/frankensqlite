@@ -915,7 +915,16 @@ pub struct DatabaseHeader {
     pub schema_cookie: u32,
     /// Schema format number (currently 4).
     pub schema_format: u32,
-    /// Default page cache size (from `PRAGMA default_cache_size`).
+    /// Persistent suggested default page-cache size, from an explicit
+    /// `PRAGMA default_cache_size` (header bytes 48..52, big-endian `i32`).
+    ///
+    /// This is the *persisted* field, not the runtime cache size. Stock SQLite
+    /// leaves it `0` ("unset") unless the application explicitly sets the
+    /// pragma; when it reads `0` the runtime default (`-2000`, i.e. ~2 MiB via
+    /// [`crate::limits::DEFAULT_CACHE_SIZE`]) applies without being written
+    /// back. A freshly created database must therefore carry `0` here, so it is
+    /// byte-faithful to stock and does not look like a client requested a cache
+    /// size it never asked for (GH#354).
     pub default_cache_size: i32,
     /// Largest root page number for auto-vacuum/incremental-vacuum (0 if not auto-vacuum).
     pub largest_root_page: u32,
@@ -947,7 +956,13 @@ impl Default for DatabaseHeader {
             freelist_count: 0,
             schema_cookie: 0,
             schema_format: 4,
-            default_cache_size: -2000,
+            // GH#354: the persistent header field is "unset" (0) on a fresh
+            // database — stock only writes a value here on an explicit
+            // `PRAGMA default_cache_size`. The runtime default (-2000) is
+            // applied at read time when this is 0; it must NOT be stamped into
+            // the file, or every fsqlite-created database looks like the client
+            // requested a cache size it never asked for.
+            default_cache_size: 0,
             largest_root_page: 0,
             text_encoding: TextEncoding::Utf8,
             user_version: 0,
