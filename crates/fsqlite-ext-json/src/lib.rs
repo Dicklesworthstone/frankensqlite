@@ -5955,6 +5955,10 @@ mod tests {
     fn test_jsonb_bytes_match_sqlite3_oracle() {
         let vectors: &[(&str, &str)] = &[
             ("1", "1331"),
+            // bd-pnfrr: the bead's cited oracle — `hex(jsonb(5))` is `1335`
+            // (header 0x13 = INT type 3, direct size 1; payload 0x35 = '5'),
+            // never a raw fixed-width binary payload.
+            ("5", "1335"),
             ("-7", "232D37"),
             ("1.5", "35312E35"),
             ("0.1", "35302E31"),
