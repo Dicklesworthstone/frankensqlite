@@ -47,6 +47,8 @@ const PAYLOAD_MASK: u64 = !(PID_BIRTH_PROCFS_TAG | PID_BIRTH_SYSCTL_TAG | PID_BI
 /// OS start time is unavailable (the caller then falls back to a time token).
 #[must_use]
 pub fn current_process_birth_token() -> Option<u64> {
+    // ubs:ignore - the "birth token" is a process start time used only to
+    // distinguish a recycled PID; it is not a security token / secret / nonce.
     let pid = std::process::id();
     #[cfg(target_os = "macos")]
     {
@@ -110,6 +112,8 @@ mod macos {
             libc::KERN_PROC_PID,
             pid as libc::c_int,
         ];
+        // ubs:ignore - kinfo_proc is a plain-old-data C struct; a zeroed output
+        // buffer is the standard `sysctl` idiom, not an uninitialized-read hazard.
         // SAFETY: `mem::zeroed()` is valid for `kinfo_proc` (a plain C struct of
         // integers/timevals with no invalid bit patterns).
         let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
