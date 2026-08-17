@@ -48,6 +48,51 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-17 - NO-GO: Track S union-style borrowed register file to kill Arc refcounting (bd-i9sov P0 / bd-b3yw2)
+
+- Target workload: eliminate Arc atomic refcounting from the VDBE register hot
+  path via a C-SQLite-Mem-style `RegisterValue<'a>` (i64/f64/borrowed `&'a [u8]`
+  into the pinned page buffer, no Arc). Confirms + strengthens the 2026-04-01
+  bd-b3yw2 deferral with fresh end-to-end numbers.
+- Measured (release-perf: opt-level 3 + lto=true + cgu=1 + panic=abort + strip —
+  NOT the size-opt `release` profile; Threadripper-class fleet box,
+  target-cpu=native, taskset-pinned; benches self-print SHA-256, A/A+A/B interleaved):
+  - One Arc atomic pair (fetch_add+fetch_sub) ~= 8 ns net (~4 ns/op) — the bead's
+    ~5 ns/atomic estimate is right, but it is a small slice of the value
+    lifecycle: fresh wide Text = 55.7 ns (atomics ~14%), fresh Blob = 43.4 ns
+    (atomics ~18%); malloc/free dominates and REMAINS after de-Arc'ing.
+  - E2E per-row Arc-atomic fraction: SELECT wide TEXT/BLOB (1773 ns/row) =
+    ~1.4-1.7%; UPDATE/DELETE full-scan WHERE wide-TEXT (522 ns/row) = ~3.4%.
+    Arc-free int-only control = 1021 ns/row -> the per-row cost is decode +
+    async-per-row machinery + result mechanics, NOT refcounting. To reach the
+    15% goal atomics would need ~266 ns/row; they are ~24 ns. No workload clears
+    the fleet's ~10% measurement floor. Even the FULL alloc/clone/drop lifecycle
+    (more than atomic-removal captures) is only ~7% (wide SELECT) to ~10.5%
+    (UPDATE scan).
+- Feasibility: the borrowed design is INFEASIBLE in safe Rust. `VdbeEngine` owns
+  BOTH `registers` and the `StorageCursor.payload_buf` a `RegisterValue<'a>`
+  would borrow (self-referential; rejected under the pervasive `&mut self`
+  opcode methods); borrowed regs dangle on `cursor.Next` (in-place payload refill
+  -> full re-materialize per step, defeating the purpose); ~285 register call
+  sites; adding `'a` forces `VdbeEngine<'a>` across a 38K-line file. `Rc` fallback
+  ruled out (storage is `Send`-bound for concurrent-writer/async engines).
+  De-Arc-to-owned (`Box`/`Vec`) ADDS a deep copy per cache-clone -> regression.
+- Already captured (why the win is small): FrankenSQLite implements ~90% of
+  C-SQLite's zero-atomic Mem win — inline `SmallText` SSO (<=23B -> 0 atomics),
+  lazy `OnceLock<Arc<[u8]>>` (never-cloned = 0 atomics), move-based ResultRow
+  (`take_reg_range` moves, 0 clones). Residual gap to C SQLite = allocation +
+  async per-row bridge, not refcounting.
+- Files that WOULD change (not touched): `crates/fsqlite-vdbe/src/engine.rs`
+  (register file + ~285 sites), `crates/fsqlite-types/src/lib.rs` (SqliteValue).
+- Evidence artifacts: microbench + e2e bench crates (session scratchpad
+  `{arcbench,e2ebench}`, release-perf, self-SHA-printing, A/A+A/B interleaved).
+- Retry condition: only if a future profile shows atomic refcounting >10% of
+  `execute_body` on a NEW workload shape not yet built, AND a safe-Rust design
+  avoiding the self-borrow is found (an inline `SmallBlob` mirror of `SmallText`
+  is sub-1% and does NOT qualify). Redirect Track S effort to the decode +
+  async-per-row bridge cost (~333 ns/row bridge + ~700 ns/statement per the
+  ledger), where the 1021 ns/row Arc-free floor shows the real headroom lives.
+
 ## 2026-08-12 - REJECTED: multi-SQE io_uring submission for `write_page_batch` (bd-q8501.1)
 
 - Target workload: one file-backed `IoUringFile::write_page_batch` operation
