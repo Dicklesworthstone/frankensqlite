@@ -32712,140 +32712,20 @@ impl Connection {
                     Cow::Owned(owned) => RewrittenStatement::Owned(Box::new(owned)),
                 }
             };
-            // 5B.5 + 5B.2 (bd-1yi8): autocommit wrapping — ensure a pager
-            // transaction is active for data/DDL operations outside an
-            // explicit BEGIN.  Writes use Immediate mode; reads use Deferred.
-            // Transaction-control statements manage their own transactions.
-            let is_write = matches!(
-                statement.as_ref(),
-                Statement::Insert(_)
-                    | Statement::Update(_)
-                    | Statement::Delete(_)
-                    | Statement::CreateTable(_)
-                    | Statement::CreateVirtualTable(_)
-                    | Statement::CreateView(_)
-                    | Statement::CreateTrigger(_)
-                    | Statement::Drop(_)
-                    | Statement::AlterTable(_)
-                    | Statement::CreateIndex(_)
-                    | Statement::Analyze(_)
-                    | Statement::Reindex(_)
-            );
-            // Issue #110: any statement that may delete or alter a parent row
-            // invalidates a cached "parent present" result. Plain INSERTs only add
-            // rows (safe), but UPDATE/DELETE, DDL, and INSERT OR REPLACE / upsert
-            // (which can delete or mutate an existing — possibly parent — row)
-            // must drop the transaction-scoped FK parent-validation cache. The
-            // prepared UPDATE/DELETE fast lanes bypass this dispatcher and clear
-            // the cache at their own entry point.
-            if Self::statement_may_invalidate_fk_parent_cache(statement.as_ref()) {
-                self.clear_fk_parent_validation_cache();
-            }
-            let is_txn_control = matches!(
-                statement.as_ref(),
-                Statement::Begin(_)
-                | Statement::Commit
-                | Statement::Rollback(_)
-                | Statement::Savepoint(_)
-                | Statement::Release(_)
-                // VACUUM INTO needs the pager quiescent, so it cannot run
-                // inside the implicit autocommit read transaction used for
-                // ordinary statement dispatch.
-                | Statement::Vacuum(_)
-                // PRAGMA handlers that need pager access (for example
-                // `PRAGMA wal_checkpoint`) manage their own pager operations.
-                | Statement::Pragma(_)
-            );
-            let capture_time_travel_snapshot = !matches!(
-                statement.as_ref(),
-                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-            );
-            let op_cx = self.op_cx_after_background_status();
-            let should_refresh_active_txn_memdb = !self.skip_statement_memdb_refresh.get()
-                && (self.memdb_requires_active_txn_reload.get()
-                    || !self.pending_memdb_direct_upserts.borrow().is_empty())
-                && !matches!(statement.as_ref(), Statement::Commit)
-                && !matches!(statement.as_ref(), Statement::Rollback(_));
-            let writable_schema_dml = self.statement_is_writable_schema_dml(statement.as_ref());
-            let schema_change_boundary =
-                statement_starts_fresh_schema_change_boundary(statement.as_ref())
-                    || writable_schema_dml;
-            if self.pragma_state.borrow().query_only
-                && (statement_writes_under_query_only(statement.as_ref()) || writable_schema_dml)
-            {
-                return Err(FrankenError::ReadOnly);
-            }
-            // `PRAGMA writable_schema` DML edits page-1 schema rows directly and
-            // may be repairing malformed rows. Do not refresh the normal MemDB
-            // schema image before the raw edit has had a chance to run.
-            if should_refresh_active_txn_memdb && !writable_schema_dml {
-                // bd-33sht: a read-free INSERT ... VALUES streak must not pay a
-                // full O(rows) MemDatabase reload per statement. Flush pending
-                // direct writes (the insert's own uniqueness/rowid checks read
-                // the txn b-tree) but skip the mirror reload — the mirror stays
-                // stale and is rebuilt once at the next actual read boundary.
-                if matches!(statement.as_ref(), Statement::Insert(ins)
-                    if insert_source_is_memdb_read_free(&ins.source))
-                {
-                    self.flush_pending_direct_write_runs(&op_cx).await?;
-                } else {
-                    self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
-                }
-            }
-            if !self.skip_statement_memdb_refresh.get() && !is_txn_control && !is_write {
-                self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
-                    .await?;
-            }
-            if !self.skip_statement_memdb_refresh.get()
-                && schema_change_boundary
-                && self.cached_write_txn.borrow().is_some()
-            {
-                self.invalidate_cached_write_txn(&op_cx).await;
-            }
-            let retained_boundary_flush_required = self.retained_autocommit_txn.borrow().is_some()
-                && (schema_change_boundary
-                    || matches!(
-                        statement.as_ref(),
-                        Statement::Pragma(_)
-                            | Statement::Vacuum(_)
-                            | Statement::Attach(_)
-                            | Statement::Detach(_)
-                    ));
-            if retained_boundary_flush_required {
-                // Schema/pager boundaries must not reuse a parked retained
-                // autocommit batch because they need a fresh durable view.
-                self.flush_retained_autocommit_txn(&op_cx).await?;
-            }
-            // bd-otbu1 / I1: Flush retained autocommit if read touches dirty tables.
-            // This preserves read-after-write semantics for any retained batch.
-            if !is_txn_control
-                && !is_write
-                && self.retained_autocommit_txn.borrow().is_some()
-                && matches!(statement.as_ref(), Statement::Select(select) if {
-                    // Extract table names from the SELECT's FROM clause.
-                    let read_tables = Self::extract_table_names_from_select(select);
-                    self.retained_autocommit_has_dirty_overlap(&read_tables)
-                })
-            {
-                self.flush_retained_autocommit_txn_for_read(&op_cx).await?;
-            }
-            let was_auto = if is_txn_control {
-                false // transaction-control manages its own transactions
-            } else if is_write {
-                self.ensure_autocommit_txn_with_cx(&op_cx).await?
-            } else {
-                self.ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, &op_cx, None)
-                    .await?
-            };
-            if !self.skip_statement_memdb_refresh.get()
-                && !writable_schema_dml
-                && schema_change_boundary
-                && (self.memdb_requires_active_txn_reload.get()
-                    || !self.pending_memdb_direct_upserts.borrow().is_empty()
-                    || !self.memdb_rows_loaded.get())
-            {
-                self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
-            }
+            // bd-7mnz8 Phase 1: the autocommit/memdb preparation (roughly eight
+            // `.await` points) runs in `plan_statement_execution` so its
+            // resume-state stack lives on a frame that returns before the
+            // recursive trigger-dispatch below descends. Same operations, same
+            // order; `PRAGMA query_only` still rejects writes inside the helper.
+            let StatementExecutionPlan {
+                op_cx,
+                is_write,
+                is_txn_control,
+                capture_time_travel_snapshot,
+                writable_schema_dml,
+                schema_change_boundary,
+                was_auto,
+            } = self.plan_statement_execution(statement.as_ref()).await?;
             let previous_total_changes = self.total_changes.get();
             let previous_last_insert_rowid = self.current_last_insert_rowid();
             if !is_txn_control {
