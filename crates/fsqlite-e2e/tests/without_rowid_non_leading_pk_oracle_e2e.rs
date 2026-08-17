@@ -106,7 +106,6 @@ async fn assert_parity(setup: &[&str], queries: &[&str], label: &str) {
 }
 
 #[test]
-#[ignore = "bd-v6pjf: non-leading-PK WITHOUT ROWID storage support not yet landed (atomic structural change)"]
 fn wr_single_non_leading_pk_parity() {
     asupersync::test_utils::run_test(|| async {
         assert_parity(
@@ -128,7 +127,6 @@ fn wr_single_non_leading_pk_parity() {
 }
 
 #[test]
-#[ignore = "bd-0ntuc: reordered composite-PK WITHOUT ROWID storage support not yet landed"]
 fn wr_reordered_composite_pk_parity() {
     asupersync::test_utils::run_test(|| async {
         assert_parity(
@@ -148,7 +146,6 @@ fn wr_reordered_composite_pk_parity() {
 }
 
 #[test]
-#[ignore = "bd-0ntuc: single trailing-PK WITHOUT ROWID storage support not yet landed"]
 fn wr_single_trailing_pk_parity() {
     asupersync::test_utils::run_test(|| async {
         assert_parity(
@@ -168,7 +165,6 @@ fn wr_single_trailing_pk_parity() {
 }
 
 #[test]
-#[ignore = "bd-v6pjf: non-leading-PK WITHOUT ROWID with TEXT PK / collation not yet landed"]
 fn wr_non_leading_text_pk_collation_parity() {
     asupersync::test_utils::run_test(|| async {
         assert_parity(
@@ -184,7 +180,6 @@ fn wr_non_leading_text_pk_collation_parity() {
 }
 
 #[test]
-#[ignore = "bd-v6pjf: UPDATE/DELETE on non-leading-PK WITHOUT ROWID not yet landed"]
 fn wr_non_leading_pk_update_delete_parity() {
     asupersync::test_utils::run_test(|| async {
         assert_parity(
@@ -202,7 +197,6 @@ fn wr_non_leading_pk_update_delete_parity() {
 }
 
 #[test]
-#[ignore = "bd-xe3nb: secondary UNIQUE index on non-leading-PK WITHOUT ROWID not yet landed"]
 fn wr_non_leading_pk_secondary_unique_parity() {
     asupersync::test_utils::run_test(|| async {
         assert_parity(

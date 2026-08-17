@@ -11,14 +11,14 @@
 //! data columns and a composite leading PK, then diff the vacuumed image
 //! against stock sqlite3.
 //!
-//! A non-leading-PK WITHOUT ROWID table can be CREATEd and INSERTed, but its
-//! persist/VACUUM path refuses it with `NotImplemented(... non-leading PRIMARY
-//! KEY ...)` — so m0e3b never serializes a shape it cannot represent. Stock
-//! SQLite *does* support those tables, so full non-leading-PK WR support is a
-//! separate feature gap; this keeper pins the current refusal boundary.
+//! A non-leading / reordered-PK WITHOUT ROWID table is now stored physically
+//! PK-leading (codegen `emit_wr_record` reorders on write; the table cursor and
+//! the row inflater remap on read — bd-v6pjf/bd-0ntuc), so the in-memory
+//! read/write path round-trips it against stock. The second keeper below pins
+//! that support. On-disk VACUUM/file-format parity for non-leading PK is a
+//! separate follow-up slice (compat_persist record reorder).
 
 use fsqlite_core::connection::Connection;
-use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
 #[test]
@@ -84,24 +84,51 @@ fn without_rowid_leading_pk_vacuum_roundtrips_against_stock() {
     });
 }
 
+fn text_of(v: &SqliteValue) -> String {
+    match v {
+        SqliteValue::Text(s) => s.to_string(),
+        other => panic!("expected a TEXT value, got {other:?}"),
+    }
+}
+
 #[test]
-fn without_rowid_non_leading_pk_vacuum_is_refused() {
+fn without_rowid_non_leading_pk_roundtrips_in_memory() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
-        // CREATE of a non-leading-PK WITHOUT ROWID table is allowed today...
+        // bd-v6pjf: a non-leading-PK WITHOUT ROWID table is now stored
+        // physically PK-leading and its reads remap back to declared order, so
+        // the shape round-trips instead of being refused.
         conn.execute("CREATE TABLE t(v TEXT, k TEXT PRIMARY KEY) WITHOUT ROWID;")
             .await
             .unwrap();
-        // ...but the first INSERT refuses the shape it cannot serialize, so no
-        // row image is ever written for a PK layout m0e3b's VACUUM path (and the
-        // storage format generally) cannot represent.
-        let err = conn
-            .execute("INSERT INTO t(k, v) VALUES ('a','1');")
+        conn.execute("INSERT INTO t(k, v) VALUES ('a','1'),('c','3'),('b','2');")
             .await
-            .expect_err("INSERT into a non-leading-PK WITHOUT ROWID table must be refused, not corrupt");
-        assert!(
-            matches!(&err, FrankenError::NotImplemented(msg) if msg.contains("non-leading PRIMARY KEY")),
-            "expected a non-leading-PK WR refusal, got: {err:?}"
+            .expect("non-leading-PK WITHOUT ROWID INSERT must now succeed");
+
+        // Declared projection (v, k) returned in natural PK(k) scan order.
+        let rows = conn.query("SELECT v, k FROM t").await.expect("select");
+        let got: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| {
+                let vals = row.values();
+                (text_of(&vals[0]), text_of(&vals[1]))
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("1".to_owned(), "a".to_owned()),
+                ("2".to_owned(), "b".to_owned()),
+                ("3".to_owned(), "c".to_owned()),
+            ],
+            "non-leading-PK WR must read back declared order in PK scan order"
         );
+
+        // A PK point lookup remaps the projected column too.
+        let one = conn
+            .query("SELECT v FROM t WHERE k = 'b'")
+            .await
+            .expect("point lookup");
+        assert_eq!(text_of(&one[0].values()[0]), "2");
     });
 }

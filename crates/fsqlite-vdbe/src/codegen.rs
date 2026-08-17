@@ -23149,9 +23149,10 @@ fn emit_without_rowid_index_to_table_seek(
 
 /// Resolve the WITHOUT ROWID primary-key column indices, in PRIMARY KEY order.
 ///
-/// Returns the declared table-column index of each PK column. Errors if the
-/// table has no PRIMARY KEY, or if the PK is not the leading declared columns
-/// (a shape the declared-order storage model cannot represent today).
+/// Returns the declared table-column index of each PK column. Errors only if
+/// the table has no PRIMARY KEY. Non-leading / reordered PRIMARY KEYs are
+/// supported: the record is stored physically PK-leading (see `emit_wr_record`)
+/// and the table cursor remaps reads back to declared order.
 pub fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, CodegenError> {
     let pk_group = table.primary_key_constraints.first().ok_or_else(|| {
         CodegenError::Unsupported(format!(
@@ -23175,18 +23176,9 @@ pub fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, Codeg
             })?;
         indices.push(idx);
     }
-    // Declared-order storage compares the leading `pk_count` columns as the
-    // b-tree key, so the PK must be exactly the leading declared columns.
-    let is_leading = indices
-        .iter()
-        .enumerate()
-        .all(|(pos, &col_idx)| pos == col_idx);
-    if !is_leading {
-        return Err(CodegenError::Unsupported(format!(
-            "WITHOUT ROWID table {} with a non-leading PRIMARY KEY is not yet supported",
-            table.name
-        )));
-    }
+    // Storage is physically PK-leading (emit_wr_record reorders on write, the
+    // table cursor remaps on read), so a non-leading / reordered PRIMARY KEY is
+    // fully representable — no ordering restriction here.
     Ok(indices)
 }
 

@@ -157,7 +157,8 @@ use fsqlite_types::value::{
 };
 use fsqlite_types::{
     BTreePageHeader, DatabaseHeader, EProcessConfig, EProcessOracle, PageNumber, PageSize, Region,
-    StrictColumnType, TextEncoding, TypeAffinity,
+    StrictColumnType, TextEncoding, TypeAffinity, without_rowid_declared_to_physical,
+    without_rowid_pk_is_leading, without_rowid_storage_order,
 };
 use fsqlite_vdbe::codegen::{
     CheckConstraint, CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
@@ -7719,6 +7720,7 @@ impl PreparedStatement<'_> {
             runtime_inputs.column_defaults_by_root_page,
             runtime_inputs.index_desc_flags_by_root_page,
             runtime_inputs.index_collations_by_root_page,
+            runtime_inputs.wr_storage_order_by_root_page,
             reject_mem,
             self.conn.memdb_rows_loaded.get(),
             self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -7897,6 +7899,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
+                runtime_inputs.wr_storage_order_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -7948,6 +7951,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
+                runtime_inputs.wr_storage_order_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -8080,6 +8084,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
+                runtime_inputs.wr_storage_order_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -8134,6 +8139,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
+                runtime_inputs.wr_storage_order_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -10196,6 +10202,10 @@ struct TableExecutionMetadataCacheEntry {
     column_default_sql_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
+    /// Declared->physical column permutation for WITHOUT ROWID tables whose
+    /// PRIMARY KEY is non-leading/reordered (keyed by table root page). Absent
+    /// for leading-PK tables (identity permutation). See `without_rowid_*`.
+    wr_storage_order_by_root_page: Arc<HbHashMap<i32, Vec<usize>>>,
     cached_read_runtime_inputs_no_defaults: Option<TableExecutionRuntimeInputs>,
 }
 
@@ -10209,6 +10219,7 @@ struct TableExecutionRuntimeInputs {
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
+    wr_storage_order_by_root_page: Arc<HbHashMap<i32, Vec<usize>>>,
 }
 
 // ── Time-travel MemDatabase snapshots ──────────────────────────────────────
@@ -40919,6 +40930,7 @@ impl Connection {
             column_defaults_by_root_page: empty_column_defaults_arc(),
             index_desc_flags_by_root_page: Arc::clone(&metadata.index_desc_flags_by_root_page),
             index_collations_by_root_page: Arc::clone(&metadata.index_collations_by_root_page),
+            wr_storage_order_by_root_page: Arc::clone(&metadata.wr_storage_order_by_root_page),
         })
     }
 
@@ -52648,6 +52660,7 @@ impl Connection {
             column_defaults_by_root_page,
             index_desc_flags_by_root_page: Arc::clone(&metadata.index_desc_flags_by_root_page),
             index_collations_by_root_page: Arc::clone(&metadata.index_collations_by_root_page),
+            wr_storage_order_by_root_page: Arc::clone(&metadata.wr_storage_order_by_root_page),
         }
     }
 
@@ -52675,6 +52688,7 @@ impl Connection {
         let index_count: usize = schema.iter().map(|table| table.indexes.len()).sum();
         let mut index_desc_flags_by_root_page = HbHashMap::with_capacity(index_count);
         let mut index_collations_by_root_page = HbHashMap::with_capacity(index_count);
+        let mut wr_storage_order_by_root_page: HbHashMap<i32, Vec<usize>> = HbHashMap::new();
 
         for table in schema.iter() {
             let table_name_key = table.name.to_ascii_lowercase();
@@ -52745,6 +52759,28 @@ impl Connection {
                     .collect();
                 index_desc_flags_by_root_page.insert(table.root_page, desc_flags);
                 index_collations_by_root_page.insert(table.root_page, collations);
+                // bd-v6pjf/bd-0ntuc: a non-leading or reordered PRIMARY KEY is
+                // stored physically PK-leading (PK columns in PK order, then the
+                // remaining columns in declared order) to match C SQLite's
+                // on-disk layout. Register the declared->physical permutation so
+                // the table cursor remaps reads back to declared order. Leading-PK
+                // tables are the identity permutation and stay out of the map, so
+                // the read path pays nothing for the common shape.
+                let pk_indices: Vec<usize> = pk_cols
+                    .iter()
+                    .filter_map(|name| {
+                        table
+                            .columns
+                            .iter()
+                            .position(|column| column.name.eq_ignore_ascii_case(name))
+                    })
+                    .collect();
+                if !without_rowid_pk_is_leading(&pk_indices, table.columns.len()) {
+                    wr_storage_order_by_root_page.insert(
+                        table.root_page,
+                        without_rowid_declared_to_physical(&pk_indices, table.columns.len()),
+                    );
+                }
             }
         }
 
@@ -52756,6 +52792,7 @@ impl Connection {
         let column_default_sql_by_root_page = Arc::new(column_default_sql_by_root_page);
         let index_desc_flags_by_root_page = Arc::new(index_desc_flags_by_root_page);
         let index_collations_by_root_page = Arc::new(index_collations_by_root_page);
+        let wr_storage_order_by_root_page = Arc::new(wr_storage_order_by_root_page);
         let cached_read_runtime_inputs_no_defaults = column_default_sql_by_root_page
             .is_empty()
             .then(|| TableExecutionRuntimeInputs {
@@ -52768,6 +52805,7 @@ impl Connection {
                 column_defaults_by_root_page: empty_column_defaults_arc(),
                 index_desc_flags_by_root_page: Arc::clone(&index_desc_flags_by_root_page),
                 index_collations_by_root_page: Arc::clone(&index_collations_by_root_page),
+                wr_storage_order_by_root_page: Arc::clone(&wr_storage_order_by_root_page),
             });
 
         let entry = Arc::new(TableExecutionMetadataCacheEntry {
@@ -52779,6 +52817,7 @@ impl Connection {
             column_default_sql_by_root_page,
             index_desc_flags_by_root_page,
             index_collations_by_root_page,
+            wr_storage_order_by_root_page,
             cached_read_runtime_inputs_no_defaults,
         });
         *self.table_execution_metadata_cache.borrow_mut() = Some(Arc::clone(&entry));
@@ -62681,6 +62720,32 @@ impl Connection {
         rowid_alias_col_idx: Option<usize>,
         mut default_value_at: impl FnMut(usize) -> Result<Option<SqliteValue>>,
     ) -> Result<Vec<SqliteValue>> {
+        // bd-v6pjf/bd-0ntuc: a WITHOUT ROWID table with a non-leading or
+        // reordered PRIMARY KEY stores its record physically PK-leading (the PK
+        // columns in PK order, then the remaining columns in declared order).
+        // Reorder a full-width physical payload back to declared column order
+        // before it is consumed positionally below. Identity (skipped) for rowid
+        // tables and leading-PK WITHOUT ROWID tables. A short payload (an ALTER
+        // TABLE ADD COLUMN back-fill) is left untouched; that non-leading-PK
+        // reopen edge is tracked as a follow-up (bd-xe3nb).
+        let reordered_payload: Vec<SqliteValue>;
+        let payload_values: &[SqliteValue] = if table.without_rowid
+            && payload_values.len() == table.columns.len()
+            && let Ok(pk_indices) = without_rowid_pk_indices(table)
+            && !without_rowid_pk_is_leading(&pk_indices, table.columns.len())
+        {
+            let storage_order = without_rowid_storage_order(&pk_indices, table.columns.len());
+            let mut declared = vec![SqliteValue::Null; table.columns.len()];
+            for (physical_slot, value) in payload_values.iter().enumerate() {
+                if let Some(&declared_idx) = storage_order.get(physical_slot) {
+                    declared[declared_idx] = value.clone();
+                }
+            }
+            reordered_payload = declared;
+            &reordered_payload
+        } else {
+            payload_values
+        };
         if payload_values.len() > table.columns.len() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -81392,6 +81457,7 @@ impl Connection {
             runtime_inputs.column_defaults_by_root_page,
             runtime_inputs.index_desc_flags_by_root_page,
             runtime_inputs.index_collations_by_root_page,
+            runtime_inputs.wr_storage_order_by_root_page,
             reject_mem,
             self.memdb_rows_loaded.get(),
             self.memdb_storage_count_shortcuts_safe.get(),
@@ -113108,6 +113174,7 @@ async fn execute_table_program_with_db(
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
+    wr_storage_order_by_root_page: Arc<HbHashMap<i32, Vec<usize>>>,
     reject_mem_fallback: bool,
     memdb_rows_loaded: bool,
     storage_cursor_memdb_count_shortcuts_safe: bool,
@@ -113195,6 +113262,13 @@ async fn execute_table_program_with_db(
         collect_result_rows: collect_rows,
         max_collected_result_rows,
     });
+
+    // bd-v6pjf: hand the engine the declared->physical permutation so the
+    // table cursor remaps reads of non-leading-PK WITHOUT ROWID rows. Empty
+    // for leading-PK schemas (the map only holds reordered tables), and the
+    // engine's cursor remap is gated on a non-empty map, so this is a no-op
+    // for the common shape.
+    engine.set_shared_wr_storage_order_by_root_page(wr_storage_order_by_root_page);
 
     // Phase 5 (bd-2a3y): if a transaction handle is available, lend it to
     // the engine so storage cursors route through the real pager/WAL stack.
@@ -113364,6 +113438,7 @@ async fn execute_table_program_exactly_one_row_with_db(
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
+    wr_storage_order_by_root_page: Arc<HbHashMap<i32, Vec<usize>>>,
     reject_mem_fallback: bool,
     memdb_rows_loaded: bool,
     storage_cursor_memdb_count_shortcuts_safe: bool,
@@ -113438,6 +113513,10 @@ async fn execute_table_program_exactly_one_row_with_db(
         collect_result_rows: true,
         max_collected_result_rows: Some(max_collected_result_rows),
     });
+
+    // bd-v6pjf: see execute_table_program_with_db — remap non-leading-PK
+    // WITHOUT ROWID reads; no-op for leading-PK schemas.
+    engine.set_shared_wr_storage_order_by_root_page(wr_storage_order_by_root_page);
 
     if let Some(txn) = txn {
         if let Some(ctx) = concurrent_ctx {
