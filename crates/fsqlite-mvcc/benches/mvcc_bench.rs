@@ -18,7 +18,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 
 use fsqlite_mvcc::{
     ActiveTxnView, BeginKind, ChainHeadTable, CommitIndex, CommittedWriterInfo, ConcurrentRegistry,
-    DiscoveredEdge, GcTodo, InProcessPageLockTable, TransactionManager, VersionArena,
+    DiscoveredEdge, GcTodo, InProcessPageLockTable, TransactionManager, VersionArena, VersionStore,
     discover_incoming_edges, discover_outgoing_edges, gc_tick, prune_page_chain,
     validate_first_committer_wins, witness_keys_overlap,
 };
@@ -269,6 +269,86 @@ fn bench_arena_free_list(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent version-publish benchmark (bd-8euyp)
+// ---------------------------------------------------------------------------
+//
+// Exposes the single-writer serialization of `VersionArena` allocation on the
+// MVCC version-publish path. `VersionStore::publish()` guards the arena with a
+// global `RwLock<VersionArena>` write lock across `alloc()` + prev-link +
+// chain-head CAS. Under BEGIN CONCURRENT, N writers publishing page versions
+// all serialize on that one exclusive lock.
+//
+// Each thread publishes `ops_per_thread` versions to a DISJOINT page range, so
+// the per-page chain-head CAS never contends: the ONLY shared contended
+// resource is `self.arena.write()`. Scaling from 1 → 8 threads therefore
+// isolates the arena-allocation serialization (ideal scaling would keep
+// per-op latency flat; the global write lock instead flattens throughput).
+
+/// Number of publishes each writer thread performs.
+const PUBLISH_OPS_PER_THREAD: u32 = 2000;
+/// Per-thread private page-number stride (keeps every page in the lock-free
+/// fast-array range 1..=65536 with 8 threads x 2000 ops).
+const PUBLISH_PAGE_STRIDE: u32 = 8192;
+
+/// Publish `ops` versions to the disjoint page range owned by thread `t`.
+fn publish_disjoint_range(store: &VersionStore, t: u32, ops: u32) {
+    let base = t * PUBLISH_PAGE_STRIDE + 1;
+    for i in 0..ops {
+        let pgno = base + i;
+        // Distinct page per publish => distinct chain-head slot => the only
+        // shared contended resource is the arena write lock.
+        let version = make_page_version(pgno, u64::from(i) + 1);
+        black_box(store.publish(black_box(version)));
+    }
+}
+
+/// Benchmark: N concurrent writers publishing versions (arena-alloc contention).
+fn bench_concurrent_version_publish(c: &mut Criterion) {
+    let mut group = c.benchmark_group("version_publish/concurrent_writers");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(12));
+
+    for &n_threads in &[1_u32, 2, 4, 8] {
+        group.throughput(Throughput::Elements(
+            u64::from(n_threads) * u64::from(PUBLISH_OPS_PER_THREAD),
+        ));
+        group.bench_with_input(
+            BenchmarkId::new("threads", n_threads),
+            &n_threads,
+            |b, &threads| {
+                b.iter_batched(
+                    || Arc::new(VersionStore::new(PageSize::DEFAULT)),
+                    |store| {
+                        if threads == 1 {
+                            // Single-thread baseline: no thread-spawn overhead.
+                            publish_disjoint_range(&store, 0, PUBLISH_OPS_PER_THREAD);
+                            return;
+                        }
+                        let barrier = Arc::new(Barrier::new(threads as usize));
+                        let handles: Vec<_> = (0..threads)
+                            .map(|t| {
+                                let store = Arc::clone(&store);
+                                let bar = Arc::clone(&barrier);
+                                std::thread::spawn(move || {
+                                    bar.wait();
+                                    publish_disjoint_range(&store, t, PUBLISH_OPS_PER_THREAD);
+                                })
+                            })
+                            .collect();
+                        for h in handles {
+                            h.join().unwrap();
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
 
     group.finish();
 }
@@ -1025,6 +1105,13 @@ criterion_group!(
 );
 
 criterion_group!(
+    name = version_publish;
+    config = criterion_config();
+    targets =
+        bench_concurrent_version_publish
+);
+
+criterion_group!(
     name = commit_index;
     config = criterion_config();
     targets =
@@ -1080,6 +1167,7 @@ criterion_group!(
 criterion_main!(
     lock_table,
     version_arena,
+    version_publish,
     commit_index,
     fcw_validation,
     gc,
