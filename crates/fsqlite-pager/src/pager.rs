@@ -28840,6 +28840,95 @@ mod tests {
         });
     }
 
+    // GH#348 / bd-gzyk1 wedge-reproduction probe.
+    //
+    // The reporter's permanent per-connection BusySnapshot roots in a stuck
+    // `PagerInner.active_transactions > 0`, which pins
+    // `refresh_published_snapshot` on its stale-skip early return (every
+    // autocommit read then binds a stale visibility and fails BusySnapshot
+    // forever). The inferred mechanism is a cancelled autocommit statement whose
+    // transaction-exit external unlock aborts before the `active_transactions`
+    // decrement.
+    //
+    // This test drives that exact mechanism at the pager level: a read
+    // transaction is begun (active_transactions -> 1), the owning cx is
+    // cancelled, and the handle is dropped — running the mandatory external
+    // unlock under a cancelled lineage through the checkpoint-enforced-unlock
+    // harness (whose `unlock`/`restore` abort on a cancelled, mask-honoring cx).
+    // It then asserts the reporter's ROOT invariant directly (the counter must
+    // return to 0) and proves there is no *permanent* wedge by running a fresh
+    // read boundary afterward: `refresh_published_snapshot` must succeed and a
+    // fresh begin must be admitted. If the exit leaks the counter, the fresh
+    // `refresh_published_snapshot` returns the stale-skip snapshot and the
+    // counter assertion fails — i.e. this test goes RED whenever the leak the
+    // wedge depends on is present.
+    #[test]
+    fn test_gh348_cancelled_readonly_exit_does_not_leak_active_transactions_or_wedge() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, observed_lock_level, _observed_unlock_trace_ids) =
+                observed_lock_pager_with_checkpoint_enforced_unlock().await;
+            let cx = Cx::new().with_trace_context(41, 0, 0);
+
+            // Sanity: a clean read boundary before the cancelled exit.
+            {
+                let before = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                drop(before);
+            }
+            assert_eq!(
+                pager.inner.lock().unwrap().active_transactions,
+                0,
+                "bead_id=bd-gzyk1 case=baseline_read_boundary_leaves_zero_active_transactions"
+            );
+
+            // The wedge trigger: begin a read (active_transactions -> 1), cancel
+            // the owning cx, then drop the handle so the mandatory external
+            // unlock runs under the cancelled lineage.
+            {
+                let _txn = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                assert_eq!(
+                    pager.inner.lock().unwrap().active_transactions,
+                    1,
+                    "bead_id=bd-gzyk1 case=begin_increments_active_transactions"
+                );
+                cx.cancel();
+            }
+
+            // ROOT invariant: the transaction-exit decrement must have run even
+            // though the owning cx was cancelled. A stuck value here is the
+            // wedge's entire cause.
+            assert_eq!(
+                pager.inner.lock().unwrap().active_transactions,
+                0,
+                "bead_id=bd-gzyk1 case=cancelled_exit_must_not_leak_active_transactions"
+            );
+            assert_eq!(
+                *observed_lock_level.lock().unwrap(),
+                LockLevel::None,
+                "bead_id=bd-gzyk1 case=cancelled_exit_releases_external_lock"
+            );
+
+            // Prove there is no PERMANENT wedge: a fresh (uncancelled) read
+            // boundary must converge. If active_transactions were still > 0,
+            // `refresh_published_snapshot` would take its stale-skip early return
+            // and a real connection's prebound-reload compare would fail
+            // BusySnapshot forever.
+            let fresh = Cx::new().with_trace_context(99, 0, 0);
+            pager
+                .refresh_published_snapshot(&fresh)
+                .await
+                .expect("bead_id=bd-gzyk1 case=post_cancel_refresh_must_converge");
+            {
+                let after = pager.begin(&fresh, TransactionMode::ReadOnly).await.unwrap();
+                drop(after);
+            }
+            assert_eq!(
+                pager.inner.lock().unwrap().active_transactions,
+                0,
+                "bead_id=bd-gzyk1 case=fresh_read_boundary_leaves_zero_active_transactions"
+            );
+        });
+    }
+
     #[test]
     fn test_reader_exit_preserves_shared_lock_for_other_reader() {
         asupersync::test_utils::run_test(|| async {
