@@ -62416,9 +62416,26 @@ impl Connection {
             // legitimately in-txn-allocated btree pages as "past the end of the
             // database" (GH#113).
             let published_db_size = self.pager.refresh_published_snapshot(cx).await?.db_size;
+            // bd-2whq5: bound the orphan scan by the header's declared page-count
+            // (the *logical* database size), exactly as stock SQLite does — its
+            // integrity_check trusts the in-header size (offset 28) and ignores
+            // physical trailing slack whenever the header is not stale. The
+            // pager's committed db_size is `max(header.page_count, file_pages)`
+            // for crash-recovery visibility (pager.rs ~8672); feeding that
+            // inflated size into the scan falsely flags stock-legal trailing
+            // slack (pages past page_count) as "page N is never used". Trust the
+            // header size only when it is not stale (`version_valid_for ==
+            // change_counter`); otherwise fall back to the file-derived size,
+            // matching stock's own fallback. A db stock accepts has no b-tree
+            // page past page_count, so this never turns into "lies past the end".
+            let logical_db_size = if !header.is_page_count_stale() && header.page_count > 0 {
+                header.page_count.min(published_db_size)
+            } else {
+                published_db_size
+            };
             let total_pages = active_state
                 .as_ref()
-                .map_or(published_db_size, |(_, sz)| (*sz).max(published_db_size));
+                .map_or(logical_db_size, |(_, sz)| (*sz).max(logical_db_size));
             let master_rows = Self::read_sqlite_master_rows_in_txn(
                 cx,
                 txn,
@@ -62481,7 +62498,17 @@ impl Connection {
                     // Auto-vacuum: pointer-map pages are unmarked by this walk.
                     return Ok(Vec::new());
                 }
-                let total_pages = self.pager.refresh_published_snapshot(cx).await?.db_size;
+                // bd-2whq5: bound by the header's declared page-count when it is
+                // not stale, mirroring the integrity_check orphan scan. Without
+                // this, the open-time migration pass re-frees stock-legal
+                // trailing slack (pages past page_count) into the freelist,
+                // silently mutating databases stock considers healthy.
+                let published_db_size = self.pager.refresh_published_snapshot(cx).await?.db_size;
+                let total_pages = if !header.is_page_count_stale() && header.page_count > 0 {
+                    header.page_count.min(published_db_size)
+                } else {
+                    published_db_size
+                };
                 if total_pages == 0 {
                     return Ok(Vec::new());
                 }
