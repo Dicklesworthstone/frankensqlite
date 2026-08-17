@@ -6,6 +6,11 @@ name: Concurrent Tests — Platform Matrix
 
 on:
   workflow_dispatch:
+  # bd-xekq8: PR-only never fires on this PR-less repo, and a full 4-platform matrix
+  # (Linux x86_64/ARM64, macOS arm64, Windows) is too heavy to run on every main
+  # push — so run it as a nightly batch. PR retained for branch/fork validation.
+  schedule:
+    - cron: "41 4 * * *"
   pull_request:
     branches: [main]
     paths:
@@ -20,6 +25,10 @@ on:
       - "crates/fsqlite/**"
       - "crates/fsqlite-harness/**"
       - "scripts/ci_integrity_check.sh"
+
+concurrency:
+  group: concurrent-platform-matrix-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   RUST_BACKTRACE: "1"

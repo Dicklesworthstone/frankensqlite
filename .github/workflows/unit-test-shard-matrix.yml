@@ -2,6 +2,18 @@ name: Unit Test Shard Matrix
 
 on:
   workflow_dispatch:
+  # bd-xekq8: this repo pushes directly to main (no PRs), so a pull_request-only
+  # trigger never fires — the core unit + fsqlite-e2e shard gate silently never ran.
+  # Run it on main pushes, bounded by the concurrency group below (rapid successive
+  # pushes cancel the superseded run). PR retained for branch/fork validation.
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/unit-test-shard-matrix.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
   pull_request:
     branches:
       - main
@@ -10,6 +22,10 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+
+concurrency:
+  group: unit-test-shard-matrix-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   unit-shards:
