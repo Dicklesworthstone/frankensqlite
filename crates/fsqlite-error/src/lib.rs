@@ -64,6 +64,18 @@ pub enum FrankenError {
     #[error("file is not a database: '{path}'")]
     NotADatabase { path: PathBuf },
 
+    /// The on-disk `.fsqlite` format version is newer than this build supports.
+    ///
+    /// Refusing to open prevents a downgraded binary from silently corrupting a
+    /// database written by a newer release — the rollback-safety handshake
+    /// (bd-yaomh.6). `supported` is this build's
+    /// `CURRENT_FSQLITE_FORMAT_VERSION`; `on_disk` is the version stored in the
+    /// file. Maps to [`SQLITE_OPEN_NEWER_FORMAT`].
+    #[error(
+        "this database was written by a newer fsqlite ({supported} vs {on_disk}); refusing to open to prevent corruption. Either upgrade fsqlite or restore from a pre-upgrade backup"
+    )]
+    NewerFormat { on_disk: u32, supported: u32 },
+
     /// Database is full (max page count reached).
     #[error("database is full")]
     DatabaseFull,
@@ -428,6 +440,18 @@ pub enum ErrorCode {
     Done = 101,
 }
 
+/// Extended result code for a refused open due to a newer on-disk `.fsqlite`
+/// format version (rollback-safety handshake, bd-yaomh.6).
+///
+/// FrankenSQLite-private extended code built on the `SQLITE_CANTOPEN` (14) base,
+/// following SQLite's `extended = (ext_num << 8) | base` convention:
+/// `14 | (0x7F << 8) = 32526`. The high private `ext_num` (`0x7F`) sits far
+/// above stock SQLite's `SQLITE_CANTOPEN_*` extended codes (max 6), so it can
+/// never collide with them. Returned by
+/// [`FrankenError::extended_error_code`] for [`FrankenError::NewerFormat`],
+/// whose primary code is [`ErrorCode::CantOpen`].
+pub const SQLITE_OPEN_NEWER_FORMAT: i32 = 14 | (0x7F << 8);
+
 impl FrankenError {
     /// Map this error to a SQLite error code for compatibility.
     #[allow(clippy::match_same_arms)]
@@ -439,6 +463,10 @@ impl FrankenError {
             }
             Self::DatabaseCorrupt { .. } | Self::WalCorrupt { .. } => ErrorCode::Corrupt,
             Self::NotADatabase { .. } => ErrorCode::NotADb,
+            // Refusing to open a newer on-disk format is an open failure
+            // (SQLITE_CANTOPEN base); see `SQLITE_OPEN_NEWER_FORMAT` for the
+            // FrankenSQLite-private extended code (bd-yaomh.6).
+            Self::NewerFormat { .. } => ErrorCode::CantOpen,
             Self::DatabaseFull => ErrorCode::Full,
             Self::SchemaChanged => ErrorCode::Schema,
             Self::Io(_)
@@ -629,6 +657,7 @@ impl FrankenError {
             Self::BusyRecovery => 5 | (1 << 8),        // SQLITE_BUSY_RECOVERY = 261
             Self::BusySnapshot { .. } => 5 | (2 << 8), // SQLITE_BUSY_SNAPSHOT = 517
             Self::DatatypeViolation { .. } => 3091,    // SQLITE_CONSTRAINT_DATATYPE
+            Self::NewerFormat { .. } => SQLITE_OPEN_NEWER_FORMAT, // 14 | (0x7F << 8) = 32526
             _ => self.error_code() as i32,
         }
     }

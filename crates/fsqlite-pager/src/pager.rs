@@ -12349,6 +12349,14 @@ fn bootstrap_header_from_stale_main_file(
             header_bytes[70],
             header_bytes[71],
         ]),
+        // FrankenSQLite on-disk format version (bd-yaomh.6), big-endian at
+        // bytes 72..76 of SQLite's reserved-for-expansion region.
+        format_version: u32::from_be_bytes([
+            header_bytes[72],
+            header_bytes[73],
+            header_bytes[74],
+            header_bytes[75],
+        ]),
         version_valid_for: u32::from_be_bytes([
             header_bytes[92],
             header_bytes[93],

@@ -936,6 +936,17 @@ pub struct DatabaseHeader {
     pub incremental_vacuum: u32,
     /// Application ID (from `PRAGMA application_id`).
     pub application_id: u32,
+    /// FrankenSQLite on-disk format version, stored big-endian at header bytes
+    /// 72..76 inside SQLite's "reserved for expansion" region (bytes 72..=91).
+    ///
+    /// Stock SQLite ignores that region, so stamping a non-zero value keeps the
+    /// file readable by stock C SQLite — the rollback-safety handshake
+    /// (bd-yaomh.6). A value of `0` means "never stamped" and is treated as the
+    /// legacy/v1 format that every build can open. A build refuses to open a
+    /// database whose `format_version` exceeds [`CURRENT_FSQLITE_FORMAT_VERSION`]
+    /// so a downgraded binary cannot silently corrupt a database written by a
+    /// newer release.
+    pub format_version: u32,
     /// Version-valid-for number (the change counter value when the version
     /// number was stored).
     pub version_valid_for: u32,
@@ -968,6 +979,11 @@ impl Default for DatabaseHeader {
             user_version: 0,
             incremental_vacuum: 0,
             application_id: 0,
+            // A fresh database is byte-faithful to stock C SQLite: the reserved
+            // region (bytes 72..=91) stays zero, so `format_version` is 0 =
+            // legacy/v1. It is only stamped non-zero when a build deliberately
+            // writes a newer on-disk artifact (bd-yaomh.6).
+            format_version: 0,
             version_valid_for: 0,
             sqlite_version: 0,
         }
@@ -986,6 +1002,21 @@ pub const DATABASE_HEADER_SIZE: usize = 100;
 /// value, the database must be refused. If only the write version exceeds this value, the
 /// database may be opened read-only.
 pub const MAX_FILE_FORMAT_VERSION: u8 = 2;
+
+/// Current FrankenSQLite on-disk format version understood by this build.
+///
+/// Stored big-endian at header bytes 72..76 as
+/// [`DatabaseHeader::format_version`], inside SQLite's reserved-for-expansion
+/// region (bytes 72..=91), which stock C SQLite ignores. A build refuses to
+/// open a database whose stored `format_version` is greater than this value, so
+/// a downgraded binary cannot silently corrupt a database written by a newer
+/// release — the rollback-safety handshake (bd-yaomh.6). Legacy databases store
+/// `0`, which is always openable and treated as v1.
+///
+/// This starts at `1`. Bump it only in lockstep with a real on-disk format
+/// change (for example the first release that writes a `.fsqlite-history`
+/// sidecar), and only in a build that can also read the new format back.
+pub const CURRENT_FSQLITE_FORMAT_VERSION: u32 = 1;
 
 /// SQLite version number written into the database header for FrankenSQLite-created databases.
 ///
@@ -1028,6 +1059,11 @@ pub enum DatabaseHeaderError {
     },
     /// Read file format version is too new to be understood.
     UnsupportedReadVersion { read_version: u8, max_supported: u8 },
+    /// The on-disk FrankenSQLite format version (header bytes 72..76) is newer
+    /// than this build understands; opening would risk silent corruption. The
+    /// rollback-safety handshake (bd-yaomh.6). `on_disk` is the version stored
+    /// in the file; `supported` is [`CURRENT_FSQLITE_FORMAT_VERSION`].
+    NewerFormat { on_disk: u32, supported: u32 },
     /// Text encoding field was not 1/2/3.
     InvalidTextEncoding { raw: u32 },
     /// Schema format number is unsupported.
@@ -1050,6 +1086,10 @@ impl fmt::Display for DatabaseHeaderError {
             } => write!(
                 f,
                 "usable page size too small: page_size={page_size} reserved={reserved_per_page} usable={usable_size}"
+            ),
+            Self::NewerFormat { on_disk, supported } => write!(
+                f,
+                "this database was written by a newer fsqlite ({supported} vs {on_disk}); refusing to open to prevent corruption. Either upgrade fsqlite or restore from a pre-upgrade backup"
             ),
             Self::UnsupportedReadVersion {
                 read_version,
@@ -1145,6 +1185,21 @@ impl DatabaseHeader {
         let user_version = encoding::read_u32_be(&buf[60..64]).expect("fixed u32 field");
         let incremental_vacuum = encoding::read_u32_be(&buf[64..68]).expect("fixed u32 field");
         let application_id = encoding::read_u32_be(&buf[68..72]).expect("fixed u32 field");
+
+        // Rollback-safety handshake (bd-yaomh.6): the FrankenSQLite on-disk
+        // format version lives big-endian at bytes 72..76 of SQLite's
+        // reserved-for-expansion region. Refuse to open a database whose format
+        // is newer than this build understands so a downgraded binary cannot
+        // silently corrupt it. `0` is the legacy format and always opens. This
+        // mirrors the `read_version > MAX_FILE_FORMAT_VERSION` refusal above.
+        let format_version = encoding::read_u32_be(&buf[72..76]).expect("fixed u32 field");
+        if format_version > CURRENT_FSQLITE_FORMAT_VERSION {
+            return Err(DatabaseHeaderError::NewerFormat {
+                on_disk: format_version,
+                supported: CURRENT_FSQLITE_FORMAT_VERSION,
+            });
+        }
+
         let version_valid_for = encoding::read_u32_be(&buf[92..96]).expect("fixed u32 field");
         let sqlite_version = encoding::read_u32_be(&buf[96..100]).expect("fixed u32 field");
 
@@ -1165,6 +1220,7 @@ impl DatabaseHeader {
             user_version,
             incremental_vacuum,
             application_id,
+            format_version,
             version_valid_for,
             sqlite_version,
         })
@@ -1279,7 +1335,12 @@ impl DatabaseHeader {
         encoding::write_u32_be(&mut out[64..68], self.incremental_vacuum).expect("fixed u32 field");
         encoding::write_u32_be(&mut out[68..72], self.application_id).expect("fixed u32 field");
 
-        // Bytes 72..92 are reserved for future expansion. We always write zeros.
+        // Bytes 72..92 are SQLite's reserved-for-expansion region (stock C
+        // SQLite ignores them). FrankenSQLite stamps its on-disk format version
+        // big-endian at bytes 72..76 (rollback-safety handshake, bd-yaomh.6);
+        // `out` was zero-filled above, so bytes 76..92 stay zero as stock
+        // expects.
+        encoding::write_u32_be(&mut out[72..76], self.format_version).expect("fixed u32 field");
         encoding::write_u32_be(&mut out[92..96], self.version_valid_for).expect("fixed u32 field");
         encoding::write_u32_be(&mut out[96..100], self.sqlite_version).expect("fixed u32 field");
 
@@ -1291,6 +1352,23 @@ impl DatabaseHeader {
         let mut out = [0u8; DATABASE_HEADER_SIZE];
         self.write_to_bytes(&mut out)?;
         Ok(out)
+    }
+
+    /// Stamp a specific FrankenSQLite on-disk format version into the header.
+    ///
+    /// This is the write-side of the rollback-safety handshake (bd-yaomh.6): a
+    /// build that first creates a newer on-disk artifact (for example the first
+    /// `.fsqlite-history` sidecar) stamps the matching version here, so a later
+    /// downgraded binary refuses to open the database instead of silently
+    /// corrupting it. Until such an artifact exists, headers keep
+    /// `format_version == 0` (legacy) and stay byte-faithful to stock C SQLite.
+    ///
+    /// Callers must only stamp a version this build can itself read back — i.e.
+    /// `version <= CURRENT_FSQLITE_FORMAT_VERSION` — otherwise this very build
+    /// would refuse to reopen the database it just wrote. The PRAGMA surface
+    /// that gates the bump (`fsqlite_enable_format_v2`) is wired separately.
+    pub const fn set_format_version(&mut self, version: u32) {
+        self.format_version = version;
     }
 }
 
@@ -1803,10 +1881,11 @@ pub fn without_rowid_storage_order(pk_indices: &[usize], n_cols: usize) -> Vec<u
 }
 
 /// Inverse of [`without_rowid_storage_order`]: `inv[d]` is the physical slot
-/// that holds declared column `d`. To read declared column `d` out of a
-/// physical (PK-leading) `WITHOUT ROWID` record, read field `inv[d]`.
+/// that holds declared column `d`.
 ///
-/// Like the forward permutation, this is the identity for a leading-PK table.
+/// To read declared column `d` out of a physical (PK-leading) `WITHOUT ROWID`
+/// record, read field `inv[d]`. Like the forward permutation, this is the
+/// identity for a leading-PK table.
 #[must_use]
 pub fn without_rowid_declared_to_physical(pk_indices: &[usize], n_cols: usize) -> Vec<usize> {
     let perm = without_rowid_storage_order(pk_indices, n_cols);
@@ -1818,9 +1897,10 @@ pub fn without_rowid_declared_to_physical(pk_indices: &[usize], n_cols: usize) -
 }
 
 /// Whether a `WITHOUT ROWID` table's PRIMARY KEY is exactly the leading
-/// declared columns — i.e. the storage permutation is the identity and no
-/// column reordering is needed on the read/write paths. This is the currently
-/// fast, always-supported shape.
+/// declared columns.
+///
+/// I.e. the storage permutation is the identity and no column reordering is
+/// needed on the read/write paths — the currently fast, always-supported shape.
 #[must_use]
 pub fn without_rowid_pk_is_leading(pk_indices: &[usize], n_cols: usize) -> bool {
     pk_indices.len() <= n_cols
@@ -2156,6 +2236,7 @@ mod tests {
             user_version: 0,
             incremental_vacuum: 0,
             application_id: 0,
+            format_version: 0,
             version_valid_for: 7,
             sqlite_version: FRANKENSQLITE_SQLITE_VERSION_NUMBER,
         }
@@ -2508,6 +2589,70 @@ mod tests {
         let buf2 = hdr2.to_bytes().unwrap();
         for (i, &byte) in buf2.iter().enumerate().take(92).skip(72) {
             assert_eq!(byte, 0, "byte {i} should be zero even with custom app_id");
+        }
+    }
+
+    #[test]
+    fn test_format_version_default_is_legacy_zero() {
+        // bd-yaomh.6: a default header is byte-faithful to stock — the reserved
+        // region (incl. the format-version slot at 72..76) stays zero.
+        let hdr = make_header_for_tests();
+        assert_eq!(hdr.format_version, 0);
+        let buf = hdr.to_bytes().unwrap();
+        assert_eq!(&buf[72..76], &[0, 0, 0, 0]);
+        assert_eq!(DatabaseHeader::from_bytes(&buf).unwrap().format_version, 0);
+    }
+
+    #[test]
+    fn test_format_version_roundtrip_stamped() {
+        // bd-yaomh.6: stamping CURRENT round-trips and lands big-endian at 72.
+        let mut hdr = make_header_for_tests();
+        hdr.set_format_version(CURRENT_FSQLITE_FORMAT_VERSION);
+        let buf = hdr.to_bytes().unwrap();
+        assert_eq!(
+            u32::from_be_bytes([buf[72], buf[73], buf[74], buf[75]]),
+            CURRENT_FSQLITE_FORMAT_VERSION
+        );
+        // The rest of the reserved region stays zero.
+        for (i, &byte) in buf.iter().enumerate().take(92).skip(76) {
+            assert_eq!(byte, 0, "byte {i} beyond format_version must stay zero");
+        }
+        let parsed = DatabaseHeader::from_bytes(&buf).unwrap();
+        assert_eq!(parsed, hdr);
+        assert_eq!(parsed.format_version, CURRENT_FSQLITE_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn test_format_version_newer_is_refused() {
+        // bd-yaomh.6: a build refuses a database whose format is newer than it
+        // understands, mirroring the read_version refusal.
+        let mut hdr = make_header_for_tests();
+        hdr.set_format_version(CURRENT_FSQLITE_FORMAT_VERSION + 1);
+        let buf = hdr.to_bytes().unwrap();
+        let err = DatabaseHeader::from_bytes(&buf).unwrap_err();
+        assert_eq!(
+            err,
+            DatabaseHeaderError::NewerFormat {
+                on_disk: CURRENT_FSQLITE_FORMAT_VERSION + 1,
+                supported: CURRENT_FSQLITE_FORMAT_VERSION,
+            }
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("newer fsqlite"), "message was: {msg}");
+        assert!(msg.contains("refusing to open"), "message was: {msg}");
+    }
+
+    #[test]
+    fn test_format_version_equal_and_older_open() {
+        // Equal to CURRENT and any older/legacy value must open cleanly.
+        for version in [0, CURRENT_FSQLITE_FORMAT_VERSION] {
+            let mut hdr = make_header_for_tests();
+            hdr.set_format_version(version);
+            let buf = hdr.to_bytes().unwrap();
+            assert_eq!(
+                DatabaseHeader::from_bytes(&buf).unwrap().format_version,
+                version
+            );
         }
     }
 
