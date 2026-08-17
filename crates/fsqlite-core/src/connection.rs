@@ -4625,6 +4625,9 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     if name_is("wal_autocheckpoint") {
         return &["wal_autocheckpoint"];
     }
+    if name_is("journal_size_limit") {
+        return &["journal_size_limit"];
+    }
     if name_is("locking_mode") {
         return &["locking_mode"];
     }
