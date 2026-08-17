@@ -427,6 +427,14 @@ enum BindingLease {
     Transitioning,
     /// GH#140 / bd-daqmp sidecar-less read-only binding: no files, no locks.
     ReadOnlyUnadmitted,
+    /// bd-97kjm terminal teardown state: every advisory lock has been released
+    /// and every retained sidecar descriptor has been closed. A binding enters
+    /// this state through [`DatabaseNamespaceBinding::quiesce`] (explicit
+    /// pool-drop teardown) or [`DatabaseNamespaceBinding::guard_generation`]
+    /// (on a detected main-file quarantine/rename). It is inert and idempotent:
+    /// a lingering `Arc` clone can no longer write through the released
+    /// descriptors, and the binding's own `Drop` has nothing left to release.
+    Quiesced,
 }
 
 /// Lifetime lease binding all path-derived companions to one main-file
@@ -521,7 +529,9 @@ impl DatabaseNamespaceBinding {
             .map_err(|_| FrankenError::internal("namespace lease mutex poisoned"))?;
         if matches!(
             *lease,
-            BindingLease::Shared { .. } | BindingLease::ReadOnlyUnadmitted
+            BindingLease::Shared { .. }
+                | BindingLease::ReadOnlyUnadmitted
+                | BindingLease::Quiesced
         ) {
             return Ok(());
         }
@@ -560,6 +570,96 @@ impl DatabaseNamespaceBinding {
             )
         })
     }
+
+    /// bd-97kjm ask #2 — explicit namespace quiescence/teardown.
+    ///
+    /// Deterministically release every advisory lock and close every retained
+    /// sidecar descriptor owned by this generation **now**, regardless of how
+    /// many [`Arc`] clones still reference the binding. The persistent sidecar
+    /// files are never unlinked (that would split the advisory-lock domain);
+    /// only the process-local descriptors and their `flock` claims are dropped.
+    ///
+    /// A pool owner calls this once the last connection bound to the file has
+    /// closed, so a subsequent generation transition (or a fresh admission)
+    /// observes no stale `use` lease even when a background reference (a
+    /// detached flusher, a pooled handle) still holds an `Arc` clone. The
+    /// operation is idempotent and, after it returns, the binding is inert:
+    /// [`Self::finish_bootstrap`] becomes a no-op and no retained descriptor
+    /// can write through the released `use`/`gate` handles.
+    ///
+    /// The caller owns the "no live connection is cut off" contract exactly as
+    /// [`cleanup_abandoned_private_database`] does: invoke this only after every
+    /// pager/validation connection bound to this generation has closed. For a
+    /// teardown that is safe even while a connection may still be live, prefer
+    /// [`Self::guard_generation`], which releases only after proving the bound
+    /// generation is no longer installed at the path.
+    pub fn quiesce(&self) {
+        let mut lease = match self.lease.lock() {
+            Ok(lease) => lease,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Self::quiesce_lease(&mut lease);
+    }
+
+    /// Release the descriptors owned by `lease` and leave it [`BindingLease::Quiesced`].
+    fn quiesce_lease(lease: &mut BindingLease) {
+        // Unlock explicitly before the descriptor closes so the advisory-lock
+        // handoff boundary is immediate on every platform, then drop the owned
+        // `File`s so their (single) open file descriptions — and thus the
+        // retained fds — are gone the instant this returns.
+        match std::mem::replace(lease, BindingLease::Quiesced) {
+            BindingLease::Shared { use_file } => {
+                let _ = AdvisoryFileLock::unlock(&use_file);
+                drop(use_file);
+            }
+            BindingLease::BootstrapExclusive { gate, use_file }
+            | BindingLease::BootstrapUseShared { gate, use_file } => {
+                let _ = AdvisoryFileLock::unlock(&use_file);
+                let _ = AdvisoryFileLock::unlock(&gate);
+                drop(use_file);
+                drop(gate);
+            }
+            BindingLease::Transitioning
+            | BindingLease::ReadOnlyUnadmitted
+            | BindingLease::Quiesced => {}
+        }
+    }
+
+    /// Whether this binding has been torn down by [`Self::quiesce`] or a
+    /// generation-guard release. A quiesced binding owns no descriptors and no
+    /// advisory locks.
+    #[must_use]
+    pub fn is_quiesced(&self) -> bool {
+        self.lease
+            .lock()
+            .is_ok_and(|lease| matches!(*lease, BindingLease::Quiesced))
+    }
+
+    /// bd-97kjm ask #3 — generation-bound teardown.
+    ///
+    /// Re-probe the stable pathname's file identity. While the bound generation
+    /// is still installed this is a pure, side-effect-free check identical to
+    /// [`Self::validate_path_identity`]. When the probe proves the generation
+    /// changed — a recovery flow quarantined or renamed the main file and a new
+    /// inode now occupies the path — this additionally [`Self::quiesce`]s the
+    /// binding, so the retained `use`/`gate` descriptors are closed rather than
+    /// left pointing at the superseded generation. The stale generation is
+    /// error, so a still-valid live connection is never cut off; only a binding
+    /// whose main file is provably gone releases its state.
+    ///
+    /// This never mutates the main database, the quarantined old inode, or the
+    /// persistent sidecars: identity is probed with `symlink_metadata` on Unix
+    /// (no descriptor, so no `fcntl` record lock is disturbed — bd-qduu1) and
+    /// the release path only unlocks and closes already-held descriptors.
+    pub fn guard_generation(&self) -> Result<()> {
+        match self.validate_path_identity() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.quiesce();
+                Err(error)
+            }
+        }
+    }
 }
 
 impl Drop for DatabaseNamespaceBinding {
@@ -582,7 +682,9 @@ impl Drop for DatabaseNamespaceBinding {
                 let _ = AdvisoryFileLock::unlock(use_file);
                 let _ = AdvisoryFileLock::unlock(gate);
             }
-            BindingLease::Transitioning | BindingLease::ReadOnlyUnadmitted => {}
+            BindingLease::Transitioning
+            | BindingLease::ReadOnlyUnadmitted
+            | BindingLease::Quiesced => {}
         }
     }
 }
@@ -1843,6 +1945,31 @@ mod tests {
         binding.finish_bootstrap().expect("publish generation");
     }
 
+    /// Enumerate every pathname the current process has open (`/proc/self/fd`).
+    ///
+    /// Portable fd-leak detection without the external `lsof` binary. Used to
+    /// assert that a namespace teardown leaves no retained descriptor resolving
+    /// to a database's sidecars (bd-97kjm asks #2/#3).
+    #[cfg(target_os = "linux")]
+    fn process_fd_targets() -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .collect()
+    }
+
+    /// Whether any open descriptor in this process resolves to `path`.
+    #[cfg(target_os = "linux")]
+    fn fd_open_to(path: &Path) -> bool {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        process_fd_targets().iter().any(|target| {
+            std::fs::canonicalize(target).unwrap_or_else(|_| target.clone()) == canonical
+        })
+    }
+
     #[test]
     fn new_generation_stays_exclusive_until_bootstrap_finishes() {
         let dir = tempdir().expect("tempdir");
@@ -2129,6 +2256,183 @@ mod tests {
             NamespaceGenerationTransitionOutcome::Published
         );
         transition.finish().expect("finish replacement transition");
+    }
+
+    #[test]
+    fn pool_drop_teardown_releases_retained_namespace_fd() {
+        // bd-97kjm ask #2 (lsof-clean): a pool drop must fully release the
+        // namespace state and the retained sidecar descriptor even while a
+        // background reference still holds an `Arc` clone. Before teardown the
+        // `use` lease blocks a generation transition and its fd is open; after
+        // `quiesce()` the lease and its descriptor are gone for every clone.
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("pool-teardown.db");
+        let identity = create_database(&database, b"pooled generation");
+        let use_path = sidecar_path(&database, USE_SUFFIX);
+
+        let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit generation")
+            .bind(identity)
+            .expect("bind generation");
+        binding.finish_bootstrap().expect("publish generation");
+
+        // A pooled/background reference that outlives the intended pool drop.
+        let lingering = Arc::clone(&binding);
+
+        // Precondition: the retained `use` lease blocks a generation transition
+        // and its descriptor is open — this is exactly the fd/lock that
+        // outlives a pool drop on HEAD.
+        assert!(
+            matches!(
+                begin_database_namespace_generation_transition(&database, identity),
+                Err(FrankenError::Busy)
+            ),
+            "a live `use` lease must block a generation transition"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            fd_open_to(&use_path),
+            "the retained identity-sidecar descriptor must be open before teardown"
+        );
+
+        // Teardown releases everything now, even though `lingering` still lives.
+        binding.quiesce();
+        assert!(binding.is_quiesced());
+        assert!(
+            lingering.is_quiesced(),
+            "the shared lease is quiesced through every Arc clone"
+        );
+        assert_eq!(
+            Arc::strong_count(&binding),
+            2,
+            "the background clone still references the binding"
+        );
+
+        // The retained descriptor is gone before any new holder opens it...
+        #[cfg(target_os = "linux")]
+        assert!(
+            !fd_open_to(&use_path),
+            "no retained descriptor may resolve to the identity sidecar after teardown"
+        );
+        // ...and the released `use` lock lets a fresh generation transition run.
+        let transition = begin_database_namespace_generation_transition(&database, identity)
+            .expect("teardown released the retained `use` lease");
+        drop(transition);
+
+        // Teardown is idempotent and the eventual Arc drops are pure no-ops.
+        binding.quiesce();
+        binding.finish_bootstrap().expect("quiesced bootstrap is inert");
+        drop(binding);
+        drop(lingering);
+    }
+
+    #[test]
+    fn quarantine_generation_guard_releases_retained_fd() {
+        // bd-97kjm ask #3: when a recovery flow quarantines/renames the main
+        // file, the generation guard must detect the superseded generation and
+        // release the retained sidecar descriptor, so no retained fd survives
+        // pointing at the old generation. The quarantined old inode is never
+        // written. GH#334/bd-a5zj5 note: `validate_path_identity` semantics are
+        // unchanged; the guard only *adds* the on-mismatch release.
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("quarantine-guard.db");
+        let quarantined = dir.path().join("quarantine-guard.quarantined.db");
+        let identity = create_database(&database, b"live generation");
+        let use_path = sidecar_path(&database, USE_SUFFIX);
+
+        let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit generation")
+            .bind(identity)
+            .expect("bind generation");
+        binding.finish_bootstrap().expect("publish generation");
+
+        // While the bound generation is live the guard is side-effect-free and
+        // keeps the lease intact (a live connection is never cut off).
+        binding
+            .guard_generation()
+            .expect("live generation passes the guard");
+        assert!(!binding.is_quiesced());
+        #[cfg(target_os = "linux")]
+        assert!(
+            fd_open_to(&use_path),
+            "the retained descriptor stays open while the generation is live"
+        );
+
+        // Simulate recovery: quarantine the main file, install a fresh inode.
+        fs::rename(&database, &quarantined).expect("quarantine main file");
+        let old_bytes = fs::read(&quarantined).expect("snapshot quarantined inode bytes");
+        let replacement = create_database(&database, b"replacement generation");
+        assert_ne!(identity, replacement);
+
+        // The guard now proves the bound generation is gone and releases state.
+        assert!(matches!(
+            binding.guard_generation(),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert!(
+            binding.is_quiesced(),
+            "a superseded generation releases the retained lease"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            !fd_open_to(&use_path),
+            "no retained descriptor may survive a quarantined generation"
+        );
+
+        // No retained fd wrote to the quarantined old inode.
+        assert_eq!(
+            fs::read(&quarantined).expect("re-read quarantined inode bytes"),
+            old_bytes,
+            "the quarantined old inode must remain byte-identical"
+        );
+
+        // Idempotent: guarding a quiesced binding stays fail-closed.
+        assert!(binding.guard_generation().is_err());
+        binding.quiesce();
+        drop(binding);
+    }
+
+    #[test]
+    fn readonly_reopen_of_retained_generation_is_byte_neutral() {
+        // bd-97kjm ask #1 residual guard (a410c2735 + bd-lcuoc): re-opening a
+        // namespace-retained database READ-ONLY must not re-checkpoint or
+        // otherwise mutate the main file or the persistent sidecars, and the
+        // new teardown/guard primitives must themselves be byte-neutral.
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("readonly-neutral.db");
+        let identity = create_database(&database, b"retained generation payload");
+        publish_generation(&database, identity);
+
+        let gate_path = sidecar_path(&database, GATE_SUFFIX);
+        let use_path = sidecar_path(&database, USE_SUFFIX);
+        let before_main = fs::read(&database).expect("snapshot main");
+        let before_gate = fs::read(&gate_path).expect("snapshot gate record");
+        let before_use = fs::read(&use_path).expect("snapshot identity record");
+
+        let reader = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting)
+            .expect("admit read-only generation")
+            .bind(identity)
+            .expect("bind read-only generation");
+        reader
+            .validate_path_identity()
+            .expect("read-only generation remains bound");
+        reader
+            .guard_generation()
+            .expect("guard is neutral while the generation is live");
+        reader
+            .finish_bootstrap()
+            .expect("read-only binding has no bootstrap transition");
+        reader.quiesce();
+        assert!(reader.is_quiesced());
+        drop(reader);
+
+        assert_eq!(fs::read(&database).expect("re-read main"), before_main);
+        assert_eq!(fs::read(&gate_path).expect("re-read gate record"), before_gate);
+        assert_eq!(
+            fs::read(&use_path).expect("re-read identity record"),
+            before_use,
+            "read-only teardown must not rewrite the identity record"
+        );
     }
 
     #[test]
