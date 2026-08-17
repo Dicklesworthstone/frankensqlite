@@ -127,9 +127,12 @@ async fn setup_mem() -> (Connection, rusqlite::Connection) {
 ///      lever is the unqualified-outer-ref binding in the TVF-arg substitution
 ///      (see `probe_unqualified_external_ref` in
 ///      `substitute_outer_refs_in_select_with_schema_context`).
-/// Fix belongs in connection.rs (IvoryFortress's lane); ignored until gap (2) lands.
+/// Fixed by bd-l3tce (gap 2): the unqualified outer column `x` is now
+/// substituted into the `json_each(x)` TVF arg in the correlated-EXISTS WHERE
+/// fallback — `substitute_outer_refs_in_table_or_subquery`'s `TableFunction` arm
+/// falls back to an empty protected set when the source's protected set is
+/// unknown, so an unqualified TVF arg resolves as the outer ref it is.
 #[test]
-#[ignore = "bd-and-or-short-circuit-value-jump-gaps-dkswh: fix(1) short-circuit LANDED (execute_join_select WHERE routes through eval_expr_truthiness; the 'bare' row now passes). Still red on x='{}': gap(2) unqualified outer col `x` is not substituted into the json_each(x) TVF arg in the correlated-EXISTS WHERE fallback (errors \"column not found: x\"); qualified t.x already works. Un-ignore once gap(2) lands."]
 fn where_or_subq_short_circuits() {
     asupersync::test_utils::run_test(|| async {
         let (f, r) = setup_mem().await;

@@ -48176,9 +48176,27 @@ impl Connection {
             return;
         }
 
-        let mode = self
+        let mut mode = self
             .checkpoint_schedule_override_mode()
             .unwrap_or_else(|| Self::checkpoint_pick_auto_mode(&snapshot));
+        // bd-2rsuf / bd-yoa57: enforce `PRAGMA journal_size_limit`. If the WAL
+        // is already larger than the configured byte cap, promote this
+        // checkpoint to `Truncate` so the WAL is reclaimed rather than left
+        // grown past the limit. A negative limit means "no limit". This mirrors
+        // SQLite, which applies journal_size_limit when a checkpoint would
+        // otherwise leave the WAL/journal file large. The estimate is
+        // WAL_HEADER + frames * (page_size + WAL_FRAME_HEADER).
+        let journal_size_limit = self.pragma_state.borrow().journal_size_limit;
+        if journal_size_limit >= 0 {
+            let frame_bytes = u64::from(self.pager.page_size().get())
+                .saturating_add(fsqlite_wal::WAL_FRAME_HEADER_SIZE as u64);
+            let wal_bytes = (fsqlite_wal::WAL_HEADER_SIZE as u64)
+                .saturating_add(snapshot.wal_frames_estimate.saturating_mul(frame_bytes));
+            #[allow(clippy::cast_sign_loss)]
+            if wal_bytes > journal_size_limit as u64 {
+                mode = CheckpointMode::Truncate;
+            }
+        }
         let cx = match self.op_cx() {
             Ok(cx) => cx,
             Err(_) => return,
@@ -99569,12 +99587,24 @@ fn substitute_outer_refs_in_table_or_subquery(
         }
         TableOrSubquery::TableFunction { args, .. } => {
             let no_local_outputs = HashSet::new();
+            // bd-l3tce: a table-valued-function argument is evaluated in the
+            // ENCLOSING scope, so an unqualified column there is an outer
+            // reference (the function's own output columns are not visible to
+            // its own args). `collect_known_source_columns` returns `None` for a
+            // TVF source, so the inherited protected set is `None`; with
+            // `probe_unqualified_external_ref = false` that left unqualified `x`
+            // in `json_each(x)` unsubstituted ("column not found: x") while
+            // qualified `t.x` already worked. Fall back to an empty protected
+            // set so an unqualified arg is resolved as an outer ref; a non-outer
+            // arg still resolves to `None` and is left unchanged (no regression).
+            let empty_protected = HashSet::new();
+            let arg_protected = protected_unqualified_columns.or(Some(&empty_protected));
             for expr in args {
                 *expr = substitute_outer_refs_in_expr(
                     expr,
                     lookup,
                     protected_tables,
-                    protected_unqualified_columns,
+                    arg_protected,
                     &no_local_outputs,
                     opaque_cte_names,
                 );
