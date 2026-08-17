@@ -124019,7 +124019,6 @@ fn compile_expression_select(
             where_clause,
             group_by,
             having,
-            windows,
             ..
         } => {
             // DISTINCT is handled post-execution via the collation-aware dedup
@@ -124040,11 +124039,15 @@ fn compile_expression_select(
                     "HAVING is not supported in this connection path".to_owned(),
                 ));
             }
-            if !windows.is_empty() {
-                return Err(FrankenError::NotImplemented(
-                    "WINDOW is not supported in this connection path".to_owned(),
-                ));
-            }
+            // bd-rwaxp: an UNUSED WINDOW clause (declared but referenced by no
+            // window function) is valid in SQLite — its declaration chain is
+            // already validated upstream (validate_named_window_definitions, via
+            // the direct validate_aggregate_window_misuse path and the prepared
+            // validate_statement_select_semantics path), and any window-*using*
+            // FROM-less query routes to execute_fromless_window_select before
+            // reaching here. So ignore the WINDOW clause rather than rejecting it
+            // (test_named_window_reference_form_and_declaration_validation:
+            // `SELECT 1 WINDOW a AS (missing)` must return 1, not error).
             if columns.is_empty() {
                 return Err(FrankenError::ParseError {
                     offset: 0,
