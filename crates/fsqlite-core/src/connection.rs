@@ -123595,8 +123595,16 @@ fn parse_database_header_checked(page1_bytes: &[u8]) -> Result<DatabaseHeader> {
     }
     let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
     header_bytes.copy_from_slice(&page1_bytes[..DATABASE_HEADER_SIZE]);
-    DatabaseHeader::from_bytes(&header_bytes).map_err(|err| FrankenError::DatabaseCorrupt {
-        detail: format!("database header invalid: {err}"),
+    DatabaseHeader::from_bytes(&header_bytes).map_err(|err| match err {
+        // bd-e9hws: a database written by a newer FrankenSQLite format is a
+        // rollback-safety refusal, not corruption — surface the dedicated
+        // SQLITE_OPEN_NEWER_FORMAT code (and message) rather than SQLITE_CORRUPT.
+        fsqlite_types::DatabaseHeaderError::NewerFormat { on_disk, supported } => {
+            FrankenError::NewerFormat { on_disk, supported }
+        }
+        other => FrankenError::DatabaseCorrupt {
+            detail: format!("database header invalid: {other}"),
+        },
     })
 }
 

@@ -19,6 +19,7 @@
 //!   (d) stock `rusqlite` opens a format-stamped DB and `integrity_check == ok`
 //!       (the forward-compat oracle), including a stamp *newer* than CURRENT.
 
+use fsqlite_core::connection::Connection;
 use fsqlite_types::{
     CURRENT_FSQLITE_FORMAT_VERSION, DATABASE_HEADER_SIZE, DatabaseHeader, DatabaseHeaderError,
 };
@@ -218,4 +219,51 @@ fn stock_sqlite_opens_format_stamped_db() {
         .expect_err("engine refuses a newer stamp on a real file");
     assert!(matches!(refuse, DatabaseHeaderError::NewerFormat { .. }));
     assert_stock_ok(&path, rows);
+}
+
+/// (e) bd-e9hws: the FULL `Connection::open` path (pager open + first-open
+/// migration) must REFUSE a database whose on-disk format is newer than this
+/// build understands — not open it, "repair" it, or rewrite it — while stock C
+/// SQLite still opens the same bytes. Guards the end-to-end rollback-safety
+/// guarantee above the header-parse unit level.
+#[test]
+fn connection_open_refuses_newer_format_db() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("newer_open.db");
+        let rows = make_stock_db(&path);
+
+        // Stamp a format newer than this build supports; stock is unaffected by
+        // the reserved-slot value (forward-compat).
+        stamp_format_version(&path, CURRENT_FSQLITE_FORMAT_VERSION + 1);
+        assert_stock_ok(&path, rows);
+
+        // fsqlite must refuse to open it.
+        let err = Connection::open(path.to_string_lossy().as_ref())
+            .await
+            .err()
+            .expect("Connection::open must refuse a newer-format database");
+
+        // The refusal diagnostic names the newer-format cause regardless of
+        // which storage layer (pager open vs integrity walk) rejects it first.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer fsqlite"),
+            "refusal must name the newer-format cause; got: {msg}"
+        );
+
+        // The refused file's page-1 header is untouched: we rejected it, we did
+        // not rewrite or "repair" it (the stamp survives byte-for-byte).
+        let after = read_header(&path);
+        assert_eq!(
+            u32::from_be_bytes([
+                after[FORMAT_VERSION_OFFSET],
+                after[FORMAT_VERSION_OFFSET + 1],
+                after[FORMAT_VERSION_OFFSET + 2],
+                after[FORMAT_VERSION_OFFSET + 3],
+            ]),
+            CURRENT_FSQLITE_FORMAT_VERSION + 1,
+            "a refused newer-format file must not be rewritten/repaired"
+        );
+    });
 }
