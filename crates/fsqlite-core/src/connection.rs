@@ -92441,6 +92441,7 @@ async fn rewrite_in_select_core(
 ) -> Result<()> {
     if let SelectCore::Select {
         columns,
+        from,
         where_clause,
         group_by,
         having,
@@ -92464,6 +92465,18 @@ async fn rewrite_in_select_core(
         }
         for window in windows.iter_mut() {
             rewrite_in_window_spec(&mut window.spec, conn, rewrite_in, params).await?;
+        }
+        // bd-lryih P9: descend into JOIN-ON constraints so the Tier-1
+        // `0 AND E`->FALSE fold in `rewrite_in_expr` reaches ON expressions.
+        // Previously `from` was dropped here, so an erroring uncorrelated
+        // subquery inside `ON (0 AND E) OR <eq>` was eagerly hoisted instead
+        // of being folded away, diverging from stock (which returns rows).
+        if let Some(from) = from.as_mut() {
+            for join in from.joins.iter_mut() {
+                if let Some(JoinConstraint::On(on_expr)) = join.constraint.as_mut() {
+                    rewrite_in_expr(on_expr, conn, rewrite_in, params).await?;
+                }
+            }
         }
     }
     Ok(())
@@ -93535,6 +93548,7 @@ fn select_core_contains_rewritable_subquery(core: &SelectCore) -> bool {
     match core {
         SelectCore::Select {
             columns,
+            from,
             where_clause,
             group_by,
             having,
@@ -93552,6 +93566,13 @@ fn select_core_contains_rewritable_subquery(core: &SelectCore) -> bool {
                     .as_ref()
                     .is_some_and(|expr| expr_contains_rewritable_subquery(expr))
                 || windows.iter().any(window_contains_rewritable_subquery)
+                // bd-lryih P9: scan JOIN-ON (and FROM subqueries) so a select
+                // whose only rewritable subquery sits in an ON clause still
+                // enters `rewrite_in_select_core` instead of early-returning
+                // unchanged — otherwise the `0 AND E` ON fold never runs.
+                || from
+                    .as_ref()
+                    .is_some_and(from_clause_contains_rewritable_subquery)
         }
         SelectCore::Values(_) => false,
     }
