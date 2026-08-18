@@ -7826,7 +7826,7 @@ impl VdbeEngine {
                     conflict_rowid,
                     &meta.column_indices,
                 );
-                let key_bytes = encode_record(&key_values);
+                let key_bytes = encode_record_with_encoding(&key_values, self.text_encoding);
 
                 // Seek to the key in the index cursor and delete it.
                 let found =
@@ -7980,7 +7980,7 @@ impl VdbeEngine {
                             rowid,
                             &meta.column_indices,
                         );
-                        let key_bytes = encode_record(&key_values);
+                        let key_bytes = encode_record_with_encoding(&key_values, self.text_encoding);
                         if let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id)
                             && sc.writable
                         {
@@ -11639,7 +11639,16 @@ impl VdbeEngine {
                     // Collect key bytes BEFORE borrowing cursor (borrow checker).
                     let key_bytes: Option<Vec<u8>> = if key_count > 0 {
                         let iter = (0..key_count).map(|i| self.get_reg(key_start_reg + i));
-                        Some(fsqlite_types::record::serialize_record_iter(iter))
+                        // bd-bld9w.7 family (b): encode the index-delete probe key in
+                        // the DB text encoding so it matches the stored UTF-16 key
+                        // (byte-identical to serialize_record_iter for UTF-8).
+                        let mut key_buf = Vec::new();
+                        fsqlite_types::record::serialize_record_iter_into_with_encoding(
+                            iter,
+                            self.text_encoding,
+                            &mut key_buf,
+                        );
+                        Some(key_buf)
                     } else {
                         None
                     };
