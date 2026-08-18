@@ -1154,6 +1154,44 @@ fn parse_leaf_raw(page: &[u8]) -> Result<Fts5LeafRaw> {
     })
 }
 
+/// Decode a stitched doclist byte buffer where `abs_offsets` lists the buffer
+/// offsets at which a rowid is stored ABSOLUTE rather than as a delta from the
+/// previous rowid. FTS5 stores the first rowid of every leaf page absolute (the
+/// `first_rowid_offset` header points at it on a continuation page); when a
+/// doclist is stitched across pages those page-boundary rowids stay absolute, so
+/// a plain delta decode would corrupt every rowid after the first page (GH#360).
+/// Poslist bodies, by contrast, are byte-contiguous across the stitch, so each
+/// poslist decodes normally. `abs_offsets` is ascending and always contains the
+/// buffer start (a term's own first rowid).
+fn decode_stitched_doclist(buffer: &[u8], abs_offsets: &[usize]) -> Result<Fts5Doclist> {
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    let mut previous_rowid = 0u64;
+    let mut abs_index = 0usize;
+    while offset < buffer.len() {
+        while abs_index < abs_offsets.len() && abs_offsets[abs_index] < offset {
+            abs_index += 1;
+        }
+        let is_absolute =
+            offset == 0 || (abs_index < abs_offsets.len() && abs_offsets[abs_index] == offset);
+        let raw = fts5_read_varint(buffer, &mut offset, "doclist rowid")?;
+        let rowid = if is_absolute {
+            raw
+        } else {
+            if raw == 0 {
+                return Err(fts5_data_error("doclist rowid delta must be positive"));
+            }
+            previous_rowid
+                .checked_add(raw)
+                .ok_or_else(|| fts5_data_error("doclist rowid overflow"))?
+        };
+        let poslist = Fts5Poslist::decode(buffer, &mut offset)?;
+        entries.push(Fts5DoclistEntry { rowid, poslist });
+        previous_rowid = rowid;
+    }
+    Ok(Fts5Doclist::new(entries))
+}
+
 /// Reassembles a segment's `(term, doclist)` stream by stitching each doclist's
 /// bytes across leaf-page continuation boundaries (GH#360). Pages are pushed in
 /// ascending pgno order; a term is emitted only once its doclist is complete
@@ -1161,13 +1199,17 @@ fn parse_leaf_raw(page: &[u8]) -> Result<Fts5LeafRaw> {
 ///
 /// A term's doclist runs from its data start until the next term. The last term
 /// on a page may spill: its bytes so far are held in `pending`, extended by each
-/// following page's leading continuation region `[4, first-term-entry)` (or the
-/// whole `[4, footer_offset)` for a term-less continuation page), and finally
-/// decoded when the next term appears. `first_rowid_offset` is not consulted —
-/// the footer term-entry offsets bound every doclist.
+/// following page's leading continuation region `[4, first-term-entry)`, and
+/// finally decoded when the next term appears. Crucially, a continuation page's
+/// `first_rowid_offset` header splits that leading region into a poslist tail
+/// `[4, first_rowid_offset)` (completing the entry in progress) and fresh doclist
+/// entries `[first_rowid_offset, first-term-entry)` whose first rowid is stored
+/// ABSOLUTE — so `pending` also records the buffer offsets of those absolute
+/// rowids for [`decode_stitched_doclist`].
 struct Fts5DoclistStitcher {
-    /// The last term seen whose doclist may still be spilling: `(term, bytes so far)`.
-    pending: Option<(Vec<u8>, Vec<u8>)>,
+    /// The last term seen whose doclist may still be spilling:
+    /// `(term, doclist bytes so far, absolute-rowid offsets within those bytes)`.
+    pending: Option<(Vec<u8>, Vec<u8>, Vec<usize>)>,
 }
 
 impl Fts5DoclistStitcher {
@@ -1175,30 +1217,48 @@ impl Fts5DoclistStitcher {
         Self { pending: None }
     }
 
+    fn complete(pending: (Vec<u8>, Vec<u8>, Vec<usize>)) -> Result<Fts5SegmentTerm> {
+        let (term, buffer, abs_offsets) = pending;
+        Ok(Fts5SegmentTerm {
+            term,
+            doclist: decode_stitched_doclist(&buffer, &abs_offsets)?,
+        })
+    }
+
     /// Feed one leaf page (ascending pgno order); returns the terms COMPLETED by
     /// this page (their doclists fully stitched and decoded), in term order.
     fn push_page(&mut self, page: &[u8]) -> Result<Vec<Fts5SegmentTerm>> {
         let raw = parse_leaf_raw(page)?;
+        let first_rowid_offset = usize::from(read_be_u16(&page[0..2]));
         let mut completed = Vec::new();
 
-        // Bytes before the first term entry continue the pending (spilled) doclist.
-        let leading_end = raw
+        // Everything before the first term entry continues the pending doclist.
+        let first_term_entry = raw
             .entry_offsets
             .first()
             .copied()
             .unwrap_or(raw.footer_offset);
-        if let Some((_, buffer)) = self.pending.as_mut() {
-            buffer.extend_from_slice(&page[4..leading_end]);
-        }
-        // The pending doclist ends where a NEW term begins. If this page has no
-        // terms it is pure continuation and the pending term keeps growing.
-        if !raw.terms.is_empty()
-            && let Some((term, buffer)) = self.pending.take()
+        if let Some((_, buffer, abs_offsets)) = self.pending.as_mut()
+            && first_term_entry > 4
         {
-            completed.push(Fts5SegmentTerm {
-                term,
-                doclist: Fts5Doclist::decode(&buffer)?,
-            });
+            if (4..=first_term_entry).contains(&first_rowid_offset) {
+                // `[4, first_rowid_offset)` completes the in-progress poslist;
+                // a fresh (absolute) rowid run starts at `first_rowid_offset`.
+                buffer.extend_from_slice(&page[4..first_rowid_offset]);
+                abs_offsets.push(buffer.len());
+                buffer.extend_from_slice(&page[first_rowid_offset..first_term_entry]);
+            } else {
+                // No bare rowid on this page (first_rowid_offset == 0): the whole
+                // leading region is poslist continuation.
+                buffer.extend_from_slice(&page[4..first_term_entry]);
+            }
+        }
+        // A new term ends the pending doclist. A term-less page is pure
+        // continuation and the pending term keeps growing.
+        if !raw.terms.is_empty()
+            && let Some(pending) = self.pending.take()
+        {
+            completed.push(Self::complete(pending)?);
         }
 
         let term_count = raw.terms.len();
@@ -1211,14 +1271,15 @@ impl Fts5DoclistStitcher {
             if doclist_start > doclist_end {
                 return Err(fts5_data_error("segment term doclist start past its end"));
             }
-            let bytes = &page[doclist_start..doclist_end];
+            let bytes = page[doclist_start..doclist_end].to_vec();
             if index + 1 == term_count {
                 // Last term on the page: its doclist may spill onto later pages.
-                self.pending = Some((term, bytes.to_vec()));
+                // Its first rowid (offset 0) is absolute.
+                self.pending = Some((term, bytes, vec![0]));
             } else {
                 completed.push(Fts5SegmentTerm {
                     term,
-                    doclist: Fts5Doclist::decode(bytes)?,
+                    doclist: decode_stitched_doclist(&bytes, &[0])?,
                 });
             }
         }
@@ -1228,10 +1289,7 @@ impl Fts5DoclistStitcher {
     /// Complete the final pending term after the last page has been pushed.
     fn finish(&mut self) -> Result<Option<Fts5SegmentTerm>> {
         match self.pending.take() {
-            Some((term, buffer)) => Ok(Some(Fts5SegmentTerm {
-                term,
-                doclist: Fts5Doclist::decode(&buffer)?,
-            })),
+            Some(pending) => Ok(Some(Self::complete(pending)?)),
             None => Ok(None),
         }
     }
