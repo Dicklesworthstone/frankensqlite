@@ -44128,15 +44128,24 @@ impl Connection {
             // and columns stay deferred to normal resolution, matching the
             // execute-path guard's behavior.
             Statement::Update(update) => {
-                let table_name = &update.table.name.name;
-                let schema = self.schema.borrow();
-                if let Some(table_schema) = schema
-                    .iter()
-                    .find(|t| t.name.eq_ignore_ascii_case(table_name))
                 {
-                    Self::validate_update_target_columns(table_schema, &update.assignments)?;
+                    let table_name = &update.table.name.name;
+                    let schema = self.schema.borrow();
+                    if let Some(table_schema) = schema
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                    {
+                        Self::validate_update_target_columns(table_schema, &update.assignments)?;
+                    }
                 }
-                Ok(())
+                // bd-wlo29 L10: a forced partial INDEXED BY on the UPDATE target
+                // must be covered by the statement WHERE, exactly like a SELECT
+                // source. The schema borrow above is scoped so this can re-borrow.
+                self.validate_dml_target_partial_index(&update.table, update.where_clause.as_ref())
+            }
+            Statement::Delete(delete) => {
+                // bd-wlo29 L10: same forced-partial-index cover check for DELETE.
+                self.validate_dml_target_partial_index(&delete.table, delete.where_clause.as_ref())
             }
             Statement::Explain { stmt, .. } => self.validate_statement_select_semantics(stmt),
             _ => Ok(()),
@@ -44441,13 +44450,78 @@ impl Connection {
         false
     }
 
+    /// Whether `query_term` being true guarantees the (already column-normalized)
+    /// expression `col` is not NULL — SQLite's null-rejecting-comparison rule, so
+    /// a query term like `b = 5` covers a partial predicate `b IS NOT NULL`
+    /// (bd-wlo29 H3). Both operands are assumed already column-normalized.
+    fn query_term_rejects_null(query_term: &Expr, col: &Expr) -> bool {
+        match query_term {
+            // A bare truthy column reference (`WHERE b`) is false/NULL when NULL.
+            Expr::Column(..) => query_term == col,
+            // A null-rejecting comparison with `col` as an operand: the whole
+            // comparison is NULL — never true — when `col` is NULL. `IS` / `IS
+            // NOT` are NULL-tolerant and deliberately excluded.
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => {
+                matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                ) && (left.as_ref() == col || right.as_ref() == col)
+            }
+            // `col IS NOT NULL` directly.
+            Expr::IsNull {
+                expr, not: true, ..
+            } => expr.as_ref() == col,
+            // NULL propagates through IN / BETWEEN / LIKE on `col`, so any of
+            // these (negated or not) is NULL — never true — when `col` is NULL.
+            Expr::In { expr, .. } | Expr::Between { expr, .. } | Expr::Like { expr, .. } => {
+                expr.as_ref() == col
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a single normalized query WHERE/ON conjunct `query_term` logically
+    /// covers the partial-index predicate conjunct `predicate`, mirroring
+    /// SQLite's `sqlite3ExprImpliesExpr` (bd-wlo29 H3): an `exprCompare`/commute
+    /// match, an OR whose either branch is covered, or a null-rejecting term
+    /// covering an `IS NOT NULL`. This is still NOT full arithmetic implication —
+    /// `b > 5` does not cover `b > 0`, exactly as C SQLite rejects it.
+    fn query_term_implies_predicate(query_term: &Expr, predicate: &Expr) -> bool {
+        if Self::normalized_conjuncts_equivalent(query_term, predicate) {
+            return true;
+        }
+        match predicate {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Or,
+                right,
+                ..
+            } => {
+                Self::query_term_implies_predicate(query_term, left)
+                    || Self::query_term_implies_predicate(query_term, right)
+            }
+            Expr::IsNull {
+                expr, not: true, ..
+            } => Self::query_term_rejects_null(query_term, expr),
+            _ => false,
+        }
+    }
+
     /// Whether a forced partial index is usable: every conjunct of its partial
-    /// `predicate` must be syntactically present among the query's
-    /// `query_conjuncts` (WHERE + join-ON terms), after normalizing column
-    /// qualifiers that name the forced table (`targets`) and allowing a single
-    /// comparison to be commuted. Mirrors SQLite's `whereUsablePartialIndex` /
-    /// `sqlite3ExprImpliesExpr` cover check — a syntactic match, NOT logical
-    /// implication.
+    /// `predicate` must be *implied* by some conjunct among `query_conjuncts`
+    /// (the WHERE / join-ON terms the join tree exposes to this table), after
+    /// normalizing column qualifiers that name the forced table (`targets`).
+    /// Mirrors SQLite's `whereUsablePartialIndex` / `sqlite3ExprImpliesExpr`:
+    /// an `exprCompare`/commute match, an OR whose either branch is covered, or
+    /// a null-rejecting comparison covering an `IS NOT NULL` — but NOT full
+    /// arithmetic implication (`b > 5` does not cover `b > 0`).
     fn forced_partial_index_predicate_covered(
         predicate: &Expr,
         query_conjuncts: &[&Expr],
@@ -44469,7 +44543,7 @@ impl Connection {
             let mut normalized_predicate = (*predicate_conjunct).clone();
             Self::normalize_partial_predicate_columns(&mut normalized_predicate, targets);
             normalized_query.iter().any(|query_conjunct| {
-                Self::normalized_conjuncts_equivalent(query_conjunct, &normalized_predicate)
+                Self::query_term_implies_predicate(query_conjunct, &normalized_predicate)
             })
         })
     }
@@ -44486,21 +44560,65 @@ impl Connection {
             ..
         } = &select.body.select
         {
-            // Query WHERE + join-ON conjuncts, shared across every forced-index
-            // source, used to check partial-index usability below.
-            let mut query_conjuncts: Vec<&Expr> = Vec::new();
+            // Partition the query's conjuncts by how the join tree exposes them
+            // to each source (bd-wlo29 H4). WHERE terms and INNER/CROSS join-ON
+            // terms constrain every source (`regular_conjuncts`); an OUTER join's
+            // ON terms constrain ONLY the unpreserved (right) table of THAT join.
+            // Pooling ON terms globally (the previous behavior) let a forced
+            // partial scan on an OUTER join's PRESERVED side be judged "covered"
+            // by an ON conjunct — then silently DROP the LEFT JOIN's preserved
+            // rows when the partial index was honored.
+            //
+            // Source indices: 0 is `from.source`; join `i` contributes the source
+            // at index `i + 1`. `outer_on_for_source[si]` holds the ON conjuncts
+            // usable ONLY by source `si` (a LEFT join's own right table);
+            // `source_is_outer_right[si]` marks a source that must NOT fall back
+            // to `regular_conjuncts` (any outer-join right table).
+            let mut regular_conjuncts: Vec<&Expr> = Vec::new();
             if let Some(where_expr) = where_clause {
-                Self::collect_and_conjuncts(where_expr, &mut query_conjuncts);
+                Self::collect_and_conjuncts(where_expr, &mut regular_conjuncts);
             }
-            for join in &from.joins {
+            let source_count = from.joins.len() + 1;
+            let mut outer_on_for_source: Vec<Vec<&Expr>> = vec![Vec::new(); source_count];
+            let mut source_is_outer_right: Vec<bool> = vec![false; source_count];
+            for (i, join) in from.joins.iter().enumerate() {
+                let mut on_conjuncts: Vec<&Expr> = Vec::new();
                 if let Some(JoinConstraint::On(on_expr)) = &join.constraint {
-                    Self::collect_and_conjuncts(on_expr, &mut query_conjuncts);
+                    Self::collect_and_conjuncts(on_expr, &mut on_conjuncts);
+                }
+                match join.join_type.kind {
+                    fsqlite_ast::JoinKind::Inner | fsqlite_ast::JoinKind::Cross => {
+                        regular_conjuncts.extend(on_conjuncts);
+                    }
+                    fsqlite_ast::JoinKind::Left => {
+                        // LEFT: the right table (source i + 1) is unpreserved; its
+                        // own ON terms — and ONLY those — may cover its partial
+                        // index.
+                        source_is_outer_right[i + 1] = true;
+                        outer_on_for_source[i + 1] = on_conjuncts;
+                    }
+                    fsqlite_ast::JoinKind::Right | fsqlite_ast::JoinKind::Full => {
+                        // RIGHT/FULL: the right table is preserved (RIGHT) or both
+                        // sides are (FULL). Conservatively expose NO ON terms to
+                        // it for a forced partial cover so no preserved row can be
+                        // dropped; erring toward a strict "no query solution" is
+                        // rare here and never loses rows.
+                        source_is_outer_right[i + 1] = true;
+                    }
                 }
             }
 
-            let mut sources: Vec<&TableOrSubquery> = vec![&from.source];
-            sources.extend(from.joins.iter().map(|j| &j.table));
-            for tos in sources {
+            let sources: Vec<&TableOrSubquery> = std::iter::once(&from.source)
+                .chain(from.joins.iter().map(|j| &j.table))
+                .collect();
+            for (si, tos) in sources.iter().enumerate() {
+                // Derived tables carry their own INDEXED BY hints; recurse so a
+                // subquery source is validated exactly like a top-level SELECT
+                // (bd-wlo29 L10).
+                if let TableOrSubquery::Subquery { query, .. } = tos {
+                    self.validate_select_index_hints(query)?;
+                    continue;
+                }
                 if let TableOrSubquery::Table {
                     name,
                     alias,
@@ -44509,61 +44627,28 @@ impl Connection {
                 } = tos
                 {
                     if let Some(ti) = self.schema_index_of(&name.name) {
-                        // Resolve the forced index while the schema is borrowed;
-                        // capture only owned facts so the borrow is released
-                        // before the (allocating) cover check below.
-                        let mut index_known = false;
-                        let mut forced_partial = false;
-                        let mut partial_predicate: Option<Expr> = None;
-                        {
-                            let schema = self.schema.borrow();
-                            if let Some(forced_index) = schema.get(ti).and_then(|t| {
-                                t.indexes.iter().find(|i| i.name.eq_ignore_ascii_case(idx))
-                            }) {
-                                index_known = true;
-                                if forced_index.where_clause.is_some() {
-                                    forced_partial = true;
-                                    partial_predicate =
-                                        Self::parse_partial_index_predicate_for_integrity(
-                                            forced_index,
-                                        )
-                                        .ok()
-                                        .flatten();
-                                }
-                            }
-                        }
+                        let (index_known, partial_predicate) =
+                            self.resolve_forced_index_partial_predicate(ti, idx);
                         if !index_known {
                             return Err(FrankenError::FunctionError(format!(
                                 "no such index: {idx}"
                             )));
                         }
-                        // A forced PARTIAL index is usable only when every
-                        // conjunct of its partial predicate is syntactically
-                        // present among the query's WHERE / join-ON conjuncts.
-                        // This mirrors C SQLite's `whereUsablePartialIndex`
-                        // cover check, which is a *syntactic* match (modulo
-                        // column-qualifier and single-comparison commutation
-                        // normalization) and NOT logical implication: `b > 5`
-                        // does not satisfy a `b > 0` predicate even though it
-                        // implies it. Otherwise SQLite fails at prepare with
-                        // "no query solution" (GH#173, bd-qfgsa).
-                        if forced_partial {
-                            let mut targets: Vec<&str> = vec![name.name.as_str()];
-                            if let Some(alias) = alias {
-                                targets.push(alias.as_str());
-                            }
-                            let covered = partial_predicate.as_ref().is_some_and(|pred| {
-                                Self::forced_partial_index_predicate_covered(
-                                    pred,
-                                    &query_conjuncts,
-                                    &targets,
-                                )
-                            });
-                            if !covered {
-                                return Err(FrankenError::FunctionError(
-                                    "no query solution".to_owned(),
-                                ));
-                            }
+                        if let Some(predicate) = &partial_predicate {
+                            // The conjuncts the join tree actually exposes to this
+                            // source (bd-wlo29 H4): an outer-join right table sees
+                            // only its own ON terms, never the global set.
+                            let available: &[&Expr] = if source_is_outer_right[si] {
+                                &outer_on_for_source[si]
+                            } else {
+                                &regular_conjuncts
+                            };
+                            Self::forced_partial_cover_or_err(
+                                predicate,
+                                available,
+                                name.name.as_str(),
+                                alias.as_deref(),
+                            )?;
                         }
                     } else if name.schema.as_deref().is_some_and(|schema| {
                         !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
@@ -44590,6 +44675,83 @@ impl Connection {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Resolve a forced `INDEXED BY <idx>` against the table at schema index
+    /// `ti`. Returns `(index_known, partial_predicate)`: `index_known` is false
+    /// when the table has no such index, and `partial_predicate` is `Some` only
+    /// for a partial index whose predicate parsed.
+    fn resolve_forced_index_partial_predicate(&self, ti: usize, idx: &str) -> (bool, Option<Expr>) {
+        let schema = self.schema.borrow();
+        match schema
+            .get(ti)
+            .and_then(|t| t.indexes.iter().find(|i| i.name.eq_ignore_ascii_case(idx)))
+        {
+            Some(forced_index) => {
+                let predicate = if forced_index.where_clause.is_some() {
+                    Self::parse_partial_index_predicate_for_integrity(forced_index)
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                (true, predicate)
+            }
+            None => (false, None),
+        }
+    }
+
+    /// A forced PARTIAL index is usable only when every conjunct of its partial
+    /// `predicate` is implied by the `available` query conjuncts (see
+    /// [`Self::forced_partial_index_predicate_covered`]). Otherwise C SQLite
+    /// fails at prepare with "no query solution" (GH#173, bd-qfgsa, bd-wlo29).
+    fn forced_partial_cover_or_err(
+        predicate: &Expr,
+        available: &[&Expr],
+        name: &str,
+        alias: Option<&str>,
+    ) -> Result<()> {
+        let mut targets: Vec<&str> = vec![name];
+        if let Some(alias) = alias {
+            targets.push(alias);
+        }
+        if Self::forced_partial_index_predicate_covered(predicate, available, &targets) {
+            Ok(())
+        } else {
+            Err(FrankenError::FunctionError("no query solution".to_owned()))
+        }
+    }
+
+    /// Validate a forced partial `INDEXED BY` on an UPDATE/DELETE target the same
+    /// way SELECT sources are validated (bd-wlo29 L10). The target relation is
+    /// constrained by the statement's own WHERE clause, so those conjuncts are
+    /// the available cover set. Missing-index *existence* is reported by the
+    /// compile / EXPLAIN paths; this only adds the partial-predicate cover check.
+    fn validate_dml_target_partial_index(
+        &self,
+        table: &fsqlite_ast::QualifiedTableRef,
+        where_clause: Option<&Expr>,
+    ) -> Result<()> {
+        let Some(fsqlite_ast::IndexHint::IndexedBy(idx)) = &table.index_hint else {
+            return Ok(());
+        };
+        let Some(ti) = self.schema_index_of(&table.name.name) else {
+            return Ok(());
+        };
+        let (_, partial_predicate) = self.resolve_forced_index_partial_predicate(ti, idx);
+        if let Some(predicate) = &partial_predicate {
+            let mut available: Vec<&Expr> = Vec::new();
+            if let Some(where_expr) = where_clause {
+                Self::collect_and_conjuncts(where_expr, &mut available);
+            }
+            Self::forced_partial_cover_or_err(
+                predicate,
+                &available,
+                table.name.name.as_str(),
+                table.alias.as_deref(),
+            )?;
         }
         Ok(())
     }
