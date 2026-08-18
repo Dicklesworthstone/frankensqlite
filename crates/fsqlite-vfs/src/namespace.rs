@@ -446,6 +446,22 @@ pub struct DatabaseNamespaceBinding {
     lease: Mutex<BindingLease>,
 }
 
+/// Outcome of re-probing whether a binding's bound generation is still
+/// installed at its stable path. Distinguishing a *proven* supersession from a
+/// transient probe failure is what keeps
+/// [`DatabaseNamespaceBinding::guard_generation`] from releasing a still-live
+/// writer's advisory locks on a transient stat error (bd-ep8y9).
+enum GenerationProbe {
+    /// The stable path still names the bound file identity.
+    Current,
+    /// The stable path provably no longer names this generation: a different
+    /// inode, a non-file, or nothing (`ENOENT`) now occupies it.
+    Superseded,
+    /// The probe itself failed for a transient or ambiguous reason; the bound
+    /// generation's liveness is unknown and the lease must be left intact.
+    ProbeFailed(FrankenError),
+}
+
 impl DatabaseNamespaceBinding {
     /// The single absolute path from which all companion names must derive.
     #[must_use]
@@ -637,26 +653,108 @@ impl DatabaseNamespaceBinding {
 
     /// bd-97kjm ask #3 — generation-bound teardown.
     ///
-    /// Re-probe the stable pathname's file identity. While the bound generation
-    /// is still installed this is a pure, side-effect-free check identical to
-    /// [`Self::validate_path_identity`]. When the probe proves the generation
-    /// changed — a recovery flow quarantined or renamed the main file and a new
-    /// inode now occupies the path — this additionally [`Self::quiesce`]s the
-    /// binding, so the retained `use`/`gate` descriptors are closed rather than
-    /// left pointing at the superseded generation. The stale generation is
-    /// error, so a still-valid live connection is never cut off; only a binding
-    /// whose main file is provably gone releases its state.
+    /// Re-probe the stable pathname's file identity and act on the three
+    /// distinguishable outcomes (bd-ep8y9):
+    ///
+    /// * **Current** — the path still names this binding's identity: a pure,
+    ///   side-effect-free check identical to [`Self::validate_path_identity`].
+    /// * **Superseded** — the probe *proves* the generation changed (a different
+    ///   inode, a non-file, or nothing at all now occupies the path — the
+    ///   recovery quarantine/rename case). Only then does this [`Self::quiesce`]
+    ///   the binding, closing the retained `use`/`gate` descriptors so they can
+    ///   never write through the superseded generation. Returns `Err`.
+    /// * **Probe failure** — the identity could not be read at all (a transient
+    ///   `EIO`/`EACCES`/`ESTALE`, an ambiguous open error): liveness is UNKNOWN.
+    ///   The lease is left fully intact and `Err` is returned so the caller
+    ///   fails the operation *closed* with its advisory locks still held.
+    ///
+    /// The last case is the whole point of the split-brain fix: a transient stat
+    /// error must NOT release the namespace locks of a still-live writer. If it
+    /// did, this process would keep writing lock-free while a second process
+    /// could win admission on the released `-ns-use`/`-ns-gate` locks. For the
+    /// same reason, once the lease is already [`BindingLease::Quiesced`] this
+    /// fails closed unconditionally: a later successful probe must never report
+    /// a lock-less binding as a live generation.
     ///
     /// This never mutates the main database, the quarantined old inode, or the
     /// persistent sidecars: identity is probed with `symlink_metadata` on Unix
     /// (no descriptor, so no `fcntl` record lock is disturbed — bd-qduu1) and
     /// the release path only unlocks and closes already-held descriptors.
     pub fn guard_generation(&self) -> Result<()> {
-        match self.validate_path_identity() {
-            Ok(()) => Ok(()),
-            Err(error) => {
+        // Fail closed once quiesced: a quiesced lease owns no advisory locks, so
+        // reporting its generation as live would let this lock-less binding keep
+        // writing while another process holds the namespace locks (bd-ep8y9).
+        if self.is_quiesced() {
+            return Err(cannot_open(&self.stable_path));
+        }
+        match self.probe_generation() {
+            GenerationProbe::Current => Ok(()),
+            GenerationProbe::Superseded => {
+                // The bound generation is provably gone: release the retained
+                // descriptors/locks so they cannot write through the superseded
+                // inode. A still-live connection is never reached here.
                 self.quiesce();
-                Err(error)
+                Err(cannot_open(&self.stable_path))
+            }
+            // Transient/ambiguous probe failure: identity unknown. Never release
+            // the lease — dropping a live writer's locks here is the split-brain
+            // bug (bd-ep8y9). Surface the error so the caller fails closed.
+            GenerationProbe::ProbeFailed(error) => Err(error),
+        }
+    }
+
+    /// Classify a generation re-probe into the three outcomes acted on by
+    /// [`Self::guard_generation`]. Separating a *proven* supersession from a
+    /// transient probe failure is load-bearing: only the former may release the
+    /// lease (bd-ep8y9). The probe never opens the main database file on Unix
+    /// (`symlink_metadata`, no descriptor — bd-qduu1).
+    fn probe_generation(&self) -> GenerationProbe {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            match std::fs::symlink_metadata(&self.stable_path) {
+                Ok(metadata) => {
+                    if metadata.is_file()
+                        && FileIdentity::from_unix_parts(metadata.dev(), metadata.ino())
+                            == self.identity
+                    {
+                        GenerationProbe::Current
+                    } else {
+                        // Stat succeeded, but a different inode (or a non-file)
+                        // now occupies the path: provably superseded.
+                        GenerationProbe::Superseded
+                    }
+                }
+                // ENOENT: the main file was renamed/unlinked off the stable path
+                // — a proven supersession (the bd-97kjm quarantine case), not a
+                // transient read failure.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    GenerationProbe::Superseded
+                }
+                // EIO / EACCES / ESTALE / …: the identity could not be read.
+                // Liveness is unknown — leave the lease intact, fail closed.
+                Err(_) => GenerationProbe::ProbeFailed(cannot_open(&self.stable_path)),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            // Windows: closing a handle releases *that handle's* byte-range
+            // locks, so a probe-error quiesce would drop this binding's
+            // `-ns-use`/`-ns-gate` locks exactly as on Unix. Classify
+            // conservatively — only a successfully-read mismatching identity
+            // supersedes; every open/identity failure is a transient probe
+            // failure (fail closed, lease retained), never a supersession.
+            match open_identity_probe(&self.stable_path) {
+                Ok(file) => match FileIdentity::from_file(&file) {
+                    Ok(Some(current)) if current == self.identity => GenerationProbe::Current,
+                    Ok(Some(_)) => GenerationProbe::Superseded,
+                    Ok(None) | Err(_) => {
+                        GenerationProbe::ProbeFailed(cannot_open(&self.stable_path))
+                    }
+                },
+                Err(_) => GenerationProbe::ProbeFailed(cannot_open(&self.stable_path)),
             }
         }
     }
@@ -2410,6 +2508,119 @@ mod tests {
 
         // Idempotent: guarding a quiesced binding stays fail-closed.
         assert!(binding.guard_generation().is_err());
+        binding.quiesce();
+        drop(binding);
+    }
+
+    #[test]
+    fn generation_guard_fails_closed_after_supersession_then_restore() {
+        // bd-ep8y9: once a probe releases the lease (here via an ENOENT
+        // rename-away supersession), a LATER successful probe must NOT report
+        // the lock-less binding as a live generation. Before the fix
+        // guard_generation returned Ok after the file was renamed back, leaving
+        // this process writing with no advisory locks while a second process
+        // could win admission on the released -ns-use/-ns-gate locks —
+        // cross-process split-brain.
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("fail-closed.db");
+        let moved = dir.path().join("fail-closed.moved.db");
+        let identity = create_database(&database, b"live generation");
+
+        let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit generation")
+            .bind(identity)
+            .expect("bind generation");
+        binding.finish_bootstrap().expect("publish generation");
+        binding
+            .guard_generation()
+            .expect("live generation passes the guard");
+        assert!(!binding.is_quiesced());
+
+        // Rename the main file off the stable path: an ENOENT supersession
+        // releases the lease (quiesce) and reports Err.
+        fs::rename(&database, &moved).expect("rename main file away");
+        assert!(matches!(
+            binding.guard_generation(),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert!(
+            binding.is_quiesced(),
+            "an ENOENT supersession releases the lease"
+        );
+
+        // Restore the ORIGINAL inode at the stable path. The path now names the
+        // bound identity again, but the lease is already quiesced (lock-free):
+        // the guard MUST stay fail-closed rather than resurrect a lock-less
+        // binding that a second writer could race.
+        fs::rename(&moved, &database).expect("rename main file back");
+        assert!(
+            binding.guard_generation().is_err(),
+            "a quiesced binding must fail closed even once its identity reappears"
+        );
+        assert!(binding.is_quiesced(), "the lease stays quiesced");
+
+        binding.quiesce();
+        drop(binding);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn generation_guard_transient_probe_error_keeps_lease() {
+        // bd-ep8y9 core: a transient stat failure (EACCES here, via a parent
+        // directory stripped of search permission) must NOT quiesce a still-live
+        // binding. Before the fix ANY validate_path_identity error quiesced,
+        // releasing the namespace locks of a live writer -> split-brain. The
+        // generation is installed the whole time; only the probe transiently
+        // cannot read it.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().expect("tempdir");
+        let guarded = dir.path().join("transient");
+        fs::create_dir(&guarded).expect("create guarded dir");
+        let database = guarded.join("transient.db");
+        let identity = create_database(&database, b"live generation");
+
+        let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit generation")
+            .bind(identity)
+            .expect("bind generation");
+        binding.finish_bootstrap().expect("publish generation");
+        binding
+            .guard_generation()
+            .expect("live generation passes the guard");
+        assert!(!binding.is_quiesced());
+
+        // Strip search permission from the parent directory so symlink_metadata
+        // on the child fails with EACCES. If we are root (perms bypassed) the
+        // probe still succeeds; skip the assertions rather than assert a false
+        // negative.
+        let original = fs::metadata(&guarded)
+            .expect("stat guarded dir")
+            .permissions();
+        fs::set_permissions(&guarded, fs::Permissions::from_mode(0o000))
+            .expect("strip guarded dir perms");
+        let probe_blocked = fs::symlink_metadata(&database).is_err();
+
+        if probe_blocked {
+            // The transient probe failure surfaces Err WITHOUT quiescing.
+            assert!(
+                binding.guard_generation().is_err(),
+                "a transient probe failure fails the operation closed"
+            );
+            assert!(
+                !binding.is_quiesced(),
+                "a transient probe failure must NOT release a live writer's lease (bd-ep8y9)"
+            );
+        }
+
+        // Restore perms; the generation was live throughout, so the guard passes
+        // and the lease — never released — is still intact.
+        fs::set_permissions(&guarded, original).expect("restore guarded dir perms");
+        binding
+            .guard_generation()
+            .expect("guard passes once the probe recovers");
+        assert!(!binding.is_quiesced());
+
         binding.quiesce();
         drop(binding);
     }
