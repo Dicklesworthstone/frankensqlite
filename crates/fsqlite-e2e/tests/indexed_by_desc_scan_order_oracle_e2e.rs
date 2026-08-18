@@ -42,7 +42,9 @@ async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
 
 /// Query rusqlite (= C SQLite), preserving row order (no sort).
 fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("csql prep `{sql}`: {e}"));
+    let mut stmt = conn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("csql prep `{sql}`: {e}"));
     let n = stmt.column_count();
     stmt.query_map([], |row| {
         let mut out = Vec::with_capacity(n);

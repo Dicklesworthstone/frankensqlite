@@ -27,15 +27,25 @@ fn render_frank(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => format!("i:{n}"),
         SqliteValue::Float(f) => format!("f:{f}"),
         SqliteValue::Text(s) => format!("t:{s}"),
-        SqliteValue::Blob(b) => format!("x:{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "x:{}",
+            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+        ),
     }
 }
 
 /// Write a fixture with frank to `path`: set page_size + journal_mode, run the
 /// schema/data statements, checkpoint (fold any WAL into the main db), close.
-async fn frank_write(path: &Path, page_size: u32, journal_mode: &str, stmts: &[&str]) -> Result<(), String> {
+async fn frank_write(
+    path: &Path,
+    page_size: u32,
+    journal_mode: &str,
+    stmts: &[&str],
+) -> Result<(), String> {
     let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_owned())?;
-    let conn = Connection::open(path_str).await.map_err(|e| format!("open: {e}"))?;
+    let conn = Connection::open(path_str)
+        .await
+        .map_err(|e| format!("open: {e}"))?;
     conn.execute(&format!("PRAGMA page_size={page_size};"))
         .await
         .map_err(|e| format!("page_size: {e}"))?;
@@ -43,7 +53,9 @@ async fn frank_write(path: &Path, page_size: u32, journal_mode: &str, stmts: &[&
         .await
         .map_err(|e| format!("journal_mode: {e}"))?;
     for s in stmts {
-        conn.execute(s).await.map_err(|e| format!("stmt `{s}`: {e}"))?;
+        conn.execute(s)
+            .await
+            .map_err(|e| format!("stmt `{s}`: {e}"))?;
     }
     // Fold the WAL back into the main database so a plain reader sees everything.
     let _ = conn.query("PRAGMA wal_checkpoint(TRUNCATE);").await;
@@ -52,12 +64,20 @@ async fn frank_write(path: &Path, page_size: u32, journal_mode: &str, stmts: &[&
 }
 
 /// Write the same fixture with stock C SQLite (rusqlite) to `path`.
-fn stock_write(path: &Path, page_size: u32, journal_mode: &str, stmts: &[&str]) -> Result<(), String> {
+fn stock_write(
+    path: &Path,
+    page_size: u32,
+    journal_mode: &str,
+    stmts: &[&str],
+) -> Result<(), String> {
     let conn = rusqlite::Connection::open(path).map_err(|e| format!("open: {e}"))?;
-    conn.execute_batch(&format!("PRAGMA page_size={page_size}; PRAGMA journal_mode={journal_mode};"))
-        .map_err(|e| format!("pragmas: {e}"))?;
+    conn.execute_batch(&format!(
+        "PRAGMA page_size={page_size}; PRAGMA journal_mode={journal_mode};"
+    ))
+    .map_err(|e| format!("pragmas: {e}"))?;
     for s in stmts {
-        conn.execute_batch(s).map_err(|e| format!("stmt `{s}`: {e}"))?;
+        conn.execute_batch(s)
+            .map_err(|e| format!("stmt `{s}`: {e}"))?;
     }
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     Ok(())
@@ -87,16 +107,23 @@ fn read_rows_rusqlite(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Stri
                     rusqlite::types::ValueRef::Null => "NULL".to_owned(),
                     rusqlite::types::ValueRef::Integer(x) => format!("i:{x}"),
                     rusqlite::types::ValueRef::Real(f) => format!("f:{f}"),
-                    rusqlite::types::ValueRef::Text(t) => format!("t:{}", String::from_utf8_lossy(t)),
+                    rusqlite::types::ValueRef::Text(t) => {
+                        format!("t:{}", String::from_utf8_lossy(t))
+                    }
                     rusqlite::types::ValueRef::Blob(b) => {
-                        format!("x:{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+                        format!(
+                            "x:{}",
+                            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+                        )
                     }
                 });
             }
             Ok(cells.join(","))
         })
         .map_err(|e| format!("map: {e}"))?;
-    let mut rows: Vec<String> = iter.collect::<Result<_, _>>().map_err(|e| format!("run: {e}"))?;
+    let mut rows: Vec<String> = iter
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("run: {e}"))?;
     rows.sort();
     Ok(rows)
 }
@@ -104,12 +131,20 @@ fn read_rows_rusqlite(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Stri
 /// With frank: sorted rows of `verify` from an on-disk file.
 async fn frank_read(path: &Path, verify: &str) -> Result<Vec<String>, String> {
     let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_owned())?;
-    let conn = Connection::open(path_str).await.map_err(|e| format!("open: {e}"))?;
+    let conn = Connection::open(path_str)
+        .await
+        .map_err(|e| format!("open: {e}"))?;
     let out = match conn.query(verify).await {
         Ok(rs) => {
             let mut rows: Vec<String> = rs
                 .iter()
-                .map(|row| row.values().iter().map(render_frank).collect::<Vec<_>>().join(","))
+                .map(|row| {
+                    row.values()
+                        .iter()
+                        .map(render_frank)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
                 .collect();
             rows.sort();
             Ok(rows)
@@ -121,65 +156,137 @@ async fn frank_read(path: &Path, verify: &str) -> Result<Vec<String>, String> {
 }
 
 /// (name, page_size, journal_mode, setup stmts, verify query).
-type Fixture = (&'static str, u32, &'static str, &'static [&'static str], &'static str);
+type Fixture = (
+    &'static str,
+    u32,
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+);
 
 fn fixtures() -> Vec<Fixture> {
     vec![
-        ("basic_delete_4096", 4096, "DELETE", &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, v REAL)",
-            "INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.5),(3,'c',3.5)",
-        ], "SELECT id,name,v FROM t"),
-        ("basic_wal_4096", 4096, "WAL", &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)",
-            "INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z')",
-        ], "SELECT id,name FROM t"),
-        ("page_size_512", 512, "DELETE", &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
-            "INSERT INTO t VALUES (1,100),(2,200),(3,300)",
-        ], "SELECT id,v FROM t"),
-        ("page_size_65536", 65536, "DELETE", &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
-            "INSERT INTO t VALUES (1,100),(2,200)",
-        ], "SELECT id,v FROM t"),
-        ("index_and_multitable", 4096, "WAL", &[
-            "CREATE TABLE a(id INTEGER PRIMARY KEY, k TEXT)",
-            "CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER, val INTEGER)",
-            "CREATE INDEX ix ON b(aid)",
-            "INSERT INTO a VALUES (1,'one'),(2,'two')",
-            "INSERT INTO b VALUES (10,1,111),(11,1,222),(12,2,333)",
-        ], "SELECT b.val, a.k FROM b JOIN a ON b.aid=a.id"),
-        ("overflow_large_text", 4096, "DELETE", &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, big TEXT)",
-            // A 20000-char string forces an overflow-page chain in the on-disk
-            // b-tree cell (printf width conformance already proven by bd-cgkwp).
-            "INSERT INTO t VALUES (1, printf('%020000d', 7))",
-            "INSERT INTO t VALUES (2, 'small')",
-        ], "SELECT id, length(big), substr(big,1,4) FROM t"),
-        ("blobs_and_nulls", 4096, "DELETE", &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB, n INTEGER)",
-            "INSERT INTO t VALUES (1, x'deadbeef', NULL)",
-            "INSERT INTO t VALUES (2, x'00', 5)",
-            "INSERT INTO t VALUES (3, NULL, NULL)",
-        ], "SELECT id, b, n FROM t"),
-        ("without_rowid", 4096, "DELETE", &[
-            "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
-            "INSERT INTO t VALUES ('alpha',1),('beta',2),('gamma',3)",
-        ], "SELECT k,v FROM t"),
-        ("many_rows_btree_split", 4096, "DELETE", &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
-            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<500) INSERT INTO t SELECT i, i*i FROM c",
-        ], "SELECT count(*), sum(v), max(v) FROM t"),
-        ("delete_then_freelist", 4096, "DELETE", &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
-            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<300) INSERT INTO t SELECT i, i FROM c",
-            "DELETE FROM t WHERE id % 2 = 0",
-        ], "SELECT count(*), sum(v) FROM t"),
-        ("autoincrement", 4096, "DELETE", &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
-            "INSERT INTO t(v) VALUES ('a'),('b'),('c')",
-            "DELETE FROM t WHERE id=3",
-            "INSERT INTO t(v) VALUES ('d')",
-        ], "SELECT id,v FROM t"),
+        (
+            "basic_delete_4096",
+            4096,
+            "DELETE",
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, v REAL)",
+                "INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.5),(3,'c',3.5)",
+            ],
+            "SELECT id,name,v FROM t",
+        ),
+        (
+            "basic_wal_4096",
+            4096,
+            "WAL",
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z')",
+            ],
+            "SELECT id,name FROM t",
+        ),
+        (
+            "page_size_512",
+            512,
+            "DELETE",
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t VALUES (1,100),(2,200),(3,300)",
+            ],
+            "SELECT id,v FROM t",
+        ),
+        (
+            "page_size_65536",
+            65536,
+            "DELETE",
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t VALUES (1,100),(2,200)",
+            ],
+            "SELECT id,v FROM t",
+        ),
+        (
+            "index_and_multitable",
+            4096,
+            "WAL",
+            &[
+                "CREATE TABLE a(id INTEGER PRIMARY KEY, k TEXT)",
+                "CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER, val INTEGER)",
+                "CREATE INDEX ix ON b(aid)",
+                "INSERT INTO a VALUES (1,'one'),(2,'two')",
+                "INSERT INTO b VALUES (10,1,111),(11,1,222),(12,2,333)",
+            ],
+            "SELECT b.val, a.k FROM b JOIN a ON b.aid=a.id",
+        ),
+        (
+            "overflow_large_text",
+            4096,
+            "DELETE",
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, big TEXT)",
+                // A 20000-char string forces an overflow-page chain in the on-disk
+                // b-tree cell (printf width conformance already proven by bd-cgkwp).
+                "INSERT INTO t VALUES (1, printf('%020000d', 7))",
+                "INSERT INTO t VALUES (2, 'small')",
+            ],
+            "SELECT id, length(big), substr(big,1,4) FROM t",
+        ),
+        (
+            "blobs_and_nulls",
+            4096,
+            "DELETE",
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB, n INTEGER)",
+                "INSERT INTO t VALUES (1, x'deadbeef', NULL)",
+                "INSERT INTO t VALUES (2, x'00', 5)",
+                "INSERT INTO t VALUES (3, NULL, NULL)",
+            ],
+            "SELECT id, b, n FROM t",
+        ),
+        (
+            "without_rowid",
+            4096,
+            "DELETE",
+            &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('alpha',1),('beta',2),('gamma',3)",
+            ],
+            "SELECT k,v FROM t",
+        ),
+        (
+            "many_rows_btree_split",
+            4096,
+            "DELETE",
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+                "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<500) INSERT INTO t SELECT i, i*i FROM c",
+            ],
+            "SELECT count(*), sum(v), max(v) FROM t",
+        ),
+        (
+            "delete_then_freelist",
+            4096,
+            "DELETE",
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+                "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<300) INSERT INTO t SELECT i, i FROM c",
+                "DELETE FROM t WHERE id % 2 = 0",
+            ],
+            "SELECT count(*), sum(v) FROM t",
+        ),
+        (
+            "autoincrement",
+            4096,
+            "DELETE",
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+                "INSERT INTO t(v) VALUES ('a'),('b'),('c')",
+                "DELETE FROM t WHERE id=3",
+                "INSERT INTO t(v) VALUES ('d')",
+            ],
+            "SELECT id,v FROM t",
+        ),
     ]
 }
 
@@ -214,12 +321,16 @@ fn cross_engine_ondisk_format_probe() {
             // (1) Can stock C SQLite read the file frank wrote?
             let (fr_integ, fr_rows) = stock_read(&frank_db, verify);
             if !fr_integ.starts_with("ok") {
-                println!("FRANK-FILE-INTEGRITY [{name}] stock integrity_check on frank file: {fr_integ}");
+                println!(
+                    "FRANK-FILE-INTEGRITY [{name}] stock integrity_check on frank file: {fr_integ}"
+                );
                 diverged += 1;
             }
             match (&fr_rows, &st_rows) {
                 (Ok(a), Ok(b)) if a != b => {
-                    println!("STOCK-READS-FRANK-DIFF [{name}] {verify}\n    frank-file: {a:?}\n    stock-file: {b:?}");
+                    println!(
+                        "STOCK-READS-FRANK-DIFF [{name}] {verify}\n    frank-file: {a:?}\n    stock-file: {b:?}"
+                    );
                     diverged += 1;
                 }
                 (Err(e), _) => {
@@ -237,7 +348,9 @@ fn cross_engine_ondisk_format_probe() {
             let fr_of_stock = frank_read(&stock_db, verify).await;
             match (&fr_of_stock, &st_rows) {
                 (Ok(a), Ok(b)) if a != b => {
-                    println!("FRANK-READS-STOCK-DIFF [{name}] {verify}\n    frank-read: {a:?}\n    stock-read: {b:?}");
+                    println!(
+                        "FRANK-READS-STOCK-DIFF [{name}] {verify}\n    frank-read: {a:?}\n    stock-read: {b:?}"
+                    );
                     diverged += 1;
                 }
                 (Err(e), _) => {
@@ -247,6 +360,115 @@ fn cross_engine_ondisk_format_probe() {
                 _ => {}
             }
         }
-        println!("\nPROBE SUMMARY: {} fixtures, {} divergences", fixtures().len(), diverged);
+        println!(
+            "\nPROBE SUMMARY: {} fixtures, {} divergences",
+            fixtures().len(),
+            diverged
+        );
+    });
+}
+
+/// Write a WAL fixture with frank but do NOT checkpoint — the committed data
+/// stays in the `-wal` sidecar. Tests whether frank's WAL is in stock-replayable
+/// SQLite-WAL format (frank uses MVCC page-versioning internally).
+async fn frank_write_wal_no_checkpoint(path: &Path, stmts: &[&str]) -> Result<(), String> {
+    let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_owned())?;
+    let conn = Connection::open(path_str)
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+    conn.execute("PRAGMA page_size=4096;")
+        .await
+        .map_err(|e| format!("page_size: {e}"))?;
+    conn.execute("PRAGMA journal_mode=WAL;")
+        .await
+        .map_err(|e| format!("journal_mode: {e}"))?;
+    for s in stmts {
+        conn.execute(s)
+            .await
+            .map_err(|e| format!("stmt `{s}`: {e}"))?;
+    }
+    // Deliberately NO checkpoint: leave the committed data in the -wal sidecar.
+    conn.close_without_checkpoint()
+        .await
+        .map_err(|e| format!("close: {e}"))?;
+    Ok(())
+}
+
+/// The uncheckpointed-WAL sidecar test: the divergence the SQL and checkpointed
+/// probes can't reach. Frank commits to WAL without checkpointing; a fresh stock
+/// C SQLite reader must replay the `-wal` and see the committed data. If frank's
+/// sidecar is not stock-WAL-format, stock sees only the (empty) main db.
+#[test]
+#[ignore = "uncheckpointed WAL-sidecar probe (not a keeper): stock must replay frank's -wal"]
+fn cross_engine_uncheckpointed_wal_probe() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal_fixtures: &[(&str, &[&str], &str)] = &[
+            (
+                "wal_insert",
+                &[
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+                    "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')",
+                ],
+                "SELECT id,v FROM t",
+            ),
+            (
+                "wal_multi_txn",
+                &[
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+                    "INSERT INTO t VALUES (1,10)",
+                    "INSERT INTO t VALUES (2,20)",
+                    "UPDATE t SET v=v+1 WHERE id=1",
+                ],
+                "SELECT id,v FROM t",
+            ),
+        ];
+        let mut diverged = 0usize;
+        for &(name, stmts, verify) in wal_fixtures {
+            let db = dir.path().join(format!("{name}.db"));
+            if let Err(e) = frank_write_wal_no_checkpoint(&db, stmts).await {
+                println!("FRANK-WAL-WRITE-FAIL [{name}] {e}");
+                diverged += 1;
+                continue;
+            }
+            let wal = dir.path().join(format!("{name}.db-wal"));
+            let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            // Stock reads the frank main db + must replay frank's -wal sidecar.
+            let (integ, rows) = stock_read(&db, verify);
+            // Baseline: same data written by stock WAL-no-checkpoint, read by a
+            // fresh stock reader. Keep the writer connection ALIVE during the read
+            // so its -wal is not checkpointed (a fresh reader must replay it).
+            let stock_db = dir.path().join(format!("{name}_stock.db"));
+            let writer = rusqlite::Connection::open(&stock_db).unwrap();
+            writer
+                .execute_batch(
+                    "PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;",
+                )
+                .unwrap();
+            for s in stmts {
+                writer.execute_batch(s).unwrap();
+            }
+            let (_st_integ, st_rows) = stock_read(&stock_db, verify);
+            drop(writer);
+            println!("[{name}] frank -wal size={wal_len} bytes; stock-on-frank integ={integ}");
+            match (&rows, &st_rows) {
+                (Ok(a), Ok(b)) if a != b => {
+                    println!(
+                        "WAL-SIDECAR-DIVERGE [{name}] {verify}\n    stock-reads-frank: {a:?}\n    stock-baseline:    {b:?}"
+                    );
+                    diverged += 1;
+                }
+                (Err(e), _) => {
+                    println!("WAL-SIDECAR-ERR [{name}] {e}");
+                    diverged += 1;
+                }
+                _ => {}
+            }
+        }
+        println!(
+            "\nWAL PROBE SUMMARY: {} fixtures, {} divergences",
+            wal_fixtures.len(),
+            diverged
+        );
     });
 }

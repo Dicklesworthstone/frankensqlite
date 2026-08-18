@@ -210,8 +210,11 @@ fn aggregate_window_tvf_divergence_probe() {
         let f = Connection::open(":memory:").await.expect("open frank");
         let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
         for s in SETUP {
-            f.execute(s).await.unwrap_or_else(|e| panic!("frank setup `{s}`: {e}"));
-            r.execute_batch(s).unwrap_or_else(|e| panic!("csql setup `{s}`: {e}"));
+            f.execute(s)
+                .await
+                .unwrap_or_else(|e| panic!("frank setup `{s}`: {e}"));
+            r.execute_batch(s)
+                .unwrap_or_else(|e| panic!("csql setup `{s}`: {e}"));
         }
         let mut diverged = 0usize;
         let mut both_err = 0usize;
