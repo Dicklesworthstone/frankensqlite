@@ -18982,8 +18982,25 @@ fn codegen_select_group_by_aggregate(
         for key in &group_by_keys {
             match key {
                 GroupByKey::Column(col_idx) => {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    b.emit_op(Opcode::Column, cursor, *col_idx as i32, reg, P4::None, 0);
+                    // bd-hx3zu (GH#227 sibling): a VIRTUAL generated column is not
+                    // materialized in the record — reading it raw here grouped on
+                    // the NULL placeholder. Route it through the canonical reader
+                    // so the generating expression is computed on read, exactly
+                    // as single-table projection / emit_join_expr do.
+                    if virtual_generated_column_expr(&table.columns[*col_idx]).is_some() {
+                        emit_table_column_read(
+                            b,
+                            cursor,
+                            table,
+                            table_alias,
+                            Some(schema),
+                            *col_idx,
+                            reg,
+                        );
+                    } else {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        b.emit_op(Opcode::Column, cursor, *col_idx as i32, reg, P4::None, 0);
+                    }
                 }
                 GroupByKey::Expression(expr) => {
                     emit_expr(b, expr, reg, Some(&scan_ctx));
@@ -18992,8 +19009,14 @@ fn codegen_select_group_by_aggregate(
             reg += 1;
         }
         for &col_idx in &agg_arg_table_cols {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+            // bd-hx3zu (GH#227 sibling): compute a VIRTUAL generated column used
+            // as an aggregate argument instead of reading its NULL placeholder.
+            if virtual_generated_column_expr(&table.columns[col_idx]).is_some() {
+                emit_table_column_read(b, cursor, table, table_alias, Some(schema), col_idx, reg);
+            } else {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+            }
             reg += 1;
         }
         // Expression-arg aggregates: evaluate each expression into its sorter slot.
