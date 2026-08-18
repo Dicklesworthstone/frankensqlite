@@ -7063,7 +7063,7 @@ impl<'conn> PreparedStatement<'conn> {
     /// error propagates.
     async fn with_same_connection_schema_reprepare<T, Op>(&self, mut op: Op) -> Result<T>
     where
-        Op: std::ops::AsyncFnMut(&PreparedStatement<'conn>) -> Result<T>,
+        Op: std::ops::AsyncFnMut(&Self) -> Result<T>,
     {
         match op(self).await {
             Err(FrankenError::SchemaChanged) if self.schema_change_is_same_connection() => {}
