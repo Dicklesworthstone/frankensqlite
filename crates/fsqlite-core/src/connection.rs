@@ -79846,6 +79846,20 @@ impl Connection {
 
         // Identify ORDER BY terms referencing columns not in the SELECT list.
         // These must be temporarily appended for sorting, then stripped.
+        //
+        // bd-j5sft: strip any COLLATE wrapper from the appended hidden sort
+        // column. The column exists only to carry the ORDER BY term's *value*
+        // (COLLATE never changes a value, only comparison), while each term's
+        // effective collation is resolved per-term inside
+        // `sort_rows_by_order_terms` (an explicit `Expr::Collate` overrides,
+        // else `col_collations[idx]`). If the hidden column kept the COLLATE
+        // wrapper, its `col_collations` entry would report the overriding
+        // collation, and a *sibling* bare term that dedups onto the same
+        // column (e.g. `ORDER BY x COLLATE NOCASE, x` where the output is an
+        // expression like `quote(x)`) would inherit that collation instead of
+        // the column's intrinsic one — silently dropping the tie-breaker.
+        // Storing the intrinsic collation keeps a COLLATE local to the term
+        // that spells it.
         let mut extra_order_exprs: Vec<Expr> = Vec::new();
         for term in &select.order_by {
             if matches!(&term.expr, Expr::Literal(Literal::Integer(_), _)) {
@@ -79860,9 +79874,10 @@ impl Connection {
                     &[],
                     &fts5_rank_table_names,
                 )?;
-                extra_order_exprs.push(term.expr.clone());
+                let hidden_expr = strip_collate_wrappers(&term.expr).clone();
+                extra_order_exprs.push(hidden_expr.clone());
                 expanded_columns.push(ResultColumn::Expr {
-                    expr: term.expr.clone(),
+                    expr: hidden_expr,
                     alias: None,
                 });
             }
