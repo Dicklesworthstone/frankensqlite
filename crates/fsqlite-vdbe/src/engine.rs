@@ -4628,21 +4628,6 @@ impl MemDatabase {
         }
     }
 
-    /// Discard the row image of every table (table structures are kept),
-    /// WITHOUT recording undo ops.
-    ///
-    /// bd-ixf69: used to reset the connection's in-memory mirror to an
-    /// unhydrated state on an in-txn schema-cookie fast-path refresh. The
-    /// mirror is a cache re-hydrated from the authoritative pager, so — exactly
-    /// like the full reload that replaces the whole `MemDatabase` — its stale
-    /// row image is simply discarded, not transactionally undone (the caller
-    /// pairs this with `memdb_rows_loaded = false`, forcing lazy re-hydration).
-    pub fn clear_all_table_rows(&mut self) {
-        for table in self.tables.values_mut() {
-            table.clear();
-        }
-    }
-
     fn alloc_rowid(&mut self, root_page: i32) -> i64 {
         if let Some(table) = self.tables.get_mut(&root_page) {
             let prev_next_rowid = table.next_rowid;

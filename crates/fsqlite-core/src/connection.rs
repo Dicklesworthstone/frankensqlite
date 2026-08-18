@@ -21266,19 +21266,21 @@ impl Connection {
         // sqlite_sequence unconditionally when any autoincrement table
         // exists) so last_insert_rowid stays correct.
         //
-        // bd-ixf69 (restores the schema-reparse-skip perf win bd-dsxu2 reverted):
-        // this per-write in-txn refresh uses the schema-cookie fast path even on
-        // a DIRTY mirror. The prior FK regression (bd-dsxu2) was that the fast
-        // path cleared `memdb_requires_active_txn_reload` while LEAVING the mirror's
-        // stale rows, so an in-txn-deleted FK parent survived as a ghost that
-        // `fk_parent_rowid_fast_lookup` trusted. That is now fixed inside the
-        // fast-path branch itself (reload_memdb_from_txn_with_mode): when it fires
-        // on a dirty mirror it DISCARDS the stale row image
-        // (`clear_all_table_rows` + `memdb_rows_loaded = false`), forcing lazy
-        // re-hydration from the authoritative pager — equivalent to the full
-        // reload's fresh-empty mirror, minus the O(corpus) sqlite_master reparse.
-        // Guarded by test_issue110_fk_parent_cache_invalidated_*.
-        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, true)
+        // bd-dsxu2 REGRESSION FIX: this per-write in-txn refresh must NOT use the
+        // schema-cookie fast path on a DIRTY mirror. Unlike the two from-pager
+        // reload call sites (which use `allow_dirty_schema_only_fast_path=true`),
+        // this call site is `refresh_memdb_from_active_txn_if_dirty` -- the ONLY
+        // per-write path that absorbs in-txn DML row changes into the mirror.
+        // With `true`, the fast path (reload_memdb_from_txn_with_mode's
+        // schema-cookie branch) fires on a dirty mirror and clears
+        // `memdb_requires_active_txn_reload` WITHOUT absorbing those rows, so an
+        // in-txn parent DELETE leaves a ghost parent in the mirror and
+        // `fk_parent_rowid_fast_lookup` then trusts it -> FK constraint silently
+        // bypassed (test_issue110_fk_parent_cache_invalidated_by_delete /
+        // _insert_or_replace). Keep `false` here so a dirty mirror takes the
+        // row-absorbing reload. (Re-doing the schema-reparse-skip perf win
+        // without breaking row-dirty absorption is tracked as bd-ixf69.)
+        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, false)
             .await
     }
 
@@ -83395,18 +83397,6 @@ impl Connection {
                 // Match the Lightweight refresh path in
                 // `try_refresh_prepared_metadata_if_stale` and refresh the cache
                 // here when we have any autoincrement tables to track.
-                // bd-ixf69 (fixes the bd-dsxu2 regression while restoring the
-                // schema-reparse-skip perf win): this fast path may fire on a
-                // DIRTY mirror (`allow_dirty_schema_only_fast_path`), i.e. one
-                // whose row image has NOT absorbed this txn's DML. The schema is
-                // provably unchanged (cookie match) so skipping the sqlite_master
-                // reparse is safe — but the STALE ROWS must not be trusted, or a
-                // ghost row (e.g. an in-txn-deleted FK parent) survives in the
-                // mirror and `fk_parent_rowid_fast_lookup` reads it (bd-dsxu2).
-                // Discard the mirror's row image so row consumers re-hydrate
-                // lazily from the authoritative pager — equivalent to the full
-                // path's fresh-empty `MemDatabase`, minus the reparse.
-                let mirror_row_image_is_stale = self.memdb_requires_active_txn_reload.get();
                 let has_autoincrement_tables = !self.autoincrement_tables.borrow().is_empty();
                 if has_autoincrement_tables {
                     let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn).await?;
@@ -83417,9 +83407,6 @@ impl Connection {
                 // observe this cross-process commit.
                 self.set_memdb_visible_commit_seq_from_publication(bound_visible_commit_seq);
                 *self.change_counter.borrow_mut() = change_counter;
-                if mirror_row_image_is_stale {
-                    self.db.borrow_mut().clear_all_table_rows();
-                }
                 self.memdb_rows_loaded.set(false);
                 self.memdb_requires_active_txn_reload.set(false);
                 self.memdb_storage_count_shortcuts_safe.set(false);
