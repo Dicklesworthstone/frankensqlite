@@ -19586,20 +19586,33 @@ impl Connection {
     #[cfg(feature = "ext-fts5")]
     async fn promote_lazy_fts5_table(&self, table_name: &str) -> Result<()> {
         let key = table_name.to_ascii_uppercase();
-        {
+        let is_contentless = {
             let instances = self.vtab_instances.borrow();
-            let still_lazy = instances
+            let Some(fts5) = instances
                 .get(&key)
                 .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
-                .is_some_and(Fts5Table::is_lazy_on_disk);
-            if !still_lazy {
+            else {
+                return Ok(());
+            };
+            if !fts5.is_lazy_on_disk() {
                 return Ok(());
             }
-        }
+            fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless
+        };
 
         let schema_snapshot: Vec<TableSchema> = self.schema.borrow().clone();
         let alias_snapshot: HashMap<String, usize> = self.rowid_alias_columns.borrow().clone();
-        let content = self
+
+        // A CONTENTLESS table keeps no `_content` rows — its `_data` postings are the
+        // ONLY copy of the corpus. Hydrate the in-memory index from those persisted
+        // segments; rebuilding from (empty) content would blank the index and, on a
+        // subsequent write, permanently drop the corpus. Content-backed tables still
+        // rebuild from their stored `_content`.
+        enum LazyPromoteSource {
+            Content(Vec<(i64, Vec<String>)>),
+            Segments(Box<Fts5ShadowRows>),
+        }
+        let source = self
             .with_integrity_txn(async |cx, txn| {
                 let page1 = txn.get_page(cx, PageNumber::ONE).await?;
                 let header = parse_database_header_checked(page1.as_ref())?;
@@ -19631,17 +19644,35 @@ impl Connection {
                         )));
                     }
                 };
-                self.read_fts5_rootpage_zero_content_rows_for_reload(
-                    cx,
-                    txn,
-                    header.page_size,
-                    header.reserved_per_page,
-                    &schema_snapshot,
-                    &alias_snapshot,
-                    table_name,
-                    &args,
-                )
-                .await
+                if is_contentless {
+                    Ok(LazyPromoteSource::Segments(Box::new(
+                        self.read_fts5_shadow_rows_for_reload(
+                            cx,
+                            txn,
+                            header.page_size,
+                            header.reserved_per_page,
+                            &schema_snapshot,
+                            &alias_snapshot,
+                            table_name,
+                            &args,
+                        )
+                        .await?,
+                    )))
+                } else {
+                    Ok(LazyPromoteSource::Content(
+                        self.read_fts5_rootpage_zero_content_rows_for_reload(
+                            cx,
+                            txn,
+                            header.page_size,
+                            header.reserved_per_page,
+                            &schema_snapshot,
+                            &alias_snapshot,
+                            table_name,
+                            &args,
+                        )
+                        .await?,
+                    ))
+                }
             })
             .await?;
 
@@ -19657,7 +19688,13 @@ impl Connection {
                     "virtual table changed type during promotion: {table_name}"
                 ))
             })?;
-        fts5.rebuild_documents(content);
+        match source {
+            LazyPromoteSource::Content(content) => fts5.rebuild_documents(content),
+            LazyPromoteSource::Segments(rows) => {
+                fts5.bind_shadow_rows(*rows)?;
+                fts5.ensure_shadow_rows_materializable_for_mutation()?;
+            }
+        }
         fts5.clear_lazy_on_disk();
         Ok(())
     }
