@@ -4498,6 +4498,11 @@ const CACHE_PAGES_TABLE_COLUMN_NAME_STRINGS: [&str; 6] = [
 // (e.g. `PRAGMA table_info(t)`), which `execute_pragma` builds.
 const PRAGMA_TABLE_INFO_TVF_COLUMNS: [&str; 6] =
     ["cid", "name", "type", "notnull", "dflt_value", "pk"];
+/// Columns of `PRAGMA function_list` (GH#206 / bd-gh-pragma-introspection):
+/// `name|builtin|type|enc|narg|flags`, matching stock SQLite's introspection
+/// surface.
+const PRAGMA_FUNCTION_LIST_COLUMNS: [&str; 6] =
+    ["name", "builtin", "type", "enc", "narg", "flags"];
 const PRAGMA_TABLE_XINFO_TVF_COLUMNS: [&str; 7] = [
     "cid",
     "name",
@@ -4655,6 +4660,9 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     }
     if name_is("threads") {
         return &["threads"];
+    }
+    if name_is("function_list") {
+        return &PRAGMA_FUNCTION_LIST_COLUMNS;
     }
     if name_is("case_sensitive_like") {
         return &[];
@@ -5094,6 +5102,7 @@ fn pragma_dispatches_without_schema(name: &str) -> bool {
         "database_list",
         "table_list",
         "collation_list",
+        "function_list",
         "data_version",
         "encoding",
     ]
@@ -65970,6 +65979,8 @@ impl Connection {
             "fsqlite.concurrency" | "concurrency" | "fsqlite_concurrency" => {
                 Ok(self.concurrency_model_rows())
             }
+            // GH#206 (bd-gh-pragma-introspection): the built-in function catalog.
+            "function_list" => Ok(self.pragma_function_list_rows()),
             // ── AAC-P6: statement micro-batcher knobs ──────────────────────
             // `fsqlite.stmt_microbatch`         — enable/disable (SAFE=on)
             // `fsqlite.stmt_microbatch_max_r`   — consecutive-call row budget
@@ -68231,6 +68242,38 @@ impl Connection {
     /// divergence explicit so callers do not silently assume SQLite's
     /// single-writer WAL contract. It is purely observational and changes
     /// no behavior. See `docs/concurrency-contract.md`.
+    /// Rows for `PRAGMA function_list` (GH#206 / bd-gh-pragma-introspection):
+    /// the built-in SQL function catalog, one row per registered name/arity.
+    /// Columns are `name|builtin|type|enc|narg|flags`, matching stock SQLite's
+    /// introspection surface. `type` is `s`/`a`/`w` for scalar/aggregate/window;
+    /// `builtin` is always 1 (every entry is a runtime built-in); `enc` is
+    /// always `utf8` (the engine is UTF-8 internally); `flags` is 0 (SQLite's
+    /// internal flag bitmask has no clean-room equivalent and is outside the
+    /// introspection contract). Sourced from the authoritative runtime inventory
+    /// so it cannot drift from the actual registration path.
+    fn pragma_function_list_rows(&self) -> Vec<Row> {
+        builtin_function_surface_inventory()
+            .iter()
+            .map(|entry| {
+                let type_char = match entry.family {
+                    BuiltinFunctionFamily::Scalar => "s",
+                    BuiltinFunctionFamily::Aggregate => "a",
+                    BuiltinFunctionFamily::Window => "w",
+                };
+                Row {
+                    values: vec![
+                        SqliteValue::Text(entry.name.clone().into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text(type_char.into()),
+                        SqliteValue::Text("utf8".into()),
+                        SqliteValue::Integer(i64::from(entry.num_args)),
+                        SqliteValue::Integer(0),
+                    ],
+                }
+            })
+            .collect()
+    }
+
     fn concurrency_model_rows(&self) -> Vec<Row> {
         // Report journal_mode exactly as `PRAGMA journal_mode` does: the raw
         // connection-local state. Its read path applies no :memory: rewrite
