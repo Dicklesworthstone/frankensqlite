@@ -52384,13 +52384,16 @@ impl Connection {
 
         for row in replacement_rows {
             max_rowid = max_rowid.saturating_add(1).max(1);
-            let record = serialize_record(&[
-                SqliteValue::Text(row.table_name.clone().into()),
-                row.index_name.as_ref().map_or(SqliteValue::Null, |name| {
-                    SqliteValue::Text(name.clone().into())
-                }),
-                SqliteValue::Text(row.stat.clone().into()),
-            ]);
+            let record = serialize_record_with_encoding(
+                &[
+                    SqliteValue::Text(row.table_name.clone().into()),
+                    row.index_name.as_ref().map_or(SqliteValue::Null, |name| {
+                        SqliteValue::Text(name.clone().into())
+                    }),
+                    SqliteValue::Text(row.stat.clone().into()),
+                ],
+                self.db_text_encoding.get(),
+            );
             cursor.table_insert(cx, max_rowid, &record).await?;
         }
 
@@ -52511,10 +52514,13 @@ impl Connection {
             max_rowid.saturating_add(1).max(1)
         };
 
-        let record = serialize_record(&[
-            SqliteValue::Text(table_name.into()),
-            SqliteValue::Integer(seq),
-        ]);
+        let record = serialize_record_with_encoding(
+            &[
+                SqliteValue::Text(table_name.into()),
+                SqliteValue::Integer(seq),
+            ],
+            self.db_text_encoding.get(),
+        );
         cursor.table_insert(cx, rowid, &record).await?;
         tracing::trace!(table = table_name, seq, rowid, "sqlite_sequence upsert");
         Ok(())
@@ -52655,10 +52661,13 @@ impl Connection {
                     });
                 }
                 cursor.delete(cx).await?;
-                let record = serialize_record(&[
-                    SqliteValue::Text(new_name.into()),
-                    seq.clone(),
-                ]);
+                let record = serialize_record_with_encoding(
+                    &[
+                        SqliteValue::Text(new_name.into()),
+                        seq.clone(),
+                    ],
+                    self.db_text_encoding.get(),
+                );
                 cursor.table_insert(cx, *rowid, &record).await?;
             }
             tracing::trace!(old = old_name, new = new_name, rows = matching_rows.len(), "sqlite_sequence rename entries");
