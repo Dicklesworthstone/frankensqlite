@@ -19099,6 +19099,13 @@ impl Connection {
             let instance = instances.get(&key).ok_or_else(|| {
                 FrankenError::Internal(format!("virtual table not found: {}", name.name))
             })?;
+            // fts5vocab's generic live-vtab cursor is an always-EOF stub, so the
+            // cursor-counting strategy below would report 0. Exclude vocab tables
+            // from this fast path; the normal scan (scan_fts5vocab_rows) counts
+            // them correctly (bd-90m1n).
+            if instance.as_any().downcast_ref::<Fts5VocabTable>().is_some() {
+                return Ok(None);
+            }
             instance
                 .as_any()
                 .downcast_ref::<Fts5Table>()
@@ -46911,6 +46918,18 @@ impl Connection {
                     .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
                     .is_some_and(Fts5Table::is_lazy_on_disk)
             };
+            if is_lazy {
+                // Snapshot the instance's transaction state BEFORE any lazy
+                // mutation (note_lazy_deleted_rows in the tombstone path below,
+                // or promote), so a ROLLBACK restores the cached lazy row count.
+                // These paths mutate the instance directly; without a registered
+                // live-vtab transaction xRollback has no snapshot to restore and
+                // count(*) stays wrong until a reconnect (bd-90m1n).
+                let cx = self.op_cx()?;
+                self.with_active_live_vtab_instance(&cx, table_name, "xBegin", |instance| {
+                    self.begin_live_vtab_transaction_if_needed(table_name, instance, &cx)
+                })?;
+            }
             // Lazy `contentless_delete` tables tombstone the deleted rowids'
             // owning on-disk segments WITHOUT hydrating the corpus (v2
             // origin-targeted). Falls through to promote only when the delete
@@ -47471,10 +47490,28 @@ impl Connection {
             })
             .await?;
 
-        // No persisted segment yet (fresh table, or only empty rows so far):
-        // the full encode lays down the first segment plus the config/idx/docsize
-        // shadows. Once a segment exists, every later INSERT appends incrementally.
+        // No persisted segment yet (fresh table, or only empty rows so far, or
+        // just reset by 'delete-all'): the full encode lays down the first
+        // segment plus the config/idx/docsize shadows. Once a segment exists,
+        // every later INSERT appends incrementally.
         let Some(structure) = structure.filter(|s| s.segment_count() > 0) else {
+            // A lazy table with zero live segments has an EMPTY on-disk corpus
+            // (e.g. after 'delete-all' marks it lazy with doc_count 0), so the
+            // in-memory index holds the entire corpus — the full re-encode is
+            // safe and correct. Clear the lazy flag first: encode_data_rows'
+            // debug_assert(!is_lazy_on_disk()) guards against a full rewrite
+            // DROPPING a non-empty on-disk corpus, which cannot happen here, and
+            // would otherwise abort the transaction in debug builds (bd-90m1n).
+            {
+                let mut instances = self.vtab_instances.borrow_mut();
+                let key = table_name.to_ascii_uppercase();
+                if let Some(fts5) = instances
+                    .get_mut(&key)
+                    .and_then(|instance| instance.as_any_mut().downcast_mut::<Fts5Table>())
+                {
+                    fts5.clear_lazy_on_disk();
+                }
+            }
             return self
                 .persist_rootpage_zero_fts5_shadow_rows(table_name)
                 .await;
