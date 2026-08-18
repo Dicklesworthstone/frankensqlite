@@ -1340,6 +1340,147 @@ pub fn build_tombstone_hash(
     })
 }
 
+/// The segment that owns `origin` — the one whose `[origin_lower, origin_upper]`
+/// range contains it.
+///
+/// Each lazy incremental-insert segment stamps
+/// `origin_lower == origin_upper == batch_origin`, and `_docsize.origin` records
+/// that value per row, so a deleted rowid's origin resolves to exactly the
+/// segment holding its postings. `None` if no segment claims the origin (e.g. a
+/// row written before origin tracking; the caller then falls back to promote).
+#[must_use]
+pub fn resolve_tombstone_target_segment(
+    structure: &Fts5StructureRecord,
+    origin: u64,
+) -> Option<u32> {
+    structure
+        .levels
+        .iter()
+        .flat_map(|level| level.segments.iter())
+        .find(|segment| segment.origin_lower <= origin && origin <= segment.origin_upper)
+        .map(|segment| segment.segid)
+}
+
+/// One document being deleted from a lazy contentless FTS5 table.
+#[derive(Debug, Clone)]
+pub struct Fts5DeletedDoc {
+    /// The SQLite rowid (deleted from `_docsize` as-is; keyed into the tombstone
+    /// hash as `rowid as u64`, matching the u64 doclist rowids the read path
+    /// compares against).
+    pub rowid: i64,
+    /// The owning segment, resolved from `_docsize.origin` via
+    /// [`resolve_tombstone_target_segment`].
+    pub segid: u32,
+    /// Per-column token counts from the deleted doc's `_docsize.sz`, subtracted
+    /// from the averages record so BM25 stats exclude the tombstoned doc.
+    pub column_token_counts: Vec<u32>,
+}
+
+/// The persist payload for one lazy contentless DELETE statement.
+///
+/// The tombstone hash pages to upsert into `_data`, the updated structure +
+/// averages rows, and the `_docsize` rowids to delete. See
+/// [`encode_incremental_delete_flush`].
+#[derive(Debug, Clone)]
+pub struct Fts5IncrementalDeleteFlush {
+    pub tombstone_data_rows: Vec<Fts5DataRow>,
+    pub structure_data_row: Fts5DataRow,
+    pub averages_data_row: Fts5DataRow,
+    pub docsize_rowids_to_delete: Vec<i64>,
+}
+
+/// Assemble the persist payload for deleting `deleted` from a lazy contentless
+/// FTS5 table, WITHOUT hydrating the corpus.
+///
+/// For each touched segment, the new
+/// tombstone hash = its existing tombstoned rowids (decoded from
+/// `existing_tombstones`) UNION the newly deleted rowids, laid out by
+/// [`build_tombstone_hash`]; the segment's `tombstone_page_count`/
+/// `tombstone_entry_count` are updated in a cloned structure. Averages are
+/// decremented by the deleted docs' row count and per-column token counts.
+///
+/// Reads nothing but the passed structure/averages/tombstones — never a leaf or
+/// posting page — so a delete stays O(deleted + touched-segment tombstones), not
+/// O(corpus). `page_count` is monotonic non-decreasing (the union only adds
+/// rowids), so upserting hash pages `0..page_count` never orphans an old page.
+pub fn encode_incremental_delete_flush(
+    deleted: &[Fts5DeletedDoc],
+    existing_structure: &Fts5StructureRecord,
+    existing_averages: &Fts5AveragesRecord,
+    existing_tombstones: &BTreeMap<u32, Vec<Fts5TombstonePage>>,
+    slots_per_page: usize,
+) -> Result<Fts5IncrementalDeleteFlush> {
+    // Group newly deleted rowids (as the u64 the tombstone hash keys on) by
+    // owning segment; collect the `_docsize` rowids to delete.
+    let mut new_by_segment: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
+    let mut docsize_rowids_to_delete = Vec::with_capacity(deleted.len());
+    for doc in deleted {
+        new_by_segment
+            .entry(doc.segid)
+            .or_default()
+            .insert(doc.rowid as u64);
+        docsize_rowids_to_delete.push(doc.rowid);
+    }
+
+    let mut structure = existing_structure.clone();
+    let mut tombstone_data_rows = Vec::new();
+    for (&segid, new_rowids) in &new_by_segment {
+        // Union: existing tombstoned rowids for this segment + the new ones.
+        let mut all_rowids: BTreeSet<u64> = new_rowids.clone();
+        let mut tombstone_zero = new_rowids.contains(&0);
+        if let Some(pages) = existing_tombstones.get(&segid) {
+            for page in pages {
+                tombstone_zero |= page.rowid_zero;
+                all_rowids.extend(page.slots.iter().flatten().copied());
+            }
+        }
+        // rowid 0 rides the zero flag, never a slot value.
+        all_rowids.remove(&0);
+
+        let hash = build_tombstone_hash(&all_rowids, tombstone_zero, slots_per_page)?;
+        for (hash_pgno, page) in hash.pages.iter().enumerate() {
+            let pgno = u32::try_from(hash_pgno)
+                .map_err(|_| fts5_data_error("tombstone hash page count exceeds u32"))?;
+            tombstone_data_rows.push(page.to_data_row(segid, pgno)?);
+        }
+
+        let segment = structure
+            .levels
+            .iter_mut()
+            .flat_map(|level| level.segments.iter_mut())
+            .find(|segment| segment.segid == segid)
+            .ok_or_else(|| fts5_data_error("delete targets a segment absent from the structure"))?;
+        segment.tombstone_page_count = hash.page_count;
+        segment.tombstone_entry_count = u64::from(hash.entry_count);
+    }
+
+    let structure_data_row = Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode());
+
+    // Averages: drop the deleted docs from total_rows and per-column token sums.
+    let mut column_token_totals = existing_averages.column_token_totals.clone();
+    for doc in deleted {
+        for (col, count) in doc.column_token_counts.iter().copied().enumerate() {
+            if let Some(total) = column_token_totals.get_mut(col) {
+                *total = total.saturating_sub(u64::from(count));
+            }
+        }
+    }
+    let total_rows = existing_averages
+        .total_rows
+        .saturating_sub(u64::try_from(deleted.len()).unwrap_or(u64::MAX));
+    let averages_data_row = Fts5DataRow::new(
+        FTS5_AVERAGES_ROWID,
+        Fts5AveragesRecord::new(total_rows, column_token_totals).encode(),
+    );
+
+    Ok(Fts5IncrementalDeleteFlush {
+        tombstone_data_rows,
+        structure_data_row,
+        averages_data_row,
+        docsize_rowids_to_delete,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fts5PendingIndex {
     Main,
@@ -11597,6 +11738,122 @@ mod tests {
 
         // A degenerate slot count is rejected (no room for probe termination).
         assert!(build_tombstone_hash(&present, false, 1).is_err());
+    }
+
+    #[test]
+    fn test_encode_incremental_delete_flush_tombstones_by_segment() {
+        // Is `rowid` reported tombstoned in `segid`, exactly as the reader would
+        // (page = rowid % tombstone_page_count, then contains_rowid), using the
+        // flush's pages + the flush's updated structure?
+        fn tombstoned(
+            flush: &Fts5IncrementalDeleteFlush,
+            structure: &Fts5StructureRecord,
+            segid: u32,
+            rowid: u64,
+        ) -> bool {
+            let count = structure
+                .levels
+                .iter()
+                .flat_map(|level| level.segments.iter())
+                .find(|segment| segment.segid == segid)
+                .map_or(0, |segment| segment.tombstone_page_count);
+            if count == 0 {
+                return false;
+            }
+            let hash_pgno = u32::try_from(rowid % u64::from(count)).unwrap();
+            let want = Fts5DataRowid::Tombstone { segid, hash_pgno }.encode().unwrap();
+            flush
+                .tombstone_data_rows
+                .iter()
+                .find(|row| row.id == want)
+                .is_some_and(|row| {
+                    Fts5TombstonePage::decode(&row.block)
+                        .unwrap()
+                        .contains_rowid(count, rowid)
+                })
+        }
+
+        // Two lazily-appended segments (origin 2 and 3), no tombstones yet.
+        let structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 5,
+            origin_counter: 4,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                vec![
+                    Fts5StructureSegment::new(1, 1, 1).with_origin_tracking(2, 2, 0, 0, 3),
+                    Fts5StructureSegment::new(2, 1, 1).with_origin_tracking(3, 3, 0, 0, 4),
+                ],
+            )],
+        };
+        let averages = Fts5AveragesRecord::new(10, vec![100]);
+
+        // Origin resolution: rowid at origin 2 -> segid 1, origin 3 -> segid 2.
+        assert_eq!(resolve_tombstone_target_segment(&structure, 2), Some(1));
+        assert_eq!(resolve_tombstone_target_segment(&structure, 3), Some(2));
+        assert_eq!(resolve_tombstone_target_segment(&structure, 9), None);
+
+        // First delete: rowid 5 from segment 1, rowid 6 from segment 2.
+        let deleted = vec![
+            Fts5DeletedDoc {
+                rowid: 5,
+                segid: 1,
+                column_token_counts: vec![7],
+            },
+            Fts5DeletedDoc {
+                rowid: 6,
+                segid: 2,
+                column_token_counts: vec![3],
+            },
+        ];
+        let flush =
+            encode_incremental_delete_flush(&deleted, &structure, &averages, &BTreeMap::new(), 4)
+                .unwrap();
+
+        assert_eq!(flush.docsize_rowids_to_delete, vec![5, 6]);
+        let updated = Fts5StructureRecord::decode(&flush.structure_data_row.block).unwrap();
+        assert!(tombstoned(&flush, &updated, 1, 5), "rowid 5 tombstoned in segment 1");
+        assert!(tombstoned(&flush, &updated, 2, 6), "rowid 6 tombstoned in segment 2");
+        assert!(!tombstoned(&flush, &updated, 1, 6), "rowid 6 is not in segment 1");
+        assert!(!tombstoned(&flush, &updated, 2, 5), "rowid 5 is not in segment 2");
+
+        // Averages dropped both docs: total_rows 10->8, tokens 100-7-3 = 90.
+        let updated_avg = Fts5AveragesRecord::decode(&flush.averages_data_row.block, 1).unwrap();
+        assert_eq!(updated_avg.total_rows, 8);
+        assert_eq!(updated_avg.column_token_totals, vec![90]);
+
+        // Second delete of rowid 9 from segment 1, feeding back segment 1's
+        // existing tombstone pages: the prior tombstone (5) must survive the
+        // union alongside the new one (9).
+        let count1 = updated
+            .levels
+            .iter()
+            .flat_map(|level| level.segments.iter())
+            .find(|segment| segment.segid == 1)
+            .unwrap()
+            .tombstone_page_count;
+        let mut seg1_pages = Vec::new();
+        for hash_pgno in 0..count1 {
+            let id = Fts5DataRowid::Tombstone { segid: 1, hash_pgno }.encode().unwrap();
+            let row = flush.tombstone_data_rows.iter().find(|row| row.id == id).unwrap();
+            seg1_pages.push(Fts5TombstonePage::decode(&row.block).unwrap());
+        }
+        let mut existing = BTreeMap::new();
+        existing.insert(1_u32, seg1_pages);
+
+        let deleted2 = vec![Fts5DeletedDoc {
+            rowid: 9,
+            segid: 1,
+            column_token_counts: vec![2],
+        }];
+        let flush2 =
+            encode_incremental_delete_flush(&deleted2, &updated, &updated_avg, &existing, 4).unwrap();
+        let updated2 = Fts5StructureRecord::decode(&flush2.structure_data_row.block).unwrap();
+        assert!(tombstoned(&flush2, &updated2, 1, 5), "prior tombstone 5 preserved");
+        assert!(tombstoned(&flush2, &updated2, 1, 9), "new tombstone 9 added");
+        let final_avg = Fts5AveragesRecord::decode(&flush2.averages_data_row.block, 1).unwrap();
+        assert_eq!(final_avg.total_rows, 7);
+        assert_eq!(final_avg.column_token_totals, vec![88]);
     }
 
     #[test]
