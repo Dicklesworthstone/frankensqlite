@@ -85116,17 +85116,20 @@ impl Connection {
                     }
                 }
 
-                // OPT-IN until two prerequisites land (see below): binding to the
-                // persisted segments is ~90x faster to open and ~110x smaller, but
-                // on this corpus the segments are BOTH unreadable by the lazy
-                // reader ("truncated poslist body", on segments stock SQLite reads
-                // fine) and badly stale relative to `_content`. Rebuilding masks
-                // both, which is exactly why neither was noticed. Turning this on
-                // by default would trade a slow-but-right answer for a fast wrong
-                // one, so it stays behind an explicit opt-in.
+                // DEFAULT-ON since the two prerequisites landed (GH#358): binding
+                // the persisted segments is ~90x faster to open and ~110x smaller
+                // than re-tokenizing the whole corpus on every open. The blockers
+                // that once made this unsafe are fixed — the lazy reader now
+                // stitches doclists across leaf pages so it reads what stock reads
+                // ("truncated poslist body", GH#360), and contentless tables no
+                // longer keep/rebuild from a stale `_content` (GH#361/#362). A
+                // broad cross-engine conformance suite pins the lazy read path to
+                // stock across exact/prefix/boolean queries + tombstones + spilled
+                // doclists. Set FSQLITE_DISABLE_LAZY_FTS5_REBIND to fall back to
+                // the (slower) rebuild-on-open as a runtime escape hatch.
                 #[cfg(feature = "ext-fts5")]
                 if !self.defer_fts5_hydration
-                    && std::env::var_os("FSQLITE_ENABLE_LAZY_FTS5_REBIND").is_some()
+                    && std::env::var_os("FSQLITE_DISABLE_LAZY_FTS5_REBIND").is_none()
                 {
                     let is_fts5_lazy_candidate = self.invoke_live_vtab_callback("asAny", || {
                         Ok(pending_instance
