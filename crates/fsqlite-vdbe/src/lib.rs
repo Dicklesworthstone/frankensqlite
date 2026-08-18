@@ -1615,6 +1615,11 @@ pub mod pragma {
         pub checkpoint_fullfsync: bool,
         /// `PRAGMA automatic_index` toggle (default ON). Set/readback surface.
         pub automatic_index: bool,
+        /// `PRAGMA reverse_unordered_selects` toggle (default OFF). When ON, a
+        /// SELECT whose row order is otherwise unspecified (no ORDER BY) walks
+        /// its full-table scan in reverse. Consumed by codegen via
+        /// `CodegenContext::reverse_unordered_selects` (GH #236 / bd-3gk2x).
+        pub reverse_unordered_selects: bool,
         /// `PRAGMA locking_mode` (`normal` or `exclusive`; default `normal`).
         /// Set/readback surface only.
         pub locking_mode: String,
@@ -1666,6 +1671,7 @@ pub mod pragma {
                 cell_size_check: false,
                 checkpoint_fullfsync: false,
                 automatic_index: true,
+                reverse_unordered_selects: false,
                 locking_mode: "normal".to_owned(),
                 secure_delete: 0,
                 threads: 0,
@@ -1793,6 +1799,9 @@ pub mod pragma {
         }
         if name.eq_ignore_ascii_case("automatic_index") {
             return apply_bool_toggle(&mut state.automatic_index, stmt);
+        }
+        if name.eq_ignore_ascii_case("reverse_unordered_selects") {
+            return apply_bool_toggle(&mut state.reverse_unordered_selects, stmt);
         }
         if name.eq_ignore_ascii_case("soft_heap_limit") {
             return Ok(apply_soft_heap_limit(stmt));
@@ -3875,6 +3884,33 @@ mod tests {
         apply_sql(&mut state, "PRAGMA cache_spill=500");
         assert_eq!(apply_sql(&mut state, "PRAGMA cache_size=100"), Int(100));
         assert_eq!(apply_sql(&mut state, "PRAGMA cache_spill"), Int(500));
+    }
+
+    #[test]
+    fn test_connection_pragma_reverse_unordered_selects_gh236() {
+        // GH #236: reverse_unordered_selects is a bool-toggle — bare readback
+        // echoes 0/1; the codegen effect (reversing unordered scans) is proven
+        // end-to-end in the fsqlite-core integration keeper.
+        use pragma::PragmaOutput::Bool;
+        let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA reverse_unordered_selects"),
+            Bool(false)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA reverse_unordered_selects = ON"),
+            Bool(true)
+        );
+        assert!(state.reverse_unordered_selects);
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA reverse_unordered_selects"),
+            Bool(true)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA reverse_unordered_selects = OFF"),
+            Bool(false)
+        );
+        assert!(!state.reverse_unordered_selects);
     }
 
     #[test]

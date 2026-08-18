@@ -4670,6 +4670,7 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
                 | "checkpoint_fullfsync"
                 | "automatic_index"
                 | "cache_spill"
+                | "reverse_unordered_selects"
         )
     {
         return &[];
@@ -4734,6 +4735,11 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     // has_value gate above returns &[] for the assignment form); GH #275.
     if name_is("cache_spill") {
         return &["cache_spill"];
+    }
+    // `reverse_unordered_selects`: one row on a bare query, none on assignment
+    // (suppressed by the has_value gate above); GH #236.
+    if name_is("reverse_unordered_selects") {
+        return &["reverse_unordered_selects"];
     }
 
     // Header, integrity, and standard introspection PRAGMAs.
@@ -10193,6 +10199,10 @@ thread_local! {
 struct CompiledCacheEntry {
     sql: String,
     program: Arc<VdbeProgram>,
+    /// The `reverse_unordered_selects` pragma value the program was compiled
+    /// under. A cached program encodes the scan direction, so a lookup under a
+    /// different setting must miss and recompile (GH #236 / bd-3gk2x).
+    reverse_unordered_selects: bool,
 }
 
 #[derive(Clone)]
@@ -30754,6 +30764,7 @@ impl Connection {
         schema_cookie: u32,
         schema_generation: u64,
         function_registry_generation: u64,
+        reverse_unordered_selects: bool,
     ) -> u64 {
         use std::hash::BuildHasher;
         // bd-#70: db_generation (memdb_visible_commit_seq) and the finalized
@@ -30770,11 +30781,16 @@ impl Connection {
         // Conservative wedge: any commit invalidates non-direct-DML plans.
         // Future optimization: narrow by `pages_read_set ∩ pages_written_set`
         // so a commit that only touches unrelated pages leaves the plan live.
+        // reverse_unordered_selects changes the emitted scan direction, so it
+        // must partition the compiled-program cache: ON and OFF get distinct
+        // keys, otherwise a program compiled under one setting could be reused
+        // stale after the pragma is toggled (GH #236 / bd-3gk2x).
         foldhash::fast::FixedState::default().hash_one((
             sql,
             schema_cookie,
             schema_generation,
             function_registry_generation,
+            reverse_unordered_selects,
         ))
     }
 
@@ -30784,6 +30800,7 @@ impl Connection {
             self.schema_cookie(),
             self.schema_generation(),
             self.function_registry_generation(),
+            self.pragma_state.borrow().reverse_unordered_selects,
         )
     }
 
@@ -31415,9 +31432,10 @@ impl Connection {
 
     /// Look up a cached compiled VdbeProgram by SQL hash.
     fn lookup_compiled_cache(&self, key: u64, sql: &str) -> Option<Arc<CompiledCacheEntry>> {
+        let reverse_unordered_selects = self.pragma_state.borrow().reverse_unordered_selects;
         let mut cache = self.compiled_cache.borrow_mut();
         let entry = cache.get(&key)?;
-        if entry.sql == sql {
+        if entry.sql == sql && entry.reverse_unordered_selects == reverse_unordered_selects {
             Some(Arc::clone(entry))
         } else {
             None
@@ -31480,10 +31498,12 @@ impl Connection {
         sql: &str,
         program: VdbeProgram,
     ) -> Arc<CompiledCacheEntry> {
+        let reverse_unordered_selects = self.pragma_state.borrow().reverse_unordered_selects;
         let mut cache = self.compiled_cache.borrow_mut();
         let entry = Arc::new(CompiledCacheEntry {
             sql: sql.to_owned(),
             program: Arc::new(program),
+            reverse_unordered_selects,
         });
         cache.put(key, Arc::clone(&entry));
         entry
@@ -68357,6 +68377,7 @@ impl Connection {
             rowid_alias_col_idx: None,
             index_ordered_scan_reliable: true,
             planner_select_directive,
+            reverse_unordered_selects: self.pragma_state.borrow().reverse_unordered_selects,
             ..CodegenContext::default()
         };
         let t = prof.then(Instant::now);
