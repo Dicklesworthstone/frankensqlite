@@ -46596,6 +46596,53 @@ impl Connection {
     ) -> Result<usize> {
         let table_name = update.table.name.name.clone();
 
+        // Contentless FTS5 keeps no old column values to preserve across an UPDATE,
+        // so stock rejects UPDATE entirely on a plain contentless table and rejects
+        // a subset-of-columns UPDATE on a `contentless_delete` table (every column
+        // must be assigned — a full-row replace). Without this guard frank would
+        // delete the old row and insert a partial one, corrupting the index.
+        #[cfg(feature = "ext-fts5")]
+        {
+            let key = table_name.to_ascii_uppercase();
+            let contentless = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .filter(|fts5| {
+                        fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless
+                    })
+                    .map(|fts5| (fts5.config().contentless_delete_enabled(), fts5.columns().to_vec()))
+            };
+            if let Some((delete_enabled, columns)) = contentless {
+                if !delete_enabled {
+                    return Err(FrankenError::function_error(&format!(
+                        "cannot UPDATE contentless fts5 table: {table_name}"
+                    )));
+                }
+                let mut assigned: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for assignment in &update.assignments {
+                    match &assignment.target {
+                        fsqlite_ast::AssignmentTarget::Column(col) => {
+                            assigned.insert(col.to_ascii_lowercase());
+                        }
+                        fsqlite_ast::AssignmentTarget::ColumnList(cols) => {
+                            assigned.extend(cols.iter().map(|col| col.to_ascii_lowercase()));
+                        }
+                    }
+                }
+                if columns
+                    .iter()
+                    .any(|col| !assigned.contains(&col.to_ascii_lowercase()))
+                {
+                    return Err(FrankenError::function_error(&format!(
+                        "cannot UPDATE a subset of columns on fts5 contentless-delete table: {table_name}"
+                    )));
+                }
+            }
+        }
+
         // Enumerate the affected rowids via the live scan the user sees (same
         // table + predicate as the NEW-image collection below, so the two lists
         // align positionally). An empty/no-WHERE update touches every row.
