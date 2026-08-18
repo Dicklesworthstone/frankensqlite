@@ -1754,7 +1754,9 @@ pub struct Fts5DeleteAllFlush {
 
 /// Encode a contentless `'delete-all'` maintenance command: drop every on-disk
 /// segment and reset the structure + averages to empty, WITHOUT hydrating or
-/// rebuilding the corpus (the lazy-read invariant this epic exists to keep).
+/// rebuilding the corpus.
+///
+/// This preserves the lazy-read invariant this epic exists to keep.
 ///
 /// Reads nothing but the decoded structure, so it is `O(segments)` regardless
 /// of corpus size. The structure cookie survives, and the table stays in its
@@ -10414,8 +10416,10 @@ fn strip_main_marker(stored_term: &[u8]) -> &[u8] {
 
 /// Normalize main-index-only `(stored_term, entries)` groups (as produced by
 /// [`collect_live_term_groups_from_shadow_rows`]) into `(token, entries)` with
-/// the marker byte removed. Terms are already main-index only, so this never
-/// needs to reject prefix-index terms.
+/// the marker byte removed.
+///
+/// Terms are already main-index only, so this never needs to reject
+/// prefix-index terms.
 #[must_use]
 pub fn strip_main_marker_term_groups(
     groups: Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>,
@@ -10431,9 +10435,11 @@ pub fn strip_main_marker_term_groups(
         .collect()
 }
 
-/// Filter all-term `(stored_term, entries)` groups (as produced by
-/// [`collect_merged_term_groups`], which enumerates BOTH the main index and any
-/// prefix indexes) down to the MAIN-index tokens, stripping the marker byte.
+/// Filter all-term `(stored_term, entries)` groups down to the MAIN-index
+/// tokens, stripping the marker byte.
+///
+/// The groups come from [`collect_merged_term_groups`], which enumerates BOTH
+/// the main index and any prefix indexes.
 ///
 /// `fts5vocab` reports only real tokens, so prefix-index terms (marked with a
 /// byte greater than [`FTS5_MAIN_PREFIX_BYTE`]) are dropped. Segments that store
@@ -10561,10 +10567,11 @@ pub fn build_fts5vocab_rows(
     rows
 }
 
-/// The `fts5vocab` virtual table instance. Holds only the reference to the
-/// source FTS5 table and the requested vocabulary type; the actual vocabulary
-/// rows are produced by the host (which owns the source table's storage) via
-/// [`build_fts5vocab_rows`].
+/// The `fts5vocab` virtual table instance.
+///
+/// Holds only the reference to the source FTS5 table and the requested
+/// vocabulary type; the actual vocabulary rows are produced by the host (which
+/// owns the source table's storage) via [`build_fts5vocab_rows`].
 #[derive(Debug, Clone)]
 pub struct Fts5VocabTable {
     source_table: String,
@@ -10624,13 +10631,15 @@ impl VirtualTable for Fts5VocabTable {
     }
 
     fn open(&self) -> Result<Self::Cursor> {
-        Ok(Fts5VocabCursor::default())
+        Ok(Fts5VocabCursor)
     }
 }
 
-/// Cursor for a standalone `fts5vocab` scan. The host answers vocabulary scans
-/// directly (it owns the source table's storage), so this generic cursor is a
-/// safe empty fallback used only when the host routing is bypassed.
+/// Cursor for a standalone `fts5vocab` scan.
+///
+/// The host answers vocabulary scans directly (it owns the source table's
+/// storage), so this generic cursor is a safe empty fallback used only when the
+/// host routing is bypassed.
 #[derive(Debug, Default)]
 pub struct Fts5VocabCursor;
 
