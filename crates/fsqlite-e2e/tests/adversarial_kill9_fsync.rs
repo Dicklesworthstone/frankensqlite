@@ -45,7 +45,9 @@ async fn ordered_values_fsqlite(conn: &Connection) -> Vec<i64> {
 
 fn ordered_values_stock(db: &Path) -> Vec<i64> {
     let conn = rusqlite::Connection::open(db).expect("stock open");
-    let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x;").expect("prepare");
+    let mut stmt = conn
+        .prepare("SELECT x FROM t ORDER BY x;")
+        .expect("prepare");
     stmt.query_map([], |r| r.get::<_, i64>(0))
         .expect("query")
         .collect::<Result<Vec<_>, _>>()
@@ -67,14 +69,20 @@ async fn assert_recovered_matches(db: &Path, expected: &[i64], label: &str) {
         "[{label}] stock integrity_check on the recovered image must be ok"
     );
     let stock_rows = ordered_values_stock(db);
-    assert_eq!(stock_rows, expected, "[{label}] stock recovered rows diverged");
+    assert_eq!(
+        stock_rows, expected,
+        "[{label}] stock recovered rows diverged"
+    );
 
     let conn = Connection::open(db.to_string_lossy().as_ref())
         .await
         .expect("reopen recovered db");
     let f_rows = ordered_values_fsqlite(&conn).await;
     conn.close().await.ok();
-    assert_eq!(f_rows, expected, "[{label}] fsqlite recovered rows diverged");
+    assert_eq!(
+        f_rows, expected,
+        "[{label}] fsqlite recovered rows diverged"
+    );
     assert_eq!(
         f_rows, stock_rows,
         "[{label}] fsqlite and stock disagree on the recovered rows"

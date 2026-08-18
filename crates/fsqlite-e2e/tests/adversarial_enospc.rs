@@ -30,8 +30,13 @@ fn page(fill: u8) -> Vec<u8> {
 
 fn seed_committed_page(backing: &MemoryVfs, path: &Path, fill: u8) -> (PageNumber, Vec<u8>) {
     let cx = Cx::new();
-    let pager = block_on(SimplePager::open_with_cx(&cx, backing.clone(), path, PageSize::DEFAULT))
-        .expect("open seed pager");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        backing.clone(),
+        path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open seed pager");
     let original = page(fill);
     let page_no = {
         let mut txn = block_on(pager.begin(&cx, TransactionMode::Immediate)).expect("begin seed");
@@ -46,8 +51,13 @@ fn seed_committed_page(backing: &MemoryVfs, path: &Path, fill: u8) -> (PageNumbe
 
 fn read_page(backing: &MemoryVfs, path: &Path, page_no: PageNumber) -> Vec<u8> {
     let cx = Cx::new();
-    let pager = block_on(SimplePager::open_with_cx(&cx, backing.clone(), path, PageSize::DEFAULT))
-        .expect("open reader");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        backing.clone(),
+        path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open reader");
     let reader = block_on(pager.begin(&cx, TransactionMode::ReadOnly)).expect("begin readonly");
     let bytes = block_on(reader.get_page(&cx, page_no))
         .expect("read page")
@@ -68,8 +78,13 @@ fn disk_full_commit_surfaces_sqlite_full_code_and_preserves_page() {
 
     let fault_vfs = FaultInjectingVfs::with_seed(backing.clone(), SEED);
     fault_vfs.inject_fault(FaultSpec::disk_full("*.db-journal").build());
-    let pager =
-        block_on(SimplePager::open_with_cx(&cx, fault_vfs, &path, PageSize::DEFAULT)).expect("open");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        fault_vfs,
+        &path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open");
 
     let err = {
         let mut txn = block_on(pager.begin(&cx, TransactionMode::Immediate)).expect("begin");
@@ -110,8 +125,13 @@ fn database_recovers_after_transient_disk_full() {
     {
         let fault_vfs = FaultInjectingVfs::with_seed(backing.clone(), SEED ^ 0x0F);
         fault_vfs.inject_fault(FaultSpec::disk_full("*.db-journal").build());
-        let pager = block_on(SimplePager::open_with_cx(&cx, fault_vfs, &path, PageSize::DEFAULT))
-            .expect("open fault pager");
+        let pager = block_on(SimplePager::open_with_cx(
+            &cx,
+            fault_vfs,
+            &path,
+            PageSize::DEFAULT,
+        ))
+        .expect("open fault pager");
         let mut txn = block_on(pager.begin(&cx, TransactionMode::Immediate)).expect("begin");
         block_on(txn.write_page(&cx, page_no, &page(0x99))).expect("stage");
         assert!(
@@ -122,7 +142,11 @@ fn database_recovers_after_transient_disk_full() {
     }
 
     // The old image is intact after the failure.
-    assert_eq!(read_page(&backing, &path, page_no), original, "pre-full image intact");
+    assert_eq!(
+        read_page(&backing, &path, page_no),
+        original,
+        "pre-full image intact"
+    );
 
     // Space is back: a fresh pager commits new data, which reads back correctly.
     {

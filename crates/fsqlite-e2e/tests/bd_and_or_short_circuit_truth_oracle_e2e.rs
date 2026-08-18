@@ -98,8 +98,11 @@ async fn setup_mem() -> (Connection, rusqlite::Connection) {
     let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in DDL {
-        f.execute(s).await.unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
-        r.execute_batch(s).unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
+        f.execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+        r.execute_batch(s)
+            .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
     }
     (f, r)
 }
@@ -243,8 +246,11 @@ fn upsert_case_or_scalar_short_circuits() {
              THEN 'matched' ELSE 'nomatch' END",
         ];
         for s in ddl {
-            f.execute(s).await.unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
-            r.execute_batch(s).unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
+            f.execute(s)
+                .await
+                .unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+            r.execute_batch(s)
+                .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
         }
         check(
             &f,

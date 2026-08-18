@@ -13,8 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use fsqlite_e2e::block_on;
-use fsqlite_harness::fault_vfs::FaultSpec;
 use fsqlite_harness::fault_vfs::FaultInjectingVfs;
+use fsqlite_harness::fault_vfs::FaultSpec;
 use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::{PageNumber, PageSize};
@@ -28,8 +28,13 @@ fn page(fill: u8) -> Vec<u8> {
 
 fn read_page(backing: &MemoryVfs, path: &Path, page_no: PageNumber) -> Vec<u8> {
     let cx = Cx::new();
-    let pager = block_on(SimplePager::open_with_cx(&cx, backing.clone(), path, PageSize::DEFAULT))
-        .expect("open reader");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        backing.clone(),
+        path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open reader");
     let reader = block_on(pager.begin(&cx, TransactionMode::ReadOnly)).expect("begin readonly");
     let bytes = block_on(reader.get_page(&cx, page_no))
         .expect("read page")
@@ -54,8 +59,13 @@ fn write_latency_does_not_fail_or_corrupt_commit() {
             .trigger_count(256)
             .build(),
     );
-    let pager =
-        block_on(SimplePager::open_with_cx(&cx, fault_vfs, &path, PageSize::DEFAULT)).expect("open");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        fault_vfs,
+        &path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open");
 
     let page_no = {
         let mut txn = block_on(pager.begin(&cx, TransactionMode::Immediate)).expect("begin");
@@ -88,8 +98,13 @@ fn sustained_latency_preserves_all_committed_pages() {
             .trigger_count(1024)
             .build(),
     );
-    let pager =
-        block_on(SimplePager::open_with_cx(&cx, fault_vfs, &path, PageSize::DEFAULT)).expect("open");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        fault_vfs,
+        &path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open");
 
     let mut pages = Vec::new();
     for i in 0..8u8 {

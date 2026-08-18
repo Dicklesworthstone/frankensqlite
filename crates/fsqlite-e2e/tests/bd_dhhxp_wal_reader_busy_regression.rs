@@ -67,9 +67,9 @@ fn bd_dhhxp_bare_wal_reads_never_busy_under_single_writer() {
             .expect("seed wal");
         rt.block_on(conn.execute("PRAGMA fsqlite.concurrent_mode = OFF"))
             .expect("seed concurrent off");
-        rt.block_on(conn.execute(
-            "CREATE TABLE kv (id INTEGER PRIMARY KEY, payload TEXT, n INTEGER)",
-        ))
+        rt.block_on(
+            conn.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, payload TEXT, n INTEGER)"),
+        )
         .expect("seed create");
         rt.block_on(conn.close()).expect("seed close");
     }

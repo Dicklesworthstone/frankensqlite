@@ -343,7 +343,10 @@ fn ioq6x_checkpoint_refresh_drops_freelist_pages_into_orphans() {
         100.0 * orphans as f64 / pages.max(1) as f64,
     );
 
-    assert_eq!(rows, expected, "row count must match arithmetic expectation");
+    assert_eq!(
+        rows, expected,
+        "row count must match arithmetic expectation"
+    );
     assert_eq!(
         orphans, 0,
         "GH#346: fsqlite orphaned {orphans} pages (freelist_count={free}, page_count={pages}, \
@@ -385,7 +388,10 @@ fn ioq6x_secondary_index_churn_stays_integral() {
          orphans={orphans} range={first:?}..={last:?} longest_contiguous_run={run}"
     );
 
-    assert_eq!(rows, expected, "row count must match arithmetic expectation");
+    assert_eq!(
+        rows, expected,
+        "row count must match arithmetic expectation"
+    );
     assert_eq!(
         table_total, index_total,
         "GH#346/bd-84rh4: table COUNT ({table_total}) != index COUNT ({index_total}) — \
