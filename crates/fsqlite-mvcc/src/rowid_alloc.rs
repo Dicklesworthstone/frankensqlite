@@ -8,7 +8,7 @@
 //! the SQLite file format. Single-process deployments use an in-memory map;
 //! multi-process deployments serve reservations over IPC (`ROWID_RESERVE`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fsqlite_types::sync_primitives::Mutex;
 use fsqlite_types::{RowId, RowIdMode, SchemaEpoch, TableId};
@@ -49,6 +49,15 @@ struct TableAllocatorState {
     mode: RowIdMode,
     /// High-water mark for AUTOINCREMENT `sqlite_sequence` persistence.
     autoincrement_high_water: i64,
+    /// bd-elcjy: the durable init tip (`next_rowid` at creation, before any
+    /// allocation) and its high-water. A table that first enters the allocator
+    /// AFTER a `SAVEPOINT` is absent from that savepoint's mark, so
+    /// [`ConcurrentRowIdAllocator::rewind_to_mark`] treats it as
+    /// `(durable_next_rowid, durable_high_water, count 0)` and rewinds it back
+    /// to fresh on `ROLLBACK TO` (the CAS still guards against a peer that also
+    /// allocated on the table in the interval).
+    durable_next_rowid: i64,
+    durable_high_water: i64,
 }
 
 impl TableAllocatorState {
@@ -71,14 +80,17 @@ impl TableAllocatorState {
             "allocator init from durable tip"
         );
 
+        let high_water = if mode == RowIdMode::AutoIncrement {
+            sqlite_sequence_seq
+        } else {
+            0
+        };
         Self {
             next_rowid: next,
             mode,
-            autoincrement_high_water: if mode == RowIdMode::AutoIncrement {
-                sqlite_sequence_seq
-            } else {
-                0
-            },
+            autoincrement_high_water: high_water,
+            durable_next_rowid: next,
+            durable_high_water: high_water,
         }
     }
 }
@@ -307,7 +319,25 @@ impl ConcurrentRowIdAllocator {
     pub fn rewind_to_mark(&self, mark: &RowidAllocSavepointMark) {
         let mut session_reservations = self.session_reservations.lock();
         let mut tables = self.tables.lock();
-        for &(key, sp_next, sp_high_water, sp_count) in &mark.entries {
+        // bd-elcjy: a table whose first allocation happened AFTER the SAVEPOINT
+        // is absent from `mark.entries`, so the original loop never rewound it
+        // (the GH#147 fresh-table subcase: a post-rollback INSERT reused the
+        // advanced tip). Treat every such table this session has reserved as if
+        // the mark had captured its durable init tip with a zero reservation
+        // count, then run it through the identical CAS-guarded rewind.
+        let marked: HashSet<AllocatorKey> = mark.entries.iter().map(|&(key, ..)| key).collect();
+        let absent_entries: Vec<(AllocatorKey, i64, i64, i64)> = session_reservations
+            .iter()
+            .filter(|((session, key), _)| *session == mark.session_id && !marked.contains(key))
+            .filter_map(|((_, key), _)| {
+                tables
+                    .get(key)
+                    .map(|state| (*key, state.durable_next_rowid, state.durable_high_water, 0))
+            })
+            .collect();
+        for &(key, sp_next, sp_high_water, sp_count) in
+            mark.entries.iter().chain(absent_entries.iter())
+        {
             let current_count = session_reservations
                 .get(&(mark.session_id, key))
                 .copied()
@@ -339,6 +369,17 @@ impl ConcurrentRowIdAllocator {
         self.session_reservations
             .lock()
             .retain(|&(session, _), _| session != session_id);
+    }
+
+    /// Number of live per-`(session, table)` reservation entries.
+    ///
+    /// bd-elcjy: session ids are monotonic and never recycled, so a finished
+    /// concurrent transaction whose entries are not cleared at teardown leaks
+    /// here unboundedly. Exposed so a connection-level regression test can
+    /// assert the map stays bounded across many transactions.
+    #[must_use]
+    pub fn session_reservation_len(&self) -> usize {
+        self.session_reservations.lock().len()
     }
 
     /// Initialise (or re-initialise) a table's allocator from the durable tip.
@@ -717,6 +758,86 @@ mod tests {
                 "CAS must not reissue peer id 3; the gap at 2 stays"
             );
         }
+    }
+
+    // ── bd-elcjy: fresh-table savepoint rewind + session-reservation leak ──
+
+    /// bd-elcjy (GH#147 fresh-table subcase): a table whose first allocation
+    /// happens AFTER the SAVEPOINT is absent from the mark; `ROLLBACK TO` must
+    /// still rewind it to its durable init tip so the next insert reuses id 1.
+    #[test]
+    fn rewind_rewinds_a_table_first_allocated_after_the_savepoint() {
+        let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+        let k = key(1, 1);
+        let session = 10u64;
+        // Savepoint taken BEFORE the table is ever touched → absent from mark.
+        let mark = alloc.mark_savepoint(session);
+        alloc.init_table(k, None, 0, RowIdMode::AutoIncrement);
+        assert_eq!(alloc.allocate_one_for_session(k, session).unwrap().get(), 1);
+        alloc.rewind_to_mark(&mark);
+        // The rewind restores both the tip and the AUTOINCREMENT high-water to
+        // the durable init (checked before the reclaiming insert re-bumps them).
+        assert_eq!(
+            alloc.autoincrement_high_water(&k),
+            Some(0),
+            "fresh-table rewind must restore the high-water to its durable init"
+        );
+        // Previously the tip stayed at 2 (absent tables were never rewound);
+        // now the rolled-back id 1 is reclaimed.
+        assert_eq!(
+            alloc.allocate_one_for_session(k, session).unwrap().get(),
+            1,
+            "fresh-table ROLLBACK TO must reclaim id 1, not advance to 2"
+        );
+    }
+
+    /// The fresh-table rewind must keep the CAS guarantee: a peer that allocated
+    /// on the same brand-new table between the savepoint and the rollback must
+    /// never have its id reissued.
+    #[test]
+    fn fresh_table_rewind_never_reissues_a_concurrent_peer_id() {
+        let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+        let k = key(1, 1);
+        let (session_a, session_b) = (10u64, 20u64);
+        let mark = alloc.mark_savepoint(session_a); // k absent from A's mark
+        alloc.init_table(k, None, 0, RowIdMode::AutoIncrement);
+        assert_eq!(
+            alloc.allocate_one_for_session(k, session_a).unwrap().get(),
+            1
+        );
+        // Peer B reserves id 2 before A rolls back.
+        assert_eq!(
+            alloc.allocate_one_for_session(k, session_b).unwrap().get(),
+            2
+        );
+        alloc.rewind_to_mark(&mark);
+        // The tip (3) is not A's contiguous tail (durable 1 + 1), so the CAS
+        // declines: B's id 2 is preserved and never reissued.
+        assert_eq!(
+            alloc.allocate_one_for_session(k, session_a).unwrap().get(),
+            3,
+            "fresh-table CAS must not reissue peer id 2"
+        );
+    }
+
+    /// bd-elcjy: `clear_session` must drop a finished session's reservation
+    /// entries so the process-shared map does not leak (session ids are
+    /// monotonic and never recycled, so a BEGIN-time clear of a fresh id is a
+    /// no-op — teardown must clear the real id).
+    #[test]
+    fn clear_session_releases_reservation_entries() {
+        let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+        let k = key(1, 1);
+        let session = 10u64;
+        alloc.init_table(k, None, 0, RowIdMode::Normal);
+        alloc.allocate_one_for_session(k, session).unwrap();
+        assert_eq!(alloc.session_reservation_len(), 1);
+        alloc.clear_session(session);
+        assert_eq!(
+            alloc.session_reservation_len(),
+            0,
+            "clear_session must release the finished session's entries"
+        );
     }
 
     // ── 1. test_rowid_allocator_basic ──
