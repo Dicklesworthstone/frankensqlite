@@ -2197,6 +2197,11 @@ pub struct CodegenContext {
     /// SELECT access paths. When present, lowering either honors it or emits
     /// an explicit bypass reason before falling back to heuristic selection.
     pub planner_select_directive: Option<SelectPlannerDirective>,
+    /// `PRAGMA reverse_unordered_selects`: when true, a SELECT whose row order
+    /// is not fixed by an ORDER BY walks its full-table scan in reverse
+    /// (`Last`/`Prev` instead of `Rewind`/`Next`). Only unordered scans are
+    /// affected; a query with an ORDER BY keeps its required order (GH #236).
+    pub reverse_unordered_selects: bool,
 }
 
 /// Errors during code generation.
@@ -3731,7 +3736,9 @@ pub fn codegen_select(
                         out_col_count,
                         done_label,
                         end_label,
-                        false,
+                        // reverse_unordered_selects: reverse this scan only when
+                        // the row order is not fixed by an ORDER BY (GH #236).
+                        ctx.reverse_unordered_selects && stmt.order_by.is_empty(),
                     );
                 }
                 PlannerSelectAccessKind::RowidLookup => match rowid_target {
@@ -4297,7 +4304,9 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
-            false,
+            // reverse_unordered_selects: reverse only when the row order is not
+            // fixed by an ORDER BY (GH #236).
+            ctx.reverse_unordered_selects && stmt.order_by.is_empty(),
         )
     }
 }

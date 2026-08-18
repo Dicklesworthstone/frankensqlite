@@ -4670,6 +4670,7 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
                 | "checkpoint_fullfsync"
                 | "automatic_index"
                 | "cache_spill"
+                | "reverse_unordered_selects"
         )
     {
         return &[];
@@ -4734,6 +4735,11 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     // has_value gate above returns &[] for the assignment form); GH #275.
     if name_is("cache_spill") {
         return &["cache_spill"];
+    }
+    // `reverse_unordered_selects`: one row on a bare query, none on assignment
+    // (suppressed by the has_value gate above); GH #236.
+    if name_is("reverse_unordered_selects") {
+        return &["reverse_unordered_selects"];
     }
 
     // Header, integrity, and standard introspection PRAGMAs.
@@ -10193,6 +10199,10 @@ thread_local! {
 struct CompiledCacheEntry {
     sql: String,
     program: Arc<VdbeProgram>,
+    /// The `reverse_unordered_selects` pragma value the program was compiled
+    /// under. A cached program encodes the scan direction, so a lookup under a
+    /// different setting must miss and recompile (GH #236 / bd-3gk2x).
+    reverse_unordered_selects: bool,
 }
 
 #[derive(Clone)]
@@ -21256,21 +21266,19 @@ impl Connection {
         // sqlite_sequence unconditionally when any autoincrement table
         // exists) so last_insert_rowid stays correct.
         //
-        // bd-dsxu2 REGRESSION FIX: this per-write in-txn refresh must NOT use the
-        // schema-cookie fast path on a DIRTY mirror. Unlike the two from-pager
-        // reload call sites (which use `allow_dirty_schema_only_fast_path=true`),
-        // this call site is `refresh_memdb_from_active_txn_if_dirty` -- the ONLY
-        // per-write path that absorbs in-txn DML row changes into the mirror.
-        // With `true`, the fast path (reload_memdb_from_txn_with_mode's
-        // schema-cookie branch) fires on a dirty mirror and clears
-        // `memdb_requires_active_txn_reload` WITHOUT absorbing those rows, so an
-        // in-txn parent DELETE leaves a ghost parent in the mirror and
-        // `fk_parent_rowid_fast_lookup` then trusts it -> FK constraint silently
-        // bypassed (test_issue110_fk_parent_cache_invalidated_by_delete /
-        // _insert_or_replace). Keep `false` here so a dirty mirror takes the
-        // row-absorbing reload. (Re-doing the schema-reparse-skip perf win
-        // without breaking row-dirty absorption is tracked as bd-ixf69.)
-        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, false)
+        // bd-ixf69 (restores the schema-reparse-skip perf win bd-dsxu2 reverted):
+        // this per-write in-txn refresh uses the schema-cookie fast path even on
+        // a DIRTY mirror. The prior FK regression (bd-dsxu2) was that the fast
+        // path cleared `memdb_requires_active_txn_reload` while LEAVING the mirror's
+        // stale rows, so an in-txn-deleted FK parent survived as a ghost that
+        // `fk_parent_rowid_fast_lookup` trusted. That is now fixed inside the
+        // fast-path branch itself (reload_memdb_from_txn_with_mode): when it fires
+        // on a dirty mirror it DISCARDS the stale row image
+        // (`clear_all_table_rows` + `memdb_rows_loaded = false`), forcing lazy
+        // re-hydration from the authoritative pager — equivalent to the full
+        // reload's fresh-empty mirror, minus the O(corpus) sqlite_master reparse.
+        // Guarded by test_issue110_fk_parent_cache_invalidated_*.
+        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, true)
             .await
     }
 
@@ -30754,6 +30762,7 @@ impl Connection {
         schema_cookie: u32,
         schema_generation: u64,
         function_registry_generation: u64,
+        reverse_unordered_selects: bool,
     ) -> u64 {
         use std::hash::BuildHasher;
         // bd-#70: db_generation (memdb_visible_commit_seq) and the finalized
@@ -30770,11 +30779,16 @@ impl Connection {
         // Conservative wedge: any commit invalidates non-direct-DML plans.
         // Future optimization: narrow by `pages_read_set ∩ pages_written_set`
         // so a commit that only touches unrelated pages leaves the plan live.
+        // reverse_unordered_selects changes the emitted scan direction, so it
+        // must partition the compiled-program cache: ON and OFF get distinct
+        // keys, otherwise a program compiled under one setting could be reused
+        // stale after the pragma is toggled (GH #236 / bd-3gk2x).
         foldhash::fast::FixedState::default().hash_one((
             sql,
             schema_cookie,
             schema_generation,
             function_registry_generation,
+            reverse_unordered_selects,
         ))
     }
 
@@ -30784,6 +30798,7 @@ impl Connection {
             self.schema_cookie(),
             self.schema_generation(),
             self.function_registry_generation(),
+            self.pragma_state.borrow().reverse_unordered_selects,
         )
     }
 
@@ -31415,9 +31430,10 @@ impl Connection {
 
     /// Look up a cached compiled VdbeProgram by SQL hash.
     fn lookup_compiled_cache(&self, key: u64, sql: &str) -> Option<Arc<CompiledCacheEntry>> {
+        let reverse_unordered_selects = self.pragma_state.borrow().reverse_unordered_selects;
         let mut cache = self.compiled_cache.borrow_mut();
         let entry = cache.get(&key)?;
-        if entry.sql == sql {
+        if entry.sql == sql && entry.reverse_unordered_selects == reverse_unordered_selects {
             Some(Arc::clone(entry))
         } else {
             None
@@ -31480,10 +31496,12 @@ impl Connection {
         sql: &str,
         program: VdbeProgram,
     ) -> Arc<CompiledCacheEntry> {
+        let reverse_unordered_selects = self.pragma_state.borrow().reverse_unordered_selects;
         let mut cache = self.compiled_cache.borrow_mut();
         let entry = Arc::new(CompiledCacheEntry {
             sql: sql.to_owned(),
             program: Arc::new(program),
+            reverse_unordered_selects,
         });
         cache.put(key, Arc::clone(&entry));
         entry
@@ -35009,8 +35027,31 @@ impl Connection {
                 // path receives only local literals instead of outer-table
                 // references it cannot resolve.
                 for assignment in &mut update.assignments {
-                    rewrite_dml_in_expr(&mut assignment.value, self, eager_in_subqueries, params)
+                    // bd-22jvi: a row-value SET whose RHS is directly a
+                    // multi-column subquery — `SET (a, b) = (SELECT a, b FROM
+                    // ...)` — accepts a row value, so the uncorrelated-subquery
+                    // folding pass must let the >1-column subquery survive to
+                    // codegen (which binds each output column to its target)
+                    // instead of raising the scalar "returns N columns - expected
+                    // 1" arity error. Grant the exemption only when the value IS
+                    // the subquery, mirroring the row-value comparison sites.
+                    let row_value_ctx = matches!(
+                        &assignment.target,
+                        fsqlite_ast::AssignmentTarget::ColumnList(names) if names.len() > 1
+                    ) && matches!(&assignment.value, Expr::Subquery(_, _));
+                    {
+                        let _row_value_guard = BoolCellRestoreGuard::new(
+                            &self.scalar_subquery_row_value_context,
+                            row_value_ctx,
+                        );
+                        rewrite_dml_in_expr(
+                            &mut assignment.value,
+                            self,
+                            eager_in_subqueries,
+                            params,
+                        )
                         .await?;
+                    }
                 }
                 if let Some(from) = update.from.as_mut() {
                     self.rewrite_dml_from_clause(from, eager_in_subqueries, params)
@@ -68357,6 +68398,7 @@ impl Connection {
             rowid_alias_col_idx: None,
             index_ordered_scan_reliable: true,
             planner_select_directive,
+            reverse_unordered_selects: self.pragma_state.borrow().reverse_unordered_selects,
             ..CodegenContext::default()
         };
         let t = prof.then(Instant::now);
@@ -83353,6 +83395,18 @@ impl Connection {
                 // Match the Lightweight refresh path in
                 // `try_refresh_prepared_metadata_if_stale` and refresh the cache
                 // here when we have any autoincrement tables to track.
+                // bd-ixf69 (fixes the bd-dsxu2 regression while restoring the
+                // schema-reparse-skip perf win): this fast path may fire on a
+                // DIRTY mirror (`allow_dirty_schema_only_fast_path`), i.e. one
+                // whose row image has NOT absorbed this txn's DML. The schema is
+                // provably unchanged (cookie match) so skipping the sqlite_master
+                // reparse is safe — but the STALE ROWS must not be trusted, or a
+                // ghost row (e.g. an in-txn-deleted FK parent) survives in the
+                // mirror and `fk_parent_rowid_fast_lookup` reads it (bd-dsxu2).
+                // Discard the mirror's row image so row consumers re-hydrate
+                // lazily from the authoritative pager — equivalent to the full
+                // path's fresh-empty `MemDatabase`, minus the reparse.
+                let mirror_row_image_is_stale = self.memdb_requires_active_txn_reload.get();
                 let has_autoincrement_tables = !self.autoincrement_tables.borrow().is_empty();
                 if has_autoincrement_tables {
                     let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn).await?;
@@ -83363,6 +83417,9 @@ impl Connection {
                 // observe this cross-process commit.
                 self.set_memdb_visible_commit_seq_from_publication(bound_visible_commit_seq);
                 *self.change_counter.borrow_mut() = change_counter;
+                if mirror_row_image_is_stale {
+                    self.db.borrow_mut().clear_all_table_rows();
+                }
                 self.memdb_rows_loaded.set(false);
                 self.memdb_requires_active_txn_reload.set(false);
                 self.memdb_storage_count_shortcuts_safe.set(false);
