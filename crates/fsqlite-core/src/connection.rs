@@ -11512,6 +11512,12 @@ pub struct Connection {
     /// Without this, runtime-input construction can recursively try to
     /// rebuild the same default map while already evaluating a default.
     column_default_eval_depth: Cell<usize>,
+    /// Nesting depth of statement dispatch. Zero means the outermost
+    /// (top-level) statement; a nested subquery / CTE sub-execution runs at
+    /// depth > 0. Used so the `'now'` cache is reset only when a new top-level
+    /// statement begins, keeping `julianday('now')` stable across every nested
+    /// subquery within one statement (GH #175 / bd-u4hie).
+    statement_exec_depth: Cell<usize>,
     // ── ATTACH/DETACH schema registry (§12.11, bd-7pxb) ─────────────────────
     /// Registry of attached databases. Tracks schema names registered via
     /// ATTACH DATABASE so that schema-qualified references resolve correctly.
@@ -11597,6 +11603,22 @@ impl Drop for ColumnDefaultEvalGuard<'_> {
         let depth = self.conn.column_default_eval_depth.get();
         self.conn
             .column_default_eval_depth
+            .set(depth.saturating_sub(1));
+    }
+}
+
+/// RAII guard that raises `statement_exec_depth` for the lifetime of a statement
+/// dispatch and lowers it on drop, so nested subquery / CTE sub-executions
+/// observe a non-zero depth (GH #175 / bd-u4hie).
+struct StatementExecDepthGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl Drop for StatementExecDepthGuard<'_> {
+    fn drop(&mut self) {
+        let depth = self.conn.statement_exec_depth.get();
+        self.conn
+            .statement_exec_depth
             .set(depth.saturating_sub(1));
     }
 }
@@ -12888,6 +12910,7 @@ impl Connection {
             group_by_bucket_fast_memo: RefCell::new(None),
             table_execution_metadata_cache: RefCell::new(None),
             column_default_eval_depth: Cell::new(0),
+            statement_exec_depth: Cell::new(0),
             attached_schemas: RefCell::new(SchemaRegistry::new()),
             attach_env,
             attached_connections: RefCell::new(HashMap::new()),
@@ -13420,6 +13443,7 @@ impl Connection {
             group_by_bucket_fast_memo: RefCell::new(None),
             table_execution_metadata_cache: RefCell::new(None),
             column_default_eval_depth: Cell::new(0),
+            statement_exec_depth: Cell::new(0),
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
             attached_schemas: RefCell::new(SchemaRegistry::new()),
             attach_env,
@@ -16754,8 +16778,13 @@ impl Connection {
         // GH #175: a new statement re-reads the wall clock exactly once. Clear
         // the cached `'now'` so the first `julianday('now')` / `CURRENT_*` in
         // this statement captures a fresh value that then stays stable across
-        // the statement's rows.
-        reset_statement_now();
+        // the statement's rows. bd-u4hie: only the OUTERMOST (top-level)
+        // statement resets — a nested subquery / CTE sub-execution runs at
+        // depth > 0 and must inherit the top-level statement's captured `'now'`,
+        // so `(SELECT julianday('now')) = (SELECT julianday('now'))` is 1.
+        if self.statement_exec_depth.get() == 0 {
+            reset_statement_now();
+        }
         let state = ChangeTrackingState {
             last_insert_rowid: self.last_insert_rowid.get(),
             last_changes: i64::try_from(self.last_changes.get()).unwrap_or(i64::MAX),
@@ -32760,6 +32789,11 @@ impl Connection {
                 enter_record_profile_scope(RecordProfileScope::CoreConnection);
             self.clear_table_program_error_state();
             self.sync_change_tracking_context();
+            // bd-u4hie: raise the dispatch nesting depth AFTER the `'now'` reset
+            // decision above, so any nested subquery / CTE that recurses back
+            // into this dispatch observes depth > 0 and keeps the top-level
+            // statement's captured `'now'`.
+            let _statement_exec_depth_guard = self.enter_statement_exec();
             if !select_structure_validated {
                 self.with_fallback_function_registry(|| {
                     self.validate_statement_select_structure(statement)
@@ -46700,6 +46734,16 @@ impl Connection {
         let next_depth = self.column_default_eval_depth.get().saturating_add(1);
         self.column_default_eval_depth.set(next_depth);
         ColumnDefaultEvalGuard { conn: self }
+    }
+
+    /// Raise the statement-dispatch nesting depth for the duration of the
+    /// returned guard. Entered once per statement dispatch (after the `'now'`
+    /// reset decision), so nested subquery / CTE sub-executions see depth > 0
+    /// and do not re-capture `'now'` (GH #175 / bd-u4hie).
+    fn enter_statement_exec(&self) -> StatementExecDepthGuard<'_> {
+        let next_depth = self.statement_exec_depth.get().saturating_add(1);
+        self.statement_exec_depth.set(next_depth);
+        StatementExecDepthGuard { conn: self }
     }
 
     fn is_evaluating_column_default(&self) -> bool {
