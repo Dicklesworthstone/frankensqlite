@@ -56241,6 +56241,22 @@ impl Connection {
         if matches!(alter.action, AlterTableAction::RenameTo(_))
             && self.has_live_vtab_instance(table_name)
         {
+            // GH #209: `ALTER TABLE <fts5> RENAME TO` renames the vtab together
+            // with its five shadow tables and keeps it fully functional. The
+            // generic rename path below cannot serve this: it parses the stored
+            // DDL as `CREATE TABLE` (a `CREATE VIRTUAL TABLE` cannot satisfy it)
+            // and runs FK/autoindex machinery irrelevant to a rootpage-zero
+            // vtab. Route a live FTS5 instance to the dedicated path; other live
+            // vtab modules (rtree, custom modules) stay rejected — scoping this
+            // change to FTS5 bounds the risk.
+            #[cfg(feature = "ext-fts5")]
+            if self.is_live_fts5_instance(table_name)
+                && let AlterTableAction::RenameTo(new_name) = &alter.action
+            {
+                return self
+                    .execute_alter_table_rename_fts5(table_name, new_name)
+                    .await;
+            }
             return Err(FrankenError::Unsupported);
         }
         // GH #215: SQLite forbids column DDL on a virtual table. `ALTER TABLE
@@ -57193,6 +57209,204 @@ impl Connection {
 
         // ALTER TABLE may have renamed the table or changed its column list.
         // Refresh the name side-index so subsequent lookups hit the new name.
+        self.rebuild_schema_indices();
+        self.validate_schema_index();
+        self.increment_schema_cookie().await?;
+        Ok(())
+    }
+
+    /// Rename a live FTS5 virtual table together with its shadow tables
+    /// (`_data`, `_idx`, `_config`, and — unless configured away — `_content`
+    /// and `_docsize`), matching stock SQLite's `ALTER TABLE <fts5> RENAME TO`.
+    ///
+    /// The `Fts5Table` instance stores no table name of its own and resolves
+    /// its shadow roots from the schema by name (see `with_lazy_fts5_reader`),
+    /// so once the schema entries and the live-registry key are renamed the
+    /// instance self-heals. GH #209.
+    #[cfg(feature = "ext-fts5")]
+    async fn execute_alter_table_rename_fts5(&self, old_name: &str, new_name: &str) -> Result<()> {
+        // Reject a rename onto an existing table/index/view, mirroring the
+        // generic rename path's precedence.
+        {
+            let schema = self.schema.borrow();
+            let views = self.views.borrow();
+            if !old_name.eq_ignore_ascii_case(new_name)
+                && schema_table_index_or_view_name_exists(&schema, &views, new_name)
+            {
+                return Err(FrankenError::Internal(format!(
+                    "table, index, or view {new_name} already exists"
+                )));
+            }
+        }
+
+        // Recover the CREATE VIRTUAL TABLE args from the persisted DDL so the
+        // shadow-name derivation matches exactly what CREATE produced (the
+        // `content=`/`columnsize=` options change which shadows exist).
+        let create_sql = self
+            .original_ddl_sql
+            .borrow()
+            .get(&old_name.to_ascii_lowercase())
+            .cloned()
+            .ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "cannot rename FTS5 table `{old_name}` without its CREATE VIRTUAL TABLE SQL"
+                ))
+            })?;
+        let mut create_stmt = match parse_single_statement(&create_sql)? {
+            Statement::CreateVirtualTable(stmt) => stmt,
+            _ => {
+                return Err(FrankenError::Internal(format!(
+                    "stored DDL for `{old_name}` is not a CREATE VIRTUAL TABLE statement"
+                )));
+            }
+        };
+        let args = create_stmt.args.clone();
+
+        // The `_content` shadow's column count follows the vtab's declared
+        // columns; `fts5_shadow_table_defs` only reads the length.
+        let fts_columns: Vec<ColumnInfo> = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(old_name))
+                .map(|table| table.columns.clone())
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: old_name.to_owned(),
+                })?
+        };
+
+        // Reject a rename whose new shadow names would collide with an
+        // existing table.
+        self.preflight_fts5_shadow_table_names(new_name, &args)?;
+
+        // Old shadow names and new shadow defs are built by the same helpers,
+        // in the same order and with the same conditional inclusion, so they
+        // zip element-for-element.
+        let old_shadow_names = fts5_shadow_drop_names(old_name, &args);
+        let new_shadow_defs = fts5_shadow_table_defs(new_name, &args, &fts_columns);
+        if old_shadow_names.len() != new_shadow_defs.len() {
+            return Err(FrankenError::Internal(
+                "FTS5 shadow-name derivation mismatch during rename".to_owned(),
+            ));
+        }
+
+        // Rewrite the vtab's own CREATE VIRTUAL TABLE SQL: only the table name
+        // changes; the `USING fts5(...)` argument text is preserved.
+        create_stmt.name.name = new_name.to_owned();
+        let new_vtab_sql = create_stmt.to_string();
+
+        // 1) sqlite_master: rename the vtab row (name/tbl_name/sql). The helper
+        //    also re-keys the `original_ddl_sql` cache old -> new. Root page
+        //    (0 for a vtab) is preserved.
+        self.update_sqlite_master_typed_name_tbl_name_and_sql(
+            "table",
+            old_name,
+            new_name,
+            new_name,
+            &new_vtab_sql,
+        )
+        .await?;
+
+        // 2) sqlite_master: rename each shadow row. Only name/tbl_name/sql
+        //    change; the shadow root pages (and their contents) are preserved.
+        for (old_shadow, new_def) in old_shadow_names.iter().zip(new_shadow_defs.iter()) {
+            self.update_sqlite_master_typed_name_tbl_name_and_sql(
+                "table",
+                old_shadow,
+                &new_def.name,
+                &new_def.name,
+                &new_def.create_sql,
+            )
+            .await?;
+        }
+
+        // 3) In-memory schema catalog: rename the vtab entry and every shadow
+        //    entry in one borrow pass.
+        {
+            let mut schema = self.schema.borrow_mut();
+            for table in schema.iter_mut() {
+                if table.name.eq_ignore_ascii_case(old_name) {
+                    table.name = new_name.to_owned();
+                    continue;
+                }
+                if let Some(new_def) = old_shadow_names
+                    .iter()
+                    .zip(new_shadow_defs.iter())
+                    .find(|(old_shadow, _)| table.name.eq_ignore_ascii_case(old_shadow))
+                    .map(|(_, new_def)| new_def)
+                {
+                    table.name = new_def.name.clone();
+                }
+            }
+        }
+
+        // 4) Re-key the live virtual-table registry (keyed by UPPERCASE name).
+        //    The Fts5Table instance stores no name, so re-keying is enough.
+        let old_key = old_name.to_ascii_uppercase();
+        let new_key = new_name.to_ascii_uppercase();
+        if old_key != new_key {
+            let instance = self.vtab_instances.borrow_mut().remove(&old_key);
+            if let Some(instance) = instance {
+                self.vtab_instances
+                    .borrow_mut()
+                    .insert(new_key.clone(), instance);
+            }
+            let txn_depth = self.live_vtab_transactions.borrow_mut().remove(&old_key);
+            if let Some(txn_depth) = txn_depth {
+                self.live_vtab_transactions
+                    .borrow_mut()
+                    .insert(new_key, txn_depth);
+            }
+        }
+
+        // 5) Re-key the shadow tables' rowid-alias / WITHOUT ROWID PK maps
+        //    (keyed by lowercase name). `_data`/`_content`/`_docsize` carry an
+        //    INTEGER PRIMARY KEY rowid alias; `_idx`/`_config` are WITHOUT
+        //    ROWID. The generic rename path re-keys these for ordinary tables;
+        //    the shadows need the same treatment.
+        for (old_shadow, new_def) in old_shadow_names.iter().zip(new_shadow_defs.iter()) {
+            let old_shadow_key = old_shadow.to_ascii_lowercase();
+            let new_shadow_key = new_def.name.to_ascii_lowercase();
+            let removed_alias = self
+                .rowid_alias_columns
+                .borrow_mut()
+                .remove(&old_shadow_key);
+            if let Some(idx) = removed_alias {
+                self.rowid_alias_columns
+                    .borrow_mut()
+                    .insert(new_shadow_key.clone(), idx);
+            }
+            let removed_pk_desc = self
+                .without_rowid_pk_desc
+                .borrow_mut()
+                .remove(&old_shadow_key);
+            if let Some(flags) = removed_pk_desc {
+                self.without_rowid_pk_desc
+                    .borrow_mut()
+                    .insert(new_shadow_key, flags);
+            }
+        }
+
+        // 6) Follow the rename through any dependent views/triggers, mirroring
+        //    the generic path (usually a no-op for an FTS5 table).
+        let dependent_view_sql_updates =
+            self.rename_dependent_views_for_table_rename(old_name, new_name);
+        let dependent_trigger_sql_updates =
+            self.rename_dependent_triggers_for_table_rename(old_name, new_name);
+        for (view_name, view_sql) in &dependent_view_sql_updates {
+            self.update_sqlite_master_typed_sql("view", view_name, view_sql)
+                .await?;
+        }
+        for (trigger_name, trig_table_name, trigger_sql) in &dependent_trigger_sql_updates {
+            self.update_sqlite_master_typed_tbl_name_and_sql(
+                "trigger",
+                trigger_name,
+                trig_table_name,
+                Some(trigger_sql),
+            )
+            .await?;
+        }
+
         self.rebuild_schema_indices();
         self.validate_schema_index();
         self.increment_schema_cookie().await?;
