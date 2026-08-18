@@ -11693,8 +11693,14 @@ impl VdbeEngine {
                             let payload = cursor.cursor.payload(&cursor.cx).await?;
                             (root_page, payload)
                         };
-                        let stored_values =
-                            parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        // Decode in the DB text encoding: the captured victim's
+                        // values are re-encoded as index-delete probe keys (see
+                        // the `serialize_record_iter_into_with_encoding` below and
+                        // in the victim-cleanup path), so a UTF-8-hardcoded decode
+                        // on a UTF-16 DB would orphan the victim's secondary-index
+                        // entries (bd-o3rz4, family b).
+                        let stored_values = parse_record_with_encoding(&payload, self.text_encoding)
+                            .ok_or_else(|| FrankenError::DatabaseCorrupt {
                                 detail: "REPLACE victim capture encountered a malformed WITHOUT ROWID record"
                                     .to_owned(),
                             })?;

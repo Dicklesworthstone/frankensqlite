@@ -162,6 +162,62 @@ fn bd_o3rz4_utf16_or_replace_conflict_leaves_no_stale_index_entry() {
     });
 }
 
+/// Site 5 (engine.rs:11697 IdxDelete REPLACE-victim capture, family b): a WITHOUT
+/// ROWID INSERT OR REPLACE must delete the replaced row's SECONDARY-index entry.
+/// The victim is captured by decoding the stored WITHOUT ROWID record; before
+/// bd-o3rz4 that decode was UTF-8-hardcoded, so on a UTF-16 DB the victim's
+/// re-encoded index-delete probe missed the stored key and orphaned the entry.
+#[test]
+fn bd_o3rz4_utf16_without_rowid_replace_cleans_secondary_index() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for &(encoding, expected_header) in UTF16_VARIANTS {
+            let db_path = dir.path().join(format!("wr_{encoding}.db"));
+            let db_str = db_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&db_str).await.unwrap();
+            conn.execute(&format!("PRAGMA encoding = '{encoding}';"))
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE t(city TEXT PRIMARY KEY, note TEXT) WITHOUT ROWID;")
+                .await
+                .unwrap();
+            conn.execute("CREATE INDEX idx_note ON t(note);").await.unwrap();
+            conn.execute("INSERT INTO t VALUES ('Zürich', 'Übung');")
+                .await
+                .unwrap();
+            // PK 'Zürich' conflicts → the old row (note 'Übung') is the replace
+            // victim; its idx_note='Übung' entry must be removed, not orphaned.
+            conn.execute("INSERT OR REPLACE INTO t VALUES ('Zürich', 'Neu');")
+                .await
+                .unwrap();
+
+            let stale = conn
+                .query("SELECT city FROM t WHERE note = 'Übung';")
+                .await
+                .unwrap();
+            assert!(stale.is_empty(), "{encoding}: replaced note is not matchable via the index");
+            let cur = conn
+                .query("SELECT note FROM t WHERE city = 'Zürich';")
+                .await
+                .unwrap();
+            assert_eq!(frank_text(&cur[0].values()[0]), "Neu", "{encoding}: current note");
+            conn.close().await.unwrap();
+
+            // Stock integrity_check catches an orphaned secondary-index entry.
+            assert_stock_image_ok(&db_path, expected_header, encoding);
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            let by_note: Vec<String> = stock
+                .prepare("SELECT city FROM t WHERE note = 'Übung'")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(by_note.is_empty(), "{encoding}: stock finds no stale idx_note entry");
+        }
+    });
+}
+
 /// Site 3 (engine.rs:14435 TEMP FusedAppendInsert): a TEMP row serialized in the
 /// DB encoding must be decoded in the same encoding — before bd-o3rz4 it was
 /// parsed UTF-8, mojibaking the TEMP row and lossily re-encoding it into main.
