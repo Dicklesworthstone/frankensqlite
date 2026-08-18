@@ -106,6 +106,12 @@ where
         self.inner.values()
     }
 
+    /// Returns an iterator visiting all values mutably in arbitrary order.
+    #[inline]
+    pub fn values_mut(&mut self) -> hashbrown::hash_map::ValuesMut<'_, K, V> {
+        self.inner.values_mut()
+    }
+
     /// Returns true if the map contains a value for the specified key.
     #[inline]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
