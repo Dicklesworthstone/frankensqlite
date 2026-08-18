@@ -2570,6 +2570,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     space_sign,
                     zero_pad,
                     comma_group,
+                    precision,
                 );
                 result.push_str(&formatted);
             }
@@ -2579,7 +2580,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
                 param_idx += 1;
                 #[allow(clippy::cast_sign_loss)]
-                let digits = (val as u64).to_string();
+                let digits = apply_int_precision(&(val as u64).to_string(), precision);
                 let padded = if comma_group {
                     // Zero-pad the raw digits to the field width before grouping,
                     // so the padding zeros participate in comma grouping.
@@ -2651,7 +2652,13 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                         format!("{val:.prec$E}")
                     };
                     // C printf always uses explicit sign and minimum 2-digit exponent
-                    let formatted = normalize_exponent(&raw);
+                    let mut formatted = normalize_exponent(&raw);
+                    // Alternate-form-2 (`!`) strips trailing zeros from the
+                    // mantissa (keeping >= 1 fractional digit), e.g. '%!e' 3.14159
+                    // -> "3.14159e+00", '%!e' 5.0 -> "5.0e+00".
+                    if alt_form2 {
+                        formatted = altform2_trim_exp(&formatted, spec == 'e');
+                    }
                     result.push_str(&finish_float_padding(
                         &formatted, width, left_align, show_sign, space_sign, zero_pad,
                     ));
@@ -2679,7 +2686,14 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                         &s, width, left_align, show_sign, space_sign, zero_pad,
                     ));
                 } else {
-                    let formatted = format_float_g(val, sig, spec == 'G');
+                    let mut formatted = format_float_g(val, sig, spec == 'G');
+                    // The `,` flag groups the integer part only when %g renders in
+                    // fixed (non-exponential) form; SQLite leaves exponential
+                    // output ungrouped ('%,g' 1234.5 -> "1,234.5"; '%,g' 1e6 ->
+                    // "1e+06").
+                    if comma_group && !formatted.contains(['e', 'E']) {
+                        formatted = group_signed_decimal_integer_part(&formatted);
+                    }
                     result.push_str(&finish_float_padding(
                         &formatted, width, left_align, show_sign, space_sign, zero_pad,
                     ));
@@ -2761,11 +2775,14 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
                 param_idx += 1;
                 #[allow(clippy::cast_sign_loss)]
-                let digits = if spec == 'x' {
-                    format!("{:x}", val as u64)
-                } else {
-                    format!("{:X}", val as u64)
-                };
+                let digits = apply_int_precision(
+                    &if spec == 'x' {
+                        format!("{:x}", val as u64)
+                    } else {
+                        format!("{:X}", val as u64)
+                    },
+                    precision,
+                );
                 // Alternate form (`#`) prefixes a nonzero value with 0x / 0X.
                 let prefix = if alt_form && val != 0 {
                     if spec == 'x' { "0x" } else { "0X" }
@@ -2788,7 +2805,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
                 param_idx += 1;
                 #[allow(clippy::cast_sign_loss)]
-                let digits = format!("{:o}", val as u64);
+                let digits = apply_int_precision(&format!("{:o}", val as u64), precision);
                 // Alternate form (`#`) prefixes a nonzero value with a leading 0.
                 let prefix = if alt_form && val != 0 { "0" } else { "" };
                 // As with %x, SQLite zero-pads whenever the `0` flag is present
@@ -2828,6 +2845,10 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
     Ok(result)
 }
 
+// A printf integer conversion carries several independent, non-groupable flags
+// (justification, sign mode, zero-pad, comma grouping) plus width and precision;
+// bundling them behind a struct would only add indirection for a single caller.
+#[allow(clippy::too_many_arguments)]
 fn format_integer(
     val: i64,
     width: usize,
@@ -2836,6 +2857,7 @@ fn format_integer(
     space_sign: bool,
     zero_pad: bool,
     comma_group: bool,
+    precision: Option<usize>,
 ) -> String {
     let sign = if val < 0 {
         "-".to_owned()
@@ -2846,7 +2868,7 @@ fn format_integer(
     } else {
         String::new()
     };
-    let digits = format!("{}", val.unsigned_abs());
+    let digits = apply_int_precision(&format!("{}", val.unsigned_abs()), precision);
     if comma_group {
         // SQLite zero-pads the raw digits up to the field width BEFORE inserting
         // the grouping commas, so the padding zeros are themselves grouped
@@ -2929,6 +2951,43 @@ fn group_float_integer_part(mag: &str) -> String {
         format!("{}{}", group_thousands(&mag[..dot]), &mag[dot..])
     } else {
         group_thousands(mag)
+    }
+}
+
+/// Like [`group_float_integer_part`] but for a possibly signed decimal string
+/// (e.g. a `%g` fixed-form result such as "-1234.5" -> "-1,234.5").
+fn group_signed_decimal_integer_part(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix('-') {
+        format!("-{}", group_float_integer_part(rest))
+    } else {
+        group_float_integer_part(s)
+    }
+}
+
+/// Apply an integer conversion's precision (SQLite/C printf: precision is the
+/// MINIMUM number of digits — left-pad with zeros to reach it). Applies to
+/// %d/%i/%u/%x/%X/%o. `None` (no precision) leaves the digits untouched. SQLite
+/// keeps a single "0" for `%.0d` of 0 (unlike C, which yields ""), which falls
+/// out naturally because the "0" digit already satisfies precision 0.
+fn apply_int_precision(digits: &str, precision: Option<usize>) -> String {
+    match precision {
+        Some(p) if digits.len() < p => {
+            format!("{}{digits}", "0".repeat(p - digits.len()))
+        }
+        _ => digits.to_owned(),
+    }
+}
+
+/// Alternate-form-2 (`!`) trailing-zero trim for a `%e`/`%E` result: strip
+/// trailing zeros from the mantissa (the part before the exponent marker),
+/// keeping at least one fractional digit, then reattach the exponent, e.g.
+/// "3.141590e+00" -> "3.14159e+00", "5.000000e+00" -> "5.0e+00".
+fn altform2_trim_exp(s: &str, lower: bool) -> String {
+    let marker = if lower { 'e' } else { 'E' };
+    if let Some(pos) = s.find(marker) {
+        format!("{}{}", altform2_trim_float(&s[..pos]), &s[pos..])
+    } else {
+        s.to_owned()
     }
 }
 
@@ -5191,7 +5250,12 @@ mod tests {
             ("%,.2f", 1234567.891, "1,234,567.89"),
             ("%,f", -1234.5, "-1,234.500000"),
             ("%,e", 1234.5, "1.234500e+03"),
+            // %g is grouped only in fixed (non-exponential) form.
+            ("%,g", 1234.5, "1,234.5"),
+            ("%,g", 12.0, "12"),
             ("%,g", 1234567.0, "1.23457e+06"),
+            ("%,g", 1000000.0, "1e+06"),
+            ("%,.2g", 1234.5, "1.2e+03"),
         ];
         for (spec, v, want) in float_cases {
             assert_eq!(
@@ -5199,6 +5263,76 @@ mod tests {
                 *want,
                 "spec={spec} v={v}"
             );
+        }
+    }
+
+    #[test]
+    fn test_format_integer_precision() {
+        // Integer precision (%.Nd) is the MINIMUM digit count: the digits are
+        // zero-padded to N, with sign/width applied outside. Applies to
+        // %d/%i/%u/%x/%X/%o. Frank previously ignored precision on integers
+        // ('%.3d' 5 -> "5"; probe-found divergence). Oracle: sqlite3 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: i64| -> String {
+            match f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(spec)),
+                    SqliteValue::Integer(v),
+                ])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let cases: &[(&str, i64, &str)] = &[
+            ("%.3d", 5, "005"),
+            ("%.3d", -5, "-005"),
+            ("%.0d", 0, "0"),
+            ("%.0d", 5, "5"),
+            ("%5.3d", 42, "  042"),
+            ("%-5.3d", 42, "042  "),
+            ("%.3d", 12345, "12345"),
+            ("%+.3d", 5, "+005"),
+            ("% .3d", 5, " 005"),
+            ("%08.3d", 42, "00000042"),
+            ("%.3i", 9, "009"),
+            ("%.3u", 7, "007"),
+            ("%.3x", 10, "00a"),
+            ("%.3o", 8, "010"),
+        ];
+        for (spec, v, want) in cases {
+            assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
+        }
+    }
+
+    #[test]
+    fn test_format_altform2_exponential() {
+        // The '!' flag on %e/%E strips trailing zeros from the mantissa (keeping
+        // >= 1 fractional digit), then reattaches the exponent. Oracle: sqlite3
+        // 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: f64| -> String {
+            match f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(spec)),
+                    SqliteValue::Float(v),
+                ])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let cases: &[(&str, f64, &str)] = &[
+            ("%!e", 3.14159, "3.14159e+00"),
+            ("%!E", 3.14159, "3.14159E+00"),
+            ("%!e", 5.0, "5.0e+00"),
+            ("%!.2e", 3.14159, "3.14e+00"),
+            ("%!.0e", 3.0, "3.0e+00"),
+        ];
+        for (spec, v, want) in cases {
+            assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
         }
     }
 
