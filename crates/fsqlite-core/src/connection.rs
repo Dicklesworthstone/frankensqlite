@@ -90,9 +90,9 @@ use fsqlite_ext_fts5::{
     Fts5DocsizeRow, Fts5Expr, Fts5HighlightFunc, Fts5IdxRow, Fts5MergeScheduler, Fts5OnDiskReader,
     Fts5ScoreSnapshot, Fts5ShadowRows, Fts5SnippetFunc, Fts5StructureLevel, Fts5StructureRecord,
     Fts5StructureSegment, Fts5Table, Fts5TombstonePage, build_expr, collect_merged_term_groups,
-    decode_docsize_blob, encode_incremental_delete_flush, encode_merged_segment,
-    highlight as fts5_highlight, parse_fts5_query, resolve_tombstone_target_segment,
-    snippet as fts5_snippet,
+    decode_docsize_blob, encode_contentless_delete_all_flush, encode_incremental_delete_flush,
+    encode_merged_segment, highlight as fts5_highlight, parse_fts5_query,
+    resolve_tombstone_target_segment, snippet as fts5_snippet,
 };
 #[cfg(feature = "ext-json")]
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
@@ -46609,6 +46609,34 @@ impl Connection {
             return Ok(false);
         }
 
+        // `'delete-all'` is contentless-only (stock rejects it on stored/external
+        // content). It resets the index to empty by rewriting the persisted `_data`
+        // structure directly — WITHOUT hydrating the corpus (the O(1)-in-corpus
+        // reset the lazy epic exists for; a contentless table stores no content, so
+        // there is nothing to iterate anyway). Handled fully here, before the
+        // promote-on-lazy fallback used by the other commands.
+        if command == Fts5MaintenanceCommand::DeleteAll {
+            let key = insert.table.name.to_ascii_uppercase();
+            let is_contentless = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .is_some_and(|fts5| {
+                        fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless
+                    })
+            };
+            if !is_contentless {
+                return Err(FrankenError::function_error(
+                    "'delete-all' may only be used with a contentless fts5 table",
+                ));
+            }
+            self.persist_rootpage_zero_fts5_contentless_delete_all(insert.table.name.as_str())
+                .await?;
+            self.reset_statement_change_count();
+            return Ok(true);
+        }
+
         {
             let key = insert.table.name.to_ascii_uppercase();
             let is_lazy = {
@@ -46646,6 +46674,11 @@ impl Connection {
                 drop(instances);
                 self.persist_rootpage_zero_fts5_shadow_rows(&insert.table.name)
                     .await?;
+            }
+            Fts5MaintenanceCommand::DeleteAll => {
+                // Fully handled above (contentless-only, returns early); a
+                // contentless table stores no content to iterate here.
+                unreachable!("'delete-all' is handled before the promote fallback")
             }
         }
 
@@ -47368,6 +47401,93 @@ impl Connection {
             "fts5: tombstoned lazy contentless delete (bd-fts5-lazy-shadow-reads-itcc4.3)"
         );
         Ok(Some(rowids.len()))
+    }
+
+    /// `'delete-all'` on a lazy `contentless_delete` table: reset the index to
+    /// empty by dropping every on-disk segment and re-writing an empty
+    /// structure + zeroed averages, WITHOUT hydrating the corpus. Reads only the
+    /// structure (`O(segments)`); the `_docsize` clear is `O(docs)`, never
+    /// `O(corpus tokens)`. Leaves the table lazy with an empty on-disk index.
+    /// (bd-fts5-lazy-shadow-reads-itcc4.3 special commands.)
+    #[cfg(feature = "ext-fts5")]
+    async fn persist_rootpage_zero_fts5_contentless_delete_all(
+        &self,
+        table_name: &str,
+    ) -> Result<()> {
+        let key = table_name.to_ascii_uppercase();
+        let column_count = {
+            let instances = self.vtab_instances.borrow();
+            let Some(fts5) = instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            else {
+                return Ok(());
+            };
+            fts5.columns().len()
+        };
+        if !self.schema_table_exists(&format!("{table_name}_data")) {
+            return Ok(());
+        }
+
+        // One reader pass: read the structure to enumerate every segment's `_data`
+        // rows. A missing structure means nothing is persisted yet — nothing to do.
+        let structure = self
+            .with_lazy_fts5_reader(table_name, async |reader| {
+                match reader.read_data_block(FTS5_STRUCTURE_ROWID).await? {
+                    Some(block) => Ok(Some(Fts5StructureRecord::decode(&block)?)),
+                    None => Ok(None),
+                }
+            })
+            .await?;
+        let Some(structure) = structure else {
+            return Ok(());
+        };
+
+        let flush = encode_contentless_delete_all_flush(&structure, column_count)?;
+
+        // Upsert the empty structure + zeroed averages, then delete every
+        // segment's leaf/tombstone `_data` rows.
+        let data_rows: Vec<(i64, Vec<SqliteValue>)> =
+            [flush.structure_data_row, flush.averages_data_row]
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.id,
+                        vec![
+                            SqliteValue::Integer(row.id),
+                            SqliteValue::Blob(Arc::from(row.block.into_boxed_slice())),
+                        ],
+                    )
+                })
+                .collect();
+        self.upsert_storage_table_rows(&format!("{table_name}_data"), data_rows)
+            .await?;
+        self.delete_storage_table_rows(&format!("{table_name}_data"), &flush.deleted_data_rowids)
+            .await?;
+
+        // Every document is gone: clear the whole `_docsize` shadow.
+        self.replace_storage_table_rows(
+            &format!("{table_name}_docsize"),
+            std::iter::empty::<(i64, Vec<SqliteValue>)>(),
+        )
+        .await?;
+
+        // Reset the in-memory state to an empty lazy on-disk index.
+        {
+            let mut instances = self.vtab_instances.borrow_mut();
+            if let Some(fts5) = instances
+                .get_mut(&key)
+                .and_then(|instance| instance.as_any_mut().downcast_mut::<Fts5Table>())
+            {
+                fts5.mark_lazy_on_disk(0);
+            }
+        }
+
+        tracing::debug!(
+            table = table_name,
+            "fts5: delete-all cleared lazy contentless index (bd-fts5-lazy-shadow-reads-itcc4.3)"
+        );
+        Ok(())
     }
 
     #[cfg(feature = "ext-fts5")]
@@ -93598,6 +93718,7 @@ fn resolve_virtual_table_column_infos(
 enum Fts5MaintenanceCommand {
     Optimize,
     Rebuild,
+    DeleteAll,
 }
 
 fn fts5_insert_uses_command_column(insert: &fsqlite_ast::InsertStatement) -> bool {
@@ -93626,6 +93747,11 @@ fn fts5_maintenance_insert_command(
                     if command.eq_ignore_ascii_case("rebuild") =>
                 {
                     Some(Fts5MaintenanceCommand::Rebuild)
+                }
+                Expr::Literal(Literal::String(command), _)
+                    if command.eq_ignore_ascii_case("delete-all") =>
+                {
+                    Some(Fts5MaintenanceCommand::DeleteAll)
                 }
                 _ => None,
             }
