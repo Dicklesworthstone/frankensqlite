@@ -3127,7 +3127,16 @@ fn format_float_g(val: f64, sig: usize, upper: bool) -> String {
             sig + exp.unsigned_abs() as usize - 1
         };
         let s = format!("{val:.decimal_places$}");
-        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+        // Only strip trailing zeros when there is a fractional part. When
+        // decimal_places == 0 (e.g. `%g` of 100000.0 -> exp 5, sig 6), `s` is
+        // "100000" with no '.', and an unconditional trim would strip the
+        // significant integer zeros down to "1". Mirror the exponential branch's
+        // `if s.contains('.')` guard above. (C/SQLite %g never drops integer digits.)
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_owned()
+        } else {
+            s
+        }
     };
     formatted
 }
@@ -5127,6 +5136,41 @@ mod tests {
         assert_eq!(fmt("%g", -1.5), "-1.5");
         assert_eq!(fmt("%f", -2.25), "-2.250000");
         assert_eq!(fmt("%+g", -1.5), "-1.5");
+    }
+
+    #[test]
+    fn test_format_g_integer_trailing_zeros() {
+        // bd-v4ujl: %g must not strip significant integer trailing zeros when the
+        // value rounds to an integer (decimal_places == 0). C/SQLite 3.46.1:
+        // printf('%g', 100000.0) -> "100000", never "1". Expected values below
+        // are oracle-verified against sqlite3 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: f64| -> String {
+            match f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(spec)),
+                    SqliteValue::Float(v),
+                ])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        // The bug: integer-valued %g stripped its trailing zeros to a single digit.
+        assert_eq!(fmt("%g", 100000.0), "100000");
+        assert_eq!(fmt("%g", 120000.0), "120000");
+        assert_eq!(fmt("%g", 250000.0), "250000");
+        assert_eq!(fmt("%g", 100.0), "100");
+        assert_eq!(fmt("%g", 999999.0), "999999");
+        assert_eq!(fmt("%G", 100000.0), "100000");
+        // Fractional %g still trims trailing zeros (regression guard).
+        assert_eq!(fmt("%g", 0.5), "0.5");
+        assert_eq!(fmt("%g", 1.5), "1.5");
+        // Exponential branch (exp >= sig) is unaffected by the guard.
+        assert_eq!(fmt("%g", 1000000.0), "1e+06");
+        assert_eq!(fmt("%g", 1234560.0), "1.23456e+06");
+        assert_eq!(fmt("%G", 1000000.0), "1E+06");
     }
 
     #[test]
