@@ -33612,6 +33612,29 @@ impl Connection {
                 if expression_only_has_window_functions(select) {
                     return self.execute_fromless_window_select(select, params).await;
                 }
+                // Stock rejects HAVING on a non-aggregate query at prepare time
+                // ("HAVING clause on a non-aggregate query"). A FROM-less SELECT
+                // with a HAVING but no GROUP BY and no aggregate is exactly that
+                // (bd-uobkz): otherwise it would either error "HAVING is not
+                // supported in this connection path" (compile_expression_select,
+                // no-subquery case) or silently ignore the HAVING and return the
+                // row (the subquery expression-only path). Window functions are
+                // already routed away above, and grouped/aggregate HAVING falls
+                // through to execute_fromless_aggregate below.
+                if let SelectCore::Select {
+                    from: None,
+                    having: Some(_),
+                    group_by,
+                    ..
+                } = &select.body.select
+                    && group_by.is_empty()
+                    && !implicit_aggregate
+                    && !custom_implicit_aggregate
+                {
+                    return Err(FrankenError::FunctionError(
+                        "HAVING clause on a non-aggregate query".to_owned(),
+                    ));
+                }
                 // FROM-less aggregate/grouped SELECT (for example,
                 // `SELECT COUNT(*)` or `SELECT 1 GROUP BY 1`). This must be
                 // checked before the expression-only path because its VDBE
@@ -72228,22 +72251,33 @@ impl Connection {
             }
         }
         let having_matches = if let Some(having) = having {
-            let inlined_having;
-            let effective_having = if expr_has_any_subquery(having) {
-                inlined_having = self
-                    .inline_subqueries_in_expr(having, &empty_row, &empty_col_map)
-                    .await?;
-                &inlined_having
+            // Stock folds an exact `0 AND E` to the literal 0 at parse time,
+            // discarding — and never evaluating — E (bd-uobkz). The grouped
+            // FROM-less HAVING path pre-inlines subqueries via
+            // inline_subqueries_in_expr, which (unlike eval_expr_with_subqueries)
+            // has no such fold, so a dead subquery under an integer-zero AND
+            // would be materialized and could error. Short-circuit to FALSE here
+            // instead, matching the value-context fold at line ~72943.
+            if expr_folds_to_integer_zero_via_and(having) {
+                false
             } else {
-                having
-            };
-            self.evaluate_having_predicate_with_registry(
-                effective_having,
-                &values,
-                columns,
-                &group_rows,
-                &empty_col_map,
-            )?
+                let inlined_having;
+                let effective_having = if expr_has_any_subquery(having) {
+                    inlined_having = self
+                        .inline_subqueries_in_expr(having, &empty_row, &empty_col_map)
+                        .await?;
+                    &inlined_having
+                } else {
+                    having
+                };
+                self.evaluate_having_predicate_with_registry(
+                    effective_having,
+                    &values,
+                    columns,
+                    &group_rows,
+                    &empty_col_map,
+                )?
+            }
         } else {
             true
         };
