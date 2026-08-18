@@ -22190,18 +22190,50 @@ fn codegen_update_from(
         }
     }
 
-    // Delete old index entries before updating.
-    emit_index_deletes(b, target, target_cursor);
-
-    // Evaluate SET assignments. Reset placeholder counter to 1 (SET first in SQL text).
+    // Evaluate SET assignments. Reset placeholder counter to 1 (SET first in SQL
+    // text). The scan cursor still points at the OLD row here, so `SET x = x + 1`
+    // observes the pre-update value.
     b.set_next_anon_placeholder(1);
     emit_update_assignments(b, &stmt.assignments, target, col_regs, &scan)?;
 
-    // Get old rowid.
+    // Capture the old rowid before any destructive mutation (re-insertion base).
     let old_rowid_reg = b.alloc_reg();
     b.emit_op(Opcode::Rowid, target_cursor, old_rowid_reg, 0, P4::None, 0);
 
-    // Delete old row.
+    // Recompute STORED generated columns, then validate CHECK / NOT NULL on the
+    // NEW row image BEFORE any destructive mutation — so an `UPDATE OR IGNORE
+    // ... FROM ...` whose new row fails a constraint can skip the row WITHOUT
+    // having already deleted the old one (bd-xoixz). This mirrors the plain
+    // `codegen_update` path, which defers the index deletes + row Delete until
+    // after constraint validation. `constraint_ignore_label` routes a violation
+    // to the innermost loop's Next (`skip_label`); the FROM-path uniqueness /
+    // RETURNING conflict skip already uses this same label (IfConflictSkip).
+    emit_stored_generated_columns(b, target, col_regs);
+    emit_strict_type_check(b, target, col_regs);
+    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+    // constraints see the affinity-coerced value (SQLite applies affinity, then
+    // evaluates constraints).
+    b.emit_op(
+        Opcode::Affinity,
+        col_regs,
+        n_cols as i32,
+        0,
+        P4::Affinity(target.affinity_string()),
+        0,
+    );
+    let constraint_ignore_label =
+        if matches!(stmt.or_conflict.as_ref(), Some(ConflictAction::Ignore)) {
+            Some(skip_label)
+        } else {
+            None
+        };
+    emit_check_constraints(b, target, col_regs, constraint_ignore_label);
+    emit_not_null_constraints(b, target, col_regs, stmt.or_conflict, constraint_ignore_label);
+
+    // Constraints passed: NOW perform the destructive delete+insert. Old index
+    // entries are read from the cursor (still positioned on the unchanged old
+    // row) before the row Delete.
+    emit_index_deletes(b, target, target_cursor);
     b.emit_op(
         Opcode::Delete,
         target_cursor,
@@ -22242,36 +22274,6 @@ fn codegen_update_from(
         b.resolve_label(rowid_done_label);
     }
 
-    // Recompute STORED generated columns.
-    emit_stored_generated_columns(b, target, col_regs);
-
-    // MakeRecord with ALL columns.
-    emit_strict_type_check(b, target, col_regs);
-    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
-    // constraints see the affinity-coerced value (SQLite applies affinity, then
-    // evaluates constraints).
-    b.emit_op(
-        Opcode::Affinity,
-        col_regs,
-        n_cols as i32,
-        0,
-        P4::Affinity(target.affinity_string()),
-        0,
-    );
-    // For UPDATE OR IGNORE ... FROM ..., a failing CHECK / NOT NULL constraint
-    // must skip this row silently (C SQLite semantics) rather than aborting the
-    // statement. Route the skip to the innermost loop's Next (`skip_label`),
-    // mirroring the plain `codegen_update` path's `constraint_ignore_label`
-    // (bd-xoixz). The FROM-path uniqueness/RETURNING conflict skip already uses
-    // this same `skip_label` (IfConflictSkip below).
-    let constraint_ignore_label =
-        if matches!(stmt.or_conflict.as_ref(), Some(ConflictAction::Ignore)) {
-            Some(skip_label)
-        } else {
-            None
-        };
-    emit_check_constraints(b, target, col_regs, constraint_ignore_label);
-    emit_not_null_constraints(b, target, col_regs, stmt.or_conflict, constraint_ignore_label);
     let aff_str = target.affinity_string();
     let rec_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
