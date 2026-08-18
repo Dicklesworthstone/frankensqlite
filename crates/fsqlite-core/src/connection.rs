@@ -35306,10 +35306,29 @@ impl Connection {
                             })
                     })
         );
+        // bd-gh-update-from-outer-join-wusp5 (GH#250): an `UPDATE ... FROM` whose
+        // FROM clause contains an OUTER JOIN of plain named tables carries no
+        // subquery, so the fast path below would skip the CTE-hoist rewrite that
+        // lets `codegen_update_from` drive it. Flag it so the Update arm runs
+        // `hoist_update_from_outer_join_to_cte`.
+        let has_update_from_outer_join = matches!(
+            statement,
+            Statement::Update(update)
+                if update.with.is_none()
+                    && update.from.as_ref().is_some_and(|from| {
+                        from.joins.iter().any(|join| {
+                            matches!(
+                                join.join_type.kind,
+                                JoinKind::Left | JoinKind::Right | JoinKind::Full
+                            )
+                        })
+                    })
+        );
         if !has_rewritable_subquery
             && !statement_requires_in_table_name_rewrite(statement)
             && !has_flattenable_derived_table
             && !has_update_from_subquery
+            && !has_update_from_outer_join
         {
             return Ok(Cow::Borrowed(statement));
         }
@@ -35415,6 +35434,19 @@ impl Connection {
                 // can drive it. Done before the IN/subquery rewrites so they see the
                 // flattened (plain-table) shape.
                 try_flatten_update_from_subquery(&mut update);
+                // bd-gh-update-from-outer-join-wusp5 (GH#250): an `UPDATE ... FROM`
+                // whose FROM clause contains an OUTER JOIN (LEFT/RIGHT/FULL) is not
+                // driven directly by `codegen_update_from` (it rejects outer-join
+                // sources). Rewrite the fully-qualified, plain-named-table shape into
+                // the equivalent CTE-materialized form: the outer join moves inside a
+                // CTE (where the existing SELECT-join codegen performs the
+                // null-extension correctly) and `codegen_update_from` drives the single
+                // materialized CTE source, which it already supports. Runs before the
+                // subquery hoist so the (now CTE-backed) shape reaches it. Non-rewritable
+                // shapes decline (return None) and keep their current behavior.
+                if let Some(rewritten) = hoist_update_from_outer_join_to_cte(&update) {
+                    return Ok(Cow::Owned(Statement::Update(rewritten)));
+                }
                 // bd-8ewbk: any FROM subquery source that flattening could not
                 // reduce to a base table (aggregate/GROUP BY/join/rename/...) is
                 // hoisted into a CTE. The resulting WITH-clause UPDATE routes
@@ -94919,6 +94951,499 @@ fn hoist_update_from_subqueries_to_ctes(
     });
     with.ctes.extend(hoisted_ctes);
     result.with = Some(with);
+    Some(result)
+}
+
+/// The identifying qualifier (alias if present, else the bare table name) for a
+/// plain named-table FROM source, or `None` for any other source shape
+/// (subquery / table-valued function / parenthesized join).
+fn outer_join_source_qualifier(src: &TableOrSubquery) -> Option<String> {
+    match src {
+        TableOrSubquery::Table { name, alias, .. } => {
+            Some(alias.clone().unwrap_or_else(|| name.name.clone()))
+        }
+        TableOrSubquery::Subquery { .. }
+        | TableOrSubquery::TableFunction { .. }
+        | TableOrSubquery::ParenJoin(_) => None,
+    }
+}
+
+/// Walk `expr`, collecting DISTINCT (qualifier, column) pairs whose qualifier
+/// names a FROM source (not the target). Sets `bail` — the caller then declines
+/// the whole rewrite — for any shape that cannot be rewritten correctly:
+///   - an unqualified column reference (could ambiguously be a source column);
+///   - a qualifier that matches neither the target nor any FROM source;
+///   - a nested (possibly correlated) subquery / EXISTS that could itself
+///     reference a FROM source we would not rewrite.
+/// Target-qualified references are left untouched (recorded nowhere).
+fn collect_outer_join_source_refs(
+    expr: &Expr,
+    is_target: &dyn Fn(&str) -> bool,
+    matches_source: &dyn Fn(&str) -> bool,
+    refs: &mut Vec<(String, String)>,
+    bail: &mut bool,
+) {
+    if *bail {
+        return;
+    }
+    match expr {
+        Expr::Column(col_ref, _) => match &col_ref.table {
+            None => {
+                // Unqualified: might resolve to a source column. Decline to avoid
+                // silently producing a wrong result.
+                *bail = true;
+            }
+            Some(qualifier) => {
+                let qualifier = qualifier.as_ref();
+                if is_target(qualifier) {
+                    // Target reference — resolved against the UPDATE target row.
+                } else if matches_source(qualifier) {
+                    let column = col_ref.column.to_string();
+                    let already = refs.iter().any(|(sq, sc)| {
+                        sq.eq_ignore_ascii_case(qualifier) && sc.eq_ignore_ascii_case(&column)
+                    });
+                    if !already {
+                        refs.push((qualifier.to_string(), column));
+                    }
+                } else {
+                    // Qualifier names neither the target nor a FROM source — a
+                    // shape we cannot reason about. Decline.
+                    *bail = true;
+                }
+            }
+        },
+        Expr::Subquery(..) | Expr::Exists { .. } => {
+            *bail = true;
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_outer_join_source_refs(left, is_target, matches_source, refs, bail);
+            collect_outer_join_source_refs(right, is_target, matches_source, refs, bail);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => {
+            collect_outer_join_source_refs(expr, is_target, matches_source, refs, bail);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_outer_join_source_refs(expr, is_target, matches_source, refs, bail);
+            collect_outer_join_source_refs(low, is_target, matches_source, refs, bail);
+            collect_outer_join_source_refs(high, is_target, matches_source, refs, bail);
+        }
+        Expr::In { expr, set, .. } => {
+            collect_outer_join_source_refs(expr, is_target, matches_source, refs, bail);
+            match set {
+                InSet::List(items) => {
+                    for item in items {
+                        collect_outer_join_source_refs(item, is_target, matches_source, refs, bail);
+                    }
+                }
+                // An IN (subquery) / IN table could reference a FROM source.
+                InSet::Subquery(_) | InSet::Table(_) => *bail = true,
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_outer_join_source_refs(expr, is_target, matches_source, refs, bail);
+            collect_outer_join_source_refs(pattern, is_target, matches_source, refs, bail);
+            if let Some(escape) = escape {
+                collect_outer_join_source_refs(escape, is_target, matches_source, refs, bail);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_outer_join_source_refs(operand, is_target, matches_source, refs, bail);
+            }
+            for (when, then) in whens {
+                collect_outer_join_source_refs(when, is_target, matches_source, refs, bail);
+                collect_outer_join_source_refs(then, is_target, matches_source, refs, bail);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_outer_join_source_refs(else_expr, is_target, matches_source, refs, bail);
+            }
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            match args {
+                FunctionArgs::List(items) => {
+                    for item in items {
+                        collect_outer_join_source_refs(item, is_target, matches_source, refs, bail);
+                    }
+                }
+                FunctionArgs::Star => {}
+            }
+            for term in order_by {
+                collect_outer_join_source_refs(&term.expr, is_target, matches_source, refs, bail);
+            }
+            if let Some(filter) = filter {
+                collect_outer_join_source_refs(filter, is_target, matches_source, refs, bail);
+            }
+            // A window spec introduces its own partition/order references; rather
+            // than reason about them, decline if one is present.
+            if over.is_some() {
+                *bail = true;
+            }
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            collect_outer_join_source_refs(expr, is_target, matches_source, refs, bail);
+            collect_outer_join_source_refs(path, is_target, matches_source, refs, bail);
+        }
+        Expr::RowValue(items, _) => {
+            for item in items {
+                collect_outer_join_source_refs(item, is_target, matches_source, refs, bail);
+            }
+        }
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => {}
+    }
+}
+
+/// Rewrite every source-qualified column reference collected in `refs` so it
+/// reads the CTE's projected alias `<cte_name>.__ufc{i}` instead. Target
+/// references and everything else are left untouched. Nested subqueries are not
+/// descended into — the collector already declined any statement that contained
+/// one, so none remain here.
+fn rewrite_outer_join_source_refs(expr: &mut Expr, refs: &[(String, String)], cte_name: &str) {
+    match expr {
+        Expr::Column(col_ref, _) => {
+            if let Some(qualifier) = &col_ref.table {
+                let qualifier = qualifier.as_ref();
+                if let Some(index) = refs.iter().position(|(sq, sc)| {
+                    sq.eq_ignore_ascii_case(qualifier)
+                        && sc.eq_ignore_ascii_case(col_ref.column.as_ref())
+                }) {
+                    col_ref.table = Some(Arc::from(cte_name));
+                    col_ref.column = Arc::from(format!("__ufc{index}"));
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_outer_join_source_refs(left, refs, cte_name);
+            rewrite_outer_join_source_refs(right, refs, cte_name);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => rewrite_outer_join_source_refs(expr, refs, cte_name),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_outer_join_source_refs(expr, refs, cte_name);
+            rewrite_outer_join_source_refs(low, refs, cte_name);
+            rewrite_outer_join_source_refs(high, refs, cte_name);
+        }
+        Expr::In { expr, set, .. } => {
+            rewrite_outer_join_source_refs(expr, refs, cte_name);
+            if let InSet::List(items) = set {
+                for item in items {
+                    rewrite_outer_join_source_refs(item, refs, cte_name);
+                }
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rewrite_outer_join_source_refs(expr, refs, cte_name);
+            rewrite_outer_join_source_refs(pattern, refs, cte_name);
+            if let Some(escape) = escape.as_deref_mut() {
+                rewrite_outer_join_source_refs(escape, refs, cte_name);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand.as_deref_mut() {
+                rewrite_outer_join_source_refs(operand, refs, cte_name);
+            }
+            for (when, then) in whens {
+                rewrite_outer_join_source_refs(when, refs, cte_name);
+                rewrite_outer_join_source_refs(then, refs, cte_name);
+            }
+            if let Some(else_expr) = else_expr.as_deref_mut() {
+                rewrite_outer_join_source_refs(else_expr, refs, cte_name);
+            }
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let FunctionArgs::List(items) = args {
+                for item in items {
+                    rewrite_outer_join_source_refs(item, refs, cte_name);
+                }
+            }
+            for term in order_by {
+                rewrite_outer_join_source_refs(&mut term.expr, refs, cte_name);
+            }
+            if let Some(filter) = filter.as_deref_mut() {
+                rewrite_outer_join_source_refs(filter, refs, cte_name);
+            }
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            rewrite_outer_join_source_refs(expr, refs, cte_name);
+            rewrite_outer_join_source_refs(path, refs, cte_name);
+        }
+        Expr::RowValue(items, _) => {
+            for item in items {
+                rewrite_outer_join_source_refs(item, refs, cte_name);
+            }
+        }
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _)
+        | Expr::Exists { .. }
+        | Expr::Subquery(_, _) => {}
+    }
+}
+
+/// bd-gh-update-from-outer-join-wusp5 (GH#250): rewrite an `UPDATE tgt SET ...
+/// FROM <sources with an OUTER JOIN> WHERE ...` into the equivalent
+/// CTE-materialized form, which the existing `codegen_update_from` already
+/// drives:
+///
+/// ```sql
+/// -- before
+/// UPDATE tgt SET value = COALESCE(src.value, -1)
+///   FROM ls LEFT JOIN src ON src.id = ls.id WHERE tgt.id = ls.id;
+/// -- after
+/// WITH __fsqlite_uf AS (
+///   SELECT src.value AS __ufc0, ls.id AS __ufc1
+///     FROM ls LEFT JOIN src ON src.id = ls.id)
+/// UPDATE tgt SET value = COALESCE(__fsqlite_uf.__ufc0, -1)
+///   FROM __fsqlite_uf WHERE tgt.id = __fsqlite_uf.__ufc1;
+/// ```
+///
+/// The outer join now lives inside the CTE, where the SELECT-join codegen
+/// performs the null-extension correctly (a proven-equivalent hand rewrite).
+/// This only fires for the fully-qualified, plain-named-table shape it can
+/// rewrite without changing semantics; any other shape returns `None` (a safe
+/// decline that preserves the caller's current behavior).
+fn hoist_update_from_outer_join_to_cte(
+    update: &fsqlite_ast::UpdateStatement,
+) -> Option<fsqlite_ast::UpdateStatement> {
+    // The caller only reaches this for `update.with.is_none()`; guard anyway so
+    // the fresh CTE never has to merge with a pre-existing WITH clause.
+    if update.with.is_some() {
+        return None;
+    }
+    let from = update.from.as_ref()?;
+
+    // Must contain at least one OUTER join; inner/cross FROM sources are already
+    // driven by `codegen_update_from`, so leave them alone.
+    let has_outer_join = from.joins.iter().any(|join| {
+        matches!(
+            join.join_type.kind,
+            JoinKind::Left | JoinKind::Right | JoinKind::Full
+        )
+    });
+    if !has_outer_join {
+        return None;
+    }
+
+    // Every FROM source must be a plain named table, and no join may be NATURAL
+    // or use USING(...). `outer_join_source_qualifier` returns None (=> decline)
+    // for any non-plain-table source.
+    let mut source_qualifiers: Vec<String> = Vec::new();
+    source_qualifiers.push(outer_join_source_qualifier(&from.source)?);
+    for join in &from.joins {
+        if join.join_type.natural {
+            return None;
+        }
+        if matches!(join.constraint, Some(JoinConstraint::Using(_))) {
+            return None;
+        }
+        source_qualifiers.push(outer_join_source_qualifier(&join.table)?);
+    }
+
+    // Target qualifiers (bare name + optional alias), matched case-insensitively.
+    let mut target_qualifiers: Vec<String> = vec![update.table.name.name.clone()];
+    if let Some(alias) = &update.table.alias {
+        target_qualifiers.push(alias.clone());
+    }
+
+    // A source qualifier that collides with a target qualifier — or with another
+    // source qualifier — is ambiguous; decline rather than risk a wrong rewrite.
+    for (i, s) in source_qualifiers.iter().enumerate() {
+        if target_qualifiers.iter().any(|t| t.eq_ignore_ascii_case(s)) {
+            return None;
+        }
+        if source_qualifiers[..i]
+            .iter()
+            .any(|other| other.eq_ignore_ascii_case(s))
+        {
+            return None;
+        }
+    }
+
+    let is_target = |q: &str| target_qualifiers.iter().any(|t| t.eq_ignore_ascii_case(q));
+    let matches_source = |q: &str| source_qualifiers.iter().any(|s| s.eq_ignore_ascii_case(q));
+
+    // Collect DISTINCT source-qualified refs from assignment values, WHERE, and
+    // RETURNING (first-seen order), declining on any shape we cannot rewrite.
+    let mut refs: Vec<(String, String)> = Vec::new();
+    let mut bail = false;
+    for assignment in &update.assignments {
+        collect_outer_join_source_refs(
+            &assignment.value,
+            &is_target,
+            &matches_source,
+            &mut refs,
+            &mut bail,
+        );
+    }
+    if let Some(where_clause) = &update.where_clause {
+        collect_outer_join_source_refs(
+            where_clause,
+            &is_target,
+            &matches_source,
+            &mut refs,
+            &mut bail,
+        );
+    }
+    for column in &update.returning {
+        match column {
+            // Bare `*` returns the target row's columns — unaffected by the FROM.
+            ResultColumn::Star => {}
+            ResultColumn::TableStar(name) => {
+                // `src.*` cannot be projected through the collected-column CTE.
+                if !is_target(&name.name) {
+                    return None;
+                }
+            }
+            ResultColumn::Expr { expr, .. } => {
+                collect_outer_join_source_refs(
+                    expr,
+                    &is_target,
+                    &matches_source,
+                    &mut refs,
+                    &mut bail,
+                );
+            }
+        }
+    }
+    if bail {
+        return None;
+    }
+    // No source-qualified references means the join only multiplies/filters rows
+    // (its effect is not captured by any projected column); an empty-projection
+    // CTE cannot preserve that. Decline.
+    if refs.is_empty() {
+        return None;
+    }
+
+    // Choose a collision-safe CTE name, avoiding every table name / alias in play.
+    let mut reserved: Vec<String> = target_qualifiers.clone();
+    for src in std::iter::once(&from.source).chain(from.joins.iter().map(|join| &join.table)) {
+        if let TableOrSubquery::Table { name, alias, .. } = src {
+            reserved.push(name.name.clone());
+            if let Some(alias) = alias {
+                reserved.push(alias.clone());
+            }
+        }
+    }
+    let mut cte_name = "__fsqlite_uf".to_string();
+    let mut suffix: u32 = 0;
+    while reserved.iter().any(|r| r.eq_ignore_ascii_case(&cte_name)) {
+        suffix += 1;
+        cte_name = format!("__fsqlite_uf_{suffix}");
+    }
+
+    // Build the CTE projection: one `<src>.<col> AS __ufc{i}` per distinct ref.
+    let cte_columns: Vec<ResultColumn> = refs
+        .iter()
+        .enumerate()
+        .map(|(index, (qualifier, column))| ResultColumn::Expr {
+            expr: Expr::Column(
+                ColumnRef::qualified(qualifier.clone(), column.clone()),
+                Span::ZERO,
+            ),
+            alias: Some(format!("__ufc{index}")),
+        })
+        .collect();
+
+    // The CTE body keeps the ORIGINAL from clause (outer join + ON) unchanged.
+    let cte_query = SelectStatement {
+        with: None,
+        body: SelectBody {
+            select: SelectCore::Select {
+                distinct: Distinctness::All,
+                columns: cte_columns,
+                from: Some(from.clone()),
+                where_clause: None,
+                group_by: Vec::new(),
+                having: None,
+                windows: Vec::new(),
+            },
+            compounds: Vec::new(),
+        },
+        order_by: Vec::new(),
+        limit: None,
+    };
+    let cte = fsqlite_ast::Cte {
+        name: cte_name.clone(),
+        columns: Vec::new(),
+        materialized: None,
+        query: cte_query,
+    };
+
+    // Rewrite every source-qualified ref to read the CTE's projected alias.
+    let mut result = update.clone();
+    for assignment in &mut result.assignments {
+        rewrite_outer_join_source_refs(&mut assignment.value, &refs, &cte_name);
+    }
+    if let Some(where_clause) = &mut result.where_clause {
+        rewrite_outer_join_source_refs(where_clause, &refs, &cte_name);
+    }
+    for column in &mut result.returning {
+        if let ResultColumn::Expr { expr, .. } = column {
+            rewrite_outer_join_source_refs(expr, &refs, &cte_name);
+        }
+    }
+
+    // Replace the FROM with the single materialized CTE source, and attach WITH.
+    result.from = Some(FromClause {
+        source: TableOrSubquery::Table {
+            name: QualifiedName {
+                schema: None,
+                name: cte_name,
+            },
+            alias: None,
+            index_hint: None,
+            time_travel: None,
+        },
+        joins: Vec::new(),
+    });
+    result.with = Some(fsqlite_ast::WithClause {
+        recursive: false,
+        ctes: vec![cte],
+    });
     Some(result)
 }
 
