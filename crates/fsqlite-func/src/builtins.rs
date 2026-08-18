@@ -2680,48 +2680,46 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 result.push_str(&pad_string(&truncated, width, left_align));
             }
             'q' => {
-                // Single-quote escaping; C SQLite emits nothing for %q with NULL
+                // Single-quote escaping; C SQLite emits "(NULL)" for %q with NULL.
+                // Field width applies (byte-counted, like %s), space-padded and
+                // right/left-justified, including the "(NULL)" case (bd-8959m).
                 let param = params.get(param_idx);
                 param_idx += 1;
-                match param {
+                let escaped = match param {
                     // SQLite: printf('%q', NULL) returns literal "(NULL)"
-                    Some(SqliteValue::Null) | None => {
-                        result.push_str("(NULL)");
-                    }
-                    Some(v) => {
-                        let val = v.to_text();
-                        let escaped = val.replace('\'', "''");
-                        result.push_str(&escaped);
-                    }
-                }
+                    Some(SqliteValue::Null) | None => "(NULL)".to_owned(),
+                    Some(v) => v.to_text().replace('\'', "''"),
+                };
+                result.push_str(&pad_string(&escaped, width, left_align));
             }
             'Q' => {
-                // Like %q but wrapped in quotes, NULL -> "NULL"
+                // Like %q but wrapped in quotes, NULL -> "NULL". Field width
+                // applies to the whole rendered token (bd-8959m).
                 let param = params.get(param_idx);
                 param_idx += 1;
-                match param {
-                    Some(SqliteValue::Null) | None => result.push_str("NULL"),
-                    Some(v) => {
-                        let val = v.to_text();
-                        let escaped = val.replace('\'', "''");
-                        result.push('\'');
-                        result.push_str(&escaped);
-                        result.push('\'');
-                    }
-                }
+                let rendered = match param {
+                    Some(SqliteValue::Null) | None => "NULL".to_owned(),
+                    Some(v) => format!("'{}'", v.to_text().replace('\'', "''")),
+                };
+                result.push_str(&pad_string(&rendered, width, left_align));
             }
             'w' => {
                 // Double-quote escaping for identifiers; NULL → empty.
                 // C SQLite %w with NULL produces nothing (empty string),
                 // and only escapes internal double quotes (no surrounding quotes).
+                // Field width applies to the non-NULL rendering (bd-8959m); the
+                // NULL case stays empty (its value semantics are a separate
+                // concern from width).
                 let param = params.get(param_idx);
                 param_idx += 1;
                 if matches!(param, Some(SqliteValue::Null) | None) {
-                    // NULL: produce nothing (matches C SQLite).
+                    // NULL: produce nothing (matches the existing behavior).
                 } else {
-                    let val = param.map(SqliteValue::to_text).unwrap_or_default();
-                    let escaped = val.replace('"', "\"\"");
-                    result.push_str(&escaped);
+                    let escaped = param
+                        .map(SqliteValue::to_text)
+                        .unwrap_or_default()
+                        .replace('"', "\"\"");
+                    result.push_str(&pad_string(&escaped, width, left_align));
                 }
             }
             'x' | 'X' => {
@@ -5335,6 +5333,43 @@ mod tests {
         // No width => just the first char (regression guard for bd-47mu0).
         assert_eq!(fmt(">%c<", SqliteValue::Integer(65)), ">6<");
         assert_eq!(fmt(">%c<", txt("abc")), ">a<");
+    }
+
+    #[test]
+    fn test_format_quote_specifiers_field_width_bd_8959m() {
+        // bd-8959m: printf %q/%Q/%w honor field width (byte-counted like %s,
+        // space-padded, right/left-justified). %q NULL renders "(NULL)" and %Q
+        // NULL renders "NULL", both padded; %w NULL stays empty. Width is a
+        // minimum (never truncates). Oracle-verified vs sqlite3 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: SqliteValue| -> String {
+            match f
+                .invoke(&[SqliteValue::Text(SmallText::from_string(spec)), v])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        // %q width (the bug: width was ignored) + escaping + NULL.
+        assert_eq!(fmt(">%6q<", txt("ab")), ">    ab<");
+        assert_eq!(fmt(">%-6q<", txt("ab")), ">ab    <");
+        assert_eq!(fmt(">%8q<", SqliteValue::Null), ">  (NULL)<");
+        assert_eq!(fmt(">%8q<", txt("a'b")), ">    a''b<");
+        assert_eq!(fmt(">%3q<", txt("abcde")), ">abcde<"); // width is a minimum
+        // %Q: quote-wrapped, width applies to the whole token.
+        assert_eq!(fmt(">%6Q<", txt("ab")), ">  'ab'<");
+        assert_eq!(fmt(">%-6Q<", txt("ab")), ">'ab'  <");
+        assert_eq!(fmt(">%6Q<", SqliteValue::Null), ">  NULL<");
+        // %w: identifier escaping, width on the non-NULL rendering.
+        assert_eq!(fmt(">%6w<", txt("ab")), ">    ab<");
+        assert_eq!(fmt(">%-6w<", txt("ab")), ">ab    <");
+        // Byte-counted width (matches %s): 'é' is two UTF-8 bytes.
+        assert_eq!(fmt(">%4q<", txt("é")), ">  é<");
+        // No width => unchanged (regression guard).
+        assert_eq!(fmt(">%q<", txt("ab")), ">ab<");
+        assert_eq!(fmt(">%Q<", txt("ab")), ">'ab'<");
     }
 
     #[test]
