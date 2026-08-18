@@ -143,6 +143,7 @@ use fsqlite_types::record::{
     parse_record_into_with_encoding, parse_record_projected_column_offsets, record_profile_enabled,
     record_profile_snapshot,
     reset_record_profile, serialize_record, serialize_record_iter_into,
+    serialize_record_iter_into_with_encoding,
     serialize_record_iter_with_precomputed_header_into, serialize_record_with_encoding,
     try_build_runtime_precomputed_record_header,
 };
@@ -27953,8 +27954,14 @@ impl Connection {
             record_scratch = self.prepared_direct_insert_record_scratch.borrow_mut();
             let serialize_start = profile_enabled.then(Instant::now);
             let mut cached_record_header = direct.cached_record_header.borrow_mut();
-            let serialized_with_cached_header =
-                cached_record_header.as_ref().is_some_and(|header| {
+            let insert_encoding = self.db_text_encoding.get();
+            // bd-bld9w.7 family (a): the precomputed record header caches UTF-8
+            // serial-type byte lengths, which are wrong for a UTF-16 database, so
+            // only take the precomputed fast path when the DB encoding is UTF-8;
+            // otherwise serialize through the encoding-aware path (byte-identical
+            // for UTF-8, correct for UTF-16 once the write guard lifts).
+            let serialized_with_cached_header = matches!(insert_encoding, TextEncoding::Utf8)
+                && cached_record_header.as_ref().is_some_and(|header| {
                     serialize_record_iter_with_precomputed_header_into(
                         mem_row_values.iter(),
                         header,
@@ -27962,7 +27969,11 @@ impl Connection {
                     )
                 });
             if !serialized_with_cached_header {
-                serialize_record_iter_into(mem_row_values.iter(), &mut record_scratch);
+                serialize_record_iter_into_with_encoding(
+                    mem_row_values.iter(),
+                    insert_encoding,
+                    &mut record_scratch,
+                );
                 if cached_record_header.is_none() {
                     *cached_record_header =
                         try_build_runtime_precomputed_record_header(mem_row_values.as_slice());
@@ -28964,7 +28975,11 @@ impl Connection {
         // same rowid.
         let mut record_scratch = self.prepared_direct_insert_record_scratch.borrow_mut();
         record_scratch.clear();
-        serialize_record_iter_into(new_values.iter(), &mut record_scratch);
+        serialize_record_iter_into_with_encoding(
+            new_values.iter(),
+            self.db_text_encoding.get(),
+            &mut record_scratch,
+        );
         if !cursor
             .table_overwrite_current_payload_same_size_no_overflow(
                 execution_cx,
@@ -39776,7 +39791,11 @@ impl Connection {
 
         let mut record = self.prepared_direct_insert_record_scratch.borrow_mut();
         record.clear();
-        serialize_record_iter_into(values.iter(), &mut record);
+        serialize_record_iter_into_with_encoding(
+            values.iter(),
+            self.db_text_encoding.get(),
+            &mut record,
+        );
         self.note_statement_lookaside_fallback();
         Some(record.clone())
     }
