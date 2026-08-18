@@ -66302,16 +66302,44 @@ impl Connection {
                 for table in &tables {
                     for idx in &table.indexes {
                         if idx.name.eq_ignore_ascii_case(&index_name) {
-                            let mut rows: Vec<Row> = idx
-                                .columns
-                                .iter()
-                                .enumerate()
-                                .map(|(seq, col_name)| {
-                                    let cid = table
-                                        .columns
-                                        .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                                        .map_or(-1, |p| i64::try_from(p).unwrap_or(-1));
+                            // GH #245/#246: iterate the logical key TERMS, not
+                            // idx.columns (which is empty for any index carrying
+                            // an expression term). A term that is a plain column
+                            // reference resolves to its table column (cid>=0 +
+                            // name); an expression term is reported as cid=-2 with
+                            // a NULL name, matching stock. The trailing rowid entry
+                            // (index_xinfo only) uses the key-term count as seqno.
+                            let key_count = idx.key_term_count();
+                            let resolve_term = |term_sql: &str| -> Option<(i64, String)> {
+                                let trimmed = term_sql.trim();
+                                let bytes = trimmed.as_bytes();
+                                let unquoted = if bytes.len() >= 2
+                                    && matches!(
+                                        (bytes[0], bytes[bytes.len() - 1]),
+                                        (b'"', b'"') | (b'`', b'`') | (b'[', b']')
+                                    ) {
+                                    &trimmed[1..trimmed.len() - 1]
+                                } else {
+                                    trimmed
+                                };
+                                table
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(unquoted))
+                                    .map(|p| {
+                                        (
+                                            i64::try_from(p).unwrap_or(-1),
+                                            table.columns[p].name.clone(),
+                                        )
+                                    })
+                            };
+                            let mut rows: Vec<Row> = (0..key_count)
+                                .map(|seq| {
+                                    let term_sql = idx.key_term_sql(seq).unwrap_or_default();
+                                    let (cid, name) = match resolve_term(term_sql) {
+                                        Some((cid, name)) => (cid, SqliteValue::Text(name.into())),
+                                        None => (-2, SqliteValue::Null),
+                                    };
                                     let seqno =
                                         SqliteValue::Integer(i64::try_from(seq).unwrap_or(0));
                                     if is_xinfo {
@@ -66321,7 +66349,7 @@ impl Connection {
                                             values: vec![
                                                 seqno,
                                                 SqliteValue::Integer(cid),
-                                                SqliteValue::Text(col_name.clone().into()),
+                                                name,
                                                 SqliteValue::Integer(desc),
                                                 SqliteValue::Text(coll.into()),
                                                 SqliteValue::Integer(1),
@@ -66329,11 +66357,7 @@ impl Connection {
                                         }
                                     } else {
                                         Row {
-                                            values: vec![
-                                                seqno,
-                                                SqliteValue::Integer(cid),
-                                                SqliteValue::Text(col_name.clone().into()),
-                                            ],
+                                            values: vec![seqno, SqliteValue::Integer(cid), name],
                                         }
                                     }
                                 })
@@ -66341,7 +66365,7 @@ impl Connection {
                             if is_xinfo {
                                 // Trailing rowid (covered) entry: SQLite appends the
                                 // implicit rowid with cid=-1, NULL name, key=0.
-                                let seqno = i64::try_from(idx.columns.len()).unwrap_or(0);
+                                let seqno = i64::try_from(key_count).unwrap_or(0);
                                 rows.push(Row {
                                     values: vec![
                                         SqliteValue::Integer(seqno),
