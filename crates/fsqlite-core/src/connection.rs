@@ -84550,8 +84550,39 @@ impl Connection {
                 // schema-only opens (the common case for a reader) always took the
                 // rebuild. Placed BEFORE `read_storage_table_rows_for_reload` so the
                 // row read is skipped too, not just the tokenization.
+                // A deferred-hydration open documents that it never reads or
+                // validates `%_data` and that FTS5 queries see an empty index until
+                // the shadow is rebuilt. The sibling reload path honors that; this
+                // one did not, so the "deferred" open still paid a full re-tokenize
+                // of the corpus — the exact cost the caller asked to avoid. Honor
+                // the contract by leaving the bare instance from connect() in place.
                 #[cfg(feature = "ext-fts5")]
-                if !self.defer_fts5_hydration {
+                if self.defer_fts5_hydration {
+                    let is_fts5_deferred = self.invoke_live_vtab_callback("asAny", || {
+                        Ok(pending_instance
+                            .instance()
+                            .as_any()
+                            .downcast_ref::<Fts5Table>()
+                            .is_some())
+                    })?;
+                    if is_fts5_deferred {
+                        reloaded.insert_pending(table_key.clone(), &mut pending_instance)?;
+                        continue;
+                    }
+                }
+
+                // OPT-IN until two prerequisites land (see below): binding to the
+                // persisted segments is ~90x faster to open and ~110x smaller, but
+                // on this corpus the segments are BOTH unreadable by the lazy
+                // reader ("truncated poslist body", on segments stock SQLite reads
+                // fine) and badly stale relative to `_content`. Rebuilding masks
+                // both, which is exactly why neither was noticed. Turning this on
+                // by default would trade a slow-but-right answer for a fast wrong
+                // one, so it stays behind an explicit opt-in.
+                #[cfg(feature = "ext-fts5")]
+                if !self.defer_fts5_hydration
+                    && std::env::var_os("FSQLITE_ENABLE_LAZY_FTS5_REBIND").is_some()
+                {
                     let is_fts5_lazy_candidate = self.invoke_live_vtab_callback("asAny", || {
                         Ok(pending_instance
                             .instance()
