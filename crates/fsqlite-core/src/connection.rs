@@ -210,7 +210,8 @@ use fsqlite_mvcc::SsiReadSetSummary;
 use fsqlite_mvcc::{
     CommitIndex, ConcurrentHandle, ConcurrentRegistry, ConcurrentRowIdAllocator,
     ConcurrentSavepoint, FcwResult, FlatCombiningMetrics, GcScheduler, GcTickResult, GcTodo,
-    InProcessPageLockTable, MvccError, PreparedConcurrentCommit, SharedConcurrentHandle,
+    InProcessPageLockTable, MvccError, PreparedConcurrentCommit, RowidAllocSavepointMark,
+    SharedConcurrentHandle,
     SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEProcessConfig,
     SsiEProcessGate, SsiEProcessSnapshot, SsiEvidenceLedger, VersionStore, concurrent_abort,
     concurrent_clear_page_state, concurrent_commit_read_only, concurrent_rollback_to_savepoint,
@@ -9863,6 +9864,11 @@ struct SavepointEntry {
     snapshot: DbSnapshot,
     /// Concurrent savepoint state (MVCC mode only).
     concurrent_snapshot: Option<ConcurrentSavepoint>,
+    /// bd-gh-147 (GH #147): the shared rowid allocator's per-session state at
+    /// savepoint time, so `ROLLBACK TO` can safely reclaim this session's
+    /// contiguous AUTOINCREMENT/rowid reservations. `None` outside concurrent
+    /// mode.
+    rowid_alloc_mark: Option<RowidAllocSavepointMark>,
 }
 
 enum LiveVtabRegistryUndo {
@@ -50127,6 +50133,13 @@ impl Connection {
         self.clear_memory_concurrent_synced_write_roots();
         self.clear_cached_concurrent_handle();
         *self.concurrent_session_id.borrow_mut() = concurrent_session;
+        // bd-gh-147: a recycled session id must begin with no stale rowid
+        // reservation tracking left over from a prior transaction.
+        if let Some(session_id) = concurrent_session {
+            self._shared_mvcc_state
+                .rowid_allocator
+                .clear_session(session_id);
+        }
         self.concurrent_txn.set(is_concurrent);
         self.txn_metrics_mark_started();
         record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
@@ -63846,7 +63859,7 @@ impl Connection {
         self.discard_cached_vdbe_engine();
         self.clear_prepared_direct_insert_append_hint();
         if let Some(ref sp_name) = rb.to_savepoint {
-            let (idx, snap, canonical_name, concurrent_snap) = {
+            let (idx, snap, canonical_name, concurrent_snap, rowid_alloc_mark) = {
                 let savepoints = self.savepoints.borrow();
                 let idx = savepoints
                     .iter()
@@ -63860,6 +63873,7 @@ impl Connection {
                     entry.snapshot.clone(),
                     entry.name.clone(),
                     entry.concurrent_snapshot.clone(),
+                    entry.rowid_alloc_mark.clone(),
                 )
             };
 
@@ -63994,6 +64008,15 @@ impl Connection {
                         error,
                     )
                     .await);
+            }
+            // bd-gh-147 (GH #147): reclaim this session's contiguous rowid
+            // reservations made after the savepoint so AUTOINCREMENT restarts at
+            // the pre-rollback value (matching stock), while any range a
+            // concurrent writer touched safely keeps its gap. Runs after the
+            // connection-local sqlite_sequence_cache is restored above; the
+            // shared allocator's CAS is the authoritative concurrency guard.
+            if let Some(mark) = &rowid_alloc_mark {
+                self._shared_mvcc_state.rowid_allocator.rewind_to_mark(mark);
             }
             // MVCC GC (bd-3bql / 5E.5): After savepoint rollback, trigger GC if scheduler permits.
             self.maybe_gc_tick();
@@ -64274,6 +64297,13 @@ impl Connection {
         } else {
             None
         };
+        // bd-gh-147: snapshot the shared rowid allocator for this session so a
+        // later ROLLBACK TO can reclaim this session's contiguous reservations.
+        let rowid_alloc_mark = self.concurrent_session_id.borrow().map(|session_id| {
+            self._shared_mvcc_state
+                .rowid_allocator
+                .mark_savepoint(session_id)
+        });
         let live_vtab_level = match self.next_live_vtab_savepoint_level() {
             Ok(level) => level,
             Err(error) => {
@@ -64301,6 +64331,7 @@ impl Connection {
             name: name.to_owned(),
             snapshot: self.snapshot(),
             concurrent_snapshot,
+            rowid_alloc_mark,
         });
         self.txn_metrics_set_savepoint_depth(self.savepoints.borrow().len());
         Ok(())
@@ -117398,7 +117429,11 @@ async fn execute_table_program_with_db(
                 ctx.commit_index,
                 ctx.busy_timeout_ms,
             );
-            engine.set_concurrent_rowid_allocator(ctx.rowid_allocator, ctx.schema_epoch);
+            engine.set_concurrent_rowid_allocator(
+                ctx.rowid_allocator,
+                ctx.schema_epoch,
+                ctx.session_id,
+            );
         } else {
             engine.set_transaction(txn);
         }
@@ -117639,7 +117674,11 @@ async fn execute_table_program_exactly_one_row_with_db(
                 ctx.commit_index,
                 ctx.busy_timeout_ms,
             );
-            engine.set_concurrent_rowid_allocator(ctx.rowid_allocator, ctx.schema_epoch);
+            engine.set_concurrent_rowid_allocator(
+                ctx.rowid_allocator,
+                ctx.schema_epoch,
+                ctx.session_id,
+            );
         } else {
             engine.set_transaction(txn);
         }

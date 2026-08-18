@@ -19,7 +19,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -28,25 +31,39 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 async fn fq(f: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     match f.query(sql).await {
-        Ok(rows) => Ok(rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect()),
+        Ok(rows) => Ok(rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect()),
         Err(e) => Err(format!("{e:?}")),
     }
 }
 fn rq(r: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let mut st = r.prepare(sql).map_err(|e| e.to_string())?;
     let n = st.column_count();
-    Ok(st.query_map([], |row| Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect()))
+    Ok(st
+        .query_map([], |row| {
+            Ok((0..n)
+                .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect())
+        })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?)
 }
 async fn fx(f: &Connection, sql: &str) -> Result<(), String> {
-    f.execute(sql).await.map(|_| ()).map_err(|e| format!("{e:?}"))
+    f.execute(sql)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// Run `setup` on both, then compare `query` results (as strings, on error a marker).
@@ -57,7 +74,9 @@ async fn agree(setup: &[&str], query: &str, msg: &str) {
         let _ = fx(&f, s).await;
         let _ = r.execute_batch(s);
     }
-    let fr = fq(&f, query).await.unwrap_or_else(|e| vec![vec![format!("<ERR {e}>")]]);
+    let fr = fq(&f, query)
+        .await
+        .unwrap_or_else(|e| vec![vec![format!("<ERR {e}>")]]);
     let rr = rq(&r, query).unwrap_or_else(|e| vec![vec![format!("<ERR {e}>")]]);
     assert_eq!(fr, rr, "{msg}");
 }
@@ -103,9 +122,14 @@ fn gh144_schema_qualified_main_not_temp_shadow() {
             ("SELECT x FROM main.t ORDER BY x", "main.t"),
             ("SELECT x FROM temp.t ORDER BY x", "temp.t"),
         ] {
-            let fr = fq(&f, q).await.unwrap_or_else(|e| vec![vec![format!("<ERR {e}>")]]);
+            let fr = fq(&f, q)
+                .await
+                .unwrap_or_else(|e| vec![vec![format!("<ERR {e}>")]]);
             let rr = rq(&r, q).unwrap_or_else(|e| vec![vec![format!("<ERR {e}>")]]);
-            assert_eq!(fr, rr, "GH#144: {label} content diverges (main-qualified write hit TEMP)");
+            assert_eq!(
+                fr, rr,
+                "GH#144: {label} content diverges (main-qualified write hit TEMP)"
+            );
         }
     });
 }
@@ -127,10 +151,10 @@ fn gh145_upsert_partial_unique_target() {
     });
 }
 
+// GH#147 fixed (bd-gh-147): a CAS-safe savepoint rewind of the shared concurrent
+// rowid allocator now restores the AUTOINCREMENT allocator on ROLLBACK TO in
+// concurrent mode (id 2 for row c, matching stock and the non-concurrent control).
 #[test]
-#[ignore = "GH#147 still RED at HEAD: concurrent-mode AUTOINCREMENT allocator is \
-not restored on ROLLBACK TO (frank gives id 3 for row c; stock/non-concurrent gives 2). \
-Un-ignore when the concurrent allocator savepoint state is fixed."]
 fn gh147_concurrent_autoincrement_savepoint_rollback() {
     asupersync::test_utils::run_test(|| async {
         agree(
@@ -167,14 +191,26 @@ fn gh149_deferred_no_action_fk() {
             fx(&f, s).await.unwrap();
             r.execute_batch(s).unwrap();
         }
-        let txn = ["BEGIN", "DELETE FROM p WHERE id=1", "INSERT INTO p VALUES (1)", "COMMIT"];
+        let txn = [
+            "BEGIN",
+            "DELETE FROM p WHERE id=1",
+            "INSERT INTO p VALUES (1)",
+            "COMMIT",
+        ];
         let frank_ok = {
             let mut ok = true;
-            for s in txn { if fx(&f, s).await.is_err() { ok = false; } }
+            for s in txn {
+                if fx(&f, s).await.is_err() {
+                    ok = false;
+                }
+            }
             ok
         };
         let stock_ok = txn.iter().all(|s| r.execute_batch(s).is_ok());
-        assert_eq!(frank_ok, stock_ok, "GH#149: deferred NO ACTION FK must allow the temporary orphan (stock_ok={stock_ok})");
+        assert_eq!(
+            frank_ok, stock_ok,
+            "GH#149: deferred NO ACTION FK must allow the temporary orphan (stock_ok={stock_ok})"
+        );
     });
 }
 
@@ -213,9 +249,15 @@ fn gh244_update_attached_schema_in_txn() {
             "UPDATE aux.t SET x=2",
             "COMMIT",
         ] {
-            fx(&f, s).await.unwrap_or_else(|e| panic!("GH#244: `{s}` must succeed: {e}"));
+            fx(&f, s)
+                .await
+                .unwrap_or_else(|e| panic!("GH#244: `{s}` must succeed: {e}"));
         }
         let rows = fq(&f, "SELECT x FROM aux.t").await.unwrap();
-        assert_eq!(rows, vec![vec!["2".to_owned()]], "GH#244: attached UPDATE in a txn must commit x=2");
+        assert_eq!(
+            rows,
+            vec![vec!["2".to_owned()]],
+            "GH#244: attached UPDATE in a txn must commit x=2"
+        );
     });
 }

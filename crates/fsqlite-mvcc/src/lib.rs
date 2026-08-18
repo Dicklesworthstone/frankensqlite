@@ -560,7 +560,7 @@ pub use retry_policy::{
 };
 pub use rowid_alloc::{
     AllocatorKey, ConcurrentRowIdAllocator, DEFAULT_RANGE_SIZE, LocalRowIdCache, RangeReservation,
-    RowIdAllocError, SQLITE_FULL, SQLITE_SCHEMA,
+    RowIdAllocError, RowidAllocSavepointMark, SQLITE_FULL, SQLITE_SCHEMA,
 };
 pub use seqlock::{
     SeqLock, SeqLockPair, SeqLockTriple, SeqlockMetrics, reset_seqlock_metrics, seqlock_metrics,

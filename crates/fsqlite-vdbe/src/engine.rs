@@ -6356,6 +6356,10 @@ pub struct VdbeEngine {
     concurrent_rowid_allocator: Option<Arc<ConcurrentRowIdAllocator>>,
     /// Schema epoch namespace for concurrent rowid reservations.
     concurrent_rowid_schema_epoch: SchemaEpoch,
+    /// Concurrent session id owning implicit rowid reservations (bd-gh-147), so
+    /// the shared allocator can attribute them for a provably-safe savepoint
+    /// rewind. 0 when no concurrent transaction is bound.
+    concurrent_rowid_session_id: u64,
     /// INTEGER PRIMARY KEY alias column positions keyed by root page number.
     /// Used to decode storage-cursor payload columns for rowid tables.
     rowid_alias_col_by_root_page: Arc<HashMap<i32, usize>>,
@@ -6915,6 +6919,7 @@ impl VdbeEngine {
             autoincrement_seq_by_root_page: HashMap::new(),
             concurrent_rowid_allocator: None,
             concurrent_rowid_schema_epoch: SchemaEpoch::ZERO,
+            concurrent_rowid_session_id: 0,
             rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
             table_column_count_by_root_page: Arc::new(HashMap::new()),
             first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
@@ -7152,6 +7157,7 @@ impl VdbeEngine {
         if !retain_cursors {
             self.concurrent_rowid_allocator = None;
             self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
+            self.concurrent_rowid_session_id = 0;
         }
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
@@ -8280,9 +8286,11 @@ impl VdbeEngine {
         &mut self,
         allocator: Arc<ConcurrentRowIdAllocator>,
         schema_epoch: SchemaEpoch,
+        session_id: u64,
     ) {
         self.concurrent_rowid_allocator = Some(allocator);
         self.concurrent_rowid_schema_epoch = schema_epoch;
+        self.concurrent_rowid_session_id = session_id;
     }
 
     fn storage_cursor_runtime_meta(&self, root_page: i32) -> (RowIdMode, i64) {
@@ -8342,9 +8350,14 @@ impl VdbeEngine {
         Ok(rowid)
     }
 
+    // bd-gh-147 added `session_id` (8th arg) to attribute reservations to the
+    // concurrent session; the params are a flat threading list, not worth a
+    // dedicated struct.
+    #[allow(clippy::too_many_arguments)]
     async fn allocate_concurrent_storage_rowid(
         allocator: &ConcurrentRowIdAllocator,
         schema_epoch: SchemaEpoch,
+        session_id: u64,
         root_page: i32,
         mode: RowIdMode,
         autoinc_max: i64,
@@ -8366,7 +8379,7 @@ impl VdbeEngine {
             mode,
         );
         let rowid = allocator
-            .allocate_one(key)
+            .allocate_one_for_session(key, session_id)
             .map_err(|err| Self::map_rowid_allocator_error(err, overflow_detail))?
             .get();
         sc.last_alloc_rowid = rowid;
@@ -10639,6 +10652,7 @@ impl VdbeEngine {
                         None
                     };
                     let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
+                    let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
                     // GH #186: capture the AUTOINCREMENT table's root page so the
                     // allocated rowid can be folded into the program-scoped
                     // high-water AFTER the `sc` borrow ends (sqlite_sequence must
@@ -10661,6 +10675,7 @@ impl VdbeEngine {
                                 Self::allocate_concurrent_storage_rowid(
                                     allocator,
                                     concurrent_schema_epoch,
+                                    concurrent_rowid_session_id,
                                     root_page,
                                     rowid_mode,
                                     autoinc_max,
@@ -14315,6 +14330,7 @@ impl VdbeEngine {
                 let num_cols = usize::try_from(op.p3).unwrap_or(0);
                 let concurrent_allocator = self.concurrent_rowid_allocator.clone();
                 let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
+                let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
                 let previous_last_insert_rowid = self.last_insert_rowid;
                 let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
 
@@ -14328,6 +14344,7 @@ impl VdbeEngine {
                             Self::allocate_concurrent_storage_rowid(
                                 allocator,
                                 concurrent_schema_epoch,
+                                concurrent_rowid_session_id,
                                 root_page,
                                 rowid_mode,
                                 autoinc_max,
@@ -14865,6 +14882,7 @@ impl VdbeEngine {
         Self::apply_make_record_null_placeholders(&mut values, &template.record_p4);
         let concurrent_allocator = self.concurrent_rowid_allocator.clone();
         let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
+        let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
         let previous_last_insert_rowid = self.last_insert_rowid;
         let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
 
@@ -14884,6 +14902,7 @@ impl VdbeEngine {
                 Self::allocate_concurrent_storage_rowid(
                     allocator,
                     concurrent_schema_epoch,
+                    concurrent_rowid_session_id,
                     template.root_page,
                     rowid_mode,
                     autoinc_max,

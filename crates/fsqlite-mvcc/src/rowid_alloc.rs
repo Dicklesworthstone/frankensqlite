@@ -222,6 +222,25 @@ pub struct ConcurrentRowIdAllocator {
     current_epoch: Mutex<SchemaEpoch>,
     /// Per-table allocator states.
     tables: Mutex<HashMap<AllocatorKey, TableAllocatorState>>,
+    /// bd-gh-147 (GH #147): per-`(session, table)` count of rowids this session
+    /// has reserved-and-not-yet-rolled-back. Enables a provably-safe savepoint
+    /// rewind: on `ROLLBACK TO`, the shared allocator's `next_rowid` is rewound
+    /// only when this session reserved the entire contiguous tail since the
+    /// savepoint (so no other writer's committed id is ever reissued). A
+    /// concurrent writer that intervened leaves the gap intact (§5.10.1.1).
+    session_reservations: Mutex<HashMap<(u64, AllocatorKey), i64>>,
+}
+
+/// A savepoint-time mark of the allocator state relevant to one session.
+///
+/// Taken at `SAVEPOINT` and consumed by
+/// [`ConcurrentRowIdAllocator::rewind_to_mark`] on `ROLLBACK TO`. Entries are
+/// `(key, next_rowid, autoincrement_high_water, session_reservation_count)`
+/// snapshotted at mark time.
+#[derive(Debug, Clone)]
+pub struct RowidAllocSavepointMark {
+    session_id: u64,
+    entries: Vec<(AllocatorKey, i64, i64, i64)>,
 }
 
 impl ConcurrentRowIdAllocator {
@@ -231,7 +250,95 @@ impl ConcurrentRowIdAllocator {
         Self {
             current_epoch: Mutex::new(current_epoch),
             tables: Mutex::new(HashMap::new()),
+            session_reservations: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record that `session_id` reserved `count` rowids for `key` (bd-gh-147).
+    /// Called by the reservation path so a later savepoint rewind can prove the
+    /// contiguous tail belongs entirely to this session.
+    fn note_session_reservation(&self, session_id: u64, key: AllocatorKey, count: i64) {
+        if count <= 0 {
+            return;
+        }
+        *self
+            .session_reservations
+            .lock()
+            .entry((session_id, key))
+            .or_insert(0) += count;
+    }
+
+    /// Snapshot the allocator state for `session_id` at a `SAVEPOINT` boundary.
+    #[must_use]
+    pub fn mark_savepoint(&self, session_id: u64) -> RowidAllocSavepointMark {
+        let session_reservations = self.session_reservations.lock();
+        let tables = self.tables.lock();
+        let entries = tables
+            .iter()
+            .map(|(key, state)| {
+                let count = session_reservations
+                    .get(&(session_id, *key))
+                    .copied()
+                    .unwrap_or(0);
+                (
+                    *key,
+                    state.next_rowid,
+                    state.autoincrement_high_water,
+                    count,
+                )
+            })
+            .collect();
+        RowidAllocSavepointMark {
+            session_id,
+            entries,
+        }
+    }
+
+    /// Rewind the allocator to `mark` on `ROLLBACK TO` (bd-gh-147).
+    ///
+    /// For each table captured at mark time, the shared `next_rowid` is rewound
+    /// to the savepoint value ONLY when the allocator's current tip is exactly
+    /// where this session's contiguous reservations since the mark end
+    /// (`current == sp_next + my_count_since_mark`). That equality proves no
+    /// other writer reserved a rowid in `[sp_next, current)`, so the rewind can
+    /// never reissue another writer's id; if a peer intervened the gap is kept.
+    /// The session reservation count is reset to the mark value either way,
+    /// because every reservation since the mark has been rolled back.
+    pub fn rewind_to_mark(&self, mark: &RowidAllocSavepointMark) {
+        let mut session_reservations = self.session_reservations.lock();
+        let mut tables = self.tables.lock();
+        for &(key, sp_next, sp_high_water, sp_count) in &mark.entries {
+            let current_count = session_reservations
+                .get(&(mark.session_id, key))
+                .copied()
+                .unwrap_or(0);
+            let my_count_since = current_count - sp_count;
+            if my_count_since > 0
+                && let Some(state) = tables.get_mut(&key)
+                && state.next_rowid == sp_next + my_count_since
+            {
+                state.next_rowid = sp_next;
+                if state.mode == RowIdMode::AutoIncrement {
+                    state.autoincrement_high_water = sp_high_water;
+                }
+            }
+            // Every reservation since the mark was rolled back — restore the
+            // session's tracked count regardless of whether the tip rewound.
+            if sp_count == 0 {
+                session_reservations.remove(&(mark.session_id, key));
+            } else {
+                session_reservations.insert((mark.session_id, key), sp_count);
+            }
+        }
+    }
+
+    /// Drop all reservation tracking for `session_id` (bd-gh-147). Called when
+    /// the session's transaction ends (COMMIT or full ROLLBACK) so the map does
+    /// not accumulate dead sessions.
+    pub fn clear_session(&self, session_id: u64) {
+        self.session_reservations
+            .lock()
+            .retain(|&(session, _), _| session != session_id);
     }
 
     /// Initialise (or re-initialise) a table's allocator from the durable tip.
@@ -385,6 +492,31 @@ impl ConcurrentRowIdAllocator {
         self.reserve_range(key, 1).map(|r| r.start_rowid)
     }
 
+    /// Like [`allocate_one`](Self::allocate_one), but attributes the reservation
+    /// to `session_id` so a later `ROLLBACK TO` can safely reclaim it if it is
+    /// the contiguous tail (bd-gh-147).
+    pub fn allocate_one_for_session(
+        &self,
+        key: AllocatorKey,
+        session_id: u64,
+    ) -> Result<RowId, RowIdAllocError> {
+        let reservation = self.reserve_range(key, 1)?;
+        self.note_session_reservation(session_id, key, i64::from(reservation.count));
+        Ok(reservation.start_rowid)
+    }
+
+    /// Like [`reserve_range`](Self::reserve_range), attributed to `session_id`.
+    pub fn reserve_range_for_session(
+        &self,
+        key: AllocatorKey,
+        count: u32,
+        session_id: u64,
+    ) -> Result<RangeReservation, RowIdAllocError> {
+        let reservation = self.reserve_range(key, count)?;
+        self.note_session_reservation(session_id, key, i64::from(reservation.count));
+        Ok(reservation)
+    }
+
     /// Bump the allocator past an explicit rowid value (§5.10.1.1).
     ///
     /// If a statement inserts an explicit rowid `r`, the allocator's next value
@@ -522,6 +654,68 @@ mod tests {
         AllocatorKey {
             schema_epoch: epoch(e),
             table_id: table(t),
+        }
+    }
+
+    // ── bd-gh-147: CAS savepoint rewind safety ──
+
+    /// GH #147: `ROLLBACK TO` reclaims this session's own contiguous rowid tail,
+    /// but the CAS must NEVER reissue an id a concurrent session reserved.
+    #[test]
+    fn savepoint_rewind_reclaims_own_tail_but_never_reissues_concurrent_id() {
+        let (session_a, session_b) = (10u64, 20u64);
+
+        // Single-writer: the rolled-back tail is reclaimed (the #147 case).
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            let k = key(1, 1);
+            alloc.init_table(k, None, 0, RowIdMode::AutoIncrement);
+            assert_eq!(
+                alloc.allocate_one_for_session(k, session_a).unwrap().get(),
+                1
+            );
+            let mark = alloc.mark_savepoint(session_a);
+            assert_eq!(
+                alloc.allocate_one_for_session(k, session_a).unwrap().get(),
+                2
+            );
+            alloc.rewind_to_mark(&mark);
+            // id 2 (rolled back) is reclaimed for the next insert; high-water too.
+            assert_eq!(
+                alloc.allocate_one_for_session(k, session_a).unwrap().get(),
+                2
+            );
+            assert_eq!(alloc.autoincrement_high_water(&k), Some(2));
+        }
+
+        // Concurrent writer intervenes between the savepoint and the rollback:
+        // the tip is not this session's contiguous tail, so the CAS declines to
+        // rewind — the peer's id is never reissued and the gap is preserved.
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            let k = key(1, 1);
+            alloc.init_table(k, None, 0, RowIdMode::AutoIncrement);
+            assert_eq!(
+                alloc.allocate_one_for_session(k, session_a).unwrap().get(),
+                1
+            );
+            let mark = alloc.mark_savepoint(session_a);
+            assert_eq!(
+                alloc.allocate_one_for_session(k, session_a).unwrap().get(),
+                2
+            );
+            // Peer B reserves the next id (3) before A rolls back.
+            assert_eq!(
+                alloc.allocate_one_for_session(k, session_b).unwrap().get(),
+                3
+            );
+            alloc.rewind_to_mark(&mark);
+            // A's next insert must skip B's committed id 3 — never reissue it.
+            assert_eq!(
+                alloc.allocate_one_for_session(k, session_a).unwrap().get(),
+                4,
+                "CAS must not reissue peer id 3; the gap at 2 stays"
+            );
         }
     }
 
