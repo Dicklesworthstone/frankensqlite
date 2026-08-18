@@ -4858,6 +4858,20 @@ static FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_VDBE_DECODE_CACHE_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total number of decode-cache misses across storage, sorter, and pseudo-row paths.
 static FSQLITE_VDBE_DECODE_CACHE_MISSES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Per-thread decode-cache hit/miss counters (bd-p3963). The process-global
+    /// counters above are shared across all parallel tests, so a test that
+    /// asserts on their delta is polluted whenever another test decodes on
+    /// another thread while metrics are (globally) enabled. These thread-local
+    /// mirrors increment only on the thread that performed the decode, so a test
+    /// running its VDBE program via `block_on` (synchronous, on the test thread)
+    /// can measure exactly its own decode activity, immune to concurrent tests.
+    /// They are maintained under the same `collect_vdbe_metrics` gate, so the
+    /// production hot path is unaffected when observability is off.
+    static FSQLITE_VDBE_DECODE_CACHE_HITS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FSQLITE_VDBE_DECODE_CACHE_MISSES_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 /// Total number of decode-cache invalidations caused by row-position changes.
 static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total number of decode-cache invalidations caused by write-path mutations.
@@ -5666,13 +5680,35 @@ fn record_decoded_value_metrics(value: &SqliteValue) {
 fn note_decode_cache_hit(collect_vdbe_metrics: bool) {
     if collect_vdbe_metrics {
         FSQLITE_VDBE_DECODE_CACHE_HITS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        // bd-p3963: mirror onto the per-thread counter for race-free test reads.
+        FSQLITE_VDBE_DECODE_CACHE_HITS_THREAD.with(|c| c.set(c.get().saturating_add(1)));
     }
 }
 
 fn note_decode_cache_miss(collect_vdbe_metrics: bool) {
     if collect_vdbe_metrics {
         FSQLITE_VDBE_DECODE_CACHE_MISSES_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        FSQLITE_VDBE_DECODE_CACHE_MISSES_THREAD.with(|c| c.set(c.get().saturating_add(1)));
     }
+}
+
+/// Test-only: reset this thread's decode-cache hit/miss counters (bd-p3963).
+#[cfg(test)]
+fn reset_thread_decode_cache_metrics() {
+    FSQLITE_VDBE_DECODE_CACHE_HITS_THREAD.with(|c| c.set(0));
+    FSQLITE_VDBE_DECODE_CACHE_MISSES_THREAD.with(|c| c.set(0));
+}
+
+/// Test-only: this thread's decode-cache hit count since the last reset.
+#[cfg(test)]
+fn thread_decode_cache_hits() -> u64 {
+    FSQLITE_VDBE_DECODE_CACHE_HITS_THREAD.with(std::cell::Cell::get)
+}
+
+/// Test-only: this thread's decode-cache miss count since the last reset.
+#[cfg(test)]
+fn thread_decode_cache_misses() -> u64 {
+    FSQLITE_VDBE_DECODE_CACHE_MISSES_THREAD.with(std::cell::Cell::get)
 }
 
 fn note_decode_cache_invalidation(
@@ -32870,7 +32906,6 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev_metrics_enabled = vdbe_metrics_enabled();
-        reset_vdbe_metrics();
         set_vdbe_metrics_enabled(true);
 
         let mut db = MemDatabase::new();
@@ -32880,7 +32915,12 @@ mod tests {
             .expect("table should exist")
             .insert(1, row);
 
-        let before = vdbe_metrics_snapshot();
+        // bd-p3963: measure this thread's OWN decode activity. The VDBE runs
+        // synchronously on this thread via block_on, so the per-thread counters
+        // capture exactly this program's hits/misses — unlike the process-global
+        // counters, which a concurrent test on another thread can increment
+        // during the measurement window.
+        reset_thread_decode_cache_metrics();
         let rows = run_with_storage_cursors(db, |b| {
             let end = b.emit_label();
             let eof = b.emit_label();
@@ -32894,20 +32934,13 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        let after = vdbe_metrics_snapshot();
 
         assert_eq!(
             rows,
             vec![vec![SqliteValue::Integer(64), SqliteValue::Integer(64)]]
         );
-        assert_eq!(
-            after.decode_cache_hits_total - before.decode_cache_hits_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_misses_total - before.decode_cache_misses_total,
-            1
-        );
+        assert_eq!(thread_decode_cache_hits(), 1);
+        assert_eq!(thread_decode_cache_misses(), 1);
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
