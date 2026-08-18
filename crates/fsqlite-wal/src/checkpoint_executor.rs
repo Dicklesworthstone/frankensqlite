@@ -119,6 +119,27 @@ pub async fn execute_checkpoint<F: VfsFile>(
     target: &mut impl CheckpointTarget,
 ) -> Result<CheckpointExecutionResult> {
     let checkpoint_start = fsqlite_types::sync_primitives::Instant::now();
+
+    // bd-km8qs: the plan window, progress, and post-actions all derive from the
+    // caller-supplied CheckpointState; only `end` is clamped to the live WAL.
+    // Revalidate that the state still describes the current WAL BEFORE copying
+    // frames, resetting the WAL, or running post-actions — the production caller
+    // sets `total_frames = wal.frame_count()` under the coordination guard, so a
+    // mismatch means the WAL grew or shrank between planning and execution (a
+    // caller-side locking regression), which would otherwise silently drop the
+    // frames beyond the planned window instead of erroring.
+    let live_frame_count = u32::try_from(wal.frame_count()).unwrap_or(u32::MAX);
+    if state.total_frames != live_frame_count {
+        return Err(FrankenError::CheckpointFailed {
+            detail: format!(
+                "checkpoint state is stale: total_frames={} but the live WAL has \
+                 {live_frame_count} frames — a coordination guard was violated between \
+                 planning and execution",
+                state.total_frames
+            ),
+        });
+    }
+
     let plan = plan_checkpoint(mode, state);
     let normalized = state.normalized();
 
@@ -494,6 +515,41 @@ mod tests {
         assert!(!result.wal_was_reset);
         assert_eq!(target.pages.len(), 5);
         assert!(target.sync_count >= 1);
+    }
+
+    #[test]
+    fn test_stale_checkpoint_state_after_wal_growth_errors_bd_km8qs() {
+        // bd-km8qs: a CheckpointState planned against an earlier WAL snapshot must
+        // be rejected if the WAL grew before execution (a coordination-guard
+        // regression), rather than silently checkpointing only the planned window.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 3);
+
+        // Plan against the 3-frame snapshot.
+        let state = CheckpointState {
+            total_frames: 3,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+
+        // The WAL grows before execution — the state is now stale.
+        let extra = sample_page(0xAB);
+        wal.append_frame(&cx, 4, &extra, 0).expect("append extra frame");
+        wal.append_frame(&cx, 5, &extra, 5)
+            .expect("append extra commit frame");
+        assert_eq!(wal.frame_count(), 5);
+
+        let mut target = RecordingTarget::new();
+        let err = execute_checkpoint(&cx, &mut wal, CheckpointMode::Passive, state, &mut target)
+            .expect_err("a stale checkpoint state must be rejected");
+        assert!(matches!(err, FrankenError::CheckpointFailed { .. }));
+        assert!(
+            target.pages.is_empty(),
+            "no frames may be copied before the stale-state guard fires"
+        );
     }
 
     #[test]
