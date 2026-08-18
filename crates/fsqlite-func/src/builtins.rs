@@ -2473,6 +2473,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
         let mut zero_pad = false;
         let mut alt_form = false;
         let mut alt_form2 = false;
+        let mut comma_group = false;
         loop {
             if i >= chars.len() {
                 break;
@@ -2486,6 +2487,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 // SQLite's alternate-form-2 flag. For non-float conversions it has
                 // no effect; for %f/%g it selects the shortest round-trip form.
                 '!' => alt_form2 = true,
+                // SQLite's comma flag: group the integer digits into
+                // thousands separated by commas. Applies to the decimal
+                // conversions %d/%i/%u and the integer part of %f; it is
+                // accepted-but-inert for %e/%g/%x/%o (matches C SQLite).
+                ',' => comma_group = true,
                 _ => break,
             }
             i += 1;
@@ -2556,8 +2562,15 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
             'd' | 'i' => {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
                 param_idx += 1;
-                let formatted =
-                    format_integer(val, width, left_align, show_sign, space_sign, zero_pad);
+                let formatted = format_integer(
+                    val,
+                    width,
+                    left_align,
+                    show_sign,
+                    space_sign,
+                    zero_pad,
+                    comma_group,
+                );
                 result.push_str(&formatted);
             }
             'u' => {
@@ -2567,7 +2580,21 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 param_idx += 1;
                 #[allow(clippy::cast_sign_loss)]
                 let digits = (val as u64).to_string();
-                let padded = if zero_pad && width > digits.len() {
+                let padded = if comma_group {
+                    // Zero-pad the raw digits to the field width before grouping,
+                    // so the padding zeros participate in comma grouping.
+                    let base = if zero_pad && width > digits.len() {
+                        format!("{}{}", "0".repeat(width - digits.len()), digits)
+                    } else {
+                        digits
+                    };
+                    let grouped = group_thousands(&base);
+                    if zero_pad {
+                        grouped
+                    } else {
+                        pad_string(&grouped, width, left_align)
+                    }
+                } else if zero_pad && width > digits.len() {
                     format!("{}{}", "0".repeat(width - digits.len()), digits)
                 } else {
                     pad_string(&digits, width, left_align)
@@ -2581,23 +2608,30 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 // 0 (no minus), and any sign flag then applies to +0.0
                 // (bd-gh-printf-negative-zero-era4w). `-0.0 == 0.0` is true.
                 let val = if val == 0.0 { 0.0 } else { val };
-                let formatted = if alt_form2 && val.is_finite() {
-                    // Alternate-form-2 (`!`): shortest round-trip representation
-                    // (always with a decimal point), ignoring precision — matches
-                    // C SQLite, e.g. printf('%!f',0.1) -> "0.1", '%!.3f' 1.5 -> "1.5".
-                    finish_float_padding(
-                        &format!("{val:?}"),
-                        width,
-                        left_align,
-                        show_sign,
-                        space_sign,
-                        zero_pad,
-                    )
+                let formatted = if let Some(s) =
+                    nonfinite_float_str(val, width, left_align, show_sign, space_sign)
+                {
+                    s
                 } else {
+                    // Build the unsigned magnitude, honoring precision. Alt-form-2
+                    // (`!`) applies the requested precision FIRST and then strips
+                    // trailing fractional zeros (keeping >=1 digit, forcing ".0"
+                    // when precision is 0) — matches C SQLite, e.g. '%!5.2f' 3.14159
+                    // -> "3.14", '%!.3f' 1.5 -> "1.5", '%!f' 0.1 -> "0.1".
                     let prec = precision.unwrap_or(6);
-                    format_float_f(
-                        val, prec, width, left_align, show_sign, space_sign, zero_pad,
-                    )
+                    let mut mag = format!("{:.prec$}", val.abs());
+                    if alt_form2 {
+                        mag = altform2_trim_float(&mag);
+                    }
+                    if comma_group {
+                        mag = group_float_integer_part(&mag);
+                    }
+                    let body = if val.is_sign_negative() {
+                        format!("-{mag}")
+                    } else {
+                        mag
+                    };
+                    finish_float_padding(&body, width, left_align, show_sign, space_sign, zero_pad)
                 };
                 result.push_str(&formatted);
             }
@@ -2801,6 +2835,7 @@ fn format_integer(
     show_sign: bool,
     space_sign: bool,
     zero_pad: bool,
+    comma_group: bool,
 ) -> String {
     let sign = if val < 0 {
         "-".to_owned()
@@ -2812,6 +2847,27 @@ fn format_integer(
         String::new()
     };
     let digits = format!("{}", val.unsigned_abs());
+    if comma_group {
+        // SQLite zero-pads the raw digits up to the field width BEFORE inserting
+        // the grouping commas, so the padding zeros are themselves grouped
+        // (e.g. '%,08d' 1234 -> "00,001,234"). Space padding, by contrast, is
+        // applied to the already-grouped value ('%,10d' 1234567 -> " 1,234,567").
+        let padded_digits = if zero_pad && width > sign.len() + digits.len() {
+            format!("{}{digits}", "0".repeat(width - sign.len() - digits.len()))
+        } else {
+            digits
+        };
+        let body = format!("{sign}{}", group_thousands(&padded_digits));
+        if zero_pad || body.len() >= width {
+            return body;
+        }
+        let pad = width - body.len();
+        return if left_align {
+            format!("{body}{}", " ".repeat(pad))
+        } else {
+            format!("{}{body}", " ".repeat(pad))
+        };
+    }
     let body = format!("{sign}{digits}");
     if body.len() >= width {
         return body;
@@ -2823,6 +2879,56 @@ fn format_integer(
         format!("{sign}{}{digits}", "0".repeat(pad))
     } else {
         format!("{}{body}", " ".repeat(pad))
+    }
+}
+
+/// Insert a comma every three digits, counting from the right, into a string of
+/// ASCII digits — SQLite's printf `,` grouping flag. Input with fewer than four
+/// digits (or any non-digit byte) is returned unchanged.
+fn group_thousands(digits: &str) -> String {
+    if digits.len() <= 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return digits.to_owned();
+    }
+    let lead = digits.len() % 3;
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    if lead > 0 {
+        out.push_str(&digits[..lead]);
+    }
+    let mut idx = lead;
+    while idx < digits.len() {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&digits[idx..idx + 3]);
+        idx += 3;
+    }
+    out
+}
+
+/// Alternate-form-2 (`!`) trailing-zero trim for a `%f` magnitude string: strip
+/// trailing fractional zeros but keep at least one digit after the decimal
+/// point, and add a ".0" when there is no point at all (precision 0). Matches
+/// C SQLite: "5.000000" -> "5.0", "1.500" -> "1.5", "6" -> "6.0", "3.14" -> "3.14".
+fn altform2_trim_float(mag: &str) -> String {
+    if mag.contains('.') {
+        let trimmed = mag.trim_end_matches('0');
+        if trimmed.ends_with('.') {
+            format!("{trimmed}0")
+        } else {
+            trimmed.to_owned()
+        }
+    } else {
+        format!("{mag}.0")
+    }
+}
+
+/// Apply the `,` thousands grouping to the integer part of an unsigned `%f`
+/// magnitude string, e.g. "1234.500000" -> "1,234.500000".
+fn group_float_integer_part(mag: &str) -> String {
+    if let Some(dot) = mag.find('.') {
+        format!("{}{}", group_thousands(&mag[..dot]), &mag[dot..])
+    } else {
+        group_thousands(mag)
     }
 }
 
@@ -2886,45 +2992,6 @@ fn finish_float_padding(
         format!("{sign}{}{digits}", "0".repeat(pad))
     } else {
         format!("{}{sign}{digits}", " ".repeat(pad))
-    }
-}
-
-fn format_float_f(
-    val: f64,
-    prec: usize,
-    width: usize,
-    left_align: bool,
-    show_sign: bool,
-    space_sign: bool,
-    zero_pad: bool,
-) -> String {
-    if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign) {
-        return s;
-    }
-    // Emit '-' for negative values. Signed zero is normalized to +0.0 by the
-    // caller (bd-gh-printf-negative-zero-era4w), so this only fires for genuine
-    // negatives; is_sign_negative and `val < 0.0` are equivalent here.
-    let sign = if val.is_sign_negative() {
-        "-".to_owned()
-    } else if show_sign {
-        "+".to_owned()
-    } else if space_sign {
-        " ".to_owned()
-    } else {
-        String::new()
-    };
-    let digits = format!("{:.prec$}", val.abs());
-    let body = format!("{sign}{digits}");
-    if body.len() >= width {
-        return body;
-    }
-    let pad = width - body.len();
-    if left_align {
-        format!("{body}{}", " ".repeat(pad))
-    } else if zero_pad {
-        format!("{sign}{}{digits}", "0".repeat(pad))
-    } else {
-        format!("{}{body}", " ".repeat(pad))
     }
 }
 
@@ -5033,6 +5100,106 @@ mod tests {
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("0.1"))
         );
+    }
+
+    #[test]
+    fn test_format_altform2_precision_and_width() {
+        // The '!' (alternate-form-2) flag on %f applies the requested precision
+        // FIRST and then strips trailing fractional zeros (keeping >= 1 digit;
+        // ".0" is forced at precision 0), with width/sign flags applied last.
+        // Frank previously used Rust's shortest round-trip form and ignored an
+        // explicit precision, so '%!5.2f' 3.14159 rendered "3.14159" instead of
+        // " 3.14" (probe-found divergence). Oracle: sqlite3 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: f64| -> String {
+            match f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(spec)),
+                    SqliteValue::Float(v),
+                ])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let cases: &[(&str, f64, &str)] = &[
+            ("%!f", 0.1, "0.1"),
+            ("%!5.2f", 3.14159, " 3.14"),
+            ("%!.3f", 1.5, "1.5"),
+            ("%!f", 3.14159, "3.14159"),
+            ("%!f", 5.0, "5.0"),
+            ("%!f", 5.5, "5.5"),
+            ("%!.0f", 5.5, "6.0"),
+            ("%!f", -0.5, "-0.5"),
+            ("%+!f", 0.5, "+0.5"),
+            ("%!f", 100.0, "100.0"),
+            ("%!8.2f", 3.14159, "    3.14"),
+            ("%!08.3f", 1.5, "000001.5"),
+            ("%!10.2f", 3.14159, "      3.14"),
+        ];
+        for (spec, v, want) in cases {
+            assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
+        }
+    }
+
+    #[test]
+    fn test_format_comma_grouping_flag() {
+        // SQLite's `,` printf flag groups the integer digits into thousands.
+        // Applies to %d/%i/%u and the integer part of %f; it is accepted but
+        // inert for %e/%g/%x. Frank previously did not recognize `,` as a flag
+        // and emitted the spec verbatim ('%,d' 1234567 -> "%,d"; probe-found).
+        // Zero padding pads the raw digits BEFORE grouping ('%,08d' 1234 ->
+        // "00,001,234"); space padding is applied AFTER grouping. Oracle:
+        // sqlite3 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: SqliteValue| -> String {
+            match f
+                .invoke(&[SqliteValue::Text(SmallText::from_string(spec)), v])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let int_cases: &[(&str, i64, &str)] = &[
+            ("%,d", 1234567, "1,234,567"),
+            ("%,d", -1234567, "-1,234,567"),
+            ("%,d", 123, "123"),
+            ("%,d", 1000, "1,000"),
+            ("%,d", 0, "0"),
+            ("%,d", -100, "-100"),
+            ("%,d", 1000000, "1,000,000"),
+            ("%,10d", 1234567, " 1,234,567"),
+            ("%,08d", 1234, "00,001,234"),
+            ("%+,d", 1234567, "+1,234,567"),
+            ("%, d", 1234567, " 1,234,567"),
+            ("%-,12d", 1234567, "1,234,567   "),
+            ("%,i", 1234567, "1,234,567"),
+            ("%,u", 1234567, "1,234,567"),
+            ("%,x", 1234567, "12d687"),
+        ];
+        for (spec, v, want) in int_cases {
+            assert_eq!(
+                fmt(spec, SqliteValue::Integer(*v)),
+                *want,
+                "spec={spec} v={v}"
+            );
+        }
+        let float_cases: &[(&str, f64, &str)] = &[
+            ("%,f", 1234567.5, "1,234,567.500000"),
+            ("%,.2f", 1234567.891, "1,234,567.89"),
+            ("%,f", -1234.5, "-1,234.500000"),
+            ("%,e", 1234.5, "1.234500e+03"),
+            ("%,g", 1234567.0, "1.23457e+06"),
+        ];
+        for (spec, v, want) in float_cases {
+            assert_eq!(
+                fmt(spec, SqliteValue::Float(*v)),
+                *want,
+                "spec={spec} v={v}"
+            );
+        }
     }
 
     // ── format ───────────────────────────────────────────────────────────
