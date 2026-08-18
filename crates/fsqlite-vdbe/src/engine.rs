@@ -175,7 +175,8 @@ use fsqlite_types::opcode::{
 };
 use fsqlite_types::record::{
     ColumnOffset, PrecomputedSerialTypeKind, RecordProfileScope, enter_record_profile_scope,
-    parse_record, record_iter_with_precomputed_header_exact_size, serialize_record,
+    parse_record, parse_record_into_with_encoding, parse_record_with_encoding,
+    record_iter_with_precomputed_header_exact_size, serialize_record,
     serialize_record_iter_with_precomputed_header_into,
     serialize_record_iter_with_precomputed_header_into_slice, simd_serialize_integer_record,
 };
@@ -7847,7 +7848,11 @@ impl VdbeEngine {
         };
 
         // Parse old row to extract column values for index key construction.
-        let old_row = parse_record(&payload).ok_or_else(|| {
+        // Decode in the DB text encoding: the probe key below is re-encoded with
+        // `self.text_encoding`, so a UTF-8-hardcoded decode on a UTF-16 DB would
+        // build a probe that never matches the stored key, orphaning the old
+        // index entry on INSERT OR REPLACE (bd-o3rz4).
+        let old_row = parse_record_with_encoding(&payload, self.text_encoding).ok_or_else(|| {
             FrankenError::internal("delete_secondary_index_entries: malformed table record")
         })?;
         let table_root_page = self.table_root_page_for_cursor(tbl_cursor_id);
@@ -8010,11 +8015,15 @@ impl VdbeEngine {
                 let table_index_meta = Arc::clone(&self.table_index_meta);
                 let table_root_page = self.table_root_page_for_cursor(cursor_id);
                 if let Some(index_metas) = table_index_meta.get(&cursor_id) {
-                    let old_row = parse_record(&payload).ok_or_else(|| {
-                        FrankenError::internal(
-                            "UPDATE conflict restore could not decode original row payload",
-                        )
-                    })?;
+                    // Decode in the DB text encoding to match the encoding-aware
+                    // index-key re-encode below (bd-o3rz4): a UTF-8-hardcoded
+                    // decode on a UTF-16 DB would restore a wrong index key.
+                    let old_row = parse_record_with_encoding(&payload, self.text_encoding)
+                        .ok_or_else(|| {
+                            FrankenError::internal(
+                                "UPDATE conflict restore could not decode original row payload",
+                            )
+                        })?;
                     for meta in index_metas.iter() {
                         // Empty column metadata denotes an expression or
                         // partial index. These indexes were not restorable by
@@ -12406,9 +12415,15 @@ impl VdbeEngine {
 
                         sc.target_vals_buf.clear();
                         if let SqliteValue::Blob(bytes) = &probe_val {
-                            fsqlite_types::record::parse_record_into(
+                            // Decode the probe key with the cursor's own text
+                            // encoding — the cursor-side key is decoded with
+                            // `sc.text_encoding`, so a UTF-8-hardcoded probe
+                            // decode makes every TEXT index seek mis-compare on a
+                            // UTF-16 DB (bd-o3rz4).
+                            parse_record_into_with_encoding(
                                 bytes,
                                 &mut sc.target_vals_buf,
+                                sc.text_encoding,
                             )
                             .ok_or_else(|| {
                                 FrankenError::internal("index seek: malformed probe key record")
@@ -14432,9 +14447,16 @@ impl VdbeEngine {
                         &op.p4,
                         &mut rec_buf,
                     );
-                    let values = parse_record(&rec_buf).ok_or_else(|| {
-                        FrankenError::internal("malformed SQLite record in TEMP FusedAppendInsert")
-                    })?;
+                    // `serialize_record_from_register_range` above encodes TEXT in
+                    // `self.text_encoding`; decode with the same encoding so a
+                    // UTF-16 DB does not mojibake the TEMP row (and lossily
+                    // re-encode it back into main) (bd-o3rz4).
+                    let values = parse_record_with_encoding(&rec_buf, self.text_encoding)
+                        .ok_or_else(|| {
+                            FrankenError::internal(
+                                "malformed SQLite record in TEMP FusedAppendInsert",
+                            )
+                        })?;
                     rec_buf.clear();
                     self.make_record_lookaside.replace_buf(rec_buf);
 

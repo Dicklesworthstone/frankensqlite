@@ -340,6 +340,21 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
     Some(values)
 }
 
+/// Encoding-aware variant of [`parse_record`] (bd-o3rz4).
+///
+/// TEXT columns are decoded according to the database `encoding`; passing
+/// [`TextEncoding::Utf8`] is byte-for-byte identical to [`parse_record`]. Use
+/// this wherever a decoded row is re-serialized with the DB encoding or
+/// compared against encoding-aware keys — a UTF-8-hardcoded decode paired with
+/// an encoding-aware encode silently corrupts every TEXT column on a UTF-16 DB.
+#[allow(clippy::cast_possible_truncation)]
+pub fn parse_record_with_encoding(data: &[u8], encoding: TextEncoding) -> Option<Vec<SqliteValue>> {
+    let cap = (data.len() / 8).clamp(4, 64);
+    let mut values = Vec::with_capacity(cap);
+    parse_record_into_with_encoding(data, &mut values, encoding)?;
+    Some(values)
+}
+
 /// Parse a serialized record into an existing `Vec<SqliteValue>`.
 ///
 /// Existing slots are reused when possible so repeated row decodes can keep

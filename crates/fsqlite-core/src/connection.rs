@@ -145,8 +145,9 @@ use fsqlite_types::record::set_record_profile_enabled;
 use fsqlite_types::record::{
     ColumnOffset, NumericColumnValue, PrecomputedRecordHeader, RecordHotPathProfileSnapshot,
     RecordProfileScope, decode_column_from_offset, decode_numeric_column_from_offset, encode_batch,
-    enter_record_profile_scope, parse_record, parse_record_header_into, parse_record_into,
-    parse_record_into_with_encoding, parse_record_projected_column_offsets, record_profile_enabled,
+    enter_record_profile_scope, parse_record, parse_record_header_into,
+    parse_record_into_with_encoding, parse_record_projected_column_offsets,
+    parse_record_with_encoding, record_profile_enabled,
     record_profile_snapshot,
     reset_record_profile, serialize_record,
     serialize_record_iter_into_with_encoding,
@@ -22178,6 +22179,10 @@ impl Connection {
                 }
                 self.clear_cached_concurrent_handle();
                 registry.remove_and_recycle(session_id);
+                // bd-elcjy: release this session's rowid reservations.
+                self._shared_mvcc_state
+                    .rowid_allocator
+                    .clear_session(session_id);
             }
             *self.concurrent_session_id.get_mut() = None;
             *self.in_transaction.get_mut() = false;
@@ -29325,12 +29330,15 @@ impl Connection {
             // Decode the on-disk record into the scratch values. IPK columns are
             // stored as NULL in the payload (key is the rowid); we patch them
             // below when reserializing to keep the record shape identical.
-            parse_record_into(payload_buf, new_values).ok_or_else(|| {
-                FrankenError::DatabaseCorrupt {
+            // Decode in the DB text encoding: the row is re-serialized below with
+            // `serialize_record_iter_into_with_encoding`, so a UTF-8-hardcoded
+            // decode would double-encode every TEXT column NOT in the SET clause
+            // on a UTF-16 DB (bd-o3rz4).
+            parse_record_into_with_encoding(payload_buf, new_values, self.db_text_encoding.get())
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "prepared direct update: failed to parse existing row payload"
                         .to_owned(),
-                }
-            })?;
+                })?;
             // `parse_record_into` truncates to the decoded column count; pad/trim
             // back to the schema width so IPK / missing columns are explicit.
             while new_values.len() < direct.columns.len() {
@@ -29785,11 +29793,15 @@ impl Connection {
             cursor.payload_into(execution_cx, &mut payload_buf).await?;
             let mut old_values = self.prepared_direct_update_row_scratch.borrow_mut();
             old_values.clear();
-            parse_record_into(&payload_buf, &mut old_values).ok_or_else(|| {
-                FrankenError::DatabaseCorrupt {
-                    detail: "prepared direct delete: failed to parse existing row payload"
-                        .to_owned(),
-                }
+            // Decode in the DB text encoding so the count/SUM-cache projection
+            // sees the true column values on a UTF-16 DB (bd-o3rz4).
+            parse_record_into_with_encoding(
+                &payload_buf,
+                &mut old_values,
+                self.db_text_encoding.get(),
+            )
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "prepared direct delete: failed to parse existing row payload".to_owned(),
             })?;
             self.retained_autocommit_count_sum_cache_project_value(
                 root_page,
@@ -48048,7 +48060,11 @@ impl Connection {
                 if cursor.first(cx).await? {
                     loop {
                         let payload = cursor.payload(cx).await?;
-                        let mut values = parse_record(&payload).ok_or_else(|| {
+                        // Decode in the DB text encoding to match the encoding-aware
+                        // re-serialize below: a UTF-8-hardcoded decode would corrupt
+                        // every TEXT column of the table on DROP COLUMN over a
+                        // UTF-16 DB (bd-o3rz4).
+                        let mut values = parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
                                     "WITHOUT ROWID table `{table_name}` key is not a valid SQLite record"
@@ -48079,8 +48095,11 @@ impl Connection {
                 loop {
                     let rowid = cursor.rowid(cx).await?;
                     let payload = cursor.payload(cx).await?;
+                    // Decode in the DB text encoding to match the encoding-aware
+                    // re-serialize below (bd-o3rz4): a UTF-8-hardcoded decode would
+                    // corrupt every TEXT column on DROP COLUMN over a UTF-16 DB.
                     let mut values =
-                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "table `{table_name}` rowid {rowid} payload is not a valid SQLite record"
                             ),
@@ -50139,7 +50158,7 @@ impl Connection {
             *self.active_txn.borrow_mut() = Some(txn);
             self.note_autocommit_txn_started();
             self.concurrent_txn.set(false);
-            *self.concurrent_session_id.borrow_mut() = None;
+            self.end_concurrent_rowid_session();
             self.txn_metrics_mark_started();
             if hot_path_profile_enabled() {
                 FSQLITE_CACHED_WRITE_TXN_REUSES.fetch_add(1, AtomicOrdering::Relaxed);
@@ -50175,7 +50194,7 @@ impl Connection {
             // Retained autocommit always uses serialized mode (not concurrent)
             // to simplify conflict handling within the retained batch.
             self.concurrent_txn.set(false);
-            *self.concurrent_session_id.borrow_mut() = None;
+            self.end_concurrent_rowid_session();
             self.txn_metrics_mark_started();
             if hot_path_profile_enabled() {
                 FSQLITE_RETAINED_AUTOCOMMIT_REUSES.fetch_add(1, AtomicOrdering::Relaxed);
@@ -50221,7 +50240,7 @@ impl Connection {
             *self.active_txn.borrow_mut() = Some(txn);
             self.note_autocommit_txn_started();
             self.concurrent_txn.set(false);
-            *self.concurrent_session_id.borrow_mut() = None;
+            self.end_concurrent_rowid_session();
             self.txn_metrics_mark_started();
             if hot_path_profile_enabled() {
                 FSQLITE_CACHED_READ_SNAPSHOT_REUSES.fetch_add(1, AtomicOrdering::Relaxed);
@@ -50379,6 +50398,23 @@ impl Connection {
         Ok(true)
     }
 
+    /// End the current concurrent session id and release its shared
+    /// rowid-allocator reservation tracking.
+    ///
+    /// bd-elcjy: concurrent session ids are monotonic and never recycled, so the
+    /// BEGIN-time `clear_session` of a fresh id is a no-op and the process-shared
+    /// `session_reservations` map would grow unboundedly across finished
+    /// transactions. This teardown clear — called wherever a concurrent session
+    /// ends (`concurrent_session_id` returns to `None`) — is what actually frees
+    /// the entries. A no-op when there is no active concurrent session.
+    fn end_concurrent_rowid_session(&self) {
+        if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
+            self._shared_mvcc_state
+                .rowid_allocator
+                .clear_session(session_id);
+        }
+    }
+
     /// Abort and unregister the currently active concurrent session, if any.
     fn abort_current_concurrent_session(&self) {
         let Some(session_id) = self.concurrent_session_id.borrow_mut().take() else {
@@ -50391,6 +50427,10 @@ impl Connection {
         }
         self.clear_cached_concurrent_handle();
         registry.remove_and_recycle(session_id);
+        // bd-elcjy: release this session's shared rowid-allocator reservations.
+        self._shared_mvcc_state
+            .rowid_allocator
+            .clear_session(session_id);
     }
 
     /// Discard the cached read-only pager snapshot, rolling it back properly.
@@ -52192,7 +52232,7 @@ impl Connection {
                 self.autocommit_txn_begin_schema_generation.set(None);
                 self.live_vtab_transactions.borrow_mut().clear();
                 self.concurrent_txn.set(false);
-                *self.concurrent_session_id.borrow_mut() = None;
+                self.end_concurrent_rowid_session();
                 self.txn_metrics_mark_finished();
                 if ok {
                     self.finalize_live_vtab_registry_commit(cx);
@@ -52232,7 +52272,7 @@ impl Connection {
             self.cached_read_snapshot_commit_epoch
                 .set(self.current_global_commit_seq().get());
             self.concurrent_txn.set(false);
-            *self.concurrent_session_id.borrow_mut() = None;
+            self.end_concurrent_rowid_session();
             self.txn_metrics_mark_finished();
             if hot_path_profile_enabled() {
                 FSQLITE_CACHED_READ_SNAPSHOT_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -52254,7 +52294,7 @@ impl Connection {
             let vtab_rollback_result = self.live_vtab_rollback_all(cx);
             let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
             self.concurrent_txn.set(false);
-            *self.concurrent_session_id.borrow_mut() = None;
+            self.end_concurrent_rowid_session();
             self.txn_metrics_mark_finished();
             self.clear_prepared_direct_insert_append_hint();
             if txn_has_pending_writes && rollback_succeeded {
@@ -52283,7 +52323,7 @@ impl Connection {
         {
             *self.retained_autocommit_txn.borrow_mut() = Some(txn);
             self.concurrent_txn.set(false);
-            *self.concurrent_session_id.borrow_mut() = None;
+            self.end_concurrent_rowid_session();
             self.txn_metrics_mark_finished();
             // Flush the retained batch: commit prior good writes, reset counters.
             self.flush_retained_autocommit_txn(cx).await?;
@@ -52334,7 +52374,7 @@ impl Connection {
                         let vtab_rollback_result = self.live_vtab_rollback_all(cx);
                         let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
                         self.concurrent_txn.set(false);
-                        *self.concurrent_session_id.borrow_mut() = None;
+                        self.end_concurrent_rowid_session();
                         self.txn_metrics_mark_finished();
                         self.clear_prepared_direct_insert_append_hint();
                         if txn_has_pending_writes && rollback_succeeded {
@@ -52387,7 +52427,7 @@ impl Connection {
                     }
                     self.retained_autocommit_note_write();
                     self.concurrent_txn.set(false);
-                    *self.concurrent_session_id.borrow_mut() = None;
+                    self.end_concurrent_rowid_session();
                     self.txn_metrics_mark_finished();
                     self.invalidate_cached_read_snapshot(cx).await;
                     if hot_path_profile_enabled() {
@@ -52503,7 +52543,7 @@ impl Connection {
                             }
                         }
                         self.concurrent_txn.set(false);
-                        *self.concurrent_session_id.borrow_mut() = None;
+                        self.end_concurrent_rowid_session();
                         self.txn_metrics_mark_finished();
                         // Invalidate read snapshot — it's stale after a write.
                         self.invalidate_cached_read_snapshot(cx).await;
@@ -52569,7 +52609,7 @@ impl Connection {
                         }
                         self.clear_prepared_direct_insert_append_hint();
                         self.concurrent_txn.set(false);
-                        *self.concurrent_session_id.borrow_mut() = None;
+                        self.end_concurrent_rowid_session();
                         self.txn_metrics_mark_finished();
                         return Err(e);
                     }
@@ -52639,6 +52679,10 @@ impl Connection {
                             self.clear_cached_concurrent_handle();
                             lock_unpoisoned(&self.concurrent_registry)
                                 .remove_and_recycle(session_id);
+                            // bd-elcjy: release this session's rowid reservations.
+                            self._shared_mvcc_state
+                                .rowid_allocator
+                                .clear_session(session_id);
                         }
                     }
                     drop(commit_registry_guard.take());
@@ -52705,7 +52749,7 @@ impl Connection {
 
         // Ensure connection-level transaction state is cleared regardless of outcome.
         self.concurrent_txn.set(false);
-        *self.concurrent_session_id.borrow_mut() = None;
+        self.end_concurrent_rowid_session();
         self.txn_metrics_mark_finished();
         // This tail is only reached by autocommit paths that did not park a
         // retained writer transaction. Any direct-INSERT append hint was
@@ -63586,7 +63630,7 @@ impl Connection {
                     self.clear_cached_concurrent_handle();
                     registry.recycle_handle(shared_handle);
                 }
-                *self.concurrent_session_id.borrow_mut() = None;
+                self.end_concurrent_rowid_session();
                 self.clear_memory_concurrent_synced_write_roots();
                 Err(error)
             }
@@ -63627,7 +63671,7 @@ impl Connection {
         );
         self.clear_cached_concurrent_handle();
         registry.remove_and_recycle(session_id);
-        *self.concurrent_session_id.borrow_mut() = None;
+        self.end_concurrent_rowid_session();
         self.clear_memory_concurrent_synced_write_roots();
         should_record_commit_evidence
             .then(|| Self::build_ssi_commit_decision_draft(&plan, committed_seq))
@@ -63641,7 +63685,7 @@ impl Connection {
             let mut registry = lock_unpoisoned(&self.concurrent_registry);
             let Some(shared_handle) = registry.remove(session_id) else {
                 self.clear_cached_concurrent_handle();
-                *self.concurrent_session_id.borrow_mut() = None;
+                self.end_concurrent_rowid_session();
                 self.clear_memory_concurrent_synced_write_roots();
                 return;
             };
@@ -63653,7 +63697,7 @@ impl Connection {
             };
             self.clear_cached_concurrent_handle();
             registry.recycle_handle(shared_handle);
-            *self.concurrent_session_id.borrow_mut() = None;
+            self.end_concurrent_rowid_session();
             self.clear_memory_concurrent_synced_write_roots();
             let committed_seq = self.current_global_commit_seq();
             {
@@ -63750,7 +63794,7 @@ impl Connection {
             self.set_fast_path_bit(fast_path_gate::IN_TRANSACTION, false);
             self.implicit_txn.set(false);
             self.concurrent_txn.set(false);
-            *self.concurrent_session_id.borrow_mut() = None;
+            self.end_concurrent_rowid_session();
             self.txn_metrics_mark_finished();
             self.db.borrow_mut().commit_undo();
             self.reset_transaction_lookaside();
@@ -64564,6 +64608,10 @@ impl Connection {
                     }
                     self.clear_cached_concurrent_handle();
                     registry.remove_and_recycle(session_id);
+                    // bd-elcjy: release this session's rowid reservations.
+                    self._shared_mvcc_state
+                        .rowid_allocator
+                        .clear_session(session_id);
                 }
                 self.clear_memory_concurrent_synced_write_roots();
             }
