@@ -45,6 +45,12 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## Standing Swarm Authorization (NO PERMISSION-ASKING)
+
+**Swarm lanes have standing authorization to work autonomously.** Claim the next ready bead from `br ready` and proceed without asking; never end a turn waiting for a "go". If your intended next action is already unblocked and reversible, do it. Ask only for: Rule 1 deletions, destructive commands, quiet-host/fleet infra, or genuine design forks with no findings-driven answer. Ending a turn with "shall I proceed?" on ordinary bead work is a defect, not politeness.
+
+---
+
 ## Toolchain: Rust & Cargo
 
 We only use **Cargo** in this project, NEVER any other package manager.
