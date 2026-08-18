@@ -1294,6 +1294,27 @@ pub fn cleanup_abandoned_private_database(
     // Dynamic WAL segment cleanup is intentionally absent: transient VACUUM
     // candidates never enter WAL mode, and broad prefix deletion would violate
     // the exact-entry ownership boundary of this function.
+    //
+    // `.fsqlite-migration-state` (bd-zywqc.5 / `fsqlite_core::migration::
+    // MIGRATION_MARKER_SUFFIX`) is included here too. `fsqlite-core` depends
+    // on `fsqlite-vfs`, not the reverse, so the constant cannot be imported
+    // here; it is a literal, same as every other companion suffix in this
+    // list. Without it: this function is the exclusive-ownership teardown
+    // for a caller-reserved transient candidate, called once every pager
+    // binding to `database_path` has closed -- but current fsqlite stamps
+    // that marker at birth on every database it creates (marker-at-birth,
+    // unconditional), so any database this function tears down that was
+    // ever actually opened carries one. Leaving it on disk after this
+    // function reports success means a caller who re-lists the directory
+    // afterward sees a leftover artifact from ITS OWN prior generation and
+    // cannot distinguish it from a genuine new writer having repopulated
+    // the namespace mid-cleanup -- observed live: HFDT's SEC XBRL scratch
+    // cleanup (hfdt-storage) called this, got `true`, re-listed, found
+    // `.fsqlite-migration-state` still present, and correctly (given what
+    // it could see) refused with `store.migration_preflight_scratch_
+    // cleanup_identity_drift` rather than risk deleting a live writer's
+    // file. The false alarm was here: this function's own "complete fixed
+    // companion set" was incomplete.
     let companion_paths = [
         sidecar_path(database_path, "-journal"),
         sidecar_path(database_path, "-wal"),
@@ -1303,6 +1324,7 @@ pub fn cleanup_abandoned_private_database(
         sidecar_path(database_path, "-lock-shared"),
         sidecar_path(database_path, "-lock-reserved"),
         sidecar_path(database_path, "-lock-pending"),
+        sidecar_path(database_path, ".fsqlite-migration-state"),
     ];
     let companion_exists = companion_paths
         .iter()
@@ -3536,6 +3558,11 @@ mod tests {
             "-lock-shared",
             "-lock-reserved",
             "-lock-pending",
+            // hfdt-0117-committed-cleanup-scratch-allowlist-3mekls: current
+            // fsqlite stamps every database it creates with this marker at
+            // birth (bd-zywqc.5), unconditionally, so any real candidate
+            // this function tears down carries one.
+            ".fsqlite-migration-state",
         ] {
             fs::write(sidecar_path(&database, suffix), b"candidate artifact")
                 .expect("seed exact candidate companion");
@@ -3565,6 +3592,7 @@ mod tests {
             "-lock-shared",
             "-lock-reserved",
             "-lock-pending",
+            ".fsqlite-migration-state",
             GATE_SUFFIX,
             USE_SUFFIX,
         ] {
