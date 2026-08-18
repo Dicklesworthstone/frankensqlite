@@ -59991,6 +59991,52 @@ impl Connection {
         columns
     }
 
+    /// Project a DML `RETURNING` clause against one INSTEAD OF view pseudo-row.
+    ///
+    /// `values` is the affected view row aligned to `column_names` — the NEW
+    /// row for INSERT/UPDATE, the OLD row for DELETE. SQLite's `RETURNING`
+    /// references the target's output columns (not `NEW`/`OLD`), so bare column
+    /// references and `*` resolve to the view's columns. Returns one `Row`.
+    /// (GH #160/#241/#242: previously all three view-DML paths returned
+    /// `Vec::new()`, dropping RETURNING output while applying the side effect.)
+    ///
+    /// Placeholders in a RETURNING expression are bound from `params` with a
+    /// projection-local counter; literal RETURNING lists (the overwhelmingly
+    /// common case) need no binding and are exact.
+    fn project_instead_of_view_returning(
+        &self,
+        returning: &[ResultColumn],
+        column_names: &[String],
+        values: &[SqliteValue],
+        view_name: &str,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Row> {
+        let col_map: Vec<(String, String, bool)> = column_names
+            .iter()
+            .map(|name| (view_name.to_owned(), name.clone(), false))
+            .collect();
+        let mut out = Vec::new();
+        let mut bind_state = BindParamState::default();
+        for column in returning {
+            match column {
+                ResultColumn::Star | ResultColumn::TableStar(_) => {
+                    out.extend_from_slice(values);
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    let value = if let Some(p) = params {
+                        let mut bound = expr.clone();
+                        bind_placeholders_in_expr(&mut bound, &mut bind_state, p)?;
+                        self.eval_join_expr_with_registry(&bound, values, &col_map)?
+                    } else {
+                        self.eval_join_expr_with_registry(expr, values, &col_map)?
+                    };
+                    out.push(value);
+                }
+            }
+        }
+        Ok(Row { values: out })
+    }
+
     /// INSERT INTO <view> with an INSTEAD OF INSERT trigger: build a NEW
     /// pseudo-row per source row (aligned to the view's columns) and fire.
     async fn execute_instead_of_view_insert(
@@ -60004,6 +60050,7 @@ impl Connection {
             .collect_view_insert_new_rows(insert, &column_names, params)
             .await?;
         let event = fsqlite_ast::TriggerEvent::Insert;
+        let mut returning_rows = Vec::new();
         for new_values in &new_rows {
             self.fire_instead_of_triggers(
                 &view_name,
@@ -60013,8 +60060,17 @@ impl Connection {
                 Some(new_values),
             )
             .await?;
+            if !insert.returning.is_empty() {
+                returning_rows.push(self.project_instead_of_view_returning(
+                    &insert.returning,
+                    &column_names,
+                    new_values,
+                    &view_name,
+                    params,
+                )?);
+            }
         }
-        Ok(Vec::new())
+        Ok(returning_rows)
     }
 
     /// UPDATE <view> with an INSTEAD OF UPDATE trigger: materialize the matched
@@ -60058,6 +60114,7 @@ impl Connection {
         let event = fsqlite_ast::TriggerEvent::Update(Self::assignment_target_column_names(
             &update.assignments,
         ));
+        let mut returning_rows = Vec::new();
         for row in matched_rows {
             let old_values = row.values().to_vec();
             let mut new_values = old_values.clone();
@@ -60078,8 +60135,18 @@ impl Connection {
                 Some(&new_values),
             )
             .await?;
+            // RETURNING references the post-update (NEW) row.
+            if !update.returning.is_empty() {
+                returning_rows.push(self.project_instead_of_view_returning(
+                    &update.returning,
+                    &column_names,
+                    &new_values,
+                    &view_name,
+                    params,
+                )?);
+            }
         }
-        Ok(Vec::new())
+        Ok(returning_rows)
     }
 
     /// DELETE FROM <view> with an INSTEAD OF DELETE trigger: materialize the
@@ -60093,6 +60160,7 @@ impl Connection {
         let column_names = self.view_trigger_column_names(&view_name)?;
         let old_rows = self.collect_delete_trigger_rows(delete, params).await?;
         let event = fsqlite_ast::TriggerEvent::Delete;
+        let mut returning_rows = Vec::new();
         for (_old_rowid, old_values) in &old_rows {
             self.fire_instead_of_triggers(
                 &view_name,
@@ -60102,8 +60170,18 @@ impl Connection {
                 None,
             )
             .await?;
+            // RETURNING references the deleted (OLD) row.
+            if !delete.returning.is_empty() {
+                returning_rows.push(self.project_instead_of_view_returning(
+                    &delete.returning,
+                    &column_names,
+                    old_values,
+                    &view_name,
+                    params,
+                )?);
+            }
         }
-        Ok(Vec::new())
+        Ok(returning_rows)
     }
 
     /// Apply one UPDATE assignment to `new_values` (indexed by the view's
