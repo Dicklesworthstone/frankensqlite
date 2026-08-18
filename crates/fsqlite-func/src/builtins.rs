@@ -933,62 +933,13 @@ impl ScalarFunction for RoundFunc {
         if !(-4_503_599_627_370_496.0..=4_503_599_627_370_496.0).contains(&x) {
             return Ok(SqliteValue::Float(x));
         }
-        // SQLite uses "round half away from zero" via its custom printf.
-        // Rust's format! uses "round half to even" (IEEE 754 default).
-        // They agree on all cases except exact ties (digit at n+1 is
-        // precisely 5 with no further non-zero digits). For ties, we
-        // detect and adjust to match SQLite.
-        #[allow(clippy::cast_possible_truncation)]
-        let rounded = {
-            let prec = (n as usize) + 15;
-            let full = format!("{x:.prec$}");
-            let dot = full.find('.').unwrap_or(full.len());
-            let rd_idx = dot + 1 + n as usize;
-            if rd_idx >= full.len() {
-                format!("{x:.prec$}", prec = n as usize)
-                    .parse::<f64>()
-                    .unwrap_or(x)
-            } else {
-                let rd = full.as_bytes()[rd_idx] - b'0';
-                if rd != 5 || !full[rd_idx + 1..].bytes().all(|b| b == b'0') {
-                    // Not an exact tie — format!'s default rounding is correct
-                    format!("{x:.prec$}", prec = n as usize)
-                        .parse::<f64>()
-                        .unwrap_or(x)
-                } else {
-                    // Exact tie — round half away from zero by incrementing
-                    // the truncated string's last digit.
-                    let mut trunc = full.as_bytes()[..rd_idx].to_vec();
-                    // Strip trailing '.' for n==0
-                    if trunc.last() == Some(&b'.') {
-                        trunc.pop();
-                    }
-                    let start = usize::from(trunc.first() == Some(&b'-'));
-                    let mut carry = true;
-                    for b in trunc[start..].iter_mut().rev() {
-                        if *b == b'.' {
-                            continue;
-                        }
-                        if carry {
-                            if *b == b'9' {
-                                *b = b'0';
-                            } else {
-                                *b += 1;
-                                carry = false;
-                                break;
-                            }
-                        }
-                    }
-                    if carry {
-                        trunc.insert(start, b'1');
-                    }
-                    String::from_utf8(trunc)
-                        .ok()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .unwrap_or(x)
-                }
-            }
-        };
+        // SQLite uses "round half away from zero" via its custom printf, while
+        // Rust's format! uses "round half to even" (IEEE 754 default). They
+        // agree on every value except an exact binary tie, which the shared
+        // fixed-notation helper detects and adjusts to match SQLite.
+        let rounded = format_fixed_round_half_away(x, n as usize)
+            .parse::<f64>()
+            .unwrap_or(x);
         Ok(SqliteValue::Float(rounded))
     }
 
@@ -2620,7 +2571,10 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     // when precision is 0) — matches C SQLite, e.g. '%!5.2f' 3.14159
                     // -> "3.14", '%!.3f' 1.5 -> "1.5", '%!f' 0.1 -> "0.1".
                     let prec = precision.unwrap_or(6);
-                    let mut mag = format!("{:.prec$}", val.abs());
+                    // Round exact binary ties away from zero (C SQLite) rather
+                    // than Rust's round-half-to-even, e.g. printf('%.0f', 2.5)
+                    // -> "3" not "2" (bd-o1tu1).
+                    let mut mag = format_fixed_round_half_away(val.abs(), prec);
                     if alt_form2 {
                         mag = altform2_trim_float(&mag);
                     }
@@ -2646,11 +2600,10 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 {
                     result.push_str(&s);
                 } else {
-                    let raw = if spec == 'e' {
-                        format!("{val:.prec$e}")
-                    } else {
-                        format!("{val:.prec$E}")
-                    };
+                    // Round the mantissa's exact ties away from zero (C SQLite)
+                    // instead of Rust's round-half-to-even, e.g.
+                    // printf('%.0e', 2.5) -> "3e+00" not "2e+00" (bd-o1tu1).
+                    let raw = format_sci_round_half_away(val, prec, spec == 'E');
                     // C printf always uses explicit sign and minimum 2-digit exponent
                     let mut formatted = normalize_exponent(&raw);
                     // Alternate-form-2 (`!`) strips trailing zeros from the
@@ -3091,6 +3044,164 @@ fn normalize_exponent(s: &str) -> String {
     format!("{prefix}{e_char}{sign}{padded}")
 }
 
+/// A finite `f64` has at most 1074 fractional decimal digits (the smallest
+/// positive subnormal, `2^-1074`). Formatting with this many guard digits
+/// therefore reproduces the value's EXACT decimal expansion, so a trailing
+/// "…5000…0" is a genuine binary half-tie rather than a rounding artifact.
+const MAX_F64_FRACTIONAL_DIGITS: usize = 1074;
+
+/// Increment a non-negative decimal magnitude given as ASCII digit bytes (may
+/// contain a single `.`, never a sign) by one unit in its last place,
+/// propagating carry and prepending `1` on overflow, e.g. `"2"` → `"3"`,
+/// `"9"` → `"10"`, `"9.9"` → `"10.0"`.
+fn increment_decimal_digits(digits: &mut Vec<u8>) {
+    let mut carry = true;
+    for b in digits.iter_mut().rev() {
+        if *b == b'.' {
+            continue;
+        }
+        if carry {
+            if *b == b'9' {
+                *b = b'0';
+            } else {
+                *b += 1;
+                carry = false;
+                break;
+            }
+        }
+    }
+    if carry {
+        digits.insert(0, b'1');
+    }
+}
+
+/// True iff the non-negative magnitude `mag` is an EXACT binary half-tie at
+/// `prec` fractional digits — its exact decimal expansion has digit `prec + 1`
+/// equal to `5` with only zeros afterward. Rust's `format!` rounds ties to
+/// even while C SQLite rounds them away from zero, so ONLY exact ties diverge;
+/// every other value is already correctly rounded by `format!`.
+///
+/// A real tie shows the "…5000" pattern at any guard length, so a cheap guard
+/// is checked first; it is confirmed against the full exact expansion only to
+/// reject near-ties whose long 9-/0-runs a short guard would round into a
+/// spurious "…5000" (e.g. `0.15` is really `0.14999…`, not a tie).
+fn is_exact_decimal_tie(mag: f64, prec: usize) -> bool {
+    fn looks_like_tie(mag: f64, prec: usize, guard: usize) -> bool {
+        let full = format!("{mag:.guard$}");
+        let Some(dot) = full.find('.') else {
+            return false;
+        };
+        let rd_idx = dot + 1 + prec;
+        let bytes = full.as_bytes();
+        rd_idx < bytes.len()
+            && bytes[rd_idx] == b'5'
+            && full[rd_idx + 1..].bytes().all(|b| b == b'0')
+    }
+    looks_like_tie(mag, prec, prec + 18)
+        && looks_like_tie(mag, prec, prec + MAX_F64_FRACTIONAL_DIGITS)
+}
+
+/// Scientific-notation analogue of [`is_exact_decimal_tie`]: true iff the
+/// mantissa of `mag` (normalized to `[1, 10)`) has an exact `5` with only
+/// trailing zeros at fractional digit `prec + 1`.
+fn is_exact_sci_tie(mag: f64, prec: usize) -> bool {
+    fn looks_like_tie(mag: f64, prec: usize, guard: usize) -> bool {
+        let s = format!("{mag:.guard$e}");
+        let Some((mant, _)) = s.split_once('e') else {
+            return false;
+        };
+        let Some(dot) = mant.find('.') else {
+            return false;
+        };
+        let rd_idx = dot + 1 + prec;
+        let bytes = mant.as_bytes();
+        rd_idx < bytes.len()
+            && bytes[rd_idx] == b'5'
+            && mant[rd_idx + 1..].bytes().all(|b| b == b'0')
+    }
+    looks_like_tie(mag, prec, prec + 18)
+        && looks_like_tie(mag, prec, prec + MAX_F64_FRACTIONAL_DIGITS)
+}
+
+/// Format a finite float in fixed notation with `prec` fractional digits,
+/// rounding exact binary half-ties AWAY FROM ZERO (matching C SQLite's
+/// `printf`/`round`) instead of Rust's round-half-to-even. Non-tie values are
+/// left to `format!`, which already rounds them exactly as SQLite does; only a
+/// confirmed exact tie is adjusted. A leading `-` is preserved for negatives.
+fn format_fixed_round_half_away(val: f64, prec: usize) -> String {
+    let base = format!("{val:.prec$}");
+    let mag = val.abs();
+    if !is_exact_decimal_tie(mag, prec) {
+        return base;
+    }
+    // Exact tie: round the magnitude up (away from zero) by incrementing the
+    // truncated digit string, then reattach the sign.
+    let src = format!("{mag:.p$}", p = prec + 2);
+    let dot = src.find('.').unwrap_or(src.len());
+    let rd_idx = dot + 1 + prec;
+    let mut digits = src.as_bytes()[..rd_idx].to_vec();
+    if digits.last() == Some(&b'.') {
+        digits.pop();
+    }
+    increment_decimal_digits(&mut digits);
+    let Ok(body) = String::from_utf8(digits) else {
+        return base;
+    };
+    if val.is_sign_negative() {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// Format a finite float in `%e`/`%E` scientific notation with `prec`
+/// fractional mantissa digits, rounding an exact mantissa half-tie AWAY FROM
+/// ZERO. A carry out of `[1, 10)` renormalizes the mantissa (e.g. `9.5` at
+/// precision 0 → `1e+01`) and bumps the exponent. Returns an un-normalized
+/// `d.ddde{exp}` string (sign included, exponent not zero-padded) that mirrors
+/// Rust's `{:e}`/`{:E}` output, so callers post-process it with
+/// `normalize_exponent`/`altform2_trim_exp` exactly as before.
+fn format_sci_round_half_away(val: f64, prec: usize, upper: bool) -> String {
+    let base = if upper {
+        format!("{val:.prec$E}")
+    } else {
+        format!("{val:.prec$e}")
+    };
+    let mag = val.abs();
+    if mag == 0.0 || !is_exact_sci_tie(mag, prec) {
+        return base;
+    }
+    let e_char = if upper { 'E' } else { 'e' };
+    let src = format!("{mag:.p$e}", p = prec + 2);
+    let Some((mant, exp_str)) = src.split_once('e') else {
+        return base;
+    };
+    let mut exp: i64 = exp_str.parse().unwrap_or(0);
+    let dot = mant.find('.').unwrap_or(mant.len());
+    let rd_idx = dot + 1 + prec;
+    let mut digits = mant.as_bytes()[..rd_idx].to_vec();
+    if digits.last() == Some(&b'.') {
+        digits.pop();
+    }
+    increment_decimal_digits(&mut digits);
+    let Ok(mut mantissa) = String::from_utf8(digits) else {
+        return base;
+    };
+    // A carry out of the `[1, 10)` mantissa produces a two-digit integer part
+    // ("10" or "10.0…0"); renormalize to "1.0…0" and bump the exponent.
+    let int_len = mantissa.find('.').unwrap_or(mantissa.len());
+    if int_len == 2 {
+        mantissa = if prec > 0 {
+            format!("1.{}", "0".repeat(prec))
+        } else {
+            "1".to_owned()
+        };
+        exp += 1;
+    }
+    let sign = if val.is_sign_negative() { "-" } else { "" };
+    format!("{sign}{mantissa}{e_char}{exp}")
+}
+
 /// Format a float using `%g`/`%G` semantics.
 fn format_float_g(val: f64, sig: usize, upper: bool) -> String {
     if !val.is_finite() {
@@ -3099,15 +3210,18 @@ fn format_float_g(val: f64, sig: usize, upper: bool) -> String {
     // C SQLite canonicalizes signed zero for %g: both +0.0 and -0.0 render as
     // "0" (no minus sign). `-0.0 == 0.0` is true, so this maps -0.0 to +0.0.
     let val = if val == 0.0 { 0.0 } else { val };
-    let e_str = format!("{val:.prec$e}", prec = sig.saturating_sub(1));
-    let exp: i32 = e_str
+    // Round to `sig` significant digits half-away (matching C SQLite), then read
+    // the resulting exponent. The rounding may carry across a power of ten
+    // (e.g. `9.5` at 1 significant digit → `1e1`), and that rounded exponent —
+    // not the raw one — selects fixed vs. exponential form below.
+    let sci = format_sci_round_half_away(val, sig.saturating_sub(1), false);
+    let exp: i32 = sci
         .rsplit_once('e')
         .and_then(|(_, e)| e.parse().ok())
         .unwrap_or(0);
     #[allow(clippy::cast_possible_wrap)]
     let formatted = if exp < -4 || exp >= sig as i32 {
-        let s = format!("{val:.prec$e}", prec = sig.saturating_sub(1));
-        let s = if upper { s.replace('e', "E") } else { s };
+        let s = if upper { sci.replace('e', "E") } else { sci };
         // Strip trailing zeros from mantissa, then normalize the exponent.
         let trimmed = if s.contains('.') {
             if let Some(e_pos) = s.find('e').or_else(|| s.find('E')) {
@@ -3126,7 +3240,7 @@ fn format_float_g(val: f64, sig: usize, upper: bool) -> String {
         } else {
             sig + exp.unsigned_abs() as usize - 1
         };
-        let s = format!("{val:.decimal_places$}");
+        let s = format_fixed_round_half_away(val, decimal_places);
         // Only strip trailing zeros when there is a fractional part. When
         // decimal_places == 0 (e.g. `%g` of 100000.0 -> exp 5, sig 6), `s` is
         // "100000" with no '.', and an unconditional trim would strip the
@@ -5171,6 +5285,146 @@ mod tests {
         assert_eq!(fmt("%g", 1000000.0), "1e+06");
         assert_eq!(fmt("%g", 1234560.0), "1.23456e+06");
         assert_eq!(fmt("%G", 1000000.0), "1E+06");
+    }
+
+    #[test]
+    fn test_format_round_half_away_from_zero_bd_o1tu1() {
+        // bd-o1tu1: printf/format float conversions %f/%e/%g must round exact
+        // binary half-ties AWAY FROM ZERO (C SQLite) rather than Rust's
+        // round-half-to-even. Non-tie values (e.g. 0.135, 1.005, 2.675, 0.15)
+        // are NOT exact binary ties and MUST stay on their correctly-rounded
+        // value. Every expected string below was produced by running
+        // `sqlite3 :memory: "SELECT printf('<spec>', <val>);"` against stock
+        // sqlite3 3.46.1 — assert exactly that, never a guess.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: f64| -> String {
+            match f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(spec)),
+                    SqliteValue::Float(v),
+                ])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let cases: &[(&str, f64, &str)] = &[
+            // %f exact ties -> away from zero.
+            ("%.0f", 2.5, "3"),
+            ("%.0f", 0.5, "1"),
+            ("%.0f", -2.5, "-3"),
+            ("%.0f", 3.5, "4"),
+            ("%.0f", -0.5, "-1"),
+            ("%.0f", -3.5, "-4"),
+            ("%.0f", 1.5, "2"),
+            ("%.2f", 0.125, "0.13"),
+            ("%.2f", 0.375, "0.38"),
+            ("%.2f", 0.625, "0.63"),
+            ("%.2f", 2.125, "2.13"),
+            ("%.2f", -0.125, "-0.13"),
+            ("%.1f", 0.25, "0.3"),
+            ("%.1f", 0.75, "0.8"),
+            ("%.1f", 2.25, "2.3"),
+            ("%.1f", -0.25, "-0.3"),
+            ("%.1f", 0.05, "0.1"),
+            ("%.0f", 12.5, "13"),
+            ("%.2f", 12.5, "12.50"),
+            // %f non-ties -> unchanged (correctly-rounded true value).
+            ("%.2f", 0.135, "0.14"),
+            ("%.2f", 0.35, "0.35"),
+            ("%.2f", 0.15, "0.15"),
+            ("%.2f", 0.85, "0.85"),
+            ("%.2f", 0.95, "0.95"),
+            ("%.2f", 1.005, "1.00"),
+            ("%.2f", 2.675, "2.67"),
+            ("%.2f", 0.005, "0.01"),
+            ("%.2f", 0.015, "0.01"),
+            ("%.2f", 0.025, "0.03"),
+            ("%.1f", 0.35, "0.3"),
+            ("%.1f", 0.15, "0.1"),
+            ("%.1f", 0.135, "0.1"),
+            ("%.0f", 2.675, "3"),
+            ("%.0f", 0.49999, "0"),
+            // Sign / width / uppercase interplay applied AFTER rounding.
+            ("%+.0f", 2.5, "+3"),
+            ("%8.0f", 2.5, "       3"),
+            // %e exact mantissa ties -> away (carry may bump the exponent).
+            ("%.0e", 2.5, "3e+00"),
+            ("%.0e", 9.5, "1e+01"),
+            ("%.0e", 1.5, "2e+00"),
+            ("%.0e", 250.0, "3e+02"),
+            ("%.0e", 0.25, "3e-01"),
+            ("%.1e", 1.25, "1.3e+00"),
+            ("%.1e", 12.5, "1.3e+01"),
+            ("%.0E", 2.5, "3E+00"),
+            // %e non-ties -> unchanged.
+            ("%.1e", 0.5, "5.0e-01"),
+            ("%.1e", 9.95, "9.9e+00"),
+            ("%.1e", 1.005, "1.0e+00"),
+            ("%.1e", 2.675, "2.7e+00"),
+            ("%.1e", 1.35, "1.4e+00"),
+            ("%.0e", 0.5, "5e-01"),
+            ("%.0e", 9.95, "1e+01"),
+            ("%.0e", 1.005, "1e+00"),
+            // %g exact ties (precision is significant digits) -> away.
+            ("%.1g", 0.25, "0.3"),
+            ("%.1g", 2.5, "3"),
+            ("%.1g", 25.0, "3e+01"),
+            ("%.2g", 0.125, "0.13"),
+            ("%.2g", 1.25, "1.3"),
+            ("%.2g", 12.5, "13"),
+            // %g non-ties -> unchanged.
+            ("%.1g", 0.35, "0.3"),
+            ("%.1g", 0.15, "0.1"),
+            ("%.1g", 0.45, "0.5"),
+            ("%.1g", 0.125, "0.1"),
+            ("%.2g", 0.135, "0.14"),
+            ("%.2g", 1.005, "1"),
+            ("%.2g", 2.675, "2.7"),
+        ];
+        for (spec, v, want) in cases {
+            assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
+        }
+    }
+
+    #[test]
+    fn test_round_half_away_near_ties_match_oracle_bd_o1tu1() {
+        // bd-o1tu1: round() shares the fixed-notation half-away helper, so its
+        // exact-tie detection must NOT misfire on near-ties whose double is not
+        // a true binary half (a small guard would round e.g. 0.15's 0.14999…
+        // into a spurious 0.1500…). Values below are stock sqlite3 3.46.1
+        // `SELECT round(v, 1);` results.
+        #[allow(clippy::float_cmp)]
+        fn round1(v: f64) -> f64 {
+            match RoundFunc
+                .invoke(&[SqliteValue::Float(v), SqliteValue::Integer(1)])
+                .unwrap()
+            {
+                SqliteValue::Float(x) => x,
+                other => panic!("expected float, got {other:?}"),
+            }
+        }
+        let cases: &[(f64, f64)] = &[
+            (0.15, 0.1),
+            (0.35, 0.3),
+            (0.85, 0.8),
+            (0.95, 0.9),
+            (0.135, 0.1),
+            (1.005, 1.0),
+            (2.675, 2.7),
+            // 0.25 is a genuine exact tie -> away from zero (0.3); 0.45's
+            // double is 0.45000…111 so it rounds up on its true value; 2.5 has
+            // no digit past precision 1 and is returned unchanged.
+            (0.25, 0.3),
+            (0.45, 0.5),
+            (2.5, 2.5),
+        ];
+        for (v, want) in cases {
+            #[allow(clippy::float_cmp)]
+            let got = round1(*v);
+            assert_eq!(got, *want, "round({v}, 1)");
+        }
     }
 
     #[test]
