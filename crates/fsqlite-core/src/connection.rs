@@ -81375,14 +81375,16 @@ impl Connection {
                 name: update.table.name.name.clone(),
             })?;
             self.validate_table_index_runtime_dependencies(table)?;
-            if targets_shadowed_main {
-                table.columns.iter().position(|column| column.is_ipk)
-            } else {
-                self.rowid_alias_columns
-                    .borrow()
-                    .get(&update.table.name.name.to_ascii_lowercase())
-                    .copied()
-            }
+            // bd-p8byg: resolve the rowid alias from the RESOLVED table's schema
+            // (`is_ipk`), never the connection-global `rowid_alias_columns` name-map.
+            // For a TEMP table shadowing a same-named main table, that bare-name map
+            // resolves to main.t's leading-IPK index instead of temp.t's non-leading
+            // INTEGER PRIMARY KEY, so UPDATE would treat a decoy column as the rowid
+            // -> NewRowid -> the row's rowid silently moves -> a later INSERT collides
+            // (PRIMARY KEY constraint failed). INSERT (compile_table_insert) and
+            // DELETE already resolve via `is_ipk`; this makes UPDATE consistent. For a
+            // normal table the name-map already equals the is_ipk index (no change).
+            table.columns.iter().position(|column| column.is_ipk)
         };
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
