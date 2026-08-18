@@ -45321,7 +45321,7 @@ impl Connection {
                                 column_values,
                                 tokenizer.as_ref(),
                             );
-                            let record = serialize_record(&persisted_values);
+                            let record = serialize_record_with_encoding(&persisted_values, self.db_text_encoding.get());
                             cursor.table_insert(cx, rowid, &record).await?;
                             inserted_row_count = inserted_row_count.saturating_add(1);
                             self.record_last_insert_rowid(rowid);
@@ -45365,7 +45365,7 @@ impl Connection {
                             column_values,
                             tokenizer.as_ref(),
                         );
-                        let record = serialize_record(&persisted_values);
+                        let record = serialize_record_with_encoding(&persisted_values, self.db_text_encoding.get());
                         cursor.table_insert(cx, rowid, &record).await?;
                         inserted_row_count = inserted_row_count.saturating_add(1);
                         self.record_last_insert_rowid(rowid);
@@ -45412,7 +45412,7 @@ impl Connection {
                     if cursor.table_move_to(cx, rowid).await?.is_found() {
                         cursor.delete(cx).await?;
                     }
-                    let record = serialize_record(&persisted_values);
+                    let record = serialize_record_with_encoding(&persisted_values, self.db_text_encoding.get());
                     cursor.table_insert(cx, rowid, &record).await?;
                     inserted_row_count = inserted_row_count.saturating_add(1);
                     self.record_last_insert_rowid(rowid);
@@ -45988,7 +45988,7 @@ impl Connection {
                     if cursor.table_move_to(cx, rowid).await?.is_found() {
                         cursor.delete(cx).await?;
                     }
-                    let record = serialize_record(&persisted_values);
+                    let record = serialize_record_with_encoding(&persisted_values, self.db_text_encoding.get());
                     cursor.table_insert(cx, rowid, &record).await?;
                 }
             }
@@ -46424,7 +46424,7 @@ impl Connection {
                     cursor.delete(cx).await?;
                 }
                 for (_synthetic_rowid, values) in rows {
-                    let record = serialize_record(&values);
+                    let record = serialize_record_with_encoding(&values, self.db_text_encoding.get());
                     cursor.index_insert(cx, &record).await?;
                 }
                 return Ok(());
@@ -46444,7 +46444,7 @@ impl Connection {
                 }
             }
             for (rowid, values) in rows {
-                let record = serialize_record(&values);
+                let record = serialize_record_with_encoding(&values, self.db_text_encoding.get());
                 cursor.table_insert(cx, rowid, &record).await?;
             }
             Ok(())
@@ -46520,7 +46520,7 @@ impl Connection {
                         if removed_slot < values.len() {
                             values.remove(removed_slot);
                         }
-                        rewritten.push(serialize_record(&values));
+                        rewritten.push(serialize_record_with_encoding(&values, self.db_text_encoding.get()));
                         if !cursor.next(cx).await? {
                             break;
                         }
@@ -46550,7 +46550,7 @@ impl Connection {
                     if removed_slot < values.len() {
                         values.remove(removed_slot);
                     }
-                    rewritten.push((rowid, serialize_record(&values)));
+                    rewritten.push((rowid, serialize_record_with_encoding(&values, self.db_text_encoding.get())));
                     if !cursor.next(cx).await? {
                         break;
                     }
@@ -46591,7 +46591,7 @@ impl Connection {
                 if cursor.table_move_to(cx, rowid).await?.is_found() {
                     cursor.delete(cx).await?;
                 }
-                let record = serialize_record(&values);
+                let record = serialize_record_with_encoding(&values, self.db_text_encoding.get());
                 cursor.table_insert(cx, rowid, &record).await?;
             }
             Ok(())
