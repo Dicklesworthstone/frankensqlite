@@ -277,10 +277,21 @@ impl Fts5AveragesRecord {
             }
             *total = fts5_read_varint(block, &mut offset, "averages column total")?;
         }
-        if offset != block.len() {
-            return Err(fts5_data_error(
-                "trailing bytes after averages column totals",
-            ));
+        // Tolerate trailing ZERO totals.
+        //
+        // A table declared as `fts5(content, ..., content = '')` names a column
+        // and sets an option with the same word, and the writer and the column
+        // parser can disagree by one on how many columns that is. The surplus
+        // entries are always zero, and a zero token total carries no
+        // information, so refusing the record loses a readable index over
+        // nothing. Real trailing data still fails: only zeros are skipped.
+        while offset != block.len() {
+            let surplus = fts5_read_varint(block, &mut offset, "averages column total")?;
+            if surplus != 0 {
+                return Err(fts5_data_error(
+                    "trailing bytes after averages column totals",
+                ));
+            }
         }
 
         Ok(Self {
