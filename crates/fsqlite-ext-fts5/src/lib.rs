@@ -1481,6 +1481,158 @@ pub fn encode_incremental_delete_flush(
     })
 }
 
+/// The persist payload for merging several on-disk segments into one.
+#[derive(Debug, Clone)]
+pub struct Fts5MergeFlush {
+    /// The merged segment's leaf `_data` rows (pgno `1..=N`). Empty when the
+    /// merge dropped every row (all inputs fully tombstoned) — then no segment
+    /// is added to the structure.
+    pub leaf_data_rows: Vec<Fts5DataRow>,
+    /// The updated structure row: the merged inputs removed from `source_level`,
+    /// and (unless empty) the new segment added at `source_level + 1`.
+    pub structure_data_row: Fts5DataRow,
+    /// The merged inputs' `_data` rows (segment leaves + tombstone pages) to
+    /// physically delete, reclaiming their space.
+    pub deleted_data_rowids: Vec<i64>,
+}
+
+/// Encode the merge of `merged_segids` (all at `source_level`) into one new
+/// segment `new_segid`.
+///
+/// Built from their already recency-merged, tombstone-applied `term_doclists`
+/// (term-sorted — typically produced by an async collector over only the merged
+/// segments so the merge stays lazy).
+///
+/// The merged segment collapses the inputs into fewer/larger leaves, carries no
+/// tombstones (tombstoned rows are already dropped from `term_doclists`), and
+/// spans `[min origin_lower, max origin_upper]` over the inputs so the DELETE
+/// path's `resolve_tombstone_target_segment` still maps a merged row's origin to
+/// it. Averages are unchanged (same live docs). The structure surgery removes
+/// the inputs from `source_level` and appends the merged segment at
+/// `source_level + 1` (the strictly-older level — correct recency, since the
+/// merged rows are older than everything still at `source_level`). Leaf-building
+/// mirrors [`Fts5Table::to_segment_leaves`]. (bd-fts5-lazy-shadow-reads-itcc4.3)
+pub fn encode_merged_segment(
+    term_doclists: Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>,
+    merged_segids: &[u32],
+    existing_structure: &Fts5StructureRecord,
+    source_level: usize,
+    new_segid: u32,
+    leaf_budget: usize,
+) -> Result<Fts5MergeFlush> {
+    // Build the merged segment's leaves (mirrors Fts5Table::to_segment_leaves).
+    let mut leaves: Vec<Fts5SegmentLeaf> = Vec::new();
+    let mut current: Vec<Fts5SegmentTerm> = Vec::new();
+    let mut current_bytes = FTS5_LEAF_HEADER_BYTES;
+    let mut live_rowids: BTreeSet<u64> = BTreeSet::new();
+    for (term, mut entries) in term_doclists {
+        // `Fts5Doclist::encode` requires strictly-increasing rowids; the recency
+        // merge yields newest-segment order, so sort + dedup by rowid.
+        entries.sort_by_key(|entry| entry.rowid);
+        entries.dedup_by_key(|entry| entry.rowid);
+        for entry in &entries {
+            if !entry.poslist.delete {
+                live_rowids.insert(entry.rowid);
+            }
+        }
+        let seg_term = Fts5SegmentTerm::new(term, Fts5Doclist::new(entries));
+        let estimate = estimate_leaf_term_bytes(&seg_term);
+        if estimate > FTS5_SAFE_LEAF_BYTES {
+            // A single term's doclist exceeds the leaf u16 offset space (cass#369);
+            // drop it from the leaf image (it stays searchable via the
+            // authoritative index), exactly as `to_segment_leaves` does.
+            continue;
+        }
+        if !current.is_empty() && current_bytes + estimate > leaf_budget {
+            leaves.push(Fts5SegmentLeaf::new(std::mem::take(&mut current)));
+            current_bytes = FTS5_LEAF_HEADER_BYTES;
+        }
+        current_bytes += estimate;
+        current.push(seg_term);
+    }
+    if !current.is_empty() {
+        leaves.push(Fts5SegmentLeaf::new(current));
+    }
+
+    // Locate the merged segments for their origin span + `_data` delete ids.
+    let mut origin_lower = u64::MAX;
+    let mut origin_upper = 0_u64;
+    let mut deleted_data_rowids = Vec::new();
+    let mut found = 0_usize;
+    for level in &existing_structure.levels {
+        for segment in &level.segments {
+            if !merged_segids.contains(&segment.segid) {
+                continue;
+            }
+            found += 1;
+            origin_lower = origin_lower.min(segment.origin_lower);
+            origin_upper = origin_upper.max(segment.origin_upper);
+            for pgno in segment.pgno_first..=segment.pgno_last {
+                deleted_data_rowids.push(
+                    Fts5DataRowid::SegmentLeaf {
+                        segid: segment.segid,
+                        pgno,
+                    }
+                    .encode()?,
+                );
+            }
+            for hash_pgno in 0..segment.tombstone_page_count {
+                deleted_data_rowids.push(
+                    Fts5DataRowid::Tombstone {
+                        segid: segment.segid,
+                        hash_pgno,
+                    }
+                    .encode()?,
+                );
+            }
+        }
+    }
+    if found != merged_segids.len() {
+        return Err(fts5_data_error(
+            "merge references a segment absent from the structure",
+        ));
+    }
+
+    // Structure surgery: drop the merged inputs from `source_level`.
+    let mut structure = existing_structure.clone();
+    if let Some(level) = structure.levels.get_mut(source_level) {
+        level
+            .segments
+            .retain(|segment| !merged_segids.contains(&segment.segid));
+    }
+
+    // Encode the merged leaves (normalized via encode/decode) and append the new
+    // segment at the target level — unless the merge dropped every row.
+    let mut leaf_data_rows = Vec::with_capacity(leaves.len());
+    if !leaves.is_empty() {
+        let pgno_last = u32::try_from(leaves.len())
+            .map_err(|_| fts5_data_error("merged segment leaf count exceeds u32"))?;
+        for (index, leaf) in leaves.iter().enumerate() {
+            let pgno = u32::try_from(index + 1)
+                .map_err(|_| fts5_data_error("merged leaf pgno exceeds u32"))?;
+            let decoded = Fts5SegmentLeaf::decode(&leaf.encode()?)?;
+            leaf_data_rows.push(decoded.to_data_row(new_segid, pgno)?);
+        }
+        let entry_count = u64::try_from(live_rowids.len()).unwrap_or(u64::MAX);
+        let merged_segment = Fts5StructureSegment::new(new_segid, 1, pgno_last)
+            .with_origin_tracking(origin_lower, origin_upper, 0, 0, entry_count);
+        let target_level = source_level + 1;
+        while structure.levels.len() <= target_level {
+            structure
+                .levels
+                .push(Fts5StructureLevel::new(0, Vec::new()));
+        }
+        structure.levels[target_level].segments.push(merged_segment);
+    }
+    structure.write_counter = structure.write_counter.saturating_add(1);
+
+    Ok(Fts5MergeFlush {
+        leaf_data_rows,
+        structure_data_row: Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
+        deleted_data_rowids,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fts5PendingIndex {
     Main,
@@ -11907,6 +12059,83 @@ mod tests {
         assert!(table.documents.is_empty(), "no transient documents retained");
         assert!(table.index.index.is_empty(), "no transient postings retained");
         assert!(table.shadow_rows.is_none(), "reads historical state from the host");
+    }
+
+    #[test]
+    fn test_encode_merged_segment_surgery_and_leaves() {
+        fn entry(rowid: u64) -> Fts5DoclistEntry {
+            Fts5DoclistEntry::new(rowid, Fts5Poslist::new(false, Vec::new()))
+        }
+
+        // Two level-0 segments (segids 1, 2; origins 1 and 2; one leaf each).
+        let structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 3,
+            origin_counter: 3,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                vec![
+                    Fts5StructureSegment::new(1, 1, 1).with_origin_tracking(1, 1, 0, 0, 2),
+                    Fts5StructureSegment::new(2, 1, 1).with_origin_tracking(2, 2, 0, 0, 1),
+                ],
+            )],
+        };
+        // Merged (term -> doclist) across the two segments; the 'rust' entries are
+        // deliberately NOT rowid-sorted, to exercise the sort.
+        let term_doclists = vec![
+            (b"0rust".to_vec(), vec![entry(3), entry(1)]),
+            (b"0search".to_vec(), vec![entry(2)]),
+        ];
+        let flush =
+            encode_merged_segment(term_doclists, &[1, 2], &structure, 0, 3, 60_000).unwrap();
+
+        // Structure surgery: source level emptied, merged segment at level 1
+        // spanning origins [1, 2] with no tombstones.
+        let merged = Fts5StructureRecord::decode(&flush.structure_data_row.block).unwrap();
+        assert!(merged.levels[0].segments.is_empty(), "source level emptied");
+        assert_eq!(merged.levels.len(), 2, "target level created");
+        let sm = &merged.levels[1].segments[0];
+        assert_eq!(sm.segid, 3);
+        assert_eq!(
+            (sm.origin_lower, sm.origin_upper),
+            (1, 2),
+            "merged segment spans the inputs' origins"
+        );
+        assert_eq!(sm.tombstone_page_count, 0, "merged segment has no tombstones");
+
+        // Delete list = the two inputs' single leaves (no tombstones).
+        let mut want: Vec<i64> = vec![
+            Fts5DataRowid::SegmentLeaf { segid: 1, pgno: 1 }.encode().unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 1 }.encode().unwrap(),
+        ];
+        want.sort_unstable();
+        let mut got = flush.deleted_data_rowids.clone();
+        got.sort_unstable();
+        assert_eq!(got, want);
+
+        // The merged leaf holds both terms with rowid-ascending doclists.
+        assert_eq!(flush.leaf_data_rows.len(), 1, "the small merge fits one leaf");
+        let leaf = Fts5SegmentLeaf::decode(&flush.leaf_data_rows[0].block).unwrap();
+        let rust = leaf.terms.iter().find(|term| term.term == b"0rust").unwrap();
+        assert_eq!(
+            rust.doclist
+                .entries
+                .iter()
+                .map(|e| e.rowid)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "doclist sorted rowid-ascending"
+        );
+        let search = leaf.terms.iter().find(|term| term.term == b"0search").unwrap();
+        assert_eq!(
+            search
+                .doclist
+                .entries
+                .iter()
+                .map(|e| e.rowid)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[test]
