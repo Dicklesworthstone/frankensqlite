@@ -63,8 +63,9 @@ use smallvec::SmallVec;
 use crate::attach::SchemaRegistry;
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, BoundCollation, ColumnConstraintKind, ColumnRef, CompoundOp,
-    CreateTableBody, DefaultValue, Distinctness, DropObjectType, Expr, FrameBound, FrameExclude,
-    FrameSpec, FrameType, FromClause, FunctionArgs, GeneratedStorage, InSet, InsertSource,
+    CreateTableBody, CteMaterialized, DefaultValue, Distinctness, DropObjectType, Expr, FrameBound,
+    FrameExclude, FrameSpec, FrameType, FromClause, FunctionArgs, GeneratedStorage, InSet,
+    InsertSource,
     InsertStatement, JoinClause, JoinConstraint, JoinKind, JsonArrow, LikeOp, LimitClause, Literal,
     NullsOrder, OrderingTerm, PlaceholderType, PragmaValue, QualifiedName, ResultColumn,
     SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement, TableConstraintKind,
@@ -77686,6 +77687,16 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // bd-gh-cte-materialization-hints-sn0yh / GH#204: a NOT MATERIALIZED
+        // non-recursive CTE must be inlined at each reference so its body
+        // re-evaluates per use (a materialized CTE is computed once). Rewrite the
+        // references to derived subqueries before any materialization path runs;
+        // the now-unreferenced CTE is dropped by `prune_unreferenced_ctes` below,
+        // leaving pure inlining. Returns `None` (untouched) for MATERIALIZED,
+        // default, and recursive CTEs, so existing behavior is unchanged.
+        let inlined_not_materialized = inline_not_materialized_ctes(select);
+        let select = inlined_not_materialized.as_ref().unwrap_or(select);
+
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "select",
             "with_clause_materialization",
@@ -93857,6 +93868,409 @@ fn prune_unreferenced_ctes(select: &SelectStatement) -> Option<fsqlite_ast::With
         keep
     });
     Some(pruned)
+}
+
+/// bd-gh-cte-materialization-hints-sn0yh / GH#204: inline every reference to a
+/// `NOT MATERIALIZED` non-recursive CTE as a derived subquery so its body
+/// re-evaluates at each use, matching SQLite (a materialized CTE is computed
+/// once; `NOT MATERIALIZED` must not be).
+///
+/// Each relation reference — `FROM c`, the `IN c` shorthand, and the same
+/// positions inside scalar / `EXISTS` / `IN (...)` subqueries — is rewritten to
+/// `(<cte body>) AS c`, carrying the CTE's declared column aliases. The rewritten
+/// CTE is left in the `WITH` list; because no relation reference to it remains,
+/// [`prune_unreferenced_ctes`] drops it before materialization, yielding pure
+/// inlining. Any reference we cannot inline (a column-aliased body that is not a
+/// plain projection, or a name shadowed by a nested `WITH`) simply keeps the CTE
+/// referenced, so it falls back to the existing materialize path instead of
+/// erroring.
+///
+/// Returns `Some(rewritten)` only when at least one reference was inlined;
+/// `MATERIALIZED`, default (no hint), and recursive CTEs take the original path
+/// untouched.
+fn inline_not_materialized_ctes(select: &SelectStatement) -> Option<SelectStatement> {
+    let with = select.with.as_ref()?;
+    if with.recursive {
+        return None;
+    }
+
+    let mut inlinable: Vec<(String, SelectStatement)> = Vec::new();
+    for cte in &with.ctes {
+        if cte.materialized != Some(CteMaterialized::NotMaterialized) {
+            continue;
+        }
+        // A body that references its own name is recursive even without the
+        // RECURSIVE keyword (an error in SQLite); never inline it.
+        if cte_body_references_relation(&cte.query, &cte.name) {
+            continue;
+        }
+        if let Some(body) = cte_inline_body(cte) {
+            inlinable.push((cte.name.clone(), body));
+        }
+    }
+    if inlinable.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = select.clone();
+    let mut inlined = 0usize;
+    for (name, body) in &inlinable {
+        subst_cte_refs_in_select(&mut rewritten, name, body, &mut inlined);
+    }
+    (inlined > 0).then_some(rewritten)
+}
+
+/// True when `body` references `name` in a relation position (`FROM name` or the
+/// `IN name` shorthand), mirroring the reference set counted by
+/// [`prune_unreferenced_ctes`].
+fn cte_body_references_relation(body: &SelectStatement, name: &str) -> bool {
+    let mut found = false;
+    let _ = visit_select_qualified_names(body, &mut |qualified| {
+        if qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name) {
+            found = true;
+        }
+        Ok(())
+    });
+    found
+}
+
+/// Build the subquery body to inline for a CTE, applying its declared column
+/// aliases. Returns `None` when the aliases cannot be applied in place (a
+/// compound body, a `VALUES` body, a projection containing `*`, or an arity
+/// mismatch), leaving that CTE on the materialize path.
+fn cte_inline_body(cte: &fsqlite_ast::Cte) -> Option<SelectStatement> {
+    let mut body = cte.query.clone();
+    if cte.columns.is_empty() {
+        return Some(body);
+    }
+    if !body.body.compounds.is_empty() {
+        return None;
+    }
+    let SelectCore::Select { columns, .. } = &mut body.body.select else {
+        return None;
+    };
+    if columns.len() != cte.columns.len() {
+        return None;
+    }
+    for (column, alias_name) in columns.iter_mut().zip(&cte.columns) {
+        let ResultColumn::Expr { alias, .. } = column else {
+            return None;
+        };
+        *alias = Some(alias_name.clone());
+    }
+    Some(body)
+}
+
+fn subst_cte_refs_in_select(
+    select: &mut SelectStatement,
+    name: &str,
+    body: &SelectStatement,
+    inlined: &mut usize,
+) {
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            subst_cte_refs_in_nested_select(&mut cte.query, name, body, inlined);
+        }
+    }
+    subst_cte_refs_in_core(&mut select.body.select, name, body, inlined);
+    for (_, core) in &mut select.body.compounds {
+        subst_cte_refs_in_core(core, name, body, inlined);
+    }
+    for term in &mut select.order_by {
+        subst_cte_refs_in_expr(&mut term.expr, name, body, inlined);
+    }
+    if let Some(limit) = &mut select.limit {
+        subst_cte_refs_in_expr(&mut limit.limit, name, body, inlined);
+        if let Some(offset) = &mut limit.offset {
+            subst_cte_refs_in_expr(offset, name, body, inlined);
+        }
+    }
+}
+
+/// Descend into a nested SELECT, honoring lexical shadowing: a nested `WITH`
+/// that redefines `name` hides the outer CTE, so that subtree is left untouched.
+fn subst_cte_refs_in_nested_select(
+    select: &mut SelectStatement,
+    name: &str,
+    body: &SelectStatement,
+    inlined: &mut usize,
+) {
+    if let Some(with) = &select.with {
+        if with.ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(name)) {
+            return;
+        }
+    }
+    subst_cte_refs_in_select(select, name, body, inlined);
+}
+
+fn subst_cte_refs_in_core(
+    core: &mut SelectCore,
+    name: &str,
+    body: &SelectStatement,
+    inlined: &mut usize,
+) {
+    let SelectCore::Select {
+        columns,
+        from,
+        where_clause,
+        group_by,
+        having,
+        windows,
+        ..
+    } = core
+    else {
+        // `VALUES` rows are immutable in the AST; a CTE reference buried inside a
+        // VALUES subquery stays on the materialize path (a safe fallback).
+        return;
+    };
+    for column in columns {
+        if let ResultColumn::Expr { expr, .. } = column {
+            subst_cte_refs_in_expr(expr, name, body, inlined);
+        }
+    }
+    if let Some(from) = from {
+        subst_cte_refs_in_from(from, name, body, inlined);
+    }
+    if let Some(where_expr) = where_clause {
+        subst_cte_refs_in_expr(where_expr, name, body, inlined);
+    }
+    for expr in group_by {
+        subst_cte_refs_in_expr(expr, name, body, inlined);
+    }
+    if let Some(having_expr) = having {
+        subst_cte_refs_in_expr(having_expr, name, body, inlined);
+    }
+    for window in windows {
+        subst_cte_refs_in_window_spec(&mut window.spec, name, body, inlined);
+    }
+}
+
+fn subst_cte_refs_in_from(
+    from: &mut FromClause,
+    name: &str,
+    body: &SelectStatement,
+    inlined: &mut usize,
+) {
+    subst_cte_refs_in_table(&mut from.source, name, body, inlined);
+    for join in &mut from.joins {
+        subst_cte_refs_in_table(&mut join.table, name, body, inlined);
+        if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+            subst_cte_refs_in_expr(expr, name, body, inlined);
+        }
+    }
+}
+
+fn subst_cte_refs_in_table(
+    source: &mut TableOrSubquery,
+    name: &str,
+    body: &SelectStatement,
+    inlined: &mut usize,
+) {
+    match source {
+        TableOrSubquery::Table {
+            name: qualified,
+            alias,
+            index_hint,
+            time_travel,
+        } => {
+            if qualified.schema.is_none()
+                && index_hint.is_none()
+                && time_travel.is_none()
+                && qualified.name.eq_ignore_ascii_case(name)
+            {
+                let preserved_alias = alias.clone().unwrap_or_else(|| qualified.name.clone());
+                *source = TableOrSubquery::Subquery {
+                    query: Box::new(body.clone()),
+                    alias: Some(preserved_alias),
+                };
+                *inlined += 1;
+            }
+        }
+        TableOrSubquery::Subquery { query, .. } => {
+            subst_cte_refs_in_nested_select(query, name, body, inlined);
+        }
+        TableOrSubquery::TableFunction { args, .. } => {
+            for arg in args {
+                subst_cte_refs_in_expr(arg, name, body, inlined);
+            }
+        }
+        TableOrSubquery::ParenJoin(paren) => {
+            subst_cte_refs_in_from(paren, name, body, inlined);
+        }
+    }
+}
+
+fn subst_cte_refs_in_expr(
+    expr: &mut Expr,
+    name: &str,
+    body: &SelectStatement,
+    inlined: &mut usize,
+) {
+    match expr {
+        Expr::Subquery(subquery, _) | Expr::Exists { subquery, .. } => {
+            subst_cte_refs_in_nested_select(subquery, name, body, inlined);
+        }
+        Expr::In {
+            expr: operand, set, ..
+        } => {
+            subst_cte_refs_in_expr(operand, name, body, inlined);
+            match set {
+                InSet::List(list) => {
+                    for item in list {
+                        subst_cte_refs_in_expr(item, name, body, inlined);
+                    }
+                }
+                InSet::Subquery(subquery) => {
+                    subst_cte_refs_in_nested_select(subquery, name, body, inlined);
+                }
+                InSet::Table(qualified) => {
+                    if qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name) {
+                        *set = InSet::Subquery(Box::new(select_star_from_derived(body, name)));
+                        *inlined += 1;
+                    }
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            subst_cte_refs_in_expr(left, name, body, inlined);
+            subst_cte_refs_in_expr(right, name, body, inlined);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => subst_cte_refs_in_expr(expr, name, body, inlined),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            subst_cte_refs_in_expr(expr, name, body, inlined);
+            subst_cte_refs_in_expr(low, name, body, inlined);
+            subst_cte_refs_in_expr(high, name, body, inlined);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            subst_cte_refs_in_expr(expr, name, body, inlined);
+            subst_cte_refs_in_expr(pattern, name, body, inlined);
+            if let Some(escape) = escape {
+                subst_cte_refs_in_expr(escape, name, body, inlined);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                subst_cte_refs_in_expr(operand, name, body, inlined);
+            }
+            for (when_expr, then_expr) in whens {
+                subst_cte_refs_in_expr(when_expr, name, body, inlined);
+                subst_cte_refs_in_expr(then_expr, name, body, inlined);
+            }
+            if let Some(else_expr) = else_expr {
+                subst_cte_refs_in_expr(else_expr, name, body, inlined);
+            }
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let FunctionArgs::List(list) = args {
+                for arg in list {
+                    subst_cte_refs_in_expr(arg, name, body, inlined);
+                }
+            }
+            for term in order_by {
+                subst_cte_refs_in_expr(&mut term.expr, name, body, inlined);
+            }
+            if let Some(filter) = filter {
+                subst_cte_refs_in_expr(filter, name, body, inlined);
+            }
+            if let Some(window) = over {
+                subst_cte_refs_in_window_spec(window, name, body, inlined);
+            }
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            subst_cte_refs_in_expr(expr, name, body, inlined);
+            subst_cte_refs_in_expr(path, name, body, inlined);
+        }
+        Expr::RowValue(items, _) => {
+            for item in items {
+                subst_cte_refs_in_expr(item, name, body, inlined);
+            }
+        }
+        Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => {}
+    }
+}
+
+fn subst_cte_refs_in_window_spec(
+    window: &mut WindowSpec,
+    name: &str,
+    body: &SelectStatement,
+    inlined: &mut usize,
+) {
+    for expr in &mut window.partition_by {
+        subst_cte_refs_in_expr(expr, name, body, inlined);
+    }
+    for term in &mut window.order_by {
+        subst_cte_refs_in_expr(&mut term.expr, name, body, inlined);
+    }
+    if let Some(frame) = &mut window.frame {
+        subst_cte_refs_in_frame_bound(&mut frame.start, name, body, inlined);
+        if let Some(end) = &mut frame.end {
+            subst_cte_refs_in_frame_bound(end, name, body, inlined);
+        }
+    }
+}
+
+fn subst_cte_refs_in_frame_bound(
+    bound: &mut FrameBound,
+    name: &str,
+    body: &SelectStatement,
+    inlined: &mut usize,
+) {
+    if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = bound {
+        subst_cte_refs_in_expr(expr, name, body, inlined);
+    }
+}
+
+/// `SELECT * FROM (<body>) AS name`, used to inline the `IN name` table
+/// shorthand into `IN (SELECT * FROM (<body>) AS name)`.
+fn select_star_from_derived(body: &SelectStatement, name: &str) -> SelectStatement {
+    SelectStatement {
+        with: None,
+        body: SelectBody {
+            select: SelectCore::Select {
+                distinct: Distinctness::All,
+                columns: vec![ResultColumn::Star],
+                from: Some(FromClause {
+                    source: TableOrSubquery::Subquery {
+                        query: Box::new(body.clone()),
+                        alias: Some(name.to_owned()),
+                    },
+                    joins: Vec::new(),
+                }),
+                where_clause: None,
+                group_by: Vec::new(),
+                having: None,
+                windows: Vec::new(),
+            },
+            compounds: Vec::new(),
+        },
+        order_by: Vec::new(),
+        limit: None,
+    }
 }
 
 /// Recursively resolve column names for a subquery that uses `SELECT *`.
