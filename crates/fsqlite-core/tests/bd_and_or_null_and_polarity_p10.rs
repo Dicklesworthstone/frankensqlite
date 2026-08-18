@@ -66,13 +66,12 @@ async fn setup(frank: &Connection, stock: &rusqlite::Connection) {
     stock.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t(id) VALUES (1),(2);").expect("stock setup");
 }
 
+// The seeking-true polarity fold landed in rewrite_in_expr (bd-lryih P10/P12,
+// 45d02fe49): `WHERE NULL AND E` now short-circuits to no rows without executing
+// the uncorrelated subquery E, while `WHERE NOT (NULL AND E)` stays eager and
+// errors (both engines). Un-ignored 2026-08-18 — verified green vs sqlite3
+// 3.46.1 at HEAD.
 #[test]
-#[ignore = "bd-and-or P10/P12 residual: seeking-true `WHERE NULL AND E` errors (fsqlite eagerly \
-hoists/executes the uncorrelated subquery E in rewrite_in_expr before the truth-context \
-short-circuit can protect it) where stock returns no rows. RED verified at HEAD 62269d908 \
-(cargo test -p fsqlite-core --test bd_and_or_null_and_polarity_p10: fsqlite errs, stock empty). \
-Un-ignore when the seeking_true polarity fold lands in rewrite_in_expr (P12 `WHERE NOT(NULL AND E)` \
-must stay eager/erroring). Fix gated on the connection.rs lease."]
 fn bd_and_or_null_and_polarity_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         let frank = Connection::open(":memory:").await.expect("open frank");
