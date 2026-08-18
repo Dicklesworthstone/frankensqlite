@@ -83398,6 +83398,75 @@ impl Connection {
                 let mut pending_instance =
                     PendingLiveVtabGuard::connected(self, cx, table_name, instance);
 
+                // A materialized FTS5 table whose index is already persisted must be
+                // BOUND to its on-disk segments, never re-derived. Rebuilding means
+                // reading every content row and re-tokenizing the whole corpus into an
+                // in-memory inverted index on every open — O(corpus) time and memory
+                // for what should be O(1) work, and it is paid by every read-only
+                // command that opens the database.
+                //
+                // The sibling reload path already had this gate; this path did not, so
+                // schema-only opens (the common case for a reader) always took the
+                // rebuild. Placed BEFORE `read_storage_table_rows_for_reload` so the
+                // row read is skipped too, not just the tokenization.
+                #[cfg(feature = "ext-fts5")]
+                if !self.defer_fts5_hydration {
+                    let is_fts5_lazy_candidate = self.invoke_live_vtab_callback("asAny", || {
+                        Ok(pending_instance
+                            .instance()
+                            .as_any()
+                            .downcast_ref::<Fts5Table>()
+                            .is_some())
+                    })?;
+                    if is_fts5_lazy_candidate
+                        && Self::fts5_table_is_lazy_capable(
+                            schema,
+                            table_name,
+                            &create_stmt.args,
+                            self.allow_lazy_contentless_fts5,
+                        )
+                        && self
+                            .read_fts5_lazy_has_segments(
+                                cx,
+                                txn,
+                                page_size,
+                                reserved_per_page,
+                                schema,
+                                table_name,
+                            )
+                            .await?
+                    {
+                        let column_count =
+                            parse_virtual_table_column_infos(&create_stmt.args).len();
+                        let doc_count = self
+                            .read_fts5_lazy_doc_count(
+                                cx,
+                                txn,
+                                page_size,
+                                reserved_per_page,
+                                schema,
+                                table_name,
+                                column_count,
+                            )
+                            .await?;
+                        self.invoke_live_vtab_callback("asAnyMut", || {
+                            let fts5 = pending_instance
+                                .instance_mut()
+                                .as_any_mut()
+                                .downcast_mut::<Fts5Table>()
+                                .ok_or_else(|| {
+                                    FrankenError::Internal(format!(
+                                        "virtual table {table_name} changed type during schema reload"
+                                    ))
+                                })?;
+                            fts5.mark_lazy_on_disk(doc_count);
+                            Ok(())
+                        })?;
+                        reloaded.insert_pending(table_key.clone(), &mut pending_instance)?;
+                        continue;
+                    }
+                }
+
                 let table = schema
                     .iter()
                     .find(|candidate| candidate.name.eq_ignore_ascii_case(table_name))
