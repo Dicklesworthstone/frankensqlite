@@ -3023,6 +3023,53 @@ fn collect_live_term_groups_from_shadow_rows(
     Ok(by_term.into_iter().collect())
 }
 
+/// Collect every LIVE posting across ONLY the segments in `sub_structure`,
+/// grouped by stored term, with the lazy reader's recency + tombstone semantics.
+///
+/// The async, on-disk twin of [`collect_live_term_groups_from_shadow_rows`],
+/// used to feed [`encode_merged_segment`] when merging segments. It enumerates
+/// ALL of each segment's terms via the raw empty-key
+/// [`lazy_segment_prefix_term_groups`] — NOT the `segment_lookup_keys` marker
+/// wrapper, which returns only the first marker's terms and would silently drop
+/// the prefix-index doclists (a corruption for `prefix='…'` tables). Walks
+/// segments newest-first, keeps the first (newest) occurrence of each
+/// `(term, rowid)`, and drops delete markers + tombstoned rows. Because
+/// `sub_structure` holds only the segments being merged, it reads only their
+/// leaves + touched tombstone pages, never the whole corpus.
+/// (bd-fts5-lazy-shadow-reads-itcc4.3)
+pub async fn collect_merged_term_groups<R: Fts5OnDiskReader>(
+    reader: &mut R,
+    sub_structure: &Fts5StructureRecord,
+) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>> {
+    let mut by_term: BTreeMap<Vec<u8>, Vec<Fts5DoclistEntry>> = BTreeMap::new();
+    let mut seen: HashSet<(Vec<u8>, u64)> = HashSet::new();
+    for level in &sub_structure.levels {
+        for segment in level.segments.iter().rev() {
+            for (term, entries) in lazy_segment_prefix_term_groups(reader, segment, &[]).await? {
+                for entry in entries {
+                    if !seen.insert((term.clone(), entry.rowid)) {
+                        // An older segment's occurrence of this (term, rowid),
+                        // shadowed by the newer one already recorded.
+                        continue;
+                    }
+                    if entry.poslist.delete {
+                        // Contentless deletes are tombstones, not delete markers,
+                        // so this only fires for imported/UPDATE segments; dropping
+                        // it is safe here because a merge always consumes the
+                        // oldest run at a level (no older live posting to resurrect).
+                        continue;
+                    }
+                    if rowid_tombstoned_in_segment(reader, segment, entry.rowid).await? {
+                        continue;
+                    }
+                    by_term.entry(term.clone()).or_default().push(entry);
+                }
+            }
+        }
+    }
+    Ok(by_term.into_iter().collect())
+}
+
 /// Lazily collect the LIVE doclist entries for an exact `term`.
 ///
 /// Reads leaf pages on demand via `reader` across every on-disk segment of
@@ -11804,6 +11851,76 @@ mod tests {
             rowids.sort_unstable();
             rowids.dedup();
             assert_eq!(rowids, vec![1, 4, 30]);
+        });
+    }
+
+    #[test]
+    fn test_collect_merged_term_groups_recency_and_tombstone() {
+        fn entry(rowid: u64) -> Fts5DoclistEntry {
+            Fts5DoclistEntry::new(rowid, Fts5Poslist::new(false, Vec::new()))
+        }
+        fn term(name: &[u8], rowids: &[u64]) -> Fts5SegmentTerm {
+            Fts5SegmentTerm::new(
+                name.to_vec(),
+                Fts5Doclist::new(rowids.iter().copied().map(entry).collect()),
+            )
+        }
+
+        // Segment 1 (older): 0alpha->[1,2], 0beta->[1]; a tombstone for rowid 2.
+        let seg1_leaf = Fts5SegmentLeaf::new(vec![term(b"0alpha", &[1, 2]), term(b"0beta", &[1])]);
+        let tombstone = build_tombstone_hash(&BTreeSet::from([2_u64]), false, 8).unwrap();
+        assert_eq!(tombstone.page_count, 1);
+        // Segment 2 (newer): 0alpha->[3].
+        let seg2_leaf = Fts5SegmentLeaf::new(vec![term(b"0alpha", &[3])]);
+
+        let data = vec![
+            seg1_leaf.to_data_row(1, 1).unwrap(),
+            tombstone.pages[0].to_data_row(1, 0).unwrap(),
+            seg2_leaf.to_data_row(2, 1).unwrap(),
+        ];
+        let structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 2,
+            origin_counter: 2,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                vec![
+                    Fts5StructureSegment::new(1, 1, 1).with_origin_tracking(1, 1, 1, 1, 2),
+                    Fts5StructureSegment::new(2, 1, 1).with_origin_tracking(2, 2, 0, 0, 1),
+                ],
+            )],
+        };
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build merged-collector test runtime");
+        runtime.block_on(async {
+            let mut reader = SliceOnDiskReader {
+                data,
+                idx: Vec::new(),
+            };
+            let groups = collect_merged_term_groups(&mut reader, &structure)
+                .await
+                .unwrap();
+            let rowids_of = |name: &[u8]| {
+                let mut rowids: Vec<u64> = groups
+                    .iter()
+                    .find(|(term, _)| term.as_slice() == name)
+                    .map(|(_, entries)| entries.iter().map(|e| e.rowid).collect())
+                    .unwrap_or_default();
+                rowids.sort_unstable();
+                rowids
+            };
+            // 0alpha: rowid 2 is tombstoned in seg1 (dropped); 1 (older) + 3
+            // (newer) survive the recency merge.
+            assert_eq!(rowids_of(b"0alpha"), vec![1, 3], "recency merge + tombstone drop");
+            // 0beta: only in the older segment, rowid 1 live.
+            assert_eq!(rowids_of(b"0beta"), vec![1]);
+            // Terms are grouped and term-sorted.
+            assert_eq!(
+                groups.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+                vec![b"0alpha".to_vec(), b"0beta".to_vec()]
+            );
         });
     }
 
