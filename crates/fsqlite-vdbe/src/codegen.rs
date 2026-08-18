@@ -36532,6 +36532,26 @@ pub fn emit_backfill_key_expr(
     emit_expr(b, expr, target_reg, Some(&scan));
 }
 
+/// Emit the read of a plain-column index key term during index backfill.
+///
+/// Delegates to `emit_table_column_read` so a plain (non-expression) index on a
+/// VIRTUAL generated column (bd-gh-virtual-generated-columns-5e0u1 / GH#227)
+/// computes the generating expression on read instead of reading the NULL
+/// placeholder record slot. Without this, pre-existing rows backfilled at
+/// `CREATE INDEX` time would get NULL index keys, silently diverging from keys
+/// written by post-creation DML. INTEGER PRIMARY KEY columns read the rowid;
+/// all other columns read the record slot directly, so this is a drop-in
+/// replacement for a raw `Opcode::Column` read.
+pub fn emit_backfill_column_read(
+    b: &mut ProgramBuilder,
+    col_idx: usize,
+    target_reg: i32,
+    cursor: i32,
+    table: &TableSchema,
+) {
+    emit_table_column_read(b, cursor, table, None, None, col_idx, target_reg);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
