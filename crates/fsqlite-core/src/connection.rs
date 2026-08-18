@@ -5195,9 +5195,35 @@ fn pragma_table_function_columns(name: &str) -> Option<&'static [&'static str]> 
         // No-argument pragma TVF: `SELECT * FROM pragma_compile_options()` reuses
         // the `PRAGMA compile_options` row generator (GH #207).
         Some(&PRAGMA_COMPILE_OPTIONS_TVF_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("function_list") {
+        // No-argument pragma TVF: `SELECT * FROM pragma_function_list()` reuses
+        // the `PRAGMA function_list` row generator (GH #206/#207).
+        Some(&PRAGMA_FUNCTION_LIST_COLUMNS)
     } else {
         None
     }
+}
+
+/// Whether a `pragma_<name>` table-valued function is one of the NO-ARGUMENT
+/// introspection pragmas that produce a meaningful result with zero arguments
+/// (e.g. `SELECT * FROM pragma_database_list`). This is the allow-list used to
+/// route the *parenless* eponymous bare-table form through the pragma-TVF
+/// execution path (GH #207/#213, bd-xl98m).
+///
+/// Arg-requiring pragma TVFs (e.g. `pragma_table_info(t)`) are intentionally
+/// excluded: their bare, argument-less form keeps its prior behaviour
+/// (`NoSuchTable`) — only the no-arg pragmas are in scope for this fix.
+fn pragma_table_function_is_no_arg(name: &str) -> bool {
+    let Some(prefix) = name.get(..7) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case("pragma_") {
+        return false;
+    }
+    let pragma = &name[7..];
+    pragma.eq_ignore_ascii_case("database_list")
+        || pragma.eq_ignore_ascii_case("compile_options")
+        || pragma.eq_ignore_ascii_case("function_list")
 }
 
 struct HtmMetricsVtab;
@@ -32709,6 +32735,15 @@ impl Connection {
             {
                 return Err(error);
             }
+            // bd-xl98m (GH #207/#213): route the parenless eponymous no-arg pragma
+            // TVF form (`SELECT * FROM pragma_compile_options`) into the equivalent
+            // call form BEFORE relation validation, so the whole downstream
+            // pipeline (relation/semantics validation and dispatch) serves it
+            // through the already-working table-function path instead of raising
+            // NoSuchTable. Non-pragma statements are returned borrowed unchanged,
+            // so this only pays a cheap FROM-source scan on the common path.
+            let rewritten_statement = self.rewrite_statement_bare_pragma_table_functions(statement);
+            let statement: &Statement = rewritten_statement.as_ref();
             self.refresh_select_schema_before_relation_validation(statement)
                 .await?;
             for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
@@ -60679,6 +60714,147 @@ impl Connection {
             rewrite_core(core);
         }
         referenced
+    }
+
+    /// bd-xl98m (GH #207/#213): rewrite a *parenless* eponymous no-arg pragma
+    /// table-valued function used as a bare FROM source
+    /// (`SELECT * FROM pragma_compile_options`) into the equivalent call form
+    /// (`pragma_compile_options()`), so the existing table-function execution
+    /// path serves it instead of the bare-table resolver raising `NoSuchTable`.
+    ///
+    /// Only the NO-ARG synthesize-path pragmas (`pragma_table_function_is_no_arg`)
+    /// are routed, and only when no real table, view, or in-scope CTE shadows the
+    /// name — so unknown bare names still raise `NoSuchTable`, a real relation
+    /// still wins, and arg-requiring pragma TVFs (`pragma_table_info`) are
+    /// untouched. Returns a borrowed statement when nothing is rewritten, so the
+    /// common (non-pragma) path pays only a cheap scan and never clones.
+    fn rewrite_statement_bare_pragma_table_functions<'a>(
+        &self,
+        statement: &'a Statement,
+    ) -> Cow<'a, Statement> {
+        let Statement::Select(select) = statement else {
+            return Cow::Borrowed(statement);
+        };
+        match self.rewrite_bare_pragma_table_functions(select) {
+            Cow::Borrowed(_) => Cow::Borrowed(statement),
+            Cow::Owned(rewritten) => Cow::Owned(Statement::Select(rewritten)),
+        }
+    }
+
+    fn rewrite_bare_pragma_table_functions<'a>(
+        &self,
+        select: &'a SelectStatement,
+    ) -> Cow<'a, SelectStatement> {
+        if !self.select_has_bare_pragma_table_function(select) {
+            return Cow::Borrowed(select);
+        }
+        let cte_names = Self::top_level_cte_names(select);
+        let mut owned = select.clone();
+        if let SelectCore::Select {
+            from: Some(from), ..
+        } = &mut owned.body.select
+        {
+            self.rewrite_bare_pragma_in_from_clause(from, &cte_names);
+        }
+        Cow::Owned(owned)
+    }
+
+    fn top_level_cte_names(select: &SelectStatement) -> Vec<String> {
+        select.with.as_ref().map_or_else(Vec::new, |with| {
+            with.ctes.iter().map(|cte| cte.name.clone()).collect()
+        })
+    }
+
+    /// Whether the primary SELECT core has at least one bare FROM source that is
+    /// a routable no-arg pragma table-valued function.
+    fn select_has_bare_pragma_table_function(&self, select: &SelectStatement) -> bool {
+        let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            return false;
+        };
+        let cte_names = Self::top_level_cte_names(select);
+        self.from_clause_has_bare_pragma_tvf(from, &cte_names)
+    }
+
+    fn from_clause_has_bare_pragma_tvf(&self, from: &FromClause, cte_names: &[String]) -> bool {
+        self.source_is_bare_pragma_tvf(&from.source, cte_names)
+            || from
+                .joins
+                .iter()
+                .any(|join| self.source_is_bare_pragma_tvf(&join.table, cte_names))
+    }
+
+    fn source_is_bare_pragma_tvf(&self, source: &TableOrSubquery, cte_names: &[String]) -> bool {
+        match source {
+            TableOrSubquery::Table {
+                name,
+                index_hint,
+                time_travel,
+                ..
+            } => {
+                name.schema.is_none()
+                    && index_hint.is_none()
+                    && time_travel.is_none()
+                    && pragma_table_function_is_no_arg(&name.name)
+                    && !self.bare_name_shadows_pragma_tvf(&name.name, cte_names)
+            }
+            TableOrSubquery::ParenJoin(from) => self.from_clause_has_bare_pragma_tvf(from, cte_names),
+            TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => false,
+        }
+    }
+
+    /// A real table, view, or in-scope CTE with the same name shadows the
+    /// eponymous pragma TVF (matching SQLite), so the bare form must resolve to
+    /// that relation rather than the pragma.
+    fn bare_name_shadows_pragma_tvf(&self, name: &str, cte_names: &[String]) -> bool {
+        self.schema_index_of(name).is_some()
+            || self
+                .views
+                .borrow()
+                .iter()
+                .any(|view| view.name.eq_ignore_ascii_case(name))
+            || cte_names
+                .iter()
+                .any(|cte_name| cte_name.eq_ignore_ascii_case(name))
+    }
+
+    fn rewrite_bare_pragma_in_from_clause(&self, from: &mut FromClause, cte_names: &[String]) {
+        self.rewrite_bare_pragma_in_source(&mut from.source, cte_names);
+        for join in &mut from.joins {
+            self.rewrite_bare_pragma_in_source(&mut join.table, cte_names);
+        }
+    }
+
+    fn rewrite_bare_pragma_in_source(&self, source: &mut TableOrSubquery, cte_names: &[String]) {
+        match source {
+            TableOrSubquery::Table {
+                name,
+                alias,
+                index_hint,
+                time_travel,
+            } => {
+                if name.schema.is_none()
+                    && index_hint.is_none()
+                    && time_travel.is_none()
+                    && pragma_table_function_is_no_arg(&name.name)
+                    && !self.bare_name_shadows_pragma_tvf(&name.name, cte_names)
+                {
+                    let tvf_name = std::mem::take(&mut name.name);
+                    let tvf_alias = alias.take();
+                    *source = TableOrSubquery::TableFunction {
+                        name: tvf_name,
+                        args: Vec::new(),
+                        alias: tvf_alias,
+                    };
+                }
+            }
+            TableOrSubquery::ParenJoin(from) => {
+                self.rewrite_bare_pragma_in_from_clause(from, cte_names);
+            }
+            TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => {}
+        }
     }
 
     /// Check if a SELECT references any views in its FROM/JOIN sources.
