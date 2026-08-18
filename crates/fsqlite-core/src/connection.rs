@@ -226401,6 +226401,12 @@ mod pager_routing_tests {
              FROM scores WHERE subject = 'math'",
                 );
 
+                // bd-7rmuo: this RefCell guard is deliberately held across the
+                // await — the test exists to prove that execute_window_select
+                // surfaces a "schema metadata is already mutably borrowed" query
+                // error (asserted below) rather than panicking when the schema is
+                // locked. It is safe on run_test's current-thread runtime, where
+                // no other task can interleave and re-enter the borrow.
                 let _schema_write = conn.schema.borrow_mut();
                 window_select_outcome = Some(conn.execute_window_select(&select, None).await);
             });
