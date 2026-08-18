@@ -14721,15 +14721,31 @@ fn emit_aggregate_accumulate_body(
                 emit_expr(b, expr, arg_base, Some(&scan_ctx));
             } else {
                 let col_idx = agg.arg_col_index.unwrap_or(0);
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                b.emit_op(
-                    Opcode::Column,
-                    cursor,
-                    col_idx as i32,
-                    arg_base,
-                    P4::None,
-                    0,
-                );
+                // bd-hx3zu (GH#227 sibling): a VIRTUAL generated column passed as
+                // an aggregate argument on a table scan (no GROUP BY) read its
+                // NULL placeholder, so sum/avg/min/max/count saw NULLs. Compute
+                // the generating expression via the canonical reader instead.
+                if virtual_generated_column_expr(&table.columns[col_idx]).is_some() {
+                    emit_table_column_read(
+                        b,
+                        cursor,
+                        table,
+                        table_alias,
+                        Some(schema),
+                        col_idx,
+                        arg_base,
+                    );
+                } else {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    b.emit_op(
+                        Opcode::Column,
+                        cursor,
+                        col_idx as i32,
+                        arg_base,
+                        P4::None,
+                        0,
+                    );
+                }
             }
 
             // Extra arguments (e.g. separator for group_concat).
