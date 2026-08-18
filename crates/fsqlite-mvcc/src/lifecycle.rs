@@ -19,7 +19,7 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::sync_primitives::{Instant, Mutex};
 use fsqlite_types::{
     CommitSeq, MergePageKind, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
-    TxnEpoch, TxnId, TxnToken,
+    TxnEpoch, TxnId, TxnToken, WitnessKey,
 };
 use fsqlite_vfs::ShmRegion;
 use fsqlite_wal::DEFAULT_RAPTORQ_REPAIR_SYMBOLS;
@@ -35,6 +35,11 @@ use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
 use crate::materialize::{MaterializationTrigger, materialize_page};
 use crate::observability::{mvcc_snapshot_established, mvcc_snapshot_released};
 use crate::shm::SharedMemoryLayout;
+use crate::ssi_validation::{
+    ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, discover_incoming_edges,
+    discover_outgoing_edges,
+};
+use crate::witness_plane::witness_keys_overlap;
 
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_SERIALIZED_WRITER_LEASE_SECS: u64 = 30;
@@ -461,6 +466,109 @@ pub struct Savepoint {
 }
 
 // ---------------------------------------------------------------------------
+// SSI witness registry (bd-gh-mvcc-ssi-wuupf / GH#189)
+// ---------------------------------------------------------------------------
+
+/// Maximum committed-witness ring entries retained for cross-txn SSI edge
+/// discovery on the direct [`TransactionManager`] API. Bounds memory so the
+/// ring cannot grow unbounded across a long-lived connection.
+const SSI_COMMITTED_WITNESS_CAP: usize = 256;
+
+/// Live read/write witness set for one active, SSI-enabled concurrent
+/// transaction, tracked by the direct [`TransactionManager`] API so that
+/// [`TransactionManager::commit_concurrent`] can run the same rw-antidependency
+/// edge discovery the BEGIN CONCURRENT path already runs. Only maintained for
+/// concurrent transactions begun with SSI enabled.
+#[derive(Debug, Clone)]
+struct ActiveWitness {
+    /// Transaction identity (for edge attribution / self-exclusion).
+    token: TxnToken,
+    /// Snapshot lower bound (begin sequence).
+    begin_seq: CommitSeq,
+    /// Page-granularity read witnesses observed so far.
+    read_keys: HashSet<WitnessKey>,
+    /// Page-granularity write witnesses observed so far.
+    write_keys: HashSet<WitnessKey>,
+}
+
+/// A recently committed transaction's read/write witness set, retained in a
+/// bounded ring so a later committer can discover incoming edges from committed
+/// readers and outgoing edges to committed writers (mirrors the RCRI/CommitLog
+/// inputs the BEGIN CONCURRENT path feeds to `discover_*`).
+#[derive(Debug, Clone)]
+struct CommittedWitness {
+    token: TxnToken,
+    begin_seq: CommitSeq,
+    commit_seq: CommitSeq,
+    read_keys: Vec<WitnessKey>,
+    write_keys: Vec<WitnessKey>,
+}
+
+/// Owned, snapshot-in-time [`ActiveTxnView`] over another active transaction's
+/// witness set. Built while holding the witness-registry lock, then used for
+/// edge discovery AFTER the lock has been released (see
+/// [`TransactionManager::ssi_run_edge_discovery`]).
+///
+/// Only the read-side of the trait is exercised by `discover_incoming_edges` /
+/// `discover_outgoing_edges`; the `set_*` mutators are unreachable here (this
+/// path deliberately does not run the full `ssi_validate_and_publish` T3
+/// propagation) so they are inert.
+struct WitnessTxnView {
+    token: TxnToken,
+    begin_seq: CommitSeq,
+    read_keys: Vec<WitnessKey>,
+    write_keys: Vec<WitnessKey>,
+}
+
+impl ActiveTxnView for WitnessTxnView {
+    fn token(&self) -> TxnToken {
+        self.token
+    }
+
+    fn begin_seq(&self) -> CommitSeq {
+        self.begin_seq
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    fn read_keys(&self) -> &[WitnessKey] {
+        &self.read_keys
+    }
+
+    fn write_keys(&self) -> &[WitnessKey] {
+        &self.write_keys
+    }
+
+    fn check_read_overlap(&self, write_key: &WitnessKey) -> bool {
+        self.read_keys
+            .iter()
+            .any(|k| witness_keys_overlap(k, write_key))
+    }
+
+    fn check_write_overlap(&self, read_key: &WitnessKey) -> bool {
+        self.write_keys
+            .iter()
+            .any(|k| witness_keys_overlap(k, read_key))
+    }
+
+    fn has_in_rw(&self) -> bool {
+        false
+    }
+
+    fn has_out_rw(&self) -> bool {
+        false
+    }
+
+    fn set_has_out_rw(&self, _val: bool) {}
+
+    fn set_has_in_rw(&self, _val: bool) {}
+
+    fn set_marked_for_abort(&self, _val: bool) {}
+}
+
+// ---------------------------------------------------------------------------
 // TransactionManager
 // ---------------------------------------------------------------------------
 
@@ -528,6 +636,19 @@ pub struct TransactionManager {
     /// transaction's `structural_pages` set commit cell deltas here, enabling
     /// concurrent writers on the same page to succeed when they modify different cells.
     cell_log: CellVisibilityLog,
+    /// SSI witness registry for the direct API (bd-gh-mvcc-ssi-wuupf / GH#189).
+    ///
+    /// Live read/write witness sets of currently-active, SSI-enabled concurrent
+    /// transactions, keyed by [`TxnId`]. Populated by the read/write entry
+    /// points and consumed by `commit_concurrent` edge discovery so the direct
+    /// `TransactionManager` API detects write-skew (dangerous rw-antidependency
+    /// structure) the same way the BEGIN CONCURRENT path does. Serialized
+    /// transactions never register here (zero overhead for SI/serialized txns).
+    ssi_active_witnesses: Mutex<HashMap<TxnId, ActiveWitness>>,
+    /// Bounded ring of recently committed witness sets (committed readers +
+    /// committed writers) feeding the committed-overlap inputs of edge
+    /// discovery. Capped at [`SSI_COMMITTED_WITNESS_CAP`] entries.
+    ssi_committed_witnesses: Mutex<Vec<CommittedWitness>>,
 }
 
 impl TransactionManager {
@@ -591,6 +712,8 @@ impl TransactionManager {
             snapshot_reuse_misses: AtomicU64::new(0),
             // Cell-level MVCC log: budget = 10% of typical 256MB page cache = ~25MB
             cell_log: CellVisibilityLog::new(25 * 1024 * 1024),
+            ssi_active_witnesses: Mutex::new(HashMap::new()),
+            ssi_committed_witnesses: Mutex::new(Vec::new()),
         }
     }
 
@@ -770,6 +893,11 @@ impl TransactionManager {
         // PRAGMA is per-connection and takes effect at BEGIN (not retroactive).
         txn.ssi_enabled_at_begin = self.ssi_enabled;
 
+        // bd-gh-mvcc-ssi-wuupf (GH#189): register the live witness set for
+        // SSI-enabled concurrent transactions so commit_concurrent can run
+        // real edge discovery.
+        self.ssi_witness_begin(&txn);
+
         // For Immediate/Exclusive: acquire serialized writer exclusion at BEGIN.
         if kind == BeginKind::Immediate || kind == BeginKind::Exclusive {
             if let Err(e) = self.acquire_serialized_writer_exclusion(txn_id) {
@@ -832,6 +960,7 @@ impl TransactionManager {
                 .and_then(|entry| entry.new_version.or(entry.old_version))
                 .unwrap_or(txn.snapshot.high);
             txn.record_page_read(pgno, tracked_version);
+            self.ssi_witness_record_read(txn, pgno);
             return Ok(Some(data));
         }
 
@@ -856,6 +985,7 @@ impl TransactionManager {
             return Ok(None);
         };
         txn.record_page_read(pgno, version.commit_seq);
+        self.ssi_witness_record_read(txn, pgno);
         Ok(Some(version.data))
     }
 
@@ -901,6 +1031,7 @@ impl TransactionManager {
             .max()
         {
             txn.record_page_read(pgno, committed_high);
+            self.ssi_witness_record_read(txn, pgno);
         }
         let materialized_snapshot = Snapshot::new(materialized_high, txn.snapshot.schema_epoch);
         let result = materialize_page(
@@ -932,6 +1063,7 @@ impl TransactionManager {
                 .resolve_visible_commit_seq(txn, page)
                 .unwrap_or(fallback_version);
             txn.record_page_read(page, version);
+            self.ssi_witness_record_read(txn, page);
         }
     }
 
@@ -959,6 +1091,7 @@ impl TransactionManager {
                     // SSI can reason about the scan footprint without a second
                     // resolve/tracking pass.
                     txn.record_page_read(page, txn.snapshot.high);
+                    self.ssi_witness_record_read(txn, page);
                 }
                 visible_pages.push((page, page_data));
             }
@@ -1198,6 +1331,10 @@ impl TransactionManager {
         // If no writes, just commit (read-only transaction). Cell-level
         // deltas are writes too, even when no full page image is staged.
         if txn.write_set.is_empty() && txn.write_set_data.is_empty() && !has_cell_deltas {
+            // Read-only fast path never runs commit_concurrent, so drop the
+            // live SSI witness here to avoid leaking the active entry
+            // (bd-gh-mvcc-ssi-wuupf / GH#189).
+            self.ssi_witness_forget(txn);
             txn.commit();
             self.release_all_resources(txn);
             return Ok(CommitSeq::ZERO);
@@ -1226,6 +1363,9 @@ impl TransactionManager {
 
         // Clear structural pages tracking
         txn.clear_structural_pages();
+
+        // bd-gh-mvcc-ssi-wuupf (GH#189): drop this txn's live SSI witness entry.
+        self.ssi_witness_forget(txn);
 
         txn.abort();
         self.release_all_resources(txn);
@@ -1329,6 +1469,204 @@ impl TransactionManager {
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // SSI witness registry maintenance (bd-gh-mvcc-ssi-wuupf / GH#189)
+    // -----------------------------------------------------------------------
+
+    /// Whether this transaction participates in direct-API SSI witness
+    /// tracking. Only SSI-enabled concurrent transactions do; serialized/SI
+    /// transactions skip all registry work.
+    fn ssi_witness_tracking_enabled(txn: &Transaction) -> bool {
+        txn.ssi_enabled_at_begin && txn.mode == TransactionMode::Concurrent
+    }
+
+    /// Register an empty witness set for a newly-begun SSI concurrent txn.
+    fn ssi_witness_begin(&self, txn: &Transaction) {
+        if !Self::ssi_witness_tracking_enabled(txn) {
+            return;
+        }
+        self.ssi_active_witnesses.lock().insert(
+            txn.txn_id,
+            ActiveWitness {
+                token: txn.token(),
+                begin_seq: txn.snapshot.high,
+                read_keys: HashSet::new(),
+                write_keys: HashSet::new(),
+            },
+        );
+    }
+
+    /// Record a page read into the txn's live witness set (idempotent).
+    fn ssi_witness_record_read(&self, txn: &Transaction, pgno: PageNumber) {
+        if !Self::ssi_witness_tracking_enabled(txn) {
+            return;
+        }
+        if let Some(w) = self.ssi_active_witnesses.lock().get_mut(&txn.txn_id) {
+            w.read_keys.insert(WitnessKey::Page(pgno));
+        }
+    }
+
+    /// Record a page write into the txn's live witness set (idempotent).
+    fn ssi_witness_record_write(&self, txn: &Transaction, pgno: PageNumber) {
+        if !Self::ssi_witness_tracking_enabled(txn) {
+            return;
+        }
+        if let Some(w) = self.ssi_active_witnesses.lock().get_mut(&txn.txn_id) {
+            w.write_keys.insert(WitnessKey::Page(pgno));
+        }
+    }
+
+    /// Drop a txn's active witness entry (abort / read-only finalization).
+    fn ssi_witness_forget(&self, txn: &Transaction) {
+        if !Self::ssi_witness_tracking_enabled(txn) {
+            return;
+        }
+        self.ssi_active_witnesses.lock().remove(&txn.txn_id);
+    }
+
+    /// Move a txn's active witness set into the bounded committed ring on a
+    /// successful concurrent publish, then drop the active entry.
+    fn ssi_witness_publish(&self, txn: &Transaction, commit_seq: CommitSeq) {
+        if !Self::ssi_witness_tracking_enabled(txn) {
+            return;
+        }
+        let entry = self.ssi_active_witnesses.lock().remove(&txn.txn_id);
+        let (begin_seq, read_keys, write_keys) = match entry {
+            Some(w) => (
+                w.begin_seq,
+                w.read_keys.into_iter().collect::<Vec<_>>(),
+                w.write_keys.into_iter().collect::<Vec<_>>(),
+            ),
+            None => (txn.snapshot.high, Vec::new(), Vec::new()),
+        };
+        // A committed txn with neither reads nor writes cannot participate in a
+        // future rw-antidependency edge, so there is nothing worth retaining.
+        if read_keys.is_empty() && write_keys.is_empty() {
+            return;
+        }
+        let mut committed = self.ssi_committed_witnesses.lock();
+        committed.push(CommittedWitness {
+            token: txn.token(),
+            begin_seq,
+            commit_seq,
+            read_keys,
+            write_keys,
+        });
+        // Bound the ring: drop the oldest entries (commit order ≈ push order).
+        let len = committed.len();
+        if len > SSI_COMMITTED_WITNESS_CAP {
+            committed.drain(0..len - SSI_COMMITTED_WITNESS_CAP);
+        }
+    }
+
+    /// Run the existing rw-antidependency edge discovery for a committing
+    /// concurrent transaction and populate its `has_in_rw` / `has_out_rw`
+    /// flags, so the pre-existing Step 1 pivot check in `commit_concurrent`
+    /// fires on genuine write-skew.
+    ///
+    /// This mirrors the BEGIN CONCURRENT path (`prepare_concurrent_commit_with_ssi`
+    /// → `discover_incoming_edges` / `discover_outgoing_edges`): it reuses the
+    /// SAME discovery functions and the SAME `ActiveTxnView` /
+    /// `CommittedReaderInfo` / `CommittedWriterInfo` types, assembled here from
+    /// the direct-API witness registry.
+    ///
+    /// Lock discipline: the registry mutexes are snapshotted (cloned) and
+    /// released BEFORE discovery runs, so no registry lock is held across the
+    /// discovery/commit path.
+    fn ssi_run_edge_discovery(&self, txn: &mut Transaction) {
+        let committing = txn.token();
+        let begin_seq = txn.snapshot.high;
+        // Upper bound on the committing txn's eventual commit sequence, used
+        // only as the interval end-point in the overlap test. Every concurrent
+        // active/committed witness has begin_seq ≤ the current committed
+        // watermark < this value, so genuinely concurrent transactions overlap.
+        // Using an upper bound never produces false negatives (missed edges);
+        // the real commit_seq is allocated later during publish.
+        let commit_seq = CommitSeq::new(self.shm.load_commit_seq().get().saturating_add(1));
+
+        // Snapshot the OTHER active witnesses, dropping the guard before doing
+        // any further work.
+        let active_views: Vec<WitnessTxnView> = {
+            let active = self.ssi_active_witnesses.lock();
+            active
+                .values()
+                .filter(|w| w.token != committing)
+                .map(|w| WitnessTxnView {
+                    token: w.token,
+                    begin_seq: w.begin_seq,
+                    read_keys: w.read_keys.iter().cloned().collect(),
+                    write_keys: w.write_keys.iter().cloned().collect(),
+                })
+                .collect()
+        };
+
+        // Snapshot the committed ring into committed-reader / committed-writer
+        // discovery inputs, again dropping the guard immediately.
+        let (committed_readers, committed_writers): (
+            Vec<CommittedReaderInfo>,
+            Vec<CommittedWriterInfo>,
+        ) = {
+            let committed = self.ssi_committed_witnesses.lock();
+            let committed_readers = committed
+                .iter()
+                .filter(|c| c.token != committing && !c.read_keys.is_empty())
+                .map(|c| CommittedReaderInfo {
+                    token: c.token,
+                    begin_seq: c.begin_seq,
+                    commit_seq: c.commit_seq,
+                    had_in_rw: false,
+                    keys: c.read_keys.clone(),
+                })
+                .collect();
+            let committed_writers = committed
+                .iter()
+                .filter(|c| c.token != committing && !c.write_keys.is_empty())
+                .map(|c| CommittedWriterInfo {
+                    token: c.token,
+                    commit_seq: c.commit_seq,
+                    had_out_rw: false,
+                    keys: c.write_keys.clone(),
+                })
+                .collect();
+            (committed_readers, committed_writers)
+        };
+
+        // The committing txn's own keys are authoritative from the Transaction
+        // itself (they include cell-delta commit writes recorded just above).
+        let write_keys: Vec<WitnessKey> = txn.write_keys.iter().cloned().collect();
+        let read_keys: Vec<WitnessKey> = txn.read_keys.iter().cloned().collect();
+
+        // The same active views serve as both candidate readers (checked via
+        // check_read_overlap) and candidate writers (check_write_overlap); the
+        // discovery functions filter by actual key overlap.
+        let active_refs: Vec<&dyn ActiveTxnView> = active_views
+            .iter()
+            .map(|v| v as &dyn ActiveTxnView)
+            .collect();
+
+        let in_edges = discover_incoming_edges(
+            committing,
+            begin_seq,
+            commit_seq,
+            &write_keys,
+            &active_refs,
+            &committed_readers,
+        );
+        let out_edges = discover_outgoing_edges(
+            committing,
+            begin_seq,
+            commit_seq,
+            &read_keys,
+            &active_refs,
+            &committed_writers,
+        );
+
+        // Mirror ssi_validate_and_publish lines 900-901: only OR the flags on,
+        // never clear a flag another path may have set.
+        txn.has_in_rw |= !in_edges.is_empty();
+        txn.has_out_rw |= !out_edges.is_empty();
+    }
 
     fn publish_shared_snapshot(&self, commit_seq: CommitSeq) {
         let snapshot = Snapshot::new(commit_seq, self.schema_epoch);
@@ -1446,6 +1784,9 @@ impl TransactionManager {
         self.ensure_serialized_write_exclusion(txn)?;
 
         txn.record_page_write(pgno, self.resolve_visible_commit_seq(txn, pgno));
+        // Serialized txns never register a witness (guard no-ops); kept for
+        // symmetry with the concurrent path.
+        self.ssi_witness_record_write(txn, pgno);
 
         // No page lock needed (mutex provides exclusion).
         // Track in write_set — check write_set_data (HashMap, O(1)) instead of
@@ -1494,6 +1835,7 @@ impl TransactionManager {
         }
 
         txn.record_page_write(pgno, self.resolve_visible_commit_seq(txn, pgno));
+        self.ssi_witness_record_write(txn, pgno);
 
         // Track in write_set — check write_set_data (HashMap, O(1)) instead of
         // write_set (Vec, O(n)) to avoid linear scan on repeated page writes.
@@ -1613,6 +1955,17 @@ impl TransactionManager {
         let pages = self.pending_commit_pages(txn);
         let snapshot_high = txn.snapshot.high;
 
+        // Step 0 (bd-gh-mvcc-ssi-wuupf / GH#189): run the existing rw-anti-
+        // dependency edge discovery so has_in_rw/has_out_rw reflect real reads
+        // and writes before the Step 1 pivot check below. Without this, the
+        // direct TransactionManager API left both flags at their begin-time
+        // default and Step 1 was dead, so classic write-skew (disjoint write
+        // sets) committed non-serializably. Guarded on SSI + concurrent so
+        // serialized/SI transactions pay nothing.
+        if Self::ssi_witness_tracking_enabled(txn) {
+            self.ssi_run_edge_discovery(txn);
+        }
+
         // Step 1: SSI validation — if dangerous structure, abort immediately.
         // Skipped when txn began with PRAGMA fsqlite.serializable = OFF (plain SI mode).
         if txn.ssi_enabled_at_begin && txn.has_dangerous_structure() {
@@ -1724,6 +2077,11 @@ impl TransactionManager {
         };
         self.txn_manager.finish_commit_seq(commit_seq);
         self.publish_shared_snapshot(commit_seq);
+        // bd-gh-mvcc-ssi-wuupf (GH#189): retire this txn's live witness set into
+        // the committed ring (with its real commit_seq) BEFORE release_all_resources
+        // clears txn.read_keys/txn.write_keys. Reads its keys from the registry
+        // entry, so ordering relative to release is otherwise irrelevant.
+        self.ssi_witness_publish(txn, commit_seq);
         txn.commit();
         self.release_all_resources(txn);
         self.post_commit_version_maintenance(&pages, snapshot_high, &chain_lens);
@@ -5960,21 +6318,72 @@ mod tests {
         // T2: reads P_B, writes P_A.
         let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
         let _ = m.read_page(&mut t2, pb).unwrap();
-        // t2 can't write P_A since page lock isn't held for reads, but
-        // we simulate the rw-antidependency flags as the witness plane would set them.
         m.write_page(&mut t2, pa, test_data(0x11)).unwrap();
 
-        // Simulate SSI flags that the witness plane would set:
-        // T1 has in_rw (T2 wrote P_A which T1 read) and out_rw (T1 wrote P_B which T2 read).
-        t1.has_in_rw = true;
-        t1.has_out_rw = true;
-
-        // T1 commit must fail due to dangerous structure.
+        // No mock: real edge discovery in commit_concurrent must populate
+        // T1's has_in_rw (T2 wrote P_A which T1 read) and has_out_rw (T1 wrote
+        // P_B which T2, still active, read), so Step 1 aborts the pivot.
+        // bd-gh-mvcc-ssi-wuupf / GH#189.
         let result = m.commit(&mut t1);
         assert_eq!(
             result.unwrap_err(),
             MvccError::BusySnapshot,
-            "write skew must be detected and aborted under SSI"
+            "write skew must be detected and aborted under SSI (real discovery)"
+        );
+    }
+
+    #[test]
+    fn test_ssi_write_skew_direct_api_no_mock_aborts_one() {
+        // bd-gh-mvcc-ssi-wuupf / GH#189: exercise the direct TransactionManager
+        // API end-to-end with NO hand-set flags. Classic write-skew with
+        // DISJOINT write sets:
+        //   T1 reads page A, writes page B.
+        //   T2 reads page B, writes page A.
+        // Real edge discovery in commit_concurrent must populate has_in_rw /
+        // has_out_rw so the Step 1 pivot check aborts exactly one transaction.
+        // Mirrors ssi_anomaly_tests::ssi_write_skew_balance_constraint_aborts_one_without_mock_edges.
+        let m = mgr();
+        assert!(m.ssi_enabled(), "SSI must be on by default");
+
+        let pa = PageNumber::new(1).unwrap();
+        let pb = PageNumber::new(2).unwrap();
+
+        // Seed both pages so the reads resolve to a committed version.
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, pa, test_data(0x10)).unwrap();
+        m.write_page(&mut setup, pb, test_data(0x20)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        // Two concurrent txns at the SAME post-setup snapshot.
+        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        // T1 reads A, writes B.
+        let _ = m.read_page(&mut t1, pa).unwrap();
+        m.write_page(&mut t1, pb, test_data(0x21)).unwrap();
+
+        // T2 reads B, writes A. Disjoint write sets (B vs A) — a plain
+        // first-committer-wins scheme would let BOTH commit non-serializably.
+        let _ = m.read_page(&mut t2, pb).unwrap();
+        m.write_page(&mut t2, pa, test_data(0x11)).unwrap();
+
+        // Commit both WITHOUT touching any SSI flag.
+        let r1 = m.commit(&mut t1);
+        let r2 = m.commit(&mut t2);
+
+        let committed = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        let aborted = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(MvccError::BusySnapshot)))
+            .count();
+
+        assert_eq!(
+            committed, 1,
+            "exactly one txn must commit (r1={r1:?}, r2={r2:?})"
+        );
+        assert_eq!(
+            aborted, 1,
+            "the other txn must get BusySnapshot via the real pivot abort (r1={r1:?}, r2={r2:?})"
         );
     }
 
@@ -6351,16 +6760,26 @@ mod tests {
             assert!(sum1 >= 0, "txn1 local constraint check must pass");
             assert!(sum2 >= 0, "txn2 local constraint check must pass");
 
-            // Under SSI, one of the two must abort to preserve the invariant.
-            let _ = m.commit(&mut t1).unwrap();
+            // No mock: real edge discovery (bd-gh-mvcc-ssi-wuupf / GH#189) must
+            // abort exactly one of the two write-skew pivots. The commit order
+            // is fixed (t1 then t2); whichever transaction commits while the
+            // other is still an overlapping active writer is the one that trips
+            // the Step 1 pivot check, so exactly one commits and one aborts.
+            let r1 = m.commit(&mut t1);
+            let r2 = m.commit(&mut t2);
 
-            // Simulate witness-plane discovery of the dangerous structure.
-            t2.has_in_rw = true;
-            t2.has_out_rw = true;
+            let committed = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+            let aborted = [&r1, &r2]
+                .iter()
+                .filter(|r| matches!(r, Err(MvccError::BusySnapshot)))
+                .count();
             assert_eq!(
-                m.commit(&mut t2).unwrap_err(),
-                MvccError::BusySnapshot,
-                "SSI must abort one writer to prevent write skew"
+                committed, 1,
+                "exactly one writer must commit (r1={r1:?}, r2={r2:?})"
+            );
+            assert_eq!(
+                aborted, 1,
+                "exactly one writer must abort as an SSI pivot (r1={r1:?}, r2={r2:?})"
             );
 
             // Verify global invariant preserved: final sum must be >= 0.
@@ -6412,13 +6831,9 @@ mod tests {
             m.write_page(&mut t1, pa, test_i64(a1 - 90)).unwrap();
             m.write_page(&mut t2, pb, test_i64(b2 - 90)).unwrap();
 
-            // Even if the witness plane marks the structure as dangerous, the
-            // per-txn PRAGMA snapshot should skip SSI validation entirely.
-            t1.has_in_rw = true;
-            t1.has_out_rw = true;
-            t2.has_in_rw = true;
-            t2.has_out_rw = true;
-
+            // No mock: the per-txn PRAGMA snapshot (serializable = OFF) skips
+            // SSI edge discovery entirely, so both commit and the SI anomaly is
+            // preserved. bd-gh-mvcc-ssi-wuupf / GH#189.
             let _ = m.commit(&mut t1).unwrap();
             let _ = m.commit(&mut t2).unwrap();
 
@@ -6463,10 +6878,9 @@ mod tests {
         let _ = m.read_page(&mut t2, pb).unwrap(); // T2 reads B
         m.write_page(&mut t2, pa, test_data(0x11)).unwrap(); // T2 writes A
 
-        // T1: in_rw (T2 writes A, which T1 read), out_rw (T1 writes B, which T2 read).
-        t1.has_in_rw = true;
-        t1.has_out_rw = true;
-
+        // No mock: real discovery gives T1 in_rw (T2, active, writes A which T1
+        // read) and out_rw (T1 writes B which T2 read), so T1 (the committing
+        // pivot) aborts. bd-gh-mvcc-ssi-wuupf / GH#189.
         let r1 = m.commit(&mut t1);
         assert_eq!(
             r1.unwrap_err(),
@@ -6504,16 +6918,10 @@ mod tests {
         let _ = m.read_page(&mut t3, p3).unwrap();
         m.write_page(&mut t3, p1, test_data(0x31)).unwrap();
 
-        // In a 3-way cycle, the "pivot" transactions have both edges.
-        // At page-SSI granularity, all three are pivots.
-        t1.has_in_rw = true;
-        t1.has_out_rw = true;
-        t2.has_in_rw = true;
-        t2.has_out_rw = true;
-        t3.has_in_rw = true;
-        t3.has_out_rw = true;
+        // No mock: real discovery in commit_concurrent detects the cycle
+        // T1→T2→T3→T1 at page-SSI granularity. bd-gh-mvcc-ssi-wuupf / GH#189.
 
-        // At least one must abort. With all having dangerous structure, all abort.
+        // At least one must abort.
         let mut aborted = 0_u32;
         if m.commit(&mut t1).is_err() {
             aborted += 1;
