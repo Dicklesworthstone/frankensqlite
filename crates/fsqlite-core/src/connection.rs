@@ -34559,7 +34559,7 @@ impl Connection {
                 // resolve on tables without an INTEGER PRIMARY KEY column. An
                 // ordinary UPDATE leaves the rowid unchanged, so the same rowid is
                 // passed as both OLD and NEW. (GH #205)
-                let trigger_rows = if has_before_update || has_after_update {
+                let mut trigger_rows = if has_before_update || has_after_update {
                     self.collect_update_trigger_rows_with_rowids(&effective_update, params)
                         .await?
                 } else {
@@ -34567,8 +34567,24 @@ impl Connection {
                 };
 
                 // Phase 5G.2 (bd-iqam): Fire BEFORE UPDATE triggers.
-                let skip_dml = if has_before_update {
-                    let mut skip = false;
+                //
+                // GH #177 (bd-gh-trigger-raise-ignore-row-skip-oit9m): a
+                // `RAISE(IGNORE)` raised from a BEFORE UPDATE trigger skips ONLY the
+                // current row — the remaining rows must still be updated. Fire the
+                // BEFORE triggers per row, keep the rows that did NOT raise IGNORE,
+                // then restrict the executed UPDATE (and the downstream FK actions /
+                // assignment freeze / AFTER triggers, which key off `trigger_rows`)
+                // to those rowids via a `rowid IN (<non-ignored>)` rewrite — instead
+                // of aborting the whole statement on the first IGNORE. Mirrors the
+                // BEFORE DELETE handling below. WITHOUT ROWID tables have no rowid to
+                // key the rewrite on, so they retain the historical statement-level
+                // skip semantics.
+                let mut update_where_rewritten = false;
+                if has_before_update {
+                    let is_rowid_table = !trigger_rows.is_empty()
+                        && trigger_rows.iter().all(|(rowid, _, _)| rowid.is_some());
+                    let mut non_ignored_rows = Vec::with_capacity(trigger_rows.len());
+                    let mut ignored_any = false;
                     for (row_rowid, old_values, new_values) in &trigger_rows {
                         if self
                             .fire_before_triggers(
@@ -34581,17 +34597,47 @@ impl Connection {
                             )
                             .await?
                         {
-                            skip = true;
-                            break;
+                            ignored_any = true;
+                            if !is_rowid_table {
+                                // No rowid to key a per-row rewrite on: preserve the
+                                // historical statement-level skip.
+                                self.reset_statement_change_count();
+                                return Ok(Vec::new());
+                            }
+                        } else {
+                            non_ignored_rows.push((
+                                *row_rowid,
+                                old_values.clone(),
+                                new_values.clone(),
+                            ));
                         }
                     }
-                    skip
-                } else {
-                    false
-                };
-                if skip_dml {
-                    self.reset_statement_change_count();
-                    return Ok(Vec::new());
+                    if ignored_any {
+                        if non_ignored_rows.is_empty() {
+                            // Every row raised IGNORE: the whole UPDATE is a no-op.
+                            self.reset_statement_change_count();
+                            return Ok(Vec::new());
+                        }
+                        let rowid_literals: Vec<Expr> = non_ignored_rows
+                            .iter()
+                            .filter_map(|(rowid, _, _)| {
+                                rowid.as_ref().map(|&i| {
+                                    Expr::Literal(Literal::Integer(i), fsqlite_ast::Span::new(0, 0))
+                                })
+                            })
+                            .collect();
+                        effective_update.where_clause = Some(Expr::In {
+                            expr: Box::new(Expr::Column(
+                                fsqlite_ast::ColumnRef::bare("rowid"),
+                                fsqlite_ast::Span::new(0, 0),
+                            )),
+                            not: false,
+                            set: fsqlite_ast::InSet::List(rowid_literals),
+                            span: fsqlite_ast::Span::new(0, 0),
+                        });
+                        trigger_rows = non_ignored_rows;
+                        update_where_rewritten = true;
+                    }
                 }
 
                 // SQLite computes the candidate NEW row before firing BEFORE
@@ -34650,7 +34696,9 @@ impl Connection {
 
                 let arc_prog;
                 let program: &VdbeProgram =
-                    if let Some(p) = precompiled.filter(|_| !froze_before_update_assignments) {
+                    if let Some(p) =
+                        precompiled.filter(|_| !froze_before_update_assignments && !update_where_rewritten)
+                    {
                         p
                     } else {
                         let plan_span = tracing::span!(
@@ -34822,7 +34870,7 @@ impl Connection {
                     fsqlite_ast::TriggerTiming::After,
                     &delete_event,
                 );
-                let trigger_old_rows = if has_before_delete || has_after_delete {
+                let mut trigger_old_rows = if has_before_delete || has_after_delete {
                     self.collect_delete_trigger_rows(&effective_delete, params)
                         .await?
                 } else {
@@ -34830,8 +34878,24 @@ impl Connection {
                 };
 
                 // Phase 5G.2 (bd-iqam): Fire BEFORE DELETE triggers.
-                let skip_dml = if has_before_delete {
-                    let mut skip = false;
+                //
+                // GH #177 (bd-gh-trigger-raise-ignore-row-skip-oit9m): a
+                // `RAISE(IGNORE)` raised from a BEFORE DELETE trigger skips ONLY the
+                // current row — the remaining rows must still be deleted. Fire the
+                // BEFORE triggers per row, keep the rows that did NOT raise IGNORE,
+                // then restrict the executed DELETE (and the downstream FK actions /
+                // AFTER triggers, which key off `trigger_old_rows`) to those rowids
+                // via a `rowid IN (<non-ignored>)` rewrite — instead of aborting the
+                // whole statement on the first IGNORE. The row set is the pre-scan
+                // snapshot in `trigger_old_rows`; IGNORE simply removes rows from it.
+                // WITHOUT ROWID tables have no rowid to key the rewrite on, so they
+                // retain the historical statement-level skip semantics.
+                let mut delete_where_rewritten = false;
+                if has_before_delete {
+                    let is_rowid_table = !trigger_old_rows.is_empty()
+                        && trigger_old_rows.iter().all(|(rowid, _)| rowid.is_some());
+                    let mut non_ignored_rows = Vec::with_capacity(trigger_old_rows.len());
+                    let mut ignored_any = false;
                     for (old_rowid, old_values) in &trigger_old_rows {
                         if self
                             .fire_before_triggers(
@@ -34844,17 +34908,46 @@ impl Connection {
                             )
                             .await?
                         {
-                            skip = true;
-                            break;
+                            ignored_any = true;
+                            if !is_rowid_table {
+                                // No rowid to key a per-row rewrite on: preserve the
+                                // historical statement-level skip.
+                                self.reset_statement_change_count();
+                                return Ok(Vec::new());
+                            }
+                        } else {
+                            non_ignored_rows.push((*old_rowid, old_values.clone()));
                         }
                     }
-                    skip
-                } else {
-                    false
-                };
-                if skip_dml {
-                    self.reset_statement_change_count();
-                    return Ok(Vec::new());
+                    if ignored_any {
+                        if non_ignored_rows.is_empty() {
+                            // Every row raised IGNORE: the whole DELETE is a no-op.
+                            self.reset_statement_change_count();
+                            return Ok(Vec::new());
+                        }
+                        let rowid_literals: Vec<Expr> = non_ignored_rows
+                            .iter()
+                            .filter_map(|(rowid, _)| {
+                                rowid.as_ref().map(|&i| {
+                                    Expr::Literal(Literal::Integer(i), fsqlite_ast::Span::new(0, 0))
+                                })
+                            })
+                            .collect();
+                        effective_delete.where_clause = Some(Expr::In {
+                            expr: Box::new(Expr::Column(
+                                fsqlite_ast::ColumnRef::bare("rowid"),
+                                fsqlite_ast::Span::new(0, 0),
+                            )),
+                            not: false,
+                            set: fsqlite_ast::InSet::List(rowid_literals),
+                            span: fsqlite_ast::Span::new(0, 0),
+                        });
+                        trigger_old_rows = non_ignored_rows;
+                        // The precompiled program was built for the ORIGINAL DELETE;
+                        // force a recompile so the `rowid IN (...)` restriction takes
+                        // effect (mirrors the UPDATE froze-assignments guard).
+                        delete_where_rewritten = true;
+                    }
                 }
 
                 // Validate FK constraints and retain the required actions before
@@ -34928,7 +35021,9 @@ impl Connection {
                 }
 
                 let arc_prog;
-                let program: &VdbeProgram = if let Some(p) = precompiled {
+                let program: &VdbeProgram = if let Some(p) =
+                    precompiled.filter(|_| !delete_where_rewritten)
+                {
                     p
                 } else {
                     let plan_span = tracing::span!(
