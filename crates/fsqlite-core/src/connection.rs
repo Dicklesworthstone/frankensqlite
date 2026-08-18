@@ -73795,7 +73795,7 @@ impl Connection {
             // argument or FILTER again while computing the aggregate would
             // duplicate UDF side effects and could choose a bare row that does
             // not correspond to the reported value.
-            let minmax_cache = if let Some((is_max, _)) = &minmax_bare_tracking {
+            let minmax_cache = if let Some((is_max, tracked_arg)) = &minmax_bare_tracking {
                 let expected_name = if *is_max { "max" } else { "min" };
                 let (descriptor_index, arg_col, arg_expr, filter, collation) = result_descriptors
                     .iter()
@@ -73817,11 +73817,14 @@ impl Connection {
                         )),
                         GroupByColumn::Plain(_) | GroupByColumn::Agg { .. } => None,
                     })
-                    .ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "{expected_name} bare-column tracking lost its aggregate descriptor"
-                        ))
-                    })?;
+                    // bd-0174u: when the tracked min()/max() is NESTED inside a
+                    // mixed output expression (e.g. `max(price) || name`), there is
+                    // no separate top-level Agg descriptor to borrow the argument,
+                    // filter, or collation from. Fall back to the argument the
+                    // detector captured; the extremum row is computed from it
+                    // directly below, and the nested aggregate itself is evaluated
+                    // within its Plain expression against that representative row.
+                    .unwrap_or_else(|| (usize::MAX, None, Some(tracked_arg), None, None));
 
                 let mut best: Option<(&Vec<SqliteValue>, usize)> = None;
                 let mut aggregate_values = Vec::with_capacity(group_rows.len());
@@ -73894,7 +73897,29 @@ impl Connection {
                             } else {
                                 expr
                             };
-                            let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                            // bd-0174u: when the single-min/max bare-column
+                            // optimization applies, bare columns nested in this
+                            // mixed output expression (for example
+                            // `max(price) || name`) must be sourced from the
+                            // extremum representative row, not the group's first
+                            // row. The group-aggregate evaluator reads
+                            // non-aggregate leaves from the first row it is
+                            // given, so present the representative row first. The
+                            // lone tracked min/max is order-independent, so this
+                            // reordering does not change its computed value.
+                            let refs: Vec<&Vec<SqliteValue>> = if minmax_bare_tracking
+                                .is_some()
+                                && let Some(repr) = repr_row
+                            {
+                                let mut ordered = Vec::with_capacity(group_rows.len());
+                                ordered.push(repr);
+                                ordered.extend(
+                                    group_rows.iter().filter(|row| !std::ptr::eq(*row, repr)),
+                                );
+                                ordered
+                            } else {
+                                group_rows.iter().collect()
+                            };
                             self.with_fallback_function_registry(|| {
                                 eval_group_agg_join_expr(effective, &refs, &col_map)
                             })?
@@ -87197,12 +87222,20 @@ fn frame_bound_has_expr(bound: &FrameBound, predicate: fn(&Expr) -> bool) -> boo
     }
 }
 
-/// bd-xplxa: Detect SQLite's "bare column tracks the min()/max() row" special
-/// case. It applies when a query's ONLY aggregate is a single `min(x)` or
-/// `max(x)` (one argument, no window spec) and at least one result column is a
-/// bare (un-grouped, non-aggregate) value. SQLite then sources every bare column
-/// from the row that produced the extremum rather than an arbitrary row.
-/// Returns `(is_max, arg_expr)` of that aggregate, or `None` otherwise.
+/// bd-xplxa / bd-0174u: Detect SQLite's "bare column tracks the min()/max() row"
+/// special case. It applies when a query's ONLY aggregate is a single `min(x)`
+/// or `max(x)` (one argument, no window spec) and at least one result column
+/// references a bare (un-grouped, non-aggregate) value. SQLite then sources
+/// every bare column from the row that produced the extremum rather than an
+/// arbitrary row. Returns `(is_max, arg_expr)` of that aggregate, or `None`.
+///
+/// bd-0174u: the aggregate and the bare column(s) may be nested together inside
+/// a single output expression (for example `max(price) || ':' || name`), not
+/// only appear as separate top-level result columns. Every result-column
+/// expression is walked in full: aggregates are tallied anywhere in the tree
+/// (there must be exactly one, a builtin `min`/`max` with one argument and no
+/// `OVER`), and a bare column reference anywhere outside that aggregate's
+/// argument (and not a GROUP BY key) satisfies the bare-column requirement.
 fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr)> {
     if !select.body.compounds.is_empty() {
         return None;
@@ -87222,48 +87255,196 @@ fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr)>
     if having.is_some() {
         return None;
     }
-    let mut minmax: Option<(bool, Expr)> = None;
-    let mut agg_count = 0usize;
-    let mut has_bare = false;
+    let mut state = MinMaxBareTrackingWalk::default();
     for col in columns {
         let ResultColumn::Expr { expr, .. } = col else {
             return None;
         };
-        match expr {
-            Expr::FunctionCall {
-                name,
-                args,
-                over: None,
-                ..
-            } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
-                agg_count += 1;
-                let arg = match args {
-                    FunctionArgs::List(a) if a.len() == 1 => &a[0],
-                    _ => return None,
-                };
-                let lname = name.to_ascii_lowercase();
-                if lname != "min" && lname != "max" {
-                    return None;
-                }
-                if minmax.is_some() {
-                    return None;
-                }
-                minmax = Some((lname == "max", arg.clone()));
+        walk_minmax_bare_tracking(expr, group_by, &mut state);
+        if state.bail {
+            return None;
+        }
+    }
+    if state.agg_count == 1 && state.has_bare {
+        state.minmax
+    } else {
+        None
+    }
+}
+
+/// Traversal state for [`select_minmax_bare_tracking`].
+#[derive(Default)]
+struct MinMaxBareTrackingWalk {
+    /// The single tracked `(is_max, arg_expr)` once its aggregate is found.
+    minmax: Option<(bool, Expr)>,
+    /// Count of aggregate function calls seen across all result columns.
+    agg_count: usize,
+    /// Whether a bare (non-aggregate, non-GROUP-BY) column reference was found.
+    has_bare: bool,
+    /// Set when a shape disqualifies the optimization (window function, a
+    /// second aggregate, or a non-min/max aggregate).
+    bail: bool,
+}
+
+/// Walk one result-column expression for [`select_minmax_bare_tracking`],
+/// tallying aggregates and bare column references into `state`.
+fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxBareTrackingWalk) {
+    if state.bail {
+        return;
+    }
+    // A subexpression that is exactly a GROUP BY key is a grouped value, not a
+    // bare column; do not descend into it.
+    if group_by.iter().any(|g| g == expr) {
+        return;
+    }
+    match expr {
+        Expr::Column(_, _) => {
+            state.has_bare = true;
+        }
+        // A window function disqualifies the optimization outright. (These
+        // queries are routed to the window pipeline elsewhere; bail defensively.)
+        Expr::FunctionCall { over: Some(_), .. } => {
+            state.bail = true;
+        }
+        // An aggregate function call. The optimization requires the query's ONLY
+        // aggregate to be a single builtin min()/max() with one argument.
+        Expr::FunctionCall { name, args, .. }
+            if is_agg_fn(name) && !is_scalar_max_min(name, args) =>
+        {
+            state.agg_count += 1;
+            if state.agg_count > 1 {
+                state.bail = true;
+                return;
             }
-            _ => {
-                if expr_has_aggregate(expr) {
-                    return None;
+            let arg = match args {
+                FunctionArgs::List(a) if a.len() == 1 => &a[0],
+                _ => {
+                    state.bail = true;
+                    return;
                 }
-                if !group_by.iter().any(|g| g == expr) {
-                    has_bare = true;
+            };
+            let lname = name.to_ascii_lowercase();
+            if lname != "min" && lname != "max" {
+                state.bail = true;
+                return;
+            }
+            state.minmax = Some((lname == "max", arg.clone()));
+            // Do NOT descend into the aggregate argument: its column references
+            // belong to the aggregate, not to the bare-column set. A nested
+            // aggregate there is a "misuse of aggregate" that other paths reject.
+        }
+        // Any other expression (scalar function, operator, CASE, ...): descend
+        // into children so nested aggregates and bare columns are counted.
+        _ => {
+            walk_minmax_bare_tracking_children(expr, group_by, state);
+        }
+    }
+}
+
+/// Recurse into the child sub-expressions of `expr` for
+/// [`walk_minmax_bare_tracking`].
+fn walk_minmax_bare_tracking_children(
+    expr: &Expr,
+    group_by: &[Expr],
+    state: &mut MinMaxBareTrackingWalk,
+) {
+    match expr {
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let FunctionArgs::List(exprs) = args {
+                for e in exprs {
+                    walk_minmax_bare_tracking(e, group_by, state);
+                }
+            }
+            for term in order_by {
+                walk_minmax_bare_tracking(&term.expr, group_by, state);
+            }
+            if let Some(f) = filter.as_deref() {
+                walk_minmax_bare_tracking(f, group_by, state);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            walk_minmax_bare_tracking(left, group_by, state);
+            walk_minmax_bare_tracking(right, group_by, state);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => {
+            walk_minmax_bare_tracking(inner, group_by, state);
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            walk_minmax_bare_tracking(inner, group_by, state);
+            walk_minmax_bare_tracking(low, group_by, state);
+            walk_minmax_bare_tracking(high, group_by, state);
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            walk_minmax_bare_tracking(inner, group_by, state);
+            if let InSet::List(values) = set {
+                for v in values {
+                    walk_minmax_bare_tracking(v, group_by, state);
                 }
             }
         }
-    }
-    if agg_count == 1 && has_bare {
-        minmax
-    } else {
-        None
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            walk_minmax_bare_tracking(inner, group_by, state);
+            walk_minmax_bare_tracking(pattern, group_by, state);
+            if let Some(e) = escape.as_deref() {
+                walk_minmax_bare_tracking(e, group_by, state);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(o) = operand.as_deref() {
+                walk_minmax_bare_tracking(o, group_by, state);
+            }
+            for (w, t) in whens {
+                walk_minmax_bare_tracking(w, group_by, state);
+                walk_minmax_bare_tracking(t, group_by, state);
+            }
+            if let Some(e) = else_expr.as_deref() {
+                walk_minmax_bare_tracking(e, group_by, state);
+            }
+        }
+        Expr::JsonAccess { expr: inner, path, .. } => {
+            walk_minmax_bare_tracking(inner, group_by, state);
+            walk_minmax_bare_tracking(path, group_by, state);
+        }
+        Expr::RowValue(values, _) => {
+            for v in values {
+                walk_minmax_bare_tracking(v, group_by, state);
+            }
+        }
+        // Leaves and opaque sub-expressions: a subquery/EXISTS is not a bare
+        // column of this query, and other paths handle those shapes. (Column is
+        // handled by the caller before dispatching here.)
+        Expr::Column(_, _)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Exists { .. }
+        | Expr::Subquery(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => {}
     }
 }
 
