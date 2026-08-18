@@ -2782,8 +2782,25 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     Some(SqliteValue::Null) | None => String::new(),
                     Some(v) => v.to_text(),
                 };
-                if let Some(c) = text.chars().next() {
+                // Field width applies, counted in CHARACTERS: the single emitted
+                // char is one width unit regardless of its byte length (unlike
+                // %s, which counts bytes), and the '0' flag is ignored — padding
+                // is always spaces, right- or left-justified (bd-ul4c0). An empty
+                // argument emits no char but is still padded to width.
+                let ch = text.chars().next();
+                let pad = width.saturating_sub(usize::from(ch.is_some()));
+                if !left_align {
+                    for _ in 0..pad {
+                        result.push(' ');
+                    }
+                }
+                if let Some(c) = ch {
                     result.push(c);
+                }
+                if left_align {
+                    for _ in 0..pad {
+                        result.push(' ');
+                    }
                 }
             }
             _ => {
@@ -5285,6 +5302,39 @@ mod tests {
         assert_eq!(fmt("%g", 1000000.0), "1e+06");
         assert_eq!(fmt("%g", 1234560.0), "1.23456e+06");
         assert_eq!(fmt("%G", 1000000.0), "1E+06");
+    }
+
+    #[test]
+    fn test_format_c_field_width_bd_ul4c0() {
+        // bd-ul4c0: printf %c honors field width, counted in CHARACTERS — the
+        // single emitted char is one width unit regardless of byte length
+        // (unlike %s, which counts bytes) — padded with spaces (the '0' flag is
+        // ignored), right- or left-justified. %c still emits the FIRST char of
+        // the argument's text form (bd-47mu0). Oracle-verified vs sqlite3 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: SqliteValue| -> String {
+            match f
+                .invoke(&[SqliteValue::Text(SmallText::from_string(spec)), v])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        // The bug: %c emitted the char but ignored field width entirely.
+        assert_eq!(fmt(">%3c<", SqliteValue::Integer(65)), ">  6<");
+        assert_eq!(fmt(">%-3c<", SqliteValue::Integer(65)), ">6  <");
+        // First char of the text form, then width padding.
+        assert_eq!(fmt(">%5c<", txt("abc")), ">    a<");
+        assert_eq!(fmt(">%-5c<", txt("abc")), ">a    <");
+        // The '0' flag does NOT zero-pad %c; padding stays spaces.
+        assert_eq!(fmt(">%03c<", SqliteValue::Integer(65)), ">  6<");
+        // Width counts CHARACTERS, not bytes: 'é' (2 UTF-8 bytes) is one unit.
+        assert_eq!(fmt(">%3c<", txt("é")), ">  é<");
+        // No width => just the first char (regression guard for bd-47mu0).
+        assert_eq!(fmt(">%c<", SqliteValue::Integer(65)), ">6<");
+        assert_eq!(fmt(">%c<", txt("abc")), ">a<");
     }
 
     #[test]
