@@ -3842,6 +3842,160 @@ mod tests {
         conn.close_sync().expect("close should succeed");
     }
 
+    // A recursive-CTE `count(*)` keeps the VDBE opcode loop busy across many
+    // `VDBE_EXECUTION_CHECKPOINT_INTERVAL` (4096-opcode) boundaries, so a
+    // relayed cancellation is observed within a few thousand opcodes rather
+    // than only after the whole count finishes. Modest bound keeps a regressed
+    // (never-interrupted) run and its detached worker short.
+    #[cfg(test)]
+    const GH306_LONG_RUNNING_QUERY: &str = "WITH RECURSIVE c(x) AS (\
+         SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 50000000\
+         ) SELECT count(*) FROM c";
+
+    /// GH#306 (bd-zdf85) crux: once a command has been admitted AND the worker
+    /// has actually begun executing it, cancelling the caller `Cx` must
+    /// interrupt the *in-flight* database operation — the per-operation cancel
+    /// relay reaches the worker's `execution_cx`, whose opcode-loop checkpoint
+    /// returns `Abort`, which the caller observes as `Interrupt`. The defect the
+    /// issue describes is the opposite: the worker runs the operation to
+    /// completion while the caller merely stops awaiting. This test proves the
+    /// running operation is genuinely interrupted.
+    #[test]
+    fn inflight_cancellation_interrupts_running_worker_operation() {
+        let runtime = test_runtime();
+        let conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
+        let cx = Cx::new();
+
+        let (outcome, interrupt_latency) = runtime.block_on(async {
+            let preflight = preflight_async_call(&cx).expect("preflight should succeed");
+            let (tx, mut rx, operation) = async_operation_response_channel::<Vec<Row>>();
+            conn.sender()
+                .expect("worker sender")
+                .send_async(
+                    &preflight,
+                    Command::Query {
+                        sql: GH306_LONG_RUNNING_QUERY.to_owned(),
+                        tx,
+                    },
+                )
+                .await
+                .expect("query command should be admitted");
+
+            // `OperationControl::run` publishes `Running` before it enters the
+            // engine, so observing it proves the operation is in-flight, not
+            // merely queued behind a busy worker.
+            let running_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while operation.phase.load(Ordering::Acquire) != OperationPhase::Running as u8 {
+                assert!(
+                    std::time::Instant::now() < running_deadline,
+                    "worker never began executing the long-running operation"
+                );
+                future::yield_now().await;
+            }
+            assert_ne!(
+                operation.phase.load(Ordering::Acquire),
+                OperationPhase::Completed as u8,
+                "the long operation must still be running at the moment we cancel"
+            );
+
+            // Cancel the caller AFTER the operation is in-flight.
+            let cancelled_at = std::time::Instant::now();
+            cx.cancel();
+
+            // Bound the wait so a regression (relay ignored, operation runs to
+            // completion) fails on a fixed wall clock instead of hanging.
+            let receive = recv_async_operation_response(&preflight, &mut rx, operation);
+            let deadline = async {
+                let stop = std::time::Instant::now() + Duration::from_secs(10);
+                while std::time::Instant::now() < stop {
+                    future::yield_now().await;
+                }
+            };
+            let outcome = future::or(async { Some(receive.await) }, async {
+                deadline.await;
+                None
+            })
+            .await;
+            (outcome, cancelled_at.elapsed())
+        });
+
+        match outcome {
+            Some(result) => assert!(
+                matches!(result, Err(FrankenError::Interrupt)),
+                "in-flight cancellation must interrupt the running operation (got \
+                 {result:?}); any completed result means the worker ran to \
+                 completion instead of honoring the relayed cancel (GH#306)"
+            ),
+            None => test_panic(
+                "in-flight cancellation did not interrupt the running worker \
+                 operation within 10s (GH#306 regression: cancel not relayed to \
+                 the execution context)",
+            ),
+        }
+        assert!(
+            interrupt_latency < Duration::from_secs(10),
+            "cancellation should interrupt the in-flight operation promptly, took \
+             {interrupt_latency:?}"
+        );
+
+        // The worker aborted its operation and returned to the command loop, so
+        // Drop's non-blocking detach is clean.
+        drop(conn);
+    }
+
+    /// GH#306 (bd-zdf85) Drop claim: dropping an `AsyncConnection` whose worker
+    /// is actively running an operation must NOT block for the operation's
+    /// duration. `Drop` sends `Shutdown`, drops the command sender, and drops
+    /// the `std::thread::JoinHandle` — which detaches rather than joins — so it
+    /// returns promptly while the detached worker finishes its single terminal
+    /// cleanup path on its own thread.
+    #[test]
+    fn drop_with_worker_mid_operation_does_not_block() {
+        let runtime = test_runtime();
+        let conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
+        let cx = Cx::new();
+
+        let drop_latency = runtime.block_on(async move {
+            let preflight = preflight_async_call(&cx).expect("preflight should succeed");
+            // The response is intentionally abandoned: this test exercises Drop
+            // while the worker is mid-operation, not the response path.
+            let (tx, _rx, operation) = async_operation_response_channel::<Vec<Row>>();
+            conn.sender()
+                .expect("worker sender")
+                .send_async(
+                    &preflight,
+                    Command::Query {
+                        sql: GH306_LONG_RUNNING_QUERY.to_owned(),
+                        tx,
+                    },
+                )
+                .await
+                .expect("query command should be admitted");
+
+            let running_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while operation.phase.load(Ordering::Acquire) != OperationPhase::Running as u8 {
+                assert!(
+                    std::time::Instant::now() < running_deadline,
+                    "worker never began executing the long-running operation"
+                );
+                future::yield_now().await;
+            }
+
+            // Drop the connection while the worker is mid-operation and measure
+            // how long Drop takes. It must be near-instant (detach), never the
+            // multi-second operation duration.
+            let started = std::time::Instant::now();
+            drop(conn);
+            started.elapsed()
+        });
+
+        assert!(
+            drop_latency < Duration::from_secs(1),
+            "Drop with a worker mid-operation must not block on the operation; \
+             took {drop_latency:?} (GH#306: 'Drop can then block indefinitely')"
+        );
+    }
+
     #[test]
     fn transaction_state_is_worker_published_when_response_is_abandoned() {
         let mut conn = AsyncConnection::open_sync(":memory:").expect("open should succeed");
