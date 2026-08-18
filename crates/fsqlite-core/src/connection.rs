@@ -33748,6 +33748,32 @@ impl Connection {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
                     }
                     Ok(rows)
+                } else if where_should_route_to_fallback_for_shortcircuit(self, select) {
+                    // bd-lryih P10: a non-correlated, non-VDBE-lowerable subquery
+                    // sitting in a short-circuitable WHERE position (operand of
+                    // AND/OR/NOT) must be filtered through eval_expr_truthiness so
+                    // `NULL AND E` / `0 AND E` absorb E without executing it —
+                    // matching stock. The VDBE branch below reaches this via
+                    // rewrite_subqueries -> rewrite_in_expr, which EAGERLY executes
+                    // the uncorrelated subquery and errors before any short-circuit.
+                    // Route to execute_join_select, whose per-row WHERE filter
+                    // short-circuits with correct polarity. CRITICAL: bind
+                    // placeholders only — do NOT call rewrite_in_subqueries_select
+                    // here (it would re-trigger the eager execution we are avoiding).
+                    self.log_mem_execution_fallback("select", "where_shortcircuit_subquery_fallback")?;
+                    let mut bound = bind_placeholders_in_select_for_fallback(select, params)?;
+                    let limit_clause = bound.limit.take();
+                    if limit_clause
+                        .as_ref()
+                        .is_some_and(bound_limit_clause_is_constant_zero)
+                    {
+                        return Ok(Vec::new());
+                    }
+                    let mut rows = self.execute_join_select(&bound, None).await?;
+                    if let Some(limit) = limit_clause {
+                        self.apply_limit_clause(&mut rows, &limit, None)?;
+                    }
+                    Ok(rows)
                 } else {
                     let arc_prog;
                     let program: &VdbeProgram = if let Some(p) = precompiled {
@@ -34953,6 +34979,18 @@ impl Connection {
             && !statement_requires_in_table_name_rewrite(statement)
             && !has_flattenable_derived_table
             && !has_update_from_subquery
+        {
+            return Ok(Cow::Borrowed(statement));
+        }
+        // bd-lryih P10: a single-table SELECT whose WHERE holds a non-correlated,
+        // non-VDBE-lowerable subquery in a short-circuitable position (`NULL AND E`)
+        // must NOT be eager-rewritten here — `rewrite_in_expr` would execute the
+        // subquery at prepare time and error, defeating stock's short-circuit.
+        // Leave it un-rewritten so the execute dispatch routes it to
+        // `execute_join_select`, whose per-row `eval_expr_truthiness` short-circuits
+        // it with correct polarity.
+        if let Statement::Select(select) = statement
+            && where_should_route_to_fallback_for_shortcircuit(self, select)
         {
             return Ok(Cow::Borrowed(statement));
         }
@@ -95040,6 +95078,96 @@ fn correlated_exists_matches_count_semijoin_shape(
     // matching `extract_exists_rowid_probe` + the recognizer's single-residual
     // ceiling.
     correlated_probe_terms == 1 && residual_terms <= 1
+}
+
+// bd-lryih P10: a subquery matches iff it is exactly what the eager prepare-time
+// rewrite would execute (non-correlated) AND cannot be lowered by native VDBE
+// codegen (e.g. a `json_each(...)`-sourced subquery). Those are the subqueries
+// whose eager execution diverges from stock when they sit in a short-circuitable
+// WHERE position; routing to the semantic fallback lets `eval_expr_truthiness`
+// short-circuit them per-row instead of executing them at prepare time.
+fn subquery_is_noncorrelated_nonlowerable(subquery: SubqueryExprRef<'_>, conn: &Connection) -> bool {
+    match subquery {
+        SubqueryExprRef::Scalar(inner) => {
+            !rewrite_probe_is_correlated(conn, inner)
+                && !scalar_subquery_supported_by_vdbe(inner, conn)
+        }
+        SubqueryExprRef::Exists(inner) => {
+            !rewrite_probe_is_correlated(conn, inner)
+                && !exists_subquery_supported_by_vdbe(inner, conn)
+        }
+        SubqueryExprRef::In(inner) => {
+            !rewrite_probe_is_correlated(conn, inner)
+                && !in_subquery_supported_by_vdbe(inner, conn)
+        }
+    }
+}
+
+// bd-lryih P10: true iff `select` is a plain single-table SELECT whose WHERE holds
+// a `subquery_is_noncorrelated_nonlowerable` subquery in a short-circuitable
+// position (reachable through an AND/OR/NOT connective). Such a query errors on
+// the VDBE path (rewrite_in_expr eagerly executes the subquery) though stock
+// short-circuits it (`NULL AND E`, `0 AND E`), so route it to execute_join_select
+// whose per-row `eval_expr_truthiness` short-circuits with correct polarity.
+fn where_should_route_to_fallback_for_shortcircuit(
+    conn: &Connection,
+    select: &SelectStatement,
+) -> bool {
+    let SelectCore::Select {
+        from: Some(from),
+        where_clause: Some(where_expr),
+        group_by,
+        having,
+        ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    // Defensive: earlier cascade branches already peel joins / subquery sources /
+    // table-function sources / aggregates / windows; keep this to the plain
+    // single-table shape execute_join_select handles cleanly.
+    if !from.joins.is_empty()
+        || !matches!(from.source, TableOrSubquery::Table { .. })
+        || !group_by.is_empty()
+        || having.is_some()
+    {
+        return false;
+    }
+    // Short-circuitable position = under an AND/OR/NOT connective. A subquery that
+    // is the sole WHERE leaf or only under value/comparison operators is always
+    // evaluated by stock and already handled correctly on the VDBE path, so we
+    // leave those there.
+    fn walk(conn: &Connection, e: &Expr) -> bool {
+        match e {
+            Expr::BinaryOp {
+                op: BinaryOp::And | BinaryOp::Or,
+                left,
+                right,
+                ..
+            } => {
+                expr_contains_subquery_matching_deep(
+                    left,
+                    conn,
+                    subquery_is_noncorrelated_nonlowerable,
+                ) || expr_contains_subquery_matching_deep(
+                    right,
+                    conn,
+                    subquery_is_noncorrelated_nonlowerable,
+                )
+            }
+            Expr::UnaryOp {
+                op: UnaryOp::Not,
+                expr: inner,
+                ..
+            } => expr_contains_subquery_matching_deep(
+                inner,
+                conn,
+                subquery_is_noncorrelated_nonlowerable,
+            ),
+            _ => false,
+        }
+    }
+    walk(conn, where_expr)
 }
 
 fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -> bool {
