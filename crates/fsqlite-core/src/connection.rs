@@ -122737,11 +122737,39 @@ impl<'a> SelectStructureResolver<'a> {
             }
         }
 
+        // fts5 `rank` / `bm25(<tbl>)` in ORDER BY resolve at execution via the
+        // fts5 auxiliary-scoring context (which promotes a lazy table), NOT
+        // against `col_map`. Collect the live-fts5 source labels so those terms
+        // bypass column-name resolution here — otherwise `ORDER BY rank` is
+        // rejected at prepare with "no such column: rank" and never reaches the
+        // executor that already handles it (bd-fts5-lazy-shadow-reads-itcc4.3).
+        #[cfg(feature = "ext-fts5")]
+        let fts5_rank_names: Vec<&str> = from
+            .as_ref()
+            .map(|from_clause| {
+                std::iter::once(&from_clause.source)
+                    .chain(from_clause.joins.iter().map(|join| &join.table))
+                    .filter_map(|source| match source {
+                        TableOrSubquery::Table { name, alias, .. }
+                            if self.connection.has_live_fts5_instance(&name.name) =>
+                        {
+                            Some(alias.as_deref().unwrap_or(&name.name))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         for (index, term) in select.order_by.iter().enumerate() {
             if self.order_term_records_ordinal(term, index, output_width)? {
                 continue;
             }
             if resolve_order_term_idx(&term.expr, columns).is_some() {
+                continue;
+            }
+            #[cfg(feature = "ext-fts5")]
+            if expr_needs_fts5_aux_context(&term.expr, &fts5_rank_names) {
                 continue;
             }
             self.validate_order_expr(
