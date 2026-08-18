@@ -89,9 +89,10 @@ use fsqlite_ext_fts5::{
     FTS5_AVERAGES_ROWID, FTS5_STRUCTURE_ROWID, Fts5AveragesRecord, Fts5DataRowid, Fts5DeletedDoc,
     Fts5DocsizeRow, Fts5Expr, Fts5HighlightFunc, Fts5IdxRow, Fts5MergeScheduler, Fts5OnDiskReader,
     Fts5ScoreSnapshot, Fts5ShadowRows, Fts5SnippetFunc, Fts5StructureLevel, Fts5StructureRecord,
-    Fts5StructureSegment, Fts5Table, Fts5TombstonePage, build_expr, collect_merged_term_groups,
-    decode_docsize_blob, encode_contentless_delete_all_flush, encode_incremental_delete_flush,
-    encode_merged_segment, highlight as fts5_highlight, parse_fts5_query,
+    Fts5StructureSegment, Fts5Table, Fts5TombstonePage, Fts5VocabTable, Fts5VocabType, build_expr,
+    build_fts5vocab_rows, collect_merged_term_groups, decode_docsize_blob,
+    encode_contentless_delete_all_flush, encode_incremental_delete_flush, encode_merged_segment,
+    fts5vocab_module_factory, highlight as fts5_highlight, main_index_term_groups, parse_fts5_query,
     resolve_tombstone_target_segment, snippet as fts5_snippet,
 };
 #[cfg(feature = "ext-json")]
@@ -4429,6 +4430,8 @@ fn shared_default_vtab_module_registry() -> &'static HashMap<String, Arc<dyn Vta
             "FTS5".to_owned(),
             Arc::new(module_factory_from::<Fts5Table>()),
         );
+        #[cfg(feature = "ext-fts5")]
+        modules.insert("FTS5VOCAB".to_owned(), Arc::new(fts5vocab_module_factory()));
         #[cfg(feature = "ext-json")]
         modules.insert(
             "JSON_EACH".to_owned(),
@@ -18846,6 +18849,25 @@ impl Connection {
         let key = src.table_name.to_ascii_uppercase();
         let num_cols = src.col_names.len();
 
+        // fts5vocab tables expose the vocabulary of ANOTHER fts5 table. They are
+        // read from the source table's storage here (the generic cursor has no
+        // access to it), before the generic and fts5 lazy paths.
+        #[cfg(feature = "ext-fts5")]
+        {
+            let vocab = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5VocabTable>())
+                    .map(|vocab| (vocab.source_table().to_owned(), vocab.vocab_type()))
+            };
+            if let Some((source_table, vocab_type)) = vocab {
+                return self
+                    .scan_fts5vocab_rows(src, &source_table, vocab_type)
+                    .await;
+            }
+        }
+
         // FTS5 tables are answered without the generic cursor: either lazily by
         // point-reading on-disk segments (reopened `_data`-backed index) or from
         // the in-memory/shadow-bound table state. Handle them here so a lazy
@@ -18917,6 +18939,129 @@ impl Connection {
         }
 
         Ok(rows)
+    }
+
+    /// Produce the vocabulary rows for an `fts5vocab` table that references
+    /// `source_table`. The source FTS5 table's storage is read directly: its
+    /// in-memory/shadow-bound state synchronously, or its persisted segments via
+    /// the lazy on-disk reader. Rows are projected to the query's requested
+    /// column width and carry a 1-based rowid (matching stock, which numbers
+    /// vocabulary rows sequentially in scan order).
+    #[cfg(feature = "ext-fts5")]
+    async fn scan_fts5vocab_rows(
+        &self,
+        src: &JoinTableSource,
+        source_table: &str,
+        vocab_type: Fts5VocabType,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let source_key = source_table.to_ascii_uppercase();
+
+        // Snapshot the source's column names and mode without holding the
+        // instance borrow across the (possible) async reader below.
+        let source_meta = {
+            let instances = self.vtab_instances.borrow();
+            instances
+                .get(&source_key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .map(|fts5| (fts5.columns().to_vec(), fts5.is_lazy_on_disk()))
+        };
+        let Some((source_columns, is_lazy)) = source_meta else {
+            return Err(FrankenError::function_error(format!(
+                "no such fts5 table: {source_table}"
+            )));
+        };
+
+        let groups = if is_lazy {
+            self.with_lazy_fts5_reader(source_table, async |reader| {
+                let structure = match reader.read_data_block(FTS5_STRUCTURE_ROWID).await? {
+                    Some(block) => Fts5StructureRecord::decode(&block)?,
+                    None => return Ok(Vec::new()),
+                };
+                let raw = collect_merged_term_groups(reader, &structure).await?;
+                Ok(main_index_term_groups(raw))
+            })
+            .await?
+        } else {
+            let instances = self.vtab_instances.borrow();
+            let fts5 = instances
+                .get(&source_key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .ok_or_else(|| {
+                    FrankenError::function_error(format!("no such fts5 table: {source_table}"))
+                })?;
+            fts5.vocab_term_groups()?
+        };
+
+        let vocab_rows = build_fts5vocab_rows(vocab_type, &groups, &source_columns);
+
+        let num_cols = src.col_names.len();
+        Ok(vocab_rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, values)| {
+                let mut row: Vec<SqliteValue> = values.into_iter().take(num_cols).collect();
+                while row.len() < num_cols {
+                    row.push(SqliteValue::Null);
+                }
+                if src.hidden_rowid_projection.is_some() {
+                    let rowid = i64::try_from(index)
+                        .ok()
+                        .and_then(|value| value.checked_add(1))
+                        .unwrap_or(i64::MAX);
+                    row.push(SqliteValue::Integer(rowid));
+                }
+                row
+            })
+            .collect())
+    }
+
+    /// Reconstruct a virtual table's column schema from its registered module
+    /// during a schema reload from `sqlite_master`.
+    ///
+    /// For modules whose `USING` arguments are NOT column declarations (e.g.
+    /// `fts5vocab(source, type)`, which declares `(term, doc, cnt)` regardless of
+    /// its args), the columns cannot be recovered by parsing the DDL. Ask the
+    /// module factory for its schema instead, exactly as `CREATE VIRTUAL TABLE`
+    /// does. Returns `None` when no module is registered or the factory reports
+    /// no columns (e.g. FTS5, whose args ARE its columns) so the caller falls
+    /// back to DDL parsing.
+    fn virtual_table_reload_column_infos(
+        &self,
+        create_stmt: &fsqlite_ast::CreateVirtualTableStatement,
+    ) -> Option<Vec<ColumnInfo>> {
+        let module_key = create_stmt.module.to_ascii_uppercase();
+        let factory = self.vtab_modules.borrow().get(&module_key).cloned()?;
+        let mut full_args = vec![
+            create_stmt.module.clone(),
+            "main".to_owned(),
+            create_stmt.name.name.clone(),
+        ];
+        full_args.extend(create_stmt.args.iter().cloned());
+        let refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
+        let factory_columns = factory.column_info(&refs);
+        if factory_columns.is_empty() {
+            return None;
+        }
+        // When the DDL args already declare these column names (e.g. rtree,
+        // whose `USING rtree(id, minx, ...)` args ARE its columns), the normal
+        // DDL-arg parse already recovers the correct schema, so leave the reload
+        // untouched — otherwise this would override rtree/fts5 column affinities
+        // from the factory. Only override when the args are NOT a column list
+        // (e.g. fts5vocab's `'src','type'`), which the DDL parse mis-reads as
+        // columns.
+        let declared_names: Vec<String> =
+            parse_declared_virtual_table_column_infos(&create_stmt.args)
+                .iter()
+                .map(|column| column.name.to_ascii_lowercase())
+                .collect();
+        let factory_names: Vec<String> = factory_columns
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        if declared_names == factory_names {
+            return None;
+        }
+        Some(resolve_virtual_table_column_infos(Vec::new(), factory_columns))
     }
 
     fn try_execute_plain_live_vtab_count_star(
@@ -86024,9 +86169,11 @@ impl Connection {
                     let parsed_vtab =
                         self.parse_stored_schema_statement_cached(&create_sql, schema_cookie);
                     let columns = match parsed_vtab {
-                        Ok(Statement::CreateVirtualTable(create_stmt)) => {
-                            parse_virtual_table_column_infos(&create_stmt.args)
-                        }
+                        Ok(Statement::CreateVirtualTable(create_stmt)) => self
+                            .virtual_table_reload_column_infos(&create_stmt)
+                            .unwrap_or_else(|| {
+                                parse_virtual_table_column_infos(&create_stmt.args)
+                            }),
                         _ => {
                             crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql)
                         }
@@ -86048,9 +86195,22 @@ impl Connection {
                 // Parse the CREATE TABLE to extract column info.
                 let parsed_table =
                     self.parse_stored_schema_statement_cached(&create_sql, schema_cookie);
-                let parsed_create_table = match parsed_table {
-                    Ok(Statement::CreateTable(create_stmt)) => Some(create_stmt),
+                let parsed_create_table = match &parsed_table {
+                    Ok(Statement::CreateTable(create_stmt)) => Some(create_stmt.clone()),
                     _ => None,
+                };
+                // A materialized (root_page > 0) virtual table with a registered
+                // module whose args are not column declarations (e.g. fts5vocab)
+                // must recover its schema from the module, not the DDL args.
+                let vtab_factory_columns = if is_virtual_sql {
+                    match &parsed_table {
+                        Ok(Statement::CreateVirtualTable(create_stmt)) => {
+                            self.virtual_table_reload_column_infos(create_stmt)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
                 };
                 let bound_table_autoindexes = if is_virtual_sql {
                     None
@@ -86063,12 +86223,14 @@ impl Connection {
                         }
                     })?)
                 };
-                let columns = parsed_create_table
-                    .as_ref()
-                    .and_then(crate::compat_persist::columns_from_create_table_statement)
-                    .unwrap_or_else(|| {
-                        crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql)
-                    });
+                let columns = vtab_factory_columns.unwrap_or_else(|| {
+                    parsed_create_table
+                        .as_ref()
+                        .and_then(crate::compat_persist::columns_from_create_table_statement)
+                        .unwrap_or_else(|| {
+                            crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql)
+                        })
+                });
                 let num_columns = columns.len();
                 let without_rowid = parsed_create_table.as_ref().map_or_else(
                     || is_without_rowid_table_sql(&create_sql),

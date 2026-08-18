@@ -14,9 +14,9 @@ use std::sync::Arc;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::ScalarFunction;
 use fsqlite_func::vtab::{
-    ColumnContext, IndexInfo, ShadowTablePolicy, TransactionalVtabState, VirtualTable,
-    VirtualTableCursor, VtabIntegrityPolicy, VtabLifecyclePolicy, VtabModuleMetadata,
-    VtabRiskLevel,
+    ColumnContext, ErasedVtabInstance, IndexInfo, ShadowTablePolicy, TransactionalVtabState,
+    VirtualTable, VirtualTableCursor, VtabIntegrityPolicy, VtabLifecyclePolicy, VtabModuleFactory,
+    VtabModuleMetadata, VtabRiskLevel,
 };
 use fsqlite_types::cx::Cx;
 use fsqlite_types::serial_type::{read_varint, write_varint};
@@ -6094,6 +6094,55 @@ impl InvertedIndex {
         self.tokendata
     }
 
+    /// Enumerate every MAIN-index term with its live doclist entries, for the
+    /// `fts5vocab` module. Terms are raw tokens (no prefix marker byte). Each
+    /// [`Fts5DoclistEntry`] carries one [`Fts5ColumnPositions`] per column the
+    /// term occurs in for that document; columns are ascending and offsets are
+    /// sorted, and the outer list is sorted by term. Prefix indexes are ignored:
+    /// `fts5vocab` reports only the actual tokens.
+    ///
+    /// For `detail=col`/`detail=none` tables the in-memory postings store fewer
+    /// positional details (position and/or column collapse to 0), so the derived
+    /// counts/offsets follow the stored detail rather than stock's NULL columns.
+    #[must_use]
+    pub fn vocab_term_groups(&self) -> Vec<(String, Vec<Fts5DoclistEntry>)> {
+        let mut out: Vec<(String, Vec<Fts5DoclistEntry>)> = Vec::with_capacity(self.index.len());
+        for (term, postings) in &self.index {
+            // Group this term's postings by document, then by column, collecting
+            // token offsets. `BTreeMap` keeps documents (rowids) and columns in
+            // ascending order to match stock's doclist iteration.
+            let mut by_doc: BTreeMap<i64, BTreeMap<u32, Vec<u32>>> = BTreeMap::new();
+            for posting in postings {
+                by_doc
+                    .entry(posting.docid)
+                    .or_default()
+                    .entry(posting.column)
+                    .or_default()
+                    .extend(posting.positions.iter().copied());
+            }
+            let mut entries = Vec::with_capacity(by_doc.len());
+            for (docid, columns) in by_doc {
+                let Ok(rowid) = u64::try_from(docid) else {
+                    continue;
+                };
+                let poslist_columns = columns
+                    .into_iter()
+                    .map(|(column, mut offsets)| {
+                        offsets.sort_unstable();
+                        Fts5ColumnPositions { column, offsets }
+                    })
+                    .collect();
+                entries.push(Fts5DoclistEntry::new(
+                    rowid,
+                    Fts5Poslist::new(false, poslist_columns),
+                ));
+            }
+            out.push((String::from_utf8_lossy(term.as_bytes()).into_owned(), entries));
+        }
+        out.sort_by(|left, right| left.0.cmp(&right.0));
+        out
+    }
+
     fn index_key<'a>(&self, term: &'a str) -> &'a str {
         if self.tokendata {
             tokendata_query_key(term)
@@ -8951,6 +9000,36 @@ impl Fts5Table {
         self.lazy_on_disk
     }
 
+    /// Collect the full vocabulary of this table as `(term, entries)` groups for
+    /// the `fts5vocab` module, from whichever NON-lazy representation currently
+    /// backs the table (freshly built in-memory index, or bound shadow rows).
+    ///
+    /// The caller MUST route lazy on-disk tables ([`Self::is_lazy_on_disk`])
+    /// through the async on-disk reader instead; this method only sees the
+    /// in-memory / shadow state. Terms are raw tokens (marker byte stripped) and
+    /// the outer list is sorted by term.
+    ///
+    /// # Errors
+    /// Returns an error if the bound shadow `_data` rows cannot be decoded.
+    pub fn vocab_term_groups(&self) -> Result<Vec<(String, Vec<Fts5DoclistEntry>)>> {
+        // Mirror `all_rows`: prefer the in-memory documents/index when present,
+        // otherwise fall back to bound shadow rows. A table with neither yields
+        // an empty vocabulary.
+        if !self.documents.is_empty() {
+            return Ok(self.index.vocab_term_groups());
+        }
+        if let Some(rows) = self.shadow_rows.as_ref() {
+            let metadata = Fts5DataMetadata::decode_rows(&rows.data, self.columns.len())?;
+            let Some(structure) = metadata.structure else {
+                return Ok(Vec::new());
+            };
+            let groups =
+                collect_live_term_groups_from_shadow_rows(&rows.data, &rows.idx, &structure)?;
+            return Ok(strip_main_marker_term_groups(groups));
+        }
+        Ok(self.index.vocab_term_groups())
+    }
+
     /// Advance lazy-mode bookkeeping after the host durably appends documents.
     ///
     /// Lazy contentless tables keep their historical posting lists on disk and
@@ -10258,6 +10337,353 @@ impl Fts5Cursor {
             .collect();
         self.position = 0;
     }
+}
+
+// ---------------------------------------------------------------------------
+// fts5vocab virtual-table module
+// ---------------------------------------------------------------------------
+
+/// The table type of an `fts5vocab` virtual table, selecting which vocabulary
+/// projection is exposed. See
+/// <https://sqlite.org/fts5.html#the_fts5vocab_virtual_table_module>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5VocabType {
+    /// One row per distinct term: `(term, doc, cnt)`.
+    Row,
+    /// One row per (term, column): `(term, col, doc, cnt)`.
+    Col,
+    /// One row per term occurrence: `(term, doc, col, offset)`.
+    Instance,
+}
+
+impl Fts5VocabType {
+    /// Parse the (already unquoted) `type` argument, case-insensitively.
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "row" => Some(Self::Row),
+            "col" => Some(Self::Col),
+            "instance" => Some(Self::Instance),
+            _ => None,
+        }
+    }
+
+    /// The declared column names for this vocabulary type, in schema order.
+    #[must_use]
+    pub const fn column_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Row => &["term", "doc", "cnt"],
+            Self::Col => &["term", "col", "doc", "cnt"],
+            Self::Instance => &["term", "doc", "col", "offset"],
+        }
+    }
+}
+
+/// Column schema `(name, affinity)` for an `fts5vocab` table of the given type.
+/// Every column is typeless (affinity `'A'` = NONE), matching stock fts5vocab,
+/// whose columns declare no type.
+#[must_use]
+pub fn fts5vocab_column_info(vocab_type: Fts5VocabType) -> Vec<(String, char)> {
+    vocab_type
+        .column_names()
+        .iter()
+        .map(|name| ((*name).to_owned(), 'A'))
+        .collect()
+}
+
+/// Strip the leading [`FTS5_MAIN_PREFIX_BYTE`] main-index marker from a stored
+/// term, returning the raw token bytes. A term with no marker is returned
+/// unchanged (some segments store raw tokens; see
+/// [`hydrate_contentless_index_from_segments`]).
+fn strip_main_marker(stored_term: &[u8]) -> &[u8] {
+    match stored_term.split_first() {
+        Some((&FTS5_MAIN_PREFIX_BYTE, rest)) => rest,
+        _ => stored_term,
+    }
+}
+
+/// Normalize main-index-only `(stored_term, entries)` groups (as produced by
+/// [`collect_live_term_groups_from_shadow_rows`]) into `(token, entries)` with
+/// the marker byte removed. Terms are already main-index only, so this never
+/// needs to reject prefix-index terms.
+#[must_use]
+pub fn strip_main_marker_term_groups(
+    groups: Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>,
+) -> Vec<(String, Vec<Fts5DoclistEntry>)> {
+    groups
+        .into_iter()
+        .map(|(term, entries)| {
+            (
+                String::from_utf8_lossy(strip_main_marker(&term)).into_owned(),
+                entries,
+            )
+        })
+        .collect()
+}
+
+/// Filter all-term `(stored_term, entries)` groups (as produced by
+/// [`collect_merged_term_groups`], which enumerates BOTH the main index and any
+/// prefix indexes) down to the MAIN-index tokens, stripping the marker byte.
+///
+/// `fts5vocab` reports only real tokens, so prefix-index terms (marked with a
+/// byte greater than [`FTS5_MAIN_PREFIX_BYTE`]) are dropped. Segments that store
+/// raw (unmarked) tokens are therefore not enumerable through this path; such
+/// tables are the rare exception (frankensqlite's own writer and stock SQLite
+/// both mark main terms).
+#[must_use]
+pub fn main_index_term_groups(
+    groups: Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>,
+) -> Vec<(String, Vec<Fts5DoclistEntry>)> {
+    groups
+        .into_iter()
+        .filter_map(|(term, entries)| match term.split_first() {
+            Some((&FTS5_MAIN_PREFIX_BYTE, rest)) => {
+                Some((String::from_utf8_lossy(rest).into_owned(), entries))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Total number of token occurrences (positions) recorded by a doclist entry.
+fn entry_position_count(entry: &Fts5DoclistEntry) -> i64 {
+    let total: usize = entry
+        .poslist
+        .columns
+        .iter()
+        .map(|column| column.offsets.len())
+        .sum();
+    i64::try_from(total).unwrap_or(i64::MAX)
+}
+
+/// Map a poslist column index to the source table's column name, or NULL when
+/// the index is out of range.
+fn vocab_col_value(source_columns: &[String], column: u32) -> SqliteValue {
+    usize::try_from(column)
+        .ok()
+        .and_then(|index| source_columns.get(index))
+        .map_or(SqliteValue::Null, |name| {
+            SqliteValue::Text(SmallText::new(name))
+        })
+}
+
+/// Build the vocabulary rows for the given type from `(token, entries)` groups.
+///
+/// `groups` MUST already be main-index tokens (marker stripped) and sorted by
+/// term — both [`strip_main_marker_term_groups`] and [`main_index_term_groups`]
+/// satisfy this. Rows are returned in stock fts5vocab order:
+/// - `row`: by term.
+/// - `col`: by (term, column index).
+/// - `instance`: by (term, rowid, column index, offset).
+///
+/// Each returned row has exactly the columns of the declared schema
+/// ([`Fts5VocabType::column_names`]) in that order; the host projects/pads to
+/// the query's requested width and appends the 1-based rowid.
+#[must_use]
+pub fn build_fts5vocab_rows(
+    vocab_type: Fts5VocabType,
+    groups: &[(String, Vec<Fts5DoclistEntry>)],
+    source_columns: &[String],
+) -> Vec<Vec<SqliteValue>> {
+    let mut rows: Vec<Vec<SqliteValue>> = Vec::new();
+    for (term, entries) in groups {
+        let term_value = || SqliteValue::Text(SmallText::new(term));
+        match vocab_type {
+            Fts5VocabType::Row => {
+                let doc = i64::try_from(entries.len()).unwrap_or(i64::MAX);
+                let cnt: i64 = entries
+                    .iter()
+                    .map(entry_position_count)
+                    .fold(0_i64, i64::saturating_add);
+                rows.push(vec![
+                    term_value(),
+                    SqliteValue::Integer(doc),
+                    SqliteValue::Integer(cnt),
+                ]);
+            }
+            Fts5VocabType::Col => {
+                // Per column: distinct documents (each entry is one document) and
+                // total occurrences. `BTreeMap` keeps ascending column order.
+                let mut per_col: BTreeMap<u32, (i64, i64)> = BTreeMap::new();
+                for entry in entries {
+                    for column in &entry.poslist.columns {
+                        let slot = per_col.entry(column.column).or_insert((0, 0));
+                        slot.0 = slot.0.saturating_add(1);
+                        slot.1 = slot
+                            .1
+                            .saturating_add(i64::try_from(column.offsets.len()).unwrap_or(i64::MAX));
+                    }
+                }
+                for (column, (doc, cnt)) in per_col {
+                    rows.push(vec![
+                        term_value(),
+                        vocab_col_value(source_columns, column),
+                        SqliteValue::Integer(doc),
+                        SqliteValue::Integer(cnt),
+                    ]);
+                }
+            }
+            Fts5VocabType::Instance => {
+                // One row per position, ordered by (rowid, column index, offset).
+                let mut ordered: Vec<&Fts5DoclistEntry> = entries.iter().collect();
+                ordered.sort_by_key(|entry| entry.rowid);
+                for entry in ordered {
+                    let doc = i64::try_from(entry.rowid).unwrap_or(i64::MAX);
+                    let mut columns: Vec<&Fts5ColumnPositions> = entry.poslist.columns.iter().collect();
+                    columns.sort_by_key(|column| column.column);
+                    for column in columns {
+                        let col_value = vocab_col_value(source_columns, column.column);
+                        let mut offsets = column.offsets.clone();
+                        offsets.sort_unstable();
+                        for offset in offsets {
+                            rows.push(vec![
+                                term_value(),
+                                SqliteValue::Integer(doc),
+                                col_value.clone(),
+                                SqliteValue::Integer(i64::from(offset)),
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// The `fts5vocab` virtual table instance. Holds only the reference to the
+/// source FTS5 table and the requested vocabulary type; the actual vocabulary
+/// rows are produced by the host (which owns the source table's storage) via
+/// [`build_fts5vocab_rows`].
+#[derive(Debug, Clone)]
+pub struct Fts5VocabTable {
+    source_table: String,
+    vocab_type: Fts5VocabType,
+}
+
+impl Fts5VocabTable {
+    /// The name of the source FTS5 table whose vocabulary is exposed.
+    #[must_use]
+    pub fn source_table(&self) -> &str {
+        &self.source_table
+    }
+
+    /// The vocabulary projection type (`row`/`col`/`instance`).
+    #[must_use]
+    pub const fn vocab_type(&self) -> Fts5VocabType {
+        self.vocab_type
+    }
+
+    /// Parse the canonical vtab argv `[module, db, table, source, type]`.
+    fn from_args(args: &[&str]) -> Result<Self> {
+        // Stock fts5vocab requires exactly two module arguments: the source
+        // table name and the type.
+        if args.len() != 5 {
+            return Err(FrankenError::function_error(
+                "wrong number of vtable arguments",
+            ));
+        }
+        let source_table = unquote_fts_arg(args[3]).to_owned();
+        let type_arg = unquote_fts_arg(args[4]);
+        let vocab_type = Fts5VocabType::parse(type_arg).ok_or_else(|| {
+            FrankenError::function_error(format!("fts5vocab: unknown table type: '{type_arg}'"))
+        })?;
+        if source_table.is_empty() {
+            return Err(FrankenError::function_error(
+                "fts5vocab: missing source table name",
+            ));
+        }
+        Ok(Self {
+            source_table,
+            vocab_type,
+        })
+    }
+}
+
+impl VirtualTable for Fts5VocabTable {
+    type Cursor = Fts5VocabCursor;
+
+    fn connect(_cx: &Cx, args: &[&str]) -> Result<Self> {
+        Self::from_args(args)
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+        info.estimated_cost = 1_000.0;
+        info.estimated_rows = 1_000;
+        Ok(())
+    }
+
+    fn open(&self) -> Result<Self::Cursor> {
+        Ok(Fts5VocabCursor::default())
+    }
+}
+
+/// Cursor for a standalone `fts5vocab` scan. The host answers vocabulary scans
+/// directly (it owns the source table's storage), so this generic cursor is a
+/// safe empty fallback used only when the host routing is bypassed.
+#[derive(Debug, Default)]
+pub struct Fts5VocabCursor;
+
+impl VirtualTableCursor for Fts5VocabCursor {
+    fn filter(
+        &mut self,
+        _cx: &Cx,
+        _idx_num: i32,
+        _idx_str: Option<&str>,
+        _args: &[SqliteValue],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn next(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+
+    fn eof(&self) -> bool {
+        true
+    }
+
+    fn column(&self, ctx: &mut ColumnContext, _col: i32) -> Result<()> {
+        ctx.set_value(SqliteValue::Null);
+        Ok(())
+    }
+
+    fn rowid(&self) -> Result<i64> {
+        Ok(0)
+    }
+}
+
+/// Module factory for `CREATE VIRTUAL TABLE ... USING fts5vocab(source, type)`.
+///
+/// Unlike [`module_factory_from`](fsqlite_func::vtab::module_factory_from), this
+/// factory reports the type-dependent column schema through
+/// [`VtabModuleFactory::column_info`].
+#[derive(Debug, Clone, Copy)]
+struct Fts5VocabFactory;
+
+impl VtabModuleFactory for Fts5VocabFactory {
+    fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+        Ok(Box::new(Fts5VocabTable::connect(cx, args)?))
+    }
+
+    fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+        self.create(cx, args)
+    }
+
+    fn column_info(&self, args: &[&str]) -> Vec<(String, char)> {
+        // Best-effort: an invalid argv yields an empty schema, and the failing
+        // `create` call surfaces the real error.
+        args.get(4)
+            .map(|raw| unquote_fts_arg(raw))
+            .and_then(Fts5VocabType::parse)
+            .map(fts5vocab_column_info)
+            .unwrap_or_default()
+    }
+}
+
+/// Return a module factory for `CREATE VIRTUAL TABLE ... USING fts5vocab(...)`.
+#[must_use]
+pub fn fts5vocab_module_factory() -> impl VtabModuleFactory {
+    Fts5VocabFactory
 }
 
 // ---------------------------------------------------------------------------
