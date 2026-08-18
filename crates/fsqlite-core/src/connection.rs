@@ -4528,6 +4528,9 @@ const PRAGMA_FOREIGN_KEY_LIST_TVF_COLUMNS: [&str; 8] = [
 const PRAGMA_WAL_CHECKPOINT_COLUMNS: [&str; 3] = ["busy", "log", "checkpointed"];
 const PRAGMA_FOREIGN_KEY_CHECK_COLUMNS: [&str; 4] = ["table", "rowid", "parent", "fkid"];
 const PRAGMA_DATABASE_LIST_COLUMNS: [&str; 3] = ["seq", "name", "file"];
+/// Column of `pragma_compile_options()` (GH#207 / bd-gh-pragma-tvf): the
+/// single `compile_options` text column, matching stock SQLite.
+const PRAGMA_COMPILE_OPTIONS_TVF_COLUMNS: [&str; 1] = ["compile_options"];
 const PRAGMA_TABLE_LIST_COLUMNS: [&str; 6] = ["schema", "name", "type", "ncol", "wr", "strict"];
 const PRAGMA_COLLATION_LIST_COLUMNS: [&str; 2] = ["seq", "name"];
 const PRAGMA_KEY_VALUE_COLUMNS: [&str; 2] = ["key", "value"];
@@ -5188,6 +5191,10 @@ fn pragma_table_function_columns(name: &str) -> Option<&'static [&'static str]> 
         // No-argument pragma TVF: `SELECT * FROM pragma_database_list()` reuses
         // the PRAGMA database_list row generator (GH #213).
         Some(&PRAGMA_DATABASE_LIST_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("compile_options") {
+        // No-argument pragma TVF: `SELECT * FROM pragma_compile_options()` reuses
+        // the `PRAGMA compile_options` row generator (GH #207).
+        Some(&PRAGMA_COMPILE_OPTIONS_TVF_COLUMNS)
     } else {
         None
     }
