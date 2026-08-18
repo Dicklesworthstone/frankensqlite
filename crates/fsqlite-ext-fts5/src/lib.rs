@@ -1233,6 +1233,113 @@ impl Fts5TombstonePage {
     }
 }
 
+/// A segment's complete tombstone hash: `pages[i]` is hash page `i`
+/// (`Fts5DataRowid::Tombstone { hash_pgno: i }`), every page sized identically.
+#[derive(Debug, Clone)]
+pub struct Fts5TombstoneHash {
+    pub pages: Vec<Fts5TombstonePage>,
+    pub page_count: u32,
+    pub entry_count: u32,
+}
+
+/// Lay out a segment's complete tombstone hash for `rowids` (plus rowid 0 via
+/// `tombstone_zero`) so the read path finds every tombstoned rowid and no other.
+///
+/// This is the write counterpart of [`Fts5TombstonePage::contains_rowid`]; the
+/// two MUST agree on placement. The reader
+/// ([`rowid_tombstoned_in_segment`]) selects page `rowid % page_count`, then
+/// `contains_rowid(page_count, rowid)` probes from slot
+/// `(rowid / page_count) % slots_per_page`. So placement of rowid `r` (r != 0)
+/// is: page `r % page_count`, initial slot `(r / page_count) % slots_per_page`,
+/// linear-probe to the first empty (`None`) slot. rowid 0 cannot be a slot value
+/// (0 marks an empty slot), so it is recorded by the `rowid_zero` flag on the
+/// page it maps to (page 0).
+///
+/// All pages share `slots_per_page` slots. `page_count` starts at 1 and doubles
+/// until no page would exceed a 0.5 load factor — which keeps at least one empty
+/// slot per page so every open-addressed probe terminates. Because the segment
+/// records the chosen `page_count` (`tombstone_page_count`) and stock reads with
+/// it, any self-consistent layout is valid; this need not match stock's exact
+/// growth timing, only produce a hash stock's identical `contains_rowid` math
+/// can read.
+pub fn build_tombstone_hash(
+    rowids: &BTreeSet<u64>,
+    tombstone_zero: bool,
+    slots_per_page: usize,
+) -> Result<Fts5TombstoneHash> {
+    if slots_per_page < 2 {
+        return Err(fts5_data_error("tombstone slots_per_page must be >= 2"));
+    }
+    // rowid 0 is carried by the `rowid_zero` flag, never a slot value.
+    let nonzero: Vec<u64> = rowids.iter().copied().filter(|&r| r != 0).collect();
+    let key_size: u8 = if nonzero.iter().any(|&r| r > u64::from(u32::MAX)) {
+        8
+    } else {
+        4
+    };
+    let slots_u64 = u64::try_from(slots_per_page).unwrap_or(u64::MAX);
+    // Grow (double) the page count until no page would exceed a 0.5 load factor.
+    // Terminates: once page_count exceeds every rowid, `r % page_count == r` is
+    // distinct per rowid, so each page holds at most one entry.
+    let max_per_page = slots_per_page / 2;
+    let mut page_count: u32 = 1;
+    loop {
+        let pc = u64::from(page_count);
+        let page_len = usize::try_from(page_count).unwrap_or(usize::MAX);
+        let mut per_page = vec![0usize; page_len];
+        let mut overflow = false;
+        for &r in &nonzero {
+            let page = usize::try_from(r % pc).unwrap_or(0);
+            per_page[page] += 1;
+            if per_page[page] > max_per_page {
+                overflow = true;
+                break;
+            }
+        }
+        if !overflow {
+            break;
+        }
+        page_count = page_count
+            .checked_mul(2)
+            .ok_or_else(|| fts5_data_error("tombstone hash grew past u32 page count"))?;
+    }
+    let pc = u64::from(page_count);
+    let page_len = usize::try_from(page_count).unwrap_or(usize::MAX);
+    let mut pages: Vec<Vec<Option<u64>>> = vec![vec![None; slots_per_page]; page_len];
+    for &r in &nonzero {
+        let page = usize::try_from(r % pc).unwrap_or(0);
+        let mut slot = usize::try_from((r / pc) % slots_u64).unwrap_or(0);
+        let mut placed = false;
+        for _ in 0..slots_per_page {
+            if pages[page][slot].is_none() {
+                pages[page][slot] = Some(r);
+                placed = true;
+                break;
+            }
+            slot = (slot + 1) % slots_per_page;
+        }
+        if !placed {
+            return Err(fts5_data_error(
+                "tombstone page full despite load-factor guard",
+            ));
+        }
+    }
+    let pages: Vec<Fts5TombstonePage> = pages
+        .into_iter()
+        .enumerate()
+        .map(|(index, slots)| {
+            Fts5TombstonePage::new(key_size, index == 0 && tombstone_zero, slots)
+        })
+        .collect();
+    let entry_count = u32::try_from(nonzero.len() + usize::from(tombstone_zero))
+        .map_err(|_| fts5_data_error("tombstone entry count exceeds u32"))?;
+    Ok(Fts5TombstoneHash {
+        pages,
+        page_count,
+        entry_count,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fts5PendingIndex {
     Main,
@@ -11432,6 +11539,64 @@ mod tests {
         assert!(decoded_tombstone.contains_rowid(1, 9));
         assert!(decoded_tombstone.contains_rowid(1, 15));
         assert!(!decoded_tombstone.contains_rowid(1, 8));
+    }
+
+    #[test]
+    fn test_build_tombstone_hash_matches_contains_rowid_reader() {
+        // Mirror the reader exactly (rowid_tombstoned_in_segment): page =
+        // rowid % page_count, then contains_rowid — through a full round-trip.
+        fn tombstoned(hash: &Fts5TombstoneHash, rowid: u64) -> bool {
+            if hash.page_count == 0 {
+                return false;
+            }
+            let page = usize::try_from(rowid % u64::from(hash.page_count)).unwrap();
+            let decoded = Fts5TombstonePage::decode(&hash.pages[page].encode().unwrap()).unwrap();
+            decoded.contains_rowid(hash.page_count, rowid)
+        }
+
+        // Single 4-slot page (matches the hand-built layout above: 9 -> slot 1,
+        // 15 -> slot 3), plus rowid 0 carried by the zero flag.
+        let present: BTreeSet<u64> = [9, 15].into_iter().collect();
+        let hash = build_tombstone_hash(&present, true, 4).unwrap();
+        assert_eq!(hash.page_count, 1);
+        assert_eq!(hash.entry_count, 3); // 9, 15, and rowid 0
+        for r in [9_u64, 15] {
+            assert!(tombstoned(&hash, r), "rowid {r} must be tombstoned");
+        }
+        assert!(tombstoned(&hash, 0), "rowid 0 via the zero flag");
+        for r in [8_u64, 1, 16, 100] {
+            assert!(!tombstoned(&hash, r), "rowid {r} must NOT be tombstoned");
+        }
+
+        // Growth: 200 rowids into tiny 4-slot pages must add pages while every
+        // rowid stays findable and no absent rowid reads as tombstoned.
+        let many: BTreeSet<u64> = (1_u64..=200).collect();
+        let hash = build_tombstone_hash(&many, false, 4).unwrap();
+        assert!(hash.page_count > 1, "200 rowids need more than one 4-slot page");
+        assert_eq!(hash.entry_count, 200);
+        for r in 1_u64..=200 {
+            assert!(tombstoned(&hash, r), "grown-hash rowid {r} must be tombstoned");
+        }
+        for r in [0_u64, 201, 300, 12_345] {
+            assert!(!tombstoned(&hash, r), "absent rowid {r} must NOT be tombstoned");
+        }
+
+        // A rowid past u32::MAX widens every page to an 8-byte key.
+        let wide: BTreeSet<u64> = [5, u64::from(u32::MAX) + 1, 9_999_999_999]
+            .into_iter()
+            .collect();
+        let hash = build_tombstone_hash(&wide, false, 16).unwrap();
+        assert!(
+            hash.pages.iter().all(|page| page.key_size == 8),
+            "a rowid > u32::MAX must widen the tombstone key to 8 bytes"
+        );
+        for &r in &wide {
+            assert!(tombstoned(&hash, r), "wide rowid {r} must be tombstoned");
+        }
+        assert!(!tombstoned(&hash, 7));
+
+        // A degenerate slot count is rejected (no room for probe termination).
+        assert!(build_tombstone_hash(&present, false, 1).is_err());
     }
 
     #[test]
