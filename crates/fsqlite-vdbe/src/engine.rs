@@ -27381,7 +27381,12 @@ mod tests {
         assert_eq!(fused, expected);
 
         let mut fallback_buf = Vec::new();
-        serialize_compiled_record_into_vec(values.as_slice(), &builder, &mut fallback_buf);
+        serialize_compiled_record_into_vec(
+            values.as_slice(),
+            &builder,
+            TextEncoding::Utf8,
+            &mut fallback_buf,
+        );
         assert_eq!(fallback_buf, expected);
 
         let iterations = 20_000usize;
