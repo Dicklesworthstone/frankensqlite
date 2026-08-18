@@ -84044,7 +84044,10 @@ impl Connection {
         args: &[String],
     ) -> Result<Vec<(i64, Vec<String>)>> {
         let fts_columns = parse_virtual_table_column_infos(args);
-        let Some(content_option) = virtual_table_option_value(args, "content") else {
+        if virtual_table_option_value(args, "content").is_none() {
+            // Regular-stored FTS5: the corpus lives in the FTS5-managed internal
+            // `_content` shadow, which is the legitimate source for rebuilding the
+            // index on reload.
             let content_table_name = format!("{table_name}_content");
             let content_table = schema
                 .iter()
@@ -84083,74 +84086,17 @@ impl Connection {
                     )
                 })
                 .collect());
-        };
-
-        if content_option.is_empty() {
-            return Ok(Vec::new());
         }
 
-        let content_table = schema
-            .iter()
-            .find(|candidate| candidate.name.eq_ignore_ascii_case(&content_option))
-            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "FTS5 table `{table_name}` references missing external content table `{content_option}`"
-                ),
-            })?;
-        let rows = self
-            .read_storage_table_rows_for_reload(
-                cx,
-                txn,
-                page_size,
-                reserved_per_page,
-                content_table,
-                rowid_alias_columns,
-            )
-            .await?;
-        let content_rowid =
-            virtual_table_option_value(args, "content_rowid").unwrap_or_else(|| "rowid".to_owned());
-        let content_rowid_index = content_table
-            .columns
-            .iter()
-            .position(|column| column.name.eq_ignore_ascii_case(&content_rowid));
-        let column_indexes = fts_columns
-            .iter()
-            .map(|fts_column| {
-                content_table
-                    .columns
-                    .iter()
-                    .position(|column| column.name.eq_ignore_ascii_case(&fts_column.name))
-            })
-            .collect::<Vec<_>>();
-
-        rows.into_iter()
-            .map(|(storage_rowid, values)| {
-                let rowid = if matches!(
-                    content_rowid.as_str(),
-                    "rowid" | "oid" | "_rowid_" | "ROWID" | "OID" | "_ROWID_"
-                ) {
-                    storage_rowid
-                } else {
-                    let Some(index) = content_rowid_index else {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "FTS5 table `{table_name}` content_rowid `{content_rowid}` is not present in `{content_option}`"
-                            ),
-                        });
-                    };
-                    values.get(index).map_or(storage_rowid, SqliteValue::to_integer)
-                };
-                let columns = column_indexes
-                    .iter()
-                    .map(|index| {
-                        index
-                            .and_then(|idx| values.get(idx))
-                            .map_or_else(String::new, SqliteValue::to_text)
-                    })
-                    .collect();
-                Ok((rowid, columns))
-            })
-            .collect()
+        // A `content=` option is present — either contentless (`content=''`) or
+        // external content (`content=<table>`). Neither is ever re-derived from a
+        // content table during a reload: contentless keeps nothing, and an
+        // external-content FTS5 index is maintained ONLY by explicit INSERT/DELETE
+        // (and an explicit `'rebuild'`), never auto-rebuilt on reconnect. The
+        // persisted `_data` segments are the sole source of truth — feeding the
+        // external content rows here would re-index the whole corpus and collide on
+        // rowid against the persisted postings (frankensqlite external-content reopen).
+        Ok(Vec::new())
     }
 
     /// Read persisted FTS5 shadow rows for a rootpage=0 table. `_data` carries
