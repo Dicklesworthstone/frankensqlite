@@ -209,17 +209,62 @@ fn probe_typeof_null_literal() {
         .await;
     });
 }
+// bd-9zlcs FIXED: a scan-referencing bare expression over an EMPTY aggregate
+// group is now evaluated against NULL columns at finalize (codegen_select_aggregate),
+// so typeof(a) = typeof(NULL) = 'null' instead of a bare NULL.
 #[test]
-#[ignore = "bd-9zlcs still RED at HEAD: `SELECT count(*), typeof(a) FROM <empty>` returns \
-(0, NULL) in frank vs (0, 'null') in stock — the bare-aggregate synthetic empty row leaves the \
-non-aggregate typeof(a) output register NULL instead of evaluating typeof on the NULL column. \
-Un-ignore when fixed in fsqlite-vdbe codegen."]
 fn probe_typeof_empty_bare_aggregate() {
     asupersync::test_utils::run_test(|| async {
         agree(
             &["CREATE TABLE t(a INT)"],
             "SELECT count(*), typeof(a) FROM t",
             "bd-9zlcs: typeof(a) over empty bare-aggregate must be 'null'",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn probe_scalar_wrappers_empty_bare_aggregate() {
+    asupersync::test_utils::run_test(|| async {
+        // Several NULL-transforming scalar wrappers over an empty group.
+        agree(
+            &["CREATE TABLE t(a INT, b TEXT)"],
+            "SELECT count(*), typeof(a), coalesce(a, -1), ifnull(b, 'x'), \
+                    a IS NULL, length(b), quote(a) FROM t",
+            "bd-9zlcs: scalar wrappers over empty bare-aggregate match stock",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn probe_typeof_where_filters_all_rows() {
+    asupersync::test_utils::run_test(|| async {
+        // Non-empty table but WHERE excludes every row -> same empty-group path.
+        agree(
+            &[
+                "CREATE TABLE t(a INT)",
+                "INSERT INTO t VALUES(1),(2),(3)",
+            ],
+            "SELECT count(*), typeof(a), coalesce(a,-1) FROM t WHERE a > 100",
+            "bd-9zlcs: typeof/coalesce over WHERE-emptied group match stock",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn probe_typeof_nonempty_bare_aggregate_unchanged() {
+    asupersync::test_utils::run_test(|| async {
+        // Regression guard: a non-empty group keeps the captured scanned value.
+        agree(
+            &[
+                "CREATE TABLE t(a INT)",
+                "INSERT INTO t VALUES(7),(8)",
+            ],
+            "SELECT count(*), typeof(a), coalesce(a,-1) FROM t",
+            "bd-9zlcs: non-empty bare-aggregate value unchanged",
         )
         .await;
     });

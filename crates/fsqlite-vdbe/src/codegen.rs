@@ -16943,9 +16943,44 @@ fn codegen_select_aggregate(
         // value. Evaluate row-independent scalars here exactly once so empty
         // input still produces their ordinary value.
         if let Some(bare) = agg.bare_expr.as_deref() {
+            let accum_reg = accum_base + i as i32;
             if !expr_references_scan(bare, table, table_alias) {
-                let accum_reg = accum_base + i as i32;
                 emit_expr(b, bare, accum_reg, None);
+            } else {
+                // bd-9zlcs: a scan-referencing bare expression such as
+                // `typeof(a)` captured its value on the first scanned row
+                // (gated by `first_row_flag`). Over an EMPTY input group the
+                // scan never ran, so `accum_reg` still holds its NULL init —
+                // but stock evaluates the expression against NULL columns
+                // (e.g. `typeof(a)` over zero rows = typeof(NULL) = 'null',
+                // not NULL). Emit that empty-group evaluation, guarded so a
+                // non-empty group keeps its captured value byte-for-byte.
+                let skip_empty = b.emit_label();
+                b.emit_jump_to_label(Opcode::If, first_row_flag, 0, skip_empty, P4::None, 0);
+                let ncols = i32::try_from(table.columns.len()).unwrap_or(0);
+                if ncols > 0 {
+                    let null_base = b.alloc_regs(ncols);
+                    b.emit_op(
+                        Opcode::Null,
+                        0,
+                        null_base,
+                        null_base + ncols - 1,
+                        P4::None,
+                        0,
+                    );
+                    let null_ctx = ScanCtx {
+                        cursor,
+                        table,
+                        table_alias,
+                        schema: Some(schema),
+                        register_base: Some(null_base),
+                        secondaries: &[],
+                    };
+                    emit_expr(b, bare, accum_reg, Some(&null_ctx));
+                } else {
+                    emit_expr(b, bare, accum_reg, None);
+                }
+                b.resolve_label(skip_empty);
             }
             continue;
         }
