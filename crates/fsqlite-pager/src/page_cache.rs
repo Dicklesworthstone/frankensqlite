@@ -1144,7 +1144,13 @@ impl PageCache {
         let cached_pages = self.pages.len();
         let queue_snapshot = {
             let tracker = self.eviction_policy.borrow();
-            if matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_)) {
+            // bd-86ct9: S3FifoAdaptive also implements queue_snapshot (its inner
+            // S3-FIFO tracker), so it must report real t1/t2/b1/p metrics rather
+            // than the degenerate fallback.
+            if matches!(
+                &*tracker,
+                PageCacheEvictionTracker::S3Fifo(_) | PageCacheEvictionTracker::S3FifoAdaptive(_)
+            ) {
                 let residents: Vec<PageNumber> = self.pages.keys().copied().collect();
                 tracker.queue_snapshot(&residents)
             } else {
@@ -4038,7 +4044,12 @@ impl ShardedPageCache {
                 .count();
             let queue_snapshot = {
                 let tracker = self.eviction_policy.lock();
-                if matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_)) {
+                // bd-86ct9: include S3FifoAdaptive so it reports real queue metrics.
+                if matches!(
+                    &*tracker,
+                    PageCacheEvictionTracker::S3Fifo(_)
+                        | PageCacheEvictionTracker::S3FifoAdaptive(_)
+                ) {
                     let residents = arr.resident_pages();
                     tracker.queue_snapshot(&residents)
                 } else {
@@ -6296,6 +6307,43 @@ mod tests {
         assert!(
             snapshot.t2_size >= 1,
             "S3-FIFO metrics should expose a non-empty main queue after hot re-access"
+        );
+    }
+
+    #[test]
+    fn test_page_cache_s3_fifo_adaptive_reports_real_queue_metrics_bd_86ct9() {
+        // bd-86ct9: S3FifoAdaptive delegates queue_snapshot to its inner S3-FIFO
+        // tracker, so metrics_snapshot must report its real t1/t2/b1/p metrics
+        // rather than the degenerate (cached, 0, 0, cached) fallback the match arm
+        // previously fell through to for this policy.
+        let mut cache = PageCache::new(PageSize::DEFAULT);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3FifoAdaptive(
+            S3FifoConfig::with_limits(4, 1, 1, 1),
+        ));
+
+        let hot_a = PageNumber::ONE;
+        let hot_b = PageNumber::new(2).unwrap();
+        let cold_a = PageNumber::new(3).unwrap();
+        let cold_b = PageNumber::new(4).unwrap();
+
+        for page_no in [hot_a, hot_b, cold_a, cold_b] {
+            let page = cache.insert_fresh(page_no).unwrap();
+            page[0] = u8::try_from(page_no.get()).unwrap();
+        }
+
+        // Re-access the hot pages so they promote into the main (T2) queue.
+        for _ in 0..8 {
+            assert!(cache.get(hot_a).is_some(), "hot page A must remain readable");
+            assert!(cache.get(hot_b).is_some(), "hot page B must remain readable");
+        }
+
+        assert!(cache.evict_any(), "adaptive S3-FIFO should evict a cold page");
+
+        let snapshot = cache.metrics_snapshot();
+        assert!(
+            snapshot.t2_size >= 1,
+            "S3FifoAdaptive must expose a non-empty main queue (bd-86ct9): before the \
+             fix this policy fell through to the degenerate t2=0 metric"
         );
     }
 
