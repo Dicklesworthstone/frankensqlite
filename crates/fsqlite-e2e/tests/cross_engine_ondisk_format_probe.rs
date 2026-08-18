@@ -34,7 +34,8 @@ fn render_frank(v: &SqliteValue) -> String {
 /// Write a fixture with frank to `path`: set page_size + journal_mode, run the
 /// schema/data statements, checkpoint (fold any WAL into the main db), close.
 async fn frank_write(path: &Path, page_size: u32, journal_mode: &str, stmts: &[&str]) -> Result<(), String> {
-    let conn = Connection::open(path).await.map_err(|e| format!("open: {e}"))?;
+    let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_owned())?;
+    let conn = Connection::open(path_str).await.map_err(|e| format!("open: {e}"))?;
     conn.execute(&format!("PRAGMA page_size={page_size};"))
         .await
         .map_err(|e| format!("page_size: {e}"))?;
@@ -102,7 +103,8 @@ fn read_rows_rusqlite(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Stri
 
 /// With frank: sorted rows of `verify` from an on-disk file.
 async fn frank_read(path: &Path, verify: &str) -> Result<Vec<String>, String> {
-    let conn = Connection::open(path).await.map_err(|e| format!("open: {e}"))?;
+    let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_owned())?;
+    let conn = Connection::open(path_str).await.map_err(|e| format!("open: {e}"))?;
     let out = match conn.query(verify).await {
         Ok(rs) => {
             let mut rows: Vec<String> = rs
