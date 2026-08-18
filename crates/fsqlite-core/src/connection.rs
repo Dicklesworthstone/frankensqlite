@@ -47728,6 +47728,15 @@ impl Connection {
             .await?;
         self.delete_storage_table_rows(&format!("{table_name}_data"), &flush.deleted_data_rowids)
             .await?;
+        // Reclaim the merged-away segments' DoclistIndex rows too (the leaf +
+        // tombstone enumeration above misses them); otherwise a stock-written
+        // dlidx orphans and the next promote's integrity_report rejects the
+        // shadow (bd-x9ber).
+        self.delete_fts5_data_rows_for_segids(
+            table_name,
+            &merged_segids.iter().copied().collect(),
+        )
+        .await?;
 
         tracing::debug!(
             table = table_name,
@@ -47965,6 +47974,15 @@ impl Connection {
             .await?;
         self.delete_storage_table_rows(&format!("{table_name}_data"), &flush.deleted_data_rowids)
             .await?;
+        // Also reclaim every dropped segment's DoclistIndex rows, which the
+        // structure-driven leaf+tombstone enumeration misses (bd-x9ber).
+        let dropped_segids: std::collections::BTreeSet<u32> = structure
+            .levels
+            .iter()
+            .flat_map(|level| level.segments.iter().map(|segment| segment.segid))
+            .collect();
+        self.delete_fts5_data_rows_for_segids(table_name, &dropped_segids)
+            .await?;
 
         // Every document is gone: clear the whole `_docsize` shadow.
         self.replace_storage_table_rows(
@@ -48163,6 +48181,76 @@ impl Connection {
             for (rowid, values) in rows {
                 let record = serialize_record_with_encoding(&values, self.db_text_encoding.get());
                 cursor.table_insert(cx, rowid, &record).await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Delete every `_data` shadow row (segment leaf, doclist-index, or
+    /// tombstone) whose owning segid is in `segids`, by scanning `_data` and
+    /// decoding each rowid.
+    ///
+    /// The structure record only pins a segment's leaf pgno range and tombstone
+    /// page count, so the enumeration-based delete
+    /// ([`Self::delete_storage_table_rows`]) misses a segment's **DoclistIndex**
+    /// (dlidx) `_data` rows — which stock writes for large doclists. When a
+    /// merge or `'delete-all'` drops a stock-written segment, those orphaned
+    /// dlidx rows survive and the strict `integrity_report` then rejects the
+    /// shadow (`%_data row references unknown segment`), failing the next
+    /// optimize/promote on an otherwise-healthy DB. This scan reclaims them all
+    /// (bd-x9ber).
+    #[cfg(feature = "ext-fts5")]
+    async fn delete_fts5_data_rows_for_segids(
+        &self,
+        table_name: &str,
+        segids: &std::collections::BTreeSet<u32>,
+    ) -> Result<()> {
+        if segids.is_empty() {
+            return Ok(());
+        }
+        let data_name = format!("{table_name}_data");
+        let Some(root_page) = ({
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&data_name))
+                .map(|table| table.root_page)
+        }) else {
+            return Ok(());
+        };
+        if root_page == 0 {
+            return Ok(());
+        }
+        let root = page_number_from_schema_root(root_page, &data_name, "fts5 %_data shadow")?;
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+            // Collect the doomed ids first, then delete (never mutate the tree
+            // while iterating it).
+            let mut to_delete: Vec<i64> = Vec::new();
+            if cursor.first(cx).await? {
+                loop {
+                    let id = cursor.rowid(cx).await?;
+                    if let Ok(decoded) = Fts5DataRowid::decode(id) {
+                        let segid = match decoded {
+                            Fts5DataRowid::SegmentLeaf { segid, .. }
+                            | Fts5DataRowid::DoclistIndex { segid, .. }
+                            | Fts5DataRowid::Tombstone { segid, .. } => Some(segid),
+                            Fts5DataRowid::Averages | Fts5DataRowid::Structure => None,
+                        };
+                        if segid.is_some_and(|segid| segids.contains(&segid)) {
+                            to_delete.push(id);
+                        }
+                    }
+                    if !cursor.next(cx).await? {
+                        break;
+                    }
+                }
+            }
+            for id in to_delete {
+                if cursor.table_move_to(cx, id).await?.is_found() {
+                    cursor.delete(cx).await?;
+                }
             }
             Ok(())
         })
