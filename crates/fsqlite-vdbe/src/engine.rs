@@ -6183,15 +6183,26 @@ fn build_compiled_record_write_plan<'a>(
 fn serialize_compiled_record_into_vec(
     values: &[SqliteValue],
     record_builder: &CompiledRecordBuilder,
+    encoding: TextEncoding,
     buf: &mut Vec<u8>,
 ) {
-    if let CompiledRecordBuilder::PrecomputedHeader(header) = record_builder
-        && serialize_record_iter_with_precomputed_header_into(values.iter(), header, buf)
-    {
-        return;
+    // bd-bld9w.7 family (a): the precomputed header caches UTF-8 serial-type byte
+    // lengths, so only take that fast path for a UTF-8 database; UTF-16 serializes
+    // through the encoding-aware path (byte-identical for UTF-8).
+    if matches!(encoding, TextEncoding::Utf8) {
+        if let CompiledRecordBuilder::PrecomputedHeader(header) = record_builder
+            && serialize_record_iter_with_precomputed_header_into(values.iter(), header, buf)
+        {
+            return;
+        }
+        fsqlite_types::record::serialize_record_iter_into(values.iter(), buf);
+    } else {
+        fsqlite_types::record::serialize_record_iter_into_with_encoding(
+            values.iter(),
+            encoding,
+            buf,
+        );
     }
-
-    fsqlite_types::record::serialize_record_iter_into(values.iter(), buf);
 }
 
 /// The VDBE bytecode interpreter.
@@ -14823,40 +14834,47 @@ impl VdbeEngine {
             };
             rowid
         };
-        let record_plan =
-            build_compiled_record_write_plan(values.as_slice(), &template.record_builder);
-        let payload_len = record_plan.exact_size();
-        let appended_directly = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id)
-        {
-            let result = sc
-                .cursor
-                .table_append_after_last_position_with_writer(
-                    &sc.cx,
-                    rowid,
-                    payload_len,
-                    move |dst| {
-                        record_plan.write_into_slice(dst).map_err(|()| {
-                            FrankenError::internal(
-                                "compiled simple INSERT direct record serialization size mismatch",
-                            )
-                        })
-                    },
-                )
-                .await?;
-            if result {
-                sc.last_successful_insert_rowid = Some(rowid);
+        // bd-bld9w.7 family (a): the zero-copy direct slice writer pre-carves an
+        // exact-sized region from UTF-8 serial-type lengths, so only use it for a
+        // UTF-8 database; UTF-16 falls through to the encoding-aware Vec path below.
+        let appended_directly = if matches!(self.text_encoding, TextEncoding::Utf8) {
+            let record_plan =
+                build_compiled_record_write_plan(values.as_slice(), &template.record_builder);
+            let payload_len = record_plan.exact_size();
+            if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id) {
+                let result = sc
+                    .cursor
+                    .table_append_after_last_position_with_writer(
+                        &sc.cx,
+                        rowid,
+                        payload_len,
+                        move |dst| {
+                            record_plan.write_into_slice(dst).map_err(|()| {
+                                FrankenError::internal(
+                                    "compiled simple INSERT direct record serialization size mismatch",
+                                )
+                            })
+                        },
+                    )
+                    .await?;
+                if result {
+                    sc.last_successful_insert_rowid = Some(rowid);
+                }
+                result
+            } else {
+                return Err(FrankenError::internal(
+                    "compiled simple INSERT lost its cursor",
+                ));
             }
-            result
         } else {
-            return Err(FrankenError::internal(
-                "compiled simple INSERT lost its cursor",
-            ));
+            false
         };
         if !appended_directly {
             let mut payload_buf = self.make_record_lookaside.take_buf();
             serialize_compiled_record_into_vec(
                 values.as_slice(),
                 &template.record_builder,
+                self.text_encoding,
                 &mut payload_buf,
             );
             let append_result = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id)
@@ -17115,7 +17133,7 @@ impl VdbeEngine {
             && let Some(table) = self.db.as_ref().and_then(|db| db.get_table(root_page))
         {
             for row in &table.rows {
-                let payload = encode_record(&row.values);
+                let payload = encode_record_with_encoding(&row.values, self.text_encoding);
                 if cursor.table_insert(&cx, row.rowid, &payload).await.is_err() {
                     return false;
                 }
@@ -18568,6 +18586,12 @@ fn index_entry_rowid_at(
 
 fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record(values)
+}
+
+// bd-bld9w.7 family (a): encode memdb-hydration rows in the DB text encoding
+// (byte-identical to encode_record for UTF-8).
+fn encode_record_with_encoding(values: &[SqliteValue], encoding: TextEncoding) -> Vec<u8> {
+    fsqlite_types::record::serialize_record_with_encoding(values, encoding)
 }
 
 #[allow(dead_code)]
