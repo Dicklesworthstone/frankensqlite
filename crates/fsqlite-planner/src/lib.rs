@@ -1739,15 +1739,45 @@ fn best_access_path_internal(
             .iter()
             .any(|term| where_term_matches_rowid_range(&table.name, term, rowid_alias_hints));
 
-    let mut best = if explicit_indexed_by.is_some() {
-        AccessPath {
-            table: table.name.clone(),
-            kind: AccessPathKind::FullTableScan,
-            index: None,
-            estimated_cost: f64::INFINITY,
-            estimated_rows: table.n_rows as f64,
-            time_travel: None,
-            probe: None,
+    let mut best = if let Some(hinted) = explicit_indexed_by {
+        // bd-gh-indexed-by-desc-scan-order (#224): a forced `INDEXED BY <idx>`
+        // with no usable WHERE constraint is a FULL index scan in the index's
+        // stored order (ascending for an ASC index, descending for a DESC index),
+        // NOT a table scan — `INDEXED BY` is a hard contract. Seed `best` with
+        // that full index scan over the hinted index so an unconstrained forced
+        // index is honored; a constrained path over the same index (produced in
+        // the candidate loop with the 0.01 hint multiplier) still wins when a
+        // WHERE makes it seekable. If the hint names a missing index, keep the
+        // INFINITY FullTableScan sentinel so the existing missing-index
+        // diagnostic still fires.
+        if let Some(forced) = indexes.iter().find(|idx| {
+            identifier_eq(&idx.table, &table.name) && idx.name.eq_ignore_ascii_case(hinted)
+        }) {
+            let kind = AccessPathKind::CoveringIndexScan { selectivity: 1.0 };
+            AccessPath {
+                table: table.name.clone(),
+                estimated_cost: estimate_cost_ext(
+                    &kind,
+                    table.n_pages,
+                    forced.n_pages,
+                    table.n_rows,
+                ),
+                kind,
+                index: Some(forced.name.clone()),
+                estimated_rows: table.n_rows as f64,
+                time_travel: None,
+                probe: None,
+            }
+        } else {
+            AccessPath {
+                table: table.name.clone(),
+                kind: AccessPathKind::FullTableScan,
+                index: None,
+                estimated_cost: f64::INFINITY,
+                estimated_rows: table.n_rows as f64,
+                time_travel: None,
+                probe: None,
+            }
         }
     } else if !not_indexed && rowid_equality_candidate {
         let kind = AccessPathKind::RowidLookup;
@@ -10585,8 +10615,17 @@ mod tests {
             .find(|path| path.table.eq_ignore_ascii_case("users"))
             .expect("users path should exist");
 
-        assert!(matches!(users_path.kind, AccessPathKind::FullTableScan));
-        assert!(users_path.index.is_none());
+        // bd-gh-indexed-by-desc-scan-order (#224): INDEXED BY is a HARD contract.
+        // The forced `idx_users_email` cannot seek the unrelated `user_id = ?`
+        // equality, but C SQLite still honors the hint as a FULL index scan
+        // (`SCAN users USING INDEX idx_users_email`) with the predicate applied
+        // as a residual — it does NOT silently fall back to a table scan. The
+        // unrelated equality therefore has no seekable probe.
+        assert!(matches!(
+            users_path.kind,
+            AccessPathKind::CoveringIndexScan { .. }
+        ));
+        assert_eq!(users_path.index.as_deref(), Some("idx_users_email"));
         assert!(users_path.probe.is_none());
     }
 

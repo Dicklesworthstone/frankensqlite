@@ -3716,6 +3716,54 @@ pub fn codegen_select(
         } else {
             match directive.access_kind {
                 PlannerSelectAccessKind::FullTableScan => {
+                    // bd-gh-indexed-by-desc-scan-order (#224): `INDEXED BY <idx>`
+                    // is a HARD contract. The planner directive falls back to a
+                    // FullTableScan when no WHERE made the forced index seekable,
+                    // but the forced index must still be honored as a full ordered
+                    // index scan in its STORED order (forward Rewind/Next: ascending
+                    // for an ASC index, descending for a DESC index), matching C
+                    // SQLite, rather than silently table-scanning in rowid order.
+                    if let Some(fsqlite_ast::IndexHint::IndexedBy(hinted)) = from_index_hint
+                        && stmt.order_by.is_empty()
+                        && let Some(forced_idx) = table
+                            .indexes
+                            .iter()
+                            .find(|idx| idx.name.eq_ignore_ascii_case(hinted))
+                        && forced_idx.supports_direct_column_lookup()
+                    {
+                        log_planner_select_directive_outcome(
+                            directive,
+                            "honored",
+                            "none",
+                            "forced_index_full_scan",
+                        );
+                        let plan = OrderByIndexPlan {
+                            index: forced_idx.clone(),
+                            descending: false,
+                            equality_prefix_len: 0,
+                            covering_output: resolve_covering_output_sources(
+                                columns,
+                                table,
+                                table_alias,
+                                forced_idx,
+                            ),
+                        };
+                        return codegen_select_index_ordered_scan(
+                            b,
+                            cursor,
+                            table,
+                            table_alias,
+                            schema,
+                            columns,
+                            where_clause.as_deref(),
+                            stmt.limit.as_ref(),
+                            out_regs,
+                            out_col_count,
+                            done_label,
+                            end_label,
+                            &plan,
+                        );
+                    }
                     log_planner_select_directive_outcome(
                         directive,
                         "honored",
@@ -4287,6 +4335,49 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
+        )
+    } else if let Some(fsqlite_ast::IndexHint::IndexedBy(hinted)) = from_index_hint
+        && stmt.order_by.is_empty()
+        && let Some(forced_idx) = table
+            .indexes
+            .iter()
+            .find(|idx| idx.name.eq_ignore_ascii_case(hinted))
+        && forced_idx.supports_direct_column_lookup()
+    {
+        // bd-gh-indexed-by-desc-scan-order (#224): `INDEXED BY <idx>` is a HARD
+        // contract. When no WHERE constraint made the index seekable we reached
+        // the table-scan fallback and silently ignored the forced index. Instead
+        // scan the forced index as a FULL ordered index scan in its STORED order
+        // — a forward Rewind/Next walk, which yields ascending values for an ASC
+        // index and descending for a DESC index, matching C SQLite. Covering when
+        // every output column is in the index; otherwise the shared emitter reads
+        // the rowid and looks the row up in the table. `descending: false` keeps
+        // the forward (stored-order) traversal for both ASC and DESC indexes.
+        let plan = OrderByIndexPlan {
+            index: forced_idx.clone(),
+            descending: false,
+            equality_prefix_len: 0,
+            covering_output: resolve_covering_output_sources(
+                columns,
+                table,
+                table_alias,
+                forced_idx,
+            ),
+        };
+        codegen_select_index_ordered_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            where_clause.as_deref(),
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            &plan,
         )
     } else {
         // --- Full table scan ---
