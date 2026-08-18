@@ -64846,6 +64846,7 @@ impl Connection {
                             Some(user_version as u32),
                             None,
                             None,
+                            None,
                         )
                         .await?;
                     }
@@ -64858,6 +64859,7 @@ impl Connection {
                             None,
                             None,
                             Some(application_id as u32),
+                            None,
                             None,
                         )
                         .await?;
@@ -64875,6 +64877,7 @@ impl Connection {
                         None,
                         None,
                         Some(default_cache_size),
+                        None,
                     )
                     .await?;
                 }
@@ -81263,6 +81266,7 @@ impl Connection {
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx,
+            text_encoding: self.db_text_encoding.get(),
             ..CodegenContext::default()
         };
         let temp_roots = self.temp_storage_roots();
@@ -81944,11 +81948,13 @@ impl Connection {
         user_version: Option<u32>,
         application_id: Option<u32>,
         default_cache_size: Option<i32>,
+        text_encoding: Option<TextEncoding>,
     ) -> Result<()> {
         if schema_cookie.is_none()
             && user_version.is_none()
             && application_id.is_none()
             && default_cache_size.is_none()
+            && text_encoding.is_none()
         {
             return Ok(());
         }
@@ -81976,6 +81982,9 @@ impl Connection {
             }
             if let Some(dcs) = default_cache_size {
                 header.default_cache_size = dcs;
+            }
+            if let Some(enc) = text_encoding {
+                header.text_encoding = enc;
             }
             let encoded = header
                 .to_bytes()
@@ -82044,7 +82053,7 @@ impl Connection {
         // the end of this function once the DDL state is fully consistent.
         self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, false);
         if let Err(error) = self
-            .update_database_header_metadata(Some(new_cookie), None, None, None)
+            .update_database_header_metadata(Some(new_cookie), None, None, None, None)
             .await
         {
             self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, true);

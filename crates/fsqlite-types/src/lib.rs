@@ -823,6 +823,18 @@ impl TextEncoding {
     pub const fn is_read_supported(self) -> bool {
         matches!(self, Self::Utf8 | Self::Utf16le | Self::Utf16be)
     }
+
+    /// Whether this encoding is supported for READ-WRITE access (bd-bld9w.7).
+    ///
+    /// UTF-8 plus UTF-16LE/BE: every on-disk write-serialization path now encodes
+    /// TEXT in the database's text encoding (the bd-bld9w.7 write-encode sweep), so
+    /// writing a UTF-16 database is byte-correct end to end. Mutation admission is
+    /// gated on this rather than the narrower [`Self::is_runtime_supported`], which
+    /// remains for callers that specifically need the UTF-8-only predicate.
+    #[must_use]
+    pub const fn is_write_supported(self) -> bool {
+        matches!(self, Self::Utf8 | Self::Utf16le | Self::Utf16be)
+    }
 }
 
 /// Journal mode for the database connection.
@@ -2948,6 +2960,19 @@ mod tests {
         assert!(TextEncoding::Utf8.is_runtime_supported());
         assert!(!TextEncoding::Utf16le.is_runtime_supported());
         assert!(!TextEncoding::Utf16be.is_runtime_supported());
+    }
+
+    #[test]
+    fn test_text_encoding_read_write_support() {
+        // Read and write admission both allow UTF-8 and UTF-16LE/BE (bd-bld9w.7).
+        for enc in [
+            TextEncoding::Utf8,
+            TextEncoding::Utf16le,
+            TextEncoding::Utf16be,
+        ] {
+            assert!(enc.is_read_supported());
+            assert!(enc.is_write_supported());
+        }
     }
 
     #[test]
