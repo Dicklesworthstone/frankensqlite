@@ -79,6 +79,8 @@ pub struct Fts5Config {
     insttoken: bool,
     locale: bool,
     tokendata: bool,
+    /// Soft leaf-size target from `%_config` `pgsz` (see [`effective_leaf_budget`]).
+    page_size: i64,
 }
 
 const FTS5_CONFIG_VERSION: i64 = 4;
@@ -94,6 +96,21 @@ const FTS5_MAX_PAGE_SIZE: i64 = 64 * 1024;
 /// plus the per-term size estimate's slack, so a leaf accepted by the estimate
 /// always actually encodes within the u16 ceiling.
 const FTS5_SAFE_LEAF_BYTES: usize = 60_000;
+/// The leaf-break budget honoring `%_config` `pgsz` (bd-3e08r).
+///
+/// `pgsz` is a SOFT target for when the writer should start a new segment leaf,
+/// whereas [`FTS5_SAFE_LEAF_BYTES`] is an ABSOLUTE u16 hard ceiling (leaf term
+/// offsets are stored in u16 fields, so a leaf must encode to <= 65535 bytes).
+/// We clamp `pgsz` down to that ceiling so a large or maximum `pgsz` (the max is
+/// 65536, one past the u16 limit) can never breach it, and so a non-positive or
+/// otherwise unrepresentable `pgsz` falls back to the safe ceiling. This budget
+/// governs ONLY the leaf-break decision; the single-term drop decision keeps the
+/// hard ceiling so a tiny `pgsz` never causes data loss.
+fn effective_leaf_budget(page_size: i64) -> usize {
+    usize::try_from(page_size)
+        .map(|p| p.min(FTS5_SAFE_LEAF_BYTES))
+        .unwrap_or(FTS5_SAFE_LEAF_BYTES)
+}
 /// Fixed 4-byte segment-leaf header (first_rowid_offset u16 + footer_offset u16).
 const FTS5_LEAF_HEADER_BYTES: usize = 4;
 const FTS5_DEFAULT_AUTOMERGE: i64 = 4;
@@ -1425,6 +1442,7 @@ impl Fts5PendingHash {
         &self,
         segid: u32,
         mut structure: Fts5StructureRecord,
+        leaf_budget: usize,
     ) -> Result<Fts5PendingFlush> {
         if self.is_empty() {
             return Err(fts5_data_error("cannot flush an empty pending hash"));
@@ -1435,7 +1453,7 @@ impl Fts5PendingHash {
         // (`lazy_segment_exact_postings`) linear-scans pgno_first..=pgno_last, so
         // a single segment spanning N leaves needs no idx rows and keeps origin
         // tracking clean (one segment, entry_count = row_count).
-        let leaves = self.to_segment_leaves();
+        let leaves = self.to_segment_leaves(leaf_budget);
         if leaves.is_empty() {
             return Err(fts5_data_error(
                 "pending hash produced no encodable segment leaves",
@@ -1490,16 +1508,26 @@ impl Fts5PendingHash {
         })
     }
 
-    /// cass#369: build the segment's terms (already globally sorted, since
-    /// `self.terms` is a `BTreeMap`) into one-or-more leaves, each kept under
-    /// [`FTS5_SAFE_LEAF_BYTES`]. Each leaf holds a contiguous increasing term
-    /// range and the ranges are globally ordered, exactly what the multi-leaf
-    /// reader expects. A single term whose own entry exceeds the leaf ceiling
-    /// (a pathological huge doclist) cannot fit any leaf and is skipped with a
-    /// warning — unqueryable in the SQLite shadow but still present in the
-    /// authoritative Tantivy index — mirroring the gh362 overlong-term skip
-    /// rather than failing the whole segment write.
-    fn to_segment_leaves(&self) -> Vec<Fts5SegmentLeaf> {
+    /// cass#369 / bd-3e08r: build the segment's terms (already globally sorted,
+    /// since `self.terms` is a `BTreeMap`) into one-or-more leaves. Each leaf
+    /// holds a contiguous increasing term range and the ranges are globally
+    /// ordered, exactly what the multi-leaf reader expects.
+    ///
+    /// `leaf_budget` is the SOFT leaf-break target derived from `%_config`
+    /// `pgsz` ([`effective_leaf_budget`]): once the accumulated leaf would exceed
+    /// it, the writer starts a new leaf. It is always <= the u16 HARD ceiling
+    /// [`FTS5_SAFE_LEAF_BYTES`], so a leaf accepted by the budget always encodes
+    /// within the 65535-byte u16 offset space.
+    ///
+    /// The single-term drop decision, by contrast, keeps the hard ceiling
+    /// [`FTS5_SAFE_LEAF_BYTES`] — never the (possibly tiny) `pgsz` budget — so a
+    /// small `pgsz` can never drop a term that would otherwise fit a u16 leaf.
+    /// Only a term whose own entry exceeds that hard ceiling (a pathological huge
+    /// doclist) cannot fit any leaf and is skipped with a warning — unqueryable
+    /// in the SQLite shadow but still present in the authoritative Tantivy index
+    /// — mirroring the gh362 overlong-term skip rather than failing the whole
+    /// segment write.
+    fn to_segment_leaves(&self, leaf_budget: usize) -> Vec<Fts5SegmentLeaf> {
         let mut leaves = Vec::new();
         let mut current: Vec<Fts5SegmentTerm> = Vec::new();
         let mut current_bytes = FTS5_LEAF_HEADER_BYTES;
@@ -1522,7 +1550,7 @@ impl Fts5PendingHash {
                 );
                 continue;
             }
-            if !current.is_empty() && current_bytes + estimate > FTS5_SAFE_LEAF_BYTES {
+            if !current.is_empty() && current_bytes + estimate > leaf_budget {
                 leaves.push(Fts5SegmentLeaf::new(std::mem::take(&mut current)));
                 current_bytes = FTS5_LEAF_HEADER_BYTES;
             }
@@ -2753,6 +2781,7 @@ impl Fts5ConfigMetadata {
         Self {
             secure_delete: config.secure_delete,
             insttoken: config.insttoken,
+            page_size: config.page_size,
             ..Self::default()
         }
     }
@@ -2760,6 +2789,7 @@ impl Fts5ConfigMetadata {
     pub fn apply_to_runtime_config(&self, config: &mut Fts5Config) {
         config.secure_delete = self.secure_delete;
         config.insttoken = self.insttoken;
+        config.page_size = self.page_size;
     }
 
     #[must_use]
@@ -3089,6 +3119,7 @@ impl Fts5Config {
             insttoken: false,
             locale: false,
             tokendata: false,
+            page_size: FTS5_DEFAULT_PAGE_SIZE,
         }
     }
 
@@ -8423,7 +8454,11 @@ impl Fts5Table {
             self.build_pending_hash()?
         };
         if !pending.is_empty() {
-            let flush = pending.flush_to_segment(1, structure.clone())?;
+            let flush = pending.flush_to_segment(
+                1,
+                structure.clone(),
+                effective_leaf_budget(self.config.page_size),
+            )?;
             rows.extend(flush.data_rows);
             return Ok(rows);
         }
@@ -8454,8 +8489,11 @@ impl Fts5Table {
         segid: u32,
         structure: Fts5StructureRecord,
     ) -> Result<Fts5PendingFlush> {
-        self.build_pending_hash()?
-            .flush_to_segment(segid, structure)
+        self.build_pending_hash()?.flush_to_segment(
+            segid,
+            structure,
+            effective_leaf_budget(self.config.page_size),
+        )
     }
 
     /// Encode the persist payload for a contentless INSERT as an incremental
@@ -8555,7 +8593,11 @@ impl Fts5Table {
                 docsize_rows,
             }));
         }
-        let flush = pending.flush_to_segment(next_segid, existing_structure.clone())?;
+        let flush = pending.flush_to_segment(
+            next_segid,
+            existing_structure.clone(),
+            effective_leaf_budget(self.config.page_size),
+        )?;
         let structure_data_row = Fts5DataRow::new(FTS5_STRUCTURE_ROWID, flush.structure.encode());
         // cass#369: a partitioned flush yields one leaf `_data` row per leaf
         // page (pgno 1..=N); append them all.
@@ -10717,6 +10759,7 @@ mod tests {
         insttoken: true,
         locale: false,
         tokendata: false,
+        page_size: 128,
     },
 }"#
         );
@@ -11662,7 +11705,7 @@ mod tests {
         assert_eq!(pending.term_count(), 5);
 
         let flush = pending
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
             .unwrap();
         assert_eq!(flush.data_rows.len(), 2);
         assert_eq!(
@@ -11702,7 +11745,7 @@ mod tests {
         );
 
         let flush = pending
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
             .unwrap();
 
         assert!(
@@ -11759,6 +11802,116 @@ mod tests {
         }
     }
 
+    /// bd-3e08r: a SMALL `pgsz`-derived leaf budget makes the writer partition
+    /// the same corpus into MORE, smaller leaves than the default u16 ceiling,
+    /// while every leaf still encodes within the u16 limit, terms stay globally
+    /// strictly increasing, and NO term is dropped (a tiny `pgsz` is a soft
+    /// break target, never a cause of data loss). Also pins the clamp behavior
+    /// of [`effective_leaf_budget`].
+    #[test]
+    fn test_bd3e08r_small_pgsz_budget_makes_more_leaves_without_dropping_terms() {
+        // The budget is a soft target clamped to the u16-safe hard ceiling.
+        assert_eq!(
+            effective_leaf_budget(FTS5_MAX_PAGE_SIZE),
+            FTS5_SAFE_LEAF_BYTES,
+            "a max pgsz (past the u16 limit) must clamp to the safe ceiling"
+        );
+        assert_eq!(effective_leaf_budget(65_536), FTS5_SAFE_LEAF_BYTES);
+        assert_eq!(
+            effective_leaf_budget(4050), 4050,
+            "a pgsz under the ceiling is honored verbatim"
+        );
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+        // Enough distinct in-cap tokens to comfortably exceed a small budget many
+        // times over, so the small-budget flush must span many leaves.
+        let body = (0..15_000usize)
+            .map(|i| format!("tok{i:06}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        table.insert_document(1, &[body]);
+        let pending = table.build_pending_hash().unwrap();
+        let term_count = pending.term_count();
+        assert!(
+            term_count >= 15_000,
+            "expected >=15000 distinct terms, got {term_count}"
+        );
+
+        // Same corpus, two budgets: a small pgsz-derived one vs. the u16 ceiling.
+        let small_budget = effective_leaf_budget(512);
+        assert_eq!(small_budget, 512, "512 is under the ceiling, honored verbatim");
+        let small = pending
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), small_budget)
+            .unwrap();
+        let ceiling = pending
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
+            .unwrap();
+
+        assert!(
+            small.leaves.len() > ceiling.leaves.len(),
+            "a small pgsz budget must produce MORE leaves ({}) than the u16 ceiling ({})",
+            small.leaves.len(),
+            ceiling.leaves.len()
+        );
+        assert_eq!(
+            u32::try_from(small.leaves.len()).unwrap(),
+            small.structure.levels[0].segments[0].pgno_last,
+            "the segment page range must cover every leaf"
+        );
+
+        // Every leaf still encodes within the u16 ceiling; terms are globally
+        // strictly increasing across leaves; and NO term is dropped despite the
+        // tiny budget.
+        let mut all_terms = 0usize;
+        let mut previous: Vec<u8> = Vec::new();
+        for leaf in &small.leaves {
+            let encoded = leaf.encode().expect("each partitioned leaf must encode");
+            assert!(
+                encoded.len() <= 65_535,
+                "partitioned leaf still exceeds the u16 ceiling: {} bytes",
+                encoded.len()
+            );
+            for term in &leaf.terms {
+                assert!(
+                    term.term > previous,
+                    "terms must be globally strictly increasing across leaves"
+                );
+                previous = term.term.clone();
+                all_terms += 1;
+            }
+        }
+        assert_eq!(
+            all_terms, term_count,
+            "a small pgsz budget must NOT drop any term"
+        );
+    }
+
+    /// bd-3e08r: `pgsz` (page_size) round-trips through the `%_config` codec and
+    /// [`Fts5ConfigMetadata::apply_to_runtime_config`] copies it into the runtime
+    /// [`Fts5Config`] that drives the leaf-break budget.
+    #[test]
+    fn test_bd3e08r_config_metadata_page_size_round_trip() {
+        let metadata = Fts5ConfigMetadata {
+            page_size: 128,
+            ..Default::default()
+        };
+        let rows = metadata.encode_rows();
+        let decoded = Fts5ConfigMetadata::decode_rows(&rows).unwrap();
+        assert_eq!(
+            decoded.page_size, 128,
+            "pgsz must survive the encode_rows/decode_rows round trip"
+        );
+
+        let mut runtime = Fts5Config::default();
+        assert_eq!(runtime.page_size, FTS5_DEFAULT_PAGE_SIZE);
+        decoded.apply_to_runtime_config(&mut runtime);
+        assert_eq!(
+            runtime.page_size, 128,
+            "apply_to_runtime_config must copy pgsz into the runtime config"
+        );
+    }
+
     #[test]
     fn test_fts5_pending_flush_hotspot_profile_keeps_single_structure_commit() {
         let cx = Cx::new();
@@ -11768,7 +11921,7 @@ mod tests {
         let flush = table
             .build_pending_hash()
             .unwrap()
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
             .unwrap();
         let profile = flush.hotspot_profile().unwrap();
 
@@ -11902,7 +12055,7 @@ mod tests {
             ..Default::default()
         };
         let flush = pending
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
             .unwrap();
         let scheduler = Fts5MergeScheduler {
             automerge: 4,
@@ -12042,7 +12195,7 @@ mod tests {
         let flush_profile = table
             .build_pending_hash()
             .unwrap()
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
             .unwrap()
             .hotspot_profile()
             .unwrap();
@@ -16125,6 +16278,7 @@ mod tests {
         insttoken: false,
         locale: false,
         tokendata: false,
+        page_size: 4050,
     },
     indexed_columns: [
         true,
@@ -16464,6 +16618,7 @@ mod tests {
         insttoken: true,
         locale: false,
         tokendata: false,
+        page_size: 4050,
     },
     columns: [
         "body",
@@ -16517,6 +16672,7 @@ mod tests {
         insttoken: false,
         locale: true,
         tokendata: false,
+        page_size: 4050,
     },
     columns: [
         "body",
@@ -16581,6 +16737,7 @@ mod tests {
         insttoken: false,
         locale: true,
         tokendata: false,
+        page_size: 4050,
     },
     indexed_columns: [
         true,
@@ -16777,6 +16934,7 @@ mod tests {
         insttoken: false,
         locale: false,
         tokendata: true,
+        page_size: 4050,
     },
     terms: [
         "alpha",
