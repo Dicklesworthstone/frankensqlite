@@ -2676,14 +2676,20 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 {
                     result.push_str(&s);
                 } else if alt_form2 {
-                    // Alternate-form-2 (`!`): shortest round-trip form with a
-                    // decimal point, e.g. printf('%!g',1.0) -> "1.0".
-                    let mut s = format!("{val:?}");
-                    if spec == 'G' {
-                        s = s.to_uppercase();
-                    }
+                    // Alternate-form-2 (`!`) on %g: format at the requested
+                    // significant digits (like %g, honoring precision — 0 means 1
+                    // sig fig), then ensure a decimal point with >= 1 fractional
+                    // digit. Unlike a shortest-round-trip form this respects the
+                    // precision-driven fixed/exponential choice: '%!.0g' 12345 ->
+                    // "1.0e+04", '%!.3g' 12345 -> "1.23e+04", '%!g' 100 -> "100.0".
+                    let formatted = format_float_g(val, sig, spec == 'G');
+                    let alt = if formatted.contains(['e', 'E']) {
+                        altform2_trim_exp(&formatted, spec == 'g')
+                    } else {
+                        altform2_trim_float(&formatted)
+                    };
                     result.push_str(&finish_float_padding(
-                        &s, width, left_align, show_sign, space_sign, zero_pad,
+                        &alt, width, left_align, show_sign, space_sign, zero_pad,
                     ));
                 } else {
                     let mut formatted = format_float_g(val, sig, spec == 'G');
@@ -5823,6 +5829,43 @@ mod tests {
             ("%!e", 5.0, "5.0e+00"),
             ("%!.2e", 3.14159, "3.14e+00"),
             ("%!.0e", 3.0, "3.0e+00"),
+        ];
+        for (spec, v, want) in cases {
+            assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
+        }
+    }
+
+    #[test]
+    fn test_format_altform2_g_honors_precision() {
+        // bd-g7pfx: '!' on %g formats at the requested significant digits
+        // (precision 0 => 1 sig fig, so the fixed/exponential choice is honored),
+        // then ensures a decimal point with >= 1 fractional digit. Previously the
+        // path used shortest-round-trip and ignored precision. Oracle: sqlite3
+        // 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: f64| -> String {
+            match f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(spec)),
+                    SqliteValue::Float(v),
+                ])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let cases: &[(&str, f64, &str)] = &[
+            ("%!g", 12345.0, "12345.0"),
+            ("%!.0g", 12345.0, "1.0e+04"),
+            ("%!.1g", 12345.0, "1.0e+04"),
+            ("%!.3g", 12345.0, "1.23e+04"),
+            ("%!.2g", 0.000123, "0.00012"),
+            ("%!g", 100.0, "100.0"),
+            ("%!.0g", 5.0, "5.0"),
+            ("%!g", 0.1, "0.1"),
+            ("%!G", 12345.0, "12345.0"),
+            ("%!.0G", 12345.0, "1.0E+04"),
         ];
         for (spec, v, want) in cases {
             assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
