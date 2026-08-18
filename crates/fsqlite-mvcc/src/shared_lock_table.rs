@@ -2481,7 +2481,9 @@ mod crash_cleanup_process_liveness_tests {
     static PROC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn proc_test_guard() -> MutexGuard<'static, ()> {
-        PROC_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+        PROC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Build a procfs-tagged birth token for an arbitrary (live) child `pid`,
@@ -2700,7 +2702,10 @@ mod crash_cleanup_process_liveness_tests {
                 "post-cleanup acquire by txn={next_txn} must succeed"
             );
             assert_eq!(table.holder(PAGE), Some(next_txn));
-            assert!(table.release(PAGE, next_txn), "reset page for next iteration");
+            assert!(
+                table.release(PAGE, next_txn),
+                "reset page for next iteration"
+            );
 
             ran += 1;
         }
@@ -2782,7 +2787,10 @@ mod crash_cleanup_process_liveness_tests {
         // Resume the holder. It must NOT be able to reassert ownership:
         // renew fails (it no longer holds the lease) and a fresh acquire is
         // rejected while the worker's lease is live → no double ownership.
-        assert!(send_signal(holder_pid, Signal::SIGCONT), "SIGCONT the holder");
+        assert!(
+            send_signal(holder_pid, Signal::SIGCONT),
+            "SIGCONT the holder"
+        );
         assert!(
             !table.renew_rebuild_lease(holder_pid, hard_deadline),
             "resumed holder must fail to renew a lease it no longer owns"

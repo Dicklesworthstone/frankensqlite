@@ -5577,7 +5577,10 @@ mod tests {
             })
             .expect("drain returns a result while a rebuild is in progress");
 
-        assert_eq!(result.orphaned_cleaned, 1, "the orphaned lock must be cleaned");
+        assert_eq!(
+            result.orphaned_cleaned, 1,
+            "the orphaned lock must be cleaned"
+        );
         assert_eq!(
             table.holder(page),
             None,

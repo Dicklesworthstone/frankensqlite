@@ -711,8 +711,7 @@ impl VersionStore {
                     // avoid a read→write deadlock on the arena RwLock.
                     drop(slots);
                     drop(arena);
-                    let (prev, attempts) =
-                        self.publish_relink_exclusive(shard, slot_idx, new_idx);
+                    let (prev, attempts) = self.publish_relink_exclusive(shard, slot_idx, new_idx);
                     (new_idx, prev, attempts)
                 }
             }
