@@ -87,10 +87,12 @@ use fsqlite_error::{ErrorCode, FrankenError, Result};
 #[cfg(feature = "ext-fts5")]
 use fsqlite_ext_fts5::{
     FTS5_AVERAGES_ROWID, FTS5_STRUCTURE_ROWID, Fts5AveragesRecord, Fts5DataRowid, Fts5DeletedDoc,
-    Fts5DocsizeRow, Fts5Expr, Fts5HighlightFunc, Fts5IdxRow, Fts5OnDiskReader, Fts5ScoreSnapshot,
-    Fts5ShadowRows, Fts5SnippetFunc, Fts5StructureRecord, Fts5Table, Fts5TombstonePage, build_expr,
-    decode_docsize_blob, encode_incremental_delete_flush, highlight as fts5_highlight,
-    parse_fts5_query, resolve_tombstone_target_segment, snippet as fts5_snippet,
+    Fts5DocsizeRow, Fts5Expr, Fts5HighlightFunc, Fts5IdxRow, Fts5MergeScheduler, Fts5OnDiskReader,
+    Fts5ScoreSnapshot, Fts5ShadowRows, Fts5SnippetFunc, Fts5StructureLevel, Fts5StructureRecord,
+    Fts5StructureSegment, Fts5Table, Fts5TombstonePage, build_expr, collect_merged_term_groups,
+    decode_docsize_blob, encode_incremental_delete_flush, encode_merged_segment,
+    highlight as fts5_highlight, parse_fts5_query, resolve_tombstone_target_segment,
+    snippet as fts5_snippet,
 };
 #[cfg(feature = "ext-json")]
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
@@ -46655,7 +46657,130 @@ impl Connection {
             new_rows = inserted_rowids.len(),
             "fts5: appended incremental contentless segment (bd-sf8dx)"
         );
+
+        // Keep the segment count bounded (the read path walks all segments per
+        // term): run the merge policy once for this append.
+        self.maybe_merge_rootpage_zero_fts5_segments(table_name).await?;
         Ok(true)
+    }
+
+    /// After a lazy contentless INSERT appended a segment, run the merge policy
+    /// once (at most one plan per statement) so the on-disk segment count stays
+    /// bounded — otherwise the read path walks an unbounded number of segments
+    /// per term.
+    ///
+    /// Reads only the plan's segments, never the whole corpus: resolve a plan
+    /// from the post-append structure, collect the merged term-groups over the
+    /// oldest run at the plan's level, encode the merged segment, upsert it + the
+    /// updated structure, and delete the merged inputs' `_data` rows. Rides the
+    /// caller's write txn. (bd-fts5-lazy-shadow-reads-itcc4.3)
+    #[cfg(feature = "ext-fts5")]
+    async fn maybe_merge_rootpage_zero_fts5_segments(&self, table_name: &str) -> Result<()> {
+        let key = table_name.to_ascii_uppercase();
+        let (scheduler, leaf_budget) = {
+            let instances = self.vtab_instances.borrow();
+            let Some(fts5) = instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            else {
+                return Ok(());
+            };
+            (
+                Fts5MergeScheduler::from_metadata(&fts5.config_metadata()),
+                fts5.segment_leaf_budget(),
+            )
+        };
+
+        // Read the post-append structure (the append already upserted it).
+        let structure = self
+            .with_lazy_fts5_reader(table_name, async |reader| {
+                match reader.read_data_block(FTS5_STRUCTURE_ROWID).await? {
+                    Some(block) => Ok(Some(Fts5StructureRecord::decode(&block)?)),
+                    None => Ok(None),
+                }
+            })
+            .await?;
+        let Some(structure) = structure else {
+            return Ok(());
+        };
+        let Some(plan) = scheduler.next_plan(&structure) else {
+            return Ok(());
+        };
+
+        // Select the oldest `merge_inputs` segments at the plan's level.
+        let Some(level) = structure.levels.get(plan.level) else {
+            return Ok(());
+        };
+        let merge_inputs = usize::try_from(plan.merge_inputs)
+            .unwrap_or(0)
+            .min(level.segments.len());
+        if merge_inputs < 2 {
+            return Ok(());
+        }
+        let merged: Vec<Fts5StructureSegment> = level.segments[..merge_inputs].to_vec();
+        let merged_segids: Vec<u32> = merged.iter().map(|segment| segment.segid).collect();
+        let new_segid = structure
+            .levels
+            .iter()
+            .flat_map(|level| level.segments.iter())
+            .map(|segment| segment.segid)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let sub_structure = Fts5StructureRecord {
+            cookie: structure.cookie,
+            write_counter: structure.write_counter,
+            origin_counter: structure.origin_counter,
+            levels: vec![Fts5StructureLevel::new(0, merged)],
+        };
+
+        // Collect the merged term-groups (lazy — reads only the plan's segments).
+        let term_doclists = self
+            .with_lazy_fts5_reader(table_name, async |reader| {
+                collect_merged_term_groups(reader, &sub_structure).await
+            })
+            .await?;
+
+        let flush = encode_merged_segment(
+            term_doclists,
+            &merged_segids,
+            &structure,
+            plan.level,
+            new_segid,
+            leaf_budget,
+        )?;
+
+        // Write the merged segment + updated structure, then delete the inputs'
+        // `_data` rows (both ride the active write txn; write-then-delete so a
+        // mid-crash only leaks reclaimable space, never corrupts).
+        let mut data_rows: Vec<(i64, Vec<SqliteValue>)> =
+            Vec::with_capacity(flush.leaf_data_rows.len() + 1);
+        for row in flush
+            .leaf_data_rows
+            .into_iter()
+            .chain([flush.structure_data_row])
+        {
+            data_rows.push((
+                row.id,
+                vec![
+                    SqliteValue::Integer(row.id),
+                    SqliteValue::Blob(Arc::from(row.block.into_boxed_slice())),
+                ],
+            ));
+        }
+        self.upsert_storage_table_rows(&format!("{table_name}_data"), data_rows)
+            .await?;
+        self.delete_storage_table_rows(&format!("{table_name}_data"), &flush.deleted_data_rowids)
+            .await?;
+
+        tracing::debug!(
+            table = table_name,
+            level = plan.level,
+            merged = merged_segids.len(),
+            new_segid,
+            "fts5: merged lazy contentless segments (bd-fts5-lazy-shadow-reads-itcc4.3)"
+        );
+        Ok(())
     }
 
     #[cfg(feature = "ext-fts5")]

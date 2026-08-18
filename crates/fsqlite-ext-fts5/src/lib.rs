@@ -8662,6 +8662,14 @@ impl Fts5Table {
         (effective_leaf_budget(self.config.page_size).saturating_sub(8) / 8).max(2)
     }
 
+    /// The segment-leaf byte budget for this table's page size — the leaf
+    /// partition size used by the incremental-insert and merge encode paths
+    /// (bd-fts5-lazy-shadow-reads-itcc4.3).
+    #[must_use]
+    pub fn segment_leaf_budget(&self) -> usize {
+        effective_leaf_budget(self.config.page_size)
+    }
+
     /// Answer MATCH queries in lazy mode by point-reading persisted on-disk
     /// segments through `reader`, projecting `_content` only for result rows.
     pub async fn search_rows_lazy<R: Fts5OnDiskReader>(
