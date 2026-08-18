@@ -182,7 +182,12 @@ pub const PARALLEL_WAL_PUBLICATION_SCENARIO_ID: &str = "parallel_wal_publication
 /// Stable on-disk schema version for commit-certificate canonical bytes.
 pub const PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION: u16 = 2;
 /// Stable envelope version for append-only durable certificate records.
-pub const PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION: u16 = 3;
+///
+/// Bumped 3 -> 4 for bd-85x9y / GH#364: the record envelope now carries the
+/// creating database's 16-byte creation-stable identity (`db_file_id`). A v3
+/// (identity-less) record decodes to an error, which recovery treats as an
+/// absent certificate rather than a fatal failure.
+pub const PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION: u16 = 4;
 /// Magic prefix for one record in the `-wal-cert` sidecar.
 pub const PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC: [u8; 8] = *b"FSQLCERT";
 const PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN: &str =
@@ -193,9 +198,10 @@ const PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_SIZE: usize = 32;
 const MAX_PARALLEL_WAL_LANE_COUNT: usize = 65_535;
 /// Largest valid encoded commit-certificate sidecar record.
 ///
-/// The fixed envelope is 136 bytes and each representable lane contributes
-/// one four-byte record count. Readers and writers share this bound so no
-/// successfully persisted record can become unreadable during recovery.
+/// The fixed envelope is 152 bytes (136 pre-bd-85x9y plus the 16-byte
+/// `db_file_id`) and each representable lane contributes one four-byte record
+/// count. Readers and writers share this bound so no successfully persisted
+/// record can become unreadable during recovery.
 pub const PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE: usize =
     ParallelWalDurableCertificateRecord::MIN_ENCODED_SIZE + MAX_PARALLEL_WAL_LANE_COUNT * 4;
 
@@ -670,11 +676,26 @@ pub struct ParallelWalDurableCertificateRecord {
     pub wal_frame_start: u64,
     /// One-based final (commit-marker) WAL frame covered by this certificate.
     pub wal_frame_end: u64,
+    /// Creation-stable identity of the database file this certificate was
+    /// written for (page-1 header bytes 76..92; bd-85x9y / GH#364).
+    ///
+    /// Recovery binds the certificate to this exact physical database. A cert
+    /// whose identity does not match the database currently being opened — the
+    /// signature of a stale sidecar left behind across a database-*file*
+    /// replacement — is treated as absent so it cannot re-extend a fresh,
+    /// smaller database to the replaced file's committed page count. An all-zero
+    /// value marks a legacy/pre-identity (unstamped) database and is compared
+    /// leniently by the reader. This lives on the record *envelope* only; the
+    /// [`ParallelWalCommitCertificate`] payload and its checksum are unchanged.
+    pub db_file_id: [u8; 16],
     pub certificate: ParallelWalCommitCertificate,
 }
 
 impl ParallelWalDurableCertificateRecord {
-    const FIXED_PREFIX_SIZE: usize = 8 + 2 + 4 + 4 + 4 + 4 + 8 + 8;
+    // magic(8) + version(2) + total_len(4) + checkpoint_seq(4) + salt1(4)
+    // + salt2(4) + wal_frame_start(8) + wal_frame_end(8) + db_file_id(16).
+    // The trailing 16 bytes are the bd-85x9y / GH#364 envelope identity.
+    const FIXED_PREFIX_SIZE: usize = 8 + 2 + 4 + 4 + 4 + 4 + 8 + 8 + 16;
     const MIN_CERTIFICATE_SIZE: usize =
         2 + 1 + 8 * 4 + 2 + 4 + 4 + 4 + PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_SIZE + 1 + 4;
     const ENVELOPE_CRC_SIZE: usize = 4;
@@ -694,6 +715,7 @@ impl ParallelWalDurableCertificateRecord {
         wal_generation: WalGenerationIdentity,
         wal_frame_start: u64,
         wal_frame_end: u64,
+        db_file_id: [u8; 16],
         certificate: ParallelWalCommitCertificate,
     ) -> Result<Self, String> {
         if wal_frame_start == 0 || wal_frame_end < wal_frame_start {
@@ -708,6 +730,7 @@ impl ParallelWalDurableCertificateRecord {
             wal_generation,
             wal_frame_start,
             wal_frame_end,
+            db_file_id,
             certificate,
         })
     }
@@ -748,6 +771,9 @@ impl ParallelWalDurableCertificateRecord {
         bytes.extend_from_slice(&self.wal_generation.salts.salt2.to_le_bytes());
         bytes.extend_from_slice(&self.wal_frame_start.to_le_bytes());
         bytes.extend_from_slice(&self.wal_frame_end.to_le_bytes());
+        // bd-85x9y / GH#364: creation-stable db-file identity, fixed 16-byte
+        // envelope field between the frame interval and the certificate payload.
+        bytes.extend_from_slice(&self.db_file_id);
         bytes.extend_from_slice(&certificate_bytes);
         bytes.extend_from_slice(&self.certificate.certificate_crc32c.to_le_bytes());
         let envelope_crc32c = crc32c::crc32c(&bytes);
@@ -825,6 +851,15 @@ impl ParallelWalDurableCertificateRecord {
                 "invalid durable certificate WAL frame interval {wal_frame_start}..={wal_frame_end}"
             ));
         }
+
+        // bd-85x9y / GH#364: creation-stable db-file identity (16 raw bytes).
+        let mut db_file_id = [0u8; 16];
+        db_file_id.copy_from_slice(read_record_bytes(
+            bytes,
+            &mut offset,
+            16,
+            "db-file identity",
+        )?);
 
         let format_bytes = read_record_bytes(bytes, &mut offset, 2, "certificate format")?;
         let format_version = u16::from_le_bytes([format_bytes[0], format_bytes[1]]);
@@ -924,6 +959,7 @@ impl ParallelWalDurableCertificateRecord {
             },
             wal_frame_start,
             wal_frame_end,
+            db_file_id,
             certificate,
         )
     }
@@ -5390,6 +5426,10 @@ mod tests {
                 Ok(())
             })
             .expect("certificate should publish");
+        let sample_db_file_id: [u8; 16] = [
+            0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18, 0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E,
+            0x8F, 0x90,
+        ];
         let record = ParallelWalDurableCertificateRecord::new(
             WalGenerationIdentity {
                 checkpoint_seq: 9,
@@ -5400,6 +5440,7 @@ mod tests {
             },
             17,
             21,
+            sample_db_file_id,
             receipt.certificate,
         )
         .expect("durable record should validate");
@@ -5413,8 +5454,8 @@ mod tests {
         );
         assert_eq!(
             ParallelWalDurableCertificateRecord::MIN_ENCODED_SIZE,
-            136,
-            "recovery readers must share the version-3 minimum envelope size"
+            152,
+            "recovery readers must share the version-4 minimum envelope size (136 + 16-byte db_file_id)"
         );
         let footer_offset = encoded.len() - ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE;
         assert_eq!(
@@ -5433,6 +5474,8 @@ mod tests {
             decoded.certificate.wal_frame_payload_digest,
             expected_frame_payload_digest
         );
+        // bd-85x9y / GH#364: the envelope identity survives the round-trip.
+        assert_eq!(decoded.db_file_id, sample_db_file_id);
         assert_eq!(decoded, record);
 
         let mut damaged = encoded.clone();
@@ -5456,6 +5499,62 @@ mod tests {
     }
 
     #[test]
+    fn durable_certificate_record_v4_preserves_identity_and_rejects_v3() {
+        // bd-85x9y / GH#364: a v4 record carries the 16-byte db_file_id and
+        // round-trips it losslessly; a record whose version byte is rolled back
+        // to the identity-less v3 envelope decodes to an error (which recovery
+        // treats as "certificate absent", never a fatal failure).
+        let receipt = ParallelWalDurabilityCombiner::default()
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("certificate should publish");
+        let identity: [u8; 16] = [
+            0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2,
+            0xE1, 0xF0,
+        ];
+        let record = ParallelWalDurableCertificateRecord::new(
+            WalGenerationIdentity {
+                checkpoint_seq: 3,
+                salts: crate::checksum::WalSalts {
+                    salt1: 0xDEAD_BEEF,
+                    salt2: 0xFEED_FACE,
+                },
+            },
+            1,
+            5,
+            identity,
+            receipt.certificate,
+        )
+        .expect("v4 record validates");
+
+        let encoded = record.to_bytes();
+        // v4 marker in the little-endian version slot immediately after magic.
+        assert_eq!(
+            u16::from_le_bytes([encoded[8], encoded[9]]),
+            PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION
+        );
+        assert_eq!(PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION, 4);
+
+        let decoded = ParallelWalDurableCertificateRecord::from_bytes(&encoded)
+            .expect("v4 record decodes");
+        assert_eq!(decoded.db_file_id, identity);
+        assert_eq!(decoded, record);
+
+        // Roll the version marker back to v3 (identity-less). `from_bytes`
+        // rejects the unknown version outright; crucially it returns an Err the
+        // reader can classify as an absent certificate rather than panicking.
+        let mut v3_bytes = encoded;
+        v3_bytes[8..10].copy_from_slice(&3u16.to_le_bytes());
+        let err = ParallelWalDurableCertificateRecord::from_bytes(&v3_bytes)
+            .expect_err("a v3 (identity-less) record must not decode as v4");
+        assert!(
+            err.contains("version"),
+            "decode error must name the unsupported version, got {err:?}"
+        );
+    }
+
+    #[test]
     fn durable_certificate_authorization_rejects_wrong_frame_payload_digest() {
         let request = durability_request(ParallelWalOperatingMode::Auto);
         let actual_frame_payload_digest = request.wal_frame_payload_digest;
@@ -5469,9 +5568,14 @@ mod tests {
                 salt2: 0x5566_7788,
             },
         };
-        let record =
-            ParallelWalDurableCertificateRecord::new(wal_generation, 1, 5, receipt.certificate)
-                .expect("durable record should validate");
+        let record = ParallelWalDurableCertificateRecord::new(
+            wal_generation,
+            1,
+            5,
+            [0x5A; 16],
+            receipt.certificate,
+        )
+        .expect("durable record should validate");
 
         assert!(record.authorizes_wal_boundary(wal_generation, 5, 5, actual_frame_payload_digest));
         let mut wrong_frame_payload_digest = actual_frame_payload_digest;

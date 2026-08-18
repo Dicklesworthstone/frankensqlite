@@ -2096,6 +2096,34 @@ fn durable_certificate_declares_len(bytes: &[u8], expected: usize) -> bool {
     durable_certificate_declared_len(bytes).is_some_and(|actual| actual.cmp(&expected).is_eq())
 }
 
+/// The durable-certificate record envelope version that immediately preceded
+/// bd-85x9y / GH#364 — the identity-less v3 record. A build written before the
+/// db-file identity was added stamps this version.
+const LEGACY_IDENTITYLESS_CERTIFICATE_RECORD_VERSION: u16 = 3;
+
+/// True when `bytes` begins with a well-formed durable-certificate envelope
+/// header (correct magic) that declares the specific LEGACY identity-less v3
+/// version written before bd-85x9y / GH#364.
+///
+/// Such a record is not corruption: it is a durable proof written by an older
+/// build that this build simply cannot honor (it carries no db-file identity),
+/// so the load gates treat it as an ABSENT certificate instead of failing
+/// recovery closed. Any *other* non-current version (a genuine future format, or
+/// a corrupted version byte) is deliberately NOT matched here — it falls through
+/// to strict decoding, which classifies it as corruption exactly as before.
+fn durable_certificate_is_legacy_identityless(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC) {
+        return false;
+    }
+    match bytes.get(8..10) {
+        Some(version_bytes) => {
+            u16::from_le_bytes([version_bytes[0], version_bytes[1]])
+                == LEGACY_IDENTITYLESS_CERTIFICATE_RECORD_VERSION
+        }
+        None => false,
+    }
+}
+
 fn decode_durable_certificate_record(
     bytes: &[u8],
     location: &str,
@@ -2262,6 +2290,20 @@ where
     /// because the read path is `&self` (a `WalBackend` read-snapshot method);
     /// the lock is held only for the sync take/put-back, never across `.await`.
     cached_certificate_read: std::sync::Mutex<Option<V::File>>,
+    /// Creation-stable identity of the main database file (page-1 header bytes
+    /// 76..92), captured once from the already-held verification descriptor the
+    /// first time a WAL operation runs against this adapter (bd-85x9y / GH#364).
+    ///
+    /// `None` means "not yet captured" (the very first probe has not run, or a
+    /// transient read failure left it unset — it is retried on the next call).
+    /// `Some([0u8; 16])` means the database is legacy/pre-identity (unstamped).
+    /// `Some(id)` with a non-zero `id` positively identifies this physical
+    /// database, which lets the certificate load gates reject a stale sidecar
+    /// left behind across a database-*file* replacement. It is captured with the
+    /// same `cached_verification_db` descriptor used by
+    /// [`Self::conflicts_after_generation_change`] rather than a fresh per-call
+    /// main-db open, which would release this process's fcntl locks (bd-qduu1).
+    db_file_identity: Option<[u8; 16]>,
     inner: WalBackendAdapter<V::File>,
 }
 
@@ -2292,6 +2334,7 @@ where
             namespace_binding,
             cached_verification_db: None,
             cached_certificate_read: std::sync::Mutex::new(None),
+            db_file_identity: None,
             inner: WalBackendAdapter::new(wal),
         }
     }
@@ -2408,6 +2451,99 @@ where
     /// Any missing/ambiguous baseline, unreadable or short main page, invalid
     /// database header, page-size change, WAL read error, or close failure
     /// fails closed by returning every candidate as conflicting.
+    /// Capture the main database file's creation-stable identity once
+    /// (bd-85x9y / GH#364).
+    ///
+    /// Reads page-1 header bytes 76..92 through the held `cached_verification_db`
+    /// descriptor (opening and retaining it if the cache is cold), never a
+    /// fresh per-call main-db open, so it cannot release this process's fcntl
+    /// locks (bd-qduu1). The descriptor is read-only and retained for reuse. A
+    /// transient failure leaves `db_file_identity` as `None` so the next call
+    /// retries; a successful read stores the identity even when it is all-zero
+    /// (a legacy/pre-identity database).
+    async fn ensure_db_file_identity_captured(&mut self, cx: &Cx) {
+        if self.db_file_identity.is_some() {
+            return;
+        }
+        let page_size = match usize::try_from(self.page_size) {
+            Ok(size) if size >= 92 => size,
+            _ => return,
+        };
+        let mut db_file = match self.cached_verification_db.take() {
+            Some(cached) => cached,
+            None => {
+                let main_db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+                match self.vfs.open(cx, Some(&self.db_path), main_db_flags) {
+                    Ok((file, _)) => file,
+                    // No readable main-db file yet: leave identity unknown and
+                    // retry on a later call. The gates stay lenient meanwhile.
+                    Err(_) => return,
+                }
+            }
+        };
+        let mut page_one = vec![0_u8; page_size];
+        match db_file.read(cx, &mut page_one, 0).await {
+            Ok(bytes_read) if bytes_read >= 92 => {
+                let mut id = [0_u8; 16];
+                id.copy_from_slice(&page_one[76..92]);
+                self.db_file_identity = Some(id);
+            }
+            // Short read / error: leave unknown, retry next call.
+            _ => {}
+        }
+        // Retain the descriptor for reuse (read-only, no lock impact — bd-smxhz).
+        self.cached_verification_db = Some(db_file);
+    }
+
+    /// True only when this adapter positively knows the database file's
+    /// non-zero creation-stable identity and the certificate record was bound to
+    /// that same identity (bd-85x9y / GH#364).
+    ///
+    /// An unknown (`None`) or legacy-zero adapter identity, or an all-zero
+    /// record identity, is never a match.
+    fn db_file_identity_matches(&self, record: &ParallelWalDurableCertificateRecord) -> bool {
+        match self.db_file_identity {
+            Some(id) if id != [0u8; 16] => record.db_file_id != [0u8; 16] && record.db_file_id == id,
+            _ => false,
+        }
+    }
+
+    /// True only when this adapter positively knows the database file's
+    /// non-zero identity AND the certificate record is bound to a *different*
+    /// identity — the signature of a stale/foreign sidecar left behind across a
+    /// database-*file* replacement (bd-85x9y / GH#364). Such a record must be
+    /// treated as absent.
+    ///
+    /// Returns false — do NOT reject — whenever the identity is indeterminate:
+    /// the adapter identity is unknown (capture has not yet succeeded) or
+    /// legacy-zero (a database created before identities were stamped). In those
+    /// cases identity cannot condemn the record, so the existing WAL
+    /// generation / frame-interval / payload-digest checks remain the sole
+    /// authority and a valid SAME-FILE certificate is never dropped. This is the
+    /// durability guardrail: rejection fires only on a positive cross-identity
+    /// conflict, never on uncertainty.
+    fn db_file_identity_rejects_record(
+        &self,
+        record: &ParallelWalDurableCertificateRecord,
+    ) -> bool {
+        // Reject only when identity is positively known (non-zero) AND the
+        // record does not match it. When identity is unknown/legacy the first
+        // guard is false, so no record is ever rejected on identity grounds.
+        matches!(self.db_file_identity, Some(id) if id != [0u8; 16])
+            && !self.db_file_identity_matches(record)
+    }
+
+    /// The identity to stamp into a certificate record written for this
+    /// database (bd-85x9y / GH#364): the captured non-zero identity, or the
+    /// all-zero legacy sentinel when identity is unknown/legacy so a certificate
+    /// authored before capture never claims a foreign identity.
+    fn db_file_id_for_written_certificate(&self) -> [u8; 16] {
+        match self.db_file_identity {
+            Some(id) => id,
+            None => [0u8; 16],
+        }
+    }
+
     async fn conflicts_after_generation_change(
         &mut self,
         cx: &Cx,
@@ -2545,6 +2681,11 @@ where
         if let Some(binding) = &self.namespace_binding {
             binding.validate_path_identity()?;
         }
+        // bd-85x9y / GH#364: capture the database file's creation-stable identity
+        // once, before any certificate read/write, so the load gates can reject a
+        // stale foreign certificate. Lazy + retried, so it is harmless if the
+        // main-db page 1 is not yet readable on the very first probe.
+        self.ensure_db_file_identity_captured(cx).await;
         if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
             if self.create_missing {
                 return self.replace_with_created_wal(cx).await;
@@ -2846,6 +2987,10 @@ where
             self.inner.inner().generation_identity(),
             wal_frame_start,
             wal_frame_end,
+            // bd-85x9y / GH#364: bind the certificate to this database's
+            // creation-stable identity so a reopen after a file replacement can
+            // recognize it as foreign.
+            self.db_file_id_for_written_certificate(),
             certificate.clone(),
         )
         .map_err(|error| {
@@ -3113,6 +3258,17 @@ where
                     detail: "parallel WAL checkpoint certificate handoff was short-read".to_owned(),
                 });
             }
+            // bd-85x9y / GH#364: a handoff written by the pre-identity v3 build
+            // is an absent certificate (it carries no db-file identity), not
+            // corruption — recovery must not fail closed on it. Any other bad
+            // version still decodes strictly below and is caught as corruption.
+            if durable_certificate_is_legacy_identityless(&bytes) {
+                tracing::debug!(
+                    target: "fsqlite::wal::durability_combiner",
+                    "ignored checkpoint handoff certificate from a legacy identity-less build"
+                );
+                return Ok(None);
+            }
             let record =
                 ParallelWalDurableCertificateRecord::from_bytes(&bytes).map_err(|error| {
                     FrankenError::WalCorrupt {
@@ -3121,6 +3277,21 @@ where
                         ),
                     }
                 })?;
+            // bd-85x9y / GH#364 primary gate: a handoff certificate bound to a
+            // DIFFERENT database identity is a stale sidecar left behind across a
+            // database-file replacement. Treat it as absent so it cannot
+            // re-extend a fresh, smaller database to the replaced file's
+            // committed page count. Rejection fires only on a positive
+            // cross-identity conflict, never when identity is unknown/legacy, so
+            // a valid same-file certificate is preserved (the durability
+            // guardrail).
+            if self.db_file_identity_rejects_record(&record) {
+                tracing::debug!(
+                    target: "fsqlite::wal::durability_combiner",
+                    "ignored checkpoint handoff certificate bound to a foreign database identity"
+                );
+                return Ok(None);
+            }
             Ok(Some(record.certificate))
         }
         .await;
@@ -3249,6 +3420,19 @@ where
                         "newest record",
                     )
                     .await?;
+                    // bd-85x9y / GH#364: a well-formed record from the pre-identity
+                    // v3 build is an absent certificate (it carries no db-file
+                    // identity), not corruption. Return None so recovery does not
+                    // fail closed on a legacy sidecar left behind by a prior
+                    // release. Any other bad version decodes strictly below and is
+                    // caught as corruption.
+                    if durable_certificate_is_legacy_identityless(&bytes) {
+                        tracing::debug!(
+                            target: "fsqlite::wal::durability_combiner",
+                            "ignored durable certificate sidecar from a legacy identity-less build"
+                        );
+                        return Ok(None);
+                    }
                     // A matching magic or self-declared length makes this a
                     // fully-present envelope candidate. Strict decoding is
                     // mandatory even when its magic/version/CRC/footer is
@@ -3366,6 +3550,19 @@ where
                 // record can authorize the current WAL; checkpoint clock
                 // continuation comes from the fixed handoff anchor instead.
                 if record.wal_generation != wal_generation {
+                    return Ok(None);
+                }
+                // bd-85x9y / GH#364 defense-in-depth: a record bound to a
+                // DIFFERENT database identity means the whole -wal-cert sidecar
+                // belongs to a replaced file. No record in it can authorize this
+                // database, so treat the certificate as absent. Fires only on a
+                // positive cross-identity conflict (never on unknown/legacy
+                // identity), preserving a valid same-file certificate.
+                if self.db_file_identity_rejects_record(&record) {
+                    tracing::debug!(
+                        target: "fsqlite::wal::durability_combiner",
+                        "ignored durable certificate sidecar bound to a foreign database identity"
+                    );
                     return Ok(None);
                 }
                 let frame_index =
@@ -3744,6 +3941,9 @@ where
                 wal_generation,
                 wal_frame_start,
                 wal_frame_end,
+                // bd-85x9y / GH#364: reconstruct with this database's identity so
+                // the in-doubt record matches the sidecar bytes written above.
+                self.db_file_id_for_written_certificate(),
                 certificate.clone(),
             )
             .map_err(|error| {
@@ -4638,6 +4838,10 @@ mod tests {
         let mut page = sample_page(0x11);
         page[..16].copy_from_slice(b"SQLite format 3\0");
         page[16..18].copy_from_slice(&encoded_page_size.to_be_bytes());
+        // bd-85x9y / GH#364: leave the db-file identity slot (76..92) all-zero so
+        // this fixture is a deterministic legacy/unstamped database — the load
+        // gates then stay lenient (identity cannot condemn a certificate).
+        page[76..92].fill(0);
         page
     }
 
@@ -4984,6 +5188,7 @@ mod tests {
             backend.inner.inner().generation_identity(),
             2,
             2,
+            [0u8; 16],
             orphan,
         )
         .expect("construct orphan record")
@@ -5018,6 +5223,7 @@ mod tests {
             backend.inner.inner().generation_identity(),
             2,
             2,
+            [0u8; 16],
             orphan.clone(),
         )
         .expect("construct orphan record")
@@ -5083,6 +5289,7 @@ mod tests {
             backend.inner.inner().generation_identity(),
             2,
             2,
+            [0u8; 16],
             orphan,
         )
         .expect("construct orphan record")
@@ -5180,6 +5387,7 @@ mod tests {
             backend.inner.inner().generation_identity(),
             1,
             1,
+            [0u8; 16],
             certificate.clone(),
         )
         .expect("construct maximum-size record");
@@ -5220,6 +5428,7 @@ mod tests {
                     backend.inner.inner().generation_identity(),
                     1,
                     1,
+                    [0u8; 16],
                     orphan,
                 )
                 .expect("construct bounded orphan")
@@ -5246,6 +5455,7 @@ mod tests {
                 backend.inner.inner().generation_identity(),
                 1,
                 1,
+                [0u8; 16],
                 overflow,
             )
             .expect("construct overflow orphan")
@@ -5270,6 +5480,7 @@ mod tests {
                         backend.inner.inner().generation_identity(),
                         1,
                         1,
+                        [0u8; 16],
                         sample_certificate(2, 2, vec![1]),
                     )
                     .expect("sizing record")
@@ -5284,6 +5495,7 @@ mod tests {
                     backend.inner.inner().generation_identity(),
                     2,
                     2,
+                    [0u8; 16],
                     future,
                 )
                 .expect("construct future record")
@@ -5299,6 +5511,119 @@ mod tests {
                 .expect("future-boundary records are budget-exempt")
                 .expect("authorized predecessor is found beneath futures"),
             authorized
+        );
+    }
+
+    // -- bd-85x9y / GH#364: db-file identity gate on the checkpoint handoff --
+
+    /// This database's stamped identity in the identity-gate tests.
+    const GH364_IDENTITY_A: [u8; 16] = [0xA1; 16];
+    /// A foreign (replaced-file) identity in the identity-gate tests.
+    const GH364_IDENTITY_B: [u8; 16] = [0xB2; 16];
+
+    /// Write a `test.db` main-database page 1 stamped with `identity` at header
+    /// bytes 76..92 so the adapter captures it as this file's identity.
+    fn write_identity_stamped_main_db(vfs: &MemoryVfs, cx: &Cx, identity: [u8; 16]) {
+        let mut page_one = sqlite_page_one(u16::try_from(PAGE_SIZE).expect("page size fits u16"));
+        page_one[76..92].copy_from_slice(&identity);
+        write_main_db_pages(vfs, cx, &[page_one]);
+    }
+
+    /// Overwrite the checkpoint handoff sidecar (`test.db-wal-cert-head`) with
+    /// `bytes`.
+    fn write_checkpoint_handoff(vfs: &MemoryVfs, cx: &Cx, bytes: &[u8]) {
+        let path = std::path::Path::new("test.db-wal-cert-head");
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (mut file, _) = vfs.open(cx, Some(path), flags).expect("open handoff sidecar");
+        file.truncate(cx, 0).expect("truncate handoff sidecar");
+        file.write(cx, bytes, 0).expect("write handoff sidecar");
+        file.close(cx).expect("close handoff sidecar");
+    }
+
+    /// Encode a single handoff certificate record bound to `db_file_id`.
+    fn handoff_record_bytes(
+        backend: &PathRefreshingWalBackend<MemoryVfs>,
+        db_file_id: [u8; 16],
+    ) -> Vec<u8> {
+        let certificate = sample_certificate(1, 1, vec![1]);
+        ParallelWalDurableCertificateRecord::new(
+            backend.inner.inner().generation_identity(),
+            1,
+            1,
+            db_file_id,
+            certificate,
+        )
+        .expect("construct handoff record")
+        .to_bytes()
+    }
+
+    #[test]
+    fn gh364_checkpoint_handoff_with_foreign_identity_is_absent() {
+        // A stale handoff left behind across a database-file replacement is bound
+        // to the REPLACED file's identity. On a fresh (differently stamped)
+        // database it must be treated as absent so it cannot re-extend the new,
+        // smaller file to the old file's committed page count.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        write_identity_stamped_main_db(&vfs, &cx, GH364_IDENTITY_A);
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let stale = handoff_record_bytes(&backend, GH364_IDENTITY_B);
+        write_checkpoint_handoff(&vfs, &cx, &stale);
+
+        let recovered = backend
+            .latest_authorized_parallel_wal_commit_certificate(&cx)
+            .wait()
+            .expect("handoff read must not fail closed on a foreign identity");
+        assert!(
+            recovered.is_none(),
+            "a handoff bound to a foreign db-file identity must be absent, got {recovered:?}"
+        );
+    }
+
+    #[test]
+    fn gh364_checkpoint_handoff_with_matching_identity_is_applied() {
+        // The database's own handoff (same identity) must still be honored — the
+        // db_size floor it carries prevents truncation of committed growth. This
+        // is the durability guardrail: a valid same-file certificate is applied.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        write_identity_stamped_main_db(&vfs, &cx, GH364_IDENTITY_A);
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let own = handoff_record_bytes(&backend, GH364_IDENTITY_A);
+        write_checkpoint_handoff(&vfs, &cx, &own);
+
+        let recovered = backend
+            .latest_authorized_parallel_wal_commit_certificate(&cx)
+            .wait()
+            .expect("same-identity handoff must recover");
+        assert_eq!(
+            recovered,
+            Some(sample_certificate(1, 1, vec![1])),
+            "a handoff bound to this database's own identity must be applied"
+        );
+    }
+
+    #[test]
+    fn gh364_checkpoint_handoff_with_legacy_v3_version_is_absent_not_fatal() {
+        // A handoff written by a pre-bd-85x9y build carries the identity-less v3
+        // envelope version. This build treats it as an absent certificate rather
+        // than failing recovery closed with a corruption error.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        write_identity_stamped_main_db(&vfs, &cx, GH364_IDENTITY_A);
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let mut record = handoff_record_bytes(&backend, GH364_IDENTITY_A);
+        // Roll the envelope version marker back to the identity-less v3 value.
+        record[8..10].copy_from_slice(&3u16.to_le_bytes());
+        write_checkpoint_handoff(&vfs, &cx, &record);
+
+        let recovered = backend
+            .latest_authorized_parallel_wal_commit_certificate(&cx)
+            .wait()
+            .expect("a legacy v3 handoff must be absent, never a fatal error");
+        assert!(
+            recovered.is_none(),
+            "a legacy v3 (identity-less) handoff must be absent, got {recovered:?}"
         );
     }
 

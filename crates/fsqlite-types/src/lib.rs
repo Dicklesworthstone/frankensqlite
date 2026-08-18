@@ -959,6 +959,25 @@ pub struct DatabaseHeader {
     /// so a downgraded binary cannot silently corrupt a database written by a
     /// newer release.
     pub format_version: u32,
+    /// FrankenSQLite creation-stable database-file identity, stored as 16 raw
+    /// bytes at header bytes 76..92 inside SQLite's "reserved for expansion"
+    /// region (bytes 72..=91), immediately after [`Self::format_version`]
+    /// (72..76).
+    ///
+    /// Stock SQLite ignores that region, so a non-zero identity keeps the file
+    /// readable by stock C SQLite and never triggers any open-time refusal
+    /// (unlike `format_version`, this field is read but never validated). It is
+    /// generated once from OS randomness when a database is first created and is
+    /// carried forward unchanged by every header round-trip and by VACUUM, so it
+    /// stays stable for the physical life of the file. `[0u8; 16]` means "never
+    /// stamped" and marks a legacy/pre-identity database.
+    ///
+    /// The durable parallel-WAL commit certificate (`-wal-cert` /
+    /// `-wal-cert-head` sidecars) binds to this identity so a stale certificate
+    /// left behind across a database-*file* replacement cannot re-extend a
+    /// fresh, smaller database to the replaced file's committed page count
+    /// (bd-85x9y / GH#364).
+    pub db_file_id: [u8; 16],
     /// Version-valid-for number (the change counter value when the version
     /// number was stored).
     pub version_valid_for: u32,
@@ -996,6 +1015,10 @@ impl Default for DatabaseHeader {
             // legacy/v1. It is only stamped non-zero when a build deliberately
             // writes a newer on-disk artifact (bd-yaomh.6).
             format_version: 0,
+            // A fresh, never-stamped database carries an all-zero identity so it
+            // stays byte-faithful to stock C SQLite. Callers that create a brand
+            // new database stamp a random identity here (bd-85x9y / GH#364).
+            db_file_id: [0u8; 16],
             version_valid_for: 0,
             sqlite_version: 0,
         }
@@ -1212,6 +1235,13 @@ impl DatabaseHeader {
             });
         }
 
+        // Creation-stable db-file identity (bd-85x9y / GH#364): 16 raw bytes at
+        // 76..92, immediately after the format-version slot. Stock ignores this
+        // region and this build never refuses a database based on it — an all-
+        // zero value simply marks a legacy/pre-identity file.
+        let mut db_file_id = [0u8; 16];
+        db_file_id.copy_from_slice(&buf[76..92]);
+
         let version_valid_for = encoding::read_u32_be(&buf[92..96]).expect("fixed u32 field");
         let sqlite_version = encoding::read_u32_be(&buf[96..100]).expect("fixed u32 field");
 
@@ -1233,6 +1263,7 @@ impl DatabaseHeader {
             incremental_vacuum,
             application_id,
             format_version,
+            db_file_id,
             version_valid_for,
             sqlite_version,
         })
@@ -1349,10 +1380,12 @@ impl DatabaseHeader {
 
         // Bytes 72..92 are SQLite's reserved-for-expansion region (stock C
         // SQLite ignores them). FrankenSQLite stamps its on-disk format version
-        // big-endian at bytes 72..76 (rollback-safety handshake, bd-yaomh.6);
-        // `out` was zero-filled above, so bytes 76..92 stay zero as stock
-        // expects.
+        // big-endian at bytes 72..76 (rollback-safety handshake, bd-yaomh.6) and
+        // its creation-stable db-file identity as 16 raw bytes at 76..92
+        // (bd-85x9y / GH#364). A never-stamped header carries an all-zero
+        // identity, so it stays byte-faithful to stock.
         encoding::write_u32_be(&mut out[72..76], self.format_version).expect("fixed u32 field");
+        out[76..92].copy_from_slice(&self.db_file_id);
         encoding::write_u32_be(&mut out[92..96], self.version_valid_for).expect("fixed u32 field");
         encoding::write_u32_be(&mut out[96..100], self.sqlite_version).expect("fixed u32 field");
 
@@ -1381,6 +1414,18 @@ impl DatabaseHeader {
     /// that gates the bump (`fsqlite_enable_format_v2`) is wired separately.
     pub const fn set_format_version(&mut self, version: u32) {
         self.format_version = version;
+    }
+
+    /// Stamp a creation-stable db-file identity into the header (bd-85x9y /
+    /// GH#364).
+    ///
+    /// Callers that create a brand new database stamp a value generated from OS
+    /// randomness here. The identity is read but never validated on open (stock
+    /// SQLite ignores the reserved region), so stamping is fully backward- and
+    /// forward-compatible. An all-zero value keeps the header byte-faithful to a
+    /// legacy/pre-identity database and is treated as "never stamped".
+    pub const fn set_db_file_id(&mut self, id: [u8; 16]) {
+        self.db_file_id = id;
     }
 }
 
@@ -2249,6 +2294,7 @@ mod tests {
             incremental_vacuum: 0,
             application_id: 0,
             format_version: 0,
+            db_file_id: [0u8; 16],
             version_valid_for: 7,
             sqlite_version: FRANKENSQLITE_SQLITE_VERSION_NUMBER,
         }
@@ -2588,8 +2634,14 @@ mod tests {
     }
 
     #[test]
-    fn test_reserved_bytes_72_91_zero() {
+    fn test_reserved_bytes_72_91_zero_when_unstamped() {
+        // Legacy/unstamped path: a header with a zero format_version and a zero
+        // db_file_id ([0u8; 16] by default) leaves the entire reserved region
+        // (72..92) zero, staying byte-faithful to stock C SQLite. bd-85x9y adds
+        // the db-file identity at 76..92 but a never-stamped database keeps it
+        // all-zero.
         let hdr = make_header_for_tests();
+        assert_eq!(hdr.db_file_id, [0u8; 16]);
         let buf = hdr.to_bytes().unwrap();
         for (i, &byte) in buf.iter().enumerate().take(92).skip(72) {
             assert_eq!(byte, 0, "byte {i} should be zero (reserved region)");
@@ -2602,6 +2654,38 @@ mod tests {
         for (i, &byte) in buf2.iter().enumerate().take(92).skip(72) {
             assert_eq!(byte, 0, "byte {i} should be zero even with custom app_id");
         }
+    }
+
+    #[test]
+    fn test_db_file_id_roundtrip_stamped() {
+        // bd-85x9y / GH#364: a stamped fresh database carries a non-zero
+        // creation-stable identity at header bytes 76..92 that survives a
+        // write/reopen round-trip unchanged, and never disturbs the neighbouring
+        // format-version slot (72..76) or version-valid-for field (92..96).
+        let sample_id: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xF0, 0x0F,
+        ];
+        let mut hdr = make_header_for_tests();
+        hdr.set_db_file_id(sample_id);
+        let buf = hdr.to_bytes().unwrap();
+        // The identity lands exactly at 76..92, as raw bytes.
+        assert_eq!(&buf[76..92], &sample_id[..]);
+        // The format-version slot stays byte-faithful to the (unstamped) value.
+        assert_eq!(&buf[72..76], &[0, 0, 0, 0]);
+
+        // Reopen: the identity reads back bit-for-bit and the whole header is
+        // stable across the round-trip.
+        let parsed = DatabaseHeader::from_bytes(&buf).unwrap();
+        assert_eq!(parsed.db_file_id, sample_id);
+        assert_eq!(parsed, hdr);
+        // A second write reproduces the identical bytes (stable across rewrites).
+        assert_eq!(parsed.to_bytes().unwrap(), buf);
+
+        // A default (never-stamped) header still reads back all-zero.
+        let legacy = DatabaseHeader::from_bytes(&make_header_for_tests().to_bytes().unwrap())
+            .unwrap();
+        assert_eq!(legacy.db_file_id, [0u8; 16]);
     }
 
     #[test]

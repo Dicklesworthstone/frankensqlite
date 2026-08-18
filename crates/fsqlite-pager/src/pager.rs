@@ -12298,6 +12298,42 @@ async fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
     Ok(wal_contains_valid_page1)
 }
 
+/// Generate a fresh creation-stable db-file identity for a brand-new database
+/// (bd-85x9y / GH#364).
+///
+/// The identity is 16 bytes of OS randomness stamped into header bytes 76..92
+/// at create time. It binds every durable parallel-WAL commit certificate to
+/// this exact physical database, so a stale certificate left behind across a
+/// database-*file* replacement is recognized as foreign and cannot re-extend a
+/// fresh, smaller database to the replaced file's committed page count. An
+/// all-zero identity (never generated) is treated as a legacy/pre-identity
+/// file, so a `[0u8; 16]` result must never be produced here.
+#[cfg(not(target_arch = "wasm32"))]
+fn generate_db_file_id() -> [u8; 16] {
+    // Mirror the WAL salt generation pattern (fsqlite-wal checksum.rs): draw
+    // directly from the thread-local RNG, retrying in the astronomically
+    // unlikely event of an all-zero draw so the sentinel stays reserved.
+    loop {
+        let id = rand::random::<[u8; 16]>();
+        if id != [0u8; 16] {
+            return id;
+        }
+    }
+}
+
+/// Wasm fallback: no durable file-backed databases exist on this target, so a
+/// process-unique counter suffices to keep freshly created identities distinct.
+#[cfg(target_arch = "wasm32")]
+fn generate_db_file_id() -> [u8; 16] {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&n.to_le_bytes());
+    id[8..].copy_from_slice(&n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+    id
+}
+
 fn bootstrap_header_from_stale_main_file(
     header_bytes: &[u8; DATABASE_HEADER_SIZE],
     page_size: PageSize,
@@ -12384,6 +12420,13 @@ fn bootstrap_header_from_stale_main_file(
             header_bytes[74],
             header_bytes[75],
         ]),
+        // FrankenSQLite creation-stable db-file identity (bd-85x9y / GH#364),
+        // 16 raw bytes at 76..92 of the reserved-for-expansion region.
+        db_file_id: {
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&header_bytes[76..92]);
+            id
+        },
         version_valid_for: u32::from_be_bytes([
             header_bytes[92],
             header_bytes[93],
@@ -16040,6 +16083,12 @@ where
                     page_size,
                     page_count: 1,
                     sqlite_version: FRANKENSQLITE_SQLITE_VERSION_NUMBER,
+                    // bd-85x9y / GH#364: stamp a fresh creation-stable db-file
+                    // identity at create time so durable parallel-WAL commit
+                    // certificates bind to this exact physical database and a
+                    // stale certificate from a replaced file is rejected on
+                    // reopen. Byte-faithful to stock (reserved region 76..92).
+                    db_file_id: generate_db_file_id(),
                     ..DatabaseHeader::default()
                 };
                 let hdr_bytes = header.to_bytes().map_err(|err| {
