@@ -5191,6 +5191,15 @@ fn run(opts: Options) -> Result<(), String> {
                 // the thread count. The bench writers run in-process, so
                 // the process-global counters are exactly this run's.
                 fsqlite_mvcc::reset_registry_commit_lock_metrics();
+                // bd-5fnex 1->2 cliff attribution: decompose the two
+                // commit-path locks the group-commit path serializes on
+                // (consolidator Mutex + flusher inner.lock) plus the
+                // rightmost-leaf page-lock, so a single --threads=1,2 run
+                // shows which lock's wait-time explodes from 1w to 2w.
+                fsqlite_wal::set_commit_phase_timing_enabled(true);
+                fsqlite_vdbe::engine::set_vdbe_metrics_enabled(true);
+                fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.reset();
+                fsqlite_vdbe::engine::reset_vdbe_metrics();
                 let result = run_fsqlite(
                     n,
                     opts.rows_per_thread,
@@ -5214,6 +5223,26 @@ fn run(opts: Options) -> Result<(), String> {
                         m.wait_ns_total as f64 / m.holds_total as f64 / 1_000.0,
                     );
                 }
+                let cons = fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.snapshot();
+                let vdbe = fsqlite_vdbe::engine::vdbe_metrics_snapshot();
+                eprintln!(
+                    "commit_lock_decomp threads={n} \
+                     arrival_wait_us={} consolidator_lock_wait_us={} inner_lock_wait_us={} \
+                     exclusive_lock_us={} wal_append_us={} wal_sync_us={} \
+                     waiter_epoch_wait_us={} flusher_commits={} waiter_commits={} \
+                     page_lock_waits={} page_lock_wait_us={}",
+                    cons.flusher_arrival_wait_us_total,
+                    cons.consolidator_lock_wait_us_total,
+                    cons.inner_lock_wait_us_total,
+                    cons.exclusive_lock_us_total,
+                    cons.wal_append_us_total,
+                    cons.wal_sync_us_total,
+                    cons.waiter_epoch_wait_us_total,
+                    cons.flusher_commits,
+                    cons.waiter_commits,
+                    vdbe.mvcc_write_path.page_lock_waits_total,
+                    vdbe.mvcc_write_path.page_lock_wait_time_ns_total / 1_000,
+                );
                 result
             },
         )?;
