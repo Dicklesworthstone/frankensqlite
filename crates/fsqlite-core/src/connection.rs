@@ -44044,6 +44044,205 @@ impl Connection {
         Ok(())
     }
 
+    /// Split `expr` into its AND-conjuncts, descending through the left/right
+    /// children of every top-level `AND`. Mirrors SQLite's WHERE-term
+    /// decomposition used when checking partial-index usability.
+    fn collect_and_conjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+            ..
+        } = expr
+        {
+            Self::collect_and_conjuncts(left, out);
+            Self::collect_and_conjuncts(right, out);
+        } else {
+            out.push(expr);
+        }
+    }
+
+    /// Rewrite every column reference in `expr` in place so a qualifier naming
+    /// one of `targets` (the forced table's name or alias, case-insensitive) is
+    /// dropped, and column names are lowercased. A partial index stores its
+    /// predicate as bare, table-local SQL, so this normalization lets a query
+    /// term like `t.b > 0` cover the stored `b > 0`, matching the qualifier
+    /// handling in SQLite's `sqlite3ExprCompare` cover check.
+    fn normalize_partial_predicate_columns(expr: &mut Expr, targets: &[&str]) {
+        match expr {
+            Expr::Column(cref, _) => {
+                if cref
+                    .table
+                    .as_deref()
+                    .is_some_and(|t| targets.iter().any(|q| q.eq_ignore_ascii_case(t)))
+                {
+                    cref.table = None;
+                }
+                if cref.column.chars().any(|c| c.is_ascii_uppercase()) {
+                    let lowered = cref.column.to_ascii_lowercase();
+                    cref.column = Arc::from(lowered.as_str());
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::normalize_partial_predicate_columns(left, targets);
+                Self::normalize_partial_predicate_columns(right, targets);
+            }
+            Expr::UnaryOp { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::Collate { expr, .. }
+            | Expr::IsNull { expr, .. } => {
+                Self::normalize_partial_predicate_columns(expr, targets);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                Self::normalize_partial_predicate_columns(expr, targets);
+                Self::normalize_partial_predicate_columns(low, targets);
+                Self::normalize_partial_predicate_columns(high, targets);
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                Self::normalize_partial_predicate_columns(expr, targets);
+                Self::normalize_partial_predicate_columns(pattern, targets);
+                if let Some(escape) = escape {
+                    Self::normalize_partial_predicate_columns(escape, targets);
+                }
+            }
+            Expr::In { expr, set, .. } => {
+                Self::normalize_partial_predicate_columns(expr, targets);
+                if let InSet::List(items) = set {
+                    for item in items {
+                        Self::normalize_partial_predicate_columns(item, targets);
+                    }
+                }
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    Self::normalize_partial_predicate_columns(operand, targets);
+                }
+                for (when_expr, then_expr) in whens {
+                    Self::normalize_partial_predicate_columns(when_expr, targets);
+                    Self::normalize_partial_predicate_columns(then_expr, targets);
+                }
+                if let Some(else_expr) = else_expr {
+                    Self::normalize_partial_predicate_columns(else_expr, targets);
+                }
+            }
+            Expr::JsonAccess { expr, path, .. } => {
+                Self::normalize_partial_predicate_columns(expr, targets);
+                Self::normalize_partial_predicate_columns(path, targets);
+            }
+            Expr::RowValue(items, _) => {
+                for item in items {
+                    Self::normalize_partial_predicate_columns(item, targets);
+                }
+            }
+            Expr::FunctionCall { args, .. } => {
+                if let FunctionArgs::List(items) = args {
+                    for item in items {
+                        Self::normalize_partial_predicate_columns(item, targets);
+                    }
+                }
+            }
+            // Literals, placeholders, subqueries, EXISTS, RAISE, and bound
+            // outer values carry no table-local column reference that must be
+            // normalized for a partial-index cover check.
+            _ => {}
+        }
+    }
+
+    /// The comparison operator expressing `a OP b` as `b OP' a`, if `OP`
+    /// commutes. Equality-shaped operators keep their operator; ordered
+    /// comparisons flip direction.
+    const fn commuted_comparison_op(op: BinaryOp) -> Option<BinaryOp> {
+        match op {
+            BinaryOp::Eq => Some(BinaryOp::Eq),
+            BinaryOp::Ne => Some(BinaryOp::Ne),
+            BinaryOp::Is => Some(BinaryOp::Is),
+            BinaryOp::IsNot => Some(BinaryOp::IsNot),
+            BinaryOp::Lt => Some(BinaryOp::Gt),
+            BinaryOp::Le => Some(BinaryOp::Ge),
+            BinaryOp::Gt => Some(BinaryOp::Lt),
+            BinaryOp::Ge => Some(BinaryOp::Le),
+            _ => None,
+        }
+    }
+
+    /// Structural equality of two already-column-normalized predicate
+    /// conjuncts, additionally allowing a single top-level comparison to be
+    /// written in either operand order (`0 < b` covers `b > 0`), matching
+    /// SQLite's `exprCommute` normalization. This is deliberately NOT logical
+    /// implication: `b > 5` never covers `b > 0`.
+    fn normalized_conjuncts_equivalent(a: &Expr, b: &Expr) -> bool {
+        if a == b {
+            return true;
+        }
+        if let (
+            Expr::BinaryOp {
+                left: la,
+                op: oa,
+                right: ra,
+                ..
+            },
+            Expr::BinaryOp {
+                left: lb,
+                op: ob,
+                right: rb,
+                ..
+            },
+        ) = (a, b)
+            && let Some(commuted) = Self::commuted_comparison_op(*ob)
+            && *oa == commuted
+            && la.as_ref() == rb.as_ref()
+            && ra.as_ref() == lb.as_ref()
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Whether a forced partial index is usable: every conjunct of its partial
+    /// `predicate` must be syntactically present among the query's
+    /// `query_conjuncts` (WHERE + join-ON terms), after normalizing column
+    /// qualifiers that name the forced table (`targets`) and allowing a single
+    /// comparison to be commuted. Mirrors SQLite's `whereUsablePartialIndex` /
+    /// `sqlite3ExprImpliesExpr` cover check — a syntactic match, NOT logical
+    /// implication.
+    fn forced_partial_index_predicate_covered(
+        predicate: &Expr,
+        query_conjuncts: &[&Expr],
+        targets: &[&str],
+    ) -> bool {
+        let normalized_query: Vec<Expr> = query_conjuncts
+            .iter()
+            .map(|conjunct| {
+                let mut owned = (*conjunct).clone();
+                Self::normalize_partial_predicate_columns(&mut owned, targets);
+                owned
+            })
+            .collect();
+
+        let mut predicate_conjuncts: Vec<&Expr> = Vec::new();
+        Self::collect_and_conjuncts(predicate, &mut predicate_conjuncts);
+
+        predicate_conjuncts.iter().all(|predicate_conjunct| {
+            let mut normalized_predicate = (*predicate_conjunct).clone();
+            Self::normalize_partial_predicate_columns(&mut normalized_predicate, targets);
+            normalized_query.iter().any(|query_conjunct| {
+                Self::normalized_conjuncts_equivalent(query_conjunct, &normalized_predicate)
+            })
+        })
+    }
+
     /// `INDEXED BY <name>` must reference an existing index on the named
     /// table. Shared by statement execution and `EXPLAIN` / `EXPLAIN QUERY
     /// PLAN` (hfdt-3b8zl): the plan surfaces must refuse a missing forced
@@ -44051,26 +44250,89 @@ impl Connection {
     /// plan that ignores the hint.
     fn validate_select_index_hints(&self, select: &SelectStatement) -> Result<()> {
         if let SelectCore::Select {
-            from: Some(from), ..
+            from: Some(from),
+            where_clause,
+            ..
         } = &select.body.select
         {
+            // Query WHERE + join-ON conjuncts, shared across every forced-index
+            // source, used to check partial-index usability below.
+            let mut query_conjuncts: Vec<&Expr> = Vec::new();
+            if let Some(where_expr) = where_clause {
+                Self::collect_and_conjuncts(where_expr, &mut query_conjuncts);
+            }
+            for join in &from.joins {
+                if let Some(JoinConstraint::On(on_expr)) = &join.constraint {
+                    Self::collect_and_conjuncts(on_expr, &mut query_conjuncts);
+                }
+            }
+
             let mut sources: Vec<&TableOrSubquery> = vec![&from.source];
             sources.extend(from.joins.iter().map(|j| &j.table));
             for tos in sources {
                 if let TableOrSubquery::Table {
                     name,
+                    alias,
                     index_hint: Some(fsqlite_ast::IndexHint::IndexedBy(idx)),
                     ..
                 } = tos
                 {
                     if let Some(ti) = self.schema_index_of(&name.name) {
-                        let known = self.schema.borrow().get(ti).is_some_and(|t| {
-                            t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(idx))
-                        });
-                        if !known {
+                        // Resolve the forced index while the schema is borrowed;
+                        // capture only owned facts so the borrow is released
+                        // before the (allocating) cover check below.
+                        let mut index_known = false;
+                        let mut forced_partial = false;
+                        let mut partial_predicate: Option<Expr> = None;
+                        {
+                            let schema = self.schema.borrow();
+                            if let Some(forced_index) = schema.get(ti).and_then(|t| {
+                                t.indexes.iter().find(|i| i.name.eq_ignore_ascii_case(idx))
+                            }) {
+                                index_known = true;
+                                if forced_index.where_clause.is_some() {
+                                    forced_partial = true;
+                                    partial_predicate =
+                                        Self::parse_partial_index_predicate_for_integrity(
+                                            forced_index,
+                                        )
+                                        .ok()
+                                        .flatten();
+                                }
+                            }
+                        }
+                        if !index_known {
                             return Err(FrankenError::FunctionError(format!(
                                 "no such index: {idx}"
                             )));
+                        }
+                        // A forced PARTIAL index is usable only when every
+                        // conjunct of its partial predicate is syntactically
+                        // present among the query's WHERE / join-ON conjuncts.
+                        // This mirrors C SQLite's `whereUsablePartialIndex`
+                        // cover check, which is a *syntactic* match (modulo
+                        // column-qualifier and single-comparison commutation
+                        // normalization) and NOT logical implication: `b > 5`
+                        // does not satisfy a `b > 0` predicate even though it
+                        // implies it. Otherwise SQLite fails at prepare with
+                        // "no query solution" (GH#173, bd-qfgsa).
+                        if forced_partial {
+                            let mut targets: Vec<&str> = vec![name.name.as_str()];
+                            if let Some(alias) = alias {
+                                targets.push(alias.as_str());
+                            }
+                            let covered = partial_predicate.as_ref().is_some_and(|pred| {
+                                Self::forced_partial_index_predicate_covered(
+                                    pred,
+                                    &query_conjuncts,
+                                    &targets,
+                                )
+                            });
+                            if !covered {
+                                return Err(FrankenError::FunctionError(
+                                    "no query solution".to_owned(),
+                                ));
+                            }
                         }
                     } else if name.schema.as_deref().is_some_and(|schema| {
                         !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
