@@ -477,7 +477,7 @@ pub fn run_entrypoint() {
         "bench_source_sha256 {} {}",
         file_identity(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/minmax_prefix_profile.rs"
+            "/benches/minmax_prefix_contract_bench.rs"
         )),
         file_identity(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -489,6 +489,16 @@ pub fn run_entrypoint() {
         .build()
         .expect("build minmax contract runtime");
     runtime.block_on(run_contract());
+}
+
+// bd-cargo-minmax-duplicate-target-82api: this profiler is now a dedicated
+// `harness = false` bench target (crates/fsqlite/Cargo.toml). The bench binary
+// needs its own `main`; it previously lived in a benches/ include-wrapper that
+// re-`#[path]`-imported this file from tests/, which registered the same source
+// as BOTH an auto-discovered integration test AND a bench (the duplicate-target
+// warning). The file now lives only under benches/, so there is no test target.
+fn main() {
+    run_entrypoint();
 }
 
 #[cfg(test)]
