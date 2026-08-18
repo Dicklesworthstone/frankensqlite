@@ -43,6 +43,7 @@ use fsqlite_types::cx::Cx;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_types::record::{
     RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
+    serialize_record_with_encoding,
 };
 use fsqlite_types::value::SqliteValue;
 
@@ -1317,7 +1318,12 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 // layout. `MemDatabase` keys these rows under a synthetic counter
                 // assigned at load purely to index the map — not part of the row,
                 // and it never reaches the image.
-                cursor.index_insert(cx, &serialize_record(values)).await?;
+                cursor
+                    .index_insert(
+                        cx,
+                        &serialize_record_with_encoding(values, header_template.text_encoding),
+                    )
+                    .await?;
             }
         } else {
             // Initialize the root page as an empty leaf table B-tree.
@@ -1332,7 +1338,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             );
             configure_btree_cursor_page_size(&mut cursor, usable_size, full_page_size);
             for (rowid, values) in mem_table.iter_rows() {
-                let payload = serialize_record(values);
+                let payload = serialize_record_with_encoding(values, header_template.text_encoding);
                 cursor.table_insert(cx, rowid, &payload).await?;
             }
         }
@@ -1596,7 +1602,13 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                     });
                     for key_values in &index_keys {
                         idx_cursor
-                            .index_insert(cx, &serialize_record(key_values))
+                            .index_insert(
+                                cx,
+                                &serialize_record_with_encoding(
+                                    key_values,
+                                    header_template.text_encoding,
+                                ),
+                            )
                             .await?;
                     }
                 }
@@ -1698,13 +1710,16 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 Some(sql) => SqliteValue::Text(sql.clone().into()),
                 None => SqliteValue::Null,
             };
-            let record = serialize_record(&[
-                SqliteValue::Text(entry_type.clone().into()),
-                SqliteValue::Text(name.clone().into()),
-                SqliteValue::Text(tbl_name.clone().into()),
-                SqliteValue::Integer(i64::from(*root_page_num)),
-                sql_value,
-            ]);
+            let record = serialize_record_with_encoding(
+                &[
+                    SqliteValue::Text(entry_type.clone().into()),
+                    SqliteValue::Text(name.clone().into()),
+                    SqliteValue::Text(tbl_name.clone().into()),
+                    SqliteValue::Integer(i64::from(*root_page_num)),
+                    sql_value,
+                ],
+                header_template.text_encoding,
+            );
             #[allow(clippy::cast_possible_wrap)]
             let rid = (rowid as i64) + 1;
             cursor.table_insert(cx, rid, &record).await?;
