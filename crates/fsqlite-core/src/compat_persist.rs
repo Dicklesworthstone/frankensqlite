@@ -994,8 +994,15 @@ fn load_sqlite_header_from_page1(page1_bytes: &[u8]) -> Result<DatabaseHeader> {
         .map_err(|_| FrankenError::DatabaseCorrupt {
             detail: "database header is not a fixed-size 100-byte prefix".to_owned(),
         })?;
-    DatabaseHeader::from_bytes(header_bytes).map_err(|error| FrankenError::DatabaseCorrupt {
-        detail: format!("invalid database header: {error}"),
+    DatabaseHeader::from_bytes(header_bytes).map_err(|error| match error {
+        // bd-3j2c5: a database written by a newer FrankenSQLite format is a
+        // dedicated refusal (SQLITE_OPEN_NEWER_FORMAT), not corruption.
+        fsqlite_types::DatabaseHeaderError::NewerFormat { on_disk, supported } => {
+            FrankenError::NewerFormat { on_disk, supported }
+        }
+        other => FrankenError::DatabaseCorrupt {
+            detail: format!("invalid database header: {other}"),
+        },
     })
 }
 

@@ -251,13 +251,18 @@ fn connection_open_refuses_newer_format_db() {
             msg.contains("newer fsqlite"),
             "refusal must name the newer-format cause; got: {msg}"
         );
-        // NOTE: the refusal currently surfaces via a DatabaseCorrupt-class site
-        // in the pager/open path (extended code SQLITE_CORRUPT), which still
-        // carries the newer-format message. Upgrading that to the dedicated
-        // SQLITE_OPEN_NEWER_FORMAT (32526) code across all header-mapping sites
-        // (connection.rs / compat_persist.rs / pager.rs) is tracked by bd-3j2c5;
-        // the end-to-end REFUSAL guarantee asserted here is what matters for
-        // rollback safety.
+        // bd-3j2c5: the refusal now surfaces the dedicated
+        // SQLITE_OPEN_NEWER_FORMAT extended code (not SQLITE_CORRUPT) across all
+        // header-mapping sites (connection.rs / compat_persist.rs / pager.rs), so
+        // a downgraded binary can tell "written by a newer fsqlite" apart from a
+        // genuinely damaged header regardless of which layer rejects it first.
+        assert_eq!(
+            err.extended_error_code(),
+            fsqlite_error::SQLITE_OPEN_NEWER_FORMAT,
+            "newer-format open must surface SQLITE_OPEN_NEWER_FORMAT (32526), not \
+             SQLITE_CORRUPT; got extended code {}",
+            err.extended_error_code()
+        );
 
         // The refused file's page-1 header is untouched: we rejected it, we did
         // not rewrite or "repair" it (the stamp survives byte-for-byte).

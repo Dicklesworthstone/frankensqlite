@@ -26,8 +26,8 @@ use fsqlite_types::opcode::{
 use fsqlite_types::record::{PrecomputedRecordHeader, PrecomputedSerialTypeKind};
 use fsqlite_types::value::classify_sql_like_fast_path;
 use fsqlite_types::{
-    SmallText, SqliteValue, StrictColumnType, TypeAffinity, without_rowid_pk_is_leading,
-    without_rowid_storage_order,
+    SmallText, SqliteValue, StrictColumnType, TextEncoding, TypeAffinity,
+    without_rowid_pk_is_leading, without_rowid_storage_order,
 };
 
 // ---------------------------------------------------------------------------
@@ -2180,6 +2180,12 @@ fn emit_upsert_expr(
 /// Configuration for the code generator.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CodegenContext {
+    /// The database text encoding. When not UTF-8, codegen disables the
+    /// compile-time preformatted-record bake (which assumes UTF-8 TEXT bytes) so
+    /// the encoding-aware runtime `MakeRecord` path serializes TEXT in the DB
+    /// encoding (bd-bld9w.7 family a). Defaults to UTF-8, so existing
+    /// construction sites via `..CodegenContext::default()` are unchanged.
+    pub text_encoding: TextEncoding,
     /// Whether we're in `BEGIN CONCURRENT` mode.
     /// When true, `OP_NewRowid` uses the snapshot-independent allocator.
     pub concurrent_mode: bool,
@@ -20037,8 +20043,14 @@ fn codegen_insert_values(
 
         // MakeRecord: pack columns into a record.
         let n_cols_i32 = n_cols as i32;
-        let preformatted_record =
-            try_build_preformatted_insert_record(row_values, table, col_mapping);
+        // bd-bld9w.7 family (a): the compile-time preformatted record bakes TEXT as
+        // UTF-8, so only use it for a UTF-8 database; for UTF-16 fall through to the
+        // encoding-aware runtime MakeRecord path.
+        let preformatted_record = if matches!(ctx.text_encoding, TextEncoding::Utf8) {
+            try_build_preformatted_insert_record(row_values, table, col_mapping)
+        } else {
+            None
+        };
         if preformatted_record.is_some() {
             tracing::debug!(
                 target: "fsqlite_vdbe::insert_preformat",

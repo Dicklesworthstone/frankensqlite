@@ -8468,10 +8468,11 @@ impl<F: VfsFile> PagerInner<F> {
                     Ok(base_header) => base_header.change_counter,
                     Err(error) => u32::try_from(
                         stale_main_header_change_counter_under_wal(&base_header_bytes, &error)
-                            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "invalid database-file header during WAL refresh: {error}"
-                                ),
+                            .ok_or_else(|| {
+                                map_database_header_error(
+                                    &error,
+                                    "invalid database-file header during WAL refresh",
+                                )
                             })?,
                     )
                     .map_err(|_| {
@@ -8480,8 +8481,11 @@ impl<F: VfsFile> PagerInner<F> {
                 }
             } else {
                 DatabaseHeader::from_bytes(&base_header_bytes)
-                    .map_err(|error| FrankenError::DatabaseCorrupt {
-                        detail: format!("invalid database header during pager refresh: {error}"),
+                    .map_err(|error| {
+                        map_database_header_error(
+                            &error,
+                            "invalid database header during pager refresh",
+                        )
                     })?
                     .change_counter
             };
@@ -8644,9 +8648,7 @@ impl<F: VfsFile> PagerInner<F> {
             let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
             header_bytes.copy_from_slice(&page1[..DATABASE_HEADER_SIZE]);
             let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-                FrankenError::DatabaseCorrupt {
-                    detail: format!("invalid database header during pager refresh: {error}"),
-                }
+                map_database_header_error(&error, "invalid database header during pager refresh")
             })?;
             if header.page_size != self.page_size {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -11984,10 +11986,8 @@ async fn database_image_receipt_for_open_file_with_extent<F: VfsFile>(
             ),
         });
     }
-    let header =
-        DatabaseHeader::from_bytes(&header_bytes).map_err(|err| FrankenError::DatabaseCorrupt {
-            detail: format!("invalid database image header: {err}"),
-        })?;
+    let header = DatabaseHeader::from_bytes(&header_bytes)
+        .map_err(|err| map_database_header_error(&err, "invalid database image header"))?;
     if let Some(expected_page_size) = expected_page_size
         && header.page_size != expected_page_size
     {
@@ -12150,6 +12150,33 @@ fn page_size_from_header_bytes(header_bytes: &[u8; DATABASE_HEADER_SIZE]) -> Opt
         value => u32::from(value),
     };
     PageSize::new(page_size)
+}
+
+/// Map a database-header parse error from an open/refresh/recovery read path to
+/// the caller-facing [`FrankenError`] (bd-3j2c5).
+///
+/// A newer on-disk format is a dedicated, non-corruption condition
+/// ([`FrankenError::NewerFormat`] → `SQLITE_OPEN_NEWER_FORMAT`): the header
+/// parsed cleanly but was written by a newer FrankenSQLite than this build
+/// supports, so opening is refused while staying distinguishable from a
+/// genuinely damaged header. Every other header error is corruption, reported
+/// with the caller's `context` for provenance (`"{context}: {error}"`).
+///
+/// NewerFormat is never WAL-stale-recoverable (see
+/// [`stale_main_header_is_wal_recoverable_error`]), so it always reaches the
+/// mapping fallback at every open/refresh site; routing that fallback through
+/// this helper is sufficient to surface it without disturbing stale-header
+/// recovery.
+fn map_database_header_error(error: &DatabaseHeaderError, context: &str) -> FrankenError {
+    match error {
+        DatabaseHeaderError::NewerFormat { on_disk, supported } => FrankenError::NewerFormat {
+            on_disk: *on_disk,
+            supported: *supported,
+        },
+        other => FrankenError::DatabaseCorrupt {
+            detail: format!("{context}: {other}"),
+        },
+    }
 }
 
 fn stale_main_header_is_wal_recoverable_error(error: &DatabaseHeaderError) -> bool {
@@ -14849,9 +14876,7 @@ where
             });
         }
         let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-            FrankenError::DatabaseCorrupt {
-                detail: format!("invalid database header during recovery-mode detection: {error}"),
-            }
+            map_database_header_error(&error, "invalid database header during recovery-mode detection")
         })?;
         Self::journal_mode_from_database_header(&header)
     }
@@ -15132,11 +15157,10 @@ where
                     }
                     let restored_header =
                         DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-                            FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "rollback recovery restored an invalid database header: {error}"
-                                ),
-                            }
+                            map_database_header_error(
+                                &error,
+                                "rollback recovery restored an invalid database header",
+                            )
                         })?;
                     if restored_header.page_size != journal_page_size {
                         return Err(FrankenError::DatabaseCorrupt {
@@ -15957,9 +15981,7 @@ where
                     page_size_from_header_bytes(header_bytes).unwrap_or(requested_page_size)
                 }
                 Err(error) if disposition == ReadWriteOpenDisposition::ExistingOnly => {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!("invalid database header: {error}"),
-                    });
+                    return Err(map_database_header_error(&error, "invalid database header"));
                 }
                 Err(_) => requested_page_size,
             }
@@ -16089,9 +16111,7 @@ where
                         )
                     }
                     Err(error) => {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!("invalid database header: {error}"),
-                        });
+                        return Err(map_database_header_error(&error, "invalid database header"));
                     }
                 };
             if header.page_size != page_size {
@@ -16576,9 +16596,7 @@ where
                 (None, page_size)
             }
             Err(error) => {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("invalid database header: {error}"),
-                });
+                return Err(map_database_header_error(&error, "invalid database header"));
             }
         };
 
