@@ -1625,6 +1625,14 @@ pub mod pragma {
         /// FrankenSQLite does not spawn SQLite-style sort helper threads, so this
         /// is a stored limit clamped to the stock maximum (8).
         pub threads: i64,
+        /// `PRAGMA cache_spill` page threshold (C SQLite's `szSpill`). Default
+        /// `1`. A bare query reports `0` when spilling is disabled, otherwise
+        /// `max(cache_pages, cache_spill_pages)` where `cache_pages` is derived
+        /// from `cache_size`/`page_size` (GH #275 / bd-uaxab).
+        pub cache_spill_pages: i64,
+        /// Whether cache spilling is enabled (`PRAGMA cache_spill = ON|OFF`).
+        /// Default `true`.
+        pub cache_spill_enabled: bool,
     }
 
     impl Default for ConnectionPragmaState {
@@ -1661,6 +1669,8 @@ pub mod pragma {
                 locking_mode: "normal".to_owned(),
                 secure_delete: 0,
                 threads: 0,
+                cache_spill_pages: 1,
+                cache_spill_enabled: true,
             }
         }
     }
@@ -1723,6 +1733,9 @@ pub mod pragma {
         }
         if name.eq_ignore_ascii_case("page_size") {
             return apply_page_size(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("cache_spill") {
+            return Ok(apply_cache_spill(state, stmt));
         }
         if name.eq_ignore_ascii_case("busy_timeout") {
             return apply_busy_timeout(state, stmt);
@@ -2120,6 +2133,52 @@ pub mod pragma {
                 Ok(PragmaOutput::Int(val))
             }
         }
+    }
+
+    /// Derive the effective page-cache size in *pages* from `cache_size` (C
+    /// SQLite's numeric convention): a non-negative value is a literal page
+    /// count, a negative value is a budget of `-cache_size` KiB converted to
+    /// pages by dividing by the page size. FrankenSQLite uses `0` for the
+    /// per-page bookkeeping overhead C SQLite calls `szExtra` (a C-build malloc
+    /// artifact that must not be matched byte-for-byte), so the negative form
+    /// differs from stock by that constant — the *algebra* is what conforms
+    /// (GH #275 / bd-uaxab).
+    fn cache_pages_from_size(cache_size: i64, page_size: u32) -> i64 {
+        if cache_size >= 0 {
+            cache_size
+        } else {
+            let page_bytes = i64::from(page_size).max(1);
+            cache_size.saturating_mul(-1024) / page_bytes
+        }
+    }
+
+    /// `PRAGMA cache_spill [= N|ON|OFF]`. Per-connection (GH #275 / bd-uaxab).
+    /// A bare query emits one integer row: `0` when spilling is disabled, else
+    /// `max(cache_pages, szSpill)`. An assignment emits NO rows (suppressed by
+    /// the `has_value` gate in `pragma_result_columns`) and does two independent
+    /// things, mirroring pragma.c: (1) `sqlite3GetInt32` sets the spill threshold
+    /// — `n > 0` stores `n` pages, `n < 0` stores the `-n`-KiB budget converted to
+    /// pages, `n == 0` leaves it unchanged; (2) `sqlite3GetBoolean` sets the
+    /// enabled flag, defaulting to `n != 0` when the argument is not a recognized
+    /// boolean (so `= ON`/`= OFF` toggle without touching the threshold, while a
+    /// bare number sets the threshold and enables spilling).
+    fn apply_cache_spill(state: &mut ConnectionPragmaState, stmt: &PragmaStatement) -> PragmaOutput {
+        if let Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) = &stmt.value {
+            let n = parse_integer_expr(expr).unwrap_or(0);
+            if n > 0 {
+                state.cache_spill_pages = n;
+            } else if n < 0 {
+                let page_bytes = i64::from(state.page_size).max(1);
+                state.cache_spill_pages = n.saturating_mul(-1024) / page_bytes;
+            }
+            state.cache_spill_enabled = parse_bool(expr).unwrap_or(n != 0);
+        }
+        let value = if state.cache_spill_enabled {
+            cache_pages_from_size(state.cache_size, state.page_size).max(state.cache_spill_pages)
+        } else {
+            0
+        };
+        PragmaOutput::Int(value)
     }
 
     fn apply_busy_timeout(
@@ -3772,6 +3831,50 @@ mod tests {
         assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit='junk'"), Int(70000000));
 
         pragma::reset_heap_limits_for_test();
+    }
+
+    #[test]
+    fn test_connection_pragma_cache_spill_gh275() {
+        // GH #275: cache_spill bare query = 0 when disabled, else
+        // max(cache_pages, szSpill). A positive cache_size makes cache_pages
+        // exact (= that many pages), sidestepping the szExtra caveat.
+        use pragma::PragmaOutput::Int;
+        let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_size=1000"), Int(1000));
+
+        // Default: enabled, szSpill=1 -> max(1000, 1) = 1000.
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_spill"), Int(1000));
+
+        // OFF disables spilling -> bare reads 0 (threshold left intact).
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_spill=OFF"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_spill"), Int(0));
+
+        // ON re-enables; threshold still 1 -> 1000.
+        apply_sql(&mut state, "PRAGMA cache_spill=ON");
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_spill"), Int(1000));
+
+        // Explicit N above cache_pages: readback = N.
+        apply_sql(&mut state, "PRAGMA cache_spill=1234");
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_spill"), Int(1234));
+
+        // ON does NOT reset the threshold (still 1234).
+        apply_sql(&mut state, "PRAGMA cache_spill=ON");
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_spill"), Int(1234));
+
+        // N below cache_pages loses: OFF then =77 (enables + sets 77) -> 1000.
+        apply_sql(&mut state, "PRAGMA cache_spill=OFF");
+        apply_sql(&mut state, "PRAGMA cache_spill=77");
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_spill"), Int(1000));
+
+        // Negative threshold is a KiB budget -> ~1 page, loses to cache_pages.
+        apply_sql(&mut state, "PRAGMA cache_spill=-5");
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_spill"), Int(1000));
+
+        // cache_size drives cache_pages: with szSpill=500 and cache_pages
+        // dropped to 100, the threshold now wins.
+        apply_sql(&mut state, "PRAGMA cache_spill=500");
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_size=100"), Int(100));
+        assert_eq!(apply_sql(&mut state, "PRAGMA cache_spill"), Int(500));
     }
 
     #[test]

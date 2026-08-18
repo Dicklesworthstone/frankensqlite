@@ -4669,6 +4669,7 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
                 | "cell_size_check"
                 | "checkpoint_fullfsync"
                 | "automatic_index"
+                | "cache_spill"
         )
     {
         return &[];
@@ -4728,6 +4729,11 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     }
     if name_is("automatic_index") {
         return &["automatic_index"];
+    }
+    // `cache_spill` echoes one row on a bare query but none on assignment (the
+    // has_value gate above returns &[] for the assignment form); GH #275.
+    if name_is("cache_spill") {
+        return &["cache_spill"];
     }
 
     // Header, integrity, and standard introspection PRAGMAs.
