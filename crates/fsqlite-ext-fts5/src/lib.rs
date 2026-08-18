@@ -8453,6 +8453,16 @@ impl Fts5Table {
         self.lazy_doc_count = 0;
     }
 
+    /// Slots per tombstone hash page for this table's page size.
+    ///
+    /// Sized so a worst-case 8-byte-key page stays within one leaf budget; feeds
+    /// [`build_tombstone_hash`] / [`encode_incremental_delete_flush`] from the
+    /// connection delete path (bd-fts5-lazy-shadow-reads-itcc4.3).
+    #[must_use]
+    pub fn tombstone_slots_per_page(&self) -> usize {
+        (effective_leaf_budget(self.config.page_size).saturating_sub(8) / 8).max(2)
+    }
+
     /// Answer MATCH queries in lazy mode by point-reading persisted on-disk
     /// segments through `reader`, projecting `_content` only for result rows.
     pub async fn search_rows_lazy<R: Fts5OnDiskReader>(

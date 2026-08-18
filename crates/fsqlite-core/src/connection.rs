@@ -85,10 +85,11 @@ use fsqlite_btree::{set_btree_copy_profile_enabled, set_btree_metrics_enabled};
 use fsqlite_error::{ErrorCode, FrankenError, Result};
 #[cfg(feature = "ext-fts5")]
 use fsqlite_ext_fts5::{
-    FTS5_AVERAGES_ROWID, FTS5_STRUCTURE_ROWID, Fts5AveragesRecord, Fts5DocsizeRow, Fts5Expr,
-    Fts5HighlightFunc, Fts5IdxRow, Fts5OnDiskReader, Fts5ScoreSnapshot, Fts5ShadowRows,
-    Fts5SnippetFunc, Fts5StructureRecord, Fts5Table, build_expr, decode_docsize_blob,
-    highlight as fts5_highlight, parse_fts5_query, snippet as fts5_snippet,
+    FTS5_AVERAGES_ROWID, FTS5_STRUCTURE_ROWID, Fts5AveragesRecord, Fts5DataRowid, Fts5DeletedDoc,
+    Fts5DocsizeRow, Fts5Expr, Fts5HighlightFunc, Fts5IdxRow, Fts5OnDiskReader, Fts5ScoreSnapshot,
+    Fts5ShadowRows, Fts5SnippetFunc, Fts5StructureRecord, Fts5Table, Fts5TombstonePage, build_expr,
+    decode_docsize_blob, encode_incremental_delete_flush, highlight as fts5_highlight,
+    parse_fts5_query, resolve_tombstone_target_segment, snippet as fts5_snippet,
 };
 #[cfg(feature = "ext-json")]
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
@@ -166,8 +167,8 @@ use fsqlite_vdbe::codegen::{
     CheckConstraint, CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
     SelectPlannerDirective, TableSchema, bind_explicit_index, codegen_delete, codegen_insert,
-    codegen_select, codegen_update, emit_backfill_key_expr, emit_scan_filter,
-    without_rowid_pk_indices,
+    codegen_select, codegen_update, emit_backfill_column_read, emit_backfill_key_expr,
+    emit_scan_filter, without_rowid_pk_indices,
 };
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
@@ -45947,6 +45948,19 @@ impl Connection {
                     .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
                     .is_some_and(Fts5Table::is_lazy_on_disk)
             };
+            // Lazy `contentless_delete` tables tombstone the deleted rowids'
+            // owning on-disk segments WITHOUT hydrating the corpus (v2
+            // origin-targeted). Falls through to promote only when the delete
+            // can't be tombstoned — e.g. a row predates origin tracking, so its
+            // `_docsize.origin` is NULL. (bd-fts5-lazy-shadow-reads-itcc4.3)
+            if is_lazy && !self.rootpage_zero_fts5_has_internal_content_shadow(table_name) {
+                if let Some(deleted) = self
+                    .persist_rootpage_zero_fts5_contentless_incremental_delete(table_name, rowids)
+                    .await?
+                {
+                    return Ok(deleted);
+                }
+            }
             if is_lazy {
                 self.promote_lazy_fts5_table(table_name).await?;
             }
@@ -46534,6 +46548,158 @@ impl Connection {
             .await
     }
 
+    /// Delete `rowids` from a lazy `contentless_delete` FTS5 table by
+    /// tombstone-append — WITHOUT hydrating the corpus.
+    ///
+    /// Returns `Some(count)` when the delete was tombstoned in place, or `None`
+    /// when it must fall back to promote + full re-encode (any deleted row
+    /// predates origin tracking, so its `_docsize.origin` is NULL, or the shadow
+    /// is otherwise inconsistent). One reader pass resolves each rowid to its
+    /// owning segment via `_docsize.origin`, unions the touched segments' current
+    /// tombstones with the deleted rowids ([`encode_incremental_delete_flush`]),
+    /// upserts the tombstone/structure/averages `_data` rows, drops the docsize
+    /// rows, and advances lazy bookkeeping.
+    /// (bd-fts5-lazy-shadow-reads-itcc4.3, v2 origin-targeted.)
+    #[cfg(feature = "ext-fts5")]
+    async fn persist_rootpage_zero_fts5_contentless_incremental_delete(
+        &self,
+        table_name: &str,
+        rowids: &[i64],
+    ) -> Result<Option<usize>> {
+        let key = table_name.to_ascii_uppercase();
+        let (column_count, slots_per_page) = {
+            let instances = self.vtab_instances.borrow();
+            let Some(fts5) = instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            else {
+                return Ok(None);
+            };
+            (fts5.columns().len(), fts5.tombstone_slots_per_page())
+        };
+        if !self.schema_table_exists(&format!("{table_name}_data")) {
+            return Ok(None);
+        }
+
+        // One reader pass: read structure + averages, resolve every deleted rowid
+        // to its owning segment via `_docsize.origin`, and read the touched
+        // segments' current tombstone pages. Any missing/NULL origin (or missing
+        // structure/averages/docsize/tombstone page) bails to `None` -> promote.
+        let prepared = self
+            .with_lazy_fts5_reader(table_name, async |reader| {
+                let Some(block) = reader.read_data_block(FTS5_STRUCTURE_ROWID).await? else {
+                    return Ok(None);
+                };
+                let structure = Fts5StructureRecord::decode(&block)?;
+                let Some(block) = reader.read_data_block(FTS5_AVERAGES_ROWID).await? else {
+                    return Ok(None);
+                };
+                let averages = Fts5AveragesRecord::decode(&block, column_count)?;
+
+                let mut resolved = Vec::with_capacity(rowids.len());
+                for &rowid in rowids {
+                    let Some(origin) = reader.read_docsize_origin(rowid).await? else {
+                        return Ok(None);
+                    };
+                    let Some(docsize) = reader.read_docsize(rowid, column_count).await? else {
+                        return Ok(None);
+                    };
+                    let Some(segid) =
+                        resolve_tombstone_target_segment(&structure, u64::try_from(origin).unwrap_or(0))
+                    else {
+                        return Ok(None);
+                    };
+                    resolved.push(Fts5DeletedDoc {
+                        rowid,
+                        segid,
+                        column_token_counts: docsize.column_token_counts,
+                    });
+                }
+
+                let touched: std::collections::BTreeSet<u32> =
+                    resolved.iter().map(|doc| doc.segid).collect();
+                let mut existing_tombstones: std::collections::BTreeMap<u32, Vec<Fts5TombstonePage>> =
+                    std::collections::BTreeMap::new();
+                for &segid in &touched {
+                    let count = structure
+                        .levels
+                        .iter()
+                        .flat_map(|level| level.segments.iter())
+                        .find(|segment| segment.segid == segid)
+                        .map_or(0, |segment| segment.tombstone_page_count);
+                    if count == 0 {
+                        continue;
+                    }
+                    let mut pages = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+                    for hash_pgno in 0..count {
+                        let id = Fts5DataRowid::Tombstone { segid, hash_pgno }.encode()?;
+                        let Some(block) = reader.read_data_block(id).await? else {
+                            return Ok(None);
+                        };
+                        pages.push(Fts5TombstonePage::decode(&block)?);
+                    }
+                    existing_tombstones.insert(segid, pages);
+                }
+                Ok(Some((structure, averages, resolved, existing_tombstones)))
+            })
+            .await?;
+        let Some((structure, averages, resolved, existing_tombstones)) = prepared else {
+            return Ok(None);
+        };
+
+        let flush = encode_incremental_delete_flush(
+            &resolved,
+            &structure,
+            &averages,
+            &existing_tombstones,
+            slots_per_page,
+        )?;
+
+        // Upsert the tombstone hash pages + the updated structure/averages rows.
+        let mut data_rows: Vec<(i64, Vec<SqliteValue>)> =
+            Vec::with_capacity(flush.tombstone_data_rows.len() + 2);
+        for row in flush
+            .tombstone_data_rows
+            .into_iter()
+            .chain([flush.structure_data_row, flush.averages_data_row])
+        {
+            data_rows.push((
+                row.id,
+                vec![
+                    SqliteValue::Integer(row.id),
+                    SqliteValue::Blob(Arc::from(row.block.into_boxed_slice())),
+                ],
+            ));
+        }
+        self.upsert_storage_table_rows(&format!("{table_name}_data"), data_rows)
+            .await?;
+
+        // Drop the deleted docs' `_docsize` rows.
+        self.delete_storage_table_rows(
+            &format!("{table_name}_docsize"),
+            &flush.docsize_rowids_to_delete,
+        )
+        .await?;
+
+        // Advance lazy bookkeeping (stay lazy, drop the count).
+        {
+            let mut instances = self.vtab_instances.borrow_mut();
+            if let Some(fts5) = instances
+                .get_mut(&key)
+                .and_then(|instance| instance.as_any_mut().downcast_mut::<Fts5Table>())
+            {
+                fts5.note_lazy_deleted_rows(&flush.docsize_rowids_to_delete);
+            }
+        }
+
+        tracing::debug!(
+            table = table_name,
+            deleted = rowids.len(),
+            "fts5: tombstoned lazy contentless delete (bd-fts5-lazy-shadow-reads-itcc4.3)"
+        );
+        Ok(Some(rowids.len()))
+    }
+
     #[cfg(feature = "ext-fts5")]
     fn rootpage_zero_fts5_persistence_layout(
         &self,
@@ -46671,6 +46837,38 @@ impl Connection {
             for (rowid, values) in rows {
                 let record = serialize_record_with_encoding(&values, self.db_text_encoding.get());
                 cursor.table_insert(cx, rowid, &record).await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Delete `rowids` from a rowid-keyed shadow table (e.g. `_docsize`), leaving
+    /// every other row intact.
+    ///
+    /// The lazy contentless DELETE path uses this to drop the deleted docs'
+    /// docsize rows without rewriting the whole shadow
+    /// (bd-fts5-lazy-shadow-reads-itcc4.3).
+    #[cfg(feature = "ext-fts5")]
+    async fn delete_storage_table_rows(&self, table_name: &str, rowids: &[i64]) -> Result<()> {
+        if rowids.is_empty() {
+            return Ok(());
+        }
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+        };
+        let root = page_number_from_schema_root(root_page, table_name, "table")?;
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+            for rowid in rowids {
+                if cursor.table_move_to(cx, *rowid).await?.is_found() {
+                    cursor.delete(cx).await?;
+                }
             }
             Ok(())
         })
@@ -57462,15 +57660,13 @@ impl Connection {
             }
         } else {
             // Column index: read indexed column values from the table cursor.
+            // A plain index on a VIRTUAL generated column (GH#227) must compute
+            // the generating expression on read; reading the raw record slot
+            // would key pre-existing (backfilled) rows on the NULL placeholder,
+            // diverging from keys written by post-creation DML. Non-generated
+            // columns still read the record slot directly.
             for (key_pos, &col_idx) in idx_col_positions.iter().enumerate() {
-                b.emit_op(
-                    Opcode::Column,
-                    0,
-                    col_idx as i32,
-                    key_regs + key_pos as i32,
-                    P4::None,
-                    0,
-                );
+                emit_backfill_column_read(&mut b, col_idx, key_regs + key_pos as i32, 0, table);
             }
         }
 
@@ -63371,6 +63567,117 @@ impl Connection {
     }
 
     fn inflate_table_row_values_from_payload_values(
+        table: &TableSchema,
+        rowid: i64,
+        payload_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+        default_value_at: impl FnMut(usize) -> Result<Option<SqliteValue>>,
+    ) -> Result<Vec<SqliteValue>> {
+        // Materialize the physically stored columns (plus DEFAULT / ALTER-added
+        // back-fill), then compute any VIRTUAL generated columns against the
+        // freshly built row. VIRTUAL generated columns are never persisted, so
+        // the file-backed read/inflate path — including the streaming JOIN
+        // source (`try_scan_join_source_from_pager`) — would otherwise leave a
+        // NULL placeholder in their slot and silently drop rows whose join or
+        // filter predicate references the generated column
+        // (bd-gh-virtual-generated-columns-5e0u1 / GH#227).
+        let mut values = Self::inflate_physical_row_values_from_payload_values(
+            table,
+            rowid,
+            payload_values,
+            rowid_alias_col_idx,
+            default_value_at,
+        )?;
+        Self::fill_virtual_generated_columns(table, rowid, rowid_alias_col_idx, &mut values)?;
+        Ok(values)
+    }
+
+    /// Compute VIRTUAL generated columns for a freshly inflated, full-width row.
+    ///
+    /// Mirrors the SELECT read path (`emit_table_column_read` in codegen): for
+    /// each VIRTUAL generated column, evaluate its generating expression against
+    /// the row and coerce the result to the column's declared affinity. STORED
+    /// generated columns are physically materialized in the record and are left
+    /// untouched (so they are never double-computed). Columns are filled in
+    /// declared order, so a VIRTUAL column may reference an earlier one.
+    ///
+    /// Reuses the synchronous `eval_join_expr` interpreter (the same evaluator
+    /// used by `build_expected_index_key_for_integrity` for index-on-expression
+    /// keys), which resolves scalar functions such as `json_extract` through the
+    /// registered/shared builtin function registry.
+    fn fill_virtual_generated_columns(
+        table: &TableSchema,
+        rowid: i64,
+        rowid_alias_col_idx: Option<usize>,
+        values: &mut [SqliteValue],
+    ) -> Result<()> {
+        // Hot path: nothing to compute when the table has no VIRTUAL generated
+        // columns. `generated_stored == Some(true)` marks STORED columns, which
+        // are physically present and must not be recomputed here.
+        if !table
+            .columns
+            .iter()
+            .any(|column| column.generated_expr.is_some() && column.generated_stored != Some(true))
+        {
+            return Ok(());
+        }
+        // Only operate on a full-width inflated row; a short row cannot resolve
+        // the base-column references a generating expression needs.
+        if values.len() != table.columns.len() {
+            return Ok(());
+        }
+
+        // Build the evaluation row + column map, mirroring
+        // `build_expected_index_key_for_integrity`. VIRTUAL slots start as their
+        // NULL placeholder and are overwritten in place as they are computed.
+        let mut eval_row = values.to_vec();
+        let mut col_map = table
+            .columns
+            .iter()
+            .map(|column| (table.name.clone(), column.name.clone(), false))
+            .collect::<Vec<_>>();
+        let shadowed_names = table
+            .columns
+            .iter()
+            .map(|column| column.name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        if ["rowid", "_rowid_", "oid"]
+            .iter()
+            .any(|alias| !shadowed_names.contains(*alias))
+        {
+            eval_row.push(SqliteValue::Integer(rowid));
+            col_map.push((table.name.clone(), "rowid".to_owned(), true));
+        }
+
+        for (col_idx, column) in table.columns.iter().enumerate() {
+            let Some(expr_sql) = column.generated_expr.as_deref() else {
+                continue;
+            };
+            if column.generated_stored == Some(true) {
+                // STORED: already materialized in the record; do not recompute.
+                continue;
+            }
+            let mut expr =
+                fsqlite_parser::expr::parse_expr(expr_sql).map_err(|error| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` generated column `{}` has invalid expression `{expr_sql}`: {error}",
+                            table.name, column.name
+                        ),
+                    }
+                })?;
+            if let Some(ipk_column) = rowid_alias_col_idx.and_then(|idx| table.columns.get(idx)) {
+                rewrite_rowid_aliases_in_expr(&mut expr, table, &ipk_column.name);
+            }
+            let computed = eval_join_expr(&expr, &eval_row, &col_map)?
+                .apply_affinity(affinity_char_to_type(column.affinity));
+            values[col_idx] = computed.clone();
+            eval_row[col_idx] = computed;
+        }
+        Ok(())
+    }
+
+    fn inflate_physical_row_values_from_payload_values(
         table: &TableSchema,
         rowid: i64,
         payload_values: &[SqliteValue],
@@ -125500,6 +125807,29 @@ impl<'a> Fts5LiveShadowReader<'a> {
             detail: format!("fts5 shadow row {rowid} payload is not a valid SQLite record"),
         })?;
         Ok(Some(values))
+    }
+
+    /// The `origin` column of a `contentless_delete` `_docsize` row for `rowid`
+    /// — the segment the row was inserted into — or `None` when it is
+    /// absent/NULL (a legacy 2-column docsize, or a row written by the full
+    /// re-encode path). The lazy DELETE path falls back to promote on `None`.
+    async fn read_docsize_origin(&mut self, rowid: i64) -> Result<Option<i64>> {
+        let Some(root) = self.docsize_root else {
+            return Ok(None);
+        };
+        let Some(values) = self.read_table_record(root, rowid).await? else {
+            return Ok(None);
+        };
+        // `(id INTEGER PRIMARY KEY, sz BLOB, origin INTEGER)`: origin is the
+        // integer immediately after the `sz` blob (robust to whether the
+        // rowid-alias `id` surfaces as a leading record value).
+        let Some(blob_pos) = values.iter().position(|value| value.as_blob_bytes().is_some()) else {
+            return Ok(None);
+        };
+        Ok(values.get(blob_pos + 1).and_then(|value| match value {
+            SqliteValue::Integer(origin) => Some(*origin),
+            _ => None,
+        }))
     }
 }
 
@@ -195827,6 +196157,117 @@ SELECT x FROM t;
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .unwrap();
             assert_eq!(matched, vec![1, 3, 4]);
+        });
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_lazy_contentless_delete_tombstones_without_promote() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("lazy_contentless_delete.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+
+            // FrankenSQLite writes a contentless_delete corpus across three
+            // statements: batch 1 (rows 1,2) via the full re-encode path, then
+            // batches 2 (3,4) and 3 (5,6) via incremental append (origin-tracked).
+            {
+                let conn = Connection::open(&db_str).await.unwrap();
+                conn.execute(
+                    "CREATE VIRTUAL TABLE t USING fts5(body, content='', contentless_delete=1);",
+                )
+                .await
+                .unwrap();
+                conn.execute("INSERT INTO t(rowid, body) VALUES (1, 'alpha rust'), (2, 'beta rust');")
+                    .await
+                    .unwrap();
+                conn.execute("INSERT INTO t(rowid, body) VALUES (3, 'gamma rust'), (4, 'delta search');")
+                    .await
+                    .unwrap();
+                conn.execute("INSERT INTO t(rowid, body) VALUES (5, 'epsilon rust'), (6, 'zeta search');")
+                    .await
+                    .unwrap();
+                conn.close().await.unwrap();
+            }
+
+            // Reopen lazy and DELETE a row that carries an origin (row 3, batch 2):
+            // this must tombstone the owning segment WITHOUT hydrating the corpus.
+            let conn = Connection::open_existing_schema_only(&db_str).await.unwrap();
+            {
+                let instances = conn.vtab_instances.borrow();
+                let fts5 = instances
+                    .get("T")
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .expect("contentless_delete table reconnects as lazy FTS5");
+                assert!(fts5.is_lazy_on_disk(), "reopened contentless table is lazy");
+                assert_eq!(fts5.row_count(), 6);
+            }
+
+            conn.execute("DELETE FROM t WHERE rowid = 3;").await.unwrap();
+
+            {
+                let instances = conn.vtab_instances.borrow();
+                let fts5 = instances
+                    .get("T")
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .expect("still FTS5");
+                assert!(
+                    fts5.is_lazy_on_disk(),
+                    "a lazy contentless delete must tombstone, not hydrate the corpus"
+                );
+                assert_eq!(fts5.row_count(), 5, "row count drops by the delete");
+            }
+
+            let rust = conn
+                .query("SELECT rowid FROM t WHERE t MATCH 'rust' ORDER BY rowid;")
+                .await
+                .unwrap();
+            assert_eq!(
+                rust.iter().map(|r| r.values()[0].clone()).collect::<Vec<_>>(),
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Integer(5)
+                ],
+                "MATCH 'rust' excludes the tombstoned row 3"
+            );
+            let gamma = conn
+                .query("SELECT rowid FROM t WHERE t MATCH 'gamma';")
+                .await
+                .unwrap();
+            assert!(gamma.is_empty(), "row 3's unique term 'gamma' no longer matches");
+            drop(conn);
+
+            // Stock C SQLite reopens the tombstoned image and agrees.
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            let integrity: String = stock
+                .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                integrity, "ok",
+                "stock integrity_check after the lazy tombstone delete"
+            );
+            let matched: Vec<i64> = stock
+                .prepare("SELECT rowid FROM t WHERE t MATCH 'rust' ORDER BY rowid")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                matched,
+                vec![1, 2, 5],
+                "stock MATCH 'rust' excludes the deleted row"
+            );
+            let gamma_stock: Vec<i64> = stock
+                .prepare("SELECT rowid FROM t WHERE t MATCH 'gamma'")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(gamma_stock.is_empty(), "stock: 'gamma' (row 3) is gone");
         });
     }
 
