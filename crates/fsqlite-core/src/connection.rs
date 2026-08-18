@@ -32682,23 +32682,38 @@ impl Connection {
         params: Option<&'a [SqliteValue]>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
         Box::pin(async move {
-            let autocommit_pragma_entry = matches!(statement, Statement::Pragma(_))
-                && self.autocommit_conflict_retry_boundary();
+            // bd-b4u1r (GH #367) + #335: extend the autocommit conflict retry
+            // from PRAGMA (bd-tc8u7) to plain reads. A bare `SELECT` at an
+            // autocommit boundary can transiently observe a SQLITE_BUSY-family
+            // error (`Busy`/`BusyRecovery`/`BusySnapshot`) from the pager/MVCC
+            // layer while a single writer checkpoints — e.g. commit 653343e4b
+            // un-masked a rare (~1-in-470k) reader `Busy`, and a memdb-reload
+            // visibility-sequence straddle of a checkpoint TRUNCATE surfaces a
+            // `BusySnapshot`. WAL readers must never block on writers, so the
+            // failed read must retry within `busy_timeout` rather than surface
+            // the transient. Reads are side-effect-free and the row set is
+            // delivered atomically (a failed attempt yields no partial rows), so
+            // re-running on a fresh snapshot is always safe. Keying on
+            // `is_transient()` (via `autocommit_statement_conflict_is_retryable`)
+            // absorbs every SQLITE_BUSY-family member without a variant allowlist.
+            let autocommit_retry_entry =
+                matches!(statement, Statement::Pragma(_) | Statement::Select(_))
+                    && self.autocommit_conflict_retry_boundary();
             let mut result = self
                 .execute_statement_once_after_background_status(statement, params)
                 .await;
-            if !autocommit_pragma_entry
+            if !autocommit_retry_entry
                 || !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error))
             {
                 return result;
             }
 
-            // bd-tc8u7: concurrent connection setup can race WAL recovery while
-            // applying `PRAGMA journal_mode=WAL`. At an autocommit boundary the
-            // failed dispatch has restored its prior PRAGMA state, so retry the
-            // whole statement on the same busy-timeout handoff used by GH #333.
-            // Explicit transactions remain outside this boundary, and a
-            // non-transient error returns above without a second attempt.
+            // The failed autocommit dispatch has restored its prior state (the
+            // PRAGMA case that motivated bd-tc8u7 restores its PRAGMA state; a
+            // read has none), so retry the whole statement on the same
+            // busy-timeout handoff used by GH #333. Explicit transactions remain
+            // outside this boundary, and a non-transient error returns above
+            // without a second attempt.
             let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
             let deadline = Duration::from_millis(busy_timeout_ms);
             let started = Instant::now();
