@@ -46652,6 +46652,26 @@ impl Connection {
             return Ok(true);
         }
 
+        // `'integrity-check'` validates the persisted index WITHOUT hydrating the
+        // corpus: it decodes structure/averages and scans every segment's leaves
+        // through the page-boundary reader, so a decode failure surfaces as an
+        // error. Read-only, so it runs before the promote-on-lazy fallback.
+        if command == Fts5MaintenanceCommand::IntegrityCheck {
+            self.fts5_shadow_integrity_check(insert.table.name.as_str())
+                .await?;
+            self.reset_statement_change_count();
+            return Ok(true);
+        }
+
+        // `'flush'` moves pending in-memory writes to disk. FrankenSQLite persists
+        // every statement synchronously, so there is no pending buffer to flush —
+        // accept it as a no-op, exactly as stock does on a table with no pending
+        // writes.
+        if command == Fts5MaintenanceCommand::Flush {
+            self.reset_statement_change_count();
+            return Ok(true);
+        }
+
         {
             let key = insert.table.name.to_ascii_uppercase();
             let is_lazy = {
@@ -46690,10 +46710,14 @@ impl Connection {
                 self.persist_rootpage_zero_fts5_shadow_rows(&insert.table.name)
                     .await?;
             }
-            Fts5MaintenanceCommand::DeleteAll => {
-                // Fully handled above (contentless-only, returns early); a
-                // contentless table stores no content to iterate here.
-                unreachable!("'delete-all' is handled before the promote fallback")
+            Fts5MaintenanceCommand::DeleteAll
+            | Fts5MaintenanceCommand::IntegrityCheck
+            | Fts5MaintenanceCommand::Flush => {
+                // All handled above (they return early); none needs the promote
+                // fallback or the in-memory rewrite path.
+                unreachable!(
+                    "delete-all/integrity-check/flush are handled before the promote fallback"
+                )
             }
         }
 
@@ -47503,6 +47527,41 @@ impl Connection {
             "fts5: delete-all cleared lazy contentless index (bd-fts5-lazy-shadow-reads-itcc4.3)"
         );
         Ok(())
+    }
+
+    /// `'integrity-check'`: validate the persisted FTS5 index without hydrating
+    /// the corpus. Decodes the structure + averages and scans every segment's
+    /// leaves through the page-boundary doclist reader; a corrupt/unreadable
+    /// index surfaces as a decode error, while a readable one returns Ok. An
+    /// index with no persisted structure is trivially consistent.
+    /// (bd-fts5-lazy-shadow-reads-itcc4.3 special commands.)
+    #[cfg(feature = "ext-fts5")]
+    async fn fts5_shadow_integrity_check(&self, table_name: &str) -> Result<()> {
+        if !self.schema_table_exists(&format!("{table_name}_data")) {
+            return Ok(());
+        }
+        let key = table_name.to_ascii_uppercase();
+        let column_count = {
+            let instances = self.vtab_instances.borrow();
+            instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .map_or(0, |fts5| fts5.columns().len())
+        };
+        self.with_lazy_fts5_reader(table_name, async |reader| {
+            let Some(block) = reader.read_data_block(FTS5_STRUCTURE_ROWID).await? else {
+                return Ok(());
+            };
+            let structure = Fts5StructureRecord::decode(&block)?;
+            if let Some(block) = reader.read_data_block(FTS5_AVERAGES_ROWID).await? {
+                Fts5AveragesRecord::decode(&block, column_count)?;
+            }
+            // Scanning every term of every segment decodes every leaf/doclist
+            // (page-boundary-stitched), so a corrupt segment errors here.
+            collect_merged_term_groups(reader, &structure).await?;
+            Ok(())
+        })
+        .await
     }
 
     #[cfg(feature = "ext-fts5")]
@@ -93734,6 +93793,8 @@ enum Fts5MaintenanceCommand {
     Optimize,
     Rebuild,
     DeleteAll,
+    IntegrityCheck,
+    Flush,
 }
 
 fn fts5_insert_uses_command_column(insert: &fsqlite_ast::InsertStatement) -> bool {
@@ -93767,6 +93828,16 @@ fn fts5_maintenance_insert_command(
                     if command.eq_ignore_ascii_case("delete-all") =>
                 {
                     Some(Fts5MaintenanceCommand::DeleteAll)
+                }
+                Expr::Literal(Literal::String(command), _)
+                    if command.eq_ignore_ascii_case("integrity-check") =>
+                {
+                    Some(Fts5MaintenanceCommand::IntegrityCheck)
+                }
+                Expr::Literal(Literal::String(command), _)
+                    if command.eq_ignore_ascii_case("flush") =>
+                {
+                    Some(Fts5MaintenanceCommand::Flush)
                 }
                 _ => None,
             }
