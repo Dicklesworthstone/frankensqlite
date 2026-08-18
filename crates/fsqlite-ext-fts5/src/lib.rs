@@ -8768,6 +8768,17 @@ impl Fts5Table {
         }
         self.index = index;
         self.apply_docsize_rows(&docsize);
+        // Restore the `documents`-holds-every-live-rowid invariant. A contentless
+        // table keeps no `_content`, but `documents` is still the authoritative
+        // set of live rowids that `row_count()` and `delete_document` depend on
+        // (a fresh insert always does `documents.insert(rowid, ..)`). Hydrating
+        // only the inverted index leaves `documents` empty, so a subsequent
+        // delete's `documents.remove()` is a no-op and `row_count()` collapses to
+        // `documents.len()` == 0 even though live rows remain (bd-zqc1b). Each
+        // live rowid — enumerated by `_docsize`, one row per live document — maps
+        // to an empty column vector, matching `Fts5ShadowRows::full_scan_rows`
+        // (contentless stores no content, so a full scan projects NULLs).
+        self.documents = docsize.iter().map(|row| (row.rowid, Vec::new())).collect();
         self.shadow_rows = None;
         Ok(())
     }

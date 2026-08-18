@@ -78,6 +78,17 @@ fn bd_zqc1b_count_after_delete_on_reopened_lazy() {
         assert_eq!(rowids(&survivors), vec![1, 3], "survivors after delete");
         conn.close().await.unwrap();
 
+        // The persisted image also reports 2 after a fresh reopen (the delete
+        // durably re-encoded the shadow, not just the in-memory count).
+        let reopened = Connection::open(&db_str).await.unwrap();
+        let reopened_count = reopened.query("SELECT count(*) FROM t;").await.unwrap();
+        assert_eq!(
+            scalar_i64(&reopened_count),
+            2,
+            "count(*) after reopen must still be 2"
+        );
+        reopened.close().await.unwrap();
+
         // Bundled stock reads the same post-delete image.
         let stock = rusqlite::Connection::open(&db_path).unwrap();
         let integrity: String = stock
