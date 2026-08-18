@@ -35223,6 +35223,21 @@ impl Connection {
                 } else {
                     Box::new(Self::open_with_env(path.clone(), self.attach_env.clone()).await?)
                 };
+                // bd-6n5cy stock-fidelity: SQLite refuses to attach a database
+                // whose text encoding differs from the main database ("attached
+                // databases must use the same text encoding as main database",
+                // SQLITE_ERROR). Each connection hydrates its own db_text_encoding
+                // from its own header on open, so the attached value here reflects
+                // the file's real encoding. frank's decode layer *could* read a
+                // cross-encoding attachment, but stock forbids the cross-encoding
+                // comparisons/joins it would enable — match the rejection. (A
+                // brand-new empty attachment keeps the default UTF-8, matching a
+                // UTF-8 main.)
+                if attached_connection.db_text_encoding.get() != self.db_text_encoding.get() {
+                    return Err(FrankenError::function_error(
+                        "attached databases must use the same text encoding as main database",
+                    ));
+                }
                 self.attached_schemas
                     .borrow_mut()
                     .attach(attach.schema.clone(), path)?;
@@ -166018,12 +166033,15 @@ mod tests {
 
     #[test]
     fn test_utf16_admitted_read_only_across_open_modes_and_preserves_main_image() {
-        // bd-bld9w.7: a UTF-16LE/BE database is admitted through every open mode
-        // that shares the reload admission gate — ordinary, existing, schema-only,
-        // in-memory import, and ATTACH — and reads decode end to end. Write
-        // admission + round-trip correctness across encodings is proven by the
-        // dedicated write oracle (bd_bld9w_utf16_write_oracle.rs); this keeper
-        // focuses on the read/decode path across the open-mode matrix.
+        // bd-bld9w.7: a UTF-16LE/BE database is admitted through the direct open
+        // modes that share the reload admission gate — ordinary, existing,
+        // schema-only, and in-memory import — and reads decode end to end.
+        // ATTACH into a UTF-8 parent is the exception: bd-6n5cy makes frank
+        // match stock and reject a cross-encoding attachment, so that sub-case
+        // asserts the rejection. Write admission + round-trip correctness across
+        // encodings is proven by the dedicated write oracle
+        // (bd_bld9w_utf16_write_oracle.rs); this keeper focuses on the
+        // read/decode path across the open-mode matrix.
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             for encoding in ["UTF-16le", "UTF-16be"] {
@@ -166080,31 +166098,36 @@ mod tests {
                 );
                 drop(conn);
 
-                // ATTACH into a UTF-8 parent: attached read decodes, attached
-                // write is rejected by the child's own guard, image preserved.
+                // ATTACH into a UTF-8 parent is REJECTED (bd-6n5cy supersedes the
+                // earlier bd-bld9w.7 read-only-admit behavior): stock refuses to
+                // attach a database whose text encoding differs from the main
+                // database (SQLITE_ERROR). The rejection must leave no schema and
+                // no child connection registered. (frank's UTF-16 read/decode is
+                // already proven by the direct open modes above; a same-encoding
+                // attach would still decode.)
                 let parent = Connection::open(":memory:").await.unwrap();
                 let attach_path = db_str.replace('\'', "''");
-                parent
+                let err = parent
                     .execute(&format!("ATTACH DATABASE '{attach_path}' AS aux16;"))
                     .await
-                    .expect("ATTACH admits a UTF-16 database read-only");
+                    .expect_err("cross-encoding UTF-16 ATTACH must be rejected (bd-6n5cy)");
                 assert!(
-                    parent.attached_schemas.borrow().find("aux16").is_some(),
-                    "read-only UTF-16 ATTACH publishes the schema name"
+                    format!("{err:?}")
+                        .to_ascii_lowercase()
+                        .contains("same text encoding"),
+                    "{encoding}: expected the stock encoding-mismatch error, got {err:?}"
                 );
                 assert!(
-                    parent
+                    parent.attached_schemas.borrow().find("aux16").is_none(),
+                    "a rejected cross-encoding ATTACH must not publish the schema name"
+                );
+                assert!(
+                    !parent
                         .attached_connections
                         .borrow()
                         .contains_key(&attached_schema_key("aux16")),
-                    "read-only UTF-16 ATTACH retains the child connection"
+                    "a rejected cross-encoding ATTACH must not retain a child connection"
                 );
-                let rows = parent
-                    .query(r#"SELECT value FROM aux16."café";"#)
-                    .await
-                    .unwrap();
-                assert_eq!(rows.len(), 1, "{encoding}: attached read row count");
-                assert_eq!(rows[0].values()[0], SqliteValue::Text("Καλημέρα".into()));
             }
         });
     }
@@ -166269,19 +166292,25 @@ mod tests {
                 );
                 drop(conn);
 
+                // ATTACH into a UTF-8 parent is rejected regardless of content:
+                // stock keys on the header encoding, not the bytes, so even an
+                // ASCII-only UTF-16 database is refused (bd-6n5cy supersedes the
+                // earlier bd-bld9w.7 admit behavior).
                 let parent = Connection::open(":memory:").await.unwrap();
                 let attach_path = db_str.replace('\'', "''");
-                parent
+                let err = parent
                     .execute(&format!("ATTACH DATABASE '{attach_path}' AS ascii16;"))
                     .await
-                    .expect("ATTACH admits ASCII-only UTF-16 read-only");
-                assert_eq!(
-                    parent
-                        .query("SELECT value FROM ascii16.ascii_only_t;")
-                        .await
-                        .unwrap()[0]
-                        .values()[0],
-                    SqliteValue::Text("plain".into())
+                    .expect_err("cross-encoding ASCII-only UTF-16 ATTACH must be rejected");
+                assert!(
+                    format!("{err:?}")
+                        .to_ascii_lowercase()
+                        .contains("same text encoding"),
+                    "{encoding}: expected the stock encoding-mismatch error, got {err:?}"
+                );
+                assert!(
+                    parent.attached_schemas.borrow().find("ascii16").is_none(),
+                    "a rejected cross-encoding ATTACH must not publish the schema name"
                 );
             }
         });
