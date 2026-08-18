@@ -4655,6 +4655,12 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     if name_is("hard_heap_limit") {
         return &["hard_heap_limit"];
     }
+    // GH #251: `PRAGMA optimize` has a fixed single-column shape regardless of
+    // the mask — empty in the normal case, one `ANALYZE ...` text line per
+    // beneficial table in debug mode (mask bit 0x0001).
+    if name_is("optimize") {
+        return &["optimize"];
+    }
     if name_is("locking_mode") {
         return &["locking_mode"];
     }
@@ -57671,6 +57677,107 @@ impl Connection {
         Ok(())
     }
 
+    /// GH #251 (bd-gh-pragma-optimize-analyze): execute `PRAGMA optimize(MASK)`.
+    ///
+    /// `PRAGMA optimize` runs ANALYZE on the tables that would benefit — those
+    /// modified enough since their last ANALYZE. FrankenSQLite does not yet
+    /// track per-table change counters, so the "beneficial" set is approximated
+    /// as every user table that currently holds at least one row
+    /// (`optimize_beneficial_tables`): an empty table can never contribute a
+    /// `sqlite_stat1` row, and stock likewise never creates `sqlite_stat1` for
+    /// an all-empty database. When at least one non-empty table exists the
+    /// force-analyze routes through the existing `execute_analyze` machinery,
+    /// which materializes `sqlite_stat1` byte-identically to plain ANALYZE.
+    ///
+    /// Mask bits (SQLite >= 3.46): `0x0001` is debug mode — return one
+    /// `ANALYZE "main"."<table>"` line per table that *would* be analyzed
+    /// without touching the database; `0x0002` enables the ANALYZE
+    /// optimization; `0x10000` widens the scan from connection-used tables to
+    /// all schema tables. The no-argument default mask is `0xfffe` (analyze
+    /// enabled, debug off). We always consider every user table (not just
+    /// connection-used ones), a benign superset of the `0x10000` distinction.
+    /// `PRAGMA optimize` returns no rows outside debug mode.
+    ///
+    /// Known limitation: lacking change counters we re-analyze any non-empty
+    /// table rather than only those with stale statistics, so a tiny
+    /// incremental change stock would leave below its re-analyze threshold will
+    /// refresh (never corrupt) `sqlite_stat1` here. The empty-database,
+    /// all-fresh, mask=0, and debug cases the conformance oracle exercises all
+    /// match stock.
+    async fn execute_optimize(
+        &self,
+        value: Option<&fsqlite_ast::PragmaValue>,
+    ) -> Result<Vec<Row>> {
+        const OPTIMIZE_DEBUG_BIT: i64 = 0x0001;
+        const OPTIMIZE_ANALYZE_BIT: i64 = 0x0002;
+        // The no-argument default mask, matching SQLite: every optimization
+        // except the reserved low (debug) bit.
+        const OPTIMIZE_DEFAULT_MASK: i64 = 0xfffe;
+
+        let mask = match value {
+            Some(value) => parse_pragma_optimize_mask(value)?,
+            None => OPTIMIZE_DEFAULT_MASK,
+        };
+
+        // The ANALYZE optimization is disabled (e.g. `PRAGMA optimize(0)` or a
+        // debug-only `PRAGMA optimize(1)`): nothing to analyze or describe, and
+        // `sqlite_stat1` must not be created.
+        if (mask & OPTIMIZE_ANALYZE_BIT) == 0 {
+            return Ok(Vec::new());
+        }
+
+        let beneficial = self.optimize_beneficial_tables().await?;
+
+        // Debug mode: report the ANALYZE statements that WOULD run, one row per
+        // beneficial table, without modifying the database.
+        if (mask & OPTIMIZE_DEBUG_BIT) != 0 {
+            return Ok(beneficial
+                .iter()
+                .map(|table| Row {
+                    values: vec![SqliteValue::Text(
+                        format!("ANALYZE \"main\".\"{}\"", table.replace('"', "\"\"")).into(),
+                    )],
+                })
+                .collect());
+        }
+
+        if !beneficial.is_empty() {
+            self.execute_analyze(None).await?;
+        }
+        Ok(Vec::new())
+    }
+
+    /// The user tables `PRAGMA optimize` considers worth analyzing: every
+    /// non-internal table that currently holds at least one row, returned in
+    /// reverse schema (creation) order to match stock's debug-mode listing.
+    async fn optimize_beneficial_tables(&self) -> Result<Vec<String>> {
+        let candidates: Vec<(String, i32)> = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .filter(|table| !is_internal_sqlite_table(&table.name))
+                .map(|table| (table.name.clone(), table.root_page))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut beneficial = Vec::new();
+            for (name, root_page) in candidates.iter().rev() {
+                if self
+                    .count_btree_entries_in_txn(cx, txn, *root_page, true)
+                    .await?
+                    > 0
+                {
+                    beneficial.push(name.clone());
+                }
+            }
+            Ok(beneficial)
+        })
+        .await
+    }
+
     async fn execute_analyze(&self, target: Option<&QualifiedName>) -> Result<()> {
         let plan = self.resolve_analyze_plan(target)?;
         if plan.ensure_stat_table {
@@ -65972,6 +66079,15 @@ impl Connection {
             return Ok(vec![Row {
                 values: vec![SqliteValue::Integer(i64::from(self.defer_foreign_keys.get()))],
             }]);
+        }
+
+        // GH #251 (bd-gh-pragma-optimize-analyze): `PRAGMA optimize(MASK)` runs
+        // ANALYZE on the tables that would benefit, materializing sqlite_stat1
+        // exactly as plain ANALYZE does. Without this arm it falls through to
+        // the unknown-pragma no-op, silently skipping statistics collection so a
+        // follow-up `SELECT * FROM sqlite_stat1` fails with "no such table".
+        if pragma_name == "optimize" {
+            return self.execute_optimize(pragma.value.as_ref()).await;
         }
 
         // The v0.2 runtime is UTF-8-only. SQLite normally permits an encoding
@@ -126685,6 +126801,35 @@ fn parse_pragma_bool(value: &fsqlite_ast::PragmaValue) -> Result<bool> {
         _ => Err(FrankenError::Internal(format!(
             "PRAGMA boolean value must be ON/OFF/TRUE/FALSE/1/0, got `{text}`"
         ))),
+    }
+}
+
+/// Parse the integer bitmask argument of `PRAGMA optimize(MASK)` (GH #251).
+/// Accepts a decimal or hex integer literal, optionally with a unary `+`/`-`
+/// (e.g. `PRAGMA optimize(-1)` selects every optimization).
+fn parse_pragma_optimize_mask(value: &fsqlite_ast::PragmaValue) -> Result<i64> {
+    let expr = match value {
+        fsqlite_ast::PragmaValue::Assign(e) | fsqlite_ast::PragmaValue::Call(e) => e,
+    };
+    optimize_mask_from_expr(expr).ok_or_else(|| {
+        FrankenError::Internal("PRAGMA optimize argument must be an integer bitmask".to_owned())
+    })
+}
+
+fn optimize_mask_from_expr(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::Integer(n), _) => Some(*n),
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate,
+            expr,
+            ..
+        } => optimize_mask_from_expr(expr).map(i64::wrapping_neg),
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Plus,
+            expr,
+            ..
+        } => optimize_mask_from_expr(expr),
+        _ => None,
     }
 }
 
