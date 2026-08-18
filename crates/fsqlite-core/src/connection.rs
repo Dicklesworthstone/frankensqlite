@@ -89261,11 +89261,37 @@ fn validate_function_call_modifiers_in_frame_bound(bound: &FrameBound) -> Result
     }
 }
 
+/// Enforce SQLite's contract on `likelihood(X, Y)`: the second argument must be
+/// a floating-point *literal* in the closed range `[0.0, 1.0]`. This mirrors
+/// `exprProbability()` in SQLite's `expr.c`, which rejects the argument at
+/// prepare time when `p->op != TK_FLOAT` or the value falls outside
+/// `[0.0, 1.0]`. So an integer literal (`1`, `0`), a unary-minus literal
+/// (`-0.1`), a constant expression (`0.4 + 0.1`), a function call (`abs(0.5)`),
+/// a column reference, or `NULL` are all rejected — only a bare REAL literal
+/// token is accepted. `likely`/`unlikely` (one-argument planner hints) carry no
+/// probability argument and are unaffected.
+fn validate_likelihood_probability_arg(name: &str, args: &FunctionArgs) -> Result<()> {
+    let FunctionArgs::List(arguments) = args else {
+        return Ok(());
+    };
+    if !name.eq_ignore_ascii_case("likelihood") || arguments.len() != 2 {
+        return Ok(());
+    }
+    if matches!(&arguments[1], Expr::Literal(Literal::Float(r), _) if (0.0..=1.0).contains(r)) {
+        Ok(())
+    } else {
+        Err(FrankenError::FunctionError(
+            "second argument to likelihood() must be a constant between 0.0 and 1.0".to_owned(),
+        ))
+    }
+}
+
 fn validate_function_call_resolution(
     name: &str,
     args: &FunctionArgs,
     over: Option<&WindowSpec>,
 ) -> Result<()> {
+    validate_likelihood_probability_arg(name, args)?;
     let num_args = aggregate_args_len_for_lookup(args);
     let application_kind = current_application_function_kind(name, num_args);
     if over.is_some() && application_kind.is_some_and(|kind| !kind.is_window_callable()) {
@@ -122079,6 +122105,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
         let FunctionArgs::List(arguments) = args else {
             return Ok(());
         };
+        validate_likelihood_probability_arg(name, args)?;
         for (index, argument) in arguments.iter().enumerate() {
             if index == 0
                 && is_fts5_aux_function_name(name)
