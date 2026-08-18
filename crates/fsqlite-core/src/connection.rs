@@ -11512,6 +11512,12 @@ pub struct Connection {
     /// Without this, runtime-input construction can recursively try to
     /// rebuild the same default map while already evaluating a default.
     column_default_eval_depth: Cell<usize>,
+    /// Nesting depth of statement dispatch. Zero means the outermost
+    /// (top-level) statement; a nested subquery / CTE sub-execution runs at
+    /// depth > 0. Used so the `'now'` cache is reset only when a new top-level
+    /// statement begins, keeping `julianday('now')` stable across every nested
+    /// subquery within one statement (GH #175 / bd-u4hie).
+    statement_exec_depth: Cell<usize>,
     // ── ATTACH/DETACH schema registry (§12.11, bd-7pxb) ─────────────────────
     /// Registry of attached databases. Tracks schema names registered via
     /// ATTACH DATABASE so that schema-qualified references resolve correctly.
@@ -11597,6 +11603,22 @@ impl Drop for ColumnDefaultEvalGuard<'_> {
         let depth = self.conn.column_default_eval_depth.get();
         self.conn
             .column_default_eval_depth
+            .set(depth.saturating_sub(1));
+    }
+}
+
+/// RAII guard that raises `statement_exec_depth` for the lifetime of a statement
+/// dispatch and lowers it on drop, so nested subquery / CTE sub-executions
+/// observe a non-zero depth (GH #175 / bd-u4hie).
+struct StatementExecDepthGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl Drop for StatementExecDepthGuard<'_> {
+    fn drop(&mut self) {
+        let depth = self.conn.statement_exec_depth.get();
+        self.conn
+            .statement_exec_depth
             .set(depth.saturating_sub(1));
     }
 }
@@ -12888,6 +12910,7 @@ impl Connection {
             group_by_bucket_fast_memo: RefCell::new(None),
             table_execution_metadata_cache: RefCell::new(None),
             column_default_eval_depth: Cell::new(0),
+            statement_exec_depth: Cell::new(0),
             attached_schemas: RefCell::new(SchemaRegistry::new()),
             attach_env,
             attached_connections: RefCell::new(HashMap::new()),
@@ -13420,6 +13443,7 @@ impl Connection {
             group_by_bucket_fast_memo: RefCell::new(None),
             table_execution_metadata_cache: RefCell::new(None),
             column_default_eval_depth: Cell::new(0),
+            statement_exec_depth: Cell::new(0),
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
             attached_schemas: RefCell::new(SchemaRegistry::new()),
             attach_env,
@@ -16754,8 +16778,13 @@ impl Connection {
         // GH #175: a new statement re-reads the wall clock exactly once. Clear
         // the cached `'now'` so the first `julianday('now')` / `CURRENT_*` in
         // this statement captures a fresh value that then stays stable across
-        // the statement's rows.
-        reset_statement_now();
+        // the statement's rows. bd-u4hie: only the OUTERMOST (top-level)
+        // statement resets — a nested subquery / CTE sub-execution runs at
+        // depth > 0 and must inherit the top-level statement's captured `'now'`,
+        // so `(SELECT julianday('now')) = (SELECT julianday('now'))` is 1.
+        if self.statement_exec_depth.get() == 0 {
+            reset_statement_now();
+        }
         let state = ChangeTrackingState {
             last_insert_rowid: self.last_insert_rowid.get(),
             last_changes: i64::try_from(self.last_changes.get()).unwrap_or(i64::MAX),
@@ -21266,19 +21295,21 @@ impl Connection {
         // sqlite_sequence unconditionally when any autoincrement table
         // exists) so last_insert_rowid stays correct.
         //
-        // bd-ixf69 (restores the schema-reparse-skip perf win bd-dsxu2 reverted):
-        // this per-write in-txn refresh uses the schema-cookie fast path even on
-        // a DIRTY mirror. The prior FK regression (bd-dsxu2) was that the fast
-        // path cleared `memdb_requires_active_txn_reload` while LEAVING the mirror's
-        // stale rows, so an in-txn-deleted FK parent survived as a ghost that
-        // `fk_parent_rowid_fast_lookup` trusted. That is now fixed inside the
-        // fast-path branch itself (reload_memdb_from_txn_with_mode): when it fires
-        // on a dirty mirror it DISCARDS the stale row image
-        // (`clear_all_table_rows` + `memdb_rows_loaded = false`), forcing lazy
-        // re-hydration from the authoritative pager — equivalent to the full
-        // reload's fresh-empty mirror, minus the O(corpus) sqlite_master reparse.
-        // Guarded by test_issue110_fk_parent_cache_invalidated_*.
-        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, true)
+        // bd-dsxu2 REGRESSION FIX: this per-write in-txn refresh must NOT use the
+        // schema-cookie fast path on a DIRTY mirror. Unlike the two from-pager
+        // reload call sites (which use `allow_dirty_schema_only_fast_path=true`),
+        // this call site is `refresh_memdb_from_active_txn_if_dirty` -- the ONLY
+        // per-write path that absorbs in-txn DML row changes into the mirror.
+        // With `true`, the fast path (reload_memdb_from_txn_with_mode's
+        // schema-cookie branch) fires on a dirty mirror and clears
+        // `memdb_requires_active_txn_reload` WITHOUT absorbing those rows, so an
+        // in-txn parent DELETE leaves a ghost parent in the mirror and
+        // `fk_parent_rowid_fast_lookup` then trusts it -> FK constraint silently
+        // bypassed (test_issue110_fk_parent_cache_invalidated_by_delete /
+        // _insert_or_replace). Keep `false` here so a dirty mirror takes the
+        // row-absorbing reload. (Re-doing the schema-reparse-skip perf win
+        // without breaking row-dirty absorption is tracked as bd-ixf69.)
+        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, false)
             .await
     }
 
@@ -32758,6 +32789,11 @@ impl Connection {
                 enter_record_profile_scope(RecordProfileScope::CoreConnection);
             self.clear_table_program_error_state();
             self.sync_change_tracking_context();
+            // bd-u4hie: raise the dispatch nesting depth AFTER the `'now'` reset
+            // decision above, so any nested subquery / CTE that recurses back
+            // into this dispatch observes depth > 0 and keeps the top-level
+            // statement's captured `'now'`.
+            let _statement_exec_depth_guard = self.enter_statement_exec();
             if !select_structure_validated {
                 self.with_fallback_function_registry(|| {
                     self.validate_statement_select_structure(statement)
@@ -46698,6 +46734,16 @@ impl Connection {
         let next_depth = self.column_default_eval_depth.get().saturating_add(1);
         self.column_default_eval_depth.set(next_depth);
         ColumnDefaultEvalGuard { conn: self }
+    }
+
+    /// Raise the statement-dispatch nesting depth for the duration of the
+    /// returned guard. Entered once per statement dispatch (after the `'now'`
+    /// reset decision), so nested subquery / CTE sub-executions see depth > 0
+    /// and do not re-capture `'now'` (GH #175 / bd-u4hie).
+    fn enter_statement_exec(&self) -> StatementExecDepthGuard<'_> {
+        let next_depth = self.statement_exec_depth.get().saturating_add(1);
+        self.statement_exec_depth.set(next_depth);
+        StatementExecDepthGuard { conn: self }
     }
 
     fn is_evaluating_column_default(&self) -> bool {
@@ -83395,18 +83441,6 @@ impl Connection {
                 // Match the Lightweight refresh path in
                 // `try_refresh_prepared_metadata_if_stale` and refresh the cache
                 // here when we have any autoincrement tables to track.
-                // bd-ixf69 (fixes the bd-dsxu2 regression while restoring the
-                // schema-reparse-skip perf win): this fast path may fire on a
-                // DIRTY mirror (`allow_dirty_schema_only_fast_path`), i.e. one
-                // whose row image has NOT absorbed this txn's DML. The schema is
-                // provably unchanged (cookie match) so skipping the sqlite_master
-                // reparse is safe — but the STALE ROWS must not be trusted, or a
-                // ghost row (e.g. an in-txn-deleted FK parent) survives in the
-                // mirror and `fk_parent_rowid_fast_lookup` reads it (bd-dsxu2).
-                // Discard the mirror's row image so row consumers re-hydrate
-                // lazily from the authoritative pager — equivalent to the full
-                // path's fresh-empty `MemDatabase`, minus the reparse.
-                let mirror_row_image_is_stale = self.memdb_requires_active_txn_reload.get();
                 let has_autoincrement_tables = !self.autoincrement_tables.borrow().is_empty();
                 if has_autoincrement_tables {
                     let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn).await?;
@@ -83417,9 +83451,6 @@ impl Connection {
                 // observe this cross-process commit.
                 self.set_memdb_visible_commit_seq_from_publication(bound_visible_commit_seq);
                 *self.change_counter.borrow_mut() = change_counter;
-                if mirror_row_image_is_stale {
-                    self.db.borrow_mut().clear_all_table_rows();
-                }
                 self.memdb_rows_loaded.set(false);
                 self.memdb_requires_active_txn_reload.set(false);
                 self.memdb_storage_count_shortcuts_safe.set(false);
