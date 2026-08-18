@@ -22404,7 +22404,7 @@ where
                 self.freed_pages_index.insert(page_no);
                 self.note_freed_page_bound(page_no);
             } else if std::env::var_os("RH4_TRACE").is_some()
-                && !self.freed_pages.iter().any(|&p| p == page_no)
+                && !self.freed_pages.contains(&page_no)
             {
                 // bd-84rh4 free-tracking probe: the dedup guard skipped this
                 // free because freed_pages_index/bounds say the page is already
