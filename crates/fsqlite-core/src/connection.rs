@@ -21711,8 +21711,11 @@ impl Connection {
 
         {
             let mut pragma_state = self.pragma_state.borrow_mut();
-            pragma_state.user_version = i64::from(header.user_version);
-            pragma_state.application_id = i64::from(header.application_id);
+            // user_version/application_id are signed 32-bit header fields:
+            // sign-reinterpret so e.g. 0xFFFFFFFF hydrates as -1, not
+            // 4294967295 (GH #263).
+            pragma_state.user_version = i64::from(header.user_version.cast_signed());
+            pragma_state.application_id = i64::from(header.application_id.cast_signed());
             pragma_state.default_cache_size = i64::from(header.default_cache_size);
         }
         *self.change_counter.borrow_mut() = header.change_counter;
@@ -85541,8 +85544,10 @@ impl Connection {
             }
             {
                 let mut pragma_state = self.pragma_state.borrow_mut();
-                pragma_state.user_version = i64::from(user_version);
-                pragma_state.application_id = i64::from(application_id);
+                // Signed 32-bit header fields — sign-reinterpret on hydration
+                // (GH #263); see the sibling site in refresh_from_header.
+                pragma_state.user_version = i64::from(user_version.cast_signed());
+                pragma_state.application_id = i64::from(application_id.cast_signed());
                 pragma_state.default_cache_size = i64::from(default_cache_size);
             }
             let old_schema_cookie = *self.schema_cookie.borrow();

@@ -2284,7 +2284,10 @@ pub mod pragma {
         match &stmt.value {
             None => Ok(PragmaOutput::Int(state.user_version)),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
-                let val = parse_integer_expr(expr)?;
+                // Stock stores user_version as a signed 32-bit header field via
+                // sqlite3GetInt32: a value outside the i32 range becomes 0
+                // (GH #264). In-range values (incl. negatives) round-trip.
+                let val = i64::from(i32::try_from(parse_integer_expr(expr)?).unwrap_or(0));
                 state.user_version = val;
                 Ok(PragmaOutput::Int(val))
             }
@@ -2298,7 +2301,9 @@ pub mod pragma {
         match &stmt.value {
             None => Ok(PragmaOutput::Int(state.application_id)),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
-                let val = parse_integer_expr(expr)?;
+                // Signed 32-bit header field, same sqlite3GetInt32 rule as
+                // user_version: out-of-i32-range assignments store 0 (GH #264).
+                let val = i64::from(i32::try_from(parse_integer_expr(expr)?).unwrap_or(0));
                 state.application_id = val;
                 Ok(PragmaOutput::Int(val))
             }
