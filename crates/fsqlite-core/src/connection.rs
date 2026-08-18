@@ -142,7 +142,7 @@ use fsqlite_types::record::{
     enter_record_profile_scope, parse_record, parse_record_header_into, parse_record_into,
     parse_record_into_with_encoding, parse_record_projected_column_offsets, record_profile_enabled,
     record_profile_snapshot,
-    reset_record_profile, serialize_record, serialize_record_iter_into,
+    reset_record_profile, serialize_record,
     serialize_record_iter_into_with_encoding,
     serialize_record_iter_with_precomputed_header_into, serialize_record_with_encoding,
     try_build_runtime_precomputed_record_header,
@@ -23322,11 +23322,12 @@ impl Connection {
             // execute_statement_dispatch_with_fk_scope, which this prepared fast
             // path does not traverse). A UTF-16 database is admitted READ-ONLY —
             // the record-encode write path is not fully wired across every write
-            // site (bd-bld9w.7) — so a prepared mutation must fail closed here
-            // too, or a direct-simple write would serialize UTF-8 TEXT into a
-            // UTF-16 file (silent corruption). The write guard stays keyed to
-            // is_runtime_supported (Utf8 only) until the full write path lands.
-            if !self.db_text_encoding.get().is_runtime_supported()
+            // site (bd-bld9w.7). The write-encode sweep is complete — every
+            // on-disk write-serialization path now encodes TEXT in the DB text
+            // encoding — so mutation admission is keyed to is_write_supported
+            // (UTF-8 + UTF-16LE/BE). A non-write-supported encoding still fails
+            // closed rather than serializing mismatched TEXT bytes.
+            if !self.db_text_encoding.get().is_write_supported()
                 && (stmt.precompiled_dml().is_some() || stmt.deferred_dml_statement().is_some())
             {
                 return Err(FrankenError::Unsupported);
@@ -33130,13 +33131,14 @@ impl Connection {
     /// autocommit wrapping can bracket the entire execution.
     #[allow(clippy::too_many_lines)]
     #[allow(dead_code)]
-    /// bd-bld9w.3: reject a mutating statement on a database whose text encoding
-    /// is not fully supported. UTF-16 databases are admitted READ-ONLY (their
-    /// TEXT decodes end to end, but the record-encode/`MakeRecord` write path is
-    /// not yet encoding-aware), so a mutation fails closed rather than
-    /// serializing UTF-8 TEXT bytes into a UTF-16 database (silent corruption).
+    /// bd-bld9w.7: reject a mutating statement only on a database whose text
+    /// encoding is not write-supported. UTF-16LE/BE databases are now fully
+    /// writable — the write-encode sweep made every on-disk write-serialization
+    /// path encode TEXT in the DB text encoding — so mutation admission is keyed
+    /// to [`TextEncoding::is_write_supported`]. An unsupported encoding still
+    /// fails closed rather than serializing mismatched TEXT bytes.
     fn guard_mutation_encoding_supported(&self, statement: &Statement) -> Result<()> {
-        if self.db_text_encoding.get().is_runtime_supported()
+        if self.db_text_encoding.get().is_write_supported()
             || !statement_may_mutate_database(statement)
         {
             return Ok(());
@@ -64790,7 +64792,7 @@ impl Connection {
         // bootstrap admission gate below cannot decode. Reject every supported
         // SQLite UTF-16 spelling before any connection or pager state changes.
         if pragma_name == "encoding"
-            && pragma.value.as_ref().is_some_and(|value| {
+            && let Some(target) = pragma.value.as_ref().and_then(|value| {
                 let expr = match value {
                     PragmaValue::Assign(expr) | PragmaValue::Call(expr) => expr,
                 };
@@ -64801,13 +64803,28 @@ impl Connection {
                     }
                     _ => None,
                 };
-                matches!(
-                    requested.as_deref(),
-                    Some("utf-16" | "utf-16le" | "utf-16be")
-                )
+                // Only UTF-16 requests are intercepted here; 'UTF-16' resolves to
+                // the native default UTF-16le, matching stock sqlite3. UTF-8 and
+                // unknown spellings fall through to the normal pragma handling.
+                match requested.as_deref() {
+                    Some("utf-16" | "utf-16le") => Some(TextEncoding::Utf16le),
+                    Some("utf-16be") => Some(TextEncoding::Utf16be),
+                    _ => None,
+                }
             })
         {
-            return Err(FrankenError::Unsupported);
+            // bd-bld9w.7: the database text encoding may be set only before the
+            // first schema object is created (schema_cookie == 0), matching stock;
+            // on a non-empty database it is a silent no-op, never an error. Persist
+            // into BOTH the live db_text_encoding (consulted by the write path) and
+            // header bytes 56..60 (consulted by the header-backed `PRAGMA encoding`
+            // reader and every reopen).
+            if self.schema_cookie() == 0 {
+                self.db_text_encoding.set(target);
+                self.update_database_header_metadata(None, None, None, None, Some(target))
+                    .await?;
+            }
+            return Ok(Vec::new());
         }
 
         let mut pragma_out = {
@@ -74665,7 +74682,11 @@ impl Connection {
         enum GbwColKind {
             Plain(usize),  // index into grouped_columns
             Window(usize), // index into win_infos
-            WrappedWindow(usize, Expr),
+            /// Outer expression wrapping one or more window functions.  The
+            /// `Vec<usize>` maps placeholder slot -> index into `win_infos`
+            /// (slot `N` corresponds to the `__win_result_N__` placeholder in
+            /// the stored `Expr`).
+            WrappedWindow(Vec<usize>, Expr),
         }
 
         let mut grouped_columns: Vec<ResultColumn> = Vec::new();
@@ -74765,86 +74786,98 @@ impl Connection {
                     col_kinds.push(GbwColKind::Window(idx));
                 }
                 ResultColumn::Expr { expr, .. } if expr_has_window_function(expr) => {
-                    let ExtractedWindowFunction {
+                    // The expression contains one or more window functions
+                    // (e.g. `sum(x) OVER () + count(*) OVER ()`).  Extract every
+                    // nested window call, register each into `win_infos`, and
+                    // wrap the outer expression with a distinct placeholder per
+                    // window (`__win_result_N__`).
+                    let (outer_with_placeholder, extracted_windows) =
+                        replace_windows_with_placeholders(expr);
+                    if extracted_windows.is_empty() {
+                        return Err(FrankenError::Internal(
+                            "expr_has_window_function=true but cannot extract".to_owned(),
+                        ));
+                    }
+                    let mut slot_win_indices = Vec::with_capacity(extracted_windows.len());
+                    for ExtractedWindowFunction {
                         name: inner_name,
                         args: inner_args,
                         call_order_by: _,
                         window: raw_inner_spec,
                         filter: inner_filter,
-                    } = extract_inner_window_function(expr).ok_or_else(|| {
-                        FrankenError::Internal(
-                            "expr_has_window_function=true but cannot extract".to_owned(),
-                        )
-                    })?;
-                    let inner_spec = resolve_used_window_spec(&raw_inner_spec, &named_windows)?;
-                    let args_are_star = matches!(&inner_args, FunctionArgs::Star);
-                    let arg_exprs = match &inner_args {
-                        FunctionArgs::List(exprs) => exprs
+                    } in extracted_windows
+                    {
+                        let inner_spec = resolve_used_window_spec(&raw_inner_spec, &named_windows)?;
+                        let args_are_star = matches!(&inner_args, FunctionArgs::Star);
+                        let arg_exprs = match &inner_args {
+                            FunctionArgs::List(exprs) => exprs
+                                .iter()
+                                .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr))
+                                .collect(),
+                            FunctionArgs::Star => vec![],
+                        };
+                        #[allow(clippy::cast_possible_wrap)]
+                        let num_args = arg_exprs.len() as i32;
+                        let func = find_window_function_checked(&registry, &inner_name, num_args)?;
+                        let is_builtin = !self.is_custom_window_function(&func);
+                        let order_by_source: Vec<Expr> = inner_spec
+                            .order_by
+                            .iter()
+                            .map(|term| term.expr.clone())
+                            .collect();
+                        let ob: Vec<OrderingTerm> = inner_spec
+                            .order_by
+                            .iter()
+                            .map(|term| OrderingTerm {
+                                expr: materialize_window_expr(&mut extra_window_exprs, &term.expr),
+                                direction: term.direction,
+                                nulls: term.nulls,
+                            })
+                            .collect();
+                        let partition_by_source = inner_spec.partition_by.clone();
+                        let pb = inner_spec
+                            .partition_by
                             .iter()
                             .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr))
-                            .collect(),
-                        FunctionArgs::Star => vec![],
-                    };
-                    #[allow(clippy::cast_possible_wrap)]
-                    let num_args = arg_exprs.len() as i32;
-                    let func = find_window_function_checked(&registry, &inner_name, num_args)?;
-                    let is_builtin = !self.is_custom_window_function(&func);
-                    let order_by_source: Vec<Expr> = inner_spec
-                        .order_by
-                        .iter()
-                        .map(|term| term.expr.clone())
-                        .collect();
-                    let ob: Vec<OrderingTerm> = inner_spec
-                        .order_by
-                        .iter()
-                        .map(|term| OrderingTerm {
-                            expr: materialize_window_expr(&mut extra_window_exprs, &term.expr),
-                            direction: term.direction,
-                            nulls: term.nulls,
-                        })
-                        .collect();
-                    let partition_by_source = inner_spec.partition_by.clone();
-                    let pb = inner_spec
-                        .partition_by
-                        .iter()
-                        .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr))
-                        .collect();
-                    let upper = inner_name.to_ascii_uppercase();
-                    let needs_full_partition = is_builtin
-                        && matches!(
-                            upper.as_str(),
-                            "LEAD"
-                                | "LAG"
-                                | "NTILE"
-                                | "PERCENT_RANK"
-                                | "CUME_DIST"
-                                | "FIRST_VALUE"
-                                | "LAST_VALUE"
-                                | "NTH_VALUE"
-                        );
-                    let aggregate_no_order =
-                        !needs_full_partition && inner_spec.order_by.is_empty();
-                    let two_pass = needs_full_partition || aggregate_no_order;
-                    let filter = inner_filter
-                        .as_ref()
-                        .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr));
-                    let idx = win_infos.len();
-                    win_infos.push(WinInfo {
-                        func,
-                        is_builtin,
-                        args: arg_exprs,
-                        args_are_star,
-                        order_by: ob,
-                        order_by_source,
-                        partition_by: pb,
-                        partition_by_source,
-                        two_pass,
-                        name: upper,
-                        frame: inner_spec.frame.clone(),
-                        filter,
-                    });
-                    let outer_with_placeholder = replace_window_with_placeholder(expr);
-                    col_kinds.push(GbwColKind::WrappedWindow(idx, outer_with_placeholder));
+                            .collect();
+                        let upper = inner_name.to_ascii_uppercase();
+                        let needs_full_partition = is_builtin
+                            && matches!(
+                                upper.as_str(),
+                                "LEAD"
+                                    | "LAG"
+                                    | "NTILE"
+                                    | "PERCENT_RANK"
+                                    | "CUME_DIST"
+                                    | "FIRST_VALUE"
+                                    | "LAST_VALUE"
+                                    | "NTH_VALUE"
+                            );
+                        let aggregate_no_order =
+                            !needs_full_partition && inner_spec.order_by.is_empty();
+                        let two_pass = needs_full_partition || aggregate_no_order;
+                        let filter = inner_filter
+                            .as_ref()
+                            .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr));
+                        let idx = win_infos.len();
+                        win_infos.push(WinInfo {
+                            func,
+                            is_builtin,
+                            args: arg_exprs,
+                            args_are_star,
+                            order_by: ob,
+                            order_by_source,
+                            partition_by: pb,
+                            partition_by_source,
+                            two_pass,
+                            name: upper,
+                            frame: inner_spec.frame.clone(),
+                            filter,
+                        });
+                        slot_win_indices.push(idx);
+                    }
+                    col_kinds
+                        .push(GbwColKind::WrappedWindow(slot_win_indices, outer_with_placeholder));
                 }
                 other => {
                     let idx = grouped_columns.len();
@@ -75460,14 +75493,23 @@ impl Connection {
                     GbwColKind::Window(idx) => {
                         vals.push(window_results[*idx][ri].clone());
                     }
-                    GbwColKind::WrappedWindow(idx, outer_expr) => {
-                        // Replace __win_result__ placeholder with computed value.
-                        let win_val = window_results[*idx][ri].clone();
-                        let placeholder_col_map =
-                            vec![(String::new(), "__win_result__".to_owned(), false)];
+                    GbwColKind::WrappedWindow(win_indices, outer_expr) => {
+                        // Replace each __win_result_N__ placeholder with its
+                        // computed window value, then evaluate the residual
+                        // scalar expression.
+                        let mut placeholder_col_map = Vec::with_capacity(win_indices.len());
+                        let mut win_row = Vec::with_capacity(win_indices.len());
+                        for (slot, &wi) in win_indices.iter().enumerate() {
+                            placeholder_col_map.push((
+                                String::new(),
+                                win_placeholder_name(slot),
+                                false,
+                            ));
+                            win_row.push(window_results[wi][ri].clone());
+                        }
                         let val = self.eval_join_expr_with_registry(
                             outer_expr,
-                            &[win_val],
+                            &win_row,
                             &placeholder_col_map,
                         )?;
                         vals.push(val);
@@ -75680,11 +75722,12 @@ impl Connection {
         enum ColKind {
             Plain(Expr),
             Window(usize),
-            /// Outer expression wrapping a window function.  The `usize` is the
-            /// index into `win_funcs`, and the `Expr` is the outer expression
-            /// with the inner window call replaced by a placeholder column ref
-            /// `__win_result__`.
-            WrappedWindow(usize, Expr),
+            /// Outer expression wrapping one or more window functions.  The
+            /// `Vec<usize>` maps placeholder slot -> index into `win_funcs`
+            /// (slot `N` corresponds to the `__win_result_N__` placeholder), and
+            /// the `Expr` is the outer expression with each inner window call
+            /// replaced by its placeholder column ref.
+            WrappedWindow(Vec<usize>, Expr),
         }
         let registry = self.func_registry.borrow().clone();
         let mut col_kinds = Vec::with_capacity(expanded_columns.len());
@@ -75753,63 +75796,69 @@ impl Connection {
                     col_kinds.push(ColKind::Window(idx));
                 }
                 ResultColumn::Expr { expr, .. } if expr_has_window_function(expr) => {
-                    // The expression contains a nested window function
-                    // (e.g., ROUND(AVG(val) OVER (...), 2)).  Extract the
-                    // inner window call, register it, and wrap the outer
-                    // expression with a placeholder.
-                    let ExtractedWindowFunction {
+                    // The expression contains one or more nested window
+                    // functions (e.g., `ROUND(AVG(val) OVER (...), 2)` or
+                    // `sum(x) OVER () + count(*) OVER ()`).  Extract every inner
+                    // window call, register each, and wrap the outer expression
+                    // with a distinct placeholder per window (`__win_result_N__`).
+                    let (outer_with_placeholder, extracted_windows) =
+                        replace_windows_with_placeholders(expr);
+                    if extracted_windows.is_empty() {
+                        return Err(FrankenError::Internal(
+                            "expr_has_window_function=true but cannot extract".to_owned(),
+                        ));
+                    }
+                    let mut slot_win_indices = Vec::with_capacity(extracted_windows.len());
+                    for ExtractedWindowFunction {
                         name: inner_name,
                         args: inner_args,
                         call_order_by: _,
                         window: raw_inner_spec,
                         filter: inner_filter,
-                    } = extract_inner_window_function(expr).ok_or_else(|| {
-                        FrankenError::Internal(
-                            "expr_has_window_function=true but cannot extract".to_owned(),
-                        )
-                    })?;
-                    let inner_spec = resolve_used_window_spec(&raw_inner_spec, &named_windows)?;
-                    let args_are_star = matches!(&inner_args, FunctionArgs::Star);
-                    let arg_exprs = match &inner_args {
-                        FunctionArgs::List(exprs) => exprs.clone(),
-                        FunctionArgs::Star => vec![],
-                    };
-                    #[allow(clippy::cast_possible_wrap)]
-                    let num_args = arg_exprs.len() as i32;
-                    let func = find_window_function_checked(&registry, &inner_name, num_args)?;
-                    let is_builtin = !self.is_custom_window_function(&func);
-                    let ob = inner_spec.order_by.clone();
-                    let pb = inner_spec.partition_by.clone();
-                    let upper = inner_name.to_ascii_uppercase();
-                    let needs_full_partition = is_builtin
-                        && matches!(
-                            upper.as_str(),
-                            "LEAD"
-                                | "LAG"
-                                | "NTILE"
-                                | "PERCENT_RANK"
-                                | "CUME_DIST"
-                                | "FIRST_VALUE"
-                                | "LAST_VALUE"
-                                | "NTH_VALUE"
-                        );
-                    let aggregate_no_order =
-                        !needs_full_partition && inner_spec.order_by.is_empty();
-                    let two_pass = needs_full_partition || aggregate_no_order;
-                    let idx = win_funcs.len();
-                    win_funcs.push(func);
-                    win_args.push(arg_exprs);
-                    win_args_are_star.push(args_are_star);
-                    win_order_by.push(ob);
-                    win_partition_by.push(pb);
-                    win_two_pass.push(two_pass);
-                    win_is_builtin.push(is_builtin);
-                    win_func_names.push(upper);
-                    win_frame_specs.push(inner_spec.frame.clone());
-                    win_filters.push(inner_filter);
-                    // Replace the inner window call with a placeholder in the outer expr.
-                    let outer_with_placeholder = replace_window_with_placeholder(expr);
-                    col_kinds.push(ColKind::WrappedWindow(idx, outer_with_placeholder));
+                    } in extracted_windows
+                    {
+                        let inner_spec = resolve_used_window_spec(&raw_inner_spec, &named_windows)?;
+                        let args_are_star = matches!(&inner_args, FunctionArgs::Star);
+                        let arg_exprs = match &inner_args {
+                            FunctionArgs::List(exprs) => exprs.clone(),
+                            FunctionArgs::Star => vec![],
+                        };
+                        #[allow(clippy::cast_possible_wrap)]
+                        let num_args = arg_exprs.len() as i32;
+                        let func = find_window_function_checked(&registry, &inner_name, num_args)?;
+                        let is_builtin = !self.is_custom_window_function(&func);
+                        let ob = inner_spec.order_by.clone();
+                        let pb = inner_spec.partition_by.clone();
+                        let upper = inner_name.to_ascii_uppercase();
+                        let needs_full_partition = is_builtin
+                            && matches!(
+                                upper.as_str(),
+                                "LEAD"
+                                    | "LAG"
+                                    | "NTILE"
+                                    | "PERCENT_RANK"
+                                    | "CUME_DIST"
+                                    | "FIRST_VALUE"
+                                    | "LAST_VALUE"
+                                    | "NTH_VALUE"
+                            );
+                        let aggregate_no_order =
+                            !needs_full_partition && inner_spec.order_by.is_empty();
+                        let two_pass = needs_full_partition || aggregate_no_order;
+                        let idx = win_funcs.len();
+                        win_funcs.push(func);
+                        win_args.push(arg_exprs);
+                        win_args_are_star.push(args_are_star);
+                        win_order_by.push(ob);
+                        win_partition_by.push(pb);
+                        win_two_pass.push(two_pass);
+                        win_is_builtin.push(is_builtin);
+                        win_func_names.push(upper);
+                        win_frame_specs.push(inner_spec.frame.clone());
+                        win_filters.push(inner_filter);
+                        slot_win_indices.push(idx);
+                    }
+                    col_kinds.push(ColKind::WrappedWindow(slot_win_indices, outer_with_placeholder));
                 }
                 ResultColumn::Expr { expr, .. } => {
                     col_kinds.push(ColKind::Plain(expr.clone()));
@@ -76536,12 +76585,16 @@ impl Connection {
                             SqliteValue::Null,
                         ));
                     }
-                    ColKind::WrappedWindow(wi, outer_expr) => {
-                        // Substitute the window result into the placeholder
+                    ColKind::WrappedWindow(win_indices, outer_expr) => {
+                        // Substitute each window result into its placeholder
                         // column and evaluate the outer expression.
-                        let win_val =
-                            std::mem::replace(&mut window_results[*wi][ri], SqliteValue::Null);
-                        let substituted = substitute_placeholder_value(outer_expr, &win_val);
+                        let win_vals: Vec<SqliteValue> = win_indices
+                            .iter()
+                            .map(|&wi| {
+                                std::mem::replace(&mut window_results[wi][ri], SqliteValue::Null)
+                            })
+                            .collect();
+                        let substituted = substitute_placeholder_values(outer_expr, &win_vals);
                         values.push(self.eval_join_expr_with_registry(
                             &substituted,
                             row,
@@ -82490,13 +82543,21 @@ impl Connection {
                     let mut synthetic_rowid = 1_i64;
                     loop {
                         let payload = cursor.payload(cx).await?;
-                        let values = parse_record(&payload).ok_or_else(|| {
-                            FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "WITHOUT ROWID table `{}` payload is not a valid SQLite record",
-                                    table.name
-                                ),
-                            }
+                        // bd-bld9w.7: decode hydrated user rows through the DB text
+                        // encoding (same-class latent sibling of the VACUUM
+                        // hydration fix) so a UTF-16 mirror refresh holds canonical
+                        // values, not double-encoded raw bytes.
+                        let mut values = Vec::new();
+                        parse_record_into_with_encoding(
+                            &payload,
+                            &mut values,
+                            header.text_encoding,
+                        )
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "WITHOUT ROWID table `{}` payload is not a valid SQLite record",
+                                table.name
+                            ),
                         })?;
                         let values = self
                             .inflate_table_row_values_for_storage_reload(
@@ -82518,13 +82579,17 @@ impl Connection {
                 }
                 loop {
                     let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
-                    let mut values = parse_record(payload.as_ref()).ok_or_else(|| {
-                        FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} payload is not a valid SQLite record",
-                                table.name
-                            ),
-                        }
+                    let mut values = Vec::new();
+                    parse_record_into_with_encoding(
+                        payload.as_ref(),
+                        &mut values,
+                        header.text_encoding,
+                    )
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                            table.name
+                        ),
                     })?;
                     drop(payload);
                     if table.name.eq_ignore_ascii_case("sqlite_sequence")
@@ -84106,13 +84171,21 @@ impl Connection {
                             let mut synthetic_rowid = 1_i64;
                             loop {
                                 let payload = cursor.payload(cx).await?;
-                                let values = parse_record(&payload).ok_or_else(|| {
-                                FrankenError::DatabaseCorrupt {
+                                // bd-bld9w.7: decode hydrated user rows through the
+                                // DB text encoding (like the sqlite_master decode
+                                // above) so a UTF-16 VACUUM re-serializes canonical
+                                // values, not raw UTF-16 bytes double-encoded.
+                                let mut values = Vec::new();
+                                parse_record_into_with_encoding(
+                                    &payload,
+                                    &mut values,
+                                    header.text_encoding,
+                                )
+                                .ok_or_else(|| FrankenError::DatabaseCorrupt {
                                     detail: format!(
                                         "WITHOUT ROWID table `{name}` payload is not a valid SQLite record"
                                     ),
-                                }
-                            })?;
+                                })?;
                                 if hydrate_rows {
                                     let tbl_schema = new_schema.last().ok_or_else(|| {
                                         FrankenError::Internal(format!(
@@ -84145,13 +84218,20 @@ impl Connection {
                         }
                         loop {
                             let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
-                            let mut values = parse_record(payload.as_ref()).ok_or_else(|| {
-                            FrankenError::DatabaseCorrupt {
+                            // bd-bld9w.7: decode hydrated user rows through the DB
+                            // text encoding so a UTF-16 VACUUM re-serializes
+                            // canonical values, not double-encoded raw bytes.
+                            let mut values = Vec::new();
+                            parse_record_into_with_encoding(
+                                payload.as_ref(),
+                                &mut values,
+                                header.text_encoding,
+                            )
+                            .ok_or_else(|| FrankenError::DatabaseCorrupt {
                                 detail: format!(
                                     "table `{name}` rowid {rowid} payload is not a valid SQLite record"
                                 ),
-                            }
-                        })?;
+                            })?;
                             if name.eq_ignore_ascii_case("sqlite_sequence")
                                 && values.len() >= 2
                                 && let (SqliteValue::Text(tbl_name), SqliteValue::Integer(seq)) =
@@ -88984,101 +89064,63 @@ fn replace_first_window_with_literal(
     }
 }
 
-/// Replace the first window function call in `expr` with a placeholder
-/// column reference `__win_result__`.
-fn replace_window_with_placeholder(expr: &Expr) -> Expr {
+/// Name of the `N`-th window-result placeholder column.
+fn win_placeholder_name(slot: usize) -> String {
+    format!("__win_result_{slot}__")
+}
+
+/// Parse a `__win_result_N__` placeholder column name back into its slot index.
+fn parse_win_placeholder_slot(name: &str) -> Option<usize> {
+    name.strip_prefix("__win_result_")?
+        .strip_suffix("__")?
+        .parse::<usize>()
+        .ok()
+}
+
+/// Replace EVERY window function call nested in `expr` with a distinct
+/// placeholder column reference (`__win_result_0__`, `__win_result_1__`, ... in
+/// stable left-to-right order), returning the rewritten expression together
+/// with the ordered list of the extracted window function calls (one entry per
+/// placeholder slot).  Callers register each extracted window, compute its
+/// per-row result, then feed the values back through
+/// [`substitute_placeholder_values`] to evaluate the residual scalar
+/// expression.
+///
+/// Traversal order intentionally matches [`extract_inner_window_function`] and
+/// [`replace_first_window_with_literal`].  Subqueries are separate SELECT scopes
+/// and are therefore left untouched.
+fn replace_windows_with_placeholders(expr: &Expr) -> (Expr, Vec<ExtractedWindowFunction>) {
+    let mut extracted = Vec::new();
+    let rewritten = replace_windows_with_placeholders_rec(expr, &mut extracted);
+    (rewritten, extracted)
+}
+
+#[allow(clippy::too_many_lines)]
+fn replace_windows_with_placeholders_rec(
+    expr: &Expr,
+    extracted: &mut Vec<ExtractedWindowFunction>,
+) -> Expr {
+    if expr_folds_to_integer_zero_via_and(expr) {
+        return expr.clone();
+    }
     match expr {
-        Expr::FunctionCall { over: Some(_), .. } => Expr::Column(
-            ColumnRef::bare("__win_result__".to_owned()),
-            Span::new(0, 0),
-        ),
         Expr::FunctionCall {
             name,
             args,
-            distinct,
             order_by,
             filter,
-            over,
-            span,
+            over: Some(spec),
+            ..
         } => {
-            let new_args = match args {
-                FunctionArgs::List(exprs) => {
-                    let mut found = false;
-                    let new_exprs: Vec<Expr> = exprs
-                        .iter()
-                        .map(|e| {
-                            if !found && expr_has_window_function(e) {
-                                found = true;
-                                replace_window_with_placeholder(e)
-                            } else {
-                                e.clone()
-                            }
-                        })
-                        .collect();
-                    FunctionArgs::List(new_exprs)
-                }
-                FunctionArgs::Star => FunctionArgs::Star,
-            };
-            Expr::FunctionCall {
+            let slot = extracted.len();
+            extracted.push(ExtractedWindowFunction {
                 name: name.clone(),
-                args: new_args,
-                distinct: *distinct,
-                order_by: order_by.clone(),
-                filter: filter.clone(),
-                over: over.clone(),
-                span: *span,
-            }
-        }
-        Expr::BinaryOp {
-            left,
-            op,
-            right,
-            span,
-        } => {
-            if expr_has_window_function(left) {
-                Expr::BinaryOp {
-                    left: Box::new(replace_window_with_placeholder(left)),
-                    op: *op,
-                    right: right.clone(),
-                    span: *span,
-                }
-            } else {
-                Expr::BinaryOp {
-                    left: left.clone(),
-                    op: *op,
-                    right: Box::new(replace_window_with_placeholder(right)),
-                    span: *span,
-                }
-            }
-        }
-        Expr::UnaryOp {
-            op,
-            expr: inner,
-            span,
-        } => Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(replace_window_with_placeholder(inner)),
-            span: *span,
-        },
-        Expr::Cast {
-            expr: inner,
-            type_name,
-            span,
-        } => Expr::Cast {
-            expr: Box::new(replace_window_with_placeholder(inner)),
-            type_name: type_name.clone(),
-            span: *span,
-        },
-        _ => expr.clone(),
-    }
-}
-
-/// Substitute the `__win_result__` placeholder in an expression with a literal
-/// value computed from the window function.
-fn substitute_placeholder_value(expr: &Expr, val: &SqliteValue) -> Expr {
-    match expr {
-        Expr::Column(cr, _) if cr.column.as_ref() == "__win_result__" => {
-            Expr::Literal(sqlite_value_to_literal(val), Span::new(0, 0))
+                args: args.clone(),
+                call_order_by: order_by.clone(),
+                window: spec.clone(),
+                filter: filter.as_deref().cloned(),
+            });
+            Expr::Column(ColumnRef::bare(win_placeholder_name(slot)), Span::new(0, 0))
         }
         Expr::FunctionCall {
             name,
@@ -89093,17 +89135,28 @@ fn substitute_placeholder_value(expr: &Expr, val: &SqliteValue) -> Expr {
                 FunctionArgs::List(exprs) => FunctionArgs::List(
                     exprs
                         .iter()
-                        .map(|e| substitute_placeholder_value(e, val))
+                        .map(|e| replace_windows_with_placeholders_rec(e, extracted))
                         .collect(),
                 ),
                 FunctionArgs::Star => FunctionArgs::Star,
             };
+            let new_order_by = order_by
+                .iter()
+                .map(|term| OrderingTerm {
+                    expr: replace_windows_with_placeholders_rec(&term.expr, extracted),
+                    direction: term.direction,
+                    nulls: term.nulls,
+                })
+                .collect();
+            let new_filter = filter
+                .as_ref()
+                .map(|predicate| Box::new(replace_windows_with_placeholders_rec(predicate, extracted)));
             Expr::FunctionCall {
                 name: name.clone(),
                 args: new_args,
                 distinct: *distinct,
-                order_by: order_by.clone(),
-                filter: filter.clone(),
+                order_by: new_order_by,
+                filter: new_filter,
                 over: over.clone(),
                 span: *span,
             }
@@ -89114,9 +89167,9 @@ fn substitute_placeholder_value(expr: &Expr, val: &SqliteValue) -> Expr {
             right,
             span,
         } => Expr::BinaryOp {
-            left: Box::new(substitute_placeholder_value(left, val)),
+            left: Box::new(replace_windows_with_placeholders_rec(left, extracted)),
             op: *op,
-            right: Box::new(substitute_placeholder_value(right, val)),
+            right: Box::new(replace_windows_with_placeholders_rec(right, extracted)),
             span: *span,
         },
         Expr::UnaryOp {
@@ -89125,19 +89178,352 @@ fn substitute_placeholder_value(expr: &Expr, val: &SqliteValue) -> Expr {
             span,
         } => Expr::UnaryOp {
             op: *op,
-            expr: Box::new(substitute_placeholder_value(inner, val)),
+            expr: Box::new(replace_windows_with_placeholders_rec(inner, extracted)),
             span: *span,
         },
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            not,
+            span,
+        } => Expr::Between {
+            expr: Box::new(replace_windows_with_placeholders_rec(inner, extracted)),
+            low: Box::new(replace_windows_with_placeholders_rec(low, extracted)),
+            high: Box::new(replace_windows_with_placeholders_rec(high, extracted)),
+            not: *not,
+            span: *span,
+        },
+        Expr::In {
+            expr: inner,
+            set,
+            not,
+            span,
+        } => {
+            let new_inner = Box::new(replace_windows_with_placeholders_rec(inner, extracted));
+            let new_set = match set {
+                InSet::List(values) => InSet::List(
+                    values
+                        .iter()
+                        .map(|value_expr| {
+                            replace_windows_with_placeholders_rec(value_expr, extracted)
+                        })
+                        .collect(),
+                ),
+                InSet::Subquery(_) | InSet::Table(_) => set.clone(),
+            };
+            Expr::In {
+                expr: new_inner,
+                set: new_set,
+                not: *not,
+                span: *span,
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            op,
+            not,
+            span,
+        } => Expr::Like {
+            expr: Box::new(replace_windows_with_placeholders_rec(inner, extracted)),
+            pattern: Box::new(replace_windows_with_placeholders_rec(pattern, extracted)),
+            escape: escape
+                .as_ref()
+                .map(|escape| Box::new(replace_windows_with_placeholders_rec(escape, extracted))),
+            op: *op,
+            not: *not,
+            span: *span,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            span,
+        } => {
+            let new_operand = operand
+                .as_ref()
+                .map(|operand| Box::new(replace_windows_with_placeholders_rec(operand, extracted)));
+            let new_whens = whens
+                .iter()
+                .map(|(condition, result)| {
+                    (
+                        replace_windows_with_placeholders_rec(condition, extracted),
+                        replace_windows_with_placeholders_rec(result, extracted),
+                    )
+                })
+                .collect();
+            let new_else_expr = else_expr
+                .as_ref()
+                .map(|else_expr| Box::new(replace_windows_with_placeholders_rec(else_expr, extracted)));
+            Expr::Case {
+                operand: new_operand,
+                whens: new_whens,
+                else_expr: new_else_expr,
+                span: *span,
+            }
+        }
         Expr::Cast {
             expr: inner,
             type_name,
             span,
         } => Expr::Cast {
-            expr: Box::new(substitute_placeholder_value(inner, val)),
+            expr: Box::new(replace_windows_with_placeholders_rec(inner, extracted)),
             type_name: type_name.clone(),
             span: *span,
         },
-        _ => expr.clone(),
+        Expr::Collate {
+            expr: inner,
+            collation,
+            span,
+        } => Expr::Collate {
+            expr: Box::new(replace_windows_with_placeholders_rec(inner, extracted)),
+            collation: collation.clone(),
+            span: *span,
+        },
+        Expr::IsNull {
+            expr: inner,
+            not,
+            span,
+        } => Expr::IsNull {
+            expr: Box::new(replace_windows_with_placeholders_rec(inner, extracted)),
+            not: *not,
+            span: *span,
+        },
+        Expr::JsonAccess {
+            expr: inner,
+            path,
+            arrow,
+            span,
+        } => Expr::JsonAccess {
+            expr: Box::new(replace_windows_with_placeholders_rec(inner, extracted)),
+            path: Box::new(replace_windows_with_placeholders_rec(path, extracted)),
+            arrow: *arrow,
+            span: *span,
+        },
+        Expr::RowValue(values, span) => Expr::RowValue(
+            values
+                .iter()
+                .map(|value_expr| replace_windows_with_placeholders_rec(value_expr, extracted))
+                .collect(),
+            *span,
+        ),
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _)
+        | Expr::Subquery(_, _)
+        | Expr::Exists { .. } => expr.clone(),
+    }
+}
+
+/// Substitute every `__win_result_N__` placeholder column in `expr` with the
+/// corresponding literal value from `vals` (indexed by slot).  Placeholder
+/// columns whose slot is out of range are left untouched.
+#[allow(clippy::too_many_lines)]
+fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
+    match expr {
+        Expr::Column(cr, _) => {
+            if let Some(slot) = parse_win_placeholder_slot(cr.column.as_ref())
+                && let Some(val) = vals.get(slot)
+            {
+                return Expr::Literal(sqlite_value_to_literal(val), Span::new(0, 0));
+            }
+            expr.clone()
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            span,
+        } => {
+            let new_args = match args {
+                FunctionArgs::List(exprs) => FunctionArgs::List(
+                    exprs
+                        .iter()
+                        .map(|e| substitute_placeholder_values(e, vals))
+                        .collect(),
+                ),
+                FunctionArgs::Star => FunctionArgs::Star,
+            };
+            let new_order_by = order_by
+                .iter()
+                .map(|term| OrderingTerm {
+                    expr: substitute_placeholder_values(&term.expr, vals),
+                    direction: term.direction,
+                    nulls: term.nulls,
+                })
+                .collect();
+            let new_filter = filter
+                .as_ref()
+                .map(|predicate| Box::new(substitute_placeholder_values(predicate, vals)));
+            Expr::FunctionCall {
+                name: name.clone(),
+                args: new_args,
+                distinct: *distinct,
+                order_by: new_order_by,
+                filter: new_filter,
+                over: over.clone(),
+                span: *span,
+            }
+        }
+        Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => Expr::BinaryOp {
+            left: Box::new(substitute_placeholder_values(left, vals)),
+            op: *op,
+            right: Box::new(substitute_placeholder_values(right, vals)),
+            span: *span,
+        },
+        Expr::UnaryOp {
+            op,
+            expr: inner,
+            span,
+        } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            span: *span,
+        },
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            not,
+            span,
+        } => Expr::Between {
+            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            low: Box::new(substitute_placeholder_values(low, vals)),
+            high: Box::new(substitute_placeholder_values(high, vals)),
+            not: *not,
+            span: *span,
+        },
+        Expr::In {
+            expr: inner,
+            set,
+            not,
+            span,
+        } => {
+            let new_inner = Box::new(substitute_placeholder_values(inner, vals));
+            let new_set = match set {
+                InSet::List(values) => InSet::List(
+                    values
+                        .iter()
+                        .map(|value_expr| substitute_placeholder_values(value_expr, vals))
+                        .collect(),
+                ),
+                InSet::Subquery(_) | InSet::Table(_) => set.clone(),
+            };
+            Expr::In {
+                expr: new_inner,
+                set: new_set,
+                not: *not,
+                span: *span,
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            op,
+            not,
+            span,
+        } => Expr::Like {
+            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            pattern: Box::new(substitute_placeholder_values(pattern, vals)),
+            escape: escape
+                .as_ref()
+                .map(|escape| Box::new(substitute_placeholder_values(escape, vals))),
+            op: *op,
+            not: *not,
+            span: *span,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            span,
+        } => {
+            let new_operand = operand
+                .as_ref()
+                .map(|operand| Box::new(substitute_placeholder_values(operand, vals)));
+            let new_whens = whens
+                .iter()
+                .map(|(condition, result)| {
+                    (
+                        substitute_placeholder_values(condition, vals),
+                        substitute_placeholder_values(result, vals),
+                    )
+                })
+                .collect();
+            let new_else_expr = else_expr
+                .as_ref()
+                .map(|else_expr| Box::new(substitute_placeholder_values(else_expr, vals)));
+            Expr::Case {
+                operand: new_operand,
+                whens: new_whens,
+                else_expr: new_else_expr,
+                span: *span,
+            }
+        }
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            span,
+        } => Expr::Cast {
+            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            type_name: type_name.clone(),
+            span: *span,
+        },
+        Expr::Collate {
+            expr: inner,
+            collation,
+            span,
+        } => Expr::Collate {
+            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            collation: collation.clone(),
+            span: *span,
+        },
+        Expr::IsNull {
+            expr: inner,
+            not,
+            span,
+        } => Expr::IsNull {
+            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            not: *not,
+            span: *span,
+        },
+        Expr::JsonAccess {
+            expr: inner,
+            path,
+            arrow,
+            span,
+        } => Expr::JsonAccess {
+            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            path: Box::new(substitute_placeholder_values(path, vals)),
+            arrow: *arrow,
+            span: *span,
+        },
+        Expr::RowValue(values, span) => Expr::RowValue(
+            values
+                .iter()
+                .map(|value_expr| substitute_placeholder_values(value_expr, vals))
+                .collect(),
+            *span,
+        ),
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _)
+        | Expr::Subquery(_, _)
+        | Expr::Exists { .. } => expr.clone(),
     }
 }
 
@@ -163836,14 +164222,21 @@ mod tests {
                     .collect();
                 assert_eq!(got, expected, "{encoding}: ORDER BY name parity vs sqlite3");
 
-                // Mutations are rejected (read-only admission).
-                let err = conn
-                    .query("INSERT INTO items VALUES (4, 'x');")
+                // bd-bld9w.7: a UTF-16 database is now WRITABLE — the write path
+                // serializes TEXT in the DB text encoding, so an INSERT of a
+                // non-ASCII string succeeds and round-trips back as canonical UTF-8.
+                conn.query("INSERT INTO items VALUES (4, 'Über');")
                     .await
-                    .expect_err("UTF-16 write must fail closed");
-                assert!(
-                    matches!(err, FrankenError::Unsupported),
-                    "{encoding}: write should be Unsupported, got {err:?}"
+                    .expect("UTF-16 write now succeeds (bd-bld9w.7)");
+                let rows = conn
+                    .query("SELECT name FROM items WHERE id = 4;")
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 1, "{encoding}: inserted row is readable");
+                assert_eq!(
+                    rows[0].values()[0],
+                    SqliteValue::Text("Über".into()),
+                    "{encoding}: UTF-16 write round-trips to canonical UTF-8"
                 );
             }
         });
@@ -163851,12 +164244,12 @@ mod tests {
 
     #[test]
     fn test_utf16_admitted_read_only_across_open_modes_and_preserves_main_image() {
-        // bd-bld9w.3: a UTF-16LE/BE database is admitted READ-ONLY through every
-        // open mode that shares the reload admission gate — ordinary, existing,
-        // schema-only, in-memory import, and ATTACH. Reads decode end to end;
-        // every write fails closed (Unsupported) and the on-disk image is never
-        // mutated. Writes to an ATTACHed UTF-16 database are rejected by the
-        // attached connection's own guard, so a UTF-8 parent cannot corrupt it.
+        // bd-bld9w.7: a UTF-16LE/BE database is admitted through every open mode
+        // that shares the reload admission gate — ordinary, existing, schema-only,
+        // in-memory import, and ATTACH — and reads decode end to end. Write
+        // admission + round-trip correctness across encodings is proven by the
+        // dedicated write oracle (bd_bld9w_utf16_write_oracle.rs); this keeper
+        // focuses on the read/decode path across the open-mode matrix.
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             for encoding in ["UTF-16le", "UTF-16be"] {
@@ -163885,15 +164278,6 @@ mod tests {
                 let rows = conn.query(r#"SELECT value FROM "café";"#).await.unwrap();
                 assert_eq!(rows.len(), 1, "{encoding}: ordinary open row count");
                 assert_eq!(rows[0].values()[0], SqliteValue::Text("Καλημέρα".into()));
-                let err = conn
-                    .query(r#"INSERT INTO "café" VALUES (2, 'x');"#)
-                    .await
-                    .expect_err("write to a UTF-16 database must fail closed");
-                assert!(
-                    matches!(err, FrankenError::Unsupported),
-                    "{encoding}: ordinary-open write should be Unsupported, got {err:?}"
-                );
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
                 drop(conn);
 
                 // Existing-only open: same read-only admission.
@@ -163904,26 +164288,12 @@ mod tests {
                     conn.query(r#"SELECT value FROM "café";"#).await.unwrap()[0].values()[0],
                     SqliteValue::Text("Καλημέρα".into())
                 );
-                assert!(matches!(
-                    conn.query(r#"INSERT INTO "café" VALUES (2, 'x');"#)
-                        .await
-                        .expect_err("existing-only write must fail closed"),
-                    FrankenError::Unsupported
-                ));
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
                 drop(conn);
 
                 // Schema-only open: admitted; write rejected; image preserved.
                 let conn = Connection::open_schema_only(&db_str)
                     .await
                     .expect("schema-only open admits UTF-16 read-only");
-                assert!(matches!(
-                    conn.query(r#"INSERT INTO "café" VALUES (2, 'x');"#)
-                        .await
-                        .expect_err("schema-only write must fail closed"),
-                    FrankenError::Unsupported
-                ));
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
                 drop(conn);
 
                 // In-memory import: admitted read-only; write rejected.
@@ -163934,12 +164304,6 @@ mod tests {
                     conn.query(r#"SELECT value FROM "café";"#).await.unwrap()[0].values()[0],
                     SqliteValue::Text("Καλημέρα".into())
                 );
-                assert!(matches!(
-                    conn.query(r#"INSERT INTO "café" VALUES (2, 'x');"#)
-                        .await
-                        .expect_err("imported UTF-16 write must fail closed"),
-                    FrankenError::Unsupported
-                ));
                 drop(conn);
 
                 // ATTACH into a UTF-8 parent: attached read decodes, attached
@@ -163967,34 +164331,18 @@ mod tests {
                     .unwrap();
                 assert_eq!(rows.len(), 1, "{encoding}: attached read row count");
                 assert_eq!(rows[0].values()[0], SqliteValue::Text("Καλημέρα".into()));
-                for write in [
-                    r#"INSERT INTO aux16."café" VALUES (2, 'x');"#,
-                    r#"UPDATE aux16."café" SET value = 'x' WHERE id = 1;"#,
-                    r#"DELETE FROM aux16."café" WHERE id = 1;"#,
-                ] {
-                    let err = parent
-                        .query(write)
-                        .await
-                        .expect_err("write to an attached UTF-16 database must fail closed");
-                    assert!(
-                        matches!(err, FrankenError::Unsupported),
-                        "{encoding}: attached write `{write}` should be Unsupported, got {err:?}"
-                    );
-                }
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
             }
         });
     }
 
-    /// bd-bld9w.3/.7 regression: the prepared/precompiled-DML fast path
-    /// (execute_prepared_with_params_after_background_status) bypasses the
-    /// statement dispatcher's guard_mutation_encoding_supported, so a *prepared*
-    /// write on a read-only-admitted UTF-16 database must still fail closed —
-    /// otherwise a direct-simple write serializes UTF-8 TEXT into the UTF-16
-    /// file (silent corruption). `conn.query`-based keepers do not exercise this
-    /// lane; this one does.
+    /// bd-bld9w.7: the prepared/precompiled-DML fast path
+    /// (execute_prepared_with_params_after_background_status) now encodes TEXT in
+    /// the DB text encoding, so a *prepared* write on a UTF-16 database succeeds
+    /// and round-trips. Its guard at connection.rs flipped from is_runtime_supported
+    /// to is_write_supported; `conn.query`-based keepers do not exercise this lane,
+    /// this one does.
     #[test]
-    fn test_utf16_prepared_dml_fast_path_rejects_writes() {
+    fn test_utf16_prepared_dml_fast_path_writes_and_round_trips() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             for encoding in ["UTF-16le", "UTF-16be"] {
@@ -164010,31 +164358,50 @@ mod tests {
                         ))
                         .unwrap();
                 }
-                let original = std::fs::read(&db_path).unwrap();
                 let conn = Connection::open(&db_str)
                     .await
-                    .expect("UTF-16 database is admitted read-only");
+                    .expect("UTF-16 database opens read-write (bd-bld9w.7)");
 
-                for sql in [
-                    "INSERT INTO items VALUES (2, 'x');",
-                    "UPDATE items SET name = 'y' WHERE id = 1;",
-                    "DELETE FROM items WHERE id = 1;",
-                ] {
-                    // Fail-closed at either prepare or execute is acceptable; the
-                    // write must never reach the on-disk image.
-                    let err = match conn.prepare(sql).await {
-                        Ok(stmt) => stmt
-                            .execute()
-                            .await
-                            .expect_err("prepared write to a UTF-16 db must fail closed"),
-                        Err(err) => err,
-                    };
-                    assert!(
-                        matches!(err, FrankenError::Unsupported),
-                        "{encoding}: prepared `{sql}` should be Unsupported, got {err:?}"
-                    );
-                }
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
+                // Prepared INSERT of a non-ASCII value round-trips as canonical UTF-8.
+                let inserted = conn
+                    .prepare("INSERT INTO items VALUES (2, 'Über');")
+                    .await
+                    .expect("prepare of a UTF-16 write succeeds")
+                    .execute()
+                    .await
+                    .expect("prepared UTF-16 INSERT now succeeds");
+                assert_eq!(inserted, 1, "{encoding}: prepared INSERT affects one row");
+                assert_eq!(
+                    conn.query("SELECT name FROM items WHERE id = 2;")
+                        .await
+                        .unwrap()[0]
+                        .values()[0],
+                    SqliteValue::Text("Über".into()),
+                    "{encoding}: prepared UTF-16 write round-trips to canonical UTF-8"
+                );
+
+                // Prepared UPDATE fast path.
+                let updated = conn
+                    .prepare("UPDATE items SET name = 'y' WHERE id = 1;")
+                    .await
+                    .unwrap()
+                    .execute()
+                    .await
+                    .expect("prepared UTF-16 UPDATE now succeeds");
+                assert_eq!(updated, 1, "{encoding}: prepared UPDATE affects one row");
+
+                // Prepared DELETE fast path.
+                let deleted = conn
+                    .prepare("DELETE FROM items WHERE id = 1;")
+                    .await
+                    .unwrap()
+                    .execute()
+                    .await
+                    .expect("prepared UTF-16 DELETE now succeeds");
+                assert_eq!(deleted, 1, "{encoding}: prepared DELETE affects one row");
+                let remaining = conn.query("SELECT id FROM items ORDER BY id;").await.unwrap();
+                assert_eq!(remaining.len(), 1, "{encoding}: only id=2 remains");
+                assert_eq!(remaining[0].values()[0], SqliteValue::Integer(2));
             }
         });
     }
@@ -164116,16 +164483,6 @@ mod tests {
                             "{encoding}/{opener}: ASCII-only UTF-16 must decode to 'plain'"
                         );
                     }
-                    assert!(
-                        matches!(
-                            conn.query("INSERT INTO ascii_only_t VALUES (2, 'x');")
-                                .await
-                                .expect_err("write must fail closed"),
-                            FrankenError::Unsupported
-                        ),
-                        "{encoding}/{opener}: write should be Unsupported"
-                    );
-                    assert_eq!(std::fs::read(&db_path).unwrap(), original);
                     drop(conn);
                 }
 
@@ -164136,12 +164493,6 @@ mod tests {
                     conn.query("SELECT value FROM ascii_only_t;").await.unwrap()[0].values()[0],
                     SqliteValue::Text("plain".into())
                 );
-                assert!(matches!(
-                    conn.query("INSERT INTO ascii_only_t VALUES (2, 'x');")
-                        .await
-                        .expect_err("imported ASCII-only UTF-16 write must fail closed"),
-                    FrankenError::Unsupported
-                ));
                 drop(conn);
 
                 let parent = Connection::open(":memory:").await.unwrap();
@@ -164158,17 +164509,6 @@ mod tests {
                         .values()[0],
                     SqliteValue::Text("plain".into())
                 );
-                assert!(
-                    matches!(
-                        parent
-                            .query("INSERT INTO ascii16.ascii_only_t VALUES (2, 'x');")
-                            .await
-                            .expect_err("attached ASCII-only UTF-16 write must fail closed"),
-                        FrankenError::Unsupported
-                    ),
-                    "{encoding}: attached write should be Unsupported"
-                );
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
             }
         });
     }
@@ -182059,11 +182399,46 @@ mod tests {
     }
 
     #[test]
-    fn test_pragma_utf16_setters_fail_closed_without_mutating_database_state() {
+    fn test_pragma_utf16_encoding_sets_on_empty_noops_on_nonempty() {
+        // bd-bld9w.7: `PRAGMA encoding='UTF-16le|UTF-16be|UTF-16'` now matches stock
+        // sqlite3 — it SETS the encoding on an empty database (schema_cookie()==0)
+        // and is a silent no-op (never an error) once a schema object exists.
+        // 'UTF-16' resolves to UTF-16le.
         asupersync::test_utils::run_test(|| async {
-            for schema_initialized in [false, true] {
-                let conn = Connection::open(":memory:").await.unwrap();
-                if schema_initialized {
+            for requested in ["UTF-16le", "UTF-16be", "UTF-16"] {
+                let expected_header: u32 = if requested == "UTF-16be" { 3 } else { 2 };
+                for sql in [
+                    format!("PRAGMA encoding = '{requested}';"),
+                    format!("PRAGMA encoding('{requested}');"),
+                ] {
+                    // Empty database: the setter takes effect and a subsequent write
+                    // encodes TEXT in the chosen UTF-16 encoding (proven via the
+                    // exported header byte 56..60 and a round-trip SELECT).
+                    let conn = Connection::open(":memory:").await.unwrap();
+                    assert_eq!(conn.schema_cookie(), 0, "fresh :memory: is empty");
+                    conn.execute(&sql)
+                        .await
+                        .expect("UTF-16 encoding setter succeeds on an empty database");
+                    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT);")
+                        .await
+                        .unwrap();
+                    conn.execute("INSERT INTO t VALUES (1, 'café');").await.unwrap();
+                    let image = conn.export_bytes().await.unwrap();
+                    assert_eq!(
+                        u32::from_be_bytes(image[56..60].try_into().unwrap()),
+                        expected_header,
+                        "empty-DB {requested} setter must persist the encoding ({sql})"
+                    );
+                    assert_eq!(
+                        conn.query("SELECT note FROM t WHERE id = 1;").await.unwrap()[0].values()[0],
+                        SqliteValue::Text("café".into()),
+                        "UTF-16 write round-trips to canonical UTF-8 ({sql})"
+                    );
+                    drop(conn);
+
+                    // Non-empty database: the setter is a silent no-op, never an
+                    // error, and mutates nothing (matching stock).
+                    let conn = Connection::open(":memory:").await.unwrap();
                     conn.execute(
                         "CREATE TABLE encoding_guard_t(\
                              id INTEGER PRIMARY KEY,\
@@ -182072,54 +182447,22 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                }
-
-                let before_image = conn.export_bytes().await.unwrap();
-                let before_schema = conn
-                    .query("SELECT type, name, sql FROM sqlite_schema ORDER BY type, name;")
-                    .await
-                    .unwrap();
-                let before_attached_schemas = conn.attached_schemas.borrow().count();
-                let before_attached_connections = conn.attached_connections.borrow().len();
-
-                for requested in ["UTF-16", "UTF-16le", "UTF-16be"] {
-                    for sql in [
-                        format!("PRAGMA encoding = '{requested}';"),
-                        format!("PRAGMA encoding('{requested}');"),
-                    ] {
-                        let err = conn
-                            .execute(&sql)
-                            .await
-                            .expect_err("UTF-16 encoding setter must fail closed");
-                        assert!(
-                            matches!(err, FrankenError::Unsupported),
-                            "unexpected {requested} setter error for {sql}: {err:?}"
-                        );
-                    }
-
-                    let rows = conn.query("PRAGMA encoding;").await.unwrap();
-                    assert_eq!(
-                        rows[0].values()[0],
-                        SqliteValue::Text("UTF-8".into()),
-                        "rejected {requested} setter must retain UTF-8"
-                    );
-                    assert_eq!(conn.export_bytes().await.unwrap(), before_image);
-                    assert_eq!(
-                        conn.query(
-                            "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name;"
-                        )
+                    assert!(conn.schema_cookie() > 0, "schema present => non-empty");
+                    let before_image = conn.export_bytes().await.unwrap();
+                    conn.execute(&sql)
                         .await
-                        .unwrap(),
-                        before_schema
+                        .expect("UTF-16 encoding setter is a silent no-op on a non-empty DB");
+                    assert_eq!(
+                        conn.query("PRAGMA encoding;").await.unwrap()[0].values()[0],
+                        SqliteValue::Text("UTF-8".into()),
+                        "non-empty {requested} setter leaves encoding UTF-8 ({sql})"
                     );
                     assert_eq!(
-                        conn.attached_schemas.borrow().count(),
-                        before_attached_schemas
+                        conn.export_bytes().await.unwrap(),
+                        before_image,
+                        "non-empty {requested} setter mutates nothing ({sql})"
                     );
-                    assert_eq!(
-                        conn.attached_connections.borrow().len(),
-                        before_attached_connections
-                    );
+                    drop(conn);
                 }
             }
         });
@@ -197557,7 +197900,7 @@ fts5(title, body, content=docs, content_rowid=id)'
                 // Each admission mode gets a fresh database so an earlier open
                 // cannot checkpoint, refresh, or otherwise prime the pager/WAL
                 // state observed by a later mode.
-                let (sqlite, db_path, original) = create_live_wal_fixture(dir.path(), stem);
+                let (sqlite, db_path, _original) = create_live_wal_fixture(dir.path(), stem);
                 let db_str = db_path.to_str().unwrap();
                 // bd-bld9w.3: admitted READ-ONLY. Admission (and the row decode)
                 // must use the AUTHORITATIVE page 1 from the live WAL, not the
@@ -197584,17 +197927,6 @@ fts5(title, body, content=docs, content_rowid=id)'
                         "{stem}: decode via authoritative WAL page 1, not the stale main page 1"
                     );
                 }
-                // Writes fail closed; the on-disk main image is never mutated.
-                assert!(
-                    matches!(
-                        conn.query(r#"INSERT INTO "café" VALUES (2, 'x');"#)
-                            .await
-                            .expect_err("WAL-visible UTF-16 write must fail closed"),
-                        FrankenError::Unsupported
-                    ),
-                    "{stem}: write should be Unsupported"
-                );
-                assert_eq!(std::fs::read(&db_path).unwrap(), original);
                 drop(conn);
                 drop(sqlite);
             }

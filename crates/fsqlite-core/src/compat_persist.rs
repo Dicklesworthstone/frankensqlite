@@ -42,7 +42,7 @@ use fsqlite_types::StrictColumnType;
 use fsqlite_types::cx::Cx;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_types::record::{
-    RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
+    RecordProfileScope, enter_record_profile_scope, parse_record,
     serialize_record_with_encoding,
 };
 use fsqlite_types::value::SqliteValue;
