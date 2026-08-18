@@ -13679,6 +13679,16 @@ where
     /// file size. Publication later recomputes the same receipt under the
     /// exclusive maintenance protocol and aborts if any byte changed.
     pub async fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
+        // bd-n7ypv / GH#342: a read-only source (VACUUM INTO on a mode=ro /
+        // schema-only connection) cannot take the exclusive-maintenance fence —
+        // it acquires a RESERVED/EXCLUSIVE file lock and prepares a journal,
+        // both of which a read-only file rejects. Capture the image with a
+        // plain shared read instead: a read-only pager has no local writer and
+        // its file cannot change from this connection, so the read is
+        // consistent without the write fence.
+        if self.is_readonly() {
+            return self.capture_vacuum_source_image_readonly(cx).await;
+        }
         self.with_exclusive_maintenance(cx, &mut (), |_, cx, inner, ()| {
             Box::pin(async move {
                 let db_file = shared_db_file_read(&inner.db_file, cx).await?;
@@ -13686,6 +13696,32 @@ where
             })
         })
         .await
+    }
+
+    /// Read-only-safe source-image capture for VACUUM INTO on a read-only
+    /// source (bd-n7ypv / GH#342).
+    ///
+    /// The exclusive-maintenance fence is a write-side primitive
+    /// (RESERVED/EXCLUSIVE lock + journal prep) that a read-only file cannot
+    /// satisfy. A read-only pager takes no local writer and its file never
+    /// changes from this connection, so a plain shared read yields a consistent
+    /// image — no reader-count gate is needed either, since concurrent readers
+    /// cannot mutate a read-only file.
+    async fn capture_vacuum_source_image_readonly(
+        &self,
+        cx: &Cx,
+    ) -> Result<DatabaseImageReceipt> {
+        settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
+        self.validate_namespace_binding()?;
+        let (db_file, page_size) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            (Arc::clone(&inner.db_file), inner.page_size)
+        };
+        let db_file = shared_db_file_read(&db_file, cx).await?;
+        vacuum_source_receipt_for_open_file(cx, &*db_file, page_size).await
     }
 
     /// Minimum bytes required for a SQLite WAL to carry one complete frame:
