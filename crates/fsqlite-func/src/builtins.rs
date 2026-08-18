@@ -2621,9 +2621,17 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     // Round exact binary ties away from zero (C SQLite) rather
                     // than Rust's round-half-to-even, e.g. printf('%.0f', 2.5)
                     // -> "3" not "2" (bd-o1tu1).
+                    // C SQLite's dtoa caps at 16 significant digits of the true
+                    // value, then pads zeros (bd-o8m86). Round the naive
+                    // fixed-point rendering to that cap; a no-op when prec stays
+                    // within the value's meaningful precision. Alt-form-2 (`!`)
+                    // has its own shortest-round-trip rendering (which keeps the
+                    // exact integer of a large whole number), so it is not capped.
                     let mut mag = format_fixed_round_half_away(val.abs(), prec);
                     if alt_form2 {
                         mag = altform2_trim_float(&mag);
+                    } else {
+                        mag = round_positional_to_sig(&mag, FLOAT_SIG_DIGITS);
                     }
                     // Alternate form (`#`) forces a decimal point, e.g. '%#.0f' 3
                     // -> "3.".
@@ -2655,9 +2663,18 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     // Round the mantissa's exact ties away from zero (C SQLite)
                     // instead of Rust's round-half-to-even, e.g.
                     // printf('%.0e', 2.5) -> "3e+00" not "2e+00" (bd-o1tu1).
-                    let raw = format_sci_round_half_away(val, prec, spec == 'E');
-                    // C printf always uses explicit sign and minimum 2-digit exponent
+                    // C SQLite's dtoa caps the mantissa at 16 significant digits
+                    // of the true value, then pads zeros beyond (bd-o8m86). Round
+                    // the mantissa to <=16 sig figs, then pad zeros to `prec`.
+                    let mant_prec = prec.min(FLOAT_SIG_DIGITS - 1);
+                    let raw = format_sci_round_half_away(val, mant_prec, spec == 'E');
                     let mut formatted = normalize_exponent(&raw);
+                    if prec > mant_prec
+                        && let Some(e_pos) = formatted.find(['e', 'E'])
+                    {
+                        let (mant, exp_part) = formatted.split_at(e_pos);
+                        formatted = format!("{mant}{}{exp_part}", "0".repeat(prec - mant_prec));
+                    }
                     // Alternate-form-2 (`!`) strips trailing zeros from the
                     // mantissa (keeping >= 1 fractional digit), e.g. '%!e' 3.14159
                     // -> "3.14159e+00", '%!e' 5.0 -> "5.0e+00".
@@ -2685,6 +2702,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let val = if val == 0.0 { 0.0 } else { val };
                 let prec = precision.unwrap_or(6);
                 let sig = prec.max(1);
+                // C SQLite's dtoa caps at 16 significant digits of the true value
+                // then pads/omits beyond (bd-o8m86); the fixed-vs-exponential
+                // choice still uses the requested `sig`. format_float_g rounds
+                // (not truncates) to `min(sig, max_sig)` figs, matching the cap.
+                let max_sig = FLOAT_SIG_DIGITS;
                 if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign)
                 {
                     result.push_str(&s);
@@ -2695,7 +2717,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     // digit. Unlike a shortest-round-trip form this respects the
                     // precision-driven fixed/exponential choice: '%!.0g' 12345 ->
                     // "1.0e+04", '%!.3g' 12345 -> "1.23e+04", '%!g' 100 -> "100.0".
-                    let formatted = format_float_g(val, sig, spec == 'G', false);
+                    let formatted = format_float_g(val, sig, spec == 'G', false, max_sig);
                     let alt = if formatted.contains(['e', 'E']) {
                         altform2_trim_exp(&formatted, spec == 'g')
                     } else {
@@ -2705,7 +2727,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                         &alt, width, left_align, show_sign, space_sign, zero_pad,
                     ));
                 } else {
-                    let mut formatted = format_float_g(val, sig, spec == 'G', alt_form);
+                    let mut formatted = format_float_g(val, sig, spec == 'G', alt_form, max_sig);
                     // The `,` flag groups the integer part only when %g renders in
                     // fixed (non-exponential) form; SQLite leaves exponential
                     // output ungrouped ('%,g' 1234.5 -> "1,234.5"; '%,g' 1e6 ->
@@ -3284,18 +3306,23 @@ fn format_sci_round_half_away(val: f64, prec: usize, upper: bool) -> String {
 }
 
 /// Format a float using `%g`/`%G` semantics.
-fn format_float_g(val: f64, sig: usize, upper: bool, alt_form: bool) -> String {
+fn format_float_g(val: f64, sig: usize, upper: bool, alt_form: bool, max_sig: usize) -> String {
     if !val.is_finite() {
         return format!("{val}");
     }
     // C SQLite canonicalizes signed zero for %g: both +0.0 and -0.0 render as
     // "0" (no minus sign). `-0.0 == 0.0` is true, so this maps -0.0 to +0.0.
     let val = if val == 0.0 { 0.0 } else { val };
-    // Round to `sig` significant digits half-away (matching C SQLite), then read
-    // the resulting exponent. The rounding may carry across a power of ten
-    // (e.g. `9.5` at 1 significant digit → `1e1`), and that rounded exponent —
-    // not the raw one — selects fixed vs. exponential form below.
-    let sci = format_sci_round_half_away(val, sig.saturating_sub(1), false);
+    // The fixed-vs-exponential CHOICE uses the requested `sig`, but the actual
+    // digit count never exceeds `max_sig` — C SQLite renders from the shortest
+    // round-trip decimal (~16-17 figs) and pads/omits beyond it (bd-o8m86).
+    // Rounding to `sig_digits` (not truncating) reproduces the dtoa digits.
+    let sig_digits = sig.min(max_sig).max(1);
+    // Round to `sig_digits` significant digits half-away, then read the resulting
+    // exponent. The rounding may carry across a power of ten (e.g. `9.5` at 1
+    // significant digit → `1e1`), and that rounded exponent — not the raw one —
+    // selects fixed vs. exponential form below.
+    let sci = format_sci_round_half_away(val, sig_digits.saturating_sub(1), false);
     let exp: i32 = sci
         .rsplit_once('e')
         .and_then(|(_, e)| e.parse().ok())
@@ -3332,9 +3359,9 @@ fn format_float_g(val: f64, sig: usize, upper: bool, alt_form: bool) -> String {
         normalize_exponent(&trimmed)
     } else {
         let decimal_places = if exp >= 0 {
-            sig.saturating_sub((exp + 1) as usize)
+            sig_digits.saturating_sub((exp + 1) as usize)
         } else {
-            sig + exp.unsigned_abs() as usize - 1
+            sig_digits + exp.unsigned_abs() as usize - 1
         };
         let s = format_fixed_round_half_away(val, decimal_places);
         // Alternate form (`#`) keeps all digits and forces a decimal point.
@@ -3353,6 +3380,51 @@ fn format_float_g(val: f64, sig: usize, upper: bool, alt_form: bool) -> String {
         }
     };
     formatted
+}
+
+/// C SQLite's printf renders floats via a dtoa that emits at most this many
+/// significant digits of the true value, then pads with zeros (%f/%e) or omits
+/// (%g). Matching it caps frank's digit count at the same limit (bd-o8m86).
+const FLOAT_SIG_DIGITS: usize = 16;
+
+/// Round a non-negative positional decimal string to `max_sig` significant
+/// figures (half away from zero, with carry), zeroing digit positions beyond the
+/// cut while preserving the decimal-place count. Reproduces C SQLite's dtoa cap
+/// for `%f` (bd-o8m86): `%.20f` 0.1 -> "0.1" + zeros, `%.2f` 123456789012345.67
+/// -> "...45.70", `%f` 6.022e23 caps the integer digits. Input has no sign.
+fn round_positional_to_sig(s: &str, max_sig: usize) -> String {
+    let bytes = s.as_bytes();
+    let mut sig = 0usize;
+    let mut started = false;
+    let mut cut = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b.is_ascii_digit() && (b != b'0' || started) {
+            started = true;
+            sig += 1;
+            if sig == max_sig {
+                cut = Some(i);
+                break;
+            }
+        }
+    }
+    let Some(cut) = cut else { return s.to_owned() };
+    // Nothing significant to drop after the cut.
+    if bytes[cut + 1..].iter().all(|b| !b.is_ascii_digit()) {
+        return s.to_owned();
+    }
+    let round_up = bytes[cut + 1..]
+        .iter()
+        .find(|b| b.is_ascii_digit())
+        .is_some_and(|&b| b >= b'5');
+    let mut kept: Vec<u8> = bytes[..=cut].to_vec();
+    if round_up {
+        increment_decimal_digits(&mut kept);
+    }
+    let mut tail = String::new();
+    for &b in &bytes[cut + 1..] {
+        tail.push(if b == b'.' { '.' } else { '0' });
+    }
+    format!("{}{tail}", String::from_utf8_lossy(&kept))
 }
 
 #[cfg(test)]
@@ -5937,6 +6009,79 @@ mod tests {
             ("%#g", 0.0001, "0.000100000"),
             ("%#.1g", 9.9, "1.e+01"),
             ("%#g", 1234567.0, "1.23457e+06"),
+        ];
+        for (spec, v, want) in cases {
+            assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // literals intentionally name specific f64s
+    fn test_format_high_precision_shortest_round_trip() {
+        // bd-o8m86: beyond the shortest round-trip decimal (~16-17 sig figs) C
+        // SQLite pads with zeros rather than showing the true f64 tail. Frank
+        // must match. Normal-precision cases (< shortest length) are unchanged.
+        // Oracle: sqlite3 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: f64| -> String {
+            match f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(spec)),
+                    SqliteValue::Float(v),
+                ])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let third = 1.0 / 3.0;
+        let pi = std::f64::consts::PI;
+        let cases: &[(&str, f64, &str)] = &[
+            // --- beyond shortest: pad zeros, don't show true tail ---
+            ("%.20f", 0.1, "0.10000000000000000000"),
+            ("%.18f", 0.1, "0.100000000000000000"),
+            ("%.30f", 1.5, "1.500000000000000000000000000000"),
+            ("%.25f", 1.5, "1.5000000000000000000000000"),
+            ("%.17f", third, "0.33333333333333330"),
+            ("%.18f", third, "0.333333333333333300"),
+            ("%.17g", 0.1, "0.1"),
+            ("%.25g", 0.1, "0.1"),
+            ("%.17g", third, "0.3333333333333333"),
+            ("%.18g", third, "0.3333333333333333"),
+            ("%.17g", pi, "3.141592653589793"),
+            ("%.17e", 0.1, "1.00000000000000000e-01"),
+            ("%.16e", 0.1, "1.0000000000000000e-01"),
+            ("%.19e", third, "3.3333333333333330000e-01"),
+            ("%.17e", 2.675, "2.67500000000000000e+00"),
+            // --- 16-sig-fig dtoa cap: value whose true 16 figs are NOT its
+            // minimal-shortest ("1e-20"); C SQLite shows "9.999...e-21" ---
+            ("%.17g", 1e-20, "9.999999999999999e-21"),
+            ("%.20g", 1e-20, "9.999999999999999e-21"),
+            ("%.17e", 1e-20, "9.99999999999999900e-21"),
+            ("%.30g", 1.0 / 7.0, "0.1428571428571428"),
+            // --- %f 16-fig cap on high-integer-digit + huge-integer values ---
+            ("%.2f", 123_456_789_012_345.678, "123456789012345.70"),
+            ("%.6f", 123_456_789_012_345.678, "123456789012345.700000"),
+            ("%.17g", 123_456_789_012_345.678, "123456789012345.7"),
+            ("%f", 6.022e23, "602200000000000000000000.000000"),
+            // --- carry through the 16-fig cap + negatives ---
+            ("%.17f", 2.675, "2.67500000000000000"),
+            ("%.20f", -0.1, "-0.10000000000000000000"),
+            ("%.17f", -1.0 / 3.0, "-0.33333333333333330"),
+            // --- %!f (alt-form-2) has its own rendering, NOT the 16-cap ---
+            ("%!f", 0.1, "0.1"),
+            ("%!f", 1.5, "1.5"),
+            // --- normal precision (< shortest length): unchanged, must match ---
+            ("%.2f", 0.1, "0.10"),
+            ("%.6f", 0.1, "0.100000"),
+            ("%.15f", 0.1, "0.100000000000000"),
+            ("%.1f", 0.15, "0.1"),
+            ("%.2f", 2.675, "2.67"),
+            ("%.0f", 2.5, "3"),
+            ("%g", third, "0.333333"),
+            ("%.6e", 0.1, "1.000000e-01"),
+            ("%f", 1.5, "1.500000"),
         ];
         for (spec, v, want) in cases {
             assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
