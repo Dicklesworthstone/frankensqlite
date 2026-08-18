@@ -2625,6 +2625,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     if alt_form2 {
                         mag = altform2_trim_float(&mag);
                     }
+                    // Alternate form (`#`) forces a decimal point, e.g. '%#.0f' 3
+                    // -> "3.".
+                    if alt_form && !mag.contains('.') {
+                        mag.push('.');
+                    }
                     if comma_group {
                         mag = group_float_integer_part(&mag);
                     }
@@ -2659,6 +2664,14 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     if alt_form2 {
                         formatted = altform2_trim_exp(&formatted, spec == 'e');
                     }
+                    // Alternate form (`#`) forces a decimal point in the mantissa,
+                    // e.g. '%#.0e' 3 -> "3.e+00".
+                    if alt_form && let Some(e_pos) = formatted.find(['e', 'E']) {
+                        let (mantissa, exp_part) = formatted.split_at(e_pos);
+                        if !mantissa.contains('.') {
+                            formatted = format!("{mantissa}.{exp_part}");
+                        }
+                    }
                     result.push_str(&finish_float_padding(
                         &formatted, width, left_align, show_sign, space_sign, zero_pad,
                     ));
@@ -2682,7 +2695,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     // digit. Unlike a shortest-round-trip form this respects the
                     // precision-driven fixed/exponential choice: '%!.0g' 12345 ->
                     // "1.0e+04", '%!.3g' 12345 -> "1.23e+04", '%!g' 100 -> "100.0".
-                    let formatted = format_float_g(val, sig, spec == 'G');
+                    let formatted = format_float_g(val, sig, spec == 'G', false);
                     let alt = if formatted.contains(['e', 'E']) {
                         altform2_trim_exp(&formatted, spec == 'g')
                     } else {
@@ -2692,7 +2705,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                         &alt, width, left_align, show_sign, space_sign, zero_pad,
                     ));
                 } else {
-                    let mut formatted = format_float_g(val, sig, spec == 'G');
+                    let mut formatted = format_float_g(val, sig, spec == 'G', alt_form);
                     // The `,` flag groups the integer part only when %g renders in
                     // fixed (non-exponential) form; SQLite leaves exponential
                     // output ungrouped ('%,g' 1234.5 -> "1,234.5"; '%,g' 1e6 ->
@@ -3271,7 +3284,7 @@ fn format_sci_round_half_away(val: f64, prec: usize, upper: bool) -> String {
 }
 
 /// Format a float using `%g`/`%G` semantics.
-fn format_float_g(val: f64, sig: usize, upper: bool) -> String {
+fn format_float_g(val: f64, sig: usize, upper: bool, alt_form: bool) -> String {
     if !val.is_finite() {
         return format!("{val}");
     }
@@ -3290,8 +3303,23 @@ fn format_float_g(val: f64, sig: usize, upper: bool) -> String {
     #[allow(clippy::cast_possible_wrap)]
     let formatted = if exp < -4 || exp >= sig as i32 {
         let s = if upper { sci.replace('e', "E") } else { sci };
-        // Strip trailing zeros from mantissa, then normalize the exponent.
-        let trimmed = if s.contains('.') {
+        // Alternate form (`#`) keeps every significant digit (no trailing-zero
+        // strip) and forces a decimal point in the mantissa; otherwise strip
+        // trailing zeros. The exponent is normalized afterwards.
+        let trimmed = if alt_form {
+            if let Some(e_pos) = s.find(['e', 'E']) {
+                let (mantissa, exp_part) = s.split_at(e_pos);
+                if mantissa.contains('.') {
+                    s.clone()
+                } else {
+                    format!("{mantissa}.{exp_part}")
+                }
+            } else if s.contains('.') {
+                s.clone()
+            } else {
+                format!("{s}.")
+            }
+        } else if s.contains('.') {
             if let Some(e_pos) = s.find('e').or_else(|| s.find('E')) {
                 let mantissa = s[..e_pos].trim_end_matches('0').trim_end_matches('.');
                 format!("{mantissa}{}", &s[e_pos..])
@@ -3309,12 +3337,16 @@ fn format_float_g(val: f64, sig: usize, upper: bool) -> String {
             sig + exp.unsigned_abs() as usize - 1
         };
         let s = format_fixed_round_half_away(val, decimal_places);
+        // Alternate form (`#`) keeps all digits and forces a decimal point.
+        if alt_form {
+            if s.contains('.') { s } else { format!("{s}.") }
+        }
         // Only strip trailing zeros when there is a fractional part. When
         // decimal_places == 0 (e.g. `%g` of 100000.0 -> exp 5, sig 6), `s` is
         // "100000" with no '.', and an unconditional trim would strip the
         // significant integer zeros down to "1". Mirror the exponential branch's
         // `if s.contains('.')` guard above. (C/SQLite %g never drops integer digits.)
-        if s.contains('.') {
+        else if s.contains('.') {
             s.trim_end_matches('0').trim_end_matches('.').to_owned()
         } else {
             s
@@ -5866,6 +5898,45 @@ mod tests {
             ("%!g", 0.1, "0.1"),
             ("%!G", 12345.0, "12345.0"),
             ("%!.0G", 12345.0, "1.0E+04"),
+        ];
+        for (spec, v, want) in cases {
+            assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
+        }
+    }
+
+    #[test]
+    fn test_format_alt_form_hash_floats() {
+        // bd-0hgsi: `#` (alt-form) on floats forces a decimal point (%f/%e) and,
+        // for %g, retains every significant digit (no trailing-zero strip) plus a
+        // decimal point. Oracle: sqlite3 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str, v: f64| -> String {
+            match f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(spec)),
+                    SqliteValue::Float(v),
+                ])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let cases: &[(&str, f64, &str)] = &[
+            ("%#.0f", 3.0, "3."),
+            ("%#.2f", 3.5, "3.50"),
+            ("%#.0f", -3.0, "-3."),
+            ("%#5.0f", 3.0, "   3."),
+            ("%#.0f", 0.0, "0."),
+            ("%#.0e", 3.0, "3.e+00"),
+            ("%#e", 3.0, "3.000000e+00"),
+            ("%#.0g", 3.0, "3."),
+            ("%#g", 3.0, "3.00000"),
+            ("%#.3g", 3.0, "3.00"),
+            ("%#g", 100000.0, "100000."),
+            ("%#g", 0.0001, "0.000100000"),
+            ("%#.1g", 9.9, "1.e+01"),
+            ("%#g", 1234567.0, "1.23457e+06"),
         ];
         for (spec, v, want) in cases {
             assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
