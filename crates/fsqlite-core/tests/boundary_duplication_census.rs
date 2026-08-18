@@ -340,7 +340,8 @@ fn test_census_schema_invalidation_spike() {
         // DDL — invalidates caches.
         conn.execute("CREATE TABLE t2(x INTEGER)").await.unwrap();
 
-        // The old prepared stmt will get SchemaChanged.
+        // GH #239: the old prepared stmt now transparently re-prepares after
+        // the same-connection DDL (measurement-only; no assertion here).
         let result = stmt
             .execute_with_params(&[
                 fsqlite_types::SqliteValue::Integer(99),

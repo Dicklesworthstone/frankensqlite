@@ -6,8 +6,9 @@
 //! 3. Results remain correct after invalidation or transparent re-prepare.
 //! 4. Rollback to savepoint does NOT spuriously invalidate caches when
 //!    schema_cookie is unchanged.
-//! 5. Schema generation bump (connection-local DDL) invalidates prepared
-//!    statements via SchemaChanged error.
+//! 5. Schema generation bump (connection-local DDL) transparently re-prepares
+//!    prepared statements (GH #239), matching stock SQLite, instead of
+//!    surfacing a permanent SchemaChanged error.
 //! 6. File-backed databases share the same correctness/recovery behavior.
 //! 7. Warm-loop churn measurement scorecard with structured output.
 //!
@@ -143,21 +144,18 @@ fn test_ddl_invalidates_schema_bound_reuse_and_recovers() {
             .await
             .unwrap();
 
-        let result = stmt
+        // GH #239: a same-connection ADD COLUMN must transparently re-prepare
+        // (no SchemaChanged), returning the unchanged row.
+        let rows = stmt
             .query_with_params(&[fsqlite_types::SqliteValue::Integer(1)])
-            .await;
-        match result {
-            Err(fsqlite_error::FrankenError::SchemaChanged) => {}
-            Ok(rows) => {
-                assert_eq!(rows.len(), 1, "transparent re-prepare should return 1 row");
-                assert_eq!(
-                    rows[0].get(0),
-                    Some(&fsqlite_types::SqliteValue::Text("before".into())),
-                    "transparent re-prepare should preserve the original column"
-                );
-            }
-            Err(other) => panic!("unexpected prepared-statement error after DDL: {other:?}"),
-        }
+            .await
+            .expect("prepared SELECT must transparently re-prepare after ADD COLUMN");
+        assert_eq!(rows.len(), 1, "transparent re-prepare should return 1 row");
+        assert_eq!(
+            rows[0].get(0),
+            Some(&fsqlite_types::SqliteValue::Text("before".into())),
+            "transparent re-prepare should preserve the original column"
+        );
 
         // Query through the new schema and prove the connection-local caches recover.
         let rows = conn
@@ -264,25 +262,13 @@ fn test_schema_generation_invalidates_prepared() {
         // DDL changes schema_generation.
         conn.execute("CREATE TABLE t2(x INTEGER)").await.unwrap();
 
-        // Prepared statement should detect schema change.
-        let result = stmt
+        // GH #239: the prepared statement must transparently re-prepare on a
+        // same-connection schema change and still return the correct rows.
+        let rows = stmt
             .query_with_params(&[fsqlite_types::SqliteValue::Integer(1)])
-            .await;
-        match result {
-            Err(fsqlite_error::FrankenError::SchemaChanged) => {
-                // Expected — the statement was invalidated.
-            }
-            Ok(rows) => {
-                // Transparent re-prepare — result must still be correct.
-                assert!(
-                    !rows.is_empty(),
-                    "re-prepared result should still be correct"
-                );
-            }
-            Err(other) => {
-                panic!("unexpected error after schema change: {other:?}");
-            }
-        }
+            .await
+            .expect("prepared SELECT must transparently re-prepare after DDL");
+        assert!(!rows.is_empty(), "re-prepared result should still be correct");
     });
 }
 
@@ -350,27 +336,21 @@ fn test_file_backed_cache_invalidation() {
 
         // DDL invalidation.
         conn.execute("CREATE TABLE t2(x INTEGER)").await.unwrap();
-        let result = stmt
+        // GH #239: same-connection DDL transparently re-prepares (file-backed).
+        let rows = stmt
             .query_with_params(&[fsqlite_types::SqliteValue::Integer(1)])
-            .await;
-        match result {
-            Err(fsqlite_error::FrankenError::SchemaChanged) => {}
-            Ok(rows) => {
-                assert_eq!(
-                    rows.len(),
-                    1,
-                    "file-backed: transparent re-prepare should return 1 row"
-                );
-                assert_eq!(
-                    rows[0].get(0),
-                    Some(&fsqlite_types::SqliteValue::Text("file-backed".into())),
-                    "file-backed: transparent re-prepare should preserve row data"
-                );
-            }
-            Err(other) => {
-                panic!("file-backed: unexpected prepared-statement error after DDL: {other:?}")
-            }
-        }
+            .await
+            .expect("file-backed prepared SELECT must transparently re-prepare after DDL");
+        assert_eq!(
+            rows.len(),
+            1,
+            "file-backed: transparent re-prepare should return 1 row"
+        );
+        assert_eq!(
+            rows[0].get(0),
+            Some(&fsqlite_types::SqliteValue::Text("file-backed".into())),
+            "file-backed: transparent re-prepare should preserve row data"
+        );
 
         let rows = conn.query("SELECT val FROM t WHERE id = 1").await.unwrap();
         assert_eq!(
@@ -639,6 +619,14 @@ fn test_reprepare_after_schema_changed_returns_correct_results() {
             .query_with_params(&[fsqlite_types::SqliteValue::Integer(1)])
             .await;
         let schema_changed = matches!(result, Err(fsqlite_error::FrankenError::SchemaChanged));
+        // GH #239: FrankenSQLite now transparently re-prepares a same-connection
+        // schema change, so the caller never observes SchemaChanged here. The
+        // `if schema_changed` branch documents the historical manual-reprepare
+        // fallback and is retained only as a reference.
+        assert!(
+            !schema_changed,
+            "prepared statement must transparently re-prepare after same-connection DDL"
+        );
 
         if schema_changed {
             // Re-prepare with the NEW schema.

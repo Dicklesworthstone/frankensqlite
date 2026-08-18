@@ -2431,6 +2431,13 @@ fn format_schema_identity(cookie: u32, generation: u64) -> String {
     format!("cookie={cookie};generation={generation}")
 }
 
+/// Maximum number of transparent re-prepare attempts a prepared statement makes
+/// on `SchemaChanged` before giving up (GH #239). Mirrors stock SQLite's
+/// `SQLITE_MAX_SCHEMA_RETRY` (50): a bounded loop so a connection that changes
+/// the schema on every prepare eventually surfaces `SchemaChanged` instead of
+/// spinning forever.
+const PREPARED_SCHEMA_REPREPARE_LIMIT: usize = 50;
+
 fn is_hidden_rowid_alias_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
         || name.eq_ignore_ascii_case("_rowid_")
@@ -6635,6 +6642,10 @@ enum PreparedDmlDispatch {
 #[derive(Clone)]
 struct PreparedStatementTemplate {
     canonical_sql: Rc<str>,
+    /// Original user SQL text (see `PreparedStatement::original_sql`); carried
+    /// through the prepared cache so cache-instantiated handles can also
+    /// transparently re-prepare on same-connection DDL (GH #239).
+    original_sql: Rc<str>,
     program: Arc<VdbeProgram>,
     expression_postprocess: Option<ExpressionPostprocess>,
     distinct: bool,
@@ -6642,6 +6653,7 @@ struct PreparedStatementTemplate {
     table_backed: bool,
     schema_cookie: u32,
     schema_generation: u64,
+    local_ddl_epoch: u64,
     function_registry_generation: u64,
     /// Finalized commit epoch (global, monotonic) at the time this template
     /// was inserted into the prepared cache (bd-#70 wedge). Together with
@@ -6663,6 +6675,7 @@ impl PreparedStatementTemplate {
     fn from_statement(stmt: &PreparedStatement<'_>, commit_epoch: u64) -> Self {
         Self {
             canonical_sql: Rc::clone(&stmt.sql),
+            original_sql: Rc::clone(&stmt.original_sql),
             program: Arc::clone(&stmt.program),
             expression_postprocess: stmt.expression_postprocess.clone(),
             distinct: stmt.distinct,
@@ -6670,6 +6683,7 @@ impl PreparedStatementTemplate {
             table_backed: stmt.db.is_some(),
             schema_cookie: stmt.schema_cookie,
             schema_generation: stmt.schema_generation,
+            local_ddl_epoch: stmt.local_ddl_epoch,
             function_registry_generation: stmt.function_registry_generation,
             commit_epoch,
             dml_dispatch: stmt.dml_dispatch.clone(),
@@ -6740,6 +6754,7 @@ impl PreparedStatementTemplate {
     fn instantiate<'conn>(&self, conn: &'conn Connection) -> PreparedStatement<'conn> {
         PreparedStatement {
             sql: Rc::clone(&self.canonical_sql),
+            original_sql: Rc::clone(&self.original_sql),
             program: Arc::clone(&self.program),
             func_registry: Some(Arc::clone(&*conn.func_registry.borrow())),
             expression_postprocess: self.expression_postprocess.clone(),
@@ -6748,6 +6763,7 @@ impl PreparedStatementTemplate {
             db: self.table_backed.then(|| Rc::clone(&conn.db)),
             schema_cookie: self.schema_cookie,
             schema_generation: self.schema_generation,
+            local_ddl_epoch: self.local_ddl_epoch,
             function_registry_generation: self.function_registry_generation,
             dml_dispatch: self.dml_dispatch.clone(),
             prepared_update_delete_fast_path: self.prepared_update_delete_fast_path.clone(),
@@ -6769,6 +6785,12 @@ struct PreparedCacheEntry {
 
 pub struct PreparedStatement<'conn> {
     sql: Rc<str>,
+    /// Original user SQL text passed to `Connection::prepare` (before any
+    /// canonicalization). Retained so the statement can be transparently
+    /// re-prepared against the current schema on SQLITE_SCHEMA (GH #239),
+    /// mirroring stock SQLite's `sqlite3Reprepare`, which recompiles from the
+    /// original text so `SELECT *` re-expands to include newly added columns.
+    original_sql: Rc<str>,
     program: Arc<VdbeProgram>,
     func_registry: Option<Arc<FunctionRegistry>>,
     expression_postprocess: Option<ExpressionPostprocess>,
@@ -6783,6 +6805,11 @@ pub struct PreparedStatement<'conn> {
     /// Local schema-generation marker captured at prepare time so prepared
     /// statements invalidate on same-connection DDL before any memdb reload.
     schema_generation: u64,
+    /// Same-connection DDL epoch captured at prepare time. Compared against
+    /// `Connection::local_ddl_epoch()` to decide whether a `SchemaChanged`
+    /// originated from a same-connection DDL (transparently re-prepare, GH
+    /// #239) or a cross-connection change (preserve `SchemaChanged`).
+    local_ddl_epoch: u64,
     /// Function-registry generation captured at prepare time so cached plans
     /// and prepared handles fail fast after any UDF redefinition.
     function_registry_generation: u64,
@@ -6983,6 +7010,75 @@ impl std::fmt::Debug for PreparedStatement<'_> {
             .field("sql", &self.sql)
             .field("program", &self.program)
             .finish_non_exhaustive()
+    }
+}
+
+impl<'conn> PreparedStatement<'conn> {
+    /// True when the `SchemaChanged` this statement would raise stems from a
+    /// schema change made on THIS connection (a bumped `local_ddl_epoch`),
+    /// rather than a cross-connection change (only the shared cookie moved).
+    ///
+    /// Same-connection changes are re-prepared transparently to match stock
+    /// SQLite (GH #239); cross-connection changes retain the existing
+    /// `SchemaChanged` contract so the MVCC / concurrent-writer behavior that
+    /// the cross-connection tests pin is preserved unchanged.
+    fn schema_change_is_same_connection(&self) -> bool {
+        self.conn.local_ddl_epoch() != self.local_ddl_epoch
+    }
+
+    /// Re-parse / re-plan / re-compile this statement's ORIGINAL SQL against the
+    /// connection's CURRENT committed schema, returning a fresh handle. This is
+    /// the analog of stock SQLite's `sqlite3Reprepare`: it recompiles from the
+    /// original text (so `SELECT *` re-expands to include newly added columns)
+    /// and, if the schema change made the statement genuinely invalid (e.g. the
+    /// table was dropped or a referenced column removed), surfaces the REAL
+    /// prepare error (`no such table` / `no such column`) rather than
+    /// `SchemaChanged`.
+    async fn reprepared_for_current_schema(&self) -> Result<PreparedStatement<'conn>> {
+        let conn: &'conn Connection = self.conn;
+        conn.log_statement_reuse_event(
+            "prepared_schema_reprepare",
+            &self.original_sql,
+            false,
+            "schema_changed_reprepare",
+            0,
+            0,
+            format!(
+                "prepared_schema_identity={} current_schema_identity={}",
+                format_schema_identity(self.schema_cookie, self.schema_generation),
+                conn.current_schema_identity()
+            )
+            .as_str(),
+        );
+        conn.prepare_after_background_status(&self.original_sql).await
+    }
+
+    /// Run `op`, and if it fails with `SchemaChanged` caused by a
+    /// same-connection DDL, transparently re-prepare against the current schema
+    /// and retry — up to `PREPARED_SCHEMA_REPREPARE_LIMIT` times (GH #239).
+    ///
+    /// A `SchemaChanged` from a cross-connection change (or any other error) is
+    /// returned unchanged, preserving the existing concurrency contract. If a
+    /// re-prepare itself fails because the object no longer exists, that real
+    /// error propagates.
+    async fn with_same_connection_schema_reprepare<T, Op>(&self, mut op: Op) -> Result<T>
+    where
+        Op: std::ops::AsyncFnMut(&PreparedStatement<'conn>) -> Result<T>,
+    {
+        match op(self).await {
+            Err(FrankenError::SchemaChanged) if self.schema_change_is_same_connection() => {}
+            other => return other,
+        }
+        let mut reprepared = self.reprepared_for_current_schema().await?;
+        for _ in 0..PREPARED_SCHEMA_REPREPARE_LIMIT {
+            match op(&reprepared).await {
+                Err(FrankenError::SchemaChanged)
+                    if reprepared.schema_change_is_same_connection() => {}
+                other => return other,
+            }
+            reprepared = reprepared.reprepared_for_current_schema().await?;
+        }
+        Err(FrankenError::SchemaChanged)
     }
 }
 
@@ -7425,6 +7521,7 @@ impl PreparedStatement<'_> {
     fn clone_with_program(&self, program: Arc<VdbeProgram>) -> Self {
         Self {
             sql: Rc::clone(&self.sql),
+            original_sql: Rc::clone(&self.original_sql),
             program,
             func_registry: self.func_registry.clone(),
             expression_postprocess: self.expression_postprocess.clone(),
@@ -7433,6 +7530,7 @@ impl PreparedStatement<'_> {
             db: self.db.as_ref().map(Rc::clone),
             schema_cookie: self.schema_cookie,
             schema_generation: self.schema_generation,
+            local_ddl_epoch: self.local_ddl_epoch,
             function_registry_generation: self.function_registry_generation,
             dml_dispatch: self.dml_dispatch.clone(),
             prepared_update_delete_fast_path: self.prepared_update_delete_fast_path.clone(),
@@ -8259,9 +8357,12 @@ impl PreparedStatement<'_> {
     pub async fn query(&self) -> Result<Vec<Row>> {
         self.conn.background_status()?;
         self.conn.settle_pending_transaction_cleanup().await?;
-        self.conn
-            .query_prepared_with_params_after_background_status(self, &[])
-            .await
+        self.with_same_connection_schema_reprepare(async |stmt| {
+            stmt.conn
+                .query_prepared_with_params_after_background_status(stmt, &[])
+                .await
+        })
+        .await
     }
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
@@ -8271,24 +8372,32 @@ impl PreparedStatement<'_> {
         // `try_query_clean_memory_indexed_equality_fast` would otherwise serve a
         // read from inside an abandoned transaction without rolling it back.
         self.conn.settle_pending_transaction_cleanup().await?;
-        if let Some(rows) = self.try_query_clean_memory_indexed_equality_fast(params)? {
-            return Ok(rows);
-        }
-        self.conn
-            .query_prepared_with_params_after_background_status(self, params)
-            .await
+        self.with_same_connection_schema_reprepare(async |stmt| {
+            if let Some(rows) = stmt.try_query_clean_memory_indexed_equality_fast(params)? {
+                return Ok(rows);
+            }
+            stmt.conn
+                .query_prepared_with_params_after_background_status(stmt, params)
+                .await
+        })
+        .await
     }
 
     /// Execute as a query with bound SQL parameters, invoking `f` for each row.
-    pub async fn query_with_params_for_each<F>(&self, params: &[SqliteValue], f: F) -> Result<()>
+    pub async fn query_with_params_for_each<F>(&self, params: &[SqliteValue], mut f: F) -> Result<()>
     where
         F: FnMut(&Row) -> Result<()>,
     {
         self.conn.background_status()?;
         self.conn.settle_pending_transaction_cleanup().await?;
-        self.conn
-            .query_prepared_with_params_for_each_after_background_status(self, params, f)
-            .await
+        // The schema guard is pre-flight (no row is emitted to `f` before a
+        // `SchemaChanged`), so `&mut f` is safe to reuse across a re-prepare.
+        self.with_same_connection_schema_reprepare(async |stmt| {
+            stmt.conn
+                .query_prepared_with_params_for_each_after_background_status(stmt, params, &mut f)
+                .await
+        })
+        .await
     }
 
     /// Execute as a query and return exactly one row.
@@ -8307,25 +8416,31 @@ impl PreparedStatement<'_> {
         // MUST precede the fast paths below, which return without ever reaching
         // the general dispatcher.
         self.conn.settle_pending_transaction_cleanup().await?;
-        if let Some(params) = params
-            && let Some(row_outcome) = self.try_query_row_clean_memory_rowid_lookup_fast(params)?
-        {
-            return direct_query_row_outcome_result(row_outcome);
-        }
-        if params.is_none()
-            && let Some(row) = self.try_query_row_clean_memory_count_star_fast().await?
-        {
-            return Ok(direct_query_row_result(row));
-        }
-        // bd-5zeai: the count-probe fast path resolves parameterized bounds
-        // itself, so it runs in BOTH params branches; unresolvable bindings
-        // return None and fall through to the general dispatcher.
-        if let Some(row) = self.try_query_row_clean_memory_count_indexed_rowid_probe_fast(params)? {
-            return Ok(direct_query_row_result(row));
-        }
-        self.conn
-            .query_prepared_row_after_background_status(self, params)
-            .await
+        self.with_same_connection_schema_reprepare(async |stmt| {
+            if let Some(params) = params
+                && let Some(row_outcome) =
+                    stmt.try_query_row_clean_memory_rowid_lookup_fast(params)?
+            {
+                return direct_query_row_outcome_result(row_outcome);
+            }
+            if params.is_none()
+                && let Some(row) = stmt.try_query_row_clean_memory_count_star_fast().await?
+            {
+                return Ok(direct_query_row_result(row));
+            }
+            // bd-5zeai: the count-probe fast path resolves parameterized bounds
+            // itself, so it runs in BOTH params branches; unresolvable bindings
+            // return None and fall through to the general dispatcher.
+            if let Some(row) =
+                stmt.try_query_row_clean_memory_count_indexed_rowid_probe_fast(params)?
+            {
+                return Ok(direct_query_row_result(row));
+            }
+            stmt.conn
+                .query_prepared_row_after_background_status(stmt, params)
+                .await
+        })
+        .await
     }
 
     /// Return the number of columns this statement will produce per row.
@@ -8356,7 +8471,11 @@ impl PreparedStatement<'_> {
     /// the number of result rows.
     pub async fn execute(&self) -> Result<usize> {
         if self.dml_dispatch.is_some() {
-            return self.conn.execute_prepared(self).await;
+            return self
+                .with_same_connection_schema_reprepare(async |stmt| {
+                    stmt.conn.execute_prepared(stmt).await
+                })
+                .await;
         }
         Ok(self.query().await?.len())
     }
@@ -8369,7 +8488,11 @@ impl PreparedStatement<'_> {
     /// the number of result rows.
     pub async fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize> {
         if self.dml_dispatch.is_some() {
-            return self.conn.execute_prepared_with_params(self, params).await;
+            return self
+                .with_same_connection_schema_reprepare(async |stmt| {
+                    stmt.conn.execute_prepared_with_params(stmt, params).await
+                })
+                .await;
         }
         Ok(self.query_with_params(params).await?.len())
     }
@@ -11099,6 +11222,15 @@ pub struct Connection {
     /// Connection-local prepared-statement invalidation marker. This bumps on
     /// both local DDL and cross-connection schema reloads.
     schema_generation: Cell<u64>,
+    /// Same-connection DDL epoch. Unlike `schema_generation`, this bumps ONLY
+    /// when THIS connection executes DDL (`set_schema_cookie_exact` /
+    /// `note_temp_schema_change`); a cross-connection schema reload never
+    /// advances it. Captured on each `PreparedStatement` so the transparent
+    /// re-prepare-and-retry path (GH #239) can distinguish a same-connection
+    /// schema change (transparently re-prepare, matching stock SQLite's
+    /// SQLITE_SCHEMA handling) from a cross-connection change (preserve the
+    /// existing `SchemaChanged` MVCC contract).
+    local_ddl_epoch: Cell<u64>,
     /// One-shot guard forcing the next memdb reload to take the FULL
     /// sqlite_master rebuild path instead of the schema-only fast path
     /// (bd-xvv8f). Autocommit DDL applies its connection-local schema mutation
@@ -12805,6 +12937,7 @@ impl Connection {
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             schema_generation: Cell::new(0),
+            local_ddl_epoch: Cell::new(0),
             force_full_schema_reload_once: Cell::new(false),
             db_text_encoding: Cell::new(TextEncoding::Utf8),
             change_counter: RefCell::new(0),
@@ -13327,6 +13460,7 @@ impl Connection {
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             schema_generation: Cell::new(0),
+            local_ddl_epoch: Cell::new(0),
             force_full_schema_reload_once: Cell::new(false),
             db_text_encoding: Cell::new(TextEncoding::Utf8),
             change_counter: RefCell::new(0),
@@ -22651,7 +22785,9 @@ impl Connection {
                     span
                 });
             let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
-            let prepared_result = self.compile_and_wrap(&canonical_sql, &statement).await;
+            let prepared_result = self
+                .compile_and_wrap(&canonical_sql, sql, &statement)
+                .await;
 
             // User module metadata callbacks are deliberately reentrant and
             // may replace a scalar while preparation is in progress. Neither
@@ -39084,6 +39220,7 @@ impl Connection {
     fn wrap_deferred_prepared_dml<'conn>(
         &'conn self,
         sql: &str,
+        original_sql: &str,
         statement: &Statement,
         func_registry: Option<Arc<FunctionRegistry>>,
         column_names: Vec<String>,
@@ -39091,6 +39228,7 @@ impl Connection {
     ) -> Result<PreparedStatement<'conn>> {
         Ok(PreparedStatement {
             sql: Rc::<str>::from(sql),
+            original_sql: Rc::<str>::from(original_sql),
             program: build_placeholder_program()?,
             func_registry,
             expression_postprocess: None,
@@ -39098,6 +39236,7 @@ impl Connection {
             distinct_collations: Vec::new(),
             db: None,
             schema_cookie: self.schema_cookie(),
+            local_ddl_epoch: self.local_ddl_epoch(),
             schema_generation: self.schema_generation(),
             function_registry_generation: self.function_registry_generation(),
             dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(statement.clone()))),
@@ -39115,6 +39254,7 @@ impl Connection {
     async fn compile_and_wrap(
         &self,
         sql: &str,
+        original_sql: &str,
         statement: &Statement,
     ) -> Result<PreparedStatement<'_>> {
         // Column metadata can invoke user vtab factories, which may re-register
@@ -39134,6 +39274,7 @@ impl Connection {
             Statement::Select(_) if self.prepared_select_requires_dispatch(statement) => {
                 Ok(PreparedStatement {
                     sql: Rc::<str>::from(sql),
+                    original_sql: Rc::<str>::from(original_sql),
                     program: build_placeholder_program()?,
                     func_registry: registry,
                     expression_postprocess: None,
@@ -39143,6 +39284,7 @@ impl Connection {
                         .as_ref()
                         .map(|_| Rc::clone(&self.db)),
                     schema_cookie: self.schema_cookie(),
+                    local_ddl_epoch: self.local_ddl_epoch(),
                     schema_generation: self.schema_generation(),
                     function_registry_generation,
                     dml_dispatch: None,
@@ -39170,6 +39312,7 @@ impl Connection {
                 };
                 Ok(PreparedStatement {
                     sql: Rc::<str>::from(sql),
+                    original_sql: Rc::<str>::from(original_sql),
                     program,
                     func_registry: registry,
                     expression_postprocess,
@@ -39177,6 +39320,7 @@ impl Connection {
                     distinct_collations: prep_collations,
                     db: None,
                     schema_cookie: self.schema_cookie(),
+                    local_ddl_epoch: self.local_ddl_epoch(),
                     schema_generation: self.schema_generation(),
                     function_registry_generation,
                     dml_dispatch: None,
@@ -39205,6 +39349,7 @@ impl Connection {
                     .await?;
                 Ok(PreparedStatement {
                     sql: Rc::<str>::from(sql),
+                    original_sql: Rc::<str>::from(original_sql),
                     program,
                     func_registry: registry,
                     expression_postprocess: None,
@@ -39212,6 +39357,7 @@ impl Connection {
                     distinct_collations: prep_collations,
                     db: Some(Rc::clone(&self.db)),
                     schema_cookie: self.schema_cookie(),
+                    local_ddl_epoch: self.local_ddl_epoch(),
                     schema_generation: self.schema_generation(),
                     function_registry_generation,
                     dml_dispatch: None,
@@ -39230,6 +39376,7 @@ impl Connection {
                 {
                     return self.wrap_deferred_prepared_dml(
                         sql,
+                        original_sql,
                         statement,
                         registry,
                         prepared_column_names,
@@ -39277,6 +39424,7 @@ impl Connection {
                     };
                     Ok(PreparedStatement {
                         sql: Rc::<str>::from(sql),
+                        original_sql: Rc::<str>::from(original_sql),
                         program,
                         func_registry: registry,
                         expression_postprocess: None,
@@ -39284,6 +39432,7 @@ impl Connection {
                         distinct_collations: Vec::new(),
                         db: Some(Rc::clone(&self.db)),
                         schema_cookie: self.schema_cookie(),
+                        local_ddl_epoch: self.local_ddl_epoch(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
                         dml_dispatch: Some(if supports_direct_dispatch {
@@ -39326,6 +39475,7 @@ impl Connection {
                     // statement dispatcher instead of main-schema bytecode.
                     Ok(PreparedStatement {
                         sql: Rc::<str>::from(sql),
+                        original_sql: Rc::<str>::from(original_sql),
                         program: build_placeholder_program()?,
                         func_registry: registry,
                         expression_postprocess: None,
@@ -39333,6 +39483,7 @@ impl Connection {
                         distinct_collations: Vec::new(),
                         db: None,
                         schema_cookie: self.schema_cookie(),
+                        local_ddl_epoch: self.local_ddl_epoch(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
@@ -39354,6 +39505,7 @@ impl Connection {
                 {
                     return self.wrap_deferred_prepared_dml(
                         sql,
+                        original_sql,
                         statement,
                         registry,
                         prepared_column_names,
@@ -39378,6 +39530,7 @@ impl Connection {
                     };
                     Ok(PreparedStatement {
                         sql: Rc::<str>::from(sql),
+                        original_sql: Rc::<str>::from(original_sql),
                         program,
                         func_registry: registry,
                         expression_postprocess: None,
@@ -39385,6 +39538,7 @@ impl Connection {
                         distinct_collations: Vec::new(),
                         db,
                         schema_cookie: self.schema_cookie(),
+                        local_ddl_epoch: self.local_ddl_epoch(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
@@ -39401,6 +39555,7 @@ impl Connection {
                 } else {
                     Ok(PreparedStatement {
                         sql: Rc::<str>::from(sql),
+                        original_sql: Rc::<str>::from(original_sql),
                         program: build_placeholder_program()?,
                         func_registry: registry,
                         expression_postprocess: None,
@@ -39408,6 +39563,7 @@ impl Connection {
                         distinct_collations: Vec::new(),
                         db: None,
                         schema_cookie: self.schema_cookie(),
+                        local_ddl_epoch: self.local_ddl_epoch(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
@@ -39429,6 +39585,7 @@ impl Connection {
                 {
                     return self.wrap_deferred_prepared_dml(
                         sql,
+                        original_sql,
                         statement,
                         registry,
                         prepared_column_names,
@@ -39453,6 +39610,7 @@ impl Connection {
                     };
                     Ok(PreparedStatement {
                         sql: Rc::<str>::from(sql),
+                        original_sql: Rc::<str>::from(original_sql),
                         program,
                         func_registry: registry,
                         expression_postprocess: None,
@@ -39460,6 +39618,7 @@ impl Connection {
                         distinct_collations: Vec::new(),
                         db,
                         schema_cookie: self.schema_cookie(),
+                        local_ddl_epoch: self.local_ddl_epoch(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
@@ -39476,6 +39635,7 @@ impl Connection {
                 } else {
                     Ok(PreparedStatement {
                         sql: Rc::<str>::from(sql),
+                        original_sql: Rc::<str>::from(original_sql),
                         program: build_placeholder_program()?,
                         func_registry: registry,
                         expression_postprocess: None,
@@ -39483,6 +39643,7 @@ impl Connection {
                         distinct_collations: Vec::new(),
                         db: None,
                         schema_cookie: self.schema_cookie(),
+                        local_ddl_epoch: self.local_ddl_epoch(),
                         schema_generation: self.schema_generation(),
                         function_registry_generation,
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
@@ -39500,6 +39661,7 @@ impl Connection {
             }
             Statement::Pragma(_) => Ok(PreparedStatement {
                 sql: Rc::<str>::from(sql),
+                original_sql: Rc::<str>::from(original_sql),
                 program: build_placeholder_program()?,
                 func_registry: registry,
                 expression_postprocess: None,
@@ -39507,6 +39669,7 @@ impl Connection {
                 distinct_collations: Vec::new(),
                 db: None,
                 schema_cookie: self.schema_cookie(),
+                local_ddl_epoch: self.local_ddl_epoch(),
                 schema_generation: self.schema_generation(),
                 function_registry_generation,
                 dml_dispatch: None,
@@ -46281,17 +46444,29 @@ impl Connection {
         // Append the new documents' docsize rows (read back on reopen for BM25).
         let docsize_name = format!("{table_name}_docsize");
         if self.schema_table_exists(&docsize_name) {
+            // Contentless-delete tables carry a per-row `origin` (the 3rd
+            // `_docsize` column) identifying the segment a rowid was inserted
+            // into, so a later lazy DELETE can tombstone the owning segment
+            // without hydrating the corpus (bd-fts5-lazy-shadow-reads-itcc4.3,
+            // v2 origin-targeted). The batch's segment origin is the structure's
+            // `origin_counter` at the point of this append — exactly what
+            // `flush_to_segment` stamps onto the new segment. Legacy
+            // (non-origin-tracking) tables keep the 2-column `(id, sz)` layout.
+            let batch_origin = structure
+                .uses_origin_tracking()
+                .then(|| i64::try_from(structure.origin_counter).unwrap_or(i64::MAX));
             self.upsert_storage_table_rows(
                 &docsize_name,
                 flush.docsize_rows.into_iter().map(|row| {
                     let sz = encode_fts5_docsize_blob(&row.column_token_counts);
-                    (
-                        row.rowid,
-                        vec![
-                            SqliteValue::Integer(row.rowid),
-                            SqliteValue::Blob(Arc::from(sz.into_boxed_slice())),
-                        ],
-                    )
+                    let mut values = vec![
+                        SqliteValue::Integer(row.rowid),
+                        SqliteValue::Blob(Arc::from(sz.into_boxed_slice())),
+                    ];
+                    if let Some(origin) = batch_origin {
+                        values.push(SqliteValue::Integer(origin));
+                    }
+                    (row.rowid, values)
                 }),
             )
             .await?;
@@ -82166,6 +82341,12 @@ impl Connection {
         *self.schema_cookie.borrow_mut() = new_cookie;
         self.schema_generation
             .set(self.schema_generation.get().wrapping_add(1));
+        // Same-connection DDL: advance the local DDL epoch so prepared
+        // statements captured before this change re-prepare transparently
+        // (GH #239). Cross-connection reloads bump schema_generation but never
+        // reach this path, so they leave local_ddl_epoch untouched.
+        self.local_ddl_epoch
+            .set(self.local_ddl_epoch.get().wrapping_add(1));
         // Invalidate parse + compiled caches — schema change may affect resolution/codegen.
         self.parse_cache.borrow_mut().clear();
         self.clear_compilation_reuse_caches();
@@ -82193,6 +82374,9 @@ impl Connection {
         self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, false);
         self.schema_generation
             .set(self.schema_generation.get().wrapping_add(1));
+        // Same-connection TEMP DDL: advance the local DDL epoch (GH #239).
+        self.local_ddl_epoch
+            .set(self.local_ddl_epoch.get().wrapping_add(1));
         self.parse_cache.borrow_mut().clear();
         self.clear_compilation_reuse_caches();
         self.table_execution_metadata_cache.borrow_mut().take();
@@ -82216,6 +82400,15 @@ impl Connection {
     #[must_use]
     pub fn schema_generation(&self) -> u64 {
         self.schema_generation.get()
+    }
+
+    /// Same-connection DDL epoch. Advances only when THIS connection runs DDL;
+    /// a cross-connection schema reload leaves it unchanged. Used by the
+    /// prepared-statement transparent re-prepare path (GH #239) to scope
+    /// re-prepare to same-connection schema changes.
+    #[must_use]
+    fn local_ddl_epoch(&self) -> u64 {
+        self.local_ddl_epoch.get()
     }
 
     #[must_use]
@@ -174815,9 +175008,21 @@ mod tests {
                 .execute("CREATE TABLE anchor(replacement TEXT)")
                 .await
                 .unwrap();
+            // GH #239: the re-created `anchor` is same-connection DDL, so the
+            // prepared `SELECT id FROM anchor` transparently re-prepares against
+            // the CURRENT schema. Because the ABA-recreated table drops the `id`
+            // column, re-preparing surfaces the REAL "no such column" error
+            // (matching stock SQLite) rather than a silent SchemaChanged — and,
+            // crucially, it must NOT regain an ABA-matching identity and return
+            // stale rows.
+            let aba = prepared.query().await;
             assert!(
-                matches!(prepared.query().await, Err(FrankenError::SchemaChanged)),
-                "a prepared statement from the pre-reset schema must not regain an ABA-matching identity"
+                aba.is_err(),
+                "a prepared statement from the pre-reset schema must not regain an ABA-matching identity: {aba:?}"
+            );
+            assert!(
+                !matches!(aba, Err(FrankenError::SchemaChanged)),
+                "the ABA-invalid statement must surface the real re-prepare error, not SchemaChanged: {aba:?}"
             );
         });
     }
@@ -218007,7 +218212,10 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_prepared_select_rejects_schema_change() {
+    fn test_prepared_select_reprepares_after_schema_change() {
+        // GH #239: a same-connection DDL must NOT permanently invalidate a
+        // prepared SELECT. Stock SQLite transparently re-prepares on
+        // SQLITE_SCHEMA and returns the rows; FrankenSQLite now matches.
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE prep_schema_sel (id INTEGER PRIMARY KEY, val TEXT);")
@@ -218029,13 +218237,23 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
 
-            let err = stmt.query().await.unwrap_err();
-            assert!(matches!(err, FrankenError::SchemaChanged));
+            // Was: `Err(SchemaChanged)`. Now transparently re-prepares and
+            // returns the unchanged rows, exactly like rusqlite.
+            let rows = stmt
+                .query()
+                .await
+                .expect("prepared SELECT must transparently re-prepare after DDL");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
         });
     }
 
     #[test]
-    fn test_prepared_schema_guard_matches_rusqlite_before_and_rejects_after_ddl() {
+    fn test_prepared_schema_guard_matches_rusqlite_before_and_reprepares_after_ddl() {
+        // GH #239: before AND after a same-connection DDL, a prepared SELECT
+        // must match the rusqlite oracle. rusqlite transparently re-prepares
+        // its held statement (sqlite3_prepare_v2 auto-reprepare); FrankenSQLite
+        // now matches instead of failing with SchemaChanged.
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             let sqlite = rusqlite::Connection::open_in_memory().unwrap();
@@ -218049,23 +218267,36 @@ mod pager_routing_tests {
 
             let sql = "SELECT val FROM prep_schema_guard WHERE id = 2";
             let stmt = conn.prepare(sql).await.unwrap();
+            let mut osel = sqlite.prepare(sql).unwrap();
             let row = stmt.query_row().await.unwrap();
-            let expected: String = sqlite.query_row(sql, [], |row| row.get(0)).unwrap();
-            assert_eq!(row.values(), &[SqliteValue::Text(expected.into())]);
+            let expected: String = osel.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(row.values(), &[SqliteValue::Text(expected.clone().into())]);
 
+            // Same-connection DDL on BOTH engines.
             conn.execute("CREATE TABLE prep_schema_guard_bump (id INTEGER PRIMARY KEY);")
                 .await
                 .unwrap();
-            let err = stmt
+            sqlite
+                .execute("CREATE TABLE prep_schema_guard_bump (id INTEGER PRIMARY KEY);", [])
+                .unwrap();
+
+            // Was: `Err(SchemaChanged)`. Now both engines transparently
+            // re-prepare and return the same row.
+            let row = stmt
                 .query_row()
                 .await
-                .expect_err("schema-changing DDL must invalidate prepared SELECT");
-            assert!(matches!(err, FrankenError::SchemaChanged));
+                .expect("schema-changing DDL must transparently re-prepare, not reject");
+            let expected_after: String = osel.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(expected_after, expected);
+            assert_eq!(row.values(), &[SqliteValue::Text(expected_after.into())]);
         });
     }
 
     #[test]
-    fn test_prepared_dml_rejects_schema_change() {
+    fn test_prepared_dml_reprepares_after_schema_change() {
+        // GH #239: an unrelated same-connection DDL must NOT permanently
+        // invalidate a prepared INSERT. Stock SQLite transparently re-prepares
+        // and the INSERT succeeds; FrankenSQLite now matches.
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE prep_schema_dml (id INTEGER PRIMARY KEY, val TEXT);")
@@ -218080,17 +218311,19 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
 
-            let err = stmt
+            // Was: `Err(SchemaChanged)` with the row NOT inserted. Now the
+            // prepared INSERT transparently re-prepares and succeeds.
+            let affected = stmt
                 .execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())])
                 .await
-                .unwrap_err();
-            assert!(matches!(err, FrankenError::SchemaChanged));
+                .expect("prepared INSERT must transparently re-prepare after DDL");
+            assert_eq!(affected, 1);
 
             let rows = conn
                 .query("SELECT COUNT(*) FROM prep_schema_dml;")
                 .await
                 .unwrap();
-            assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         });
     }
 
@@ -223497,20 +223730,30 @@ mod pager_routing_tests {
             conn.execute("ALTER TABLE sr_file ADD COLUMN extra TEXT DEFAULT 'x';")
                 .await
                 .unwrap();
-            let err = stmt
+            // GH #239: was `Err(SchemaChanged)`. The prepared INSERT now
+            // transparently re-prepares against the widened table and succeeds.
+            let affected = stmt
                 .execute_with_params(&[SqliteValue::Integer(3), SqliteValue::Text("gamma".into())])
                 .await
-                .expect_err("schema change should invalidate prepared insert");
-            assert!(matches!(err, FrankenError::SchemaChanged));
+                .expect("prepared INSERT must transparently re-prepare after ADD COLUMN");
+            assert_eq!(affected, 1);
+            let count = conn
+                .query_row("SELECT COUNT(*) FROM sr_file;")
+                .await
+                .unwrap();
+            assert_eq!(count.values()[0], SqliteValue::Integer(3));
         });
     }
 
     proptest::proptest! {
         #[test]
-        fn proptest_statement_reuse_prepared_prefix_survives_schema_invalidation(
+        fn proptest_statement_reuse_prepared_prefix_reprepares_after_schema_invalidation(
             values in proptest::collection::vec(-500_i64..500, 1..8),
             invalidation_at in 0_usize..8,
         ) {
+            // GH #239: after a same-connection DDL, the prepared INSERT must
+            // transparently re-prepare and keep succeeding (matching stock
+            // SQLite) rather than failing permanently with SchemaChanged.
             let mut outcome: std::result::Result<(), proptest::test_runner::TestCaseError> = Ok(());
             asupersync::test_utils::run_test(|| async {
             outcome = async {
@@ -223537,11 +223780,13 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             let next_id = i64::try_from(cutoff + 1).unwrap();
-            let err = stmt
+            // Was: `Err(SchemaChanged)` with the row NOT inserted. Now the
+            // prepared INSERT re-prepares transparently and succeeds.
+            let affected = stmt
                 .execute_with_params(&[SqliteValue::Integer(next_id), SqliteValue::Integer(999)])
                 .await
-                .unwrap_err();
-            prop_assert!(matches!(err, FrankenError::SchemaChanged));
+                .expect("prepared INSERT must re-prepare after same-connection DDL");
+            prop_assert_eq!(affected, 1);
 
             let count = conn
                 .query_row("SELECT COUNT(*) FROM sr_prop_prepared;")
@@ -223549,7 +223794,7 @@ mod pager_routing_tests {
                 .unwrap();
             prop_assert_eq!(
                 &count.values()[0],
-                &SqliteValue::Integer(i64::try_from(cutoff).unwrap())
+                &SqliteValue::Integer(i64::try_from(cutoff + 1).unwrap())
             );
             Ok(())
             }
