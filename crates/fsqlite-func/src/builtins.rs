@@ -2551,7 +2551,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
         i += 1;
 
         match spec {
-            '%' => result.push('%'),
+            // A literal `%` honors the field width like any other conversion
+            // (space-padded, right/left-justified): `%5%` -> "    %", `%-5%` ->
+            // "%    ". The `0` flag pads with spaces (`%` is not numeric), so
+            // pad_string is correct (bd-g27fn).
+            '%' => result.push_str(&pad_string("%", width, left_align)),
             'n' => {} // no-op (security: never writes to memory)
             'd' | 'i' => {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
@@ -5854,6 +5858,28 @@ mod tests {
             result,
             SqliteValue::Text(SmallText::from_string("beforeafter"))
         );
+    }
+
+    #[test]
+    fn test_format_literal_percent_honors_width() {
+        // bd-g27fn: a literal `%` conversion honors the field width, space-padded
+        // and right/left-justified (the `0` flag pads with spaces since `%` is
+        // non-numeric). Oracle: sqlite3 3.46.1.
+        let f = FormatFunc;
+        let fmt = |spec: &str| -> String {
+            match f
+                .invoke(&[SqliteValue::Text(SmallText::from_string(spec))])
+                .unwrap()
+            {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        assert_eq!(fmt("%%"), "%");
+        assert_eq!(fmt("%5%"), "    %");
+        assert_eq!(fmt("%-5%"), "%    ");
+        assert_eq!(fmt("%05%"), "    %");
+        assert_eq!(fmt("[%3%]"), "[  %]");
     }
 
     #[test]
