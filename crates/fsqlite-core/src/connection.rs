@@ -21244,13 +21244,21 @@ impl Connection {
         // sqlite_sequence unconditionally when any autoincrement table
         // exists) so last_insert_rowid stays correct.
         //
-        // Applies the same rule the two from-pager reload call sites
-        // (reload_memdb_from_pager_with_prebound_publication_and_mode,
-        // reload_memdb_rows_from_txn_preserving_schema) already rely on
-        // with `allow_dirty_schema_only_fast_path=true` -- this is that
-        // same, already-proven invariant, extended to the one call site
-        // that was still hard-excluded from it.
-        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, true)
+        // bd-dsxu2 REGRESSION FIX: this per-write in-txn refresh must NOT use the
+        // schema-cookie fast path on a DIRTY mirror. Unlike the two from-pager
+        // reload call sites (which use `allow_dirty_schema_only_fast_path=true`),
+        // this call site is `refresh_memdb_from_active_txn_if_dirty` -- the ONLY
+        // per-write path that absorbs in-txn DML row changes into the mirror.
+        // With `true`, the fast path (reload_memdb_from_txn_with_mode's
+        // schema-cookie branch) fires on a dirty mirror and clears
+        // `memdb_requires_active_txn_reload` WITHOUT absorbing those rows, so an
+        // in-txn parent DELETE leaves a ghost parent in the mirror and
+        // `fk_parent_rowid_fast_lookup` then trusts it -> FK constraint silently
+        // bypassed (test_issue110_fk_parent_cache_invalidated_by_delete /
+        // _insert_or_replace). Keep `false` here so a dirty mirror takes the
+        // row-absorbing reload. (Re-doing the schema-reparse-skip perf win
+        // without breaking row-dirty absorption is tracked as bd-ixf69.)
+        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, false)
             .await
     }
 
