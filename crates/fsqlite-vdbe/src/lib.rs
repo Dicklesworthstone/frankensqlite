@@ -1487,6 +1487,7 @@ fn compute_bind_parameter_requirement(ops: &[VdbeOp]) -> std::result::Result<usi
 /// can remain declarative.
 pub mod pragma {
     use std::path::Path;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     use fsqlite_ast::{Expr, Literal, PragmaStatement, PragmaValue, QualifiedName, UnaryOp};
     use fsqlite_error::{FrankenError, Result};
@@ -1496,6 +1497,16 @@ pub mod pragma {
         persist_wal_fec_raptorq_repair_symbols, read_wal_fec_raptorq_repair_symbols,
     };
     use tracing::{debug, error, info, warn};
+
+    /// Process-global soft heap limit in bytes (0 = no limit). Mirrors C SQLite's
+    /// `sqlite3_soft_heap_limit64`: the limit is shared across every connection in
+    /// the process, not per-connection (GH #280 / bd-pgdi6). `0` means unlimited.
+    static SOFT_HEAP_LIMIT: AtomicI64 = AtomicI64::new(0);
+    /// Process-global hard heap limit in bytes (0 = no limit). Mirrors C SQLite's
+    /// `sqlite3_hard_heap_limit64`. From SQL the hard limit can only be *lowered*
+    /// (never raised, never cleared to 0), and lowering it retroactively lowers the
+    /// soft limit (GH #280 / bd-pgdi6).
+    static HARD_HEAP_LIMIT: AtomicI64 = AtomicI64::new(0);
 
     /// Result of applying a PRAGMA statement.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1770,6 +1781,12 @@ pub mod pragma {
         if name.eq_ignore_ascii_case("automatic_index") {
             return apply_bool_toggle(&mut state.automatic_index, stmt);
         }
+        if name.eq_ignore_ascii_case("soft_heap_limit") {
+            return Ok(apply_soft_heap_limit(stmt));
+        }
+        if name.eq_ignore_ascii_case("hard_heap_limit") {
+            return Ok(apply_hard_heap_limit(stmt));
+        }
         if name.eq_ignore_ascii_case("locking_mode") {
             return apply_locking_mode(state, stmt);
         }
@@ -1816,6 +1833,58 @@ pub mod pragma {
                 Ok(PragmaOutput::Bool(enabled))
             }
         }
+    }
+
+    /// `PRAGMA soft_heap_limit [= N]`. Process-global, mirroring C SQLite's
+    /// `sqlite3_soft_heap_limit64` (GH #280). Both the bare query and an
+    /// assignment emit exactly one integer row = the value *after* any mutation.
+    /// Assignment rules (matches pragma.c + malloc.c): `N < 0` is a no-op; a
+    /// non-numeric argument is a no-op readback; otherwise the new soft limit is
+    /// `N`, except that when a hard limit is in force (`hard > 0`) an `N` that
+    /// exceeds it or equals `0` is clamped down to `hard`.
+    fn apply_soft_heap_limit(stmt: &PragmaStatement) -> PragmaOutput {
+        if let Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) = &stmt.value
+            && let Ok(n) = parse_integer_expr(expr)
+            && n >= 0
+        {
+            let hard = HARD_HEAP_LIMIT.load(Ordering::Relaxed);
+            let effective = if hard > 0 && (n > hard || n == 0) { hard } else { n };
+            SOFT_HEAP_LIMIT.store(effective, Ordering::Relaxed);
+        }
+        PragmaOutput::Int(SOFT_HEAP_LIMIT.load(Ordering::Relaxed))
+    }
+
+    /// `PRAGMA hard_heap_limit [= N]`. Process-global, mirroring C SQLite's
+    /// `sqlite3_hard_heap_limit64` (GH #280). Both forms emit one integer row =
+    /// the value *after* any mutation. From SQL the hard limit can only be
+    /// *lowered*: pragma.c invokes the setter only when `N > 0 && (prior == 0 ||
+    /// prior > N)`, so a non-positive `N` (including `0`) and any attempt to raise
+    /// it are no-ops. Lowering the hard limit retroactively lowers the soft limit
+    /// when `N < soft` or `soft == 0`. A non-numeric argument is a no-op readback.
+    fn apply_hard_heap_limit(stmt: &PragmaStatement) -> PragmaOutput {
+        if let Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) = &stmt.value
+            && let Ok(n) = parse_integer_expr(expr)
+        {
+            let prior = HARD_HEAP_LIMIT.load(Ordering::Relaxed);
+            if n > 0 && (prior == 0 || prior > n) {
+                HARD_HEAP_LIMIT.store(n, Ordering::Relaxed);
+                let soft = SOFT_HEAP_LIMIT.load(Ordering::Relaxed);
+                if n < soft || soft == 0 {
+                    SOFT_HEAP_LIMIT.store(n, Ordering::Relaxed);
+                }
+            }
+        }
+        PragmaOutput::Int(HARD_HEAP_LIMIT.load(Ordering::Relaxed))
+    }
+
+    /// Test-only: reset the process-global heap limits to `0/0` so unit tests that
+    /// exercise the lower-only hard-limit semantics can replay C SQLite's
+    /// fresh-process oracle scenarios from a known state (the hard limit cannot be
+    /// cleared to `0` from SQL, so there is no PRAGMA-only reset).
+    #[cfg(test)]
+    pub(crate) fn reset_heap_limits_for_test() {
+        SOFT_HEAP_LIMIT.store(0, Ordering::Relaxed);
+        HARD_HEAP_LIMIT.store(0, Ordering::Relaxed);
     }
 
     /// `PRAGMA locking_mode [= NORMAL|EXCLUSIVE]`. A bare query echoes the current
@@ -3640,6 +3709,69 @@ mod tests {
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = FAST"), Int(2));
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = OFF"), Int(0));
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = 2"), Int(2));
+    }
+
+    #[test]
+    fn test_connection_pragma_heap_limits_gh280() {
+        // GH #280 / bd-pgdi6: soft_heap_limit / hard_heap_limit are process-global
+        // and both forms echo one integer = the value after any mutation. Each
+        // scenario below is a separate C SQLite 3.46.1 oracle transcript, so we
+        // reset the shared statics to 0/0 between them.
+        use pragma::PragmaOutput::Int;
+        let mut state = pragma::ConnectionPragmaState::default();
+
+        // Fresh state reads 0/0.
+        pragma::reset_heap_limits_for_test();
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit"), Int(0));
+
+        // hard=10M then soft=50M -> soft clamps down to hard (10M).
+        pragma::reset_heap_limits_for_test();
+        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=10000000"), Int(10000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=50000000"), Int(10000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit"), Int(10000000));
+
+        // hard=50M then soft=10M -> soft stays 10M (below the hard ceiling).
+        pragma::reset_heap_limits_for_test();
+        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=50000000"), Int(50000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=10000000"), Int(10000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit"), Int(10000000));
+
+        // soft=90M then hard=30M -> lowering hard retroactively lowers soft to 30M.
+        pragma::reset_heap_limits_for_test();
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=90000000"), Int(90000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=30000000"), Int(30000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit"), Int(30000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit"), Int(30000000));
+
+        // soft=-5 is a no-op (negative), reads back 0.
+        pragma::reset_heap_limits_for_test();
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=-5"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit"), Int(0));
+
+        // soft=80M then soft=0 -> 0 clears the soft limit (no hard in force).
+        pragma::reset_heap_limits_for_test();
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=80000000"), Int(80000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=0"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit"), Int(0));
+
+        // hard=80M then hard=0 -> 0 cannot clear the hard limit; it stays 80M.
+        pragma::reset_heap_limits_for_test();
+        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=80000000"), Int(80000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=0"), Int(80000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit"), Int(80000000));
+
+        // A hard limit can never be raised from SQL: hard=40M then hard=90M stays 40M.
+        pragma::reset_heap_limits_for_test();
+        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=40000000"), Int(40000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=90000000"), Int(40000000));
+
+        // A non-numeric argument is a no-op readback (not an error).
+        pragma::reset_heap_limits_for_test();
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=70000000"), Int(70000000));
+        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit='junk'"), Int(70000000));
+
+        pragma::reset_heap_limits_for_test();
     }
 
     #[test]

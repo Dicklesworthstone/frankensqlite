@@ -4628,6 +4628,12 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     if name_is("journal_size_limit") {
         return &["journal_size_limit"];
     }
+    if name_is("soft_heap_limit") {
+        return &["soft_heap_limit"];
+    }
+    if name_is("hard_heap_limit") {
+        return &["hard_heap_limit"];
+    }
     if name_is("locking_mode") {
         return &["locking_mode"];
     }
