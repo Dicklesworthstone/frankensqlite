@@ -1692,7 +1692,12 @@ impl InProcessPageLockTable {
             let draining_guard = self.draining.lock();
             let draining = draining_guard.as_ref()?;
             let mut txns: std::collections::HashSet<TxnId> = std::collections::HashSet::new();
-            for shard in &draining.shards {
+            // `.iter()` (not `&draining.shards`): `&Box<[LockShard; N]>` only
+            // reaches `IntoIterator` via deref coercion, which some toolchains in
+            // the native feature graph fail to resolve in a `for` loop (GH #363).
+            // Every other shard-array walk in this file already uses `.iter()`
+            // (e.g. lines ~1178/1186).
+            for shard in draining.shards.iter() {
                 let map = shard.lock();
                 txns.extend(map.values().copied());
             }
