@@ -46350,6 +46350,29 @@ impl Connection {
             fts5.encode_shadow_rows()?
         };
 
+        // Contentless-delete tables carry a per-row `_docsize.origin` so a later
+        // lazy DELETE can tombstone the owning segment without hydrating the
+        // corpus (bd-fts5-lazy-shadow-reads-itcc4.3). The full re-encode collapses
+        // the whole index into one origin-tracked segment, so every docsize row
+        // belongs to it and shares that segment's origin. Derive it from the
+        // structure row before `shadow_rows.data` is consumed below; legacy
+        // (non-origin-tracking) tables keep the 2-column `(id, sz)` layout.
+        let full_encode_origin: Option<i64> = shadow_rows
+            .data
+            .iter()
+            .find(|row| row.id == FTS5_STRUCTURE_ROWID)
+            .and_then(|row| Fts5StructureRecord::decode(&row.block).ok())
+            .filter(Fts5StructureRecord::uses_origin_tracking)
+            .and_then(|structure| {
+                structure
+                    .levels
+                    .iter()
+                    .flat_map(|level| level.segments.iter())
+                    .map(|segment| segment.origin_lower)
+                    .min()
+            })
+            .and_then(|origin| i64::try_from(origin).ok());
+
         self.replace_storage_table_rows(
             &format!("{table_name}_data"),
             shadow_rows.data.into_iter().map(|row| {
@@ -46418,13 +46441,14 @@ impl Connection {
                 &docsize_name,
                 shadow_rows.docsize.into_iter().map(|row| {
                     let sz = encode_fts5_docsize_blob(&row.column_token_counts);
-                    (
-                        row.rowid,
-                        vec![
-                            SqliteValue::Integer(row.rowid),
-                            SqliteValue::Blob(Arc::from(sz.into_boxed_slice())),
-                        ],
-                    )
+                    let mut values = vec![
+                        SqliteValue::Integer(row.rowid),
+                        SqliteValue::Blob(Arc::from(sz.into_boxed_slice())),
+                    ];
+                    if let Some(origin) = full_encode_origin {
+                        values.push(SqliteValue::Integer(origin));
+                    }
+                    (row.rowid, values)
                 }),
             )
             .await?;
@@ -75242,14 +75266,26 @@ impl Connection {
             .borrow()
             .get(&binding_name.name.to_ascii_lowercase())
             .copied();
-        let root_page = {
+        let table_schema = {
             let schema = self.schema.borrow();
             schema
                 .iter()
                 .find(|table| table.name.eq_ignore_ascii_case(&binding_name.name))
-                .map(|table| table.root_page)?
+                .cloned()?
         };
-        let rows = {
+        let root_page = table_schema.root_page;
+        // GH#227: VIRTUAL generated columns are stored as a NULL placeholder in
+        // the record, so the memdb mirror row carries NULL in their slot. Left
+        // uncomputed here, a JOIN/filter predicate on such a column would
+        // compare NULL and silently drop every row. Compute them per row,
+        // mirroring the pager scan path (`inflate_table_row_values...`). If any
+        // row's generating expression fails to evaluate, decline the fast path
+        // (return None) so the pager scan can surface the error properly.
+        let has_virtual_generated = table_schema
+            .columns
+            .iter()
+            .any(|column| column.generated_expr.is_some() && column.generated_stored != Some(true));
+        let rows: Option<Vec<Vec<SqliteValue>>> = {
             let db = self.db.borrow();
             let table = db.get_table(root_page)?;
             table
@@ -75261,13 +75297,23 @@ impl Connection {
                     {
                         *alias_value = SqliteValue::Integer(rowid);
                     }
+                    if has_virtual_generated {
+                        Self::fill_virtual_generated_columns(
+                            &table_schema,
+                            rowid,
+                            rowid_alias_column_index,
+                            &mut row,
+                        )
+                        .ok()?;
+                    }
                     if src.hidden_rowid_projection.is_some() {
                         row.push(SqliteValue::Integer(rowid));
                     }
-                    row
+                    Some(row)
                 })
                 .collect()
         };
+        let rows = rows?;
         if hot_path_profile_enabled() {
             FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         }
@@ -196299,7 +196345,12 @@ SELECT x FROM t;
                 assert_eq!(fts5.row_count(), 6);
             }
 
-            conn.execute("DELETE FROM t WHERE rowid = 3;").await.unwrap();
+            // Delete a batch-1 row (row 1, full-encode origin — Stage 1b) AND a
+            // batch-2 row (row 3, incremental origin): both origin sources must
+            // tombstone lazily rather than hydrate.
+            conn.execute("DELETE FROM t WHERE rowid IN (1, 3);")
+                .await
+                .unwrap();
 
             {
                 let instances = conn.vtab_instances.borrow();
@@ -196311,7 +196362,7 @@ SELECT x FROM t;
                     fts5.is_lazy_on_disk(),
                     "a lazy contentless delete must tombstone, not hydrate the corpus"
                 );
-                assert_eq!(fts5.row_count(), 5, "row count drops by the delete");
+                assert_eq!(fts5.row_count(), 4, "row count drops by the two deletes");
             }
 
             let rust = conn
@@ -196320,12 +196371,8 @@ SELECT x FROM t;
                 .unwrap();
             assert_eq!(
                 rust.iter().map(|r| r.values()[0].clone()).collect::<Vec<_>>(),
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Integer(2),
-                    SqliteValue::Integer(5)
-                ],
-                "MATCH 'rust' excludes the tombstoned row 3"
+                vec![SqliteValue::Integer(2), SqliteValue::Integer(5)],
+                "MATCH 'rust' excludes both tombstoned rows (1 and 3)"
             );
             let gamma = conn
                 .query("SELECT rowid FROM t WHERE t MATCH 'gamma';")
@@ -196352,8 +196399,8 @@ SELECT x FROM t;
                 .unwrap();
             assert_eq!(
                 matched,
-                vec![1, 2, 5],
-                "stock MATCH 'rust' excludes the deleted row"
+                vec![2, 5],
+                "stock MATCH 'rust' excludes both deleted rows"
             );
             let gamma_stock: Vec<i64> = stock
                 .prepare("SELECT rowid FROM t WHERE t MATCH 'gamma'")
