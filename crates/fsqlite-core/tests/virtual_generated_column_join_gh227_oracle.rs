@@ -37,17 +37,15 @@ async fn assert_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &st
     assert_eq!(fr, rr, "VGC join mismatch on `{sql}`");
 }
 
+// GH #227 fixed: the plain SELECT join path is VDBE-codegen'd, and its
+// join-column reader (`emit_join_expr`) emitted a raw `Opcode::Column` for the
+// VIRTUAL generated column — the NULL placeholder slot — so the join key
+// matched nothing. Fixed by routing VIRTUAL generated columns through the
+// canonical `emit_table_column_read` (which computes the generating expression
+// on read). The file-backed inflate/memdb streaming scan paths were fixed in
+// parallel for the INSERT..SELECT join shapes. (STORED generated columns are
+// physically present and already joined correctly — see the control test.)
 #[test]
-#[ignore = "bd-gh-virtual-generated-columns (GH #227): in a FILE-BACKED database a VIRTUAL \
-generated column is never stored on the page, and neither the join-scan fast path \
-(try_scan_join_source_from_pager) NOR the general file-backed read path computes it on read — so a \
-join key on the VIRTUAL column matches nothing (empty join). Bailing the fast path to the general \
-scan does NOT help (verified: the general path is also uncomputed). The fix must WIRE the on-read \
-generated-column evaluation (the generic VGC computation from 8e81220aa) into the file-backed \
-read/inflate path (inflate_table_row_values_from_payload_values at connection.rs:61598 computes only \
-DEFAULT back-fill; extend it — or its callers — to evaluate ColumnInfo.generated_expr for VIRTUAL \
-columns). Un-ignore when that lands. (STORED generated columns are physically present and already \
-join correctly — see the control test below.)"]
 fn virtual_generated_column_join_file_backed_gh227() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();

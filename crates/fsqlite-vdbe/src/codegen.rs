@@ -11621,7 +11621,22 @@ fn emit_join_expr(
                     b.emit_op(Opcode::Rowid, cursor, target, 0, P4::None, 0);
                 }
                 JoinColumnResolution::Column(cursor, col_idx) => {
-                    b.emit_op(Opcode::Column, cursor, col_idx as i32, target, P4::None, 0);
+                    let (table, table_alias) = tables[cursor as usize];
+                    if virtual_generated_column_expr(&table.columns[col_idx]).is_some() {
+                        // GH#227 (bd-gh-virtual-generated-columns-5e0u1): a
+                        // VIRTUAL generated column is not materialized in the
+                        // record — the slot holds a NULL placeholder. Reading it
+                        // raw here made a JOIN predicate/projection on the column
+                        // compare NULL and drop every row. Route through the
+                        // canonical table-column reader so the generating
+                        // expression is computed (and affinity-coerced) on read,
+                        // exactly as single-table projection does.
+                        emit_table_column_read(
+                            b, cursor, table, table_alias, None, col_idx, target,
+                        );
+                    } else {
+                        b.emit_op(Opcode::Column, cursor, col_idx as i32, target, P4::None, 0);
+                    }
                 }
             }
             Ok(())
