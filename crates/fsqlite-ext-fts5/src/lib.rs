@@ -8424,6 +8424,29 @@ impl Fts5Table {
         );
     }
 
+    /// Advance lazy-mode bookkeeping after the host durably removes documents.
+    ///
+    /// The lazy DELETE path tombstones each rowid's owning on-disk segment and
+    /// drops its `_docsize` row without hydrating the corpus. Mirror
+    /// [`Self::note_lazy_inserted_rows`]: stay lazy, drop the cached row count,
+    /// and clear the transient delta — but never touch `next_rowid`, since a
+    /// delete does not recycle rowids.
+    pub fn note_lazy_deleted_rows(&mut self, rowids: &[i64]) {
+        if !self.lazy_on_disk {
+            return;
+        }
+        self.lazy_doc_count = self.lazy_doc_count.saturating_sub(rowids.len());
+        self.documents.clear();
+        self.shadow_rows = None;
+        self.row_locales.clear();
+        self.index = InvertedIndex::with_options_and_tokendata(
+            self.config.columnsize_enabled(),
+            &self.prefix_lengths,
+            self.config.detail_mode(),
+            self.config.tokendata_enabled(),
+        );
+    }
+
     /// Leave lazy on-disk mode after the host materializes table rows.
     pub fn clear_lazy_on_disk(&mut self) {
         self.lazy_on_disk = false;
@@ -11854,6 +11877,26 @@ mod tests {
         let final_avg = Fts5AveragesRecord::decode(&flush2.averages_data_row.block, 1).unwrap();
         assert_eq!(final_avg.total_rows, 7);
         assert_eq!(final_avg.column_token_totals, vec![88]);
+    }
+
+    #[test]
+    fn test_note_lazy_deleted_rows_stays_lazy_and_drops_count() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "t", "body", "content=''", "contentless_delete=1"],
+        )
+        .unwrap();
+        table.mark_lazy_on_disk(100);
+        assert_eq!(table.row_count(), 100);
+
+        table.note_lazy_deleted_rows(&[1, 2, 3]);
+
+        assert!(table.is_lazy_on_disk(), "a lazy delete must not leave lazy mode");
+        assert_eq!(table.row_count(), 97, "row count drops by the number of deletes");
+        assert!(table.documents.is_empty(), "no transient documents retained");
+        assert!(table.index.index.is_empty(), "no transient postings retained");
+        assert!(table.shadow_rows.is_none(), "reads historical state from the host");
     }
 
     #[test]
