@@ -46,6 +46,57 @@ fn log_replay_decision(
     );
 }
 
+/// Read and validate the 32-byte WAL header, tolerating a torn read.
+///
+/// FrankenSQLite rewrites the WAL header in place with a plain 32-byte write
+/// during `create`/`reset`, with no interlock against concurrent openers or
+/// refreshers (bd-mlz2t / GH #292). A reader that catches such a rewrite
+/// mid-flight sees a header whose checksum fails; re-read once — mirroring stock
+/// SQLite's `walIndexTryHdr` double read — before concluding the header is
+/// corrupt, so a transient torn read does not spuriously discard a live WAL
+/// generation view. A short read (the file is genuinely too small) and a
+/// structural parse failure remain fatal on the first attempt.
+async fn read_wal_header_torn_tolerant<F: VfsFile>(
+    file: &F,
+    cx: &Cx,
+    context: &'static str,
+    frame_count: usize,
+) -> Result<(WalHeader, SqliteWalChecksum)> {
+    const MAX_ATTEMPTS: usize = 2;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let mut header_buf = [0u8; WAL_HEADER_SIZE];
+        let header_read = file.read(cx, &mut header_buf, 0).await?;
+        if header_read < WAL_HEADER_SIZE {
+            log_replay_decision(context, 0, frame_count, "header_short_read_corrupt");
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL file too small for header during {context}: read {header_read}, need {WAL_HEADER_SIZE}"
+                ),
+            });
+        }
+        let disk_header = WalHeader::from_bytes(&header_buf)?;
+        let disk_big_endian = disk_header.big_endian_checksum();
+        let disk_header_checksum = read_wal_header_checksum(&header_buf)?;
+        let expected_header_checksum = wal_header_checksum(&header_buf, disk_big_endian)?;
+        if disk_header_checksum == expected_header_checksum {
+            return Ok((disk_header, disk_header_checksum));
+        }
+        log_replay_decision(
+            context,
+            0,
+            frame_count,
+            if attempt < MAX_ATTEMPTS {
+                "header_checksum_mismatch_retry"
+            } else {
+                "header_checksum_mismatch_corrupt"
+            },
+        );
+    }
+    Err(FrankenError::WalCorrupt {
+        detail: format!("WAL header checksum mismatch during {context}"),
+    })
+}
+
 struct VfsWritePreflight<'a> {
     completion: Option<&'a VfsWriteCompletion>,
 }
@@ -176,32 +227,9 @@ impl<F: VfsFile> WalFile<F> {
         // Validate current on-disk header and confirm it matches our view.
         // This is necessary even if file_size == expected_size to detect ABA
         // where the WAL was reset and then appended back to the exact same size.
-        let mut header_buf = [0u8; WAL_HEADER_SIZE];
-        let header_read = self.file.read(cx, &mut header_buf, 0).await?;
-        if header_read < WAL_HEADER_SIZE {
-            log_replay_decision("refresh", 0, self.frame_count, "header_short_read_corrupt");
-            return Err(FrankenError::WalCorrupt {
-                detail: format!(
-                    "WAL file too small for header during refresh: read {header_read}, need {WAL_HEADER_SIZE}"
-                ),
-            });
-        }
-
-        let disk_header = WalHeader::from_bytes(&header_buf)?;
-        let disk_big_endian = disk_header.big_endian_checksum();
-        let disk_header_checksum = read_wal_header_checksum(&header_buf)?;
-        let expected_header_checksum = wal_header_checksum(&header_buf, disk_big_endian)?;
-        if disk_header_checksum != expected_header_checksum {
-            log_replay_decision(
-                "refresh",
-                0,
-                self.frame_count,
-                "header_checksum_mismatch_corrupt",
-            );
-            return Err(FrankenError::WalCorrupt {
-                detail: "WAL header checksum mismatch during refresh".to_owned(),
-            });
-        }
+        // A torn read of an in-progress header rewrite is retried (bd-mlz2t).
+        let (disk_header, _disk_header_checksum) =
+            read_wal_header_torn_tolerant(&self.file, cx, "refresh", self.frame_count).await?;
 
         // Header changed under us (e.g., RESET/TRUNCATE checkpoint) — rebuild.
         if disk_header.magic != self.header.magic
@@ -324,33 +352,11 @@ impl<F: VfsFile> WalFile<F> {
         // before any fallible I/O and fail closed if rebuilding fails.
         self.last_fsynced_frame_count = 0;
 
-        let mut header_buf = [0u8; WAL_HEADER_SIZE];
-        let header_read = self.file.read(cx, &mut header_buf, 0).await?;
-        if header_read < WAL_HEADER_SIZE {
-            log_replay_decision("rebuild", 0, self.frame_count, "header_short_read_corrupt");
-            return Err(FrankenError::WalCorrupt {
-                detail: format!(
-                    "WAL file too small for header during rebuild: read {header_read}, need {WAL_HEADER_SIZE}"
-                ),
-            });
-        }
-
-        let header = WalHeader::from_bytes(&header_buf)?;
+        // A torn read of an in-progress header rewrite is retried (bd-mlz2t).
+        let (header, header_checksum) =
+            read_wal_header_torn_tolerant(&self.file, cx, "rebuild", self.frame_count).await?;
         let page_size = usize::try_from(header.page_size).expect("WAL header page size fits usize");
         let big_endian_checksum = header.big_endian_checksum();
-        let header_checksum = read_wal_header_checksum(&header_buf)?;
-        let expected_header_checksum = wal_header_checksum(&header_buf, big_endian_checksum)?;
-        if header_checksum != expected_header_checksum {
-            log_replay_decision(
-                "rebuild",
-                0,
-                self.frame_count,
-                "header_checksum_mismatch_corrupt",
-            );
-            return Err(FrankenError::WalCorrupt {
-                detail: "WAL header checksum mismatch during rebuild".to_owned(),
-            });
-        }
 
         self.header = header;
         self.page_size = page_size;
@@ -561,33 +567,13 @@ impl<F: VfsFile> WalFile<F> {
     /// running checksum.
     #[allow(clippy::too_many_lines)]
     pub async fn open(cx: &Cx, file: F) -> Result<Self> {
-        // Read and parse the 32-byte header.
-        let mut header_buf = [0u8; WAL_HEADER_SIZE];
-        let bytes_read = file.read(cx, &mut header_buf, 0).await?;
-        if bytes_read < WAL_HEADER_SIZE {
-            log_replay_decision("startup_open", 0, 0, "header_short_read_corrupt");
-            return Err(FrankenError::WalCorrupt {
-                detail: format!(
-                    "WAL file too small for header: read {bytes_read}, need {WAL_HEADER_SIZE}"
-                ),
-            });
-        }
-        let header = WalHeader::from_bytes(&header_buf)?;
+        // Read and parse the 32-byte header, tolerating a torn read of an
+        // in-progress header rewrite (bd-mlz2t / GH #292).
+        let (header, header_checksum) =
+            read_wal_header_torn_tolerant(&file, cx, "startup_open", 0).await?;
         let page_size = usize::try_from(header.page_size).expect("WAL header page size fits usize");
         let big_endian_checksum = header.big_endian_checksum();
         let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
-
-        // Validate header checksum.
-        let header_checksum = read_wal_header_checksum(&header_buf)?;
-        let expected_checksum =
-            crate::checksum::wal_header_checksum(&header_buf, big_endian_checksum)?;
-        if header_checksum != expected_checksum {
-            error!("WAL header checksum mismatch — file may be corrupt");
-            log_replay_decision("startup_open", 0, 0, "header_checksum_mismatch_corrupt");
-            return Err(FrankenError::WalCorrupt {
-                detail: "WAL header checksum mismatch".to_owned(),
-            });
-        }
 
         // Scan frames to determine valid count and running checksum.
         let file_size = file.file_size(cx)?;
@@ -1763,6 +1749,152 @@ mod tests {
             .open(cx, Some(std::path::Path::new("test.db-wal")), flags)
             .expect("open WAL file");
         file
+    }
+
+    // bd-mlz2t: a read-only `VfsFile` that serves a scripted sequence of 32-byte
+    // header reads (the final entry repeats), so `read_wal_header_torn_tolerant`'s
+    // torn-read retry can be exercised deterministically. The helper only ever
+    // calls `read`; every other method is unreachable in this test.
+    struct ScriptedHeaderFile {
+        headers: Vec<[u8; WAL_HEADER_SIZE]>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedHeaderFile {
+        fn new(headers: Vec<[u8; WAL_HEADER_SIZE]>) -> Self {
+            Self {
+                headers,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn read_count(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl VfsFile for ScriptedHeaderFile {
+        fn read<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            buf: &'a mut [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+            async move {
+                assert_eq!(offset, 0, "scripted file only serves the header at offset 0");
+                let idx = self
+                    .reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    .min(self.headers.len() - 1);
+                let n = buf.len().min(WAL_HEADER_SIZE);
+                buf[..n].copy_from_slice(&self.headers[idx][..n]);
+                Ok(n)
+            }
+        }
+
+        fn close(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+        fn write<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _buf: &'a [u8],
+            _offset: u64,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            async move { unreachable!("scripted header file is read-only") }
+        }
+        fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
+            unreachable!()
+        }
+        fn sync(&mut self, _cx: &Cx, _flags: SyncFlags) -> Result<()> {
+            unreachable!()
+        }
+        fn file_size(&self, _cx: &Cx) -> Result<u64> {
+            Ok(u64::try_from(WAL_HEADER_SIZE).unwrap_or(0))
+        }
+        fn lock(&mut self, _cx: &Cx, _level: fsqlite_types::LockLevel) -> Result<()> {
+            unreachable!()
+        }
+        fn unlock(&mut self, _cx: &Cx, _level: fsqlite_types::LockLevel) -> Result<()> {
+            unreachable!()
+        }
+        fn lock_external_shared_snapshot(&mut self, _cx: &Cx) -> Result<()> {
+            unreachable!()
+        }
+        fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
+            unreachable!()
+        }
+        fn lock_external_maintenance(&mut self, _cx: &Cx, _wal_mode: bool) -> Result<()> {
+            unreachable!()
+        }
+        fn restore_external_maintenance_attempt(&mut self, _cx: &Cx) -> Result<()> {
+            unreachable!()
+        }
+        fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
+            unreachable!()
+        }
+        fn shm_map(
+            &mut self,
+            _cx: &Cx,
+            _region: u32,
+            _size: u32,
+            _extend: bool,
+        ) -> Result<fsqlite_vfs::ShmRegion> {
+            unreachable!()
+        }
+        fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
+            unreachable!()
+        }
+        fn shm_barrier(&self) {
+            unreachable!()
+        }
+        fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    /// Build a valid 32-byte WAL header (exactly as `WalFile::create` writes it)
+    /// plus a copy whose stored checksum is corrupted (parses, but fails the
+    /// checksum comparison — the torn-read shape).
+    fn valid_and_corrupt_wal_headers(cx: &Cx) -> ([u8; WAL_HEADER_SIZE], [u8; WAL_HEADER_SIZE]) {
+        let vfs = MemoryVfs::new();
+        let create_file = open_wal_file(&vfs, cx);
+        let _wal =
+            WalFile::create(cx, create_file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        let reader = open_wal_file(&vfs, cx);
+        let mut valid = [0u8; WAL_HEADER_SIZE];
+        let n = reader.read(cx, &mut valid, 0).expect("read valid header");
+        assert_eq!(n, WAL_HEADER_SIZE);
+        let mut corrupt = valid;
+        corrupt[WAL_HEADER_SIZE - 1] ^= 0xFF;
+        (valid, corrupt)
+    }
+
+    #[test]
+    fn torn_wal_header_read_retries_before_corrupt_bd_mlz2t() {
+        let cx = test_cx();
+        let (valid, corrupt) = valid_and_corrupt_wal_headers(&cx);
+        let expected_page_size = u32::try_from(PAGE_SIZE).expect("PAGE_SIZE fits u32");
+
+        // Torn read: bad checksum on the first read, valid on the retry — the
+        // header is accepted, so a live WAL generation view is not discarded.
+        let torn = ScriptedHeaderFile::new(vec![corrupt, valid]);
+        let (header, _checksum) = read_wal_header_torn_tolerant(&torn, &cx, "test_torn", 0)
+            .expect("torn read recovers on retry");
+        assert_eq!(torn.read_count(), 2, "recovery takes exactly two reads");
+        assert_eq!(header.page_size, expected_page_size);
+
+        // Persistent corruption: both attempts fail — the retry does not mask a
+        // genuinely corrupt header.
+        let bad = ScriptedHeaderFile::new(vec![corrupt]);
+        let err = read_wal_header_torn_tolerant(&bad, &cx, "test_bad", 0)
+            .expect_err("persistent corruption stays corrupt");
+        assert!(matches!(err, FrankenError::WalCorrupt { .. }));
+        assert_eq!(bad.read_count(), 2, "both attempts are exhausted first");
+
+        // Valid on the first read: no retry.
+        let good = ScriptedHeaderFile::new(vec![valid]);
+        read_wal_header_torn_tolerant(&good, &cx, "test_good", 0).expect("valid header reads");
+        assert_eq!(good.read_count(), 1, "a valid header does not retry");
     }
 
     fn track_c_scratch_run_summary(runs: &[TrackCScratchBenchRun]) -> Value {
