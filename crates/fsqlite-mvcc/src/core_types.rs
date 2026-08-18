@@ -1681,49 +1681,82 @@ impl InProcessPageLockTable {
     ///
     /// Returns `None` if no rebuild is in progress.
     pub fn drain_orphaned(&self, is_active_txn: impl Fn(TxnId) -> bool) -> Option<RebuildResult> {
+        // bd-gq0bi: never invoke the caller-supplied `is_active_txn` closure
+        // while holding the `draining` mutex or a shard lock — a re-entrant
+        // closure would deadlock parking_lot's non-reentrant mutex. Snapshot the
+        // distinct txn ids under the lock, evaluate the predicate with NO table
+        // lock held, then re-acquire and remove the orphaned entries — only if
+        // the same rebuild is still draining, so a finalized/rotated table is
+        // never edited with a stale decision set.
+        let (snapshot_epoch, candidate_txns) = {
+            let draining_guard = self.draining.lock();
+            let draining = draining_guard.as_ref()?;
+            let mut txns: std::collections::HashSet<TxnId> = std::collections::HashSet::new();
+            for shard in &draining.shards {
+                let map = shard.lock();
+                txns.extend(map.values().copied());
+            }
+            (draining.rebuild_epoch, txns)
+        };
+
+        // Evaluate the caller predicate with no table lock held (re-entrancy safe).
+        let orphaned: std::collections::HashSet<TxnId> = candidate_txns
+            .into_iter()
+            .filter(|txn_id| !is_active_txn(*txn_id))
+            .collect();
+
         let draining_guard = self.draining.lock();
         let draining = draining_guard.as_ref()?;
+        let rebuild_epoch = draining.rebuild_epoch;
+        if rebuild_epoch != snapshot_epoch {
+            // The draining table rotated or finalized under us; the snapshot is
+            // stale and must not be applied to a different rebuild's entries.
+            drop(draining_guard);
+            return Some(RebuildResult {
+                orphaned_cleaned: 0,
+                retained: 0,
+                elapsed: Duration::ZERO,
+                rebuild_epoch,
+            });
+        }
+
         let mut total_cleaned = 0usize;
         let mut total_retained = 0usize;
-
         for (shard_idx, shard) in draining.shards.iter().enumerate() {
             let mut map = shard.lock();
             let before = map.len();
             map.retain(|_page, txn_id| {
-                let active = is_active_txn(*txn_id);
-                if !active {
+                let orphan = orphaned.contains(&*txn_id);
+                if orphan {
                     tracing::debug!(
                         shard = shard_idx,
                         txn_id = %txn_id,
                         "removing orphaned lock entry from draining table"
                     );
                 }
-                active
+                !orphan
             });
             let after = map.len();
             drop(map);
             total_cleaned += before - after;
             total_retained += after;
         }
-
-        let rebuild_epoch = draining.rebuild_epoch;
         drop(draining_guard);
 
-        let elapsed = Duration::ZERO;
         if total_cleaned > 0 {
             self.notify_all_waiters();
         }
         tracing::debug!(
             cleaned = total_cleaned,
             retained = total_retained,
-            elapsed_ms = elapsed.as_millis(),
+            elapsed_ms = 0u128,
             "drain orphaned pass complete"
         );
 
         Some(RebuildResult {
             orphaned_cleaned: total_cleaned,
             retained: total_retained,
-            elapsed,
+            elapsed: Duration::ZERO,
             rebuild_epoch,
         })
     }
@@ -5509,6 +5542,41 @@ mod tests {
         assert!(
             !table.is_rebuild_in_progress(),
             "bead_id={BEAD_22N12} case=bounded_time rebuild must be finalized"
+        );
+    }
+
+    #[test]
+    fn test_drain_orphaned_predicate_not_called_under_lock_bd_gq0bi() {
+        // bd-gq0bi: drain_orphaned must evaluate the caller `is_active_txn`
+        // predicate WITHOUT holding the draining mutex, so a re-entrant predicate
+        // does not deadlock. The predicate below re-enters the table via
+        // holder(), which takes the draining lock for a page still in the
+        // draining shard table — under the old callback-under-lock code this test
+        // would hang on parking_lot's non-reentrant mutex.
+        let mut table = InProcessPageLockTable::new();
+        let txn_orphan = TxnId::new(999).unwrap();
+        let page = sharded_rebuild_page(1);
+        table.try_acquire(page, txn_orphan).unwrap();
+
+        // Rotate the orphan lock into the draining table.
+        table.begin_rebuild().unwrap();
+
+        let table = std::sync::Arc::new(table);
+        let probe = std::sync::Arc::clone(&table);
+        let result = table
+            .drain_orphaned(move |txn| {
+                // Re-enter the lock table under the predicate: holder() reads the
+                // draining shard table, taking self.draining.
+                let _ = probe.holder(page);
+                txn != txn_orphan
+            })
+            .expect("drain returns a result while a rebuild is in progress");
+
+        assert_eq!(result.orphaned_cleaned, 1, "the orphaned lock must be cleaned");
+        assert_eq!(
+            table.holder(page),
+            None,
+            "the drained orphan lock must be gone from the draining table"
         );
     }
 
