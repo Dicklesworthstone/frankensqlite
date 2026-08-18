@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::value::{format_sqlite_float, sql_like_cased};
-use fsqlite_types::{SmallText, SqliteValue};
+use fsqlite_types::{SmallText, SqliteValue, TextEncoding};
 
 use crate::agg_builtins::register_aggregate_builtins;
 use crate::datetime::register_datetime_builtins;
@@ -59,6 +59,17 @@ thread_local! {
     /// `sync_change_tracking_context`) and the datetime path captures it lazily
     /// on the first `'now'` use.
     static STATEMENT_NOW: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+    /// The database TEXT encoding for the connection whose statement is
+    /// currently executing on this thread (bd-iubwb). `octet_length(X)` must
+    /// report the byte length of X's TEXT representation *in the database
+    /// encoding*, so a UTF-16 database counts each code unit as two bytes.
+    /// Defaults to `Utf8` (the common case, byte-identical to today), and is
+    /// projected by the Connection before each statement (see
+    /// `sync_change_tracking_context`) and by the VDBE engine before every
+    /// scalar-function invocation, mirroring how `CASE_SENSITIVE_LIKE` is
+    /// threaded so the encoding never has to be passed through every call site.
+    static STATEMENT_TEXT_ENCODING: std::cell::Cell<TextEncoding> =
+        const { std::cell::Cell::new(TextEncoding::Utf8) };
 }
 
 /// Reset the captured statement `'now'` (called by the Connection at each
@@ -88,6 +99,33 @@ pub fn set_case_sensitive_like(case_sensitive: bool) {
 #[must_use]
 pub fn case_sensitive_like_active() -> bool {
     CASE_SENSITIVE_LIKE.get()
+}
+
+/// Set the active database TEXT encoding for the statement on this thread.
+///
+/// Called by the Connection before executing a statement and by the VDBE engine
+/// before invoking a scalar function. Read by `octet_length()`.
+pub fn set_statement_text_encoding(encoding: TextEncoding) {
+    STATEMENT_TEXT_ENCODING.set(encoding);
+}
+
+/// Read the active database TEXT encoding for the current statement's thread.
+/// Defaults to [`TextEncoding::Utf8`] when nothing has been projected.
+#[must_use]
+pub fn statement_text_encoding() -> TextEncoding {
+    STATEMENT_TEXT_ENCODING.get()
+}
+
+/// Byte length of `text` when serialized in the database `encoding`. UTF-8 is
+/// the string's own byte length; UTF-16 (either endianness) is two bytes per
+/// UTF-16 code unit, which counts a non-BMP scalar (a surrogate pair) as four
+/// bytes exactly as SQLite does.
+#[must_use]
+fn text_octet_length(text: &str, encoding: TextEncoding) -> usize {
+    match encoding {
+        TextEncoding::Utf8 => text.len(),
+        TextEncoding::Utf16le | TextEncoding::Utf16be => 2 * text.encode_utf16().count(),
+    }
 }
 
 /// Connection-scoped change-tracking state projected into builtin execution context.
@@ -602,10 +640,15 @@ impl ScalarFunction for OctetLengthFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
+        // bd-iubwb: octet_length reports the byte length of X's TEXT rendering
+        // in the DATABASE text encoding (projected via the thread-local), so a
+        // UTF-16 database counts two bytes per code unit. BLOB is raw bytes,
+        // regardless of encoding.
+        let encoding = statement_text_encoding();
         let len = match &args[0] {
-            SqliteValue::Text(s) => s.len(),
+            SqliteValue::Text(s) => text_octet_length(s.as_str(), encoding),
             SqliteValue::Blob(b) => b.len(),
-            other => other.to_text().len(),
+            other => text_octet_length(&other.to_text(), encoding),
         };
         Ok(SqliteValue::Integer(len as i64))
     }
@@ -3889,6 +3932,69 @@ mod tests {
             .unwrap(),
             SqliteValue::Integer(5)
         );
+    }
+
+    #[test]
+    fn test_octet_length_honors_statement_text_encoding() {
+        // Default (UTF-8): byte length is the string's own byte length.
+        set_statement_text_encoding(TextEncoding::Utf8);
+        assert_eq!(
+            invoke1(
+                &OctetLengthFunc,
+                SqliteValue::Text(SmallText::from_string("abc"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(3)
+        );
+        assert_eq!(
+            invoke1(&OctetLengthFunc, SqliteValue::Integer(12345)).unwrap(),
+            SqliteValue::Integer(5)
+        );
+
+        // UTF-16le: two bytes per code unit for TEXT and rendered numerics.
+        set_statement_text_encoding(TextEncoding::Utf16le);
+        assert_eq!(statement_text_encoding(), TextEncoding::Utf16le);
+        assert_eq!(
+            invoke1(
+                &OctetLengthFunc,
+                SqliteValue::Text(SmallText::from_string("abc"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(6)
+        );
+        assert_eq!(
+            invoke1(&OctetLengthFunc, SqliteValue::Integer(12345)).unwrap(),
+            SqliteValue::Integer(10)
+        );
+        // A non-BMP scalar is a surrogate pair = two code units = four bytes.
+        assert_eq!(
+            invoke1(
+                &OctetLengthFunc,
+                SqliteValue::Text(SmallText::from_string("\u{1F600}"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(4)
+        );
+
+        // UTF-16be counts identically to UTF-16le.
+        set_statement_text_encoding(TextEncoding::Utf16be);
+        assert_eq!(
+            invoke1(
+                &OctetLengthFunc,
+                SqliteValue::Text(SmallText::from_string("abc"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(6)
+        );
+
+        // BLOB stays raw bytes regardless of the database encoding.
+        assert_eq!(
+            invoke1(&OctetLengthFunc, SqliteValue::Blob(vec![1, 2, 3].into())).unwrap(),
+            SqliteValue::Integer(3)
+        );
+
+        // Restore the default so other tests on this thread are unaffected.
+        set_statement_text_encoding(TextEncoding::Utf8);
     }
 
     // ── lower/upper ──────────────────────────────────────────────────────

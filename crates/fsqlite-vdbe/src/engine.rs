@@ -154,7 +154,7 @@ use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{
     ApplicationFunctionKind, ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry,
-    ResolvedScalarFunction,
+    ResolvedScalarFunction, set_statement_text_encoding,
 };
 use fsqlite_mvcc::ConcurrentPageState;
 use fsqlite_mvcc::{
@@ -12939,6 +12939,20 @@ impl VdbeEngine {
                     } else {
                         None
                     };
+
+                    // bd-iubwb: project this database's TEXT encoding so
+                    // `octet_length()` reports byte lengths in the DB encoding
+                    // (UTF-16 = two bytes per code unit). `self.text_encoding`
+                    // is authoritative once a cursor has adopted it from the
+                    // page-1 header. It is only left at the `Utf8` default when
+                    // this engine never opened a table cursor (e.g. a FROM-less
+                    // scalar `SELECT octet_length(...)`); in that case the
+                    // Connection has already projected the real encoding into
+                    // the thread-local (see `sync_change_tracking_context`), so
+                    // we must NOT clobber it back to `Utf8`.
+                    if self.text_encoding != TextEncoding::Utf8 {
+                        set_statement_text_encoding(self.text_encoding);
+                    }
 
                     // Use a direct slice into the register file instead of
                     // allocating a SmallVec via collect_reg_range.  Same pattern as

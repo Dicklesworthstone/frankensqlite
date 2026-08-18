@@ -101,8 +101,8 @@ pub use authorizer::{AuthAction, AuthResult, Authorizer, AuthorizerAction, Autho
 pub use builtins::{
     ChangeTrackingState, case_sensitive_like_active, get_last_changes, get_last_insert_rowid,
     get_total_changes, register_builtins, reset_total_changes, set_case_sensitive_like,
-    set_change_tracking_state, set_last_changes, set_last_insert_rowid, sqlite_compile_options,
-    sqlite_compileoption_used,
+    set_change_tracking_state, set_last_changes, set_last_insert_rowid, set_statement_text_encoding,
+    sqlite_compile_options, sqlite_compileoption_used, statement_text_encoding,
 };
 pub use collation::{
     BinaryCollation, CollationAnnotation, CollationFunction, CollationRegistry, CollationSource,

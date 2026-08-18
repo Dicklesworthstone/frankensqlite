@@ -99,6 +99,7 @@ use fsqlite_ext_rtree::{RtreeGeometry, RtreeVirtualTable};
 use fsqlite_func::builtins::{
     ChangeTrackingState, case_sensitive_like_active, get_change_tracking_state,
     reset_statement_now, set_case_sensitive_like, set_change_tracking_state,
+    set_statement_text_encoding, statement_text_encoding,
 };
 use fsqlite_func::collation::{CollationFunction, CollationRegistry};
 use fsqlite_func::vtab::{
@@ -16800,6 +16801,16 @@ impl Connection {
         let case_sensitive_like = self.pragma_state.borrow().case_sensitive_like;
         if case_sensitive_like_active() != case_sensitive_like {
             set_case_sensitive_like(case_sensitive_like);
+        }
+        // bd-iubwb: project this database's TEXT encoding so `octet_length()`
+        // reports byte lengths in the DB encoding (UTF-16 = two bytes per code
+        // unit) on the interpreted lanes and on FROM-less scalar SELECTs, whose
+        // VDBE engine never adopts an encoding from a table page. The VDBE
+        // engine overrides this only when it has adopted a non-UTF-8 encoding
+        // from an opened cursor, so the two lanes always agree.
+        let db_text_encoding = self.db_text_encoding.get();
+        if statement_text_encoding() != db_text_encoding {
+            set_statement_text_encoding(db_text_encoding);
         }
     }
 
