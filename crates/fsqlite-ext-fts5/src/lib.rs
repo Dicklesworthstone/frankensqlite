@@ -1492,6 +1492,79 @@ pub fn encode_incremental_delete_flush(
     })
 }
 
+/// The persist payload for a contentless `'delete-all'`: reset the index to
+/// empty without reading or rebuilding the corpus.
+#[derive(Debug, Clone)]
+pub struct Fts5DeleteAllFlush {
+    /// The fresh empty structure row: every level dropped, the structure cookie
+    /// preserved, and the table kept in its current v1/v2 mode (`origin_counter`
+    /// is held `> 0` in-memory so `encode` still writes the v2 marker; the
+    /// counter value itself is not a persisted field — decode reconstructs it as
+    /// `max(origin_upper)+1`, i.e. `1` for an emptied index, which is safe since
+    /// no live segments remain to collide). `write_counter` is bumped.
+    pub structure_data_row: Fts5DataRow,
+    /// The reset averages row (zero rows, zero per-column token totals — encodes
+    /// to an empty block).
+    pub averages_data_row: Fts5DataRow,
+    /// Every segment's `_data` rows (segment leaves + tombstone pages) to
+    /// physically delete, reclaiming the whole on-disk corpus.
+    pub deleted_data_rowids: Vec<i64>,
+}
+
+/// Encode a contentless `'delete-all'` maintenance command: drop every on-disk
+/// segment and reset the structure + averages to empty, WITHOUT hydrating or
+/// rebuilding the corpus (the lazy-read invariant this epic exists to keep).
+///
+/// Reads nothing but the decoded structure, so it is `O(segments)` regardless
+/// of corpus size. The structure cookie survives, and the table stays in its
+/// current (legacy or v2 origin-tracking) mode: `origin_counter` is kept `> 0`
+/// in-memory so `encode` re-emits the v2 marker (the counter value is not a
+/// persisted field — decode reconstructs it to `1` for an emptied index, which
+/// is safe since no live segments remain). Mirrors the
+/// segment `_data`-rowid enumeration used by [`encode_merged_segment`]
+/// (segment leaves over `pgno_first..=pgno_last` plus `0..tombstone_page_count`
+/// tombstone pages), which is complete for lazily-written segments.
+pub fn encode_contentless_delete_all_flush(
+    existing_structure: &Fts5StructureRecord,
+    column_count: usize,
+) -> Result<Fts5DeleteAllFlush> {
+    let mut deleted_data_rowids = Vec::new();
+    for level in &existing_structure.levels {
+        for segment in &level.segments {
+            for pgno in segment.pgno_first..=segment.pgno_last {
+                deleted_data_rowids.push(
+                    Fts5DataRowid::SegmentLeaf {
+                        segid: segment.segid,
+                        pgno,
+                    }
+                    .encode()?,
+                );
+            }
+            for hash_pgno in 0..segment.tombstone_page_count {
+                deleted_data_rowids.push(
+                    Fts5DataRowid::Tombstone {
+                        segid: segment.segid,
+                        hash_pgno,
+                    }
+                    .encode()?,
+                );
+            }
+        }
+    }
+
+    let mut structure = existing_structure.clone();
+    structure.levels.clear();
+    structure.write_counter = structure.write_counter.saturating_add(1);
+
+    let averages = Fts5AveragesRecord::new(0, vec![0; column_count]);
+
+    Ok(Fts5DeleteAllFlush {
+        structure_data_row: Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
+        averages_data_row: Fts5DataRow::new(FTS5_AVERAGES_ROWID, averages.encode()),
+        deleted_data_rowids,
+    })
+}
+
 /// The persist payload for merging several on-disk segments into one.
 #[derive(Debug, Clone)]
 pub struct Fts5MergeFlush {
@@ -12271,6 +12344,93 @@ mod tests {
                 .map(|e| e.rowid)
                 .collect::<Vec<_>>(),
             vec![2]
+        );
+    }
+
+    #[test]
+    fn test_encode_contentless_delete_all_flush_resets_and_deletes_all_segments() {
+        // Two segments across two levels; segid 2 spans three leaves and carries
+        // two tombstone pages. Origin tracking (v2) is active.
+        let structure = Fts5StructureRecord {
+            cookie: 7,
+            write_counter: 5,
+            origin_counter: 4,
+            levels: vec![
+                Fts5StructureLevel::new(
+                    0,
+                    vec![Fts5StructureSegment::new(1, 1, 1).with_origin_tracking(1, 1, 0, 0, 3)],
+                ),
+                Fts5StructureLevel::new(
+                    0,
+                    vec![Fts5StructureSegment::new(2, 1, 3).with_origin_tracking(2, 3, 2, 5, 9)],
+                ),
+            ],
+        };
+
+        let flush = encode_contentless_delete_all_flush(&structure, 2).unwrap();
+
+        // Structure reset: no levels; cookie preserved; write_counter bumped;
+        // v2 mode preserved. origin_counter is not persisted — decode
+        // reconstructs it as max(origin_upper)+1, so an emptied v2 index
+        // reconstructs to 1 (safe: no live segments remain to collide).
+        let reset = Fts5StructureRecord::decode(&flush.structure_data_row.block).unwrap();
+        assert!(reset.levels.is_empty(), "every level dropped");
+        assert_eq!(reset.cookie, 7, "cookie preserved");
+        assert_eq!(reset.write_counter, 6, "write_counter bumped");
+        assert!(reset.uses_origin_tracking(), "empty structure keeps v2 mode");
+        assert_eq!(
+            reset.origin_counter, 1,
+            "emptied v2 index reconstructs origin_counter=1"
+        );
+
+        // Averages reset to the zero state (empty block).
+        assert_eq!(flush.averages_data_row.id, FTS5_AVERAGES_ROWID);
+        assert!(
+            flush.averages_data_row.block.is_empty(),
+            "zeroed averages encode to an empty block"
+        );
+
+        // Delete list = every segment's leaves (segid1: pgno 1; segid2: pgno
+        // 1..=3) plus segid2's two tombstone pages.
+        let mut want: Vec<i64> = vec![
+            Fts5DataRowid::SegmentLeaf { segid: 1, pgno: 1 }.encode().unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 1 }.encode().unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 2 }.encode().unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 3 }.encode().unwrap(),
+            Fts5DataRowid::Tombstone { segid: 2, hash_pgno: 0 }.encode().unwrap(),
+            Fts5DataRowid::Tombstone { segid: 2, hash_pgno: 1 }.encode().unwrap(),
+        ];
+        want.sort_unstable();
+        let mut got = flush.deleted_data_rowids.clone();
+        got.sort_unstable();
+        assert_eq!(got, want, "delete-all enumerates every segment's data rows");
+    }
+
+    #[test]
+    fn test_encode_contentless_delete_all_flush_preserves_legacy_mode() {
+        // Legacy structure (no origin tracking): origin_counter 0, zero origins.
+        let structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 2,
+            origin_counter: 0,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                vec![Fts5StructureSegment::new(1, 1, 1)],
+            )],
+        };
+
+        let flush = encode_contentless_delete_all_flush(&structure, 1).unwrap();
+        let reset = Fts5StructureRecord::decode(&flush.structure_data_row.block).unwrap();
+        assert!(reset.levels.is_empty());
+        assert!(
+            !reset.uses_origin_tracking(),
+            "legacy structure stays legacy after delete-all"
+        );
+        assert_eq!(reset.write_counter, 3, "write_counter bumped");
+        assert_eq!(
+            flush.deleted_data_rowids,
+            vec![Fts5DataRowid::SegmentLeaf { segid: 1, pgno: 1 }.encode().unwrap()],
+            "single-leaf segment enumerated"
         );
     }
 
