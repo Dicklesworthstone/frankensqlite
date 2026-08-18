@@ -73562,12 +73562,23 @@ impl Connection {
         };
         let empty_row: Vec<SqliteValue> = Vec::new();
         let empty_col_map: Vec<(String, String, bool)> = Vec::new();
+        // Route the FROM-less WHERE predicate through the short-circuiting
+        // truth-context evaluator (bd-and-or-short-circuit-dkswh) so a boolean
+        // skeleton such as `1 OR (SELECT ... FROM json_each('bad'))` stops at the
+        // first satisfying operand exactly as stock SQLite does, instead of
+        // eagerly evaluating — and erroring on — the dead arm. This matches the
+        // table-backed WHERE path (execute_join_select), which already filters
+        // through `eval_expr_truthiness`. A row is included only when the
+        // predicate is TRUE; NULL/false exclude it — identical to the prior
+        // `is_sqlite_truthy` result for scalar predicates (the truthiness
+        // evaluator's fall-through arm returns None for NULL, Some(truthy)
+        // otherwise), with short-circuit added only for AND/OR/NOT skeletons.
         let row_included = match resolved_where_clause.as_ref() {
             None => true,
-            Some(predicate) => is_sqlite_truthy(
-                &self
-                    .eval_expr_with_subqueries(predicate, &empty_row, &empty_col_map, params)
+            Some(predicate) => matches!(
+                self.eval_expr_truthiness(predicate, true, &empty_row, &empty_col_map, params)
                     .await?,
+                Some(true)
             ),
         };
 
