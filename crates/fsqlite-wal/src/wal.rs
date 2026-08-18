@@ -4839,6 +4839,86 @@ mod tests {
         wal.close(&cx).expect("close");
     }
 
+    /// GH#187 / bd-odyb1: the reader-visible publish snapshot is gated on the
+    /// post-fsync durable watermark (`last_fsynced_frame_count`), NEVER on the
+    /// raw append cursor (`last_commit_frame`).
+    ///
+    /// This proves the two-phase separation directly: appending a commit frame
+    /// advances the append cursor but NOT the durable watermark, so publishing
+    /// the just-appended commit is refused until a sync completes. It is the
+    /// permanent regression guard behind the "verified benign" verdict — the raw
+    /// cursor advancing during append is internal-only and cannot become
+    /// reader-visible before the fsync barrier.
+    #[test]
+    fn two_phase_publish_gate_blocks_commit_until_fsync() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+
+        // (a) Fresh WAL: no commits, nothing durable, nothing publishable.
+        assert_eq!(wal.frame_count(), 0);
+        assert_eq!(wal.last_commit_frame(&cx).expect("query"), None);
+        assert_eq!(wal.last_fsynced_frame_count(), 0);
+
+        // Append a *commit* frame (nonzero db_size is the engine's commit marker)
+        // via the real append path, WITHOUT calling sync()/durable_sync().
+        wal.append_frame(&cx, 1, &sample_page(0x11), 1)
+            .expect("append commit frame");
+
+        // (b) The append cursor advanced ...
+        assert_eq!(wal.frame_count(), 1);
+        assert_eq!(
+            wal.last_commit_frame(&cx).expect("query"),
+            Some(0),
+            "append cursor (last_commit_frame) must advance during append"
+        );
+        // ... but the durable watermark did NOT: nothing is fsynced yet.
+        assert_eq!(
+            wal.last_fsynced_frame_count(),
+            0,
+            "durable watermark must NOT advance on append (only on a successful sync)"
+        );
+
+        // Publishing the just-appended commit is refused because it is not yet
+        // fsynced. Under debug-assertions (the default for `cargo test`) the
+        // guard trips a `debug_assert!` and panics; in release it only errors
+        // when FRANKENSQLITE_PARANOID_DURABILITY=1. Either way the guard MUST
+        // fire while the commit is durably unbacked.
+        assert!(
+            wal.last_fsynced_frame_count() < 1,
+            "watermark below publish_frame_count means the commit is not yet publishable"
+        );
+        if cfg!(debug_assertions) {
+            // The panic message printed to stderr here is EXPECTED: it is the
+            // durability guard doing its job, not a test failure. We do not swap
+            // the global panic hook (that would race parallel tests); the
+            // captured unwind is enough to prove the guard fired.
+            let tripped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = wal.assert_publish_safe(1);
+            }));
+            assert!(
+                tripped.is_err(),
+                "assert_publish_safe(1) must trip the durability guard when the \
+                 just-appended commit has not been fsynced"
+            );
+        }
+
+        // (c) A durable sync advances the watermark to the frame count, and only
+        // then is publishing the commit allowed.
+        wal.durable_sync(&cx, fsqlite_vfs::SyncKind::FullDurable)
+            .expect("durable_sync");
+        assert_eq!(
+            wal.last_fsynced_frame_count(),
+            1,
+            "durable watermark equals the frame count after a successful fsync"
+        );
+        wal.assert_publish_safe(1)
+            .expect("publish must be safe once the commit frame is fsynced");
+
+        wal.close(&cx).expect("close WAL");
+    }
+
     #[test]
     fn durable_sync_with_data_only_kind() {
         let cx = test_cx();

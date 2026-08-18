@@ -1054,6 +1054,189 @@ impl Fts5SegmentLeaf {
     }
 }
 
+/// One segment leaf page parsed WITHOUT decoding its doclists — because stock
+/// FTS5 splits a single doclist across leaf pages (even mid-poslist), a doclist
+/// cannot be decoded from one page in isolation (that is exactly the
+/// `truncated poslist body` failure, GH#360). This records each term that
+/// STARTS on the page together with the byte offset at which its doclist begins,
+/// plus the term-entry offsets from the footer, so a segment-level stitcher can
+/// concatenate a term's doclist bytes across page boundaries and decode them as
+/// one buffer.
+struct Fts5LeafRaw {
+    /// Offset where the term/doclist data ends and the footer begins.
+    footer_offset: usize,
+    /// Entry offset of each term that starts on this page (from the footer),
+    /// ascending. `entry_offsets[i]` bounds `terms[i-1]`'s doclist end.
+    entry_offsets: Vec<usize>,
+    /// `(term bytes, doclist-start offset)` for each term that starts here,
+    /// parallel to `entry_offsets`.
+    terms: Vec<(Vec<u8>, usize)>,
+}
+
+/// Parse a segment leaf page header + footer + term entries, leaving each term's
+/// doclist as an un-decoded byte range (see [`Fts5LeafRaw`]). The first two
+/// header bytes (`first_rowid_offset`) are a seek hint only and are not needed
+/// for sequential stitching.
+fn parse_leaf_raw(page: &[u8]) -> Result<Fts5LeafRaw> {
+    if page.len() < 4 {
+        return Err(fts5_data_error("segment leaf missing header"));
+    }
+    let footer_offset = usize::from(read_be_u16(&page[2..4]));
+    if !(4..=page.len()).contains(&footer_offset) {
+        return Err(fts5_data_error("segment leaf footer offset out of range"));
+    }
+
+    let mut footer_cursor = footer_offset;
+    let mut entry_offsets: Vec<usize> = Vec::new();
+    let mut previous_term_offset = 0_u16;
+    while footer_cursor < page.len() {
+        let delta = fts5_read_u32(page, &mut footer_cursor, "segment footer offset delta")?;
+        let next_offset = u32::from(previous_term_offset)
+            .checked_add(delta)
+            .ok_or_else(|| fts5_data_error("segment footer offset overflow"))?;
+        let next_offset = u16::try_from(next_offset)
+            .map_err(|_| fts5_data_error("segment footer offset exceeds u16"))?;
+        let next_offset_usize = usize::from(next_offset);
+        if next_offset_usize < 4 || next_offset_usize >= footer_offset {
+            return Err(fts5_data_error("segment term offset out of range"));
+        }
+        entry_offsets.push(next_offset_usize);
+        previous_term_offset = next_offset;
+    }
+
+    let mut terms: Vec<(Vec<u8>, usize)> = Vec::with_capacity(entry_offsets.len());
+    let mut previous_term: Vec<u8> = Vec::new();
+    for (index, &term_offset) in entry_offsets.iter().enumerate() {
+        // The term header/bytes always live on this page (only the doclist may
+        // spill), so they must fit before the next term entry / the footer.
+        let entry_end = entry_offsets
+            .get(index + 1)
+            .copied()
+            .unwrap_or(footer_offset);
+        let mut cursor = term_offset;
+        let term = if index == 0 {
+            let term_len = fts5_read_usize(page, &mut cursor, "segment first term")?;
+            let end = cursor
+                .checked_add(term_len)
+                .ok_or_else(|| fts5_data_error("segment first term length overflow"))?;
+            if end > entry_end {
+                return Err(fts5_data_error("segment first term extends past entry"));
+            }
+            let term = page[cursor..end].to_vec();
+            cursor = end;
+            term
+        } else {
+            let prefix_len = fts5_read_usize(page, &mut cursor, "segment term prefix")?;
+            let suffix_len = fts5_read_usize(page, &mut cursor, "segment term suffix")?;
+            if prefix_len > previous_term.len() {
+                return Err(fts5_data_error("segment term prefix exceeds previous term"));
+            }
+            let suffix_end = cursor
+                .checked_add(suffix_len)
+                .ok_or_else(|| fts5_data_error("segment term suffix length overflow"))?;
+            if suffix_end > entry_end {
+                return Err(fts5_data_error("segment term suffix extends past entry"));
+            }
+            let mut term = previous_term[..prefix_len].to_vec();
+            term.extend_from_slice(&page[cursor..suffix_end]);
+            cursor = suffix_end;
+            term
+        };
+        previous_term.clone_from(&term);
+        // `cursor` now points at the term's doclist start on this page.
+        terms.push((term, cursor));
+    }
+
+    Ok(Fts5LeafRaw {
+        footer_offset,
+        entry_offsets,
+        terms,
+    })
+}
+
+/// Reassembles a segment's `(term, doclist)` stream by stitching each doclist's
+/// bytes across leaf-page continuation boundaries (GH#360). Pages are pushed in
+/// ascending pgno order; a term is emitted only once its doclist is complete
+/// (i.e. the next term has been seen, or the segment ends).
+///
+/// A term's doclist runs from its data start until the next term. The last term
+/// on a page may spill: its bytes so far are held in `pending`, extended by each
+/// following page's leading continuation region `[4, first-term-entry)` (or the
+/// whole `[4, footer_offset)` for a term-less continuation page), and finally
+/// decoded when the next term appears. `first_rowid_offset` is not consulted —
+/// the footer term-entry offsets bound every doclist.
+struct Fts5DoclistStitcher {
+    /// The last term seen whose doclist may still be spilling: `(term, bytes so far)`.
+    pending: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Fts5DoclistStitcher {
+    fn new() -> Self {
+        Self { pending: None }
+    }
+
+    /// Feed one leaf page (ascending pgno order); returns the terms COMPLETED by
+    /// this page (their doclists fully stitched and decoded), in term order.
+    fn push_page(&mut self, page: &[u8]) -> Result<Vec<Fts5SegmentTerm>> {
+        let raw = parse_leaf_raw(page)?;
+        let mut completed = Vec::new();
+
+        // Bytes before the first term entry continue the pending (spilled) doclist.
+        let leading_end = raw
+            .entry_offsets
+            .first()
+            .copied()
+            .unwrap_or(raw.footer_offset);
+        if let Some((_, buffer)) = self.pending.as_mut() {
+            buffer.extend_from_slice(&page[4..leading_end]);
+        }
+        // The pending doclist ends where a NEW term begins. If this page has no
+        // terms it is pure continuation and the pending term keeps growing.
+        if !raw.terms.is_empty()
+            && let Some((term, buffer)) = self.pending.take()
+        {
+            completed.push(Fts5SegmentTerm {
+                term,
+                doclist: Fts5Doclist::decode(&buffer)?,
+            });
+        }
+
+        let term_count = raw.terms.len();
+        for (index, (term, doclist_start)) in raw.terms.into_iter().enumerate() {
+            let doclist_end = raw
+                .entry_offsets
+                .get(index + 1)
+                .copied()
+                .unwrap_or(raw.footer_offset);
+            if doclist_start > doclist_end {
+                return Err(fts5_data_error("segment term doclist start past its end"));
+            }
+            let bytes = &page[doclist_start..doclist_end];
+            if index + 1 == term_count {
+                // Last term on the page: its doclist may spill onto later pages.
+                self.pending = Some((term, bytes.to_vec()));
+            } else {
+                completed.push(Fts5SegmentTerm {
+                    term,
+                    doclist: Fts5Doclist::decode(bytes)?,
+                });
+            }
+        }
+        Ok(completed)
+    }
+
+    /// Complete the final pending term after the last page has been pushed.
+    fn finish(&mut self) -> Result<Option<Fts5SegmentTerm>> {
+        match self.pending.take() {
+            Some((term, buffer)) => Ok(Some(Fts5SegmentTerm {
+                term,
+                doclist: Fts5Doclist::decode(&buffer)?,
+            })),
+            None => Ok(None),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fts5DlidxPage {
     pub flags: u8,
@@ -2492,16 +2675,19 @@ impl<'a> Fts5SegmentRowSet<'a> {
                 }
                 known_segids.insert(segment.segid);
                 let reader = self.reader(segment);
+                let mut stitcher = Fts5DoclistStitcher::new();
                 for pgno in segment.pgno_first..=segment.pgno_last {
                     let row = reader
                         .data_row(pgno)
                         .ok_or_else(|| fts5_data_error("missing segment leaf page"))?;
                     checksum = fts5_checksum_i64(checksum, row.id);
                     checksum = fts5_checksum_bytes(checksum, &row.block);
-                    let leaf = Fts5SegmentLeaf::decode(&row.block)?;
-                    term_count += leaf.terms.len();
+                    // Count distinct terms across the segment (doclists may span
+                    // leaf pages, GH#360), not per-isolated-page.
+                    term_count += stitcher.push_page(&row.block)?.len();
                     leaf_page_count += 1;
                 }
+                term_count += usize::from(stitcher.finish()?.is_some());
             }
         }
 
@@ -2572,7 +2758,9 @@ impl<'a> Fts5SegmentReader<'a> {
         Fts5SegmentTermCursor {
             reader: *self,
             next_pgno: pgno,
-            current_terms: Vec::new().into_iter(),
+            stitcher: Fts5DoclistStitcher::new(),
+            ready: std::collections::VecDeque::new(),
+            finished: false,
         }
     }
 
@@ -2635,7 +2823,9 @@ impl<'a> Fts5SegmentReader<'a> {
 pub struct Fts5SegmentTermCursor<'a> {
     reader: Fts5SegmentReader<'a>,
     next_pgno: u32,
-    current_terms: std::vec::IntoIter<Fts5SegmentTerm>,
+    stitcher: Fts5DoclistStitcher,
+    ready: std::collections::VecDeque<Fts5SegmentTerm>,
+    finished: bool,
 }
 
 impl Iterator for Fts5SegmentTermCursor<'_> {
@@ -2643,22 +2833,33 @@ impl Iterator for Fts5SegmentTermCursor<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(term) = self.current_terms.next() {
+            if let Some(term) = self.ready.pop_front() {
                 return Some(Ok(term));
             }
-            if self.next_pgno > self.reader.segment.pgno_last {
+            if self.finished {
                 return None;
             }
+            if self.next_pgno > self.reader.segment.pgno_last {
+                self.finished = true;
+                return match self.stitcher.finish() {
+                    Ok(Some(term)) => Some(Ok(term)),
+                    Ok(None) => None,
+                    Err(err) => Some(Err(err)),
+                };
+            }
 
-            match self.reader.leaf(self.next_pgno) {
-                Ok(Some(leaf)) => {
-                    self.next_pgno = self.next_pgno.saturating_add(1);
-                    self.current_terms = leaf.terms.into_iter();
+            let pgno = self.next_pgno;
+            self.next_pgno = self.next_pgno.saturating_add(1);
+            let Some(row) = self.reader.data_row(pgno) else {
+                self.finished = true;
+                return Some(Err(fts5_data_error("missing segment leaf page")));
+            };
+            match self.stitcher.push_page(&row.block) {
+                Ok(terms) => self.ready.extend(terms),
+                Err(err) => {
+                    self.finished = true;
+                    return Some(Err(err));
                 }
-                Ok(None) => {
-                    return Some(Err(fts5_data_error("missing segment leaf page")));
-                }
-                Err(err) => return Some(Err(err)),
             }
         }
     }
@@ -2929,6 +3130,7 @@ async fn lazy_segment_exact_postings<R: Fts5OnDiskReader>(
         .await?
         .unwrap_or(segment.pgno_first)
         .clamp(segment.pgno_first, segment.pgno_last);
+    let mut stitcher = Fts5DoclistStitcher::new();
     let mut pgno = start;
     while pgno <= segment.pgno_last {
         let id = fts5_data_rowid(segment.segid, false, 0, pgno, "segment leaf")?;
@@ -2936,8 +3138,7 @@ async fn lazy_segment_exact_postings<R: Fts5OnDiskReader>(
             .read_data_block(id)
             .await?
             .ok_or_else(|| fts5_data_error("missing segment leaf page"))?;
-        let leaf = Fts5SegmentLeaf::decode(&block)?;
-        for seg_term in leaf.terms {
+        for seg_term in stitcher.push_page(&block)? {
             match seg_term.term.as_slice().cmp(term) {
                 std::cmp::Ordering::Equal => return Ok(seg_term.doclist.entries),
                 std::cmp::Ordering::Greater => return Ok(Vec::new()),
@@ -2945,6 +3146,13 @@ async fn lazy_segment_exact_postings<R: Fts5OnDiskReader>(
             }
         }
         pgno = pgno.saturating_add(1);
+    }
+    // A term whose doclist spilled onto the last scanned page is only completed
+    // by `finish` (GH#360: the last term's doclist is stitched across pages).
+    if let Some(seg_term) = stitcher.finish()?
+        && seg_term.term.as_slice() == term
+    {
+        return Ok(seg_term.doclist.entries);
     }
     Ok(Vec::new())
 }
@@ -3187,6 +3395,7 @@ async fn lazy_segment_prefix_term_groups<R: Fts5OnDiskReader>(
         .await?
         .unwrap_or(segment.pgno_first)
         .clamp(segment.pgno_first, segment.pgno_last);
+    let mut stitcher = Fts5DoclistStitcher::new();
     let mut groups = Vec::new();
     let mut pgno = start;
     while pgno <= segment.pgno_last {
@@ -3195,8 +3404,7 @@ async fn lazy_segment_prefix_term_groups<R: Fts5OnDiskReader>(
             .read_data_block(id)
             .await?
             .ok_or_else(|| fts5_data_error("missing segment leaf page"))?;
-        let leaf = Fts5SegmentLeaf::decode(&block)?;
-        for seg_term in leaf.terms {
+        for seg_term in stitcher.push_page(&block)? {
             if seg_term.term.starts_with(prefix) {
                 groups.push((seg_term.term, seg_term.doclist.entries));
                 continue;
@@ -3209,6 +3417,12 @@ async fn lazy_segment_prefix_term_groups<R: Fts5OnDiskReader>(
             }
         }
         pgno = pgno.saturating_add(1);
+    }
+    // The last term (doclist stitched across pages, GH#360) completes at `finish`.
+    if let Some(seg_term) = stitcher.finish()?
+        && seg_term.term.starts_with(prefix)
+    {
+        groups.push((seg_term.term, seg_term.doclist.entries));
     }
     Ok(groups)
 }
@@ -13377,6 +13591,78 @@ mod tests {
             .map(|term| term.term)
             .collect();
         assert_eq!(prefix_terms, vec![b"rust".to_vec(), b"rusty".to_vec()]);
+    }
+
+    #[test]
+    fn test_fts5_stitch_stock_spilled_doclist_gh360() {
+        // Real %_data bytes from sqlite3 3.46.1: a contentless fts5 table at
+        // pgsz=64 with 40 docs all containing 'common' (doc 1 has 'common' x80 —
+        // one 80-byte poslist), `optimize`d to a single 9-leaf segment. 'common's
+        // doclist spills across leaf pages MID-POSLIST, which the old single-page
+        // decoder rejected with 'truncated poslist body' (GH#360). The stitching
+        // reader must reassemble it and return exactly what stock returns:
+        // MATCH 'common' -> rowids 1..=40, MATCH 'w7' -> [7].
+        fn hex(text: &str) -> Vec<u8> {
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+                .collect()
+        }
+        let leaves: &[(i64, &str)] = &[
+            (412316860417, "0000003F0730636F6D6D6F6E01812002030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030304"),
+            (412316860418, "0024004103030303030303030303030303030303030303030303030303030303030303030202020102020102020102020102020102020102020102020102020102"),
+            (412316860419, "00050040020C02020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102"),
+            (412316860420, "0005003A0220020201020201020201020201020201020201020201020201020204307731300A02030301310B02030301320C02030301330D020320080606"),
+            (412316860421, "0000003604307731340E02030301350F02030301361002030301371102030301381202030301391302030201320202030301301402030408060606060606"),
+            (412316860422, "0000003604307732311502030301321602030301331702030301341802030301351902030301361A02030301371B02030301381C02030408060606060606"),
+            (412316860423, "0000003604307732391D02030201330302030301301E02030301311F02030301322002030301332102030301342202030301352302030408060606060606"),
+            (412316860424, "0000003604307733362402030301372502030301382602030301392702030201340402030301302802030201350502030201360602030408060606060606"),
+            (412316860425, "0000001703307737070203020138080203020139090203040706"),
+        ];
+        let data_rows: Vec<Fts5DataRow> = leaves
+            .iter()
+            .map(|(id, block)| Fts5DataRow::new(*id, hex(block)))
+            .collect();
+        let segid = match Fts5DataRowid::decode(data_rows[0].id).unwrap() {
+            Fts5DataRowid::SegmentLeaf { segid, pgno } => {
+                assert_eq!(pgno, 1);
+                segid
+            }
+            other => panic!("first fixture row is not a segment leaf: {other:?}"),
+        };
+        let segment = Fts5StructureSegment::new(segid, 1, 9);
+        let row_set = Fts5SegmentRowSet::new(&data_rows, &[]);
+        let reader = row_set.reader(&segment);
+
+        // Full stitched term scan reassembles every doclist across page bounds.
+        let terms: Vec<(Vec<u8>, Vec<u64>)> = reader
+            .term_cursor()
+            .map(|term| {
+                let term = term.unwrap();
+                (
+                    term.term,
+                    term.doclist.entries.iter().map(|entry| entry.rowid).collect(),
+                )
+            })
+            .collect();
+        let common = terms
+            .iter()
+            .find(|(term, _)| term.ends_with(b"common"))
+            .expect("'common' term present after stitching");
+        assert_eq!(
+            common.1,
+            (1..=40).collect::<Vec<u64>>(),
+            "stitched 'common' doclist = every rowid stock returns"
+        );
+        let w7 = terms
+            .iter()
+            .find(|(term, _)| term.ends_with(b"w7"))
+            .expect("'w7' term present");
+        assert_eq!(w7.1, vec![7], "single-doc term unaffected by stitching");
+
+        // The seek path (exact_postings) stitches from its candidate page too.
+        let postings = reader.exact_postings(&common.0).unwrap().unwrap();
+        assert_eq!(postings.rowids(), (1..=40).collect::<Vec<u64>>());
     }
 
     #[test]

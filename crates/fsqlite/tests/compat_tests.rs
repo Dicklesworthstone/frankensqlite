@@ -869,6 +869,12 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
         let wal = suffixed_path(&path, "-wal");
         let wal_certificate = suffixed_path(&path, "-wal-cert");
         let shm = suffixed_path(&path, "-shm");
+        // The durable first-open migration-state marker (bd-zywqc.5, f32ce2aa6):
+        // a persisted JSON sidecar written when the writer establishes the
+        // generation, read on every later open. It is part of the steady-state
+        // artifact set (like the WAL certificate and the namespace sidecars), so
+        // a read-only open must preserve it, not create or delete it.
+        let migration_state = suffixed_path(&path, ".fsqlite-migration-state");
         assert!(
             namespace_gate.exists(),
             "writer must publish the namespace gate"
@@ -884,6 +890,10 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
         assert!(
             wal_certificate.exists(),
             "fixture must retain the WAL certificate paired with the WAL"
+        );
+        assert!(
+            migration_state.exists(),
+            "writer must persist the first-open migration-state marker"
         );
         let sentinel_modified = UNIX_EPOCH + Duration::from_hours(262_968);
         File::options()
@@ -907,6 +917,10 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
             wal_certificate
                 .file_name()
                 .expect("WAL certificate file name")
+                .to_owned(),
+            migration_state
+                .file_name()
+                .expect("migration-state marker file name")
                 .to_owned(),
         ]);
         if shm.exists() {
@@ -932,7 +946,7 @@ fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() 
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>(),
             expected_names,
-            "GH #294 steady-state fixture must contain exactly main, WAL, WAL-certificate, namespace, and native platform lock/SHM artifacts before the read-only open"
+            "GH #294 steady-state fixture must contain exactly main, WAL, WAL-certificate, namespace, migration-state marker, and native platform lock/SHM artifacts before the read-only open"
         );
 
         let readonly = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
