@@ -8434,7 +8434,30 @@ impl Fts5Table {
     /// the previous `if let Ok(..)` fall-through silently emitted an *empty*
     /// structure row on failure, so a full re-encode of a populated table
     /// could "succeed" while discarding the entire inverted index.
+    /// Encode the **entire** in-memory inverted index into a fresh `_data`
+    /// image: a single new segment `segid = 1` atop an empty structure record,
+    /// discarding whatever segments existed on disk. This is the **rewrite**
+    /// persist path (reached in production via [`Self::encode_shadow_rows`] ->
+    /// `Connection::persist_rootpage_zero_fts5_shadow_rows`).
+    ///
+    /// INVARIANT — never call this on a lazy-on-disk table. A lazy contentless
+    /// table keeps the bulk of its corpus **only on disk**, with `self.index`
+    /// holding at most the current INSERT delta, so re-encoding `self.index`
+    /// here would silently drop the historical corpus (catastrophic data loss).
+    /// Every mutation path that can reach this rewrite first fully hydrates the
+    /// table (`Connection::promote_lazy_fts5_table` -> `rebuild_documents` +
+    /// [`Self::clear_lazy_on_disk`]); the genuinely-lazy contentless-INSERT path
+    /// instead APPENDS a new segment via [`Self::encode_incremental_insert_flush`]
+    /// (`next_segid = max + 1`, existing leaves untouched) and never lands here.
+    /// The debug assert pins that contract (bd-fts5-lazy-shadow-reads-itcc4.3).
     pub fn encode_data_rows(&self) -> Result<Vec<Fts5DataRow>> {
+        debug_assert!(
+            !self.is_lazy_on_disk(),
+            "encode_data_rows (full index rewrite) must not run on a lazy-on-disk \
+             FTS5 table: self.index holds only the current delta, so this would \
+             drop the on-disk corpus. Promote/hydrate before persisting, or use \
+             the incremental append path (encode_incremental_insert_flush)."
+        );
         let docsize_rows = self.encode_docsize_rows();
         let averages = Fts5AveragesRecord::from_docsize_rows(
             u64::try_from(self.row_count()).unwrap_or(u64::MAX),
@@ -12852,6 +12875,27 @@ mod tests {
             );
             assert_no_transient_state(&table);
         }
+    }
+
+    /// The lazy-index data-loss guard must fire: `encode_data_rows` (the full
+    /// rewrite path that re-encodes the whole in-memory index into a fresh
+    /// `segid = 1`) must refuse to run on a lazy-on-disk table, whose
+    /// `self.index` holds only the current delta — rewriting it would silently
+    /// drop the on-disk corpus. `#[cfg(debug_assertions)]` because the
+    /// `debug_assert` is compiled out of release builds
+    /// (bd-fts5-lazy-shadow-reads-itcc4.3).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "must not run on a lazy-on-disk")]
+    fn test_encode_data_rows_rejects_lazy_on_disk_rewrite() {
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "content=''"]).unwrap();
+        table.mark_lazy_on_disk(1_000_000);
+        // The historical corpus lives only on disk; the in-memory index is
+        // empty. A full re-encode here would discard it, so the guard trips
+        // instead of producing a corpus-dropping image.
+        let _ = table.encode_data_rows();
     }
 
     #[test]
