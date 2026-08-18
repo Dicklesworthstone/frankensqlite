@@ -33654,7 +33654,7 @@ impl Connection {
         // (Writability of the attached schema is governed by how the attached
         // connection itself is opened, handled in the ATTACH branch below.)
         if self.pager.is_readonly()
-            && matches!(
+            && (matches!(
                 statement,
                 Statement::Insert(_)
                     | Statement::Update(_)
@@ -33666,10 +33666,14 @@ impl Connection {
                     | Statement::CreateIndex(_)
                     | Statement::Drop(_)
                     | Statement::AlterTable(_)
-                    | Statement::Vacuum(_)
                     | Statement::Analyze(_)
                     | Statement::Reindex(_)
             )
+            // Plain VACUUM rewrites the source in place and stays rejected, but
+            // VACUUM INTO only READS the source and writes a NEW target file —
+            // stock SQLite permits it on a read-only / mode=ro source.
+            // bd-n7ypv / GH#342.
+            || matches!(statement, Statement::Vacuum(v) if v.into.is_none()))
         {
             return Err(FrankenError::ReadOnly);
         }
@@ -58310,8 +58314,26 @@ impl Connection {
         }
 
         let cx = self.op_cx()?;
+        // bd-n7ypv / GH#342: a read-only source (mode=ro / schema-only) keeps a
+        // non-mutating read snapshot open in `active_txn`, which would otherwise
+        // trip quiesce_pager_export_state's "no active txn" precondition with
+        // Busy. A VACUUM INTO only reads the source, and a read-only pager can
+        // hold no pending writes, so releasing that snapshot is lossless. Plain
+        // VACUUM never reaches here on a read-only connection (rejected upstream
+        // at the read-only statement guard).
+        if self.pager.is_readonly() {
+            let retained_read_snapshot = self.active_txn.borrow_mut().take();
+            if let Some(mut txn) = retained_read_snapshot {
+                let _ = txn.rollback(&cx).await;
+            }
+        }
         self.quiesce_pager_export_state(&cx).await?;
-        if self.pager.journal_mode() == JournalMode::Wal {
+        // The source checkpoint folds WAL into the main file to stabilise the
+        // source-image receipt; a read-only source cannot be written, and the
+        // exported rows are read WAL-aware via reload_memdb_from_pager below, so
+        // it is both impossible and unnecessary here. A writable source still
+        // checkpoints as before.
+        if !self.pager.is_readonly() && self.pager.journal_mode() == JournalMode::Wal {
             self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
         }
 

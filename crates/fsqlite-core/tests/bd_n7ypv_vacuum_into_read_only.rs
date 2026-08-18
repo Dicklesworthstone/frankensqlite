@@ -8,21 +8,15 @@ use fsqlite_core::connection::Connection;
 use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
-// PARITY TARGET (bd-n7ypv/GH#342): sqlite3 permits VACUUM INTO on a read-only
-// source connection; fsqlite does not yet. Un-ignore when the read-only-
-// compatible VACUUM INTO path lands. This is a MULTI-STEP vacuum-machinery
-// feature, not an error-taxonomy fix: the guard exemption is only step 1, and
-// VACUUM's machinery is built for a writable/exclusive connection —
-// execute_vacuum_main runs quiesce_pager_export_state and then
-// capture_vacuum_source_image via pager with_exclusive_maintenance (an
-// exclusive fence), which conflict with a read-only (open_schema_only)
-// connection's retained reader state and surface FrankenError::Busy. Full
-// parity needs a read-only-compatible source-capture path (or a full
-// read-state release across all fences). See the bd-n7ypv receipt.
+// FIXED (bd-n7ypv/GH#342): sqlite3 permits VACUUM INTO on a read-only source
+// connection; fsqlite now matches. The fix: (1) exempt VACUUM INTO (into.is_some)
+// from the read-only statement guard; (2) release the read-only connection's
+// retained non-mutating read snapshot from active_txn before
+// quiesce_pager_export_state (lossless — a read-only pager holds no writes);
+// (3) skip the source WAL checkpoint on a read-only source (exported rows come
+// WAL-aware from reload_memdb_from_pager, and a read-only source cannot be
+// written). Plain VACUUM stays ReadOnly (into.is_none()).
 #[test]
-#[ignore = "bd-n7ypv/GH#342: VACUUM INTO on read-only is a multi-step \
-            vacuum-machinery feature (exclusive-maintenance/quiescence vs the \
-            read-only connection's retained reader state); un-ignore with it"]
 fn bd_n7ypv_vacuum_into_allowed_on_read_only_connection_plain_vacuum_still_rejected() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
