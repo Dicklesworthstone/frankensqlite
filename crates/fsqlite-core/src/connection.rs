@@ -35029,8 +35029,31 @@ impl Connection {
                 // path receives only local literals instead of outer-table
                 // references it cannot resolve.
                 for assignment in &mut update.assignments {
-                    rewrite_dml_in_expr(&mut assignment.value, self, eager_in_subqueries, params)
+                    // bd-22jvi: a row-value SET whose RHS is directly a
+                    // multi-column subquery — `SET (a, b) = (SELECT a, b FROM
+                    // ...)` — accepts a row value, so the uncorrelated-subquery
+                    // folding pass must let the >1-column subquery survive to
+                    // codegen (which binds each output column to its target)
+                    // instead of raising the scalar "returns N columns - expected
+                    // 1" arity error. Grant the exemption only when the value IS
+                    // the subquery, mirroring the row-value comparison sites.
+                    let row_value_ctx = matches!(
+                        &assignment.target,
+                        fsqlite_ast::AssignmentTarget::ColumnList(names) if names.len() > 1
+                    ) && matches!(&assignment.value, Expr::Subquery(_, _));
+                    {
+                        let _row_value_guard = BoolCellRestoreGuard::new(
+                            &self.scalar_subquery_row_value_context,
+                            row_value_ctx,
+                        );
+                        rewrite_dml_in_expr(
+                            &mut assignment.value,
+                            self,
+                            eager_in_subqueries,
+                            params,
+                        )
                         .await?;
+                    }
                 }
                 if let Some(from) = update.from.as_mut() {
                     self.rewrite_dml_from_clause(from, eager_in_subqueries, params)
