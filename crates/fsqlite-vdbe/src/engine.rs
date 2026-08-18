@@ -4628,6 +4628,31 @@ impl MemDatabase {
         }
     }
 
+    /// Clear (undo-recording) the row image of every table whose root page is
+    /// `<= max_root_page`, preserving table structures.
+    ///
+    /// bd-ixf69: used by the in-txn schema-cookie fast-path refresh to discard
+    /// the mirror's stale MAIN-database rows (they re-hydrate lazily from the
+    /// authoritative pager) after skipping the sqlite_master reparse. The caller
+    /// passes its TEMP-root boundary (`next_temp_root_page`): connection-local
+    /// TEMP tables live ONLY in this mirror in a separate high, descending root
+    /// namespace, so a `root_page > max_root_page` table is TEMP and is left
+    /// untouched (clearing it would lose data that is not pager-backed). Each
+    /// clear records `MemDbUndoOp::ClearTable`, so savepoint/transaction rollback
+    /// restores the rows.
+    pub fn clear_table_rows_at_or_below(&mut self, max_root_page: i32) {
+        let roots: Vec<i32> = self
+            .tables
+            .iter()
+            .map(|(root_page, _)| root_page)
+            .filter(|&&rp| rp <= max_root_page)
+            .copied()
+            .collect();
+        for rp in roots {
+            self.clear_table(rp);
+        }
+    }
+
     fn alloc_rowid(&mut self, root_page: i32) -> i64 {
         if let Some(table) = self.tables.get_mut(&root_page) {
             let prev_next_rowid = table.next_rowid;

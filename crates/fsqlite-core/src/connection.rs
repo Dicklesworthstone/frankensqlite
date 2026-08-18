@@ -21295,21 +21295,22 @@ impl Connection {
         // sqlite_sequence unconditionally when any autoincrement table
         // exists) so last_insert_rowid stays correct.
         //
-        // bd-dsxu2 REGRESSION FIX: this per-write in-txn refresh must NOT use the
-        // schema-cookie fast path on a DIRTY mirror. Unlike the two from-pager
-        // reload call sites (which use `allow_dirty_schema_only_fast_path=true`),
-        // this call site is `refresh_memdb_from_active_txn_if_dirty` -- the ONLY
-        // per-write path that absorbs in-txn DML row changes into the mirror.
-        // With `true`, the fast path (reload_memdb_from_txn_with_mode's
-        // schema-cookie branch) fires on a dirty mirror and clears
-        // `memdb_requires_active_txn_reload` WITHOUT absorbing those rows, so an
-        // in-txn parent DELETE leaves a ghost parent in the mirror and
-        // `fk_parent_rowid_fast_lookup` then trusts it -> FK constraint silently
-        // bypassed (test_issue110_fk_parent_cache_invalidated_by_delete /
-        // _insert_or_replace). Keep `false` here so a dirty mirror takes the
-        // row-absorbing reload. (Re-doing the schema-reparse-skip perf win
-        // without breaking row-dirty absorption is tracked as bd-ixf69.)
-        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, false)
+        // bd-ixf69 (restores the schema-reparse-skip perf win bd-dsxu2 reverted):
+        // this per-write in-txn refresh uses the schema-cookie fast path even on a
+        // DIRTY mirror. The prior FK regression (bd-dsxu2) was that the fast path
+        // cleared `memdb_requires_active_txn_reload` while LEAVING the mirror's
+        // stale rows, so an in-txn-deleted FK parent survived as a ghost that
+        // `fk_parent_rowid_fast_lookup` trusted. That is now fixed inside the
+        // fast-path branch (reload_memdb_from_txn_with_mode): on a dirty mirror it
+        // discards the stale MAIN-db row image via
+        // `MemDatabase::clear_table_rows_at_or_below(next_temp_root_page)` +
+        // `memdb_rows_loaded = false` (undo-recording, so savepoint rollback
+        // restores; connection-local TEMP tables are preserved), forcing lazy
+        // re-hydration from the authoritative pager -- equivalent to the full
+        // reload's fresh mirror, minus the O(corpus) sqlite_master reparse.
+        // Guarded by test_issue110_fk_parent_cache_invalidated_* and the temp/
+        // savepoint ALTER-DROP-COLUMN tests.
+        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, true)
             .await
     }
 
@@ -83441,6 +83442,19 @@ impl Connection {
                 // Match the Lightweight refresh path in
                 // `try_refresh_prepared_metadata_if_stale` and refresh the cache
                 // here when we have any autoincrement tables to track.
+                // bd-ixf69 (restores the schema-reparse-skip perf win bd-dsxu2
+                // reverted, without the FK regression): this fast path may fire on
+                // a DIRTY mirror, i.e. one whose MAIN-db row image has not absorbed
+                // this txn's DML. The schema is provably unchanged (cookie match),
+                // so skipping the sqlite_master reparse is safe — but the stale
+                // MAIN-db rows must not be trusted, or an in-txn-deleted FK parent
+                // survives as a ghost that fk_parent_rowid_fast_lookup reads
+                // (bd-dsxu2). Discard the MAIN-db row image (undo-recording, so
+                // savepoint rollback restores it) and re-hydrate lazily from the
+                // authoritative pager. Connection-local TEMP tables live ONLY in
+                // this mirror (high descending root namespace above
+                // next_temp_root_page), are NOT pager-backed, and are preserved.
+                let mirror_row_image_is_stale = self.memdb_requires_active_txn_reload.get();
                 let has_autoincrement_tables = !self.autoincrement_tables.borrow().is_empty();
                 if has_autoincrement_tables {
                     let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn).await?;
@@ -83451,6 +83465,12 @@ impl Connection {
                 // observe this cross-process commit.
                 self.set_memdb_visible_commit_seq_from_publication(bound_visible_commit_seq);
                 *self.change_counter.borrow_mut() = change_counter;
+                if mirror_row_image_is_stale {
+                    let temp_root_boundary = self.next_temp_root_page.get();
+                    self.db
+                        .borrow_mut()
+                        .clear_table_rows_at_or_below(temp_root_boundary);
+                }
                 self.memdb_rows_loaded.set(false);
                 self.memdb_requires_active_txn_reload.set(false);
                 self.memdb_storage_count_shortcuts_safe.set(false);
