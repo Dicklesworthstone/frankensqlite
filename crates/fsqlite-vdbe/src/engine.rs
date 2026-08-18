@@ -6078,6 +6078,10 @@ pub enum ExecOutcome {
 pub struct ReplaceVictim {
     pub root_page: i32,
     pub values: Vec<SqliteValue>,
+    /// Rowid of the deleted victim row, when the table has a rowid (i.e. not a
+    /// WITHOUT ROWID table). Lets REPLACE-conflict DELETE triggers resolve
+    /// `OLD.rowid` on tables without an INTEGER PRIMARY KEY column (GH #205).
+    pub rowid: Option<i64>,
 }
 
 /// Inline register storage for the 1-indexed VDBE register file.
@@ -7807,7 +7811,11 @@ impl VdbeEngine {
                 )
             })
             .collect();
-        ReplaceVictim { root_page, values }
+        ReplaceVictim {
+            root_page,
+            values,
+            rowid,
+        }
     }
 
     /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).

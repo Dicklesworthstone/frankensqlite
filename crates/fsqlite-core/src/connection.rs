@@ -34224,20 +34224,40 @@ impl Connection {
                 } else {
                     None
                 };
-                let mut trigger_new_rows = if has_before_insert || has_after_insert {
+                // NEW row images plus the explicit rowid each row supplies (None
+                // when the rowid is auto-assigned). The explicit rowid resolves
+                // `NEW.rowid` in BEFORE INSERT triggers on tables without an
+                // INTEGER PRIMARY KEY column (GH #205).
+                let (mut trigger_new_rows, trigger_new_explicit_rowids): (
+                    Vec<Vec<SqliteValue>>,
+                    Vec<Option<i64>>,
+                ) = if has_before_insert || has_after_insert {
                     if let Some(rows) = live_insert_rows.as_ref() {
-                        rows.iter().map(|row| row.values.clone()).collect()
+                        // Live virtual-table rows are inserted through the module's
+                        // xUpdate; the rowid is chosen there, not known pre-insert.
+                        let values = rows.iter().map(|row| row.values.clone()).collect();
+                        let rowids = vec![None; rows.len()];
+                        (values, rowids)
                     } else {
-                        self.collect_insert_trigger_rows(insert, params).await?
+                        self.collect_insert_trigger_rows(insert, params)
+                            .await?
+                            .into_iter()
+                            .unzip()
                     }
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
 
                 // Phase 5G.2 (bd-iqam): Fire BEFORE INSERT triggers.
                 let skip_dml = if has_before_insert {
                     let mut skip = false;
-                    for new_values in &trigger_new_rows {
+                    for (new_values, &explicit_rowid) in
+                        trigger_new_rows.iter().zip(&trigger_new_explicit_rowids)
+                    {
+                        // SQLite exposes `NEW.rowid` in BEFORE INSERT triggers as
+                        // the explicit rowid when the statement supplies one, and
+                        // as -1 when the rowid will be auto-assigned (it is not yet
+                        // known). Match that. (GH #205)
                         if self
                             .fire_before_triggers(
                                 table_name,
@@ -34245,7 +34265,7 @@ impl Connection {
                                 None,
                                 Some(new_values),
                                 None,
-                                None,
+                                Some(explicit_rowid.unwrap_or(-1)),
                             )
                             .await?
                         {
@@ -34286,14 +34306,16 @@ impl Connection {
                                 }
                             }
                         }
-                        for row in &live_insert_rows {
+                        for (row, rowid) in
+                            live_insert_rows.iter().zip(inserted_rowids.iter())
+                        {
                             self.fire_after_triggers(
                                 table_name,
                                 &insert_event,
                                 None,
                                 Some(&row.values),
                                 None,
-                                None,
+                                Some(*rowid),
                             )
                             .await?;
                         }
@@ -34385,7 +34407,15 @@ impl Connection {
                 }
 
                 // Phase 5G.3: Fire AFTER INSERT triggers.
+                // The direct VDBE INSERT path only reaches here single-row when
+                // triggers are present (multi-row VALUES and INSERT...SELECT are
+                // replayed row-by-row above), so the just-assigned
+                // `last_insert_rowid` is the NEW.rowid for this row. Tables with an
+                // INTEGER PRIMARY KEY carry the rowid in a snapshotted column and
+                // resolve the alias there; passing it additionally is harmless and
+                // makes `NEW.rowid` resolve on tables without an IPK column. (GH #205)
                 if has_after_insert {
+                    let after_insert_rowid = self.current_last_insert_rowid();
                     for new_values in &trigger_new_rows {
                         self.fire_after_triggers(
                             table_name,
@@ -34393,7 +34423,7 @@ impl Connection {
                             None,
                             Some(new_values),
                             None,
-                            None,
+                            Some(after_insert_rowid),
                         )
                             .await?;
                     }
@@ -34524,8 +34554,12 @@ impl Connection {
                         )
                         .await;
                 }
+                // Trigger rows carry the matched rowid so OLD.rowid/NEW.rowid
+                // resolve on tables without an INTEGER PRIMARY KEY column. An
+                // ordinary UPDATE leaves the rowid unchanged, so the same rowid is
+                // passed as both OLD and NEW. (GH #205)
                 let trigger_rows = if has_before_update || has_after_update {
-                    self.collect_update_trigger_rows(&effective_update, params)
+                    self.collect_update_trigger_rows_with_rowids(&effective_update, params)
                         .await?
                 } else {
                     Vec::new()
@@ -34534,15 +34568,15 @@ impl Connection {
                 // Phase 5G.2 (bd-iqam): Fire BEFORE UPDATE triggers.
                 let skip_dml = if has_before_update {
                     let mut skip = false;
-                    for (old_values, new_values) in &trigger_rows {
+                    for (row_rowid, old_values, new_values) in &trigger_rows {
                         if self
                             .fire_before_triggers(
                                 table_name,
                                 &update_event,
                                 Some(old_values),
                                 Some(new_values),
-                                None,
-                                None,
+                                *row_rowid,
+                                *row_rowid,
                             )
                             .await?
                         {
@@ -34570,7 +34604,7 @@ impl Connection {
                         table_name,
                         targets_shadowed_main,
                         &mut effective_update.assignments,
-                        &trigger_rows[0].1,
+                        &trigger_rows[0].2,
                     )?;
                 }
 
@@ -34584,7 +34618,7 @@ impl Connection {
                     let rows_to_check = if !trigger_rows.is_empty() {
                         trigger_rows
                             .iter()
-                            .map(|(old, new)| (old.clone(), new.clone()))
+                            .map(|(_rowid, old, new)| (old.clone(), new.clone()))
                             .collect::<Vec<_>>()
                     } else {
                         self.collect_update_trigger_rows(&effective_update, params)
@@ -34659,14 +34693,14 @@ impl Connection {
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update {
-                    for (old_values, new_values) in &trigger_rows {
+                    for (row_rowid, old_values, new_values) in &trigger_rows {
                         self.fire_after_triggers(
                             table_name,
                             &update_event,
                             Some(old_values),
                             Some(new_values),
-                            None,
-                            None,
+                            *row_rowid,
+                            *row_rowid,
                         )
                         .await?;
                     }
@@ -45086,11 +45120,16 @@ impl Connection {
         }
     }
 
+    /// Collect the NEW row images (in table-column order) for an INSERT's
+    /// trigger/FK enforcement, each paired with the explicit rowid the statement
+    /// supplied (`None` when the rowid will be auto-assigned). The explicit rowid
+    /// lets BEFORE INSERT triggers resolve `NEW.rowid` on tables without an
+    /// INTEGER PRIMARY KEY column (GH #205).
     async fn collect_insert_trigger_rows(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
-    ) -> Result<Vec<Vec<SqliteValue>>> {
+    ) -> Result<Vec<(Vec<SqliteValue>, Option<i64>)>> {
         let layout = self.resolve_insert_target_layout(insert)?;
         let table_column_count = layout.table_columns.len();
         if layout.default_sqls.len() != table_column_count {
@@ -45155,10 +45194,11 @@ impl Connection {
                 }
                 Ok(mapped)
             }
-            fsqlite_ast::InsertSource::DefaultValues => Ok(vec![
+            fsqlite_ast::InsertSource::DefaultValues => Ok(vec![(
                 self.evaluate_default_row_from_sqls(&layout.default_sqls)
                     .await?,
-            ]),
+                None,
+            )]),
         }
     }
 
@@ -46887,6 +46927,13 @@ impl Connection {
     }
 
     #[allow(clippy::unused_self)]
+    /// Map a single INSERT source row onto a full table row.
+    ///
+    /// Returns the mapped row together with the explicit rowid supplied by the
+    /// statement (via an INTEGER PRIMARY KEY target or a `rowid`/`oid`/`_rowid_`
+    /// target), or `None` when the rowid will be auto-assigned. Trigger firing
+    /// needs the explicit rowid so `NEW.rowid` resolves in BEFORE INSERT bodies
+    /// on tables without an IPK column to carry it (GH #205).
     fn map_insert_source_row_to_table_row(
         &self,
         default_row: &[SqliteValue],
@@ -46895,7 +46942,7 @@ impl Connection {
         explicit_rowid_source: Option<usize>,
         source_values: &[SqliteValue],
         context: &str,
-    ) -> Result<Vec<SqliteValue>> {
+    ) -> Result<(Vec<SqliteValue>, Option<i64>)> {
         if source_values.len() != source_targets.len() {
             return Err(FrankenError::Internal(format!(
                 "{context}: column count mismatch (source has {}, target expects {})",
@@ -46924,7 +46971,7 @@ impl Connection {
         if let (Some(ipk_idx), Some(rowid)) = (rowid_alias_col_idx, explicit_rowid) {
             row[ipk_idx] = SqliteValue::Integer(rowid);
         }
-        Ok(row)
+        Ok((row, explicit_rowid))
     }
 
     fn collect_insert_default_sqls(&self, table_name: &str) -> Result<Vec<Option<String>>> {
@@ -47108,14 +47155,59 @@ impl Connection {
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<(Vec<SqliteValue>, Vec<SqliteValue>)>> {
+        Ok(self
+            .collect_update_trigger_rows_with_rowids(update, params)
+            .await?
+            .into_iter()
+            .map(|(_rowid, old_values, new_values)| (old_values, new_values))
+            .collect())
+    }
+
+    /// Like [`Self::collect_update_trigger_rows`] but also captures each matched
+    /// row's rowid so `OLD.rowid` / `NEW.rowid` (and the `oid` / `_rowid_`
+    /// aliases) resolve in UPDATE trigger bodies on tables that have no INTEGER
+    /// PRIMARY KEY column to carry the rowid (GH #205). For an ordinary UPDATE the
+    /// rowid is unchanged, so the same rowid serves as both OLD and NEW; a
+    /// statement that rewrites the rowid does so through the INTEGER PRIMARY KEY
+    /// column, whose snapshotted value the alias already resolves.
+    async fn collect_update_trigger_rows_with_rowids(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<(Option<i64>, Vec<SqliteValue>, Vec<SqliteValue>)>> {
+        // Project the rowid alongside the row (rowid tables only; WITHOUT ROWID
+        // tables have no rowid) so the aliases resolve without an INTEGER PRIMARY
+        // KEY column, mirroring `collect_delete_trigger_rows`.
+        let is_rowid_table = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&update.table.name.name))
+                .is_none_or(|table| !table.without_rowid)
+        };
+        let projected_columns = if is_rowid_table {
+            vec![
+                ResultColumn::Expr {
+                    expr: Expr::Column(
+                        fsqlite_ast::ColumnRef::bare("rowid"),
+                        fsqlite_ast::Span::new(0, 0),
+                    ),
+                    alias: None,
+                },
+                ResultColumn::Star,
+            ]
+        } else {
+            vec![ResultColumn::Star]
+        };
+        let matched_select = Self::build_single_table_select(
+            &update.table,
+            projected_columns,
+            update.where_clause.as_ref(),
+            &[],
+            None,
+        );
         let matched_rows = self
-            .select_matching_rows(
-                &update.table,
-                update.where_clause.as_ref(),
-                &[],
-                None,
-                params,
-            )
+            .execute_statement(&Statement::Select(matched_select), params)
             .await?;
         if matched_rows.is_empty() {
             return Ok(Vec::new());
@@ -47170,7 +47262,19 @@ impl Connection {
 
         let mut trigger_rows = Vec::with_capacity(matched_rows.len());
         for row in matched_rows {
-            let old_values = row.values().to_vec();
+            let values = row.values();
+            let (row_rowid, old_values) = if is_rowid_table {
+                let rowid = match values.first() {
+                    Some(SqliteValue::Integer(n)) => Some(*n),
+                    _ => None,
+                };
+                (
+                    rowid,
+                    values.get(1..).map(<[SqliteValue]>::to_vec).unwrap_or_default(),
+                )
+            } else {
+                (None, values.to_vec())
+            };
             let mut new_values = old_values.clone();
 
             for assignment in &bound_assignments {
@@ -47240,7 +47344,7 @@ impl Connection {
                 }
             }
 
-            trigger_rows.push((old_values, new_values));
+            trigger_rows.push((row_rowid, old_values, new_values));
         }
         Ok(trigger_rows)
     }
@@ -57979,7 +58083,8 @@ impl Connection {
         table_name: &str,
         params: Option<&[SqliteValue]>,
     ) -> Result<()> {
-        for row_values in self.collect_insert_trigger_rows(insert, params).await? {
+        for (row_values, _explicit_rowid) in self.collect_insert_trigger_rows(insert, params).await?
+        {
             self.check_fk_parent_exists(table_name, &row_values).await?;
         }
         Ok(())
@@ -58773,12 +58878,14 @@ impl Connection {
                 // DELETE body observing the table sees post-delete state; the
                 // OLD.* frame values below are exact. RAISE outcomes propagate
                 // as statement errors like any other trigger failure.
+                // OLD.rowid resolves to the deleted victim's rowid so it works on
+                // tables without an INTEGER PRIMARY KEY column. (GH #205)
                 self.fire_before_triggers(
                     table_name,
                     &delete_event,
                     Some(&victim.values),
                     None,
-                    None,
+                    victim.rowid,
                     None,
                 )
                     .await?;
@@ -58787,7 +58894,7 @@ impl Connection {
                     &delete_event,
                     Some(&victim.values),
                     None,
-                    None,
+                    victim.rowid,
                     None,
                 )
                     .await?;
