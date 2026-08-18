@@ -17838,6 +17838,18 @@ impl Connection {
             .contains_key(&table_name.to_ascii_uppercase())
     }
 
+    /// Whether `table_name` refers to a virtual table — either a live instance
+    /// or a persisted `CREATE VIRTUAL TABLE` recorded in the original DDL. Used
+    /// to forbid column DDL on vtabs (GH #215).
+    fn table_name_is_virtual(&self, table_name: &str) -> bool {
+        self.has_live_vtab_instance(table_name)
+            || self
+                .original_ddl_sql
+                .borrow()
+                .get(&table_name.to_ascii_lowercase())
+                .is_some_and(|sql| is_virtual_table_sql(sql))
+    }
+
     fn pragma_table_list_column_count(&self, table: &TableSchema) -> usize {
         let hidden_columns = if self.has_live_fts5_instance(&table.name) {
             // FTS5 exposes the table-name control column and `rank` in
@@ -55988,6 +56000,19 @@ impl Connection {
             && self.has_live_vtab_instance(table_name)
         {
             return Err(FrankenError::Unsupported);
+        }
+        // GH #215: SQLite forbids column DDL on a virtual table. `ALTER TABLE
+        // <fts5> RENAME COLUMN old TO new` must fail with "cannot rename columns
+        // of virtual table" instead of silently rewriting the connection's
+        // shadow column list. Detect the vtab by a live instance or its
+        // persisted `CREATE VIRTUAL TABLE` DDL so a reopened (not-yet-live)
+        // FTS5 table is rejected too.
+        if matches!(alter.action, AlterTableAction::RenameColumn { .. })
+            && self.table_name_is_virtual(table_name)
+        {
+            return Err(FrankenError::Internal(format!(
+                "cannot rename columns of virtual table \"{table_name}\""
+            )));
         }
         let old_name = table_name.clone();
         let targets_main_explicit = alter
