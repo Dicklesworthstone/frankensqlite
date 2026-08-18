@@ -34218,7 +34218,18 @@ impl Connection {
                             "RETURNING is not supported for live virtual-table INSERT".to_owned(),
                         ));
                     }
-                    if insert.or_conflict.is_some() || !insert.upsert.is_empty() {
+                    // INSERT OR REPLACE is supported for live virtual tables
+                    // (delete any row conflicting on the rowid, then insert —
+                    // matching SQLite's REPLACE). UPSERT (`ON CONFLICT ... DO
+                    // ...`) and every other conflict action (ROLLBACK / ABORT /
+                    // FAIL / IGNORE) remain unimplemented. (GH #214)
+                    let is_replace = matches!(
+                        insert.or_conflict,
+                        Some(fsqlite_ast::ConflictAction::Replace)
+                    );
+                    if !insert.upsert.is_empty()
+                        || (insert.or_conflict.is_some() && !is_replace)
+                    {
                         return Err(FrankenError::NotImplemented(
                             "UPSERT and conflict clauses are not supported for live virtual-table INSERT"
                                 .to_owned(),
@@ -34379,8 +34390,14 @@ impl Connection {
                             .get(&key)
                             .is_some_and(|instance| is_rtree_instance(instance.as_ref()))
                     };
+                    // INSERT OR REPLACE resolves a rowid conflict by deleting the
+                    // existing row before inserting the new one (GH #214).
+                    let replace = matches!(
+                        insert.or_conflict,
+                        Some(fsqlite_ast::ConflictAction::Replace)
+                    );
                     let inserted_rowids = self
-                        .execute_live_vtab_insert_rows(table_name, &live_insert_rows)
+                        .execute_live_vtab_insert_rows(table_name, &live_insert_rows, replace)
                         .await?;
 
                     if has_after_insert {
@@ -45898,6 +45915,7 @@ impl Connection {
         &self,
         table_name: &str,
         rows: &[LiveVtabInsertRow],
+        replace: bool,
     ) -> Result<Vec<i64>> {
         let cx = self.op_cx()?;
         #[cfg(feature = "ext-fts5")]
@@ -45931,7 +45949,11 @@ impl Connection {
                             ))
                         })?
                         .to_integer();
-                    if !rowids.insert(rowid) {
+                    // Under INSERT OR REPLACE a duplicate rowid is not a conflict:
+                    // the per-row delete-then-insert below resolves it (last row
+                    // wins), so the primary-key pre-checks are skipped. Non-replace
+                    // inserts keep the strict PrimaryKeyViolation behavior. (GH #214)
+                    if !rowids.insert(rowid) && !replace {
                         return Err(FrankenError::PrimaryKeyViolation);
                     }
                     let exists = self
@@ -45939,7 +45961,7 @@ impl Connection {
                             Ok(reader.read_docsize(rowid, column_count).await?.is_some())
                         })
                         .await?;
-                    if exists {
+                    if exists && !replace {
                         return Err(FrankenError::PrimaryKeyViolation);
                     }
                 }
@@ -45962,6 +45984,15 @@ impl Connection {
                     } else {
                         row.explicit_rowid.clone().unwrap_or(SqliteValue::Null)
                     };
+                    // INSERT OR REPLACE: before inserting, delete any row that
+                    // conflicts on this rowid (SQLite REPLACE semantics). The
+                    // argc==1 non-null delete convention is the standard live-vtab
+                    // xUpdate delete; deleting an absent rowid is a harmless no-op.
+                    // Skipped for an auto-assigned (NULL) rowid — nothing to
+                    // conflict with. (GH #214)
+                    if replace && matches!(new_rowid, SqliteValue::Integer(_)) {
+                        instance.update(&cx, std::slice::from_ref(&new_rowid))?;
+                    }
                     args.push(new_rowid);
                     args.extend(row.values.iter().cloned());
                     let rowid = instance.update(&cx, &args)?.ok_or_else(|| {
@@ -46140,10 +46171,12 @@ impl Connection {
             })
             .collect();
 
-        // xUpdate == delete the old rows, then insert the recomputed rows.
+        // xUpdate == delete the old rows, then insert the recomputed rows. The
+        // old rows are deleted explicitly above, so the insert is a plain insert
+        // (no REPLACE conflict resolution needed).
         self.execute_live_vtab_delete_rowids(&table_name, &old_rowids)
             .await?;
-        self.execute_live_vtab_insert_rows(&table_name, &new_rows)
+        self.execute_live_vtab_insert_rows(&table_name, &new_rows, false)
             .await?;
         Ok(old_rowids.len())
     }
