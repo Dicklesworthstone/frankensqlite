@@ -271,3 +271,54 @@ fn not_materialized_references_other_cte_gh204() {
         .await;
     });
 }
+
+/// bd-wpiq6 M4: a CHAIN of NOT MATERIALIZED CTEs (`b`'s body reads `a`) must
+/// inline transitively, so `a`'s non-deterministic body re-evaluates at each of
+/// `b`'s reference sites. Frank previously inlined `b` carrying a bare `FROM a`,
+/// leaving `a` a single-evaluation shared CTE, so the two `(SELECT r FROM b)`
+/// observed one `random()` draw (`=` returned 1 where stock re-evaluates to 0).
+#[test]
+fn not_materialized_chained_random_reevaluates_wpiq6() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        const SQL: &str = "WITH a AS NOT MATERIALIZED (SELECT random() AS r), \
+                                b AS NOT MATERIALIZED (SELECT r FROM a) \
+                           SELECT (SELECT r FROM b)=(SELECT r FROM b)";
+        for _ in 0..8 {
+            assert_agree(&f, &r, SQL).await;
+            let eq = frank_rows(&f, SQL).await;
+            assert_eq!(
+                eq,
+                vec![vec!["0".to_owned()]],
+                "chained NOT MATERIALIZED `=` must be 0 (independent draws)"
+            );
+        }
+    });
+}
+
+/// bd-wpiq6 M8: a row-value comparison where one operand is `SELECT *` over an
+/// outer CTE must not falsely error at prepare. The width check computed the
+/// `SELECT *` operand's arity with an EMPTY CTE scope (under-counting it to 1),
+/// so its explicit multi-column peer was mis-classified as a scalar subquery and
+/// rejected ("sub-select returns 2 columns - expected 1"). Threading the visible
+/// CTE scope fixes the classification. Deterministic => oracle parity with stock.
+#[test]
+fn scalar_subquery_width_sees_outer_cte_wpiq6() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        assert_agree(
+            &f,
+            &r,
+            "WITH c(a,b) AS (SELECT 1,2) SELECT (SELECT * FROM c) = (SELECT a, b FROM c)",
+        )
+        .await;
+        assert_agree(
+            &f,
+            &r,
+            "WITH c(a,b) AS (SELECT 1,2) SELECT (SELECT a, b FROM c) = (SELECT * FROM c)",
+        )
+        .await;
+    });
+}

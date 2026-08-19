@@ -95967,7 +95967,20 @@ fn inline_not_materialized_ctes(select: &SelectStatement) -> Option<SelectStatem
         if cte_body_references_relation(&cte.query, &cte.name) {
             continue;
         }
-        if let Some(body) = cte_inline_body(cte) {
+        if let Some(mut body) = cte_inline_body(cte) {
+            // Expand every already-collected NOT MATERIALIZED CTE INTO this
+            // body first (CTEs are declared before they are used, so a chained
+            // reference — `b AS NOT MATERIALIZED (SELECT .. FROM a)` — sees `a`
+            // here). Without this, `b` is inlined carrying a bare `FROM a`, so
+            // `a` stays a single-evaluation CTE and is SHARED across `b`'s
+            // reference sites — a non-deterministic body (e.g. random()) then
+            // yields one value where stock re-evaluates it per reference
+            // (bd-wpiq6 M4). Pre-expanding makes each inlined reference carry
+            // `a`'s full body, so every reference re-evaluates independently.
+            let mut inner = 0usize;
+            for (prev_name, prev_body) in &inlinable {
+                subst_cte_refs_in_select(&mut body, prev_name, prev_body, &mut inner);
+            }
             inlinable.push((cte.name.clone(), body));
         }
     }
@@ -125494,12 +125507,20 @@ impl<'a> SelectStructureResolver<'a> {
                 // `x = (SELECT a, b)` stays a scalar-arity error. Mirrors the
                 // execution-time row-value handling in `rewrite_in_expr`.
                 let connection = self.connection;
+                // Thread the visible CTE scope so a `SELECT *` operand over an
+                // outer CTE resolves to its true width (an empty scope
+                // under-counts it to 1, mis-classifying its multi-column PEER as
+                // scalar and firing a false "returns N columns - expected 1" —
+                // bd-wpiq6 M8).
+                let visible_ctes = self.visible_ctes();
                 let operand_width = |operand: &Expr| -> usize {
                     match operand {
                         Expr::RowValue(values, _) => values.len(),
-                        Expr::Subquery(sub, _) => {
-                            connection.select_result_column_count(sub, &[], &mut Vec::new())
-                        }
+                        Expr::Subquery(sub, _) => connection.select_result_column_count(
+                            sub,
+                            &visible_ctes,
+                            &mut Vec::new(),
+                        ),
                         _ => 1,
                     }
                 };
