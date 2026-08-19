@@ -649,6 +649,13 @@ pub struct TransactionManager {
     /// committed writers) feeding the committed-overlap inputs of edge
     /// discovery. Capped at [`SSI_COMMITTED_WITNESS_CAP`] entries.
     ssi_committed_witnesses: Mutex<Vec<CommittedWitness>>,
+    /// bd-cht52 (M1): conservative watermark. The highest `commit_seq` of any
+    /// committed witness that the hard-cap was forced to evict while a live txn
+    /// could still overlap it (0 = none lost). A committing txn whose
+    /// `begin_seq` is below this value may have an rw-edge that can no longer be
+    /// discovered, so edge discovery treats it as a dangerous pivot. Self-heals:
+    /// new txns begin above the watermark and are unaffected.
+    ssi_witness_lost_below: AtomicU64,
 }
 
 impl TransactionManager {
@@ -714,6 +721,7 @@ impl TransactionManager {
             cell_log: CellVisibilityLog::new(25 * 1024 * 1024),
             ssi_active_witnesses: Mutex::new(HashMap::new()),
             ssi_committed_witnesses: Mutex::new(Vec::new()),
+            ssi_witness_lost_below: AtomicU64::new(0),
         }
     }
 
@@ -1331,10 +1339,16 @@ impl TransactionManager {
         // If no writes, just commit (read-only transaction). Cell-level
         // deltas are writes too, even when no full page image is staged.
         if txn.write_set.is_empty() && txn.write_set_data.is_empty() && !has_cell_deltas {
-            // Read-only fast path never runs commit_concurrent, so drop the
-            // live SSI witness here to avoid leaking the active entry
-            // (bd-gh-mvcc-ssi-wuupf / GH#189).
-            self.ssi_witness_forget(txn);
+            // Read-only fast path never runs commit_concurrent. bd-cht52 (M2):
+            // PUBLISH this txn's SIREAD witnesses (not forget) so a later writer
+            // that overwrites a key this read-only txn read can still discover
+            // the rw-antidependency — otherwise Fekete's read-only anomaly is
+            // undetectable. The read-only txn serialises at the current committed
+            // watermark, which is its witness commit_seq for the overlap test.
+            // ssi_witness_publish drops the active entry either way (so the
+            // leak GH#189 fixed stays fixed) and skips a witness with no reads.
+            let ro_commit_seq = CommitSeq::new(self.shm.load_commit_seq().get());
+            self.ssi_witness_publish(txn, ro_commit_seq);
             txn.commit();
             self.release_all_resources(txn);
             return Ok(CommitSeq::ZERO);
@@ -1545,6 +1559,12 @@ impl TransactionManager {
         if read_keys.is_empty() && write_keys.is_empty() {
             return;
         }
+        // Retention floor: a live txn overlaps a committed witness W iff the
+        // txn began before W committed (begin < W.commit_seq). A future txn
+        // begins at or above the current watermark, which is ≥ every committed
+        // commit_seq, so it never overlaps an existing witness. Therefore W is
+        // safe to drop iff W.commit_seq ≤ min(begin_seq of every live txn).
+        let min_live_begin = self.min_live_begin_seq();
         let mut committed = self.ssi_committed_witnesses.lock();
         committed.push(CommittedWitness {
             token: txn.token(),
@@ -1553,11 +1573,70 @@ impl TransactionManager {
             read_keys,
             write_keys,
         });
-        // Bound the ring: drop the oldest entries (commit order ≈ push order).
-        let len = committed.len();
-        if len > SSI_COMMITTED_WITNESS_CAP {
-            committed.drain(0..len - SSI_COMMITTED_WITNESS_CAP);
+        // bd-cht52 (M1): bound the ring by dropping ONLY witnesses no live txn
+        // can still overlap — never a relevant witness, which would silently
+        // miss a write-skew edge (the very defect 256 filler commits used to
+        // trigger). Retaining more is always correctness-safe.
+        if committed.len() > SSI_COMMITTED_WITNESS_CAP {
+            let drop_floor = min_live_begin.map_or(u64::MAX, CommitSeq::get);
+            // Oldest-first (push ≈ commit order): drop while the front witness
+            // is safe (commit_seq < drop_floor) and we are still over the cap.
+            let mut safe_drop = 0;
+            while committed.len() - safe_drop > SSI_COMMITTED_WITNESS_CAP
+                && committed
+                    .get(safe_drop)
+                    .is_some_and(|w| w.commit_seq.get() < drop_floor)
+            {
+                safe_drop += 1;
+            }
+            if safe_drop > 0 {
+                committed.drain(0..safe_drop);
+            }
+            // Hard ceiling: a long-running txn can keep every witness relevant.
+            // Past a generous multiple of the cap, force-drop the oldest and
+            // record a conservative watermark so any txn that could have
+            // overlapped a lost witness is treated as a dangerous pivot.
+            const SSI_COMMITTED_WITNESS_HARD_CAP: usize = SSI_COMMITTED_WITNESS_CAP * 4;
+            if committed.len() > SSI_COMMITTED_WITNESS_HARD_CAP {
+                let force = committed.len() - SSI_COMMITTED_WITNESS_HARD_CAP;
+                if let Some(highest_lost) = committed
+                    .get(force.saturating_sub(1))
+                    .map(|w| w.commit_seq.get())
+                {
+                    self.ssi_witness_lost_below
+                        .fetch_max(highest_lost.saturating_add(1), Ordering::AcqRel);
+                }
+                committed.drain(0..force);
+                tracing::warn!(
+                    hard_cap = SSI_COMMITTED_WITNESS_HARD_CAP,
+                    "SSI committed-witness ring hit its hard cap with all entries still \
+                     live-relevant; force-evicted oldest and armed the conservative pivot \
+                     watermark (a very long-running concurrent txn is overlapping every witness)"
+                );
+            }
         }
+    }
+
+    /// Minimum `begin_seq` (snapshot high) across all currently-live txns, or
+    /// `None` when no txn is live. Used as the SSI committed-witness retention
+    /// floor (bd-cht52 M1).
+    fn min_live_begin_seq(&self) -> Option<CommitSeq> {
+        self.active_snapshot_highs.lock().values().min().copied()
+    }
+
+    /// bd-cht52 (M6): drop active SSI witnesses whose transaction is no longer
+    /// live. A transaction that is dropped without a clean commit/abort would
+    /// otherwise leave an eternal active witness — and because it carries both
+    /// read and write keys it forms a permanent self-pivot, poisoning every
+    /// later committing txn with a spurious `BusySnapshot`. Every clean path
+    /// forgets/publishes the witness BEFORE it leaves `active_snapshot_highs`,
+    /// so a live txn is always registered there: retaining only registered
+    /// txns can never evict a live witness.
+    fn ssi_witness_drain_orphaned(&self) {
+        let live: HashSet<TxnId> = self.active_snapshot_highs.lock().keys().copied().collect();
+        self.ssi_active_witnesses
+            .lock()
+            .retain(|txn_id, _| live.contains(txn_id));
     }
 
     /// Run the existing rw-antidependency edge discovery for a committing
@@ -1575,6 +1654,9 @@ impl TransactionManager {
     /// released BEFORE discovery runs, so no registry lock is held across the
     /// discovery/commit path.
     fn ssi_run_edge_discovery(&self, txn: &mut Transaction) {
+        // bd-cht52 (M6): evict any active witness whose txn is no longer live
+        // before it can contribute a spurious edge to this discovery pass.
+        self.ssi_witness_drain_orphaned();
         let committing = txn.token();
         let begin_seq = txn.snapshot.high;
         // Upper bound on the committing txn's eventual commit sequence, used
@@ -1666,6 +1748,17 @@ impl TransactionManager {
         // never clear a flag another path may have set.
         txn.has_in_rw |= !in_edges.is_empty();
         txn.has_out_rw |= !out_edges.is_empty();
+
+        // bd-cht52 (M1): if the hard-cap force-evicted a committed witness this
+        // txn could have overlapped (its begin_seq predates the lost witness's
+        // commit_seq), an rw-edge may be undiscoverable. Treat it as a dangerous
+        // pivot on both sides so the Step-1 check aborts it, never permitting an
+        // unvalidated write-skew commit.
+        let lost_below = self.ssi_witness_lost_below.load(Ordering::Acquire);
+        if lost_below != 0 && begin_seq.get() < lost_below {
+            txn.has_in_rw = true;
+            txn.has_out_rw = true;
+        }
     }
 
     fn publish_shared_snapshot(&self, commit_seq: CommitSeq) {
@@ -6384,6 +6477,60 @@ mod tests {
         assert_eq!(
             aborted, 1,
             "the other txn must get BusySnapshot via the real pivot abort (r1={r1:?}, r2={r2:?})"
+        );
+    }
+
+    #[test]
+    fn test_ssi_write_skew_direct_api_survives_300_filler_commits() {
+        // bd-cht52 (M1): the committed-witness ring must not evict a witness a
+        // live txn can still overlap. T1 commits first (publishing read-A/write-B),
+        // then 300 unrelated commits flood the CAP=256 ring; T2 (begun before T1
+        // committed, so T1's witness is still relevant) then commits and must be
+        // aborted via T1's RETAINED committed witness. The old blind
+        // `drain(0..len-CAP)` evicted T1's (oldest) witness and let BOTH commit.
+        let m = mgr();
+        assert!(m.ssi_enabled(), "SSI must be on by default");
+        let pa = PageNumber::new(1).unwrap();
+        let pb = PageNumber::new(2).unwrap();
+
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, pa, test_data(0x10)).unwrap();
+        m.write_page(&mut setup, pb, test_data(0x20)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        // T2 opens first and stays live through everything, so T1's witness
+        // (committed while T2 is live) must be retained.
+        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        // T1: read A, write B, commit successfully (T2 has not touched A/B yet,
+        // so there is no active edge to abort T1).
+        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t1, pa).unwrap();
+        m.write_page(&mut t1, pb, test_data(0x21)).unwrap();
+        m.commit(&mut t1)
+            .expect("T1 commits cleanly (no concurrent reader/writer of A or B yet)");
+
+        // 300 unrelated commits flood the committed-witness ring (> CAP=256).
+        // Each writes a DISTINCT fresh page (a write key alone yields a retained
+        // witness), so they contend on nothing yet still fill the ring.
+        for i in 0..300u32 {
+            let mut f = m.begin(BeginKind::Concurrent).unwrap();
+            let fp = PageNumber::new(1000 + i).unwrap();
+            m.write_page(&mut f, fp, test_data(0x33)).unwrap();
+            m.commit(&mut f).expect("sequential filler commits");
+        }
+
+        // T2: read B, write A. The rw-antidependency with T1 (T2 read B ← T1
+        // wrote B; T2 write A ← T1 read A) is discoverable ONLY through T1's
+        // retained committed witness. T2 must abort.
+        let _ = m.read_page(&mut t2, pb).unwrap();
+        m.write_page(&mut t2, pa, test_data(0x11)).unwrap();
+        let r2 = m.commit(&mut t2);
+        assert_eq!(
+            r2.unwrap_err(),
+            MvccError::BusySnapshot,
+            "T1's committed witness must survive 300 filler commits so T2's \
+             write-skew is still detected (bd-cht52 M1)"
         );
     }
 
