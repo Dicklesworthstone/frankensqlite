@@ -15549,12 +15549,13 @@ impl Connection {
                 .await?
         {
             let payload_values =
-                parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "FOREIGN KEY child table `{}` rowid {rowid} has an invalid record",
-                        child.name
-                    ),
-                })?;
+                parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "FOREIGN KEY child table `{}` rowid {rowid} has an invalid record",
+                            child.name
+                        ),
+                    })?;
             if payload_values.len() > child.columns.len() {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -33718,6 +33719,16 @@ impl Connection {
             return Ok(rows);
         }
         self.reject_unsupported_attached_target_schema(statement)?;
+        // bd-1mcjr: stock SQLite rejects `TABLE.*` wildcards in RETURNING at
+        // prepare time ("RETURNING may not use \"TABLE.*\" wildcards"), for any
+        // DML target including an attached-schema-qualified one. Match it
+        // exactly rather than expanding `table.*` as `*`.
+        if statement_returning_uses_table_star(statement) {
+            return Err(FrankenError::ParseError {
+                offset: 0,
+                detail: "RETURNING may not use \"TABLE.*\" wildcards".to_owned(),
+            });
+        }
         // ATTACH/DETACH register or release a *separate* side connection and do
         // not write to the main database file, so a read-only / schema-only main
         // connection must still be allowed to run them — this matches SQLite,
@@ -117122,6 +117133,20 @@ fn statement_starts_fresh_schema_change_boundary(statement: &Statement) -> bool 
             | Statement::Analyze(_)
             | Statement::Reindex(_)
     )
+}
+
+/// bd-1mcjr: true when a DML statement's RETURNING clause contains a `TABLE.*`
+/// wildcard, which stock SQLite rejects at prepare time for every DML target.
+fn statement_returning_uses_table_star(statement: &Statement) -> bool {
+    let returning = match statement {
+        Statement::Insert(insert) => &insert.returning,
+        Statement::Update(update) => &update.returning,
+        Statement::Delete(delete) => &delete.returning,
+        _ => return false,
+    };
+    returning
+        .iter()
+        .any(|column| matches!(column, ResultColumn::TableStar(_)))
 }
 
 fn statement_writes_under_query_only(statement: &Statement) -> bool {
@@ -234674,7 +234699,9 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_attached_insert_returning_table_star_strips_same_schema_name() {
+    fn test_attached_insert_returning_table_star_is_rejected() {
+        // bd-1mcjr: stock rejects `TABLE.*` wildcards in RETURNING; frank now
+        // matches (the prior schema-strip extension is removed for parity).
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("ATTACH DATABASE ':memory:' AS aux;")
@@ -234684,21 +234711,17 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
 
-            let rows = conn
+            let err = conn
                 .query("INSERT INTO aux.t VALUES (1, 2) RETURNING aux.t.*;")
                 .await
-                .unwrap();
-            assert_eq!(
-                rows.iter()
-                    .map(|row| row.values().to_vec())
-                    .collect::<Vec<_>>(),
-                vec![vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]]
-            );
+                .expect_err("RETURNING TABLE.* must be rejected (stock parity)");
+            assert!(matches!(err, FrankenError::ParseError { .. }), "got {err:?}");
         });
     }
 
     #[test]
-    fn test_attached_insert_with_cte_returning_table_star_strips_same_schema_name() {
+    fn test_attached_insert_with_cte_returning_table_star_is_rejected() {
+        // bd-1mcjr: stock rejects `TABLE.*` wildcards in RETURNING; frank matches.
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("ATTACH DATABASE ':memory:' AS aux;")
@@ -234708,20 +234731,15 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
 
-            let rows = conn
+            let err = conn
                 .query(
                     "WITH src(id, present) AS (VALUES (1, 2))
                  INSERT INTO aux.t SELECT id, present FROM src
                  RETURNING aux.t.*;",
                 )
                 .await
-                .unwrap();
-            assert_eq!(
-                rows.iter()
-                    .map(|row| row.values().to_vec())
-                    .collect::<Vec<_>>(),
-                vec![vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]]
-            );
+                .expect_err("RETURNING TABLE.* must be rejected (stock parity)");
+            assert!(matches!(err, FrankenError::ParseError { .. }), "got {err:?}");
         });
     }
 
@@ -234812,7 +234830,8 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_attached_update_returning_table_star_strips_same_schema_name() {
+    fn test_attached_update_returning_table_star_is_rejected() {
+        // bd-1mcjr: stock rejects `TABLE.*` wildcards in RETURNING; frank matches.
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("ATTACH DATABASE ':memory:' AS aux;")
@@ -234825,21 +234844,18 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
 
-            let rows = conn
+            let err = conn
                 .query("UPDATE aux.t SET present = 2 WHERE id = 1 RETURNING aux.t.*;")
                 .await
-                .unwrap();
-            assert_eq!(
-                rows.iter()
-                    .map(|row| row.values().to_vec())
-                    .collect::<Vec<_>>(),
-                vec![vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]]
-            );
+                .expect_err("RETURNING TABLE.* must be rejected (stock parity)");
+            assert!(matches!(err, FrankenError::ParseError { .. }), "got {err:?}");
         });
     }
 
     #[test]
-    fn test_attached_delete_returning_table_star_strips_same_schema_name() {
+    fn test_attached_delete_returning_table_star_is_rejected() {
+        // bd-1mcjr: stock rejects `TABLE.*` wildcards in RETURNING; frank
+        // matches. The rejected DELETE runs no side effects — both rows persist.
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("ATTACH DATABASE ':memory:' AS aux;")
@@ -234852,24 +234868,25 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
 
-            let rows = conn
+            let err = conn
                 .query("DELETE FROM aux.t WHERE id = 1 RETURNING aux.t.*;")
                 .await
-                .unwrap();
-            assert_eq!(
-                rows.iter()
-                    .map(|row| row.values().to_vec())
-                    .collect::<Vec<_>>(),
-                vec![vec![SqliteValue::Integer(1), SqliteValue::Integer(10)]]
-            );
+                .expect_err("RETURNING TABLE.* must be rejected (stock parity)");
+            assert!(matches!(err, FrankenError::ParseError { .. }), "got {err:?}");
 
-            let persisted = conn.query("SELECT id, present FROM aux.t;").await.unwrap();
+            let persisted = conn
+                .query("SELECT id, present FROM aux.t ORDER BY id;")
+                .await
+                .unwrap();
             assert_eq!(
                 persisted
                     .iter()
                     .map(|row| row.values().to_vec())
                     .collect::<Vec<_>>(),
-                vec![vec![SqliteValue::Integer(2), SqliteValue::Integer(20)]]
+                vec![
+                    vec![SqliteValue::Integer(1), SqliteValue::Integer(10)],
+                    vec![SqliteValue::Integer(2), SqliteValue::Integer(20)],
+                ]
             );
         });
     }
