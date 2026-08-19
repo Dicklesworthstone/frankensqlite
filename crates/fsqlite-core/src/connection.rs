@@ -56741,18 +56741,35 @@ impl Connection {
             }
             return Err(FrankenError::Unsupported);
         }
-        // GH #215: SQLite forbids column DDL on a virtual table. `ALTER TABLE
-        // <fts5> RENAME COLUMN old TO new` must fail with "cannot rename columns
-        // of virtual table" instead of silently rewriting the connection's
-        // shadow column list. Detect the vtab by a live instance or its
-        // persisted `CREATE VIRTUAL TABLE` DDL so a reopened (not-yet-live)
-        // FTS5 table is rejected too.
-        if matches!(alter.action, AlterTableAction::RenameColumn { .. })
-            && self.table_name_is_virtual(table_name)
-        {
-            return Err(FrankenError::Internal(format!(
-                "cannot rename columns of virtual table \"{table_name}\""
-            )));
+        // GH #215 / bd-bzd19 L13: SQLite forbids all column DDL on a virtual
+        // table. `ALTER TABLE <vtab> {RENAME COLUMN | ADD COLUMN | DROP COLUMN}`
+        // must fail at prepare time instead of silently rewriting the
+        // connection's shadow column list. Detect the vtab by a live instance or
+        // its persisted `CREATE VIRTUAL TABLE` DDL so a reopened (not-yet-live)
+        // FTS5 table is rejected too. Messages match stock sqlite3 3.46.1
+        // verbatim (verified): ADD COLUMN reports the generic "virtual tables may
+        // not be altered"; DROP and RENAME COLUMN name the offending table.
+        // `RENAME TO` is deliberately excluded — it is handled above (a live
+        // FTS5 rename is supported; other vtabs already return Unsupported).
+        if self.table_name_is_virtual(table_name) {
+            match &alter.action {
+                AlterTableAction::RenameColumn { .. } => {
+                    return Err(FrankenError::Internal(format!(
+                        "cannot rename columns of virtual table \"{table_name}\""
+                    )));
+                }
+                AlterTableAction::DropColumn(_) => {
+                    return Err(FrankenError::Internal(format!(
+                        "cannot drop column from virtual table \"{table_name}\""
+                    )));
+                }
+                AlterTableAction::AddColumn(_) => {
+                    return Err(FrankenError::Internal(
+                        "virtual tables may not be altered".to_owned(),
+                    ));
+                }
+                AlterTableAction::RenameTo(_) => {}
+            }
         }
         let old_name = table_name.clone();
         let targets_main_explicit = alter
