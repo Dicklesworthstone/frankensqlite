@@ -97583,14 +97583,17 @@ async fn rewrite_in_select_core(
             // (bd-pgqsk M6). Only a never-true constant whose sibling contains a
             // subquery folds here; a bare column / aggregate sibling is left for
             // resolution to reject (bd-kcvra). Covers aggregate / GROUP BY shapes.
-            fold_never_true_and_in_filter(wh);
+            // bd-x25ka(a): a table WHERE is cost-reordered by stock, so a never-true
+            // constant folds in either position; a FROM-less WHERE is left-to-right.
+            fold_never_true_and_in_filter(wh, from.is_some());
             rewrite_in_expr(wh, conn, rewrite_in, params).await?;
         }
         for expr in group_by.iter_mut() {
             rewrite_in_expr(expr, conn, rewrite_in, params).await?;
         }
         if let Some(hv) = having.as_mut() {
-            fold_never_true_and_in_filter(hv);
+            // HAVING is evaluated left-to-right (never cost-reordered).
+            fold_never_true_and_in_filter(hv, false);
             rewrite_in_expr(hv, conn, rewrite_in, params).await?;
         }
         for window in windows.iter_mut() {
@@ -97604,7 +97607,8 @@ async fn rewrite_in_select_core(
         if let Some(from) = from.as_mut() {
             for join in from.joins.iter_mut() {
                 if let Some(JoinConstraint::On(on_expr)) = join.constraint.as_mut() {
-                    fold_never_true_and_in_filter(on_expr);
+                    // JOIN-ON is evaluated left-to-right (never cost-reordered).
+                    fold_never_true_and_in_filter(on_expr, false);
                     rewrite_in_expr(on_expr, conn, rewrite_in, params).await?;
                 }
             }
@@ -120115,14 +120119,22 @@ fn and_operand_is_literal_integer_zero(expr: &Expr) -> bool {
 ///    sibling is a bare column / aggregate is deliberately NOT folded here: stock
 ///    still name/aggregate-resolves that dead branch and raises `no such column` /
 ///    `misuse of aggregate`, so it must reach resolution unfolded.
-fn and_pair_folds_never_true(left: &Expr, right: &Expr) -> bool {
+fn and_pair_folds_never_true(left: &Expr, right: &Expr, table_where: bool) -> bool {
     fn never_true_beside_subquery(dead: &Expr, sibling: &Expr) -> bool {
         and_operand_is_constant_never_true(dead) && expr_has_any_subquery(sibling)
     }
     and_operand_is_literal_integer_zero(left)
         || and_operand_is_literal_integer_zero(right)
+        // A never-true constant on the LEFT short-circuits before the right operand
+        // is evaluated, matching stock's left-to-right evaluation in every filter
+        // context, so `<never-true> AND (subquery)` always folds (dropping the dead
+        // subquery).
         || never_true_beside_subquery(left, right)
-        || never_true_beside_subquery(right, left)
+        // bd-x25ka(a): `(subquery) AND <never-true>` — the subquery is on the LEFT —
+        // only folds under a cost-reordered table WHERE. In a FROM-less WHERE,
+        // HAVING, or JOIN-ON, stock evaluates the LEFT subquery FIRST and raises its
+        // error, so folding it away silently swallowed that divergence.
+        || (table_where && never_true_beside_subquery(right, left))
 }
 
 /// In a FILTER context (WHERE / HAVING / JOIN-ON), fold every `X AND Y`
@@ -120137,7 +120149,7 @@ fn and_pair_folds_never_true(left: &Expr, right: &Expr) -> bool {
 /// every value position — is left untouched. Only integer `0` is folded in a
 /// VALUE context (that stays in `rewrite_in_expr`): a value-context `NULL AND E`
 /// is `NULL`/`FALSE` and must evaluate `E`, which stock does. (bd-pgqsk M6)
-fn fold_never_true_and_in_filter(expr: &mut Expr) {
+fn fold_never_true_and_in_filter(expr: &mut Expr, table_where: bool) {
     match expr {
         Expr::BinaryOp {
             op: BinaryOp::And,
@@ -120146,9 +120158,9 @@ fn fold_never_true_and_in_filter(expr: &mut Expr) {
             span,
         } => {
             let span = *span;
-            fold_never_true_and_in_filter(left);
-            fold_never_true_and_in_filter(right);
-            if and_pair_folds_never_true(left, right) {
+            fold_never_true_and_in_filter(left, table_where);
+            fold_never_true_and_in_filter(right, table_where);
+            if and_pair_folds_never_true(left, right, table_where) {
                 *expr = Expr::Literal(Literal::Integer(0), span);
             }
         }
@@ -120158,8 +120170,8 @@ fn fold_never_true_and_in_filter(expr: &mut Expr) {
             right,
             ..
         } => {
-            fold_never_true_and_in_filter(left);
-            fold_never_true_and_in_filter(right);
+            fold_never_true_and_in_filter(left, table_where);
+            fold_never_true_and_in_filter(right, table_where);
         }
         _ => {}
     }
@@ -120169,7 +120181,7 @@ fn fold_never_true_and_in_filter(expr: &mut Expr) {
 /// some `AND` reachable through `AND`/`OR` has a constant-never-true operand, so
 /// the fold would change `expr`. Used to avoid cloning a SELECT when nothing
 /// folds. (bd-pgqsk M6)
-fn filter_expr_has_never_true_and(expr: &Expr) -> bool {
+fn filter_expr_has_never_true_and(expr: &Expr, table_where: bool) -> bool {
     match expr {
         Expr::BinaryOp {
             op: BinaryOp::And,
@@ -120177,16 +120189,19 @@ fn filter_expr_has_never_true_and(expr: &Expr) -> bool {
             right,
             ..
         } => {
-            and_pair_folds_never_true(left, right)
-                || filter_expr_has_never_true_and(left)
-                || filter_expr_has_never_true_and(right)
+            and_pair_folds_never_true(left, right, table_where)
+                || filter_expr_has_never_true_and(left, table_where)
+                || filter_expr_has_never_true_and(right, table_where)
         }
         Expr::BinaryOp {
             op: BinaryOp::Or,
             left,
             right,
             ..
-        } => filter_expr_has_never_true_and(left) || filter_expr_has_never_true_and(right),
+        } => {
+            filter_expr_has_never_true_and(left, table_where)
+                || filter_expr_has_never_true_and(right, table_where)
+        }
         _ => false,
     }
 }
@@ -120201,16 +120216,19 @@ fn fold_select_core_filters_never_true(core: &mut SelectCore) {
         ..
     } = core
     {
+        // bd-x25ka(a): only a table WHERE is cost-reordered (folds either
+        // position); FROM-less WHERE / HAVING / JOIN-ON are left-to-right.
+        let table_where = from.is_some();
         if let Some(wh) = where_clause.as_mut() {
-            fold_never_true_and_in_filter(wh);
+            fold_never_true_and_in_filter(wh, table_where);
         }
         if let Some(hv) = having.as_mut() {
-            fold_never_true_and_in_filter(hv);
+            fold_never_true_and_in_filter(hv, false);
         }
         if let Some(from) = from.as_mut() {
             for join in from.joins.iter_mut() {
                 if let Some(JoinConstraint::On(on)) = join.constraint.as_mut() {
-                    fold_never_true_and_in_filter(on);
+                    fold_never_true_and_in_filter(on, false);
                 }
             }
         }
@@ -120230,16 +120248,20 @@ fn select_has_foldable_filter_never_true_and(select: &SelectStatement) -> bool {
         else {
             return false;
         };
+        // bd-x25ka(a): mirror the fold's context sensitivity so the detector does
+        // not claim a fold the fold itself would decline (table WHERE cost-reorders;
+        // FROM-less WHERE / HAVING / JOIN-ON are left-to-right).
+        let table_where = from.is_some();
         where_clause
             .as_ref()
-            .is_some_and(|expr| filter_expr_has_never_true_and(expr))
+            .is_some_and(|expr| filter_expr_has_never_true_and(expr, table_where))
             || having
                 .as_ref()
-                .is_some_and(|expr| filter_expr_has_never_true_and(expr))
+                .is_some_and(|expr| filter_expr_has_never_true_and(expr, false))
             || from.as_ref().is_some_and(|from| {
                 from.joins.iter().any(|join| {
                     matches!(&join.constraint, Some(JoinConstraint::On(on))
-                        if filter_expr_has_never_true_and(on))
+                        if filter_expr_has_never_true_and(on, false))
                 })
             })
     };
