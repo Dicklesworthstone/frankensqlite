@@ -13,9 +13,15 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::ScalarFunction;
+// `ErasedVtabInstance` is intentionally NOT imported by name (bd-zhw11): it is a
+// blanket-impl erased-dispatch trait and only ever named as a return TYPE here
+// (fully qualified below), never as a method receiver. Importing it would bring
+// its `update`/etc. methods into scope and make `table.update(..)` ambiguous with
+// the concrete `VirtualTable::update` in this crate's tests (`use super::*`),
+// breaking the whole `--lib` build with E0034.
 use fsqlite_func::vtab::{
-    ColumnContext, ErasedVtabInstance, IndexInfo, ShadowTablePolicy, TransactionalVtabState,
-    VirtualTable, VirtualTableCursor, VtabIntegrityPolicy, VtabLifecyclePolicy, VtabModuleFactory,
+    ColumnContext, IndexInfo, ShadowTablePolicy, TransactionalVtabState, VirtualTable,
+    VirtualTableCursor, VtabIntegrityPolicy, VtabLifecyclePolicy, VtabModuleFactory,
     VtabModuleMetadata, VtabRiskLevel,
 };
 use fsqlite_types::cx::Cx;
@@ -10691,11 +10697,11 @@ impl VirtualTableCursor for Fts5VocabCursor {
 struct Fts5VocabFactory;
 
 impl VtabModuleFactory for Fts5VocabFactory {
-    fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+    fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn fsqlite_func::vtab::ErasedVtabInstance>> {
         Ok(Box::new(Fts5VocabTable::connect(cx, args)?))
     }
 
-    fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+    fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn fsqlite_func::vtab::ErasedVtabInstance>> {
         self.create(cx, args)
     }
 
