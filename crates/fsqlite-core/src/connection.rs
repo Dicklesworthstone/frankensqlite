@@ -60991,8 +60991,18 @@ impl Connection {
             };
             table.find_by_rowid(rowid).is_some()
         };
-        if present {
-            // A row present in the txn-current mirror is definitive.
+        // A present row is definitive ONLY when the mirror is authoritative for
+        // committed rows (bd-2rkvk / GH#369): a fully-hydrated mirror. This
+        // mirrors the parent-ABSENT guard below — both branches trust the mirror
+        // only under `memdb_rows_loaded`. Without it, a stale mirror still holding
+        // a since-deleted/rolled-back parent (the bd-dsxu2 ghost-parent trap) could
+        // report that ghost as a real parent and let an FK check wrongly pass. When
+        // the mirror is not authoritative, fall through to the pager-backed
+        // validation SELECT, which reads the true committed/txn state. bd-ixf69's
+        // dirty-mirror discard clears such ghosts today (so on every currently
+        // reachable path a present hit already implies `memdb_rows_loaded`); this
+        // guard makes FK correctness independent of that row-clearing.
+        if present && self.memdb_rows_loaded.get() {
             return Ok(Some(true));
         }
         // A miss is definitive only when the mirror is authoritative for
