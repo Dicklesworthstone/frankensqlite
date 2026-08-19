@@ -117073,9 +117073,23 @@ fn compute_aggregate_ext_collated(
         let snap = lock_unpoisoned(collation_registry).clone();
         let filtered = values.iter().filter(|v| !matches!(v, SqliteValue::Null));
         let result = if name == "min" {
+            // `Iterator::min_by` keeps the FIRST minimal element on ties, which
+            // matches stock minmaxStep (first-wins).
             filtered.min_by(|a, b| cmp_sqlite_values_collated_snapshot(a, b, collation, &snap))
         } else {
-            filtered.max_by(|a, b| cmp_sqlite_values_collated_snapshot(a, b, collation, &snap))
+            // bd-lgwjd(b): stock minmaxStep is FIRST-wins on collation-equal ties
+            // (strictly-greater replace), but `Iterator::max_by` is LAST-wins —
+            // e.g. NOCASE ties ('z',1),('Z',2) yield stock 'z' vs max_by 'Z'. Fold
+            // keeping the first maximal: replace only on a STRICTLY-greater value.
+            filtered.reduce(|acc, v| {
+                if cmp_sqlite_values_collated_snapshot(v, acc, collation, &snap)
+                    == std::cmp::Ordering::Greater
+                {
+                    v
+                } else {
+                    acc
+                }
+            })
         };
         return Ok(result.map_or(SqliteValue::Null, |v| (*v).clone()));
     }
