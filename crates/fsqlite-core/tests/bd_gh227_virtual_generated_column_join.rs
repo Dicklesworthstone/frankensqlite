@@ -97,6 +97,14 @@ async fn seed(fconn: &Connection, rconn: &rusqlite::Connection) {
         "INSERT INTO u VALUES ('durian', 3)",
         "INSERT INTO u2 VALUES ('banana!', 10)",
         "INSERT INTO u2 VALUES ('apple!', 20)",
+        // bd-3radn H1: a COALESCE VIRTUAL gen-col that yields a NON-NULL value
+        // for a NULL base — so a null-extended OUTER JOIN row is distinguishable
+        // from a real row whose base is NULL. r(1) matches; r(3) is a real row
+        // with base NULL (g = 99); l(2) has no match (null-extended, g = NULL).
+        "CREATE TABLE r (id INTEGER, base INTEGER, g INTEGER AS (COALESCE(base, 99)) VIRTUAL)",
+        "CREATE TABLE l (id INTEGER)",
+        "INSERT INTO r(id, base) VALUES (1, 7), (3, NULL)",
+        "INSERT INTO l VALUES (1), (2), (3)",
     ];
     for sql in pre {
         fconn
@@ -186,6 +194,30 @@ fn gh227_virtual_generated_column_join_file_backed() {
             "SELECT u.y, t.b FROM u JOIN t ON u.x = t.b ORDER BY u.y, t.rowid",
         )
         .await;
+
+        // bd-3radn H1: a COALESCE VIRTUAL gen-col on the RIGHT (nullable) side of
+        // a LEFT JOIN. For an UNMATCHED (null-extended) row the generated column
+        // must be NULL, NOT COALESCE(NULL, 99) = 99. A real row whose base is
+        // NULL still yields 99. Result must be (1,7), (2,NULL), (3,99).
+        assert_agree(
+            &fconn,
+            &rconn,
+            "SELECT l.id, r.g FROM l LEFT JOIN r ON l.id = r.id ORDER BY l.id",
+        )
+        .await;
+        // The anti-join must find exactly the null-extended row (l.id = 2). The
+        // pre-fix code computed g = 99 for it and dropped it, returning zero.
+        let anti = assert_agree(
+            &fconn,
+            &rconn,
+            "SELECT l.id FROM l LEFT JOIN r ON l.id = r.id WHERE r.g IS NULL ORDER BY l.id",
+        )
+        .await;
+        assert_eq!(
+            anti, 1,
+            "bd-3radn H1: LEFT JOIN anti-join on a COALESCE gen-col must return \
+             exactly the null-extended row (regression returned zero)"
+        );
 
         fconn.close().await.expect("close franken");
     });

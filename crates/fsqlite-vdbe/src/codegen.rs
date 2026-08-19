@@ -11631,9 +11631,22 @@ fn emit_join_expr(
                         // canonical table-column reader so the generating
                         // expression is computed (and affinity-coerced) on read,
                         // exactly as single-table projection does.
+                        //
+                        // bd-3radn H1: in an OUTER JOIN the cursor can be on a
+                        // NULL-extended (unmatched) row. Computing the generating
+                        // expression there yields a bogus non-NULL value
+                        // (e.g. COALESCE(base, 99) => 99 instead of NULL) and
+                        // breaks anti-joins (`WHERE g IS NULL`). Guard with
+                        // IfNullRow (C SQLite's OP_IfNullRow): a null-row leaves
+                        // the column NULL and skips the computation. A REAL row
+                        // whose base value happens to be NULL is NOT a null-row,
+                        // so its generating expression is still evaluated.
+                        let skip = b.emit_label();
+                        b.emit_jump_to_label(Opcode::IfNullRow, cursor, target, skip, P4::None, 0);
                         emit_table_column_read(
                             b, cursor, table, table_alias, None, col_idx, target,
                         );
+                        b.resolve_label(skip);
                     } else {
                         b.emit_op(Opcode::Column, cursor, col_idx as i32, target, P4::None, 0);
                     }
