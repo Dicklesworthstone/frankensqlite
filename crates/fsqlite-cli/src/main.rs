@@ -114,6 +114,10 @@ enum OutputMode {
     Csv,
     Tabs,
     Line,
+    /// `.mode quote`: SQL-literal rendering (text `'..'`, blob `X'..'`, NULL
+    /// bare, numbers bare) with a comma separator — matches sqlite3's quote
+    /// mode, the format oracle-comparison tooling reads back.
+    Quote,
 }
 
 impl OutputMode {
@@ -124,6 +128,7 @@ impl OutputMode {
             "csv" => Some(Self::Csv),
             "tabs" | "tab" => Some(Self::Tabs),
             "line" => Some(Self::Line),
+            "quote" => Some(Self::Quote),
             _ => None,
         }
     }
@@ -135,6 +140,7 @@ impl OutputMode {
             Self::Csv => ",",
             Self::Tabs => "\t",
             Self::Line => "",
+            Self::Quote => ",",
         }
     }
 }
@@ -961,6 +967,13 @@ where
             write_column_rows(rows, &resolved_column_names, output_options.headers, out)
         }
         OutputMode::Line => write_line_rows(rows, &resolved_column_names, out),
+        OutputMode::Quote => write_delimited_rows(
+            rows,
+            &resolved_column_names,
+            output_options,
+            OutputMode::Quote.separator(),
+            out,
+        ),
     }
 }
 
@@ -1106,6 +1119,8 @@ fn format_column_line(values: &[String], widths: &[usize]) -> String {
 fn render_output_header(name: &str, mode: OutputMode) -> String {
     match mode {
         OutputMode::Csv => render_csv_field(name),
+        // sqlite3 `.mode quote` SQL-quotes header names too: `'x','y'`.
+        OutputMode::Quote => format!("'{}'", name.replace('\'', "''")),
         OutputMode::Tabs | OutputMode::List | OutputMode::Column | OutputMode::Line => {
             name.to_owned()
         }
@@ -1114,7 +1129,9 @@ fn render_output_header(name: &str, mode: OutputMode) -> String {
 
 fn render_output_value(value: &SqliteValue, mode: OutputMode) -> String {
     match mode {
-        OutputMode::List | OutputMode::Column | OutputMode::Line => render_display_value(value),
+        OutputMode::List | OutputMode::Column | OutputMode::Line | OutputMode::Quote => {
+            render_display_value(value)
+        }
         OutputMode::Csv => render_csv_field(&render_raw_value(value)),
         OutputMode::Tabs => render_raw_value(value),
     }
@@ -1655,7 +1672,7 @@ where
         let Some(value) = parse_optional_quoted_arg(arg) else {
             let _ = writeln!(
                 err,
-                "error: .mode requires one of: list, column, csv, tabs, line"
+                "error: .mode requires one of: list, column, csv, tabs, line, quote"
             );
             *had_error = true;
             return DotCommandResult::Continue;
@@ -1663,7 +1680,7 @@ where
         let Some(mode) = OutputMode::parse(&value) else {
             let _ = writeln!(
                 err,
-                "error: unknown output mode `{value}`; expected one of: list, column, csv, tabs, line"
+                "error: unknown output mode `{value}`; expected one of: list, column, csv, tabs, line, quote"
             );
             *had_error = true;
             return DotCommandResult::Continue;
@@ -2979,6 +2996,38 @@ SELECT 1 AS one, 'two,three' AS two;\n\
             assert!(
                 stdout.contains("1,\"two,three\""),
                 "expected CSV value escaping without SQL quotes, got: {stdout}",
+            );
+        });
+    }
+
+    #[test]
+    fn test_mode_quote_renders_sql_literals_with_comma_separator() {
+        // `.mode quote` matches sqlite3: SQL-quoted header names, text `'..'`
+        // (with `''` escaping), NULL bare, blob `X'..'`, numbers bare, comma sep.
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(
+                b".mode quote\n\
+.headers on\n\
+SELECT 1 AS one, 'a''b' AS two, NULL AS three, x'01' AS four;\n\
+.quit\n"
+                    .to_vec(),
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
+
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert!(
+                stdout.contains("'one','two','three','four'"),
+                "expected SQL-quoted header row, got: {stdout}",
+            );
+            assert!(
+                stdout.contains("1,'a''b',NULL,X'01'"),
+                "expected quote-mode SQL-literal value row, got: {stdout}",
             );
         });
     }
