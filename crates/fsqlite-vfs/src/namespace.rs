@@ -770,7 +770,20 @@ impl DatabaseNamespaceBinding {
                         GenerationProbe::ProbeFailed(cannot_open(&self.stable_path))
                     }
                 },
-                Err(_) => GenerationProbe::ProbeFailed(cannot_open(&self.stable_path)),
+                // bd-ntipn: `open_identity_probe` collapses the io error kind into
+                // `FrankenError`, so re-probe existence directly to mirror the
+                // unix ENOENT arm. A main file renamed/unlinked off the stable
+                // path leaves no entry — a *proven* supersession (the bd-97kjm
+                // rename-away teardown case) that must release the binding's
+                // `-ns-use`/`-ns-gate` locks so a successor can proceed. A foreign
+                // exclusive / deny-share hold leaves the file present (metadata
+                // still readable) and stays a fail-closed `ProbeFailed`.
+                Err(_) => match std::fs::symlink_metadata(&self.stable_path) {
+                    Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound => {
+                        GenerationProbe::Superseded
+                    }
+                    _ => GenerationProbe::ProbeFailed(cannot_open(&self.stable_path)),
+                },
             }
         }
     }
