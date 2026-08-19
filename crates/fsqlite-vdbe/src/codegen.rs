@@ -17521,6 +17521,17 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     _ => (None, false, Some(Box::new(exprs[0].clone()))),
                 };
                 let extra: Vec<Expr> = exprs[1..].to_vec();
+                // bd-lgwjd(a): a single aggregate wrapped in an expression
+                // (`max(name)||''`) is lowered through THIS extractor; leaving
+                // `collation: None` made the runtime min/max step compare BINARY,
+                // ignoring the column's declared `COLLATE NOCASE`. Mirror the
+                // non-wrapper single-aggregate arm (`expr_collation_for_agg`).
+                let needs_collation = *distinct || canon_name == "MIN" || canon_name == "MAX";
+                let agg_coll = if needs_collation {
+                    expr_collation_for_agg(&exprs[0], col_idx, table)
+                } else {
+                    None
+                };
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 AggColumn {
                     name: canon_name,
@@ -17535,7 +17546,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     hidden: false,
                     multi_agg_indices: Vec::new(),
                     bare_expr: None,
-                    collation: None,
+                    collation: agg_coll,
                 }
             }
         };
@@ -17803,6 +17814,21 @@ fn rewrite_aggregates_recursive(
                     _ => (None, false, Some(Box::new(exprs[0].clone()))),
                 };
                 let extra: Vec<Expr> = exprs[1..].to_vec();
+                // bd-lgwjd(a): resolve the aggregate-argument collation for MIN/MAX
+                // (and DISTINCT) here too — a multi-aggregate expression like
+                // `max(name)||min(name)` is lowered through THIS extractor, and
+                // leaving `collation: None` made the runtime min/max step compare
+                // BINARY, so a column's declared `COLLATE NOCASE` was ignored. The
+                // single-aggregate arm already does this (see `needs_collation`
+                // above); mirror it so the extracted aggregate carries the same
+                // collation.
+                let needs_collation =
+                    *distinct || canon_name == "MIN" || canon_name == "MAX";
+                let agg_coll = if needs_collation {
+                    expr_collation_for_agg(&exprs[0], col_idx, table)
+                } else {
+                    None
+                };
                 AggColumn {
                     name: canon_name,
                     num_args: exprs.len() as i32,
@@ -17816,7 +17842,7 @@ fn rewrite_aggregates_recursive(
                     hidden: true,
                     multi_agg_indices: Vec::new(),
                     bare_expr: None,
-                    collation: None,
+                    collation: agg_coll,
                 }
             }
         };
@@ -18122,6 +18148,17 @@ fn parse_group_by_output(
                                     _ => (None, false, Some(Box::new(exprs[0].clone()))),
                                 };
                             let extra: Vec<Expr> = exprs[1..].to_vec();
+                            // bd-lgwjd(a): a direct MIN/MAX under GROUP BY is lowered
+                            // through this substrate path; carry the argument's
+                            // declared collation so the runtime step compares under it
+                            // (not BINARY), mirroring the other aggregate extractors.
+                            let needs_collation =
+                                *distinct || canon_name == "MIN" || canon_name == "MAX";
+                            let agg_coll = if needs_collation {
+                                expr_collation_for_agg(&exprs[0], col_idx, table)
+                            } else {
+                                None
+                            };
                             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                             agg_columns.push(AggColumn {
                                 name: canon_name,
@@ -18136,7 +18173,7 @@ fn parse_group_by_output(
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
                                 bare_expr: None,
-                                collation: None,
+                                collation: agg_coll,
                             });
                         }
                     }

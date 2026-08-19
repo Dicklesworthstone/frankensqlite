@@ -102,9 +102,14 @@ fn bd_lgwjd_declared_collation_minmax_value_multi_agg_and_group_by() {
                 "SELECT min(name) FROM prod;",
                 // multi-aggregate expression (no GROUP BY)
                 "SELECT max(name)||min(name) FROM prod;",
+                // single aggregate wrapped in an expression (single-agg wrapper lane)
+                "SELECT max(name)||'' FROM prod;",
                 // count + aggregate expression
                 "SELECT count(*), max(name)||'' FROM prod;",
-                // explicit constant GROUP BY
+                // direct aggregate under explicit GROUP BY (substrate path)
+                "SELECT max(name) FROM prod GROUP BY 1=1;",
+                "SELECT min(name) FROM prod GROUP BY 1=1;",
+                // aggregate expression under explicit GROUP BY (interpreter path)
                 "SELECT max(name)||min(name) FROM prod GROUP BY 1=1;",
             ],
         )
@@ -115,17 +120,22 @@ fn bd_lgwjd_declared_collation_minmax_value_multi_agg_and_group_by() {
 /// (b) `max` tie-break on collation-equal values must be FIRST-wins (stock
 /// minmaxStep), not last-wins (`Iterator::max_by`). Under NOCASE, 'z' and 'Z' are
 /// equal; inserted 'z' first, so stock keeps 'z'. `min` is coincidentally
-/// first-wins already — included as a control.
+/// first-wins already — included as a control. The `max(v), ord` shape exercises
+/// the minmax-cache VALUE lane (`compute_aggregate_ext_collated`, the reported
+/// site); the bare/`||` shapes exercise the VDBE step (already first-wins).
 #[test]
 fn bd_lgwjd_max_collation_tie_break_is_first_wins() {
     asupersync::test_utils::run_test(|| async {
         assert_frank_matches_stock(
-            &["CREATE TABLE t(v TEXT COLLATE NOCASE);"],
-            &["INSERT INTO t(v) VALUES ('z'), ('Z');"],
+            &["CREATE TABLE t(v TEXT COLLATE NOCASE, ord INTEGER);"],
+            &["INSERT INTO t(v, ord) VALUES ('z', 1), ('Z', 2);"],
             &[
                 "SELECT max(v) FROM t;",
                 "SELECT min(v) FROM t;",
                 "SELECT max(v)||'' FROM t;",
+                // single min/max + bare column -> minmax-cache lane
+                "SELECT max(v), ord FROM t;",
+                "SELECT min(v), ord FROM t;",
             ],
         )
         .await;
