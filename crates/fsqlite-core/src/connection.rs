@@ -34072,9 +34072,16 @@ impl Connection {
                 // reaches name/aggregate resolution and raises the same
                 // `no such column` / `misuse of aggregate` stock does (bd-kcvra).
                 let mut folded_select_owner;
-                let select = if select_has_foldable_filter_never_true_and(select) {
+                let select = if select_has_foldable_filter_never_true_and(select)
+                    || select_has_foldable_filter_absorbing_true_or(select)
+                {
                     folded_select_owner = select.clone();
                     fold_select_filters_never_true(&mut folded_select_owner);
+                    // bd-xmpma: also fold OR-absorbing-TRUE filters (`(subq) OR
+                    // TRUE` -> 1) so a bare aggregate reaches the plain-aggregate
+                    // branch instead of the per-row short-circuit fallback (which
+                    // does not aggregate -> per-row NULLs).
+                    fold_select_filters_absorbing_true_or(&mut folded_select_owner);
                     &folded_select_owner
                 } else {
                     select
@@ -120377,6 +120384,148 @@ fn fold_select_filters_never_true(select: &mut SelectStatement) {
     fold_select_core_filters_never_true(&mut select.body.select);
     for (_, core) in select.body.compounds.iter_mut() {
         fold_select_core_filters_never_true(core);
+    }
+}
+
+/// bd-xmpma: whether an OR pair `left OR right` folds to a constant-true filter
+/// because one operand is a truthy constant (TRUE / non-zero integer) sitting
+/// beside a subquery-bearing operand whose (possibly erroring) evaluation the
+/// compile-time fold legitimately drops. Mirrors [`and_pair_folds_never_true`]'s
+/// subquery-sibling guard so a bare column/aggregate sibling is left live for
+/// name/aggregate resolution (bd-kcvra), and only a runtime-erroring subquery is
+/// discarded.
+fn or_pair_folds_absorbing_true(left: &Expr, right: &Expr) -> bool {
+    fn truthy_beside_subquery(dead: &Expr, sibling: &Expr) -> bool {
+        literal_boolean_constant(dead) == Some(true) && expr_has_any_subquery(sibling)
+    }
+    truthy_beside_subquery(left, right) || truthy_beside_subquery(right, left)
+}
+
+/// True iff some `OR` reachable through `AND`/`OR` has a foldable absorbing-true
+/// pair, so [`fold_absorbing_true_or_in_filter`] would change `expr`. (bd-xmpma)
+fn filter_expr_has_absorbing_true_or(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            or_pair_folds_absorbing_true(left, right)
+                || filter_expr_has_absorbing_true_or(left)
+                || filter_expr_has_absorbing_true_or(right)
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => filter_expr_has_absorbing_true_or(left) || filter_expr_has_absorbing_true_or(right),
+        _ => false,
+    }
+}
+
+/// Fold every absorbing-true filter `OR` down to the integer literal `1`
+/// (constant true), so an aggregate / GROUP BY shape reaches the plain-aggregate
+/// branch with the dead (erroring) subquery dropped instead of mis-routing to the
+/// per-row short-circuit fallback. Descends only through `AND`/`OR` (both
+/// preserve filter-truth); `NOT` and every value position are left untouched,
+/// mirroring [`fold_never_true_and_in_filter`]. (bd-xmpma)
+fn fold_absorbing_true_or_in_filter(expr: &mut Expr) {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::Or,
+            left,
+            right,
+            span,
+        } => {
+            let span = *span;
+            fold_absorbing_true_or_in_filter(left);
+            fold_absorbing_true_or_in_filter(right);
+            if or_pair_folds_absorbing_true(left, right) {
+                *expr = Expr::Literal(Literal::Integer(1), span);
+            }
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            fold_absorbing_true_or_in_filter(left);
+            fold_absorbing_true_or_in_filter(right);
+        }
+        _ => {}
+    }
+}
+
+/// Apply [`fold_absorbing_true_or_in_filter`] to a SELECT core's filter clauses
+/// (WHERE / HAVING / JOIN-ON). (bd-xmpma)
+fn fold_select_core_filters_absorbing_true_or(core: &mut SelectCore) {
+    if let SelectCore::Select {
+        where_clause,
+        having,
+        from,
+        ..
+    } = core
+    {
+        if let Some(wh) = where_clause.as_mut() {
+            fold_absorbing_true_or_in_filter(wh);
+        }
+        if let Some(hv) = having.as_mut() {
+            fold_absorbing_true_or_in_filter(hv);
+        }
+        if let Some(from) = from.as_mut() {
+            for join in from.joins.iter_mut() {
+                if let Some(JoinConstraint::On(on)) = join.constraint.as_mut() {
+                    fold_absorbing_true_or_in_filter(on);
+                }
+            }
+        }
+    }
+}
+
+/// True iff any filter clause of `select` or a compound arm holds a foldable
+/// absorbing-true `OR`. (bd-xmpma)
+fn select_has_foldable_filter_absorbing_true_or(select: &SelectStatement) -> bool {
+    let core_has = |core: &SelectCore| {
+        let SelectCore::Select {
+            where_clause,
+            having,
+            from,
+            ..
+        } = core
+        else {
+            return false;
+        };
+        where_clause
+            .as_ref()
+            .is_some_and(|expr| filter_expr_has_absorbing_true_or(expr))
+            || having
+                .as_ref()
+                .is_some_and(|expr| filter_expr_has_absorbing_true_or(expr))
+            || from.as_ref().is_some_and(|from| {
+                from.joins.iter().any(|join| {
+                    matches!(&join.constraint, Some(JoinConstraint::On(on))
+                        if filter_expr_has_absorbing_true_or(on))
+                })
+            })
+    };
+    core_has(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| core_has(core))
+}
+
+/// Fold every absorbing-true filter `OR` across a SELECT and its compound arms,
+/// BEFORE execution routing, so aggregate / GROUP BY shapes reach the plain
+/// aggregate branch with the dead subquery already dropped. (bd-xmpma)
+fn fold_select_filters_absorbing_true_or(select: &mut SelectStatement) {
+    fold_select_core_filters_absorbing_true_or(&mut select.body.select);
+    for (_, core) in select.body.compounds.iter_mut() {
+        fold_select_core_filters_absorbing_true_or(core);
     }
 }
 
