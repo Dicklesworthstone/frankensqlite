@@ -553,7 +553,12 @@ fn alter_add_column_nonconstant_default_rejected_on_nonempty_table() {
     asupersync::test_utils::run_test(|| async {
         let fconn = Connection::open(":memory:").await.unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
-        apply(&fconn, &rconn, &["CREATE TABLE t (a INTEGER)", "INSERT INTO t VALUES (1)"]).await;
+        apply(
+            &fconn,
+            &rconn,
+            &["CREATE TABLE t (a INTEGER)", "INSERT INTO t VALUES (1)"],
+        )
+        .await;
 
         let diverged = apply_checked(
             &fconn,
@@ -628,5 +633,59 @@ fn alter_add_column_nonconstant_default_allowed_on_empty_table() {
             &m,
             "alter_add_column_nonconstant_default_allowed_on_empty_table_values",
         );
+    });
+}
+
+// bd-0i8ll: ADD COLUMN on a TEMP table must not fault on the sentinel root_page
+// (2147483646) that TEMP tables carry in `self.schema` — the earlier bd-kyhpi
+// pager-count fix opened that page in the MAIN pager and raised a snapshot
+// conflict, breaking EVERY temp-table ADD COLUMN. The row-gating still applies to
+// temp tables: a bare-literal / no-default is admitted on a non-empty temp table
+// (and back-fills), a non-literal default is rejected on a NON-EMPTY temp table
+// but admitted on an EMPTY one. Verified vs sqlite3 3.46.1 / rusqlite.
+#[test]
+fn alter_add_column_on_temp_table_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let fconn = Connection::open(":memory:").await.unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(
+            &fconn,
+            &rconn,
+            &[
+                "CREATE TEMP TABLE tt(a)",
+                "INSERT INTO tt VALUES (1)",
+                // Bare literal on a non-empty temp table: admitted, back-fills 7.
+                "ALTER TABLE tt ADD COLUMN c DEFAULT 7",
+            ],
+        )
+        .await;
+        let diverged = apply_checked(
+            &fconn,
+            &rconn,
+            &[
+                // Non-literal default on a NON-EMPTY temp table: rejected on both.
+                "ALTER TABLE tt ADD COLUMN d DEFAULT (random())",
+                // No default: admitted on both (e = NULL for the existing row).
+                "ALTER TABLE tt ADD COLUMN e",
+            ],
+        )
+        .await;
+        assert_no_mismatches(&diverged, "alter_add_column_on_temp_table_matches_stock");
+        let m = oracle_compare(&fconn, &rconn, &["SELECT a, c, e FROM tt ORDER BY a"]).await;
+        assert_no_mismatches(&m, "alter_add_column_on_temp_table_backfill");
+
+        // An EMPTY temp table accepts any default (the row gate is not triggered).
+        let fe = Connection::open(":memory:").await.unwrap();
+        let re = rusqlite::Connection::open_in_memory().unwrap();
+        let d2 = apply_checked(
+            &fe,
+            &re,
+            &[
+                "CREATE TEMP TABLE et(a)",
+                "ALTER TABLE et ADD COLUMN c DEFAULT (random())",
+            ],
+        )
+        .await;
+        assert_no_mismatches(&d2, "alter_add_column_on_empty_temp_table");
     });
 }

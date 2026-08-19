@@ -54565,6 +54565,48 @@ impl Connection {
         Ok(count)
     }
 
+    /// Whether `table_name` currently holds at least one row — the row-presence
+    /// gate for the ADD COLUMN non-literal-default restriction.
+    ///
+    /// bd-0i8ll: a TEMP table sits in `self.schema` with a sentinel root_page
+    /// (allocated from `TEMP_MEMDB_ROOT_START` downward) that is NOT a main-pager
+    /// page; probing it through the main pager raises a snapshot conflict. TEMP
+    /// tables live in the MemDatabase, so they are counted there (their
+    /// authoritative store). A main table is probed through the pager with an
+    /// early-exit `cursor.first()` rather than a full scan (bd-kyhpi
+    /// authoritative-source fix; the mirror is stale on a first-touch main table).
+    async fn alter_add_column_table_has_rows(&self, table_name: &str) -> Result<bool> {
+        let key = table_name.to_ascii_lowercase();
+        let (root_page, is_temp) = {
+            let schema = self.schema.borrow();
+            let rp = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page);
+            (rp, self.temp_table_names.borrow().contains(&key))
+        };
+        let Some(rp) = root_page else {
+            return Ok(false);
+        };
+        if is_temp {
+            // TEMP-table rows live in the MemDatabase, keyed by the sentinel
+            // root_page; that page is not addressable in the main pager.
+            return Ok(self
+                .db
+                .borrow()
+                .get_table(rp)
+                .is_some_and(|table| table.row_count() > 0));
+        }
+        self.with_pager_write_txn(async |cx, txn| {
+            let Some(root) = PageNumber::new(u32::try_from(rp).unwrap_or(0)) else {
+                return Ok(false);
+            };
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+            Ok(cursor.first(cx).await?)
+        })
+        .await
+    }
+
     #[allow(clippy::unused_self)]
     async fn clear_btree_entries_in_txn(
         &self,
@@ -57377,43 +57419,24 @@ impl Connection {
                     .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
                 // ADD COLUMN back-fills existing rows, so a non-empty table
                 // constrains the default (the restriction is row-gated in C
-                // SQLite — an empty table accepts any default).
-                // bd-kyhpi: count the table's rows through the pager (the
-                // authoritative row source), NOT the lazily-hydrated MemDatabase
-                // mirror. On the FIRST statement to touch a freshly created and
-                // populated table (before any read hydrates the mirror),
-                // `memdb_rows_loaded` is false and `self.db` reports 0 rows — so
-                // the non-constant-default gate below was skipped and e.g.
-                // `ADD COLUMN c DEFAULT (random())` was wrongly admitted on a
-                // non-empty table. `with_pager_write_txn` reuses the active
-                // transaction when one is open (counting uncommitted rows too) or
-                // runs a standalone read otherwise, exactly like
-                // `optimize_beneficial_tables`.
-                let add_column_table_has_rows = {
-                    let root_page = {
-                        let schema = self.schema.borrow();
-                        schema
-                            .iter()
-                            .find(|t| t.name.eq_ignore_ascii_case(table_name))
-                            .map(|t| t.root_page)
+                // SQLite — an empty table accepts any default). bd-kyhpi/bd-0i8ll:
+                // the row-presence gate matters ONLY for a NON-literal default (an
+                // empty/literal default is legal on any table), so resolve it
+                // lazily. That skips all pager/mirror work for the common case and
+                // never probes a TEMP table's sentinel root_page in the main pager
+                // (which would raise a snapshot conflict) — see
+                // `alter_add_column_table_has_rows`.
+                let default_dv = col_def.constraints.iter().find_map(|c| match &c.kind {
+                    ColumnConstraintKind::Default(dv) => Some(dv),
+                    _ => None,
+                });
+                let add_column_table_has_rows =
+                    if default_dv.is_some_and(|dv| !add_column_default_is_literal_constant(dv)) {
+                        self.alter_add_column_table_has_rows(table_name).await?
+                    } else {
+                        false
                     };
-                    match root_page {
-                        Some(rp) => {
-                            self.with_pager_write_txn(async |cx, txn| {
-                                Ok(self.count_btree_entries_in_txn(cx, txn, rp, true).await? > 0)
-                            })
-                            .await?
-                        }
-                        None => false,
-                    }
-                };
-                let default_value = col_def
-                    .constraints
-                    .iter()
-                    .find_map(|c| match &c.kind {
-                        ColumnConstraintKind::Default(dv) => Some(dv),
-                        _ => None,
-                    })
+                let default_value = default_dv
                     .map(|dv| -> Result<String> {
                         self.validate_default_value_is_constant(&col_def.name, dv)?;
                         // On a non-empty table the back-filled default must be a
@@ -57835,10 +57858,20 @@ impl Connection {
             ));
         }
 
-        if alters_temp_table && matches!(alter.action, AlterTableAction::DropColumn(_)) {
+        if alters_temp_table
+            && matches!(
+                alter.action,
+                AlterTableAction::DropColumn(_) | AlterTableAction::AddColumn(_)
+            )
+        {
             // TEMP schema and rows are connection-local. There is deliberately
-            // no sqlite_master row to update; trying the main-catalog path is
-            // what previously turned every TEMP DROP COLUMN into a late error.
+            // no main-catalog sqlite_master row to update; the column change has
+            // already been applied to `self.schema` and (for ADD COLUMN) the
+            // existing rows padded in the MemDatabase above. Trying the
+            // main-catalog master path is what previously turned every TEMP DROP
+            // COLUMN into a late "sqlite_master entry not found" error — and, once
+            // bd-kyhpi stopped ADD COLUMN from faulting earlier on the sentinel
+            // root_page, every TEMP ADD COLUMN too (bd-0i8ll).
             self.rebuild_schema_indices();
             self.validate_schema_index();
             self.note_temp_schema_change();
