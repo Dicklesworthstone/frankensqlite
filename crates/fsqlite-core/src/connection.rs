@@ -168735,8 +168735,12 @@ mod tests {
         });
     }
 
+    // Renamed (bd-dbpl2): since bd-bld9w.7 enabled UTF-16 writes this keeper no
+    // longer asserts read-only admission or image preservation (write correctness
+    // is proven by bd_bld9w_utf16_write_oracle.rs); it verifies UTF-16 admission +
+    // read/decode across the open-mode matrix, and cross-encoding ATTACH rejection.
     #[test]
-    fn test_utf16_admitted_read_only_across_open_modes_and_preserves_main_image() {
+    fn test_utf16_admitted_and_reads_decode_across_open_modes() {
         // bd-bld9w.7: a UTF-16LE/BE database is admitted through the direct open
         // modes that share the reload admission gate — ordinary, existing,
         // schema-only, and in-memory import — and reads decode end to end.
@@ -168767,7 +168771,7 @@ mod tests {
                 let expected_encoding = if encoding == "UTF-16le" { 2 } else { 3 };
                 assert_eq!(header_encoding, expected_encoding);
 
-                // Ordinary open: read decodes, write rejected, image preserved.
+                // Ordinary open: read decodes.
                 let conn = Connection::open(&db_str)
                     .await
                     .expect("ordinary open admits UTF-16 read-only");
@@ -168786,13 +168790,13 @@ mod tests {
                 );
                 drop(conn);
 
-                // Schema-only open: admitted; write rejected; image preserved.
+                // Schema-only open: admitted.
                 let conn = Connection::open_schema_only(&db_str)
                     .await
                     .expect("schema-only open admits UTF-16 read-only");
                 drop(conn);
 
-                // In-memory import: admitted read-only; write rejected.
+                // In-memory import: admitted; read decodes.
                 let conn = Connection::import_bytes(&original)
                     .await
                     .expect("import admits a UTF-16 image read-only");
@@ -168918,7 +168922,10 @@ mod tests {
     /// encoding (SELECT returns `plain`, not the raw code units) and the write
     /// guard still consults it (mutations fail closed), across every open mode.
     #[test]
-    fn test_utf16_ascii_only_schema_admitted_read_only_and_decodes() {
+    // Renamed (bd-dbpl2): "read_only" is stale since UTF-16 writes were enabled
+    // (bd-bld9w.7); this verifies an ASCII-only UTF-16 image is admitted and
+    // decodes across the open-mode matrix, with cross-encoding ATTACH rejected.
+    fn test_utf16_ascii_only_admitted_and_decodes_across_open_modes() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             for encoding in ["UTF-16le", "UTF-16be"] {
@@ -202516,7 +202523,10 @@ fts5(title, body, content=docs, content_rowid=id)'
     }
 
     #[test]
-    fn test_utf16_live_wal_admission_uses_authoritative_page1_and_preserves_main_image() {
+    // Renamed (bd-dbpl2): drops the stale "preserves_main_image" — this verifies a
+    // UTF-16 image with a live WAL is admitted and decodes via the authoritative
+    // WAL page 1 (not the stale main page 1); no image-preservation assert.
+    fn test_utf16_live_wal_admission_uses_authoritative_page1() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             fn create_live_wal_fixture(

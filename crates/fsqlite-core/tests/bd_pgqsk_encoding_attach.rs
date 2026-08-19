@@ -120,3 +120,32 @@ fn bd_pgqsk_m7_empty_attach_adopts_main_encoding() {
         assert_eq!(val, "café", "stock reads the attached-then-written row");
     });
 }
+
+/// bd-dbpl2: the encoding choice is re-settable while the database is EMPTY
+/// (schema_cookie == 0) — a later `PRAGMA encoding` overrides the earlier one,
+/// matching stock — but becomes one-way (locked) after the first schema object.
+#[test]
+fn bd_dbpl2_encoding_reset_on_empty_then_locked_after_schema() {
+    asupersync::test_utils::run_test(|| async {
+        // Empty DB: the last set wins (UTF-16le then UTF-8 => UTF-8).
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("PRAGMA encoding = 'UTF-16le';").await.unwrap();
+        conn.execute("PRAGMA encoding = 'UTF-8';").await.unwrap();
+        assert_eq!(
+            scalar_text(&conn.query("PRAGMA encoding;").await.unwrap()),
+            "UTF-8",
+            "encoding is re-settable while the DB is empty"
+        );
+
+        // After a schema object it is locked: a further set is a silent no-op.
+        let conn2 = Connection::open(":memory:").await.unwrap();
+        conn2.execute("PRAGMA encoding = 'UTF-16le';").await.unwrap();
+        conn2.execute("CREATE TABLE t(a);").await.unwrap();
+        conn2.execute("PRAGMA encoding = 'UTF-8';").await.unwrap();
+        assert_eq!(
+            scalar_text(&conn2.query("PRAGMA encoding;").await.unwrap()),
+            "UTF-16le",
+            "encoding is locked once a schema object exists"
+        );
+    });
+}
