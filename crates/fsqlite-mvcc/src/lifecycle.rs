@@ -1620,9 +1620,20 @@ impl TransactionManager {
             const SSI_COMMITTED_WITNESS_HARD_CAP: usize = SSI_COMMITTED_WITNESS_CAP * 4;
             if committed.len() > SSI_COMMITTED_WITNESS_HARD_CAP {
                 let force = committed.len() - SSI_COMMITTED_WITNESS_HARD_CAP;
+                // bd-yb0g7: the drained prefix `committed[..force]` is NOT
+                // guaranteed commit_seq-ordered — ssi_witness_publish runs after
+                // publish_shared_snapshot, so two committers can push out of
+                // allocation order (shm.rs stale-publication guard proves the
+                // window). Taking `committed[force-1]` would arm below an
+                // adjacent-disorder witness (drained tail `[..,C+1,C]` -> armed C,
+                // leaving a txn begun at C overlapping the evicted C+1 unpivoted).
+                // Arm at the MAX commit_seq over the whole drained prefix; still
+                // `<= watermark` since every committed witness is `<= watermark`.
                 if let Some(highest_lost) = committed
-                    .get(force.saturating_sub(1))
+                    .iter()
+                    .take(force)
                     .map(|w| w.commit_seq.get())
+                    .max()
                 {
                     // bd-stujd: arm the conservative pivot watermark at exactly
                     // the highest lost `commit_seq`, NOT one past it. A live txn
