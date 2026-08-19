@@ -155,12 +155,11 @@ fn update_ignore_skip_filter_survives_user_rowid_column() {
     });
 }
 
+// bd-uur1d: on a table with a user `rowid` column, the RAISE(IGNORE) BEFORE-DELETE
+// skip-filter now keys off the IMPLICIT rowid. `collect_delete_trigger_rows`
+// previously projected bare `rowid` — which resolves to the USER column — so the
+// `<alias> IN (<rowids>)` rewrite carried the user values and matched no rows.
 #[test]
-#[ignore = "bd-1mcjr L9 DELETE still RED: on a table with a user `rowid` column the \
-RAISE(IGNORE) rewrite now emits `_rowid_ IN (<true rowids>)` (is_rowid_ref recognizes \
-`_rowid_`), but the recompiled DELETE deletes nothing — a deeper codegen issue in the \
-compile_table_delete `_rowid_ IN` recompile path (the UPDATE path works via \
-execute_update_row_by_row). Follow-up: bd-uur1d."]
 fn delete_ignore_skip_filter_survives_user_rowid_column() {
     asupersync::test_utils::run_test(|| async {
         agree(
