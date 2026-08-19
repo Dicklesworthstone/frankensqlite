@@ -3039,12 +3039,14 @@ frankensqlite/
 ├── rust-toolchain.toml       # Pinned dated nightly + rustfmt + clippy
 ├── AGENTS.md                 # AI agent development guidelines
 ├── docs/
+│   ├── UPGRADE_LOG.md        # Upgrade history (relocated from repo root)
 │   ├── planning/             # Design corpus — all planning specs live here (not repo root)
 │   │   ├── COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md  # Single source of truth (~18,200 lines / 827 KB)
 │   │   ├── MVCC_SPECIFICATION.md          # Standalone MVCC formal specification
 │   │   ├── PLAN_TO_PORT_SQLITE_TO_RUST.md # 9-phase implementation roadmap
 │   │   ├── PROPOSED_ARCHITECTURE.md       # Crate architecture + MVCC design spec
-│   │   └── EXISTING_SQLITE_STRUCTURE.md   # SQLite behavioral specification
+│   │   ├── EXISTING_SQLITE_STRUCTURE.md   # SQLite behavioral specification
+│   │   └── HEADS_UP_CONNECTION_RS_WIP.md  # Connection WIP heads-up (relocated from repo root)
 │   ├── contracts/            # Normative surface + parity matrices
 │   └── concurrency-contract.md  # Caller-facing concurrency contract
 ├── crates/

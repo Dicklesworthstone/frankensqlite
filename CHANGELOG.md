@@ -17,9 +17,55 @@ as a 27-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
+Scope window: [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) (2026-08-19) through HEAD ([`b3bb22566db22caf4e91c4cd264d730d86d520fd`](https://github.com/Dicklesworthstone/frankensqlite/commit/b3bb22566db22caf4e91c4cd264d730d86d520fd)). The 0.3.6 row below matches the published GitHub Release. v0.3.2–v0.3.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
+
+## Version Timeline
+
+| Version | Kind | Date | Summary |
+|---------|------|------|---------|
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...main) | HEAD | 2026-08-19 | GH#370/#371 + janitor docs-reorg |
+| [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) | Release | 2026-08-19 | FTS5 reopen/hydration + binary release |
+| [v0.3.5](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.3.5) | Tag | 2026-08-17 | crates.io snapshot; non-leading PK WITHOUT ROWID (no GitHub Release) |
+| [v0.3.4](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.4) | Release | 2026-08-16 | GH#353 WITHOUT ROWID composite-UNIQUE auto-index |
+| [v0.3.3](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.3) | Release | 2026-08-16 | asupersync 0.4.5 |
+| [v0.3.2](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.2) | Release | 2026-08-16 | Post-0.3.1 correctness swarm tag |
+
 ---
 
-## [0.3.6] -- 2026-08-19
+## [Unreleased] -- development on `main` since [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) (as of 2026-08-19)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...main>
+
+50 non-merge commits after the v0.3.6 tag.
+
+### Janitor docs-reorg (2026-08-19)
+
+- Untracked skill-loop scratch; moved remaining root planning beads into `docs/planning/` ([`b72874ce02435cc0030a671526fbf6bd09fafec5`](https://github.com/Dicklesworthstone/frankensqlite/commit/b72874ce02435cc0030a671526fbf6bd09fafec5)).
+- Relocated remaining root reports: `UPGRADE_LOG.md` → [`docs/UPGRADE_LOG.md`](https://github.com/Dicklesworthstone/frankensqlite/blob/main/docs/UPGRADE_LOG.md); `HEADS_UP_CONNECTION_RS_WIP.md` → [`docs/planning/HEADS_UP_CONNECTION_RS_WIP.md`](https://github.com/Dicklesworthstone/frankensqlite/blob/main/docs/planning/HEADS_UP_CONNECTION_RS_WIP.md) ([`b3bb22566db22caf4e91c4cd264d730d86d520fd`](https://github.com/Dicklesworthstone/frankensqlite/commit/b3bb22566db22caf4e91c4cd264d730d86d520fd)).
+
+### Representative commits
+
+- [`b3bb22566db22caf4e91c4cd264d730d86d520fd`](https://github.com/Dicklesworthstone/frankensqlite/commit/b3bb22566db22caf4e91c4cd264d730d86d520fd) — janitor relocate remaining root reports.
+- [`a00e152cced9ab0fcf8005c26e2d6bcea0e94619`](https://github.com/Dicklesworthstone/frankensqlite/commit/a00e152cced9ab0fcf8005c26e2d6bcea0e94619) — GH#370 orphaned `%_content` reclaim.
+
+### Post-0.3.6 correctness
+
+- Reclaim orphaned `%_content` on legacy contentless FTS5 archives (GH#370, [`a00e152cced9ab0fcf8005c26e2d6bcea0e94619`](https://github.com/Dicklesworthstone/frankensqlite/commit/a00e152cced9ab0fcf8005c26e2d6bcea0e94619)).
+- Bound WITHOUT-ROWID / large-table DROP teardown memory (GH#371, [`7a3625a7d23edcf9f433225f4545a90e6bbcae8f`](https://github.com/Dicklesworthstone/frankensqlite/commit/7a3625a7d23edcf9f433225f4545a90e6bbcae8f)).
+- External-content FTS5 scans + rebuild read the SOURCE (REVIEW3-P2, [`4b8a2504fa0d845d94d5c0b7ca44f05a0f7a3348`](https://github.com/Dicklesworthstone/frankensqlite/commit/4b8a2504fa0d845d94d5c0b7ca44f05a0f7a3348)); external-content delete-all keeps rows visible and clears only the index ([`ee2e3a7ea975a1de5093760d246b8026cd578b8c`](https://github.com/Dicklesworthstone/frankensqlite/commit/ee2e3a7ea975a1de5093760d246b8026cd578b8c)).
+- Dual-recompute index keys under `integrity_check` so CAST-AS-BLOB + surrogate UTF-16 indexes stop false-flagging ([`96ae9d73c1eb5cc664bfd4e5613aa426c3a2bbdb`](https://github.com/Dicklesworthstone/frankensqlite/commit/96ae9d73c1eb5cc664bfd4e5613aa426c3a2bbdb)).
+- Trust memdb FK parent hits only when the mirror is fully hydrated ([`7bac82eb43cfb43e86455c10062dff12d5c84439`](https://github.com/Dicklesworthstone/frankensqlite/commit/7bac82eb43cfb43e86455c10062dff12d5c84439)).
+- Row-value element collation and nested subquery operands ([`40f43ccab5db4aa3371741273da9f4882d387b65`](https://github.com/Dicklesworthstone/frankensqlite/commit/40f43ccab5db4aa3371741273da9f4882d387b65)).
+- SSI `lost_below` armed at max `commit_seq` over the drained prefix ([`992c1d3ffcacc54200870c295f4a69c56909b7f4`](https://github.com/Dicklesworthstone/frankensqlite/commit/992c1d3ffcacc54200870c295f4a69c56909b7f4)).
+- Deferred ATTACH encoding stamped on the live write txn ([`2da36f586436047fbea96a603064a88cb4fa6b13`](https://github.com/Dicklesworthstone/frankensqlite/commit/2da36f586436047fbea96a603064a88cb4fa6b13)); only cost-reordered table WHERE folds (subquery) AND never-true ([`e9896efc07f85ee567ab010c02a046b4eb865249`](https://github.com/Dicklesworthstone/frankensqlite/commit/e9896efc07f85ee567ab010c02a046b4eb865249)).
+
+---
+
+## [0.3.6] -- 2026-08-19 (GitHub Release)
+
+GitHub Release: <https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6>
+Tag `v0.3.6` at [`b793ce180a8c79089fd8b75e3c44105b71d3c52b`](https://github.com/Dicklesworthstone/frankensqlite/commit/b793ce180a8c79089fd8b75e3c44105b71d3c52b).
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.5...v0.3.6>
 
 First GitHub binary release since 0.3.4 (0.3.2-0.3.4 were fast-follow point
 releases documented in their GitHub release notes; 0.3.5 was a crates.io-only
@@ -59,6 +105,39 @@ GitHub release; highlights:
 - GH#366 (fresh open after external DELETEs grow a reconstruct-produced DB's
   freelist) remains open — negative-repro probe landed (4e0ff4beb),
   investigation continues. GH#289 remains documented-open (structure-only).
+
+## [0.3.5] -- 2026-08-17 (Tag / crates.io only — no GitHub Release)
+
+> Git tag `v0.3.5` exists; **no GitHub Release was published.** 72 non-merge
+> commits since v0.3.4. Compare:
+> <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.4...v0.3.5>
+
+- Non-leading PRIMARY KEY WITHOUT ROWID reads and writes ([`92a4e4e735483be136b8a73cc6bf3a5d6263dcf8`](https://github.com/Dicklesworthstone/frankensqlite/commit/92a4e4e735483be136b8a73cc6bf3a5d6263dcf8)).
+- Sorted index keys in the rebuild/VACUUM copy path (GH#347, [`47e8ddf0082ba2a09e4ba512e3d27691a0946be2`](https://github.com/Dicklesworthstone/frankensqlite/commit/47e8ddf0082ba2a09e4ba512e3d27691a0946be2)).
+
+## [0.3.4] -- 2026-08-16 (GitHub Release)
+
+GitHub Release: <https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.4>
+14 non-merge commits since v0.3.3. Fast-follow for GH#353.
+
+- WITHOUT ROWID auto-index dedups appended PK vs index key (GH#353, [`3d3cdda455f6acd7dc076135476812c82e29402f`](https://github.com/Dicklesworthstone/frankensqlite/commit/3d3cdda455f6acd7dc076135476812c82e29402f)).
+- Preserve no-hydrator custom vtabs across file-backed schema reload ([`70f107e32ea6358333048cf46e3898e7c879d6ee`](https://github.com/Dicklesworthstone/frankensqlite/commit/70f107e32ea6358333048cf46e3898e7c879d6ee)).
+- ORDER BY sort keys decoded in DB storage encoding; NOCASE/RTRIM over UTF-16 match stock ([`0b3e88dccfeabfff24463f3430c4eaca63865a69`](https://github.com/Dicklesworthstone/frankensqlite/commit/0b3e88dccfeabfff24463f3430c4eaca63865a69)).
+
+## [0.3.3] -- 2026-08-16 (GitHub Release)
+
+GitHub Release: <https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.3>
+7 non-merge commits since v0.3.2.
+
+- Workspace bump to 0.3.3; asupersync upgraded to 0.4.5 ([`08b58bdd0681492193fda5bfc163184c75b90ed6`](https://github.com/Dicklesworthstone/frankensqlite/commit/08b58bdd0681492193fda5bfc163184c75b90ed6)).
+- IN-list `BoundOuterValue` donor affinity/collation honored in table-less IN ([`b700e396739854602d181c855483494cb4733271`](https://github.com/Dicklesworthstone/frankensqlite/commit/b700e396739854602d181c855483494cb4733271)).
+
+## [0.3.2] -- 2026-08-16 (GitHub Release)
+
+GitHub Release: <https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.2>
+539 non-merge commits since v0.3.1. Point-release tag after the post-0.3.1
+correctness swarm; detailed notes live on the GitHub Release. Compare:
+<https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.1...v0.3.2>
 
 ## [0.3.1] -- 2026-08-14
 
