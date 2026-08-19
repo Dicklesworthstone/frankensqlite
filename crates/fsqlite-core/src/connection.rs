@@ -99425,13 +99425,22 @@ fn select_has_unsupported_correlated_scalar_subquery(
 /// source-layout diagnostics. CTE and derived-table scopes matter even when
 /// their bodies contain no scalar/EXISTS/IN expression node.
 fn select_requires_column_reference_preflight(select: &SelectStatement, conn: &Connection) -> bool {
+    // bd-x25ka(b): a HAVING clause is name/aggregate-resolved by stock at prepare
+    // (`HAVING nosuchcol` raises `no such column`), but the simple-query execution
+    // path never resolved it — only WHERE / JOIN-ON did (bd-kcvra). The full
+    // column-reference resolver DOES validate HAVING; run it whenever a HAVING is
+    // present so the dead-branch resolution errors surface like stock.
+    fn core_has_having(core: &SelectCore) -> bool {
+        matches!(core, SelectCore::Select { having: Some(_), .. })
+    }
     select.with.is_some()
+        || core_has_having(&select.body.select)
         || select_core_has_derived_source(&select.body.select)
         || select
             .body
             .compounds
             .iter()
-            .any(|(_, core)| select_core_has_derived_source(core))
+            .any(|(_, core)| core_has_having(core) || select_core_has_derived_source(core))
         || select_contains_subquery_matching(select, conn, |_, _| true)
 }
 
