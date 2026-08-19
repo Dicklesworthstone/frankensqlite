@@ -23950,6 +23950,29 @@ impl Connection {
         !self.in_transaction.get() && !self.implicit_txn.get() && self.active_txn.borrow().is_none()
     }
 
+    /// bd-xv5cm L3: whether re-executing `statement` on a transient conflict is
+    /// safe — i.e. idempotent. The autocommit read retry (below and in
+    /// `execute_statement_after_background_status`) assumes a `SELECT` is
+    /// side-effect-free, but a `SELECT` that calls a user-registered
+    /// (application) function may have effects FrankenSQLite cannot prove
+    /// idempotent (writes to another store, counters, I/O). Stock SQLite never
+    /// silently re-runs a statement, so a transparent retry that runs such a
+    /// function twice is a defect. Built-in functions (including volatile ones
+    /// like `random()`) are known side-effect-free and stay retryable; only a
+    /// referenced application function bars the retry.
+    fn statement_retry_is_idempotent(&self, statement: &Statement) -> bool {
+        let Statement::Select(select) = statement else {
+            // Only reads take this retry path; a PRAGMA retry (bd-tc8u7)
+            // restores its own dispatch state and is handled separately.
+            return true;
+        };
+        let mut references_application_function = |name: &str, args: &FunctionArgs| {
+            self.application_function_kind(name, aggregate_args_len_for_lookup(args))
+                .is_some()
+        };
+        !any_function_call_in_select(select, &mut references_application_function)
+    }
+
     /// GH #333: execute a prepared statement, transparently re-executing it on
     /// transient conflict errors while the connection is in autocommit mode.
     ///
@@ -33225,6 +33248,11 @@ impl Connection {
             if !autocommit_retry_entry
                 || !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error))
                 || self.retained_flush_dropped_pending_writes.get()
+                // bd-xv5cm L3: a SELECT that calls a user-registered function may
+                // have non-idempotent side effects, so surface the transient
+                // instead of transparently re-running it. Evaluated last so the
+                // AST walk only runs on the rare transient-error path.
+                || !self.statement_retry_is_idempotent(statement)
             {
                 // bd-irmuw: a failed retained flush that dropped acknowledged
                 // writes makes this attempt non-idempotent — surface the error
@@ -94767,6 +94795,310 @@ fn visit_frame_bound_qualified_names(
         | FrameBound::CurrentRow
         | FrameBound::UnboundedFollowing => Ok(()),
     }
+}
+
+// bd-xv5cm L3: short-circuiting walk over every function call anywhere in a
+// SELECT (all cores, CTEs, subqueries, ORDER BY / LIMIT, window specs), used to
+// decide whether an autocommit read is safe to transparently re-run on a
+// transient conflict. `pred(name, args)` returns true to stop the walk. Mirrors
+// the `visit_*_qualified_names` traversal so a function hidden in a subquery or a
+// window frame is not missed.
+fn any_function_call_in_select(
+    select: &SelectStatement,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            if any_function_call_in_select(&cte.query, pred) {
+                return true;
+            }
+        }
+    }
+    if any_function_call_in_select_core(&select.body.select, pred) {
+        return true;
+    }
+    for (_, core) in &select.body.compounds {
+        if any_function_call_in_select_core(core, pred) {
+            return true;
+        }
+    }
+    for term in &select.order_by {
+        if any_function_call_in_expr(&term.expr, pred) {
+            return true;
+        }
+    }
+    if let Some(limit) = &select.limit {
+        if any_function_call_in_expr(&limit.limit, pred) {
+            return true;
+        }
+        if let Some(offset) = &limit.offset {
+            if any_function_call_in_expr(offset, pred) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn any_function_call_in_select_core(
+    core: &SelectCore,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    if any_function_call_in_expr(expr, pred) {
+                        return true;
+                    }
+                }
+            }
+            if let Some(from_clause) = from {
+                if any_function_call_in_table_or_subquery(&from_clause.source, pred) {
+                    return true;
+                }
+                for join in &from_clause.joins {
+                    if any_function_call_in_table_or_subquery(&join.table, pred) {
+                        return true;
+                    }
+                    if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                        if any_function_call_in_expr(expr, pred) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            if let Some(expr) = where_clause {
+                if any_function_call_in_expr(expr, pred) {
+                    return true;
+                }
+            }
+            for expr in group_by {
+                if any_function_call_in_expr(expr, pred) {
+                    return true;
+                }
+            }
+            if let Some(expr) = having {
+                if any_function_call_in_expr(expr, pred) {
+                    return true;
+                }
+            }
+            for window in windows {
+                if any_function_call_in_window_spec(&window.spec, pred) {
+                    return true;
+                }
+            }
+            false
+        }
+        SelectCore::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    if any_function_call_in_expr(expr, pred) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+fn any_function_call_in_table_or_subquery(
+    source: &TableOrSubquery,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    match source {
+        TableOrSubquery::Table { .. } => false,
+        TableOrSubquery::Subquery { query, .. } => any_function_call_in_select(query, pred),
+        TableOrSubquery::TableFunction { args, .. } => {
+            for expr in args {
+                if any_function_call_in_expr(expr, pred) {
+                    return true;
+                }
+            }
+            false
+        }
+        TableOrSubquery::ParenJoin(from) => {
+            if any_function_call_in_table_or_subquery(&from.source, pred) {
+                return true;
+            }
+            for join in &from.joins {
+                if any_function_call_in_table_or_subquery(&join.table, pred) {
+                    return true;
+                }
+                if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                    if any_function_call_in_expr(expr, pred) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+fn any_function_call_in_expr(
+    expr: &Expr,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    match expr {
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => false,
+        Expr::BinaryOp { left, right, .. } => {
+            any_function_call_in_expr(left, pred) || any_function_call_in_expr(right, pred)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => any_function_call_in_expr(expr, pred),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            any_function_call_in_expr(expr, pred)
+                || any_function_call_in_expr(low, pred)
+                || any_function_call_in_expr(high, pred)
+        }
+        Expr::In { expr, set, .. } => {
+            if any_function_call_in_expr(expr, pred) {
+                return true;
+            }
+            match set {
+                InSet::List(exprs) => {
+                    for expr in exprs {
+                        if any_function_call_in_expr(expr, pred) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                InSet::Subquery(subquery) => any_function_call_in_select(subquery, pred),
+                InSet::Table(_) => false,
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            any_function_call_in_expr(expr, pred)
+                || any_function_call_in_expr(pattern, pred)
+                || escape
+                    .as_ref()
+                    .is_some_and(|escape| any_function_call_in_expr(escape, pred))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                if any_function_call_in_expr(operand, pred) {
+                    return true;
+                }
+            }
+            for (when_expr, then_expr) in whens {
+                if any_function_call_in_expr(when_expr, pred)
+                    || any_function_call_in_expr(then_expr, pred)
+                {
+                    return true;
+                }
+            }
+            else_expr
+                .as_ref()
+                .is_some_and(|else_expr| any_function_call_in_expr(else_expr, pred))
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            any_function_call_in_select(subquery, pred)
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if pred(name.as_str(), args) {
+                return true;
+            }
+            if let FunctionArgs::List(list) = args {
+                for expr in list {
+                    if any_function_call_in_expr(expr, pred) {
+                        return true;
+                    }
+                }
+            }
+            for term in order_by {
+                if any_function_call_in_expr(&term.expr, pred) {
+                    return true;
+                }
+            }
+            if let Some(filter) = filter {
+                if any_function_call_in_expr(filter, pred) {
+                    return true;
+                }
+            }
+            if let Some(window) = over {
+                if any_function_call_in_window_spec(window, pred) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            any_function_call_in_expr(expr, pred) || any_function_call_in_expr(path, pred)
+        }
+        Expr::RowValue(exprs, _) => {
+            for expr in exprs {
+                if any_function_call_in_expr(expr, pred) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn any_function_call_in_window_spec(
+    window: &WindowSpec,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    for expr in &window.partition_by {
+        if any_function_call_in_expr(expr, pred) {
+            return true;
+        }
+    }
+    for term in &window.order_by {
+        if any_function_call_in_expr(&term.expr, pred) {
+            return true;
+        }
+    }
+    if let Some(frame) = &window.frame {
+        if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = &frame.start {
+            if any_function_call_in_expr(expr, pred) {
+                return true;
+            }
+        }
+        if let Some(FrameBound::Preceding(expr) | FrameBound::Following(expr)) = &frame.end {
+            if any_function_call_in_expr(expr, pred) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn visit_select_qualified_names_mut(
@@ -198278,6 +198610,85 @@ mod autocommit_txn_tests {
                 error.is_transient(),
                 "the surfaced error should be the transient flush-commit failure, got {error:?}"
             );
+        });
+    }
+
+    #[test]
+    fn test_side_effecting_udf_select_does_not_auto_retry_bd_xv5cm_l3() {
+        // bd-xv5cm L3: the autocommit SELECT retry (bd-b4u1r / GH #367)
+        // transparently re-runs a read on a transient conflict, justified by
+        // "reads are side-effect-free". That is FALSE when the SELECT calls a
+        // user-registered function: a rolled-back retry runs the function twice,
+        // doubling any effect it has (writes to another store, counters, I/O).
+        // Stock SQLite never silently re-runs a statement. A SELECT that
+        // references an application function must therefore surface the transient
+        // instead of retrying; a plain SELECT — or one that calls only built-ins
+        // (side-effect-free even when volatile, like abs/random) — still retries.
+        use fsqlite_func::ScalarFunction;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct SideEffect(Arc<AtomicUsize>);
+        impl ScalarFunction for SideEffect {
+            fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(args.first().cloned().unwrap_or(SqliteValue::Null))
+            }
+            fn num_args(&self) -> i32 {
+                1
+            }
+            fn name(&self) -> &str {
+                "side_effect"
+            }
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            // Non-zero busy_timeout so the retry loop would iterate if entered.
+            conn.execute("PRAGMA busy_timeout = 5000;").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1), (2), (3);")
+                .await
+                .unwrap();
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            conn.register_nondeterministic_scalar_function(SideEffect(Arc::clone(&calls)));
+
+            // (1) A SELECT that calls the application function must NOT auto-retry:
+            // the one-shot transient at dispatch surfaces instead of being
+            // silently absorbed by a re-run. (Pre-fix: retried, returned Ok.)
+            arm_pre_flush_dispatch_error_once(FrankenError::Busy);
+            let error = conn
+                .query("SELECT side_effect(id) FROM t ORDER BY id")
+                .await
+                .expect_err(
+                    "a SELECT calling a user function must surface the transient, \
+                     not silently re-run it",
+                );
+            assert!(
+                error.is_transient(),
+                "the surfaced error should be the injected transient, got {error:?}"
+            );
+
+            // (2) Control: a plain SELECT (no application function) still
+            // auto-retries — the one-shot transient is absorbed and the read
+            // succeeds on the second attempt.
+            arm_pre_flush_dispatch_error_once(FrankenError::Busy);
+            let rows = conn
+                .query("SELECT id FROM t ORDER BY id")
+                .await
+                .expect("a side-effect-free SELECT must still transparently retry the transient");
+            assert_eq!(rows.len(), 3);
+
+            // (3) Control: a SELECT calling only a built-in stays retryable — a
+            // volatile built-in is still known side-effect-free.
+            arm_pre_flush_dispatch_error_once(FrankenError::Busy);
+            let rows = conn
+                .query("SELECT abs(id) FROM t ORDER BY id")
+                .await
+                .expect("a built-in-only SELECT must still transparently retry the transient");
+            assert_eq!(rows.len(), 3);
         });
     }
 
