@@ -35745,9 +35745,18 @@ impl Connection {
                 // is already populated in a different encoding (bd-pgqsk M7).
                 if attached_connection.db_text_encoding.get() != self.db_text_encoding.get() {
                     if attached_connection.schema_cookie() == 0 {
+                        let adopted = self.db_text_encoding.get();
+                        attached_connection.db_text_encoding.set(adopted);
+                        // bd-ntuz0 (a): PERSIST the adopted encoding into the
+                        // attached file's header (bytes 56..60), not just the live
+                        // value — otherwise the aux is created UTF-8 on disk (its
+                        // header keeps the open-time default) while the live value
+                        // says UTF-16, so a standalone reopen reads the wrong
+                        // encoding. Stock creates a UTF-16le aux from a UTF-16le
+                        // main; match that on-disk.
                         attached_connection
-                            .db_text_encoding
-                            .set(self.db_text_encoding.get());
+                            .update_database_header_metadata(None, None, None, None, Some(adopted))
+                            .await?;
                     } else {
                         return Err(FrankenError::function_error(
                             "attached databases must use the same text encoding as main database",
@@ -47387,6 +47396,23 @@ impl Connection {
                     "'delete-all' may only be used with a contentless or external content fts5 table",
                 ));
             }
+            // bd-zdsh2: register the live-vtab transaction BEFORE the delete-all
+            // mutates the instance (persist_..._delete_all -> mark_lazy_on_disk),
+            // mirroring the bd-90m1n fix for execute_live_vtab_delete_rowids and
+            // fixing the reviewer-flagged asymmetry between the two mutation paths.
+            // This keeps the live-vtab instance's transactional bookkeeping
+            // consistent so a ROLLBACK restores the pre-delete-all instance state.
+            // (The observable `count(*)=0`-after-ROLLBACK symptom the review
+            // suspected does NOT reproduce via a normal reopen — the query
+            // re-reads the rolled-back durable image — so this is defensive
+            // consistency hardening, not a fix for a demonstrated divergence.)
+            if self.is_live_fts5_instance(insert.table.name.as_str()) {
+                let cx = self.op_cx()?;
+                let table_name = insert.table.name.as_str();
+                self.with_active_live_vtab_instance(&cx, table_name, "xBegin", |instance| {
+                    self.begin_live_vtab_transaction_if_needed(table_name, instance, &cx)
+                })?;
+            }
             self.persist_rootpage_zero_fts5_contentless_delete_all(insert.table.name.as_str())
                 .await?;
             self.reset_statement_change_count();
@@ -49102,10 +49128,20 @@ impl Connection {
                 .is_none_or(|table| !table.without_rowid)
         };
         let projected_columns = if is_rowid_table {
+            // Project the IMPLICIT rowid via the shadow-aware alias, mirroring the
+            // DELETE collector (bd-uur1d) and the RAISE(IGNORE) UPDATE rewrite's
+            // own `ignore_skip_rowid_alias` skip-filter (~35151): on a table with a
+            // user column literally named `rowid`, bare `rowid` resolves to that
+            // USER column, so the IN-list would carry user values against a true-
+            // rowid filter and match the wrong rows. `ignore_skip_rowid_alias`
+            // picks the first of rowid/_rowid_/oid that is NOT a user column, so it
+            // always resolves to the true rowid (bd-zaar8). `OLD.rowid`/`NEW.rowid`
+            // in trigger bodies still resolve the user column from the `*` below.
+            let rowid_alias = self.ignore_skip_rowid_alias(&update.table.name.name);
             vec![
                 ResultColumn::Expr {
                     expr: Expr::Column(
-                        fsqlite_ast::ColumnRef::bare("rowid"),
+                        fsqlite_ast::ColumnRef::bare(rowid_alias),
                         fsqlite_ast::Span::new(0, 0),
                     ),
                     alias: None,
@@ -57307,19 +57343,34 @@ impl Connection {
                 // ADD COLUMN back-fills existing rows, so a non-empty table
                 // constrains the default (the restriction is row-gated in C
                 // SQLite — an empty table accepts any default).
+                // bd-kyhpi: count the table's rows through the pager (the
+                // authoritative row source), NOT the lazily-hydrated MemDatabase
+                // mirror. On the FIRST statement to touch a freshly created and
+                // populated table (before any read hydrates the mirror),
+                // `memdb_rows_loaded` is false and `self.db` reports 0 rows — so
+                // the non-constant-default gate below was skipped and e.g.
+                // `ADD COLUMN c DEFAULT (random())` was wrongly admitted on a
+                // non-empty table. `with_pager_write_txn` reuses the active
+                // transaction when one is open (counting uncommitted rows too) or
+                // runs a standalone read otherwise, exactly like
+                // `optimize_beneficial_tables`.
                 let add_column_table_has_rows = {
-                    let schema = self.schema.borrow();
-                    let root_page = schema
-                        .iter()
-                        .find(|t| t.name.eq_ignore_ascii_case(table_name))
-                        .map(|t| t.root_page);
-                    drop(schema);
-                    root_page.is_some_and(|rp| {
-                        self.db
-                            .borrow()
-                            .get_table(rp)
-                            .is_some_and(|t| t.row_count() > 0)
-                    })
+                    let root_page = {
+                        let schema = self.schema.borrow();
+                        schema
+                            .iter()
+                            .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                            .map(|t| t.root_page)
+                    };
+                    match root_page {
+                        Some(rp) => {
+                            self.with_pager_write_txn(async |cx, txn| {
+                                Ok(self.count_btree_entries_in_txn(cx, txn, rp, true).await? > 0)
+                            })
+                            .await?
+                        }
+                        None => false,
+                    }
                 };
                 let default_value = col_def
                     .constraints
@@ -67881,30 +67932,35 @@ impl Connection {
         // name is rejected at prepare regardless of database state, matching
         // stock's "unsupported encoding: <name>" (bd-pgqsk L5).
         if pragma_name == "encoding"
-            && let Some(requested) = pragma.value.as_ref().and_then(|value| {
-                let expr = match value {
-                    PragmaValue::Assign(expr) | PragmaValue::Call(expr) => expr,
-                };
-                match expr {
-                    Expr::Literal(Literal::String(text), _) => Some(text.clone()),
-                    Expr::Column(column, _) if column.table.is_none() => {
-                        Some(column.column.to_string())
-                    }
-                    _ => None,
-                }
-            })
+            && let Some(value) = pragma.value.as_ref()
         {
-            // Normalize like stock: case-insensitive, optional dash. `UTF-16`
-            // resolves to the native default UTF-16le.
-            let normalized: String = requested
-                .chars()
-                .filter(|character| *character != '-')
-                .flat_map(char::to_lowercase)
-                .collect();
+            let expr = match value {
+                PragmaValue::Assign(expr) | PragmaValue::Call(expr) => expr,
+            };
+            let requested = match expr {
+                Expr::Literal(Literal::String(text), _) => text.clone(),
+                Expr::Column(column, _) if column.table.is_none() => {
+                    column.column.to_string()
+                }
+                // A non-string encoding argument (e.g. `PRAGMA encoding = 5`) is
+                // unsupported; stock rejects it at prepare rather than silently
+                // ignoring it (bd-ntuz0 b).
+                _ => {
+                    return Err(FrankenError::function_error(
+                        "unsupported encoding".to_owned(),
+                    ));
+                }
+            };
+            // Normalize like stock: case-insensitive, with the SINGLE optional
+            // dash after `UTF` — NOT arbitrary dash removal. Stock accepts exactly
+            // utf8/utf-8, utf16/utf-16, utf16le/utf-16le, utf16be/utf-16be and
+            // rejects mangled spellings such as `U-T-F-8` / `UTF--16` /
+            // `utf-16-le` (bd-ntuz0 b). `UTF-16` resolves to native UTF-16le.
+            let normalized: String = requested.chars().flat_map(char::to_lowercase).collect();
             let target = match normalized.as_str() {
-                "utf8" => TextEncoding::Utf8,
-                "utf16" | "utf16le" => TextEncoding::Utf16le,
-                "utf16be" => TextEncoding::Utf16be,
+                "utf8" | "utf-8" => TextEncoding::Utf8,
+                "utf16" | "utf-16" | "utf16le" | "utf-16le" => TextEncoding::Utf16le,
+                "utf16be" | "utf-16be" => TextEncoding::Utf16be,
                 _ => {
                     return Err(FrankenError::function_error(format!(
                         "unsupported encoding: {requested}"
@@ -119595,10 +119651,13 @@ fn and_operand_is_literal_integer_zero(expr: &Expr) -> bool {
 ///    still name/aggregate-resolves that dead branch and raises `no such column` /
 ///    `misuse of aggregate`, so it must reach resolution unfolded.
 fn and_pair_folds_never_true(left: &Expr, right: &Expr) -> bool {
+    fn never_true_beside_subquery(dead: &Expr, sibling: &Expr) -> bool {
+        and_operand_is_constant_never_true(dead) && expr_has_any_subquery(sibling)
+    }
     and_operand_is_literal_integer_zero(left)
         || and_operand_is_literal_integer_zero(right)
-        || (and_operand_is_constant_never_true(left) && expr_has_any_subquery(right))
-        || (and_operand_is_constant_never_true(right) && expr_has_any_subquery(left))
+        || never_true_beside_subquery(left, right)
+        || never_true_beside_subquery(right, left)
 }
 
 /// In a FILTER context (WHERE / HAVING / JOIN-ON), fold every `X AND Y`
@@ -165200,7 +165259,7 @@ mod tests {
                         let mut when_expected: Option<bool> = Some(is_and);
                         for &name in &chain {
                             match (is_and, name) {
-                                (true, 'F') | (true, 'N') => {
+                                (true, 'F' | 'N') => {
                                     when_expected = Some(false);
                                     break;
                                 }
@@ -169224,10 +169283,10 @@ mod tests {
                     let sqlite = rusqlite::Connection::open(&db_path).unwrap();
                     sqlite
                         .execute_batch(&format!(
-                            r#"PRAGMA encoding = '{encoding}';
+                            r"PRAGMA encoding = '{encoding}';
                                CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT);
                                CREATE INDEX idx_name ON items(name);
-                               INSERT INTO items VALUES (1, 'Καλημέρα'), (2, 'café'), (3, '日本');"#
+                               INSERT INTO items VALUES (1, 'Καλημέρα'), (2, 'café'), (3, '日本');"
                         ))
                         .unwrap();
                 }
@@ -169420,9 +169479,9 @@ mod tests {
                     let sqlite = rusqlite::Connection::open(&db_path).unwrap();
                     sqlite
                         .execute_batch(&format!(
-                            r#"PRAGMA encoding = '{encoding}';
+                            r"PRAGMA encoding = '{encoding}';
                                CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT);
-                               INSERT INTO items VALUES (1, 'café');"#
+                               INSERT INTO items VALUES (1, 'café');"
                         ))
                         .unwrap();
                 }
@@ -203825,10 +203884,32 @@ fts5(title, body, content=docs, content_rowid=id)'
                 conn.execute("INSERT INTO t(id, name) VALUES (3, 'alpha');")
                     .await
                     .unwrap();
-                conn.execute("ALTER TABLE t ADD COLUMN score INTEGER DEFAULT (1 + 2);")
+                // bd-kyhpi: SQLite forbids a parenthesized-EXPRESSION default on
+                // an ADD COLUMN over a NON-EMPTY table ("Cannot add a column with
+                // non-constant default"); only a bare literal is legal, because it
+                // is what back-fills the existing rows. Verified vs sqlite3 3.46.1.
+                // (This test previously wrongly ADMITTED these expression forms —
+                // it was passing only because the row-presence gate read the
+                // unhydrated MemDatabase mirror and saw the table as empty; that is
+                // the bd-kyhpi bug now fixed, so the reject is asserted here.)
+                assert!(
+                    conn.execute("ALTER TABLE t ADD COLUMN bad INTEGER DEFAULT (1 + 2);")
+                        .await
+                        .is_err(),
+                    "expression default (1 + 2) must be rejected on a non-empty table"
+                );
+                assert!(
+                    conn.execute("ALTER TABLE t ADD COLUMN bad2 TEXT DEFAULT ('x' || 'y');")
+                        .await
+                        .is_err(),
+                    "expression default ('x' || 'y') must be rejected on a non-empty table"
+                );
+                // Bare-literal defaults ARE admitted and back-fill the existing
+                // row (same padded values the rejected expressions would produce).
+                conn.execute("ALTER TABLE t ADD COLUMN score INTEGER DEFAULT 3;")
                     .await
                     .unwrap();
-                conn.execute("ALTER TABLE t ADD COLUMN tag TEXT DEFAULT ('x' || 'y');")
+                conn.execute("ALTER TABLE t ADD COLUMN tag TEXT DEFAULT 'xy';")
                     .await
                     .unwrap();
 

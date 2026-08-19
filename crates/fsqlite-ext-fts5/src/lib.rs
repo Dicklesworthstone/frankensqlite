@@ -277,23 +277,38 @@ impl Fts5AveragesRecord {
         let mut offset = 0;
         let total_rows = fts5_read_varint(block, &mut offset, "averages row count")?;
         let mut column_token_totals = vec![0; column_count];
+        let mut read_count = 0usize;
         for total in &mut column_token_totals {
             if offset == block.len() {
                 break;
             }
             *total = fts5_read_varint(block, &mut offset, "averages column total")?;
+            read_count += 1;
         }
-        // Tolerate trailing ZERO totals.
+        // Tolerate a column-count off-by-one, but no more (bd-5915c / bd-i78ry).
         //
         // A table declared as `fts5(content, ..., content = '')` names a column
         // and sets an option with the same word, and the writer and the column
         // parser can disagree by one on how many columns that is. The surplus
         // entries are always zero, and a zero token total carries no
         // information, so refusing the record loses a readable index over
-        // nothing. Real trailing data still fails: only zeros are skipped.
+        // nothing.
+        //
+        // bd-i78ry: cap that slack at exactly ONE in each direction. Missing
+        // more than one trailing total (down to an empty totals vector for a
+        // multi-column table), or more than one surplus total, or any NON-zero
+        // surplus, is a genuine mismatch stock reports FTS5_CORRUPT — do not
+        // open it silently.
+        if read_count + 1 < column_count {
+            return Err(fts5_data_error(
+                "averages column total count is short by more than one",
+            ));
+        }
+        let mut surplus_count = 0usize;
         while offset != block.len() {
             let surplus = fts5_read_varint(block, &mut offset, "averages column total")?;
-            if surplus != 0 {
+            surplus_count += 1;
+            if surplus != 0 || surplus_count > 1 {
                 return Err(fts5_data_error(
                     "trailing bytes after averages column totals",
                 ));
@@ -3045,11 +3060,19 @@ impl Fts5ShadowRows {
             // name (`fts5(content, content='')`), the fts5 column parser and a
             // foreign writer can disagree by one, so a docsize row carries a
             // SURPLUS trailing-zero token count (the phantom column indexes no
-            // tokens). A shorter row is fine too — the missing trailing columns
-            // are unindexed and read as zero. Only a surplus of NON-zero counts
-            // is a genuine mismatch, mirroring the averages decode's rule.
+            // tokens), or is short one trailing column (read as zero).
+            //
+            // bd-i78ry: cap that slack at exactly ONE in each direction. A
+            // shorter-by-more-than-one row (down to an empty vector for a
+            // multi-column table) or a surplus of more than one entry — or any
+            // surplus of NON-zero counts — is a genuine mismatch that stock's
+            // fts5StorageDecodeSizeArray reports as FTS5_CORRUPT, so it must not
+            // open silently.
             let counts = &row.column_token_counts;
-            if counts.len() > column_count && counts[column_count..].iter().any(|count| *count != 0)
+            if counts.len() + 1 < column_count
+                || counts.len() > column_count + 1
+                || (counts.len() > column_count
+                    && counts[column_count..].iter().any(|count| *count != 0))
             {
                 return Err(fts5_data_error("docsize row column count mismatch"));
             }
@@ -11216,6 +11239,35 @@ pub fn register_fts5_scalars(registry: &mut fsqlite_func::FunctionRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-i78ry: the averages decode tolerates a column-count off-by-one in
+    /// either direction (bd-5915c: a keyword-as-column disagreement of exactly
+    /// one), but caps that slack at 1 — a larger shortfall, more than one surplus
+    /// total, or any non-zero surplus is corruption stock reports FTS5_CORRUPT.
+    /// The docsize decode in the shadow-open path shares this rule.
+    #[test]
+    fn averages_decode_caps_column_count_slack_at_one() {
+        let block = |totals: &[u64]| Fts5AveragesRecord::new(5, totals.to_vec()).encode();
+
+        // Exact width round-trips.
+        let exact = Fts5AveragesRecord::decode(&block(&[10, 20, 30]), 3).unwrap();
+        assert_eq!(exact.total_rows, 5);
+        assert_eq!(exact.column_token_totals, vec![10, 20, 30]);
+
+        // Short by one: the missing trailing total reads as zero.
+        let short1 = Fts5AveragesRecord::decode(&block(&[10, 20]), 3).unwrap();
+        assert_eq!(short1.column_token_totals, vec![10, 20, 0]);
+
+        // One surplus ZERO total is dropped.
+        let surplus1 = Fts5AveragesRecord::decode(&block(&[10, 20, 30, 0]), 3).unwrap();
+        assert_eq!(surplus1.column_token_totals, vec![10, 20, 30]);
+
+        // Rejected: short by more than one; surplus non-zero; more than one
+        // surplus (even all-zero).
+        assert!(Fts5AveragesRecord::decode(&block(&[10]), 3).is_err());
+        assert!(Fts5AveragesRecord::decode(&block(&[10, 20, 30, 7]), 3).is_err());
+        assert!(Fts5AveragesRecord::decode(&block(&[10, 20, 30, 0, 0]), 3).is_err());
+    }
 
     #[allow(dead_code)]
     #[derive(Debug)]

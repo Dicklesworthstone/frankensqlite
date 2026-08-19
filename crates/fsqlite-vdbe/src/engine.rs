@@ -176,7 +176,7 @@ use fsqlite_types::opcode::{
 use fsqlite_types::record::{
     ColumnOffset, PrecomputedSerialTypeKind, RecordProfileScope, enter_record_profile_scope,
     parse_record, parse_record_into_with_encoding, parse_record_with_encoding,
-    record_iter_with_precomputed_header_exact_size, serialize_record,
+    record_iter_with_precomputed_header_exact_size,
     serialize_record_iter_with_precomputed_header_into,
     serialize_record_iter_with_precomputed_header_into_slice, simd_serialize_integer_record,
 };
@@ -18750,8 +18750,9 @@ fn index_entry_rowid_at(
         })
 }
 
+#[cfg(test)]
 fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
-    serialize_record(values)
+    fsqlite_types::record::serialize_record(values)
 }
 
 // bd-bld9w.7 family (a): encode memdb-hydration rows in the DB text encoding
@@ -19649,6 +19650,7 @@ mod tests {
     use super::*;
     use crate::{Label, ProgramBuilder};
     use asupersync::runtime::{Runtime, RuntimeBuilder};
+    use fsqlite_types::record::serialize_record;
     use fsqlite_func::vtab::{IndexInfo, VirtualTable, VirtualTableCursor};
     use fsqlite_func::{FunctionRegistry, ScalarFunction, register_builtins};
     use fsqlite_mvcc::ConcurrentRegistry;

@@ -2617,21 +2617,21 @@ mod crash_cleanup_process_liveness_tests {
             let Some((child, pid, birth)) = spawn_blocker_with_birth() else {
                 continue;
             };
-            if let Some(&old_birth) = retired.get(&pid) {
-                if old_birth != birth {
-                    // A killed PID has been reused by a fresh incarnation.
-                    assert!(
-                        !process_alive_os(pid, old_birth),
-                        "reused pid={pid} with the OLD birth must read Dead"
-                    );
-                    assert!(
-                        process_alive_os(pid, birth),
-                        "reused pid={pid} with the NEW birth must read Alive"
-                    );
-                    observed_reuse = true;
-                    terminate(child);
-                    break;
-                }
+            if let Some(&old_birth) = retired.get(&pid)
+                && old_birth != birth
+            {
+                // A killed PID has been reused by a fresh incarnation.
+                assert!(
+                    !process_alive_os(pid, old_birth),
+                    "reused pid={pid} with the OLD birth must read Dead"
+                );
+                assert!(
+                    process_alive_os(pid, birth),
+                    "reused pid={pid} with the NEW birth must read Alive"
+                );
+                observed_reuse = true;
+                terminate(child);
+                break;
             }
             retired.insert(pid, birth);
             terminate(child);

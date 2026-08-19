@@ -13303,15 +13303,21 @@ where
     #[cfg(all(feature = "native", any(unix, windows)))]
     pub fn validate_namespace_binding(&self) -> Result<()> {
         if let Some(binding) = &self.namespace_binding {
-            // bd-9hp58 (ask #3): `guard_generation` is `validate_path_identity`
-            // when the bound generation is still installed (identical Err, no
-            // side effect), but when it PROVES the main file was quarantined /
-            // renamed (a new inode now occupies the path) it also releases this
-            // binding's retained `-ns-gate`/`-ns-use` descriptors — so a
-            // recovery flow that supersedes the generation cannot leave a
-            // retained fd writing to the old inode. Every caller here already
-            // propagates the Err via `?`, so error semantics are unchanged.
-            binding.guard_generation()?;
+            // A superseded / renamed main file must fail every operation on this
+            // generation closed — but the write path must NOT release the
+            // binding's namespace locks. A live connection owns the namespace
+            // until it is dropped; releasing here (as `guard_generation()` does
+            // on a proven supersession, via `quiesce()`) lets a peer join the
+            // replacement — or a generation transition start — WHILE the old
+            // generation is still live, which the namespace-lifetime
+            // replacement-rejection contract forbids (bd-1fs0x; regressed by
+            // bd-9hp58 wiring `guard_generation()` here). The binding retains
+            // only the `-ns-use`/`-ns-gate` SIDECAR advisory locks (never a
+            // main-file fd), so holding them writes nothing to the superseded
+            // inode; `Drop` and the explicit `quiesce()` pool-teardown release
+            // them. `validate_path_identity` is the pure, side-effect-free
+            // liveness check: identical `Err` semantics, no lock release.
+            binding.validate_path_identity()?;
         }
         Ok(())
     }

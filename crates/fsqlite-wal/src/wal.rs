@@ -1779,16 +1779,14 @@ mod tests {
             buf: &'a mut [u8],
             offset: u64,
         ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-            async move {
-                assert_eq!(offset, 0, "scripted file only serves the header at offset 0");
-                let idx = self
-                    .reads
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    .min(self.headers.len() - 1);
-                let n = buf.len().min(WAL_HEADER_SIZE);
-                buf[..n].copy_from_slice(&self.headers[idx][..n]);
-                Ok(n)
-            }
+            assert_eq!(offset, 0, "scripted file only serves the header at offset 0");
+            let idx = self
+                .reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .min(self.headers.len() - 1);
+            let n = buf.len().min(WAL_HEADER_SIZE);
+            buf[..n].copy_from_slice(&self.headers[idx][..n]);
+            std::future::ready(Ok(n))
         }
 
         fn close(&mut self, _cx: &Cx) -> Result<()> {
@@ -1800,7 +1798,9 @@ mod tests {
             _buf: &'a [u8],
             _offset: u64,
         ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-            async move { unreachable!("scripted header file is read-only") }
+            unreachable!("scripted header file is read-only");
+            #[expect(unreachable_code, reason = "type witness for the impl-Future return")]
+            std::future::ready(Ok(()))
         }
         fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
             unreachable!()
@@ -1873,7 +1873,7 @@ mod tests {
     fn torn_wal_header_read_retries_before_corrupt_bd_mlz2t() {
         let cx = test_cx();
         let (valid, corrupt) = valid_and_corrupt_wal_headers(&cx);
-        let expected_page_size = u32::try_from(PAGE_SIZE).expect("PAGE_SIZE fits u32");
+        let expected_page_size = PAGE_SIZE;
 
         // Torn read: bad checksum on the first read, valid on the retry — the
         // header is accepted, so a live WAL generation view is not discarded.

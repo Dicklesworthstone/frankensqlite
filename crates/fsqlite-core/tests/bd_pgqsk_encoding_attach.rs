@@ -44,8 +44,12 @@ fn bd_pgqsk_l5_encoding_setter_spellings_and_rejection() {
             assert_eq!(got, expected, "spelling '{spelling}' resolves to {expected}");
         }
 
-        // An unsupported name is rejected (empty DB), matching stock.
-        for bad in ["bogus", "UTF-32", "latin1"] {
+        // An unsupported name is rejected (empty DB), matching stock — INCLUDING
+        // mangled dash spellings: stock accepts only a SINGLE optional dash after
+        // `UTF`, never arbitrary dash placement (bd-ntuz0 b).
+        for bad in [
+            "bogus", "UTF-32", "latin1", "U-T-F-8", "UTF--16", "utf-16-le",
+        ] {
             let conn = Connection::open(":memory:").await.unwrap();
             let err = conn
                 .execute(&format!("PRAGMA encoding = '{bad}';"))
@@ -56,6 +60,18 @@ fn bd_pgqsk_l5_encoding_setter_spellings_and_rejection() {
                 "'{bad}' error should mention unsupported encoding: {err}"
             );
         }
+
+        // A NON-STRING encoding argument (`PRAGMA encoding = 5`) is rejected, not
+        // silently ignored (bd-ntuz0 b).
+        let conn = Connection::open(":memory:").await.unwrap();
+        let err = conn
+            .execute("PRAGMA encoding = 5;")
+            .await
+            .expect_err("non-string encoding must be rejected");
+        assert!(
+            err.to_string().contains("unsupported encoding"),
+            "non-string error should mention unsupported encoding: {err}"
+        );
     });
 }
 
@@ -110,6 +126,17 @@ fn bd_pgqsk_m7_empty_attach_adopts_main_encoding() {
 
         // Stock reopens the aux file and reads it (written in main's encoding).
         let stock = rusqlite::Connection::open(&aux_path).unwrap();
+        // bd-ntuz0 (a): the adopted encoding must be PERSISTED to the aux header,
+        // so a standalone reopen reports UTF-16le — stock creates a UTF-16le aux
+        // from a UTF-16le main. Before the fix the aux header kept the UTF-8 open
+        // default while only the live value adopted UTF-16.
+        let aux_encoding: String = stock
+            .query_row("PRAGMA encoding;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            aux_encoding, "UTF-16le",
+            "empty aux must adopt AND persist main's UTF-16le encoding"
+        );
         let integrity: String = stock
             .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
             .unwrap();

@@ -219,7 +219,7 @@ fn bench_arena_alloc_get(c: &mut Criterion) {
             |b, &count| {
                 b.iter_batched(
                     VersionArena::new,
-                    |mut arena| {
+                    |arena| {
                         let mut indices = Vec::with_capacity(count as usize);
                         for i in 1..=u64::from(count) {
                             #[allow(clippy::cast_possible_truncation)]
@@ -250,7 +250,7 @@ fn bench_arena_free_list(c: &mut Criterion) {
     group.bench_function("alloc_free_realloc_1000", |b| {
         b.iter_batched(
             || {
-                let mut arena = VersionArena::new();
+                let arena = VersionArena::new();
                 let indices: Vec<_> = (1..=1000_u32)
                     .map(|i| arena.alloc(make_page_version(i, u64::from(i))))
                     .collect();
@@ -556,7 +556,7 @@ fn bench_fcw_conflict(c: &mut Criterion) {
 /// Returns the chain head index. Versions are linked via `prev` pointers
 /// with commit sequences from `depth` down to 1.
 fn build_version_chain(
-    arena: &mut VersionArena,
+    arena: &VersionArena,
     chain_heads: &ChainHeadTable,
     pgno: PageNumber,
     depth: u32,
@@ -594,9 +594,9 @@ fn bench_gc_prune(c: &mut Criterion) {
             |b, &depth| {
                 b.iter_batched(
                     || {
-                        let mut arena = VersionArena::new();
+                        let arena = VersionArena::new();
                         let chain_heads = ChainHeadTable::new();
-                        build_version_chain(&mut arena, &chain_heads, page(1), depth);
+                        build_version_chain(&arena, &chain_heads, page(1), depth);
                         (arena, chain_heads)
                     },
                     |(mut arena, chain_heads)| {
@@ -625,11 +625,11 @@ fn bench_gc_tick(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("pages", n_pages), &n_pages, |b, &count| {
             b.iter_batched(
                 || {
-                    let mut arena = VersionArena::new();
+                    let arena = VersionArena::new();
                     let chain_heads = ChainHeadTable::new();
                     let mut todo = GcTodo::new();
                     for i in 1..=count {
-                        build_version_chain(&mut arena, &chain_heads, page(i), chain_depth);
+                        build_version_chain(&arena, &chain_heads, page(i), chain_depth);
                         todo.enqueue(page(i));
                     }
                     (todo, arena, chain_heads)

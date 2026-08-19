@@ -2933,10 +2933,6 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
     Ok(result)
 }
 
-// A printf integer conversion carries several independent, non-groupable flags
-// (justification, sign mode, zero-pad, comma grouping) plus width and precision;
-// bundling them behind a struct would only add indirection for a single caller.
-#[allow(clippy::too_many_arguments)]
 /// Truncate `val` to `precision` BYTES, flooring to the previous char boundary
 /// so the slice stays valid UTF-8 — matching C SQLite's byte-counted string
 /// precision. Shared by %s/%z and (bd-9zzr0 L3) the pre-escape text of %q/%Q/%w.
@@ -2953,6 +2949,9 @@ fn truncate_str_precision(val: &str, precision: Option<usize>) -> &str {
     }
 }
 
+// A printf integer conversion carries several independent, non-groupable flags
+// (justification, sign mode, zero-pad, comma grouping) plus width and precision;
+// bundling them behind a struct would only add indirection for a single caller.
 #[allow(clippy::too_many_arguments)]
 fn format_integer(
     val: i64,

@@ -256,6 +256,8 @@ impl ArenaSlot {
 ///
 /// This allows GC to hold the write lock only briefly for extraction, while
 /// the free_list update is deferred and batched.
+type ArenaL2Block = Box<[OnceLock<Box<[ArenaSlot]>>]>;
+
 pub struct VersionArena {
     /// Two-level chunk directory. `l1[c / CHUNK_L2]` lazily initializes a
     /// level-2 block, and `block[c % CHUNK_L2]` lazily initializes a chunk of
@@ -263,7 +265,7 @@ pub struct VersionArena {
     /// created its slots have stable addresses and can be borrowed as
     /// `&PageVersion` under a shared read lock while other threads allocate
     /// into different slots.
-    l1: Box<[OnceLock<Box<[OnceLock<Box<[ArenaSlot]>>]>>]>,
+    l1: Box<[OnceLock<ArenaL2Block>]>,
     /// Per-writer bump-cursor shards (bd-5kgie step 3). Each shard fills whole
     /// chunks it owns exclusively, so concurrent writers on distinct shards
     /// bump-allocate without touching a shared cursor cache line. Cache-line
