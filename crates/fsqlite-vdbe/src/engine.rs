@@ -11362,15 +11362,22 @@ impl VdbeEngine {
                                                             &index_desc_flags,
                                                             &index_collations,
                                                             &BUILTIN_COLLATION_REGISTRY,
-                                                            // bd-7c6g7 #7: on-disk index-key order
-                                                            // follows the DB storage encoding
-                                                            // (bld9w.5). The unique-index blind-append
-                                                            // fast path must compare its ascending
-                                                            // check under the SAME encoding as the
-                                                            // sibling probes — a hardcoded Utf8 here
-                                                            // mis-orders a UTF-16 DB's keys and can
-                                                            // append out of order.
-                                                            sc.text_encoding,
+                                                            // bd-nmd19: this blind-append guard reasons
+                                                            // about the PHYSICAL b-tree order, which is a
+                                                            // raw memcmp of the DB-encoded key bytes (and
+                                                            // matches stock's BINARY collation on stored
+                                                            // text). BOTH operands here are raw
+                                                            // `parse_non_null_index_prefix` decodes (the
+                                                            // DB-encoded bytes reinterpreted as UTF-8), so
+                                                            // they must be compared byte-wise — i.e. under
+                                                            // `Utf8`. Comparing them under the DB encoding
+                                                            // (bd-7c6g7 #7) transcoded the already-raw
+                                                            // bytes a second time, producing an order that
+                                                            // DISAGREES with the b-tree and let the fast
+                                                            // path append a key out of order (stock
+                                                            // integrity_check then flags a non-unique
+                                                            // autoindex entry).
+                                                            TextEncoding::Utf8,
                                                         ) == Ordering::Less)
                                                             .then_some(new_prefix)
                                                     })
@@ -17732,7 +17739,17 @@ fn try_decode_storage_cursor_target_index_record(
     key_bytes: &[u8],
 ) -> bool {
     cursor.target_vals_buf.clear();
-    fsqlite_types::record::parse_record_into(key_bytes, &mut cursor.target_vals_buf).is_some()
+    // bd-oqglk / bd-spsnt: decode the cursor-side index key with the cursor's DB
+    // text encoding, matching the probe-side decode. A UTF-8-hardcoded decode
+    // here leaves TEXT columns as raw NUL-interleaved bytes on a UTF-16 DB, so a
+    // later `compare_index_prefix_keys` (which decodes the probe canonically)
+    // mis-compares and the REPLACE-conflict re-seek finds the wrong entry.
+    fsqlite_types::record::parse_record_into_with_encoding(
+        key_bytes,
+        &mut cursor.target_vals_buf,
+        cursor.text_encoding,
+    )
+    .is_some()
 }
 
 fn decode_storage_cursor_target_index_record_strict(
@@ -17756,9 +17773,18 @@ async fn try_decode_storage_cursor_current_index_record(
         .payload_into(&cursor.cx, &mut cursor.payload_buf)
         .await?;
     cursor.cur_vals_buf.clear();
-    let decoded =
-        fsqlite_types::record::parse_record_into(&cursor.payload_buf, &mut cursor.cur_vals_buf)
-            .is_some();
+    // bd-oqglk (P0) / bd-spsnt: decode the cursor's CURRENT index key under the
+    // cursor's DB text encoding, matching the canonical probe-side decode at the
+    // IdxGT/GE/LT/LE general branch. Previously this was a raw UTF-8 decode, so
+    // on a UTF-16 DB a TEXT column read as 'x\0…' compared Greater against the
+    // canonical probe 'x' and an equality-prefix IdxGT terminated a multi-column
+    // scan on its first row (returning EMPTY results).
+    let decoded = fsqlite_types::record::parse_record_into_with_encoding(
+        &cursor.payload_buf,
+        &mut cursor.cur_vals_buf,
+        cursor.text_encoding,
+    )
+    .is_some();
     cursor.cached_rowid = if decoded {
         cursor.cur_vals_buf.last().and_then(SqliteValue::as_integer)
     } else {
