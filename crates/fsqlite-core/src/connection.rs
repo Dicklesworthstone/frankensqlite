@@ -75139,6 +75139,29 @@ impl Connection {
                         } else {
                             right
                         };
+                        // bd-t7oeo: a materialized VECTOR operand (a multi-column
+                        // subquery inlined to `RowValue([BoundOuterValue, …])`, or
+                        // a literal `(a, b)` on the other side) makes this a
+                        // row-value comparison. Evaluating the RowValue as a scalar
+                        // below hits eval_join_expr's missing RowValue arm
+                        // (NotImplemented); compare element-wise instead. The
+                        // RowValue elements are already BoundOuterValue/literals,
+                        // so the synchronous element evaluator suffices.
+                        if matches!(
+                            op,
+                            BinaryOp::Eq
+                                | BinaryOp::Ne
+                                | BinaryOp::Lt
+                                | BinaryOp::Le
+                                | BinaryOp::Gt
+                                | BinaryOp::Ge
+                        ) && (matches!(left_ref, Expr::RowValue(..))
+                            || matches!(right_ref, Expr::RowValue(..)))
+                        {
+                            return eval_join_row_value_comparison(
+                                left_ref, *op, right_ref, row, col_map,
+                            );
+                        }
                         let l = self
                             .eval_expr_with_subqueries(left_ref, row, col_map, params)
                             .await?;
@@ -135569,6 +135592,25 @@ pub(crate) fn eval_join_expr(
                 };
                 return Ok(SqliteValue::Integer(result));
             }
+            // bd-t7oeo: row-value comparison in the interpreted (FROM-less /
+            // CTE-routed) evaluator. A comparison whose operand is a row value —
+            // a literal `(a, b)` or a multi-column subquery pre-evaluated to
+            // `RowValue([BoundOuterValue, …])` — is compared element-wise with
+            // SQLite's row-value semantics. eval_join_expr has no scalar arm for
+            // `Expr::RowValue`, so without this it errored NotImplemented.
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+            ) && (matches!(left.as_ref(), Expr::RowValue(..))
+                || matches!(right.as_ref(), Expr::RowValue(..)))
+            {
+                return eval_join_row_value_comparison(left, *op, right, row, col_map);
+            }
             let lv = eval_join_expr(left, row, col_map)?;
             let rv = eval_join_expr(right, row, col_map)?;
             Ok(eval_join_binary_op(left, &lv, *op, right, &rv, col_map))
@@ -136492,6 +136534,120 @@ fn eval_join_binary_op(
         | BinaryOp::BitOr
         | BinaryOp::ShiftLeft
         | BinaryOp::ShiftRight => eval_binary_op(left, op, right),
+    }
+}
+
+/// The scalar element expressions of a row-value operand. An `Expr::RowValue`
+/// yields its fields; any other expression is a width-1 row value (its single
+/// self). Used only by [`eval_join_row_value_comparison`] (bd-t7oeo).
+fn row_value_operand_elements(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::RowValue(elements, _) => elements.iter().collect(),
+        other => vec![other],
+    }
+}
+
+/// Element-wise comparison of two row values in the interpreted evaluator,
+/// matching SQLite's row-value semantics exactly (bd-t7oeo):
+///  - `=`/`<>` desugar to AND/OR of the per-element equalities under
+///    three-valued logic: a decisive unequal element settles the result, else a
+///    NULL element makes it NULL, else all-equal settles it.
+///  - `<`/`<=`/`>`/`>=` are lexicographic: the first non-equal element decides;
+///    a NULL reached at the deciding position yields NULL (`(1,NULL) < (1,3)` is
+///    NULL, but `(1,NULL) < (2,3)` is 1 because element 0 already decided).
+/// Per-element comparison reuses [`compare_join_expr_values`] so each element
+/// keeps its own affinity/collation.
+fn eval_join_row_value_comparison(
+    left_expr: &Expr,
+    op: BinaryOp,
+    right_expr: &Expr,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> Result<SqliteValue> {
+    let left_elems = row_value_operand_elements(left_expr);
+    let right_elems = row_value_operand_elements(right_expr);
+    if left_elems.len() != right_elems.len() {
+        return Err(FrankenError::function_error(format!(
+            "row value comparison operands have mismatched widths ({} vs {})",
+            left_elems.len(),
+            right_elems.len()
+        )));
+    }
+    let left_vals = left_elems
+        .iter()
+        .map(|e| eval_join_expr(e, row, col_map))
+        .collect::<Result<Vec<_>>>()?;
+    let right_vals = right_elems
+        .iter()
+        .map(|e| eval_join_expr(e, row, col_map))
+        .collect::<Result<Vec<_>>>()?;
+
+    match op {
+        BinaryOp::Eq | BinaryOp::Ne => {
+            let mut any_unequal = false;
+            let mut any_null = false;
+            for i in 0..left_vals.len() {
+                if left_vals[i].is_null() || right_vals[i].is_null() {
+                    any_null = true;
+                } else if compare_join_expr_values(
+                    left_elems[i],
+                    &left_vals[i],
+                    right_elems[i],
+                    &right_vals[i],
+                    col_map,
+                ) != std::cmp::Ordering::Equal
+                {
+                    any_unequal = true;
+                }
+            }
+            // `=` is TRUE only when every element is equal; `<>` is TRUE as soon
+            // as one element is unequal. A NULL element (with no decisive
+            // element) leaves the result unknown.
+            let equal = if any_unequal {
+                Some(false)
+            } else if any_null {
+                None
+            } else {
+                Some(true)
+            };
+            Ok(match equal {
+                None => SqliteValue::Null,
+                Some(eq) => {
+                    let result = if op == BinaryOp::Eq { eq } else { !eq };
+                    SqliteValue::Integer(i64::from(result))
+                }
+            })
+        }
+        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            for i in 0..left_vals.len() {
+                if left_vals[i].is_null() || right_vals[i].is_null() {
+                    // The deciding position is NULL — the order is unknown.
+                    return Ok(SqliteValue::Null);
+                }
+                let cmp = compare_join_expr_values(
+                    left_elems[i],
+                    &left_vals[i],
+                    right_elems[i],
+                    &right_vals[i],
+                    col_map,
+                );
+                if cmp != std::cmp::Ordering::Equal {
+                    let result = match op {
+                        BinaryOp::Lt | BinaryOp::Le => cmp == std::cmp::Ordering::Less,
+                        BinaryOp::Gt | BinaryOp::Ge => cmp == std::cmp::Ordering::Greater,
+                        _ => unreachable!("outer match filters to ordering ops"),
+                    };
+                    return Ok(SqliteValue::Integer(i64::from(result)));
+                }
+            }
+            // Every element compared equal: the rows are equal, so only the
+            // reflexive operators (`<=`, `>=`) are TRUE.
+            Ok(SqliteValue::Integer(i64::from(matches!(
+                op,
+                BinaryOp::Le | BinaryOp::Ge
+            ))))
+        }
+        _ => unreachable!("callers guard to comparison operators only"),
     }
 }
 
