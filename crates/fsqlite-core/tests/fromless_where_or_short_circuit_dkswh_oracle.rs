@@ -186,32 +186,60 @@ fn fromless_where_null_polarity_and_plain_booleans_dkswh() {
     });
 }
 
-/// RESIDUAL (tracked, currently RED so `#[ignore]`d): the compile-time
-/// absorbing-constant fold `X OR <const-true>` -> TRUE and `X AND <const-false>`
-/// -> FALSE discards the OTHER operand even when it would error, regardless of
-/// operand position. Stock folds `(erroring) OR 1` to a row and `(erroring) AND
-/// 0` to no row; frank still evaluates the erroring operand left-to-right and
-/// surfaces its error. This is a distinct gap from the left-truthy short-circuit
-/// fixed above, and it affects the table-backed WHERE path too, so it is filed
-/// separately. Un-ignore when the absorbing-constant fold lands.
+/// bd-0ivvf: the compile-time absorbing-constant fold `X OR <const-true>` ->
+/// TRUE and `X AND <const-false>` -> FALSE discards the OTHER operand — even one
+/// that would error — regardless of the operand's position, matching stock
+/// SQLite's constant fold. The absorbing literal is detected before the
+/// left-to-right walk, so an erroring operand that precedes it is never
+/// evaluated. Identity constants (`OR 0` / `AND 1`) do NOT absorb and still
+/// evaluate the other arm.
 #[test]
-#[ignore = "bd-0ivvf residual: absorbing-constant fold (X OR TRUE / X AND FALSE) not yet implemented"]
-fn fromless_where_absorbing_constant_fold_residual_dkswh() {
+fn fromless_where_absorbing_constant_fold_bd_0ivvf() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
-        // `X OR 1` absorbs to TRUE without evaluating X.
+        // `X OR 1` absorbs to TRUE without evaluating the erroring X.
         assert_rows_agree(
             &f,
             &r,
             "SELECT 1 WHERE (SELECT count(*) FROM json_each('bare')) OR 1",
         )
         .await;
-        // `X AND 0` absorbs to FALSE without evaluating X.
+        // `X AND 0` absorbs to FALSE without evaluating the erroring X.
         assert_rows_agree(
             &f,
             &r,
             "SELECT 1 WHERE (SELECT count(*) FROM json_each('bare')) AND 0",
+        )
+        .await;
+        // The absorbing constant may sit anywhere in a flattened chain.
+        assert_rows_agree(
+            &f,
+            &r,
+            "SELECT 1 WHERE (SELECT count(*) FROM json_each('bare')) OR 0 OR 1",
+        )
+        .await;
+        // Any non-zero integer is a TRUE absorbing constant, not only `1`.
+        assert_rows_agree(
+            &f,
+            &r,
+            "SELECT 1 WHERE (SELECT count(*) FROM json_each('bare')) OR 2",
+        )
+        .await;
+        // Nested: the inner `(X OR 1)` folds to TRUE, so the outer `1 AND _`
+        // reduces without ever evaluating the erroring X (recursive fold).
+        assert_rows_agree(
+            &f,
+            &r,
+            "SELECT 1 WHERE 1 AND ((SELECT count(*) FROM json_each('bare')) OR 1)",
+        )
+        .await;
+        // Identity control: `X OR 0` = X still evaluates X and errors in both
+        // engines (the fold must not over-absorb an identity constant).
+        assert_both_reject(
+            &f,
+            &r,
+            "SELECT 1 WHERE (SELECT count(*) FROM json_each('bare')) OR 0",
         )
         .await;
     });

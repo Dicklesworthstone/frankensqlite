@@ -74477,6 +74477,20 @@ impl Connection {
                         "And/Or BinaryOp must have at least two operands"
                     );
                     let is_and = matches!(op, BinaryOp::And);
+                    // bd-0ivvf: a compile-time-constant *absorbing* literal folds
+                    // the whole chain to that constant regardless of its position
+                    // — `X OR <const-true>` = TRUE, `X AND <const-false>` = FALSE.
+                    // Stock SQLite applies this fold even when a discarded operand
+                    // would error, so it must run BEFORE the left-to-right walk
+                    // below (an erroring operand may precede the absorbing
+                    // constant). Only literal constants are recognised, so a
+                    // subquery/column operand is never treated as absorbing.
+                    if chain
+                        .iter()
+                        .any(|operand| expr_is_constant_absorbing_for(operand, is_and))
+                    {
+                        return Ok(Some(!is_and));
+                    }
                     let mut saw_null = false;
                     for operand in &chain {
                         match self
@@ -118920,6 +118934,33 @@ fn expr_folds_to_integer_zero_via_and(expr: &Expr) -> bool {
         } => expr_folds_to_integer_zero_via_and(left) || expr_folds_to_integer_zero_via_and(right),
         _ => false,
     }
+}
+
+/// bd-0ivvf: the compile-time truthiness of a *literal* constant expression, or
+/// `None` when `expr` is not a recognised literal constant (a subquery, column
+/// reference, or any runtime-dependent expression). Only integer literals are
+/// recognised — the unambiguous case that carries a definite boolean value at
+/// prepare time, matching the conservatism of
+/// [`expr_folds_to_integer_zero_via_and`]. `NULL` is deliberately not a definite
+/// boolean, so it returns `None`.
+fn literal_boolean_constant(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Literal(Literal::Integer(n), _) => Some(*n != 0),
+        _ => None,
+    }
+}
+
+/// bd-0ivvf: whether `expr` is a compile-time-constant *absorbing* element for a
+/// boolean chain of the given kind. A constant that is TRUE absorbs an OR
+/// (`X OR TRUE` = TRUE); a constant that is FALSE absorbs an AND
+/// (`X AND FALSE` = FALSE). An identity constant (FALSE in OR / TRUE in AND) does
+/// not absorb. This matches stock SQLite's compile-time fold, which discards the
+/// other operands — even ones that would error — when an absorbing constant is
+/// present anywhere in the chain.
+fn expr_is_constant_absorbing_for(expr: &Expr, is_and: bool) -> bool {
+    // OR (is_and = false) absorbs on a TRUE constant; AND (is_and = true)
+    // absorbs on a FALSE constant.
+    literal_boolean_constant(expr).is_some_and(|truthy| truthy != is_and)
 }
 
 /// Return whether a statement contains any connection-local `VALUES` clause
