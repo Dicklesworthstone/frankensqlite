@@ -44364,7 +44364,39 @@ impl Connection {
             }
             Statement::Delete(delete) => {
                 // bd-wlo29 L10: same forced-partial-index cover check for DELETE.
-                self.validate_dml_target_partial_index(&delete.table, delete.where_clause.as_ref())
+                //
+                // bd-0fz9d: EXCEPT when stock takes the DELETE truncate
+                // optimization (OP_Clear), which bypasses the index entirely and
+                // so never plans the WHERE loop that would reject an uncovered
+                // forced partial index. Stock truncates iff there is no WHERE, no
+                // BEFORE/AFTER DELETE trigger, no RETURNING (its RETURNING is an
+                // internal trigger), and no foreign-key work — matching frank's
+                // own simple-delete gating (`table_is_foreign_key_parent`). In
+                // that case a bare `DELETE FROM t INDEXED BY pi` empties the table
+                // like stock instead of failing with "no query solution". When
+                // the truncate opt is disabled (WHERE, a trigger, RETURNING, or an
+                // FK parent), stock opens the index and errors, so keep the check.
+                let uses_truncate_opt = delete.where_clause.is_none()
+                    && delete.returning.is_empty()
+                    && !self.table_is_foreign_key_parent(&delete.table.name.name)
+                    && !self.has_matching_triggers(
+                        &delete.table.name.name,
+                        fsqlite_ast::TriggerTiming::Before,
+                        &fsqlite_ast::TriggerEvent::Delete,
+                    )
+                    && !self.has_matching_triggers(
+                        &delete.table.name.name,
+                        fsqlite_ast::TriggerTiming::After,
+                        &fsqlite_ast::TriggerEvent::Delete,
+                    );
+                if uses_truncate_opt {
+                    Ok(())
+                } else {
+                    self.validate_dml_target_partial_index(
+                        &delete.table,
+                        delete.where_clause.as_ref(),
+                    )
+                }
             }
             Statement::Explain { stmt, .. } => self.validate_statement_select_semantics(stmt),
             _ => Ok(()),
