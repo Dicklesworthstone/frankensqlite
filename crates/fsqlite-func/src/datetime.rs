@@ -587,13 +587,16 @@ fn apply_modifier(jdn: f64, modifier: &str) -> Option<f64> {
     parse_arithmetic_modifier(&m).map(|delta| jdn + delta)
 }
 
-/// Parse "+NNN unit" / "-NNN unit" and return the JDN delta.
+/// Parse "NNN unit" / "+NNN unit" / "-NNN unit" and return the JDN delta.
+/// SQLite's date grammar makes the sign optional: a bare `NNN units` modifier is
+/// positive (`date('now', '7 days')` == `date('now', '+7 days')`).
 fn parse_arithmetic_modifier(m: &str) -> Option<f64> {
     let (sign, rest) = if let Some(r) = m.strip_prefix('+') {
         (1.0, r.trim())
-    } else {
-        let r = m.strip_prefix('-')?;
+    } else if let Some(r) = m.strip_prefix('-') {
         (-1.0, r.trim())
+    } else {
+        (1.0, m.trim())
     };
 
     let mut parts = rest.splitn(2, ' ');
@@ -717,7 +720,11 @@ fn apply_modifiers(jdn: f64, modifiers: &[String], mut raw_numeric: bool) -> Opt
 }
 
 fn is_month_year_modifier(m: &str) -> bool {
-    (m.contains("month") || m.contains("year")) && (m.starts_with('+') || m.starts_with('-'))
+    // A month/year arithmetic modifier, signed OR unsigned (SQLite treats a bare
+    // `NNN months` as positive). Named modifiers that merely contain the words
+    // ("start of month"/"start of year") reach `apply_month_year_exact`, fail its
+    // numeric parse, and fall through to `apply_modifier` unchanged.
+    m.contains("month") || m.contains("year")
 }
 
 /// Exact month/year arithmetic by decomposing to YMD.
@@ -731,7 +738,10 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<(f64,
     } else if let Some(r) = m.strip_prefix('-') {
         (-1_i64, r.trim())
     } else {
-        return Err(());
+        // Unsigned `NNN months/years` is positive (SQLite grammar). A non-numeric
+        // leading token (e.g. "start of month") fails the parse below and the
+        // caller falls through to `apply_modifier`.
+        (1_i64, m.trim())
     };
 
     let mut parts = rest.splitn(2, ' ');
@@ -2297,6 +2307,82 @@ mod tests {
             .invoke(&[text("2024-01-01 23:00:00"), text("+2 hours")])
             .unwrap();
         assert_text(&r, "2024-01-02 01:00:00");
+    }
+
+    #[test]
+    fn test_modifier_unsigned_is_positive_bd_t8g1e() {
+        // bd-t8g1e: SQLite's date grammar makes the modifier sign optional — a
+        // bare `NNN units` is positive, identical to a `+`-prefixed modifier.
+        // Frank previously required a sign and returned NULL for the unsigned
+        // form (probe: date('2024-01-01','30 days') -> NULL vs sqlite
+        // '2024-01-31'). Oracle: sqlite3 3.46.1.
+        assert_text(
+            &DateFunc
+                .invoke(&[text("2024-01-15"), text("10 days")])
+                .unwrap(),
+            "2024-01-25",
+        );
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("2024-01-01"), text("5 hours")])
+                .unwrap(),
+            "2024-01-01 05:00:00",
+        );
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("2024-01-01"), text("90 minutes")])
+                .unwrap(),
+            "2024-01-01 01:30:00",
+        );
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("2024-01-01"), text("86400 seconds")])
+                .unwrap(),
+            "2024-01-02 00:00:00",
+        );
+        // Month/year use exact YMD math (not the approximate day-delta) even
+        // unsigned: + 2 months = 2024-03-01, + 1 year = 2025-01-01.
+        assert_text(
+            &DateFunc
+                .invoke(&[text("2024-01-01"), text("2 months")])
+                .unwrap(),
+            "2024-03-01",
+        );
+        assert_text(
+            &DateFunc
+                .invoke(&[text("2024-01-01"), text("1 year")])
+                .unwrap(),
+            "2025-01-01",
+        );
+        // Fractional unsigned modifier.
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("2024-01-01 12:00"), text("1.5 hours")])
+                .unwrap(),
+            "2024-01-01 13:30:00",
+        );
+        // Regression guard: named modifiers containing "month"/"year" still work
+        // (they reach apply_month_year_exact, fail its numeric parse, and fall
+        // through to apply_modifier unchanged).
+        assert_text(
+            &DateFunc
+                .invoke(&[text("2024-03-15"), text("start of month")])
+                .unwrap(),
+            "2024-03-01",
+        );
+        assert_text(
+            &DateFunc
+                .invoke(&[text("2024-06-15"), text("start of year")])
+                .unwrap(),
+            "2024-01-01",
+        );
+        // Signed forms unchanged.
+        assert_text(
+            &DateFunc
+                .invoke(&[text("2024-01-15"), text("-10 days")])
+                .unwrap(),
+            "2024-01-05",
+        );
     }
 
     #[test]
