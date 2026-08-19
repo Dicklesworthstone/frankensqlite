@@ -18952,7 +18952,7 @@ async fn ensure_storage_cursor_row_layout(
         {
             cursor
                 .row_decode
-                .prepare_for_record(&cursor.payload_buf)
+                .prepare_for_record_with_encoding(&cursor.payload_buf, cursor.text_encoding)
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "malformed wide record in cursor payload".to_owned(),
                 })?

@@ -999,6 +999,21 @@ impl RecordDecodeScratch {
     /// `None` when the record is malformed.
     #[must_use]
     pub fn prepare_for_record(&mut self, record: &[u8]) -> Option<bool> {
+        self.prepare_for_record_with_encoding(record, TextEncoding::Utf8)
+    }
+
+    /// Encoding-aware [`Self::prepare_for_record`]. The eager `>64`-column decode
+    /// path materializes every value NOW, so it must decode TEXT under the
+    /// database `encoding`: a UTF-8-hardcoded eager decode paired with an
+    /// encoding-aware re-encode silently corrupts every TEXT column of a wide
+    /// row on a UTF-16 database (bd-7c6g7). The lazy (`<=64`-column) path decodes
+    /// on demand with the caller's encoding, so it is unaffected here.
+    #[must_use]
+    pub fn prepare_for_record_with_encoding(
+        &mut self,
+        record: &[u8],
+        encoding: TextEncoding,
+    ) -> Option<bool> {
         let col_count = match parse_record_header_into(record, &mut self.header_offsets) {
             Some(col_count) => col_count,
             None => {
@@ -1008,7 +1023,7 @@ impl RecordDecodeScratch {
         };
         if col_count > 64 {
             recycle_values_from(&mut self.values, 0);
-            if parse_record_into(record, &mut self.values).is_none() {
+            if parse_record_into_with_encoding(record, &mut self.values, encoding).is_none() {
                 self.invalidate();
                 return None;
             }
@@ -3507,6 +3522,51 @@ mod tests {
         let mut utf8_values = Vec::new();
         parse_record_into(&record, &mut utf8_values).expect("utf8 row decodes");
         assert_ne!(utf8_values[0].as_text(), Some(text));
+    }
+
+    #[test]
+    fn prepare_for_record_with_encoding_decodes_wide_utf16_row() {
+        // bd-7c6g7: the eager >64-column decode path (prepare_for_record) must
+        // honor the database encoding. A UTF-16 wide row whose TEXT columns were
+        // decoded as UTF-8 (the previous hardcode) mojibaked every text column.
+        let text = "grüße☕";
+        let mut row: Vec<SqliteValue> = Vec::new();
+        for i in 0..65 {
+            if i % 4 == 0 {
+                row.push(SqliteValue::Text(SmallText::new(text)));
+            } else {
+                row.push(SqliteValue::Integer(i64::from(i)));
+            }
+        }
+        assert!(row.len() > 64, "row must exceed the 64-column lazy boundary");
+        let record = serialize_record_with_encoding(&row, TextEncoding::Utf16le);
+
+        let mut scratch = RecordDecodeScratch::default();
+        let eager = scratch
+            .prepare_for_record_with_encoding(&record, TextEncoding::Utf16le)
+            .expect("wide utf16 row decodes");
+        assert!(eager, "a >64-column record is eagerly decoded");
+        assert_eq!(scratch.column_count(), 65);
+        for i in 0..65 {
+            if i % 4 == 0 {
+                assert_eq!(
+                    scratch.cached_value(i).and_then(SqliteValue::as_text),
+                    Some(text),
+                    "text column {i} must decode under UTF-16, not mojibake"
+                );
+            }
+        }
+
+        // The Utf8-defaulting prepare_for_record must NOT recover the string,
+        // proving the encoding parameter is load-bearing (not byte-equality).
+        let mut utf8_scratch = RecordDecodeScratch::default();
+        utf8_scratch
+            .prepare_for_record(&record)
+            .expect("utf8 decode succeeds structurally");
+        assert_ne!(
+            utf8_scratch.cached_value(0).and_then(SqliteValue::as_text),
+            Some(text)
+        );
     }
 
     #[test]
