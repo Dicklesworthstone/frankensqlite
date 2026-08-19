@@ -2527,9 +2527,14 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 i += 1;
                 let p = params.get(param_idx).map_or(0, SqliteValue::to_integer);
                 param_idx += 1;
-                if p >= 0 {
-                    precision = Some(usize::try_from(p).unwrap_or(0).min(100_000_000));
-                }
+                // bd-9zzr0 L1: SQLite takes the ABSOLUTE value of a negative
+                // dynamic precision (unlike C's "no precision") —
+                // printf('%.*d', -3, 42) == printf('%.3d', 42) == '042'.
+                precision = Some(
+                    usize::try_from(p.unsigned_abs())
+                        .unwrap_or(usize::MAX)
+                        .min(100_000_000),
+                );
             } else {
                 let mut prec = 0usize;
                 while i < chars.len() && chars[i].is_ascii_digit() {
@@ -2773,42 +2778,50 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 // right/left-justified, including the "(NULL)" case (bd-8959m).
                 let param = params.get(param_idx);
                 param_idx += 1;
+                // bd-9zzr0 L3: precision truncates the raw text BEFORE escaping.
                 let escaped = match param {
                     // SQLite: printf('%q', NULL) returns literal "(NULL)"
                     Some(SqliteValue::Null) | None => "(NULL)".to_owned(),
-                    Some(v) => v.to_text().replace('\'', "''"),
+                    Some(v) => {
+                        let text = v.to_text();
+                        truncate_str_precision(&text, precision).replace('\'', "''")
+                    }
                 };
                 result.push_str(&pad_string(&escaped, width, left_align));
             }
             'Q' => {
                 // Like %q but wrapped in quotes, NULL -> "NULL". Field width
-                // applies to the whole rendered token (bd-8959m).
+                // applies to the whole rendered token (bd-8959m). Precision
+                // truncates the raw text before escaping (bd-9zzr0 L3).
                 let param = params.get(param_idx);
                 param_idx += 1;
                 let rendered = match param {
                     Some(SqliteValue::Null) | None => "NULL".to_owned(),
-                    Some(v) => format!("'{}'", v.to_text().replace('\'', "''")),
+                    Some(v) => {
+                        let text = v.to_text();
+                        format!(
+                            "'{}'",
+                            truncate_str_precision(&text, precision).replace('\'', "''")
+                        )
+                    }
                 };
                 result.push_str(&pad_string(&rendered, width, left_align));
             }
             'w' => {
-                // Double-quote escaping for identifiers; NULL → empty.
-                // C SQLite %w with NULL produces nothing (empty string),
-                // and only escapes internal double quotes (no surrounding quotes).
-                // Field width applies to the non-NULL rendering (bd-8959m); the
-                // NULL case stays empty (its value semantics are a separate
-                // concern from width).
+                // Double-quote escaping for identifiers. bd-9zzr0 L2: C SQLite
+                // renders NULL as the literal "(NULL)" (not empty). bd-9zzr0 L3:
+                // precision truncates the raw text before escaping. Field width
+                // applies to the whole rendered token (bd-8959m).
                 let param = params.get(param_idx);
                 param_idx += 1;
-                if matches!(param, Some(SqliteValue::Null) | None) {
-                    // NULL: produce nothing (matches the existing behavior).
-                } else {
-                    let escaped = param
-                        .map(SqliteValue::to_text)
-                        .unwrap_or_default()
-                        .replace('"', "\"\"");
-                    result.push_str(&pad_string(&escaped, width, left_align));
-                }
+                let rendered = match param {
+                    Some(SqliteValue::Null) | None => "(NULL)".to_owned(),
+                    Some(v) => {
+                        let text = v.to_text();
+                        truncate_str_precision(&text, precision).replace('"', "\"\"")
+                    }
+                };
+                result.push_str(&pad_string(&rendered, width, left_align));
             }
             'x' | 'X' => {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
@@ -2868,21 +2881,23 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     Some(SqliteValue::Null) | None => String::new(),
                     Some(v) => v.to_text(),
                 };
-                // Field width applies, counted in CHARACTERS: the single emitted
-                // char is one width unit regardless of its byte length (unlike
-                // %s, which counts bytes), and the '0' flag is ignored — padding
-                // is always spaces, right- or left-justified (bd-ul4c0). An empty
-                // argument emits no char but is still padded to width.
-                let ch = text.chars().next();
-                let pad = width.saturating_sub(usize::from(ch.is_some()));
+                // bd-9zzr0 M9: %c precision is a REPEAT count for the emitted
+                // char — printf('%.5c', 'A') == "AAAAA". Without precision the
+                // char is emitted once; an empty argument emits none.
+                // Field width applies, counted in CHARACTERS (the '0' flag is
+                // ignored — padding is always spaces, right- or left-justified;
+                // bd-ul4c0/bd-47mu0).
+                let content = match text.chars().next() {
+                    Some(c) => c.to_string().repeat(precision.unwrap_or(1)),
+                    None => String::new(),
+                };
+                let pad = width.saturating_sub(content.chars().count());
                 if !left_align {
                     for _ in 0..pad {
                         result.push(' ');
                     }
                 }
-                if let Some(c) = ch {
-                    result.push(c);
-                }
+                result.push_str(&content);
                 if left_align {
                     for _ in 0..pad {
                         result.push(' ');
@@ -2905,6 +2920,22 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
 // (justification, sign mode, zero-pad, comma grouping) plus width and precision;
 // bundling them behind a struct would only add indirection for a single caller.
 #[allow(clippy::too_many_arguments)]
+/// Truncate `val` to `precision` BYTES, flooring to the previous char boundary
+/// so the slice stays valid UTF-8 — matching C SQLite's byte-counted string
+/// precision. Shared by %s/%z and (bd-9zzr0 L3) the pre-escape text of %q/%Q/%w.
+fn truncate_str_precision(val: &str, precision: Option<usize>) -> &str {
+    match precision {
+        Some(prec) if val.len() > prec => {
+            let mut end = prec;
+            while end > 0 && !val.is_char_boundary(end) {
+                end -= 1;
+            }
+            &val[..end]
+        }
+        _ => val,
+    }
+}
+
 fn format_integer(
     val: i64,
     width: usize,
@@ -2951,10 +2982,13 @@ fn format_integer(
         return body;
     }
     let pad = width - body.len();
-    if left_align {
-        format!("{body}{}", " ".repeat(pad))
-    } else if zero_pad {
+    // bd-9zzr0 M10: SQLite's `0` flag WINS over `-` for integer conversions
+    // (unlike C, where `-` disables `0`): printf('%-05d', 42) == '00042',
+    // matching the %u/%x/%o paths. So zero-pad is checked before left-align.
+    if zero_pad {
         format!("{sign}{}{digits}", "0".repeat(pad))
+    } else if left_align {
+        format!("{body}{}", " ".repeat(pad))
     } else {
         format!("{}{body}", " ".repeat(pad))
     }
@@ -6013,6 +6047,39 @@ mod tests {
         for (spec, v, want) in cases {
             assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
         }
+    }
+
+    #[test]
+    fn test_printf_bd_9zzr0_review_fixes() {
+        // Oracle: sqlite3 3.46.1. bd-9zzr0 REVIEW-B-printf tail.
+        let f = FormatFunc;
+        let run = |args: &[SqliteValue]| -> String {
+            match f.invoke(args).unwrap() {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let int = SqliteValue::Integer;
+
+        // M9: %c precision repeats the char.
+        assert_eq!(run(&[txt("[%.5c]"), txt("A")]), "[AAAAA]");
+        assert_eq!(run(&[txt("[%c]"), txt("A")]), "[A]");
+        assert_eq!(run(&[txt("[%3c]"), txt("B")]), "[  B]");
+        // M10: the `0` flag wins over `-` for integers (matches %x/%o/%u).
+        assert_eq!(run(&[txt("[%-05d]"), int(42)]), "[00042]");
+        assert_eq!(run(&[txt("[%05d]"), int(42)]), "[00042]");
+        assert_eq!(run(&[txt("[%-5d]"), int(42)]), "[42   ]");
+        // L1: a negative dynamic precision takes its absolute value.
+        assert_eq!(run(&[txt("[%.*d]"), int(-3), int(42)]), "[042]");
+        assert_eq!(run(&[txt("[%.*d]"), int(3), int(42)]), "[042]");
+        // L2: %w with NULL renders "(NULL)", width-padded.
+        assert_eq!(run(&[txt("[%w]"), SqliteValue::Null]), "[(NULL)]");
+        assert_eq!(run(&[txt("[%10w]"), SqliteValue::Null]), "[    (NULL)]");
+        // L3: %q/%Q/%w precision truncates the raw text BEFORE escaping.
+        assert_eq!(run(&[txt("[%.3q]"), txt("ab'cdef")]), "[ab'']");
+        assert_eq!(run(&[txt("[%.3Q]"), txt("ab'cdef")]), "['ab''']");
+        assert_eq!(run(&[txt("[%.3w]"), txt("a\"bcdef")]), "[a\"\"b]");
     }
 
     #[test]
