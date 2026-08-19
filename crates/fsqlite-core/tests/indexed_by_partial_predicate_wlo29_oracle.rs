@@ -87,6 +87,35 @@ fn h3_null_rejecting_comparison_covers_is_not_null() {
 }
 
 #[test]
+fn h3_null_propagating_operand_and_or_cover_is_not_null_vi8lh() {
+    // bd-vi8lh (b): a comparison whose operand is a NULL-propagating expression
+    // of `b` (arithmetic / bitwise / concat / unary) still rejects NULL on `b`
+    // and covers `b IS NOT NULL`; an OR of null-rejecting terms covers too.
+    // CAST, functions, coalesce, and an OR with a non-rejecting arm do NOT cover
+    // (all verified vs sqlite3 3.46.1 — the recognizer must not over-reach).
+    asupersync::test_utils::run_test(|| async {
+        let c = conn(&[
+            "CREATE TABLE t(a, b);",
+            "CREATE INDEX ni ON t(a) WHERE b IS NOT NULL;",
+        ])
+        .await;
+        // NULL-propagating operands cover `b IS NOT NULL`.
+        allow_query(&c, "SELECT a FROM t INDEXED BY ni WHERE b + 0 = 5;").await;
+        allow_query(&c, "SELECT a FROM t INDEXED BY ni WHERE -b = -5;").await;
+        allow_query(&c, "SELECT a FROM t INDEXED BY ni WHERE b || '' = '5';").await;
+        allow_query(&c, "SELECT a FROM t INDEXED BY ni WHERE b & 1 = 1;").await;
+        // An OR of null-rejecting arms covers.
+        allow_query(&c, "SELECT a FROM t INDEXED BY ni WHERE b = 1 OR b = 5;").await;
+        // Non-propagating operands do NOT cover (stock is conservative).
+        reject_query(&c, "SELECT a FROM t INDEXED BY ni WHERE cast(b AS text) = '5';").await;
+        reject_query(&c, "SELECT a FROM t INDEXED BY ni WHERE coalesce(b, 0) = 5;").await;
+        reject_query(&c, "SELECT a FROM t INDEXED BY ni WHERE abs(b) = 5;").await;
+        // An OR with a non-rejecting arm does NOT cover.
+        reject_query(&c, "SELECT a FROM t INDEXED BY ni WHERE b = 1 OR a = 9;").await;
+    });
+}
+
+#[test]
 fn h3_or_branch_covers_or_predicate() {
     asupersync::test_utils::run_test(|| async {
         let c = conn(&[

@@ -44720,22 +44720,32 @@ impl Connection {
         match query_term {
             // A bare truthy column reference (`WHERE b`) is false/NULL when NULL.
             Expr::Column(..) => query_term == col,
-            // A null-rejecting comparison with `col` as an operand: the whole
-            // comparison is NULL — never true — when `col` is NULL. `IS` / `IS
-            // NOT` are NULL-tolerant and deliberately excluded.
             Expr::BinaryOp {
                 left, op, right, ..
-            } => {
-                matches!(
-                    op,
-                    BinaryOp::Eq
-                        | BinaryOp::Ne
-                        | BinaryOp::Lt
-                        | BinaryOp::Le
-                        | BinaryOp::Gt
-                        | BinaryOp::Ge
-                ) && (left.as_ref() == col || right.as_ref() == col)
-            }
+            } => match op {
+                // A null-rejecting comparison: the comparison is NULL — never
+                // true — when `col` is NULL, INCLUDING when `col` sits inside a
+                // NULL-propagating operand such as `b + 0` or `-b` (bd-vi8lh (b),
+                // mirroring sqlite3ExprImpliesNonNullRow). `IS` / `IS NOT` are
+                // NULL-tolerant and deliberately excluded.
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge => {
+                    Self::expr_null_propagates_from(left, col)
+                        || Self::expr_null_propagates_from(right, col)
+                }
+                // `X OR Y` is NULL — never true — when `col` is NULL only if BOTH
+                // arms are themselves null-rejecting on `col` (bd-vi8lh (b)):
+                // `b = 1 OR b = 5` rejects, but `b = 1 OR j = 9` does not.
+                BinaryOp::Or => {
+                    Self::query_term_rejects_null(left, col)
+                        && Self::query_term_rejects_null(right, col)
+                }
+                _ => false,
+            },
             // `col IS NOT NULL` directly.
             Expr::IsNull {
                 expr, not: true, ..
@@ -44745,6 +44755,46 @@ impl Connection {
             Expr::In { expr, .. } | Expr::Between { expr, .. } | Expr::Like { expr, .. } => {
                 expr.as_ref() == col
             }
+            _ => false,
+        }
+    }
+
+    /// bd-vi8lh (b): whether `expr` is NULL whenever `col` is NULL — the
+    /// NULL-propagation SQLite's `sqlite3ExprImpliesNonNullRow` walks, so a
+    /// comparison operand like `b + 0` / `-b` / `b || ''` / `b & 1` still rejects
+    /// NULL on `b`. Arithmetic, bitwise, and concatenation binary operators and
+    /// the arithmetic/bitwise unary operators propagate NULL from either operand;
+    /// CAST, COLLATE, function calls, and NULL-absorbing forms (`coalesce`,
+    /// `ifnull`) do NOT — verified vs sqlite3 3.46.1, where `cast(b AS text)='5'`
+    /// and `coalesce(b,0)=5` do NOT cover `b IS NOT NULL`.
+    fn expr_null_propagates_from(expr: &Expr, col: &Expr) -> bool {
+        if expr == col {
+            return true;
+        }
+        match expr {
+            Expr::BinaryOp { left, op, right, .. }
+                if matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                        | BinaryOp::Modulo
+                        | BinaryOp::Concat
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                ) =>
+            {
+                Self::expr_null_propagates_from(left, col)
+                    || Self::expr_null_propagates_from(right, col)
+            }
+            Expr::UnaryOp {
+                op: UnaryOp::Negate | UnaryOp::Plus | UnaryOp::BitNot,
+                expr: inner,
+                ..
+            } => Self::expr_null_propagates_from(inner, col),
             _ => false,
         }
     }
