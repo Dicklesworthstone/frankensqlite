@@ -1129,9 +1129,10 @@ fn render_output_header(name: &str, mode: OutputMode) -> String {
 
 fn render_output_value(value: &SqliteValue, mode: OutputMode) -> String {
     match mode {
-        OutputMode::List | OutputMode::Column | OutputMode::Line | OutputMode::Quote => {
-            render_display_value(value)
-        }
+        OutputMode::List | OutputMode::Column | OutputMode::Line => render_display_value(value),
+        // sqlite3 `.mode quote` lowercases blob hex (`X'0aff'`) unlike the other
+        // SQL-literal display modes; oracle-diff tooling reads it byte-exact.
+        OutputMode::Quote => render_quote_value(value),
         OutputMode::Csv => render_csv_field(&render_raw_value(value)),
         OutputMode::Tabs => render_raw_value(value),
     }
@@ -1150,6 +1151,26 @@ fn render_display_value(value: &SqliteValue) -> String {
             rendered
         }
         _ => value.to_string(),
+    }
+}
+
+/// `.mode quote` value rendering. Matches sqlite3's SQL-literal output, which
+/// differs from [`render_display_value`] only in blob hex casing: sqlite3
+/// lowercases (`X'0aff'`) so oracle byte-diff tooling compares cleanly. Reals
+/// are left shortest-round-trip for now; sqlite3's `%!.20g` 20-significant-digit
+/// expansion (e.g. `0.1` -> `0.100000000000000005`) needs a dedicated float
+/// decoder and is tracked separately on bd-7p5z3.
+fn render_quote_value(value: &SqliteValue) -> String {
+    match value {
+        SqliteValue::Blob(bytes) => {
+            let mut rendered = String::from("X'");
+            for byte in bytes.iter() {
+                let _ = write!(rendered, "{byte:02x}");
+            }
+            rendered.push('\'');
+            rendered
+        }
+        _ => render_display_value(value),
     }
 }
 
@@ -3028,6 +3049,38 @@ SELECT 1 AS one, 'a''b' AS two, NULL AS three, x'01' AS four;\n\
             assert!(
                 stdout.contains("1,'a''b',NULL,X'01'"),
                 "expected quote-mode SQL-literal value row, got: {stdout}",
+            );
+        });
+    }
+
+    #[test]
+    fn test_mode_quote_blob_hex_is_lowercase() {
+        // bd-7p5z3(b): sqlite3 `.mode quote` emits blob hex in lowercase
+        // (`X'0aff'`) so oracle byte-diff tooling compares cleanly; the other
+        // SQL-literal display modes stay uppercase.
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(
+                b".mode quote\n\
+SELECT x'0aff' AS b;\n\
+.quit\n"
+                    .to_vec(),
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
+
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+
+            assert_eq!(exit_code, 0);
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert!(
+                stdout.contains("X'0aff'"),
+                "expected lowercase blob hex in quote mode, got: {stdout}",
+            );
+            assert!(
+                !stdout.contains("X'0AFF'"),
+                "quote mode must not emit uppercase blob hex, got: {stdout}",
             );
         });
     }
