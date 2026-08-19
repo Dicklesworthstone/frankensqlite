@@ -472,6 +472,26 @@ fn take_settle_rollback_error_once() -> Option<FrankenError> {
     FSQLITE_SETTLE_ROLLBACK_ERROR_ONCE.with_borrow_mut(Option::take)
 }
 
+// Test-only one-shot fault injection for the retained-autocommit flush commit
+// (bd-irmuw). Forces `flush_retained_autocommit_txn`'s `txn.commit` to return the
+// armed error exactly once, so the counterkeeper can prove a flush-commit failure
+// that dropped acknowledged writes surfaces instead of being silently retried.
+#[cfg(test)]
+std::thread_local! {
+    static FSQLITE_RETAINED_FLUSH_COMMIT_ERROR_ONCE: RefCell<Option<FrankenError>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_retained_flush_commit_error_once(error: FrankenError) {
+    FSQLITE_RETAINED_FLUSH_COMMIT_ERROR_ONCE.with_borrow_mut(|slot| *slot = Some(error));
+}
+
+#[cfg(test)]
+fn take_retained_flush_commit_error_once() -> Option<FrankenError> {
+    FSQLITE_RETAINED_FLUSH_COMMIT_ERROR_ONCE.with_borrow_mut(Option::take)
+}
+
 /// Maximum trigger recursion depth (F-PGM.11).
 ///
 /// SQLite defines `SQLITE_MAX_TRIGGER_DEPTH = 1000`, but each Rust recursion
@@ -10869,6 +10889,14 @@ pub struct Connection {
     /// writes, 16 mixed), read-after-write overlap, error, or connection close
     /// (bd-m1nte / I2).
     retained_autocommit_txn: RefCell<Option<TransactionKind>>,
+    /// bd-irmuw: set true when a retained-autocommit flush rolled back a batch
+    /// that still had pending (acknowledged) writes because its commit failed.
+    /// A statement that triggered such a flush is NOT side-effect-free, so the
+    /// autocommit conflict retry must refuse it — retrying would silently re-run
+    /// the statement batch-less and return `Ok` with the dropped writes hidden.
+    /// Reset before each statement dispatch in
+    /// `execute_statement_after_background_status`.
+    retained_flush_dropped_pending_writes: Cell<bool>,
     /// Number of statements executed in the current retained autocommit batch.
     /// Flush is triggered when this reaches the adaptive threshold (bd-m1nte / I2).
     retained_autocommit_stmt_count: Cell<u32>,
@@ -12912,6 +12940,7 @@ impl Connection {
             cached_write_txn_cookie: Cell::new(0),
             cached_write_txn_memdb_row_mirror_exact: Cell::new(false),
             retained_autocommit_txn: RefCell::new(None),
+            retained_flush_dropped_pending_writes: Cell::new(false),
             retained_autocommit_stmt_count: Cell::new(0),
             retained_autocommit_dirty_tables: RefCell::new(HashSet::new()),
             retained_autocommit_count_sum_cache: RefCell::new(None),
@@ -13435,6 +13464,7 @@ impl Connection {
             cached_write_txn_cookie: Cell::new(0),
             cached_write_txn_memdb_row_mirror_exact: Cell::new(false),
             retained_autocommit_txn: RefCell::new(None),
+            retained_flush_dropped_pending_writes: Cell::new(false),
             retained_autocommit_stmt_count: Cell::new(0),
             retained_autocommit_dirty_tables: RefCell::new(HashSet::new()),
             retained_autocommit_count_sum_cache: RefCell::new(None),
@@ -32915,6 +32945,9 @@ impl Connection {
             // re-running on a fresh snapshot is always safe. Keying on
             // `is_transient()` (via `autocommit_statement_conflict_is_retryable`)
             // absorbs every SQLITE_BUSY-family member without a variant allowlist.
+            // bd-irmuw: clear the retained-flush drop marker before dispatch; the
+            // flush (if any) runs inside the first attempt below and re-arms it.
+            self.retained_flush_dropped_pending_writes.set(false);
             let autocommit_retry_entry =
                 matches!(statement, Statement::Pragma(_) | Statement::Select(_))
                     && self.autocommit_conflict_retry_boundary();
@@ -32923,7 +32956,11 @@ impl Connection {
                 .await;
             if !autocommit_retry_entry
                 || !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error))
+                || self.retained_flush_dropped_pending_writes.get()
             {
+                // bd-irmuw: a failed retained flush that dropped acknowledged
+                // writes makes this attempt non-idempotent — surface the error
+                // rather than silently retrying the statement batch-less.
                 return result;
             }
 
@@ -50811,7 +50848,14 @@ impl Connection {
         // discipline: the D1 durable-certificate stack's teardown errors
         // (e.g. Unsupported from a torn-down WAL backend) were replacing the
         // actual commit failure and hiding it from callers.
-        let commit_result = match txn.commit(cx).await {
+        #[cfg(test)]
+        let commit_attempt = match take_retained_flush_commit_error_once() {
+            Some(injected) => Err(injected),
+            None => txn.commit(cx).await,
+        };
+        #[cfg(not(test))]
+        let commit_attempt = txn.commit(cx).await;
+        let commit_result = match commit_attempt {
             Ok(()) => Ok(()),
             Err(commit_error) => {
                 let rollback_result = txn.rollback(cx).await;
@@ -50834,6 +50878,12 @@ impl Connection {
                         %reload_error,
                         "retained-flush memdb reload failed during cleanup; surfacing the original commit error"
                     );
+                }
+                if txn_had_pending_writes {
+                    // bd-irmuw: the acknowledged batch was rolled back by this
+                    // failed flush. Bar the statement-level autocommit retry from
+                    // silently re-running and returning Ok with the writes hidden.
+                    self.retained_flush_dropped_pending_writes.set(true);
                 }
                 Err(commit_error)
             }
@@ -196386,6 +196436,43 @@ mod autocommit_txn_tests {
             assert!(
                 rows.is_empty(),
                 "the forced append failure must not publish the write"
+            );
+        });
+    }
+
+    #[test]
+    fn test_retained_autocommit_flush_commit_failure_does_not_silently_retry_bd_irmuw() {
+        // bd-irmuw (P0): a dirty-table SELECT that flushes the retained batch,
+        // where the flush commit fails transient-Busy, must NOT be silently
+        // retried batch-less and returned Ok — the dropped acknowledged writes
+        // would vanish with no error. The fix bars the autocommit retry when a
+        // retained flush dropped pending writes, so the failure surfaces.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            // Park three acknowledged autocommit writes (under the adaptive flush
+            // threshold, so they stay parked and uncommitted).
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (2)").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (3)").await.unwrap();
+            assert!(
+                conn.retained_autocommit_txn.borrow().is_some(),
+                "the three inserts must be parked in the retained batch"
+            );
+            // Arm a one-shot transient Busy at the retained-flush commit.
+            arm_retained_flush_commit_error_once(FrankenError::Busy);
+            // The dirty-table SELECT triggers the flush; its commit fails, the
+            // batch is rolled back. The retry must be refused and the error
+            // surfaced (pre-fix: retried batch-less, returned Ok with 1..3 gone).
+            let result = conn.query("SELECT id FROM t ORDER BY id").await;
+            let error = result.expect_err(
+                "a flush-commit failure that dropped acknowledged writes must surface, not return Ok",
+            );
+            assert!(
+                error.is_transient(),
+                "the surfaced error should be the transient flush-commit failure, got {error:?}"
             );
         });
     }
