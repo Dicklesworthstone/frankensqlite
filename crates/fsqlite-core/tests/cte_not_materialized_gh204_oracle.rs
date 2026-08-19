@@ -328,3 +328,34 @@ fn scalar_subquery_width_sees_outer_cte_wpiq6() {
         }
     });
 }
+
+/// bd-9tcne regression: chained NOT MATERIALIZED pre-expansion must honor lexical
+/// shadowing. CTE `b`'s body opens its OWN `WITH a` that redeclares the outer
+/// `a`, so `x FROM a` inside `b` binds the LOCAL a (=2), not the outer (=1). The
+/// pre-expansion previously substituted the outer `a` into `b`'s body ignoring
+/// the shadowing WITH, yielding 1 where stock yields 2.
+#[test]
+fn not_materialized_pre_expansion_honors_lexical_shadowing_9tcne() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        // Shadowed: local `a` (=2) hides the outer `a` (=1) inside `b`.
+        assert_agree(
+            &f,
+            &r,
+            "WITH a AS NOT MATERIALIZED (SELECT 1 AS x), \
+                  b AS NOT MATERIALIZED (WITH a AS (SELECT 2 AS x) SELECT x FROM a) \
+             SELECT x FROM b",
+        )
+        .await;
+        // Control: no inner redeclaration — `b` sees the outer `a` (=1).
+        assert_agree(
+            &f,
+            &r,
+            "WITH a AS NOT MATERIALIZED (SELECT 1 AS x), \
+                  b AS NOT MATERIALIZED (SELECT x FROM a) \
+             SELECT x FROM b",
+        )
+        .await;
+    });
+}

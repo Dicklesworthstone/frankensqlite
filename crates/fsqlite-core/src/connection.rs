@@ -96378,7 +96378,14 @@ fn inline_not_materialized_ctes(select: &SelectStatement) -> Option<SelectStatem
             // `a`'s full body, so every reference re-evaluates independently.
             let mut inner = 0usize;
             for (prev_name, prev_body) in &inlinable {
-                subst_cte_refs_in_select(&mut body, prev_name, prev_body, &mut inner);
+                // bd-9tcne: honor lexical shadowing. This body may itself open a
+                // `WITH` that REDECLARES `prev_name` (e.g. `b AS (WITH a AS (SELECT
+                // 2) SELECT x FROM a)` shadows an outer `a`); go through the
+                // shadow-checked wrapper so the outer CTE is not substituted into a
+                // subtree where its name is redefined. Calling the raw
+                // `subst_cte_refs_in_select` here ignored the body's own top-level
+                // WITH and inlined the outer body, yielding 1 where stock yields 2.
+                subst_cte_refs_in_nested_select(&mut body, prev_name, prev_body, &mut inner);
             }
             inlinable.push((cte.name.clone(), body));
         }
