@@ -245,3 +245,103 @@ fn bd_i3ldw_delete_all_allows_external_content() {
         conn.close().await.unwrap();
     });
 }
+
+/// bd-2mzkj (P1): `'delete-all'` on an EXTERNAL-CONTENT fts5 table clears ONLY
+/// the index — the documents live in the content source, so `count(*)` and
+/// non-MATCH scans still see every row (only MATCH goes empty). f6f864a7c wrongly
+/// routed external content through the contentless doc-wipe (`_docsize` clear +
+/// `mark_lazy_on_disk(0)`), pinning `count(*)` to 0 and hiding the scan. The
+/// landed `bd_i3ldw` keeper only checked the src table, not the vtab.
+#[test]
+fn bd_2mzkj_external_content_delete_all_preserves_content_visibility() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ext_vis.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        fn count_scalar(rows: &[fsqlite_core::connection::Row]) -> i64 {
+            match rows[0].values()[0] {
+                SqliteValue::Integer(n) => n,
+                ref other => panic!("expected integer count, got {other:?}"),
+            }
+        }
+
+        let conn = Connection::open(&db_str).await.unwrap();
+        conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, body TEXT);")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'hello world'), (2, 'foo bar');")
+            .await
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(body, content='src', content_rowid='id');")
+            .await
+            .unwrap();
+        // External-content tables are kept in sync by explicit INSERT INTO t (or
+        // triggers), which populate the index + the doc count.
+        conn.execute("INSERT INTO t(rowid, body) VALUES (1, 'hello world'), (2, 'foo bar');")
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        // Reopen so the fts5 table binds LAZILY — that is the state `delete-all`
+        // targets (persist_rootpage_zero_fts5_contentless_delete_all). Its row
+        // count is hydrated from the persisted docsize/segments on open.
+        let conn = Connection::open(&db_str).await.unwrap();
+
+        // Before delete-all: two rows visible; MATCH 'hello' finds row 1.
+        assert_eq!(
+            count_scalar(&conn.query("SELECT count(*) FROM t;").await.unwrap()),
+            2,
+            "pre count(*)"
+        );
+        assert_eq!(
+            count_scalar(&conn.query("SELECT count(*) FROM (SELECT body FROM t);").await.unwrap()),
+            2,
+            "pre scan"
+        );
+        assert_eq!(
+            count_scalar(&conn.query("SELECT count(*) FROM t WHERE t MATCH 'hello';").await.unwrap()),
+            1,
+            "pre MATCH"
+        );
+
+        conn.execute("INSERT INTO t(t) VALUES('delete-all');")
+            .await
+            .unwrap();
+
+        // After delete-all: the index is cleared (MATCH empty) but the content
+        // source is untouched, so count(*) and scans still see both rows.
+        // Stock (confirmed): count(*)=2, scan=2, MATCH=0.
+        assert_eq!(
+            count_scalar(&conn.query("SELECT count(*) FROM t;").await.unwrap()),
+            2,
+            "bd-2mzkj: external-content delete-all must keep count(*) reading the content source, not 0"
+        );
+        assert_eq!(
+            count_scalar(&conn.query("SELECT count(*) FROM (SELECT body FROM t);").await.unwrap()),
+            2,
+            "external-content scans still read the content source after delete-all"
+        );
+        assert_eq!(
+            count_scalar(&conn.query("SELECT count(*) FROM t WHERE t MATCH 'hello';").await.unwrap()),
+            0,
+            "delete-all cleared the index, so MATCH finds nothing"
+        );
+        conn.close().await.unwrap();
+
+        // Stock oracle reads the same image (count(*)=2, MATCH=0, integrity ok).
+        let stock = rusqlite::Connection::open(&db_path).unwrap();
+        let integ: String = stock
+            .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integ, "ok", "stock integrity_check after external-content delete-all");
+        let stock_count: i64 = stock
+            .query_row("SELECT count(*) FROM t;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stock_count, 2, "stock: count(*) reads the content source after delete-all");
+        let stock_match: i64 = stock
+            .query_row("SELECT count(*) FROM t WHERE t MATCH 'hello';", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stock_match, 0, "stock: delete-all cleared the index");
+    });
+}

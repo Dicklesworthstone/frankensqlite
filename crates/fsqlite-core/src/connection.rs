@@ -48248,7 +48248,14 @@ impl Connection {
         table_name: &str,
     ) -> Result<()> {
         let key = table_name.to_ascii_uppercase();
-        let column_count = {
+        // bd-2mzkj: distinguish CONTENTLESS (content='') from EXTERNAL-CONTENT
+        // (content='<table>'). Both reach this path (neither keeps an internal
+        // `_content` shadow, so both are allowed 'delete-all'), but their
+        // semantics differ: contentless delete-all removes every document, while
+        // external-content delete-all clears ONLY the index — the documents still
+        // live in the content source, so `count(*)`/scans must keep reading them.
+        // Capture the current row count now so it can be preserved below.
+        let (column_count, is_contentless, preserved_row_count) = {
             let instances = self.vtab_instances.borrow();
             let Some(fts5) = instances
                 .get(&key)
@@ -48256,7 +48263,11 @@ impl Connection {
             else {
                 return Ok(());
             };
-            fts5.columns().len()
+            (
+                fts5.columns().len(),
+                fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless,
+                fts5.row_count(),
+            )
         };
         if !self.schema_table_exists(&format!("{table_name}_data")) {
             return Ok(());
@@ -48276,6 +48287,10 @@ impl Connection {
             return Ok(());
         };
 
+        // delete-all clears the index: an empty structure + zeroed averages. For
+        // an EXTERNAL-CONTENT table the rows stay visible through the preserved
+        // `_docsize` shadow (below), not through the averages record — which
+        // counts INDEXED documents, now zero (bd-2mzkj).
         let flush = encode_contentless_delete_all_flush(&structure, column_count)?;
 
         // Upsert the empty structure + zeroed averages, then delete every
@@ -48307,21 +48322,29 @@ impl Connection {
         self.delete_fts5_data_rows_for_segids(table_name, &dropped_segids)
             .await?;
 
-        // Every document is gone: clear the whole `_docsize` shadow.
-        self.replace_storage_table_rows(
-            &format!("{table_name}_docsize"),
-            std::iter::empty::<(i64, Vec<SqliteValue>)>(),
-        )
-        .await?;
+        // Contentless: every document is gone, so clear the whole `_docsize`
+        // shadow. External-content: the documents still live in the content
+        // source and delete-all clears only the index, so the docsize shadow
+        // must be preserved (bd-2mzkj: f6f864a7c wrongly wiped it for both).
+        if is_contentless {
+            self.replace_storage_table_rows(
+                &format!("{table_name}_docsize"),
+                std::iter::empty::<(i64, Vec<SqliteValue>)>(),
+            )
+            .await?;
+        }
 
-        // Reset the in-memory state to an empty lazy on-disk index.
+        // Reset the in-memory index so a later MATCH re-reads the now-empty
+        // on-disk structure. Contentless zeroes the doc count (every document was
+        // deleted); external-content PRESERVES it (the documents still live in
+        // the content source, so `count(*)`/scans keep reading them) — bd-2mzkj.
         {
             let mut instances = self.vtab_instances.borrow_mut();
             if let Some(fts5) = instances
                 .get_mut(&key)
                 .and_then(|instance| instance.as_any_mut().downcast_mut::<Fts5Table>())
             {
-                fts5.mark_lazy_on_disk(0);
+                fts5.mark_lazy_on_disk(if is_contentless { 0 } else { preserved_row_count });
             }
         }
 
