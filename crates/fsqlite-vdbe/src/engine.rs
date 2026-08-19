@@ -6843,6 +6843,12 @@ fn sqlite_octet_length_value(value: &SqliteValue) -> SqliteValue {
 
 fn sqlite_substr_prefix_text(text: Cow<'_, str>, prefix_len: usize) -> SqliteValue {
     let text = text.as_ref();
+    // bd-7c6g7 #2: SQLite's text functions treat an embedded NUL as a string
+    // terminator (`length('a'||char(0)||'bc')` == 1), so `substr` operates on
+    // the prefix before the first NUL. The `is_ascii()` fast path below would
+    // otherwise slice into the full byte run (NUL is ASCII), returning bytes
+    // past the terminator that stock SQLite never yields.
+    let text = text.split_once('\0').map_or(text, |(prefix, _)| prefix);
     let end = if text.is_ascii() {
         prefix_len.min(text.len())
     } else if prefix_len == 0 {

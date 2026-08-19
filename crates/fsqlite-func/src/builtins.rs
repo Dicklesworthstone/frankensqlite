@@ -1445,7 +1445,12 @@ impl ScalarFunction for SubstrFunc {
         }
 
         let text = text_arg(&args[0]);
-        let s = text.as_ref();
+        // bd-7c6g7 #2: SQLite treats an embedded NUL as a string terminator for
+        // text functions (`length('a'||char(0)||'bc')` == 1), so substr operates
+        // on the prefix before the first NUL — the is_ascii() fast path (NUL is
+        // ASCII) would otherwise index into bytes past the terminator.
+        let full = text.as_ref();
+        let s = full.split_once('\0').map_or(full, |(prefix, _)| prefix);
         let ascii_fast_path = s.is_ascii();
         let len = if ascii_fast_path {
             s.len() as i64
@@ -5203,6 +5208,24 @@ mod tests {
             ])
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("ell"))
+        );
+    }
+
+    #[test]
+    fn test_substr_truncates_at_embedded_nul() {
+        // bd-7c6g7 #2: SQLite treats an embedded NUL as a string terminator for
+        // text functions, so 'a\0bc' behaves as the 1-character string 'a'
+        // (matching `length('a'||char(0)||'bc')` == 1 and substr(...,1,4) == 'a').
+        let f = SubstrFunc;
+        let s = SqliteValue::Text(SmallText::from_string("a\u{0}bc"));
+        assert_eq!(
+            f.invoke(&[s.clone(), SqliteValue::Integer(1), SqliteValue::Integer(4)])
+                .unwrap(),
+            SqliteValue::Text(SmallText::from_string("a"))
+        );
+        assert_eq!(
+            f.invoke(&[s, SqliteValue::Integer(3)]).unwrap(),
+            SqliteValue::Text(SmallText::from_string(""))
         );
     }
 
