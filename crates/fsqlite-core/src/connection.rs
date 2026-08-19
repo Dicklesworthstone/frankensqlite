@@ -119675,16 +119675,23 @@ fn expr_folds_to_integer_zero_via_and(expr: &Expr) -> bool {
     }
 }
 
-/// bd-0ivvf: the compile-time truthiness of a *literal* constant expression, or
-/// `None` when `expr` is not a recognised literal constant (a subquery, column
-/// reference, or any runtime-dependent expression). Only integer literals are
-/// recognised — the unambiguous case that carries a definite boolean value at
-/// prepare time, matching the conservatism of
-/// [`expr_folds_to_integer_zero_via_and`]. `NULL` is deliberately not a definite
-/// boolean, so it returns `None`.
+/// bd-0ivvf / bd-vi8lh: the compile-time truthiness of a *literal* constant that
+/// stock SQLite treats as ABSORBING, or `None` otherwise (a subquery, column
+/// reference, `NULL`, or any runtime-dependent expression).
+///
+/// Recognises integer literals (both `0` and non-zero) and the keyword `TRUE`,
+/// but NOT the keyword `FALSE`. This asymmetry mirrors stock exactly (verified vs
+/// sqlite3 3.46.1): `X OR TRUE` and `X OR 1` compile-fold to TRUE (absorbing an
+/// erroring operand in either position), and `X AND 0` folds to FALSE — but
+/// `X AND FALSE` does NOT fold: `(erroring subquery) AND FALSE` still evaluates
+/// the subquery and errors, so `FALSE` must not be an absorbing constant here
+/// (only its runtime left-to-right short-circuit applies, e.g. `FALSE AND X`).
+/// `TRUE` was previously unrecognised, so `X OR TRUE` failed to absorb and
+/// diverged from stock (bd-vi8lh (c)).
 fn literal_boolean_constant(expr: &Expr) -> Option<bool> {
     match expr {
         Expr::Literal(Literal::Integer(n), _) => Some(*n != 0),
+        Expr::Literal(Literal::True, _) => Some(true),
         _ => None,
     }
 }

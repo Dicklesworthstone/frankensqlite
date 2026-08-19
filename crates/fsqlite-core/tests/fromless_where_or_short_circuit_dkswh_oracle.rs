@@ -244,3 +244,48 @@ fn fromless_where_absorbing_constant_fold_bd_0ivvf() {
         .await;
     });
 }
+
+/// bd-vi8lh (c): the absorbing fold recognises the boolean KEYWORD `TRUE` the
+/// same way it recognises a non-zero integer — `X OR TRUE` = TRUE discards the
+/// erroring operand in either position. `TRUE` was previously unrecognised, so
+/// `X OR TRUE` evaluated (and surfaced) the erroring subquery. The asymmetric
+/// non-absorbers are checked too: `FALSE` is the OR-identity and `TRUE` is the
+/// AND-identity, so both must still evaluate the other arm (stock does NOT
+/// compile-fold `X AND FALSE`, so `FALSE` is not an absorbing constant here).
+#[test]
+fn fromless_where_absorbing_true_keyword_vi8lh() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        // `X OR TRUE` absorbs to TRUE without evaluating the erroring X.
+        assert_rows_agree(
+            &f,
+            &r,
+            "SELECT 1 WHERE (SELECT count(*) FROM json_each('bare')) OR TRUE",
+        )
+        .await;
+        // Position-independent: the absorbing TRUE may precede the erroring arm.
+        assert_rows_agree(
+            &f,
+            &r,
+            "SELECT 1 WHERE TRUE OR (SELECT count(*) FROM json_each('bare'))",
+        )
+        .await;
+        // Identity control: `X OR FALSE` = X still evaluates X (FALSE does not
+        // absorb an OR), so both engines error.
+        assert_both_reject(
+            &f,
+            &r,
+            "SELECT 1 WHERE (SELECT count(*) FROM json_each('bare')) OR FALSE",
+        )
+        .await;
+        // Identity control: `X AND TRUE` = X still evaluates X (TRUE does not
+        // absorb an AND), so both engines error.
+        assert_both_reject(
+            &f,
+            &r,
+            "SELECT 1 WHERE (SELECT count(*) FROM json_each('bare')) AND TRUE",
+        )
+        .await;
+    });
+}
