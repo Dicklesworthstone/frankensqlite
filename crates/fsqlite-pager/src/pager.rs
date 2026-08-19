@@ -15800,7 +15800,26 @@ where
         }
         let (db_file, _actual_flags) = match (disposition, effective_expected_identity) {
             (ReadWriteOpenDisposition::ReservedEmpty, Some(expected_identity)) => {
-                vfs.open_reserved_with_expected_identity(cx, &db_path, flags, expected_identity)?
+                // bd-qgh42 (GH#366): the reserved (empty-slot) open rejects a slot
+                // that already holds a populated DB or leftover sidecars. The
+                // archive-reconstruct + external-DELETE sequence routes a non-empty
+                // COHERENT DB through ReservedEmpty. Fall back to an identity-checked
+                // open-existing so such a DB opens instead of hard-rejecting; a
+                // truly-bad file is still caught downstream (identity mismatch here,
+                // header incoherence at the coherent-header read, or the reserved
+                // artifact checks on the file_size==0 bootstrap path).
+                match vfs.open_reserved_with_expected_identity(
+                    cx,
+                    &db_path,
+                    flags,
+                    expected_identity,
+                ) {
+                    Ok(opened) => opened,
+                    Err(FrankenError::CannotOpen { .. }) => {
+                        vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
+                    }
+                    Err(other) => return Err(other),
+                }
             }
             (_, Some(expected_identity)) => {
                 vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
@@ -15937,15 +15956,34 @@ where
             return Err(FrankenError::CannotOpen { path: db_path });
         }
 
-        let (mut file_size, coherent_header_bytes, accept_proven_non_hot_leftover) = if disposition
+        // bd-qgh42 (GH#366): a ReservedEmpty open whose file is ALREADY a coherent
+        // populated DB must open the EXISTING file, not hard-reject. The
+        // archive-reconstruct + external-DELETE sequence leaves the namespace
+        // reservation state such that a non-empty file is routed through
+        // ReservedEmpty; the prior code forced `coherent_header_bytes = None` for
+        // EVERY ReservedEmpty open, so a non-empty file fell to
+        // `coherent_header_bytes.ok_or(CannotOpen)` below. Only the genuinely empty
+        // reserved slot (file_size == 0) takes the bootstrap None-path; a populated
+        // reserved file falls through to the same coherent-header read every other
+        // disposition uses (its reserved identity was validated when the file was
+        // opened; re-check it here before treating it as open-existing).
+        let reserved_empty_existing_size = if disposition
             == ReadWriteOpenDisposition::ReservedEmpty
         {
-            (
-                shared_db_file_read(&db_file, cx).await?.file_size(cx)?,
-                None,
-                false,
-            )
+            Some(shared_db_file_read(&db_file, cx).await?.file_size(cx)?)
         } else {
+            None
+        };
+        let (mut file_size, coherent_header_bytes, accept_proven_non_hot_leftover) = if reserved_empty_existing_size
+            == Some(0)
+        {
+            (0, None, false)
+        } else {
+            if reserved_empty_existing_size.is_some() && database_identity != expected_identity {
+                // A reserved slot holding a populated DB with a DIFFERENT identity
+                // than reserved is a genuine mismatch — reject.
+                return Err(FrankenError::CannotOpen { path: db_path });
+            }
             let mut accept_proven_non_hot_leftover = false;
             loop {
                 // Never wait for the recovery fence while holding main
@@ -47823,6 +47861,80 @@ mod tests {
                 "reopened pager should reuse persisted freelist page"
             );
             txn3.commit(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_reserved_empty_open_of_populated_db_opens_existing_bd_qgh42() {
+        // bd-qgh42 / GH#366: a coherent, POPULATED database reopened through the
+        // ReservedEmpty open-mode (as the archive-reconstruct + external-DELETE
+        // sequence routes it — the namespace-reservation layer hands back
+        // expected_identity=Some, so a non-empty file is opened as if reserving an
+        // empty slot) must OPEN THE EXISTING file, not fail with CannotOpen. Before
+        // the fix the pager forced coherent_header_bytes=None for EVERY
+        // ReservedEmpty open, so the non-empty file hit
+        // `coherent_header_bytes.ok_or(CannotOpen)` -> "unable to open database
+        // file".
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/qgh42_reserved_nonempty.db");
+            let cx = Cx::new();
+            let ps = PageSize::DEFAULT.as_usize();
+
+            // Create + populate a coherent DB, capture its file identity, close it.
+            let identity = {
+                let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                    .await
+                    .unwrap();
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let p = txn.allocate_page(&cx).await.unwrap();
+                assert_eq!(p, PageNumber::new(2).unwrap());
+                txn.write_page(&cx, p, &vec![0xAB; ps]).await.unwrap();
+                txn.commit(&cx).await.unwrap();
+                pager
+                    .file_identity(&cx)
+                    .await
+                    .unwrap()
+                    .expect("a populated file must have a file identity")
+            };
+
+            // Reopen the POPULATED file through ReservedEmpty(identity): the fix
+            // routes it to open-existing instead of the empty-slot bootstrap.
+            let reopened = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
+                &cx,
+                vfs,
+                &path,
+                PageSize::DEFAULT,
+                None,
+                ConnectionPagerOpenMode::ReservedEmpty(identity),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "ReservedEmpty open of a coherent populated DB must open-existing, \
+                     not CannotOpen (bd-qgh42/GH#366): {e:?}"
+                )
+            });
+            // open_for_connection_* retains the namespace bootstrap lease; finish it
+            // (the connection layer invokes this immediately after a successful open).
+            reopened.finish_namespace_bootstrap().unwrap();
+
+            // The persisted page survives the reserved reopen (data intact, not a
+            // fresh bootstrap that would have discarded it).
+            let txn_ro = reopened
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .unwrap();
+            let got = txn_ro
+                .get_page(&cx, PageNumber::new(2).unwrap())
+                .await
+                .unwrap()
+                .into_vec();
+            assert_eq!(
+                got,
+                vec![0xAB; ps],
+                "reopened populated DB must read the persisted page, not a bootstrapped empty one"
+            );
         });
     }
 
