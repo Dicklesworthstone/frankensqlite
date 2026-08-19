@@ -2953,6 +2953,7 @@ fn truncate_str_precision(val: &str, precision: Option<usize>) -> &str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_integer(
     val: i64,
     width: usize,
