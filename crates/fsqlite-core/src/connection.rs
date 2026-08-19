@@ -11420,6 +11420,15 @@ pub struct Connection {
     /// record-encode/`MakeRecord` write path is not yet encoding-aware. UTF-8
     /// until a UTF-16 database is admitted read-only.
     db_text_encoding: Cell<TextEncoding>,
+    /// bd-lzbku: a text encoding that this (attached) database adopted from the
+    /// main database at ATTACH time but whose on-disk header persist is DEFERRED
+    /// to the first write txn. Stock leaves a brand-new/empty aux at 0 bytes and
+    /// writes nothing until the first real write, so eagerly rewriting page 1 at
+    /// ATTACH (a) materializes a still-schema-empty aux with a committed encoding
+    /// that a later cross-encoding ATTACH rejects, and (b) fails outright when the
+    /// aux is read-only. `Some` means the next write txn must stamp the header
+    /// encoding (bytes 56..60) before its own changes; `take`n on flush.
+    pending_adopted_header_encoding: Cell<Option<TextEncoding>>,
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
@@ -13108,6 +13117,7 @@ impl Connection {
             local_ddl_epoch: Cell::new(0),
             force_full_schema_reload_once: Cell::new(false),
             db_text_encoding: Cell::new(TextEncoding::Utf8),
+            pending_adopted_header_encoding: Cell::new(None),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             inherited_recursive_program_depth: Cell::new(0),
@@ -13632,6 +13642,7 @@ impl Connection {
             local_ddl_epoch: Cell::new(0),
             force_full_schema_reload_once: Cell::new(false),
             db_text_encoding: Cell::new(TextEncoding::Utf8),
+            pending_adopted_header_encoding: Cell::new(None),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             inherited_recursive_program_depth: Cell::new(0),
@@ -35927,16 +35938,25 @@ impl Connection {
                     if attached_connection.schema_cookie() == 0 {
                         let adopted = self.db_text_encoding.get();
                         attached_connection.db_text_encoding.set(adopted);
-                        // bd-ntuz0 (a): PERSIST the adopted encoding into the
-                        // attached file's header (bytes 56..60), not just the live
-                        // value — otherwise the aux is created UTF-8 on disk (its
-                        // header keeps the open-time default) while the live value
-                        // says UTF-16, so a standalone reopen reads the wrong
-                        // encoding. Stock creates a UTF-16le aux from a UTF-16le
-                        // main; match that on-disk.
-                        attached_connection
-                            .update_database_header_metadata(None, None, None, None, Some(adopted))
-                            .await?;
+                        // bd-ntuz0 (a): the adopted encoding must reach the aux's
+                        // on-disk header (bytes 56..60), else a standalone reopen
+                        // reads the wrong encoding (the aux would be UTF-8 on disk
+                        // while its live value says UTF-16).
+                        //
+                        // bd-lzbku: DEFER that header write to the aux's first write
+                        // txn instead of persisting eagerly here. Stock leaves a
+                        // brand-new/empty aux at 0 bytes until the first real write,
+                        // so an eager page-1 rewrite (1) materializes a schema-empty
+                        // aux with a committed encoding that a later cross-encoding
+                        // ATTACH then rejects, and (2) FAILS outright when the aux is
+                        // read-only (opened schema-only -> no write txn available). A
+                        // read-only aux never writes, so it needs no persist at all —
+                        // its reads use the live adopted value.
+                        if !attached_connection.pager.is_readonly() {
+                            attached_connection
+                                .pending_adopted_header_encoding
+                                .set(Some(adopted));
+                        }
                     } else {
                         return Err(FrankenError::function_error(
                             "attached databases must use the same text encoding as main database",
@@ -53740,7 +53760,30 @@ impl Connection {
                 .await?;
             *self.active_txn.borrow_mut() = Some(txn);
         }
-        let result = {
+        // bd-lzbku: before the caller's own changes, flush any deferred
+        // adopted-encoding header persist. ATTACH of an empty aux adopts the main
+        // database's encoding in-memory and defers the on-disk page-1 write to
+        // here — the aux's first write txn. Re-enters `update_database_header_metadata`
+        // with `active_txn` already Some (auto=false), so it stamps page 1 within
+        // THIS txn and commits alongside the caller's changes. Kept out of the
+        // borrow below (it re-borrows `active_txn`); a failure folds into `result`
+        // so the auto path rolls back, and the flag is cleared only on success so a
+        // transient failure retries on the next write.
+        let pending_flush = match self.pending_adopted_header_encoding.get() {
+            Some(adopted) => {
+                let r = self
+                    .update_database_header_metadata(None, None, None, None, Some(adopted))
+                    .await;
+                if r.is_ok() {
+                    self.pending_adopted_header_encoding.set(None);
+                }
+                r
+            }
+            None => Ok(()),
+        };
+        let result = if let Err(e) = pending_flush {
+            Err(e)
+        } else {
             let mut guard = self.active_txn.borrow_mut();
             let txn = guard
                 .as_mut()
