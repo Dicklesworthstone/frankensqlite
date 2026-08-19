@@ -1,15 +1,19 @@
 # v0.3.6 release notes — DRAFT (changelog input)
 
-> **Status: DRAFT / prep only.** This is the curated `v0.3.5..HEAD` delta staged
-> as input for `CHANGELOG.md`. **No version bump has been applied** — the
-> workspace is still at `0.3.5`. Integrate the `## [0.3.6]` block below into
-> `CHANGELOG.md`, then bump the version surface (see the appendix) as a separate
-> step.
+> **Status: finalized for the 0.3.6 release (changelog input).** This is the
+> curated `v0.3.5..HEAD` delta staged as input for `CHANGELOG.md`. The **version
+> surface has been bumped to `0.3.6`** (this file accompanies the
+> `chore: bump version to 0.3.6 for release` commit; see Appendix A). Remaining
+> release steps: integrate the `## [0.3.6]` block below into `CHANGELOG.md`, then
+> tag `v0.3.6` **after the orchestrator gate is green** (core lib + async-api +
+> clippy).
 >
-> Range: `v0.3.5` (`92a4e4e73`, 2026-08-17) .. `HEAD` (2026-08-19) — **539
-> commits** (145 `fix`, 40 `feat`, 65 `test`, 6 `perf`, 241 `chore`/beads).
-> **54 unique GitHub issues** referenced. Commit hashes cited are short SHAs on
-> `main`; every headline change carries a keeper test and a tracking bead.
+> Range: `v0.3.5` (`92a4e4e73`, 2026-08-17) .. the `0.3.6` release commit
+> (2026-08-19) — **545 functional commits** (147 `fix`, 40 `feat`, 65 `test`,
+> 6 `perf`, plus `chore`/beads) as of the bump, followed by this version-bump
+> commit. **54 unique GitHub issues** referenced. Commit hashes cited are short
+> SHAs on `main`; every headline change carries a keeper test and a tracking
+> bead.
 >
 > ⚠️ **CHANGELOG gap to reconcile:** `CHANGELOG.md` currently documents through
 > `[0.3.1]` even at the `v0.3.5` tag — releases **0.3.2, 0.3.3, 0.3.4, 0.3.5**
@@ -153,23 +157,33 @@ the database's storage encoding instead of hardcoding UTF-8:
 
 ---
 
-## Appendix A — version-bump surface (pre-check; DO NOT bump yet)
+## Appendix A — version-bump surface (APPLIED in this release commit)
 
-`rg '0\.3\.5' Cargo.toml crates/*/Cargo.toml` → **29 files, 55 lines**:
+`rg '0\.3\.5' Cargo.toml crates/*/Cargo.toml` was **29 files, 55 lines** →
+all bumped `0.3.5` → `0.3.6` (manual edits, no scripts):
 
 - **28** per-crate `version = "0.3.5"` declarations (line 3 of each
-  `crates/*/Cargo.toml`). The workspace now has 28 crates under `crates/`,
+  `crates/*/Cargo.toml`). The workspace has 28 crates under `crates/`,
   including the newer `beads-doctor` and `fsqlite-wasm`. Crates **hardcode**
   the version — there is no `version.workspace = true` inheritance — so each
-  must be edited individually.
+  was edited individually.
 - **27** internal workspace-dependency pins in root `Cargo.toml` (lines
   127–153), each `version = "0.3.5"`. (`beads-doctor` is a standalone crate,
-  not listed among the root workspace dependencies, hence 27 pins vs 28
-  crates.)
+  not among the root workspace dependencies, hence 27 pins vs 28 crates.)
 
-Bump procedure at release time (28 crate `version` lines + 27 root dep pins →
-`0.3.6`, then `cargo update -w` to refresh `Cargo.lock`). Also grep the tree for
-any hardcoded `0.3.5` version strings in code/docs/tests before tagging.
+`cargo check --workspace` passed and refreshed `Cargo.lock` (all `fsqlite*`
+entries now `0.3.6`; no `0.3.5` remains in the lock).
+
+**Known, intentionally-untouched: `version = "0.3.0"` sibling floor-pins.**
+`rg 'version = "0\.3\.0"'` finds **38** explicit sibling path-dependency pins
+across 10 crate manifests (`fsqlite`, `fsqlite-core`, `fsqlite-vfs`,
+`fsqlite-vdbe`, `fsqlite-btree`, `fsqlite-wal`, `fsqlite-mvcc`, `fsqlite-pager`,
+`fsqlite-e2e`, `fsqlite-wasm`) — e.g. `crates/fsqlite/Cargo.toml` pins
+`fsqlite-core = { version = "0.3.0", path = ... }`. These are **not** part of
+the `0.3.5→0.3.6` surface and have sat at `0.3.0` unchanged across all of
+0.3.1–0.3.5; `^0.3.0` is satisfied by `0.3.6`, so the build/publish resolves.
+Left as-is to match prior releases; if the release owner wants the published
+dependency metadata tightened to `0.3.6`, that is a separate, deliberate change.
 
 ## Appendix B — release checklist notes
 
