@@ -19,6 +19,47 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.3.6] -- 2026-08-19
+
+First GitHub binary release since 0.3.4 (0.3.2-0.3.4 were fast-follow point
+releases documented in their GitHub release notes; 0.3.5 was a crates.io-only
+snapshot with no GitHub release). Full commit-cited notes are on the v0.3.6
+GitHub release; highlights:
+
+### Fixed
+
+- **FTS5 reopen/hydration**: persisted contentless FTS5 segments bind by
+  default on schema-only open (GH#358, 8d39b2fec + 6a7b52f00) — large indexed
+  corpora no longer come up empty after reopen; doclist stitching across
+  leaf-page continuations (GH#360, fd0fed9e8 + c6d0cccf4); ALTER TABLE RENAME
+  on FTS5 tables (GH#209, b17cd7551); vtab column-DDL rejected like stock
+  (GH#215); fresh-eyes FTS5 defect sweep (external-content delete-all,
+  DoclistIndex reclamation, contentless UPDATE rejection, docsize validation).
+- **integrity_check false positives**: bounded by header page_count
+  (cfb8a3bc4); UTF-16 expression-index false corruption (d17976bd3).
+- **Durability/concurrency**: autocommit reads retry transient BUSY
+  (GH#367/#335, 0787e6888); torn WAL-header tolerance (GH#292, 653343e4b);
+  WAL commit certificate bound to file identity (GH#364, bcae91436); CAS-safe
+  rowid-allocator savepoint rewind (GH#147, 21793d0db); SSI edge discovery on
+  the direct TransactionManager path (GH#189, c2f5ff8d4).
+- **VACUUM**: sorted index keys in the rebuild/VACUUM copy path (GH#347,
+  47e8ddf00, shipped in the 0.3.5 crates); VACUUM INTO preserves vtab
+  sqlite_master entries (GH#357) and works from read-only sources (GH#342).
+- Large SQL/PRAGMA conformance wave: GH#160/#173/#177/#178/#182/#204/#205/
+  #206/#207/#212/#213/#216/#224/#227/#236/#241/#242/#245/#246/#250/#251/
+  #263/#264/#275/#280 and more — see the GitHub release notes.
+
+### Added
+
+- `fts5vocab` virtual-table module (GH#271, 6cf73719e).
+- Non-leading PRIMARY KEY WITHOUT ROWID reads and writes (92a4e4e73).
+
+### Known issues
+
+- GH#366 (fresh open after external DELETEs grow a reconstruct-produced DB's
+  freelist) remains open — negative-repro probe landed (4e0ff4beb),
+  investigation continues. GH#289 remains documented-open (structure-only).
+
 ## [0.3.1] -- 2026-08-14
 
 Post-0.3.0 correctness wave: every entry below cites the landed commit and its
