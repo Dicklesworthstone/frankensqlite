@@ -75528,15 +75528,27 @@ impl Connection {
                     // comparison sees the donor. Vector subqueries stay legal
                     // exactly when the opposite operand is a row value or
                     // another subquery.
+                    // bd-rl7i9 (b): a RowValue operand whose ELEMENT is a subquery
+                    // (e.g. `(1,(SELECT 2)) = (1,2)`) also needs inlining — neither
+                    // operand is a top-level Subquery, so without this it falls to
+                    // the scalar arm and hits eval_join_expr's missing RowValue arm.
+                    // `inline_in_comparison_operand` already recurses into RowValue
+                    // fields, materializing each subquery element.
+                    let left_row_value_subquery = expr_is_row_value_with_subquery_element(left);
+                    let right_row_value_subquery = expr_is_row_value_with_subquery_element(right);
                     let subquery_operand = matches!(left.as_ref(), Expr::Subquery(..))
-                        || matches!(right.as_ref(), Expr::Subquery(..));
+                        || matches!(right.as_ref(), Expr::Subquery(..))
+                        || left_row_value_subquery
+                        || right_row_value_subquery;
                     if subquery_operand {
                         let allow_vector_left =
                             matches!(right.as_ref(), Expr::RowValue(..) | Expr::Subquery(..));
                         let allow_vector_right =
                             matches!(left.as_ref(), Expr::RowValue(..) | Expr::Subquery(..));
                         let left_materialized;
-                        let left_ref: &Expr = if matches!(left.as_ref(), Expr::Subquery(..)) {
+                        let left_ref: &Expr = if matches!(left.as_ref(), Expr::Subquery(..))
+                            || left_row_value_subquery
+                        {
                             left_materialized = self
                                 .inline_in_comparison_operand(
                                     left,
@@ -75551,7 +75563,9 @@ impl Connection {
                             left
                         };
                         let right_materialized;
-                        let right_ref: &Expr = if matches!(right.as_ref(), Expr::Subquery(..)) {
+                        let right_ref: &Expr = if matches!(right.as_ref(), Expr::Subquery(..))
+                            || right_row_value_subquery
+                        {
                             right_materialized = self
                                 .inline_in_comparison_operand(
                                     right,
@@ -135522,6 +135536,13 @@ fn coerce_values_for_comparison_affinity<'a>(
     (Cow::Borrowed(left), Cow::Borrowed(right))
 }
 
+/// bd-rl7i9 (a): the connection-less comparator lane cannot reach a
+/// Connection's collation registry, but it still must honor the built-in
+/// collations (BINARY / NOCASE / RTRIM) a row-value element carries.
+/// `CollationRegistry::new()` is pre-populated with exactly those.
+static ROW_VALUE_BUILTIN_COLLATIONS: std::sync::LazyLock<CollationRegistry> =
+    std::sync::LazyLock::new(CollationRegistry::new);
+
 fn cmp_values_with_comparison_affinity(
     left: &SqliteValue,
     right: &SqliteValue,
@@ -135572,16 +135593,24 @@ fn compare_join_expr_values(
                 // `(SELECT CAST(1 AS INTEGER)) = '1'` returned 0 where
                 // SQLite's donor rules give 1. Derive operand affinity
                 // connection-lessly (BoundOuterValue folds, CAST, COLLATE
-                // wrappers) and coerce exactly like the context path; text
-                // collation stays BINARY here as before (no registry).
+                // wrappers) and coerce exactly like the context path. bd-rl7i9
+                // (a): also apply the derived per-position collation (a declared
+                // NOCASE column / explicit COLLATE wrapper) through the builtin
+                // registry — the collations this connection-less lane can resolve
+                // (BINARY/NOCASE/RTRIM). Previously it compared BINARY and dropped
+                // the collation, so a row-value element comparison ignored NOCASE.
+                // `cmp_values_with_comparison_affinity` performs the identical
+                // affinity coercion, then applies the collation for TEXT operands.
                 let left_affinity = resolve_operand_affinity(left_expr, &[]);
                 let right_affinity = resolve_operand_affinity(right_expr, &[]);
-                let (left_coerced, right_coerced) = coerce_values_for_comparison_affinity(
+                cmp_values_with_comparison_affinity(
                     left_value,
                     right_value,
-                    TypeAffinity::comparison_affinity(left_affinity, right_affinity),
-                );
-                cmp_sqlite_values(&left_coerced, &right_coerced)
+                    left_affinity,
+                    right_affinity,
+                    collation.as_deref(),
+                    &ROW_VALUE_BUILTIN_COLLATIONS,
+                )
             },
             |context| {
                 let left_affinity = join_expr_affinity(left_expr, col_map, context);
@@ -136985,6 +137014,18 @@ fn row_value_operand_elements(expr: &Expr) -> Vec<&Expr> {
         Expr::RowValue(elements, _) => elements.iter().collect(),
         other => vec![other],
     }
+}
+
+/// bd-rl7i9 (b): whether `expr` is a `RowValue` at least one of whose elements
+/// contains a subquery (e.g. `(1, (SELECT 2))`). Such an operand must be routed
+/// through `inline_in_comparison_operand` (which materializes RowValue subquery
+/// elements) before the interpreted, synchronous row-value comparator runs.
+fn expr_is_row_value_with_subquery_element(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::RowValue(fields, _)
+            if fields.iter().any(|f| expr_contains_subquery_match(f, &mut |_| true))
+    )
 }
 
 /// Element-wise comparison of two row values in the interpreted evaluator,

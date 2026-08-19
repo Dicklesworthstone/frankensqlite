@@ -5,10 +5,10 @@
 //!
 //! * **(c) DONE**: `IS` / `IS NOT` over row values (NULL-safe element-wise
 //!   equality), e.g. `(SELECT 1,2) IS (1,2)`.
-//! * **(a) PENDING**: per-position collation (declared column collation + an
+//! * **(a) DONE**: per-position collation (declared column collation + an
 //!   explicit `COLLATE` wrapper) is dropped — the comparator's no-context
 //!   fallback (`compare_join_expr_values`) compares BINARY.
-//! * **(b) PENDING**: a `RowValue` whose *element* is a subquery, e.g.
+//! * **(b) DONE**: a `RowValue` whose *element* is a subquery, e.g.
 //!   `(1,(SELECT 2)) = (1,2)`, falls through to the scalar arm because the
 //!   dispatch only routes a *top-level* subquery operand.
 
@@ -114,10 +114,9 @@ fn row_value_is_null_safe() {
     });
 }
 
-// ---- (a) per-position collation — PENDING (documented, not yet fixed) ----
+// ---- (a) per-position collation (implemented) ----
 
 #[test]
-#[ignore = "bd-rl7i9 (a) pending: no-context comparator lane drops per-position collation"]
 fn row_value_element_collation_nocase() {
     asupersync::test_utils::run_test(|| async {
         agree(
@@ -132,10 +131,9 @@ fn row_value_element_collation_nocase() {
     });
 }
 
-// ---- (b) RowValue with a subquery element — PENDING (documented) ----
+// ---- (b) RowValue with a subquery element (implemented) ----
 
 #[test]
-#[ignore = "bd-rl7i9 (b) pending: dispatch only routes a top-level subquery operand"]
 fn row_value_with_subquery_element() {
     asupersync::test_utils::run_test(|| async {
         agree(
