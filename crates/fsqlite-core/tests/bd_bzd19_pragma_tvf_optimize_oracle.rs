@@ -204,10 +204,9 @@ fn pragma_optimize_on_read_only_connection_is_noop() {
             "PRAGMA optimize(0x10)",
             "PRAGMA optimize(0x12)",
         ] {
-            let rows = ro
-                .query(sql)
-                .await
-                .unwrap_or_else(|e| panic!("`{sql}` must be a no-op on a read-only conn, got {e:?}"));
+            let rows = ro.query(sql).await.unwrap_or_else(|e| {
+                panic!("`{sql}` must be a no-op on a read-only conn, got {e:?}")
+            });
             assert!(
                 rows.is_empty(),
                 "`{sql}` returns no rows outside debug mode, got {rows:?}"
@@ -217,11 +216,9 @@ fn pragma_optimize_on_read_only_connection_is_noop() {
 
         // Cross-engine: stock SQLite also treats these as no-ops on a read-only
         // connection (exit 0, no error).
-        let stock = rusqlite::Connection::open_with_flags(
-            &src,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .expect("stock read-only open");
+        let stock =
+            rusqlite::Connection::open_with_flags(&src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("stock read-only open");
         for sql in ["PRAGMA optimize", "PRAGMA optimize(0x02)"] {
             stock
                 .execute_batch(sql)
