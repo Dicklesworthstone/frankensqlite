@@ -97650,8 +97650,13 @@ async fn rewrite_in_select_core(
             rewrite_in_expr(expr, conn, rewrite_in, params).await?;
         }
         if let Some(hv) = having.as_mut() {
-            // HAVING is evaluated left-to-right (never cost-reordered).
-            fold_never_true_and_in_filter(hv, false);
+            // bd-815xj: a HAVING over a scan (FROM present) is planner
+            // cost-reordered by stock, which drops a `(subquery) AND never-true`
+            // branch — even under an OR — WITHOUT materializing the subquery
+            // (matches the bundled rusqlite oracle; the sqlite3 CLI 3.46.1 differs,
+            // which mis-gated bd-x25ka(a)). Fold like a table WHERE. A FROM-less
+            // HAVING has no scan, so it stays strictly left-to-right.
+            fold_never_true_and_in_filter(hv, from.is_some());
             rewrite_in_expr(hv, conn, rewrite_in, params).await?;
         }
         for window in windows.iter_mut() {
@@ -97665,8 +97670,11 @@ async fn rewrite_in_select_core(
         if let Some(from) = from.as_mut() {
             for join in from.joins.iter_mut() {
                 if let Some(JoinConstraint::On(on_expr)) = join.constraint.as_mut() {
-                    // JOIN-ON is evaluated left-to-right (never cost-reordered).
-                    fold_never_true_and_in_filter(on_expr, false);
+                    // bd-815xj: a JOIN always runs over a scan, so its ON is planner
+                    // cost-reordered — fold `(subquery) AND never-true` (even under
+                    // OR) without materializing the subquery, like a table WHERE
+                    // (rusqlite oracle).
+                    fold_never_true_and_in_filter(on_expr, true);
                     rewrite_in_expr(on_expr, conn, rewrite_in, params).await?;
                 }
             }
@@ -120290,12 +120298,17 @@ fn fold_select_core_filters_never_true(core: &mut SelectCore) {
             fold_never_true_and_in_filter(wh, table_where);
         }
         if let Some(hv) = having.as_mut() {
-            fold_never_true_and_in_filter(hv, false);
+            // bd-815xj: a HAVING over a scan is planner cost-reordered like a table
+            // WHERE (rusqlite oracle) — fold `(subquery) AND never-true` without
+            // materializing the subquery. FROM-less HAVING stays left-to-right.
+            fold_never_true_and_in_filter(hv, table_where);
         }
         if let Some(from) = from.as_mut() {
             for join in from.joins.iter_mut() {
                 if let Some(JoinConstraint::On(on)) = join.constraint.as_mut() {
-                    fold_never_true_and_in_filter(on, false);
+                    // bd-815xj: a JOIN always runs over a scan, so its ON is
+                    // cost-reordered like a table WHERE.
+                    fold_never_true_and_in_filter(on, true);
                 }
             }
         }
