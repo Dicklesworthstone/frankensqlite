@@ -47174,26 +47174,18 @@ impl Connection {
             return Ok(false);
         }
 
-        // `'delete-all'` is contentless-only (stock rejects it on stored/external
-        // content). It resets the index to empty by rewriting the persisted `_data`
-        // structure directly — WITHOUT hydrating the corpus (the O(1)-in-corpus
-        // reset the lazy epic exists for; a contentless table stores no content, so
-        // there is nothing to iterate anyway). Handled fully here, before the
-        // promote-on-lazy fallback used by the other commands.
+        // `'delete-all'` resets the FTS index to empty by rewriting the persisted
+        // `_data` structure directly — WITHOUT hydrating the corpus (the
+        // O(1)-in-corpus reset the lazy epic exists for). It never touches the
+        // content SOURCE, so stock allows it on both CONTENTLESS (content='') and
+        // EXTERNAL-CONTENT (content='<table>') tables — neither keeps an internal
+        // `_content` shadow — and rejects it only on a regular stored-content
+        // table (bd-i3ldw). Handled fully here, before the promote-on-lazy
+        // fallback used by the other commands.
         if command == Fts5MaintenanceCommand::DeleteAll {
-            let key = insert.table.name.to_ascii_uppercase();
-            let is_contentless = {
-                let instances = self.vtab_instances.borrow();
-                instances
-                    .get(&key)
-                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
-                    .is_some_and(|fts5| {
-                        fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless
-                    })
-            };
-            if !is_contentless {
+            if self.rootpage_zero_fts5_has_internal_content_shadow(insert.table.name.as_str()) {
                 return Err(FrankenError::function_error(
-                    "'delete-all' may only be used with a contentless fts5 table",
+                    "'delete-all' may only be used with a contentless or external content fts5 table",
                 ));
             }
             self.persist_rootpage_zero_fts5_contentless_delete_all(insert.table.name.as_str())

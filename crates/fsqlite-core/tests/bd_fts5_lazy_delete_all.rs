@@ -128,3 +128,42 @@ fn bd_fts5_delete_all_rejects_non_contentless() {
         conn.close().await.unwrap();
     });
 }
+
+/// bd-i3ldw: `'delete-all'` clears the FTS index but never the content SOURCE,
+/// so stock allows it on an EXTERNAL-CONTENT table (content='<table>'), not just
+/// a contentless one. Only a regular stored-content table is rejected.
+#[test]
+fn bd_i3ldw_delete_all_allows_external_content() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ext.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_str).await.unwrap();
+        conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, body TEXT);")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alpha term'), (2, 'beta term');")
+            .await
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(body, content='src', content_rowid='id');")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t(t) VALUES('rebuild');")
+            .await
+            .unwrap();
+
+        // 'delete-all' on an external-content table must SUCCEED (clears index).
+        conn.execute("INSERT INTO t(t) VALUES('delete-all');")
+            .await
+            .expect("'delete-all' must be allowed on an external-content fts5 table");
+
+        // The external content source is untouched.
+        let src_rows = conn.query("SELECT count(*) FROM src;").await.unwrap();
+        assert_eq!(
+            src_rows[0].values()[0],
+            SqliteValue::Integer(2),
+            "'delete-all' must not touch the external content table"
+        );
+        conn.close().await.unwrap();
+    });
+}
