@@ -9317,11 +9317,11 @@ impl VdbeEngine {
                     // Cast register p1 to type indicated by p2.
                     let val = self.take_reg(op.p1);
                     if collect_vdbe_metrics {
-                        let casted = sql_cast(val.clone(), op.p2);
+                        let casted = sql_cast(val.clone(), op.p2, self.text_encoding);
                         record_type_coercion(&val, &casted);
                         self.set_reg_fast(op.p1, casted);
                     } else {
-                        let casted = sql_cast(val, op.p2);
+                        let casted = sql_cast(val, op.p2, self.text_encoding);
                         self.set_reg_fast(op.p1, casted);
                     }
                     pc += 1;
@@ -19567,7 +19567,26 @@ fn parse_cast_integer_prefix(s: &str) -> i64 {
 }
 
 /// SQL CAST operation (p2 encodes target type).
-fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
+/// Relabel a BLOB's raw bytes as TEXT using the database text encoding, the way
+/// stock SQLite's `CAST(blob AS TEXT)` re-tags the payload with the connection's
+/// native encoding (bd-f3s2l).
+///
+/// On a UTF-8 database this is `SmallText::from_arc_bytes`: the bytes are
+/// preserved verbatim (invalid UTF-8 kept in the byte-preserving raw form) and
+/// the `Arc` is retained without a copy. On a UTF-16 database the bytes are
+/// decoded as UTF-16LE/BE code units (an odd trailing byte is dropped, lone
+/// surrogates become U+FFFD) — a pure byte-relabel matching stock's per-value
+/// encoding tag, NOT a canonical-UTF-8 interpretation followed by a transcode.
+fn blob_to_text_via_db_encoding(bytes: Arc<[u8]>, text_encoding: TextEncoding) -> SmallText {
+    match text_encoding {
+        TextEncoding::Utf8 => SmallText::from_arc_bytes(bytes),
+        TextEncoding::Utf16le | TextEncoding::Utf16be => {
+            SmallText::from_record_text_bytes(&bytes, text_encoding)
+        }
+    }
+}
+
+fn sql_cast(val: SqliteValue, target: i32, text_encoding: TextEncoding) -> SqliteValue {
     if val.is_null() {
         return SqliteValue::Null;
     }
@@ -19577,10 +19596,15 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
     // But more commonly p2 is used as an affinity character.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let target_byte = target as u8;
-    // C SQLite interprets blob bytes as UTF-8 text before numeric casts.
+    // C SQLite relabels blob bytes as TEXT in the DATABASE encoding before a
+    // numeric cast (bd-f3s2l): on a UTF-16 DB the raw bytes are decoded as
+    // UTF-16 (odd trailing byte dropped), not read as canonical UTF-8. On a
+    // UTF-8 DB `from_record_text_bytes` is the byte-preserving fast path, so
+    // this keeps the existing behavior (and the `Arc` sharing via
+    // `from_arc_bytes` for that case).
     let val = match (val, target_byte) {
         (SqliteValue::Blob(b), b'C' | b'c' | b'D' | b'd' | b'E' | b'e') => {
-            SqliteValue::Text(SmallText::from_arc_bytes(b))
+            SqliteValue::Text(blob_to_text_via_db_encoding(b, text_encoding))
         }
         (other, _) => other,
     };
@@ -19592,10 +19616,16 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
         }),
         b'B' | b'b' => {
             // C SQLite changes the storage-class tag without validating or
-            // replacing the BLOB payload. SmallText retains invalid UTF-8 in
-            // its byte-preserving raw representation.
+            // replacing the BLOB payload. On a UTF-8 DB the bytes are retained
+            // verbatim (byte-preserving raw representation for invalid UTF-8);
+            // on a UTF-16 DB the blob is byte-RELABELED as native UTF-16 —
+            // decoded per the DB encoding, dropping an odd trailing byte
+            // (bd-f3s2l), matching stock's per-value encoding tag rather than a
+            // canonical-UTF-8 transcode.
             match val {
-                SqliteValue::Blob(b) => SqliteValue::Text(SmallText::from_arc_bytes(b)),
+                SqliteValue::Blob(b) => {
+                    SqliteValue::Text(blob_to_text_via_db_encoding(b, text_encoding))
+                }
                 other => SqliteValue::Text(other.to_text().into()),
             }
         }

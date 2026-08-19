@@ -30,32 +30,33 @@
 //! the divergence is not about "invalid TEXT sequences" and is not a lossy-
 //! translation substitution-boundary issue. The bead premise is **refuted**.
 //!
-//! ## True root cause (out of scope for this residual)
+//! ## Root cause and the fix (bd-f3s2l — the encoding-model gap is now CLOSED)
 //!
 //! FrankenSQLite normalizes every TEXT value to canonical UTF-8 / raw-bytes with
 //! NO per-value encoding tag, and applies the database encoding only at the
-//! storage boundary. So `CAST(blob AS TEXT)` interprets the bytes as canonical
-//! UTF-8 and later transcodes to UTF-16 on store. Stock instead relabels the
-//! bytes as already-UTF-16. Matching stock would require either a per-value
-//! encoding tag (the architectural limitation of the original GH#180, mirrored in
-//! the UTF-16 direction) OR a scoped change to the VDBE `sql_cast` BLOB->TEXT arm
-//! (`fsqlite-vdbe/src/engine.rs`) so that, on a non-UTF-8 database, it decodes the
-//! blob via the DB encoding (`SmallText::from_record_text_bytes(bytes, db_enc)`)
-//! rather than `from_arc_bytes` (canonical UTF-8). The prescribed
-//! transcode-site U+FFFD substitution would NOT reproduce the oracle (it would
-//! yield `8000`/`FDFF`, not stock's ""/`C0AF`) and risks regressing the
-//! byte-preserving raw representation, so it is deliberately NOT applied.
+//! storage boundary. So `CAST(blob AS TEXT)` used to interpret the bytes as
+//! canonical UTF-8 and later transcode to UTF-16 on store, where stock instead
+//! relabels the bytes as already-UTF-16. bd-f3s2l applies the scoped fix: on a
+//! non-UTF-8 database the two cast choke points — the VDBE `sql_cast` BLOB->TEXT
+//! arm (`fsqlite-vdbe/src/engine.rs`) and the interpreted `apply_cast`
+//! (`fsqlite-core/src/connection.rs`) — decode the blob via the DB encoding
+//! (`SmallText::from_record_text_bytes(bytes, db_enc)`, an odd trailing byte
+//! dropped, lone surrogates -> U+FFFD) rather than `from_arc_bytes` (canonical
+//! UTF-8). On a UTF-8 database both keep the byte-preserving `from_arc_bytes`
+//! path, so the 84ebdf4b3 raw-byte guarantee is untouched. (The prescribed
+//! transcode-site U+FFFD substitution was NOT the fix — it would have yielded
+//! `8000`/`FDFF`, not stock's ""/`C0AF`, and would have regressed the
+//! byte-preserving raw representation.)
 //!
 //! ## What this file guards
 //!
 //! * `utf8_control_byte_preservation` — ACTIVE parity guard: the 84ebdf4b3
 //!   byte-preserving path (default UTF-8 DB) must keep the exact invalid bytes and
 //!   must never reintroduce U+FFFD. FrankenSQLite matches stock byte-for-byte.
-//! * `utf16{le,be}_documents_cast_relabel_divergence` — ACTIVE characterization:
-//!   pins stock's byte-relabel oracle AND FrankenSQLite's current transcode
-//!   output, and asserts they differ. If future architectural work aligns
-//!   `CAST(blob AS TEXT)` with stock, these fire and must be updated to parity —
-//!   the correct signal that the encoding-model gap has closed.
+//! * `utf16{le,be}_cast_relabel_parity` — ACTIVE parity guard (bd-f3s2l): a UTF-16
+//!   database's `CAST(blob AS TEXT)` now byte-relabels exactly like stock, so
+//!   FrankenSQLite's stored image matches the stock oracle byte-for-byte. If this
+//!   regresses (a transcode reappears), these fire.
 
 use fsqlite_core::connection::Connection;
 
@@ -181,9 +182,9 @@ fn cases_index(name: &str) -> usize {
     CASES.iter().position(|(n, _)| *n == name).expect("known case")
 }
 
-/// ACTIVE characterization of the UTF-16LE divergence (bd-p9nhq refutation).
+/// ACTIVE parity guard (bd-f3s2l): UTF-16LE `CAST(blob AS TEXT)` byte-relabel.
 #[test]
-fn utf16le_documents_cast_relabel_divergence() {
+fn utf16le_cast_relabel_parity() {
     asupersync::test_utils::run_test(|| async {
         let (oracle, frank_via_stock) = run_pair(Some("UTF-16le"), 2).await;
 
@@ -205,35 +206,18 @@ fn utf16le_documents_cast_relabel_divergence() {
             );
         }
 
-        // Frank = canonical-UTF-8 interpretation then UTF-8 -> UTF-16LE transcode
-        // (from_utf8_lossy for invalid bytes: one U+FFFD => FDFF per subpart).
-        let expected_frank = [
-            ("ascii_A_41", "4100"),
-            ("ascii_AB_4142", "41004200"),
-            ("valid_u2002_e28082", "0220"),
-            ("valid_u0080_c280", "8000"),
-            ("invalid_bare_cont_80", "FDFF"),
-            ("invalid_overlong_c0af", "FDFFFDFF"),
-            ("invalid_surrogate_eda080", "FDFFFDFFFDFF"),
-            ("invalid_overlong4_f08080af", "FDFFFDFFFDFFFDFF"),
-        ];
-        for (name, want) in expected_frank {
-            assert_eq!(
-                frank_via_stock[cases_index(name)], want,
-                "frank UTF-16le transcode for {name}"
-            );
-        }
-
-        assert_ne!(
+        // bd-f3s2l: FrankenSQLite now byte-relabels identically — its stored image
+        // matches the stock oracle byte-for-byte (odd trailing byte dropped).
+        assert_eq!(
             frank_via_stock, oracle,
-            "KNOWN GAP (bd-p9nhq): CAST(blob AS TEXT) byte-relabel vs canonical-UTF-8 transcode"
+            "bd-f3s2l: CAST(blob AS TEXT) must byte-relabel like stock in a UTF-16le DB"
         );
     });
 }
 
-/// ACTIVE characterization of the UTF-16BE divergence (bd-p9nhq refutation).
+/// ACTIVE parity guard (bd-f3s2l): UTF-16BE `CAST(blob AS TEXT)` byte-relabel.
 #[test]
-fn utf16be_documents_cast_relabel_divergence() {
+fn utf16be_cast_relabel_parity() {
     asupersync::test_utils::run_test(|| async {
         let (oracle, frank_via_stock) = run_pair(Some("UTF-16be"), 3).await;
 
@@ -254,26 +238,9 @@ fn utf16be_documents_cast_relabel_divergence() {
             );
         }
 
-        let expected_frank = [
-            ("ascii_A_41", "0041"),
-            ("ascii_AB_4142", "00410042"),
-            ("valid_u2002_e28082", "2002"),
-            ("valid_u0080_c280", "0080"),
-            ("invalid_bare_cont_80", "FFFD"),
-            ("invalid_overlong_c0af", "FFFDFFFD"),
-            ("invalid_surrogate_eda080", "FFFDFFFDFFFD"),
-            ("invalid_overlong4_f08080af", "FFFDFFFDFFFDFFFD"),
-        ];
-        for (name, want) in expected_frank {
-            assert_eq!(
-                frank_via_stock[cases_index(name)], want,
-                "frank UTF-16be transcode for {name}"
-            );
-        }
-
-        assert_ne!(
+        assert_eq!(
             frank_via_stock, oracle,
-            "KNOWN GAP (bd-p9nhq): CAST(blob AS TEXT) byte-relabel vs canonical-UTF-8 transcode"
+            "bd-f3s2l: CAST(blob AS TEXT) must byte-relabel like stock in a UTF-16be DB"
         );
     });
 }

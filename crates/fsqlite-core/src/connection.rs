@@ -137941,10 +137941,48 @@ fn parse_float_prefix(s: &str) -> f64 {
 
 /// Apply a CAST to a value based on the target type name.
 #[allow(clippy::cast_possible_truncation)]
+/// Relabel a BLOB's raw bytes as a TEXT value using the database text encoding,
+/// the interpreted-evaluator twin of the VDBE `sql_cast` blob→text arm
+/// (bd-f3s2l). UTF-8 preserves the bytes verbatim and retains the `Arc`;
+/// UTF-16LE/BE decodes 16-bit code units (odd trailing byte dropped, lone
+/// surrogates → U+FFFD) — a pure byte-relabel matching stock's per-value
+/// encoding tag, not a canonical-UTF-8 transcode.
+fn blob_cast_text(bytes: std::sync::Arc<[u8]>, encoding: TextEncoding) -> fsqlite_types::SmallText {
+    match encoding {
+        TextEncoding::Utf8 => fsqlite_types::SmallText::from_arc_bytes(bytes),
+        TextEncoding::Utf16le | TextEncoding::Utf16be => {
+            fsqlite_types::SmallText::from_record_text_bytes(&bytes, encoding)
+        }
+    }
+}
+
+/// Blob→text relabel for the numeric CAST arms: yields the decoded characters a
+/// numeric prefix parse consumes. On a UTF-8 DB this keeps the historical
+/// `from_utf8_lossy` behavior byte-for-byte; on a UTF-16 DB the raw bytes are
+/// decoded as UTF-16 first (bd-f3s2l), matching stock's relabel-then-parse.
+fn blob_cast_text_string(bytes: &[u8], encoding: TextEncoding) -> String {
+    match encoding {
+        TextEncoding::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+        TextEncoding::Utf16le | TextEncoding::Utf16be => {
+            fsqlite_types::SmallText::from_record_text_bytes(bytes, encoding)
+                .as_str()
+                .to_owned()
+        }
+    }
+}
+
 fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
     if val.is_null() {
         return SqliteValue::Null;
     }
+    // bd-f3s2l: a blob-to-text cast RELABELS the raw bytes as TEXT in the
+    // DATABASE encoding (stock's per-value encoding tag), not as canonical
+    // UTF-8. On a UTF-16 DB the bytes are decoded as UTF-16 (odd trailing byte
+    // dropped); on a UTF-8 DB the bytes are preserved verbatim. The DB encoding
+    // for the executing statement is projected onto this thread by
+    // `sync_change_tracking_context` (mirrors the VDBE `sql_cast` fix, which
+    // reads the engine's own `text_encoding`).
+    let db_encoding = statement_text_encoding();
     // Use SQLite affinity rules (substring matching, priority order)
     // to determine target type: INT > TEXT/CHAR/CLOB > BLOB > REAL/FLOA/DOUB > NUMERIC
     let upper = type_name.to_ascii_uppercase();
@@ -137954,15 +137992,14 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
             SqliteValue::Float(f) => SqliteValue::Integer(f as i64),
             SqliteValue::Text(ref s) => SqliteValue::Integer(parse_integer_prefix(s)),
             SqliteValue::Blob(ref b) => {
-                let s = String::from_utf8_lossy(b);
-                SqliteValue::Integer(parse_integer_prefix(&s))
+                SqliteValue::Integer(parse_integer_prefix(&blob_cast_text_string(b, db_encoding)))
             }
             SqliteValue::Null => SqliteValue::Null,
         }
     } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
         match val {
             SqliteValue::Blob(bytes) => {
-                SqliteValue::Text(fsqlite_types::SmallText::from_arc_bytes(bytes))
+                SqliteValue::Text(blob_cast_text(bytes, db_encoding))
             }
             other => SqliteValue::Text(other.to_text().into()),
         }
@@ -137984,8 +138021,7 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
                 SqliteValue::Float(if f.is_finite() { f } else { 0.0 })
             }
             SqliteValue::Blob(ref b) => {
-                let s = String::from_utf8_lossy(b);
-                let f = parse_float_prefix(&s);
+                let f = parse_float_prefix(&blob_cast_text_string(b, db_encoding));
                 SqliteValue::Float(if f.is_finite() { f } else { 0.0 })
             }
             SqliteValue::Null => SqliteValue::Null,
