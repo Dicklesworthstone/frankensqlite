@@ -1603,8 +1603,22 @@ impl TransactionManager {
                     .get(force.saturating_sub(1))
                     .map(|w| w.commit_seq.get())
                 {
+                    // bd-stujd: arm the conservative pivot watermark at exactly
+                    // the highest lost `commit_seq`, NOT one past it. A live txn
+                    // overlaps a witness iff `begin < commit_seq` (strict; see the
+                    // retention comment above), so a txn beginning AT the lost
+                    // commit_seq did not overlap it and must not be pivoted. The
+                    // former `+1` poisoned txns that begin exactly at the
+                    // watermark: read-only witnesses publish at
+                    // `commit_seq = watermark` without advancing it, so their
+                    // pileup force-evicted at `commit_seq = W` and armed
+                    // `lost_below = W+1 > watermark` — after which every new
+                    // writer (begin == W < W+1) was force-pivoted and aborted
+                    // forever (the watermark only advances on a writer commit, so
+                    // it never healed). Since `highest_lost <= watermark` always,
+                    // arming at `highest_lost` keeps `lost_below <= watermark`.
                     self.ssi_witness_lost_below
-                        .fetch_max(highest_lost.saturating_add(1), Ordering::AcqRel);
+                        .fetch_max(highest_lost, Ordering::AcqRel);
                 }
                 committed.drain(0..force);
                 tracing::warn!(
@@ -1749,15 +1763,23 @@ impl TransactionManager {
         txn.has_in_rw |= !in_edges.is_empty();
         txn.has_out_rw |= !out_edges.is_empty();
 
-        // bd-cht52 (M1): if the hard-cap force-evicted a committed witness this
-        // txn could have overlapped (its begin_seq predates the lost witness's
-        // commit_seq), an rw-edge may be undiscoverable. Treat it as a dangerous
-        // pivot on both sides so the Step-1 check aborts it, never permitting an
-        // unvalidated write-skew commit.
+        // bd-cht52 (M1) / bd-stujd: if the hard-cap force-evicted a committed
+        // witness this txn could have overlapped (its begin_seq strictly predates
+        // the lost witness's commit_seq), an rw-edge may be undiscoverable, so
+        // treat it conservatively.
         let lost_below = self.ssi_witness_lost_below.load(Ordering::Acquire);
         if lost_below != 0 && begin_seq.get() < lost_below {
+            // A lost witness might have READ a key this txn writes (an
+            // undiscoverable INCOMING rw-edge), so this txn is conservatively an
+            // in-rw target regardless of its own reads.
             txn.has_in_rw = true;
-            txn.has_out_rw = true;
+            // It might also have WRITTEN a key this txn read (an undiscoverable
+            // OUTGOING rw-edge) — but only if this txn actually read something. A
+            // read-free writer has no outgoing rw-antidependency and thus can
+            // never be the SSI pivot; forcing has_out_rw on it would abort a
+            // disjoint read-free writer, violating the core concurrent-writer
+            // invariant that such writers never conflict (bd-stujd).
+            txn.has_out_rw |= !read_keys.is_empty();
         }
     }
 
@@ -5440,6 +5462,61 @@ mod tests {
             "dangerous rw-rw structure must abort"
         );
         assert_eq!(pivot.state, TransactionState::Aborted);
+    }
+
+    /// bd-stujd regression: a pileup of overlapping READ-ONLY concurrent commits
+    /// publishes witnesses at `commit_seq == watermark` without ever advancing
+    /// the watermark. Once the committed-witness ring hits its hard cap
+    /// (`SSI_COMMITTED_WITNESS_CAP * 4`) and force-evicts, the conservative pivot
+    /// watermark must NOT be armed above the live watermark — otherwise every
+    /// future writer (which begins at the stable watermark) is force-pivoted and
+    /// aborts `BusySnapshot` forever, since only a writer commit can advance the
+    /// watermark. Brand-new, fully disjoint, read-free writers must still commit.
+    #[test]
+    fn test_bd_stujd_ro_witness_pileup_does_not_livelock_disjoint_writers() {
+        let m = mgr();
+        let p1 = PageNumber::new(1).unwrap();
+
+        // Seed one committed write so the watermark W > 0.
+        let mut setup = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut setup, p1, test_data(0x01)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        // Overlapping read-only concurrent txns, keeping one live at all times so
+        // `min_live_begin` stays == W and no witness is ever "safe" to drop. Run
+        // more than the hard cap (SSI_COMMITTED_WITNESS_CAP * 4 = 1024) to force
+        // an eviction of witnesses all sitting at `commit_seq == W`.
+        let mut prev = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut prev, p1).unwrap();
+        for i in 0..1200u32 {
+            let mut next = m.begin(BeginKind::Concurrent).unwrap();
+            let _ = m.read_page(&mut next, p1).unwrap();
+            // Commit the OLDER one; `next` stays live, pinning the floor at W.
+            m.commit(&mut prev)
+                .unwrap_or_else(|e| panic!("read-only commit {i} must succeed, got {e:?}"));
+            prev = next;
+        }
+        m.commit(&mut prev).unwrap();
+
+        // No txns are live now. Ten brand-new, completely disjoint writers (each
+        // writes a page nobody has ever read or written, and reads nothing) must
+        // ALL commit. Before the fix, `lost_below` was armed one past the
+        // watermark, so every one of these force-pivoted and aborted forever.
+        for i in 0..10u32 {
+            let mut w = m.begin(BeginKind::Concurrent).unwrap();
+            let fresh = PageNumber::new(50_000 + i).unwrap();
+            m.write_page(&mut w, fresh, test_data(0x77)).unwrap();
+            let seq = m.commit(&mut w).unwrap_or_else(|e| {
+                panic!(
+                    "disjoint read-free writer {i} must commit after a read-only witness \
+                     pileup (bd-stujd), got {e:?}"
+                )
+            });
+            assert!(
+                seq > CommitSeq::ZERO,
+                "disjoint writer {i} must receive a real commit sequence"
+            );
+        }
     }
 
     #[test]
