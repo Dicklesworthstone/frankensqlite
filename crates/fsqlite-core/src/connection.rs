@@ -119651,10 +119651,13 @@ fn and_operand_is_literal_integer_zero(expr: &Expr) -> bool {
 ///    still name/aggregate-resolves that dead branch and raises `no such column` /
 ///    `misuse of aggregate`, so it must reach resolution unfolded.
 fn and_pair_folds_never_true(left: &Expr, right: &Expr) -> bool {
+    fn never_true_beside_subquery(dead: &Expr, sibling: &Expr) -> bool {
+        and_operand_is_constant_never_true(dead) && expr_has_any_subquery(sibling)
+    }
     and_operand_is_literal_integer_zero(left)
         || and_operand_is_literal_integer_zero(right)
-        || (and_operand_is_constant_never_true(left) && expr_has_any_subquery(right))
-        || (and_operand_is_constant_never_true(right) && expr_has_any_subquery(left))
+        || never_true_beside_subquery(left, right)
+        || never_true_beside_subquery(right, left)
 }
 
 /// In a FILTER context (WHERE / HAVING / JOIN-ON), fold every `X AND Y`
@@ -165256,7 +165259,7 @@ mod tests {
                         let mut when_expected: Option<bool> = Some(is_and);
                         for &name in &chain {
                             match (is_and, name) {
-                                (true, 'F') | (true, 'N') => {
+                                (true, 'F' | 'N') => {
                                     when_expected = Some(false);
                                     break;
                                 }
@@ -169280,10 +169283,10 @@ mod tests {
                     let sqlite = rusqlite::Connection::open(&db_path).unwrap();
                     sqlite
                         .execute_batch(&format!(
-                            r#"PRAGMA encoding = '{encoding}';
+                            r"PRAGMA encoding = '{encoding}';
                                CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT);
                                CREATE INDEX idx_name ON items(name);
-                               INSERT INTO items VALUES (1, 'Καλημέρα'), (2, 'café'), (3, '日本');"#
+                               INSERT INTO items VALUES (1, 'Καλημέρα'), (2, 'café'), (3, '日本');"
                         ))
                         .unwrap();
                 }
@@ -169476,9 +169479,9 @@ mod tests {
                     let sqlite = rusqlite::Connection::open(&db_path).unwrap();
                     sqlite
                         .execute_batch(&format!(
-                            r#"PRAGMA encoding = '{encoding}';
+                            r"PRAGMA encoding = '{encoding}';
                                CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT);
-                               INSERT INTO items VALUES (1, 'café');"#
+                               INSERT INTO items VALUES (1, 'café');"
                         ))
                         .unwrap();
                 }
