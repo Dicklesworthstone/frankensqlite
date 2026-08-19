@@ -414,6 +414,17 @@ pub trait PageWriter: PageReader {
         cx: &'a Cx,
         page_no: PageNumber,
     ) -> impl Future<Output = Result<()>> + 'a;
+    /// Drop a just-freed page's cached buffer from the page pool.
+    ///
+    /// Default is a no-op. The teardown path ([`BtCursor::free_subtree_pages`])
+    /// calls this after freeing each page so a large DROP does not retain the
+    /// whole b-tree (and its overflow chains) in the page cache and exhaust the
+    /// buffer pool (bd-pirr5, GH#371). Implementations backed by a shared page
+    /// cache override it to evict the buffer; the page is already on the freelist
+    /// and is re-read fresh if it is re-allocated, so this only bounds resident
+    /// memory and never affects correctness. Kept out of `free_page` so normal
+    /// (non-teardown) frees do not perturb the concurrent-writer cache.
+    fn forget_page(&mut self, _page_no: PageNumber) {}
     /// Record a granular write witness for fine-grained SSI.
     fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey);
 }
@@ -550,6 +561,10 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
         page_no: PageNumber,
     ) -> impl Future<Output = Result<()>> + 'a {
         self.txn.free_page(cx, page_no)
+    }
+
+    fn forget_page(&mut self, page_no: PageNumber) {
+        self.txn.forget_cached_page(page_no);
     }
 
     fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
@@ -5485,6 +5500,10 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             self.pager.free_page(cx, current_page).await?;
+            // bd-pirr5 (GH#371): drop the just-freed page's buffer from the pool
+            // so tearing down a large (e.g. WITHOUT ROWID) table does not retain
+            // the whole b-tree in the page cache and exhaust the buffer pool.
+            self.pager.forget_page(current_page);
         }
         Ok(())
     }
@@ -6381,6 +6400,10 @@ impl<P: PageWriter> BtCursor<P> {
                 u32::from_be_bytes([page_bytes[0], page_bytes[1], page_bytes[2], page_bytes[3]]);
             current = PageNumber::new(next);
             self.pager.free_page(&cleanup_cx, pgno).await?;
+            // bd-pirr5 (GH#371): drop overflow pages from the pool as they are
+            // freed too, so a large-value teardown stays within a bounded working
+            // set (overflow pages dominate the size of the fts_messages case).
+            self.pager.forget_page(pgno);
         }
 
         Ok(())
