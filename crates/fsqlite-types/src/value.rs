@@ -2279,6 +2279,48 @@ fn trim_sqlite_float_tail(out: &mut String) {
     }
 }
 
+/// The full-precision significant digits SQLite's `%!` (alt-form-2) float
+/// rendering draws from (bd-ixizz).
+///
+/// This is the exact double TRUNCATED to its value-dependent cap of 18
+/// significant digits (19 when `|f| >= 1e18`) — the digit sequence stock's
+/// `sqlite3FpDecode` (printf.c) produces at maximum precision: it scales `|f|`
+/// into `[1e17, 1e19)` and TRUNCATES to the integer `v = (u64)rr`, giving
+/// exactly 18 or 19 significant digits. e.g. `2.0/3.0` ->
+/// `("666666666666666629", -1)` (stock `%!.40e` = `6.66666666666666629e-01`);
+/// `1e300` -> `("1000000000000000052", 300)`.
+///
+/// The returned digits are NOT trailing-zero-stripped — the caller emits
+/// `min(requested + 1, digits.len())` of them (ROUNDING when below the cap,
+/// these exact digits AT the cap) and strips trailing zeros itself. `exponent`
+/// is the power-of-ten of the first digit (scientific-notation exponent):
+/// value ≈ `digits[0].digits[1..] × 10^exponent`. NaN/∞/0 return `(vec![b'0'], 0)`.
+#[must_use]
+pub fn sqlite_float_altform2_digits(f: f64) -> (Vec<u8>, i32) {
+    if !f.is_finite() || f == 0.0 {
+        return (vec![b'0'], 0);
+    }
+    let r = f.abs();
+    // Rust's fixed-precision float formatter is itself exact: an f64's decimal
+    // expansion is finite, so a high enough precision reproduces the true
+    // leading digits (rounding only perturbs digits far past our 18-19 cap).
+    // Render 41 significant digits and TRUNCATE at the cap — matching stock's
+    // `(u64)rr` truncation without porting the double-double scaler.
+    let rendered = format!("{r:.40e}");
+    let (mantissa_part, exp_part) = rendered
+        .split_once('e')
+        .expect("Rust scientific formatting always emits an exponent");
+    let exponent: i32 = exp_part
+        .parse()
+        .expect("Rust scientific exponent is a decimal integer");
+    let mut digits: Vec<u8> = mantissa_part.bytes().filter(|&b| b != b'.').collect();
+    // 18 significant digits normally; 19 when the value is >= 1e18 (the wider
+    // `[1e18, 1e19)` landing zone of stock's scaling loop).
+    let target = if exponent >= 18 { 19 } else { 18 };
+    digits.truncate(target);
+    (digits, exponent)
+}
+
 fn sqlite_float_decode(f: f64) -> SqliteFloatDecode {
     let negative = f < 0.0;
     let r = if negative { -f } else { f };
@@ -4198,6 +4240,36 @@ mod tests {
     }
 
     // ── format_sqlite_float ────────────────────────────────────────────
+
+    #[test]
+    fn test_sqlite_float_altform2_digits_matches_stock_bd_ixizz() {
+        // Oracle: sqlite3 3.46.1 printf('%!.40e', X) — the value-dependent full
+        // precision, TRUNCATED (not rounded to the round-trip 17).
+        fn check(f: f64, digits: &str, exp: i32) {
+            let (d, e) = super::sqlite_float_altform2_digits(f);
+            assert_eq!(
+                (String::from_utf8(d).unwrap().as_str(), e),
+                (digits, exp),
+                "sqlite_float_altform2_digits({f})"
+            );
+        }
+        // 6.66666666666666629e-01 (18 sig, truncated: ...629 not ...630).
+        check(2.0 / 3.0, "666666666666666629", -1);
+        // 3.33333333333333314e-01 (18).
+        check(1.0 / 3.0, "333333333333333314", -1);
+        // 1.00000000000000005e-01 (18).
+        check(0.1, "100000000000000005", -1);
+        // 1.42857142857142849e-01 (18).
+        check(1.0 / 7.0, "142857142857142849", -1);
+        // 1.000000000000000052e+300 (19 — larger exponent needs more digits).
+        check(1e300, "1000000000000000052", 300);
+        // Exact short values: the FULL cap-length digits (18) with the exact
+        // trailing zeros — the caller strips them, not this helper.
+        check(2.5, "250000000000000000", 0);
+        check(5.0, "500000000000000000", 0);
+        check(100.0, "100000000000000000", 2);
+        check(0.5, "500000000000000000", -1);
+    }
 
     #[test]
     fn test_format_sqlite_float_whole_number() {
