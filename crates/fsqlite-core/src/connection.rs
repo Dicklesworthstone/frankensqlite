@@ -66251,6 +66251,7 @@ impl Connection {
         Ok(is_sqlite_truthy(&predicate_value))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_expected_index_key_for_integrity(
         table: &TableSchema,
         index_name: &str,
@@ -66259,6 +66260,7 @@ impl Connection {
         column_positions: &[usize],
         key_expressions: &[Expr],
         rowid_alias_col_idx: Option<usize>,
+        encoding: TextEncoding,
     ) -> Result<Vec<u8>> {
         let mut key_values = Vec::with_capacity(
             column_positions
@@ -66307,7 +66309,11 @@ impl Connection {
             }
         }
         key_values.push(SqliteValue::Integer(rowid));
-        Ok(serialize_record(&key_values))
+        // Serialize with the database text encoding so the recomputed key
+        // byte-matches the stored index key the store wrote in the same
+        // encoding (bd-7c6g7.6). `TextEncoding::Utf8` is byte-for-byte
+        // identical to `serialize_record`, so the UTF-8 path is unchanged.
+        Ok(serialize_record_with_encoding(&key_values, encoding))
     }
 
     fn compare_index_key_values_for_integrity(
@@ -67253,13 +67259,25 @@ impl Connection {
                     loop {
                         let rowid = cursor.rowid(cx).await?;
                         let payload = cursor.payload(cx).await?;
-                        let values = parse_record(&payload).ok_or_else(|| {
-                            FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "table `{}` rowid {rowid} payload is not a valid SQLite record",
-                                    table.name
-                                ),
-                            }
+                        // Decode the table row with the database text encoding
+                        // (bd-7c6g7.6). A UTF-8-hardcoded decode leaves TEXT
+                        // columns of a UTF-16 database as raw byte-preserving
+                        // strings; a plain-column index key round-trips those
+                        // opaque bytes byte-for-byte, but an EXPRESSION index
+                        // (e.g. `lower(y)`) evaluates against the mis-decoded
+                        // lossy string and re-serializes it as UTF-8, diverging
+                        // from the UTF-16 key the store wrote and false-flagging
+                        // corruption. Decoding here yields canonical text so the
+                        // expected key encodes back to the stored bytes.
+                        let values = parse_record_with_encoding(
+                            &payload,
+                            self.db_text_encoding.get(),
+                        )
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                                table.name
+                            ),
                         })?;
                         if !quick && values.len() > max_payload_columns {
                             return Err(FrankenError::DatabaseCorrupt {
@@ -67333,6 +67351,7 @@ impl Connection {
                                             &index_spec.positions,
                                             &index_spec.key_expressions,
                                             rowid_alias_col_idx,
+                                            self.db_text_encoding.get(),
                                         )
                                     },
                                 )?;
@@ -67402,6 +67421,20 @@ impl Connection {
                     if cursor.first(cx).await? {
                         loop {
                             let payload = cursor.payload(cx).await?;
+                            // Decode stored index keys for the ORDER comparison
+                            // with the UTF-8-hardcoded `parse_record` on purpose
+                            // (do NOT thread the DB text encoding here). SQLite's
+                            // BINARY collation orders TEXT by the *stored encoded
+                            // bytes*: on a UTF-16LE database that is UTF-16LE byte
+                            // order, which diverges from code-point order for
+                            // characters above U+00FF (e.g. U+03A9 `Ω` = LE bytes
+                            // A9 03 sorts before U+00C0 `À` = C0 00). Decoding to
+                            // canonical UTF-8 and comparing code points would
+                            // mis-order those keys and false-flag "entries out of
+                            // order". The raw byte-preserving decode compares the
+                            // stored UTF-16 bytes, matching stock. (The residual
+                            // NOCASE-on-UTF-16 order case is tracked separately;
+                            // see the bd-7c6g7 residual bead.)
                             let payload_values = parse_record(&payload).ok_or_else(|| {
                                 FrankenError::DatabaseCorrupt {
                                     detail: format!(
