@@ -422,7 +422,17 @@ impl VersionArena {
     #[inline]
     fn claim_chunk(&self) -> u32 {
         let raw = self.next_chunk.fetch_add(1, Ordering::AcqRel);
-        u32::try_from(raw).expect("arena chunk index overflow")
+        let chunk = u32::try_from(raw).expect("arena chunk index overflow");
+        // An intrusive free-stack slot node packs `(chunk << 12) | offset` into
+        // 32 bits, so a chunk index >= 2^20 overflows the packing and silently
+        // aliases another shard's slot. Fail loudly at the real addressable limit
+        // instead of corrupting the free stack (bd-xv5cm L5). The generic
+        // `u32::try_from` above only catches the far-later 2^32 boundary.
+        assert!(
+            chunk < (1 << 20),
+            "arena chunk index {chunk} exceeds the 2^20 (chunk<<12) addressable limit"
+        );
+        chunk
     }
 
     /// Bump-allocate a fresh `(chunk, offset)` from this writer's cursor shard
