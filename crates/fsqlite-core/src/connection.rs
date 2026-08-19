@@ -66324,6 +66324,22 @@ impl Connection {
         // `partial_cmp` only performs a binary (memcmp) TEXT comparison, which
         // disagrees with the leaf's actual NOCASE/RTRIM/custom ordering
         // (frankensqlite#112).
+        //
+        // UTF-16 encoding invariant (bd-utf16-index-key-order-encoded-byte-npl2p):
+        // the `lhs`/`rhs` values MUST arrive decoded with the byte-preserving
+        // `parse_record` (NOT `parse_record_with_encoding`). On a UTF-16 database
+        // stock SQLite orders BINARY TEXT index keys by their stored encoded-byte
+        // order (UTF-16LE/BE bytes), which diverges from code-point order above
+        // U+00FF. `parse_record` keeps the raw UTF-16 payload bytes and
+        // `SmallText::cmp` falls back to a raw-byte comparison for those
+        // (invalid-UTF-8) bytes, so BINARY here matches BOTH stock's encoded-byte
+        // order AND the B-tree store comparator (`cmp_index_values_collated`),
+        // which decodes the same way — the physical index and the check agree, so
+        // a clean UTF-16 image is not false-flagged. Threading
+        // `parse_record_with_encoding` here would decode to canonical UTF-8 and
+        // compare code points, silently regressing BINARY ordering on UTF-16. A
+        // rusqlite differential keeper pins this:
+        // `tests/bd_npl2p_utf16_index_key_order.rs`.
         let registry = self
             .collation_registry
             .lock()

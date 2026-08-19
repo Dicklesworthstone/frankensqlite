@@ -62,13 +62,13 @@ async fn frank_build(
         .await
         .unwrap();
 
-    for (i, k) in BINARY_ROWS.iter().enumerate() {
-        conn.execute(&format!("INSERT INTO tb VALUES({}, '{}');", i + 1, k))
+    for k in BINARY_ROWS {
+        conn.execute(&format!("INSERT INTO tb(k) VALUES('{k}');"))
             .await
             .unwrap();
     }
-    for (i, k) in NOCASE_ROWS.iter().enumerate() {
-        conn.execute(&format!("INSERT INTO tn VALUES({}, '{}');", i + 1, k))
+    for k in NOCASE_ROWS {
+        conn.execute(&format!("INSERT INTO tn(k) VALUES('{k}');"))
             .await
             .unwrap();
     }
@@ -119,12 +119,12 @@ fn stock_order(encoding: &str) -> (Vec<String>, Vec<String>) {
          CREATE INDEX inc ON tn(k COLLATE NOCASE);",
     )
     .unwrap();
-    for (i, k) in BINARY_ROWS.iter().enumerate() {
-        conn.execute("INSERT INTO tb VALUES(?1, ?2);", rusqlite::params![i as i64 + 1, k])
+    for k in BINARY_ROWS {
+        conn.execute("INSERT INTO tb(k) VALUES(?1);", rusqlite::params![k])
             .unwrap();
     }
-    for (i, k) in NOCASE_ROWS.iter().enumerate() {
-        conn.execute("INSERT INTO tn VALUES(?1, ?2);", rusqlite::params![i as i64 + 1, k])
+    for k in NOCASE_ROWS {
+        conn.execute("INSERT INTO tn(k) VALUES(?1);", rusqlite::params![k])
             .unwrap();
     }
     // Confirm the oracle really is UTF-16.
