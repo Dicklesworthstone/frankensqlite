@@ -66187,6 +66187,103 @@ impl Connection {
         Ok(count)
     }
 
+    /// bd-7o1vu (GH#370): names of orphaned `%_content` shadow tables left on
+    /// legacy CONTENTLESS FTS5 tables by an old build.
+    ///
+    /// A `content=''` (contentless) FTS5 table created by a FrankenSQLite version
+    /// that still materialized a `%_content` corpus shadow carries that shadow as
+    /// pure dead weight: at HEAD contentless reads bind persisted segments and
+    /// never touch `_content`, `CREATE` no longer makes it, and `VACUUM` will not
+    /// remove it. Because the shadow is otherwise a well-formed table it stays
+    /// `integrity_check`-CLEAN, so the orphan is invisible until enumerated here.
+    ///
+    /// Detection mirrors [`Self::rootpage_zero_fts5_has_internal_content_shadow`]:
+    /// a vtab is contentless exactly when its CREATE args carry `content=''`
+    /// (`virtual_table_option_value(..) == Some("")`), as distinct from the
+    /// default/absent option (`None`, which OWNS a real corpus shadow) and from
+    /// external content (`content='src'`). Only such a vtab's own,
+    /// exactly-named `<name>_content` shadow is reported — never a user table
+    /// that merely resembles the suffix but is owned by no contentless FTS5
+    /// vtab (see `test_drop_materialized_virtual_table_preserves_shadow_named_user_tables`).
+    pub(crate) fn orphaned_fts5_content_shadow_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let ddl = self.original_ddl_sql.borrow();
+        for (name_lc, create_sql) in ddl.iter() {
+            let Ok(Statement::CreateVirtualTable(stmt)) = parse_single_statement(create_sql) else {
+                continue;
+            };
+            if !stmt.module.eq_ignore_ascii_case("fts5") {
+                continue;
+            }
+            // `content=''` == contentless. `Some("")` is an EMPTY value, distinct
+            // from `None` (default; the vtab OWNS a real corpus shadow) and from
+            // `Some("src")` (external content living in another table).
+            if virtual_table_option_value(&stmt.args, "content").as_deref() != Some("") {
+                continue;
+            }
+            // Resolve the vtab's actual (case-preserving) catalog name so the
+            // `_content` suffix is formed against the real name.
+            let schema = self.schema.borrow();
+            let Some(vtab_name) = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(name_lc))
+                .map(|table| table.name.clone())
+            else {
+                continue;
+            };
+            let content_shadow = format!("{vtab_name}_content");
+            let exists = schema
+                .iter()
+                .any(|table| table.name.eq_ignore_ascii_case(&content_shadow));
+            // The `_content` name existing is necessary but NOT sufficient: it
+            // must carry the genuine fts5 internal-content shadow shape, never a
+            // leftover/user table that merely shares the suffix. See
+            // `ddl_matches_fts5_internal_content_shadow` and
+            // `test_reopen_duplicate_fts5_rootpage_zero_allows_authoritative_repair`.
+            if exists
+                && ddl
+                    .get(&content_shadow.to_ascii_lowercase())
+                    .is_some_and(|content_sql| ddl_matches_fts5_internal_content_shadow(content_sql))
+            {
+                names.push(content_shadow);
+            }
+        }
+        names
+    }
+
+    /// bd-7o1vu (GH#370): reclaim (drop) the orphaned `%_content` shadows a legacy
+    /// build left on contentless FTS5 tables. Returns the dropped shadow names.
+    ///
+    /// **DESTRUCTIVE.** This is only ever invoked from the one-time first-open
+    /// migration (`crate::migration::run_first_open_migration`), after the
+    /// pre-migration backup of the original database has been taken.
+    ///
+    /// SAFETY: the victims are exactly [`Self::orphaned_fts5_content_shadow_names`]
+    /// — a genuinely contentless fts5 vtab's own `<name>_content`, never a user
+    /// table that merely resembles a shadow suffix. Each drop reuses the SAME
+    /// primitive `DROP VIRTUAL TABLE` cascades its shadow cleanup through:
+    /// [`Self::execute_drop`] on a bare-table `DropStatement` (see the
+    /// `pending_shadow_drops` re-entry in [`Self::execute_drop`]). Because the
+    /// shadow is a plain, real-root-page table, `execute_drop_single` frees its
+    /// b-tree pages back to the freelist and removes its `sqlite_master` row
+    /// exactly as the `%_data`/`%_idx` shadows are dropped on a real
+    /// `DROP VIRTUAL TABLE`. Each drop is its own atomic commit, so an
+    /// interruption leaves the database at a valid inter-commit state.
+    pub(crate) async fn reclaim_orphaned_fts5_content_shadows(&self) -> Result<Vec<String>> {
+        let victims = self.orphaned_fts5_content_shadow_names();
+        let mut dropped = Vec::with_capacity(victims.len());
+        for content_shadow in victims {
+            let drop_stmt = fsqlite_ast::DropStatement {
+                object_type: DropObjectType::Table,
+                if_exists: true,
+                name: fsqlite_ast::QualifiedName::bare(content_shadow.clone()),
+            };
+            self.execute_drop(&drop_stmt).await?;
+            dropped.push(content_shadow);
+        }
+        Ok(dropped)
+    }
+
     async fn read_sqlite_master_rows_in_txn(
         cx: &Cx,
         txn: &mut TransactionKind,
@@ -130167,6 +130264,63 @@ fn virtual_table_option_value(args: &[String], option: &str) -> Option<String> {
         } else {
             None
         }
+    })
+}
+
+/// bd-7o1vu (GH#370) SAFETY GUARD: is `sql` the genuine fts5 internal-content
+/// shadow layout, versus a leftover/user table that merely shares the
+/// `_content` suffix?
+///
+/// The fts5 internal-content shadow (see [`fts5_shadow_table_defs`]) is exactly
+/// `CREATE TABLE <x>(id INTEGER PRIMARY KEY, c0, c1, ..., c{n-1})`: a leading
+/// rowid-alias `id INTEGER PRIMARY KEY` followed by TYPELESS, sequentially
+/// `c`-named columns, with no table-level constraints, on a plain rowid table
+/// (not `STRICT`, not `WITHOUT ROWID`). A leftover/user `_content` table that
+/// declares column types (e.g. `c0 TEXT`), uses different names/counts, or adds
+/// constraints does NOT match and is preserved — the exact hazard verified by
+/// `test_reopen_duplicate_fts5_rootpage_zero_allows_authoritative_repair`.
+///
+/// This is deliberately restrictive: when the shape is anything but the
+/// canonical fts5 shadow, we preserve (never drop). A destructive reclaim must
+/// bias toward leaving a user's table alone.
+fn ddl_matches_fts5_internal_content_shadow(sql: &str) -> bool {
+    let Ok(Statement::CreateTable(stmt)) = parse_single_statement(sql) else {
+        return false;
+    };
+    if stmt.without_rowid || stmt.strict {
+        return false;
+    }
+    let CreateTableBody::Columns {
+        columns,
+        constraints,
+    } = &stmt.body
+    else {
+        return false;
+    };
+    if !constraints.is_empty() || columns.len() < 2 {
+        return false;
+    }
+    // Column 0 must be the rowid-alias `id INTEGER PRIMARY KEY`.
+    let id_col = &columns[0];
+    let id_ok = id_col.name.eq_ignore_ascii_case("id")
+        && id_col
+            .type_name
+            .as_ref()
+            .is_some_and(|type_name| type_name.name.eq_ignore_ascii_case("INTEGER"))
+        && id_col
+            .constraints
+            .iter()
+            .any(|constraint| matches!(constraint.kind, ColumnConstraintKind::PrimaryKey { .. }));
+    if !id_ok {
+        return false;
+    }
+    // Columns 1..=N must be `c0`, `c1`, ... — TYPELESS and unconstrained. A user
+    // table's declared column types (the hazard fixture uses `c0 TEXT, c1 TEXT`)
+    // fail here, so the user table is preserved.
+    columns[1..].iter().enumerate().all(|(idx, col)| {
+        col.name.eq_ignore_ascii_case(&format!("c{idx}"))
+            && col.type_name.is_none()
+            && col.constraints.is_empty()
     })
 }
 
