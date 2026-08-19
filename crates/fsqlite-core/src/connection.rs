@@ -76892,6 +76892,16 @@ impl Connection {
                 &minmax_bare_tracking
             {
                 let expected_name = if *is_max { "max" } else { "min" };
+                // bd-89z48: the tracked argument's EFFECTIVE collation — an
+                // explicit `COLLATE` wrapper (`max(name COLLATE NOCASE)`) OR the
+                // column's declared collation (`name TEXT COLLATE NOCASE`), both
+                // resolved by `join_expr_effective_collation`. Used by the
+                // nested-aggregate fallback below so the extremum ROW is selected
+                // under the same collation as the VALUE computed in
+                // `eval_group_agg_join_expr`; the former explicit-only extraction
+                // left a declared-NOCASE column's row on BINARY while its value
+                // used NOCASE (the `Z2` vs `Z1` hybrid).
+                let fallback_collation = join_expr_effective_collation(tracked_arg, &col_map);
                 let (descriptor_index, arg_col, arg_expr, filter, collation) = result_descriptors
                     .iter()
                     .enumerate()
@@ -76923,17 +76933,12 @@ impl Connection {
                     // The nested aggregate is then evaluated within its Plain
                     // expression against that representative row.
                     .unwrap_or_else(|| {
-                        let collation = if let Expr::Collate { collation, .. } = tracked_arg {
-                            Some(collation.as_str())
-                        } else {
-                            None
-                        };
                         (
                             usize::MAX,
                             None,
                             Some(tracked_arg),
                             tracked_filter.as_ref(),
-                            collation,
+                            fallback_collation.as_deref(),
                         )
                     });
 
@@ -106843,6 +106848,41 @@ fn eval_group_agg_join_expr(
                         col_map,
                         &collation_registry,
                     );
+                    // bd-89z48 / bd-9vtbh: a nested min()/max() whose argument
+                    // carries a collation — an explicit `COLLATE` wrapper
+                    // (`max(name COLLATE NOCASE)`) OR the column's declared
+                    // collation (`name TEXT COLLATE NOCASE`), both resolved by
+                    // `join_expr_effective_collation` into `distinct_collation` —
+                    // must select its extremum VALUE under that collation, exactly
+                    // as the group-by extremum-ROW selection does. The shared
+                    // aggregate registry compares only BINARY, so
+                    // `max(name COLLATE NOCASE) || price` used to report the BINARY
+                    // max value ('q') paired with the NOCASE-selected row's other
+                    // columns (price of 'Z') — a self-inconsistent hybrid. Compute
+                    // the collated extremum here with the same strict-comparison
+                    // tie-break as the row site (first occurrence wins ties).
+                    if distinct_collation.is_some() && (func == "min" || func == "max") {
+                        let is_max = func == "max";
+                        let extremum = aggregate_args
+                            .iter()
+                            .filter_map(|values| values.first().cloned())
+                            .filter(|value| !value.is_null())
+                            .reduce(|acc, value| {
+                                let ordering = cmp_sqlite_values_collated_snapshot(
+                                    &value,
+                                    &acc,
+                                    distinct_collation.as_deref(),
+                                    &collation_registry,
+                                );
+                                let take_value = if is_max {
+                                    ordering == std::cmp::Ordering::Greater
+                                } else {
+                                    ordering == std::cmp::Ordering::Less
+                                };
+                                if take_value { value } else { acc }
+                            });
+                        return Ok(extremum.unwrap_or(SqliteValue::Null));
+                    }
                     if let Some(result) = invoke_current_registered_aggregate(
                         &func,
                         &aggregate_args,
