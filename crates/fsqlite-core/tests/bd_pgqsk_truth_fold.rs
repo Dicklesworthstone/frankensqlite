@@ -101,6 +101,45 @@ fn bd_pgqsk_m6_where_never_true_and_short_circuits() {
 }
 
 #[test]
+fn bd_kcvra_never_true_and_does_not_swallow_prepare_errors() {
+    // bd-kcvra regression: the M6 fold must not drop a `<never-true> AND E` dead
+    // branch BEFORE name/aggregate resolution. Stock folds ONLY literal integer 0
+    // pre-resolution; every other never-true constant resolves the dead branch
+    // first and raises `no such column` / `misuse of aggregate` (verified vs
+    // sqlite3 3.46.1). Frank previously folded all of them, silently swallowing
+    // those prepare-time errors.
+    asupersync::test_utils::run_test(|| async {
+        let f = setup_f().await;
+        for lhs in ["NULL", "0.0", "FALSE", "'x'", "''", "+0"] {
+            assert!(
+                f.query(&format!("SELECT 1 FROM t WHERE {lhs} AND nosuchcol"))
+                    .await
+                    .is_err(),
+                "`{lhs} AND nosuchcol` must raise no-such-column, not silently fold"
+            );
+            assert!(
+                f.query(&format!("SELECT 1 FROM t WHERE {lhs} AND max(a)"))
+                    .await
+                    .is_err(),
+                "`{lhs} AND max(a)` must raise misuse-of-aggregate, not silently fold"
+            );
+        }
+        // Control: literal integer 0 IS stock's one pre-resolution fold, so the
+        // dead branch is never resolved and no error is raised (empty result).
+        assert!(
+            f.query("SELECT 1 FROM t WHERE 0 AND nosuchcol")
+                .await
+                .is_ok(),
+            "`0 AND nosuchcol` must fold silently (stock-correct)"
+        );
+        assert!(
+            f.query("SELECT 1 FROM t WHERE 0 AND max(a)").await.is_ok(),
+            "`0 AND max(a)` must fold silently (stock-correct)"
+        );
+    });
+}
+
+#[test]
 fn bd_pgqsk_m6_having_never_true_and_short_circuits() {
     asupersync::test_utils::run_test(|| async {
         let f = setup_f().await;

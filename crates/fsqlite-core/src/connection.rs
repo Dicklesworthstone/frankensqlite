@@ -33864,11 +33864,15 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Select(select) => {
-                // bd-pgqsk M6: fold `<never-true-const> AND E` in the filter
-                // clauses (WHERE/HAVING/JOIN-ON) BEFORE any execution routing, so
-                // an aggregate / GROUP BY shape reaches the right branch with the
-                // dead (possibly erroring) subquery already dropped — the routing
-                // otherwise excludes those shapes from the short-circuit path.
+                // bd-pgqsk M6 / bd-kcvra: fold a never-true filter `AND` in the
+                // clauses (WHERE/HAVING/JOIN-ON) BEFORE execution routing, so an
+                // aggregate / GROUP BY shape reaches the right branch with the
+                // dead branch dropped (e.g. `count(*) WHERE 0 AND E` -> [[0]], not
+                // []). The fold fires for the literal integer `0` OR a never-true
+                // constant whose sibling carries a SUBQUERY; a never-true constant
+                // whose sibling is a bare column / aggregate is left unfolded so it
+                // reaches name/aggregate resolution and raises the same
+                // `no such column` / `misuse of aggregate` stock does (bd-kcvra).
                 let mut folded_select_owner;
                 let select = if select_has_foldable_filter_never_true_and(select) {
                     folded_select_owner = select.clone();
@@ -96989,8 +96993,9 @@ async fn rewrite_in_select_core(
         if let Some(wh) = where_clause.as_mut() {
             // Filter context: fold `<never-true-const> AND E` -> 0 so an erroring
             // subquery in the dead branch is dropped, not eagerly hoisted below
-            // (bd-pgqsk M6). Covers aggregate / GROUP BY shapes too, since it
-            // rewrites the predicate itself rather than gating a routing choice.
+            // (bd-pgqsk M6). Only a never-true constant whose sibling contains a
+            // subquery folds here; a bare column / aggregate sibling is left for
+            // resolution to reject (bd-kcvra). Covers aggregate / GROUP BY shapes.
             fold_never_true_and_in_filter(wh);
             rewrite_in_expr(wh, conn, rewrite_in, params).await?;
         }
@@ -119486,6 +119491,36 @@ fn and_operand_is_constant_never_true(expr: &Expr) -> bool {
     try_fold_constant_value(expr).is_some_and(|value| !is_sqlite_truthy(&value))
 }
 
+/// True ONLY for the bare integer literal `0` — the single never-true constant
+/// stock SQLite folds BEFORE name/aggregate resolution of the other AND operand.
+/// Every other never-true constant (`NULL`, `0.0`, `FALSE`, `'x'`, `+0`, `0*1`,
+/// …) is name/aggregate-resolved first by stock, so a `no such column` /
+/// `misuse of aggregate` in the dead branch is still raised at prepare — matched
+/// empirically vs sqlite3 3.46.1 (bd-kcvra). Deliberately does NOT descend
+/// through unary `+`/`-`, `COLLATE`, or arithmetic: stock errors on
+/// `+0 AND nosuchcol` / `0*1 AND nosuchcol`, so those must not fold here.
+fn and_operand_is_literal_integer_zero(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(Literal::Integer(0), _))
+}
+
+/// Whether a filter-context `left AND right` conjunction folds to constant-false
+/// PRE-execution, matching stock SQLite exactly (bd-pgqsk M6 / bd-kcvra):
+///  - either operand is the bare literal integer `0` — stock's one unconditional
+///    pre-resolution fold (so even `0 AND nosuchcol` is silent); OR
+///  - one operand is a never-true constant (NULL / 0.0 / FALSE / falsy text / +0)
+///    AND its sibling CONTAINS A SUBQUERY. The subquery is dropped so it is not
+///    eagerly materialized (an erroring uncorrelated subquery in a dead branch
+///    must not surface — stock short-circuits it). A never-true constant whose
+///    sibling is a bare column / aggregate is deliberately NOT folded here: stock
+///    still name/aggregate-resolves that dead branch and raises `no such column` /
+///    `misuse of aggregate`, so it must reach resolution unfolded.
+fn and_pair_folds_never_true(left: &Expr, right: &Expr) -> bool {
+    and_operand_is_literal_integer_zero(left)
+        || and_operand_is_literal_integer_zero(right)
+        || (and_operand_is_constant_never_true(left) && expr_has_any_subquery(right))
+        || (and_operand_is_constant_never_true(right) && expr_has_any_subquery(left))
+}
+
 /// In a FILTER context (WHERE / HAVING / JOIN-ON), fold every `X AND Y`
 /// conjunction whose one operand is a constant that can never be TRUE down to the
 /// integer literal `0`. The conjunction can never be TRUE, so the row is filtered
@@ -119509,9 +119544,7 @@ fn fold_never_true_and_in_filter(expr: &mut Expr) {
             let span = *span;
             fold_never_true_and_in_filter(left);
             fold_never_true_and_in_filter(right);
-            if and_operand_is_constant_never_true(left)
-                || and_operand_is_constant_never_true(right)
-            {
+            if and_pair_folds_never_true(left, right) {
                 *expr = Expr::Literal(Literal::Integer(0), span);
             }
         }
@@ -119540,8 +119573,7 @@ fn filter_expr_has_never_true_and(expr: &Expr) -> bool {
             right,
             ..
         } => {
-            and_operand_is_constant_never_true(left)
-                || and_operand_is_constant_never_true(right)
+            and_pair_folds_never_true(left, right)
                 || filter_expr_has_never_true_and(left)
                 || filter_expr_has_never_true_and(right)
         }
