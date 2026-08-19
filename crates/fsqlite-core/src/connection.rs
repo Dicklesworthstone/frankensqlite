@@ -62378,12 +62378,7 @@ impl Connection {
         }
         let cte_names = Self::top_level_cte_names(select);
         let mut owned = select.clone();
-        if let SelectCore::Select {
-            from: Some(from), ..
-        } = &mut owned.body.select
-        {
-            self.rewrite_bare_pragma_in_from_clause(from, &cte_names);
-        }
+        self.rewrite_bare_pragma_in_body(&mut owned.body, &cte_names);
         Cow::Owned(owned)
     }
 
@@ -62393,17 +62388,39 @@ impl Connection {
         })
     }
 
-    /// Whether the primary SELECT core has at least one bare FROM source that is
-    /// a routable no-arg pragma table-valued function.
+    /// The CTE names visible inside a FROM-subquery: the inherited outer scope
+    /// plus the subquery's own top-level `WITH` names (which shadow the outer
+    /// ones for the eponymous-pragma-TVF check, exactly as they do in stock).
+    fn extend_cte_scope(outer: &[String], nested: &SelectStatement) -> Vec<String> {
+        let mut scope = outer.to_vec();
+        scope.extend(Self::top_level_cte_names(nested));
+        scope
+    }
+
+    /// Whether *any* SELECT core in the statement — the primary core, every
+    /// compound (UNION/INTERSECT/EXCEPT) arm, or a nested FROM-subquery — has a
+    /// bare FROM source that is a routable no-arg pragma table-valued function.
+    /// bd-bzd19 L11: stock resolves `pragma_database_list` (etc.) in every one
+    /// of those positions, so the bare-to-call rewrite must reach all of them.
     fn select_has_bare_pragma_table_function(&self, select: &SelectStatement) -> bool {
+        let cte_names = Self::top_level_cte_names(select);
+        self.select_body_has_bare_pragma_tvf(&select.body, &cte_names)
+    }
+
+    fn select_body_has_bare_pragma_tvf(&self, body: &SelectBody, cte_names: &[String]) -> bool {
+        std::iter::once(&body.select)
+            .chain(body.compounds.iter().map(|(_, core)| core))
+            .any(|core| self.select_core_has_bare_pragma_tvf(core, cte_names))
+    }
+
+    fn select_core_has_bare_pragma_tvf(&self, core: &SelectCore, cte_names: &[String]) -> bool {
         let SelectCore::Select {
             from: Some(from), ..
-        } = &select.body.select
+        } = core
         else {
             return false;
         };
-        let cte_names = Self::top_level_cte_names(select);
-        self.from_clause_has_bare_pragma_tvf(from, &cte_names)
+        self.from_clause_has_bare_pragma_tvf(from, cte_names)
     }
 
     fn from_clause_has_bare_pragma_tvf(&self, from: &FromClause, cte_names: &[String]) -> bool {
@@ -62429,7 +62446,11 @@ impl Connection {
                     && !self.bare_name_shadows_pragma_tvf(&name.name, cte_names)
             }
             TableOrSubquery::ParenJoin(from) => self.from_clause_has_bare_pragma_tvf(from, cte_names),
-            TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => false,
+            TableOrSubquery::Subquery { query, .. } => {
+                let inner_scope = Self::extend_cte_scope(cte_names, query);
+                self.select_body_has_bare_pragma_tvf(&query.body, &inner_scope)
+            }
+            TableOrSubquery::TableFunction { .. } => false,
         }
     }
 
@@ -62446,6 +62467,22 @@ impl Connection {
             || cte_names
                 .iter()
                 .any(|cte_name| cte_name.eq_ignore_ascii_case(name))
+    }
+
+    fn rewrite_bare_pragma_in_body(&self, body: &mut SelectBody, cte_names: &[String]) {
+        self.rewrite_bare_pragma_in_core(&mut body.select, cte_names);
+        for (_, core) in &mut body.compounds {
+            self.rewrite_bare_pragma_in_core(core, cte_names);
+        }
+    }
+
+    fn rewrite_bare_pragma_in_core(&self, core: &mut SelectCore, cte_names: &[String]) {
+        if let SelectCore::Select {
+            from: Some(from), ..
+        } = core
+        {
+            self.rewrite_bare_pragma_in_from_clause(from, cte_names);
+        }
     }
 
     fn rewrite_bare_pragma_in_from_clause(&self, from: &mut FromClause, cte_names: &[String]) {
@@ -62481,7 +62518,11 @@ impl Connection {
             TableOrSubquery::ParenJoin(from) => {
                 self.rewrite_bare_pragma_in_from_clause(from, cte_names);
             }
-            TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => {}
+            TableOrSubquery::Subquery { query, .. } => {
+                let inner_scope = Self::extend_cte_scope(cte_names, query);
+                self.rewrite_bare_pragma_in_body(&mut query.body, &inner_scope);
+            }
+            TableOrSubquery::TableFunction { .. } => {}
         }
     }
 
