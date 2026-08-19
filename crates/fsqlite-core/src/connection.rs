@@ -7138,19 +7138,45 @@ impl<'conn> PreparedStatement<'conn> {
     /// returned unchanged, preserving the existing concurrency contract. If a
     /// re-prepare itself fails because the object no longer exists, that real
     /// error propagates.
-    async fn with_same_connection_schema_reprepare<T, Op>(&self, mut op: Op) -> Result<T>
+    async fn with_same_connection_schema_reprepare<T, Op>(&self, op: Op) -> Result<T>
     where
         Op: std::ops::AsyncFnMut(&Self) -> Result<T>,
     {
+        self.with_same_connection_schema_reprepare_if(op, || true)
+            .await
+    }
+
+    /// Like [`with_same_connection_schema_reprepare`], but a transparent
+    /// re-prepare+retry is taken only while `can_retry()` is also true.
+    ///
+    /// The plain variant assumes the same-connection `SchemaChanged` is
+    /// pre-flight — raised before any result is handed to the caller — so
+    /// re-running the operation is side-effect-free. That assumption breaks for
+    /// the streaming `for_each` path: a reentrant virtual-table or UDF callback
+    /// can run same-connection DDL *mid-scan* and raise `SchemaChanged` after
+    /// rows have already been emitted. Retrying then replays the emitted prefix
+    /// and duplicates rows (bd-bzd19 L12). Such callers pass a guard that is
+    /// false once any row has been emitted, so the mid-scan `SchemaChanged`
+    /// propagates as an error instead of silently duplicating output.
+    async fn with_same_connection_schema_reprepare_if<T, Op, Guard>(
+        &self,
+        mut op: Op,
+        can_retry: Guard,
+    ) -> Result<T>
+    where
+        Op: std::ops::AsyncFnMut(&Self) -> Result<T>,
+        Guard: Fn() -> bool,
+    {
         match op(self).await {
-            Err(FrankenError::SchemaChanged) if self.schema_change_is_same_connection() => {}
+            Err(FrankenError::SchemaChanged)
+                if self.schema_change_is_same_connection() && can_retry() => {}
             other => return other,
         }
         let mut reprepared = self.reprepared_for_current_schema().await?;
         for _ in 0..PREPARED_SCHEMA_REPREPARE_LIMIT {
             match op(&reprepared).await {
                 Err(FrankenError::SchemaChanged)
-                    if reprepared.schema_change_is_same_connection() => {}
+                    if reprepared.schema_change_is_same_connection() && can_retry() => {}
                 other => return other,
             }
             reprepared = reprepared.reprepared_for_current_schema().await?;
@@ -8467,13 +8493,31 @@ impl PreparedStatement<'_> {
     {
         self.conn.background_status()?;
         self.conn.settle_pending_transaction_cleanup().await?;
-        // The schema guard is pre-flight (no row is emitted to `f` before a
-        // `SchemaChanged`), so `&mut f` is safe to reuse across a re-prepare.
-        self.with_same_connection_schema_reprepare(async |stmt| {
-            stmt.conn
-                .query_prepared_with_params_for_each_after_background_status(stmt, params, &mut f)
-                .await
-        })
+        // The same-connection schema guard normally re-prepares transparently on
+        // a pre-flight `SchemaChanged`. But this path streams rows to `f` as it
+        // scans, and a reentrant virtual-table/UDF callback can run
+        // same-connection DDL *mid-scan* (`invoke_live_vtab_callback` ->
+        // `SchemaChanged`) after rows have already been handed to `f`. Retrying
+        // then would replay the emitted prefix and duplicate rows. bd-bzd19 L12:
+        // count emitted rows and permit the transparent re-prepare only while
+        // none have been emitted; a mid-scan `SchemaChanged` otherwise surfaces
+        // as an error rather than duplicated output.
+        let emitted = std::cell::Cell::new(0u64);
+        self.with_same_connection_schema_reprepare_if(
+            async |stmt| {
+                stmt.conn
+                    .query_prepared_with_params_for_each_after_background_status(
+                        stmt,
+                        params,
+                        &mut |row: &Row| {
+                            emitted.set(emitted.get() + 1);
+                            f(row)
+                        },
+                    )
+                    .await
+            },
+            || emitted.get() == 0,
+        )
         .await
     }
 
