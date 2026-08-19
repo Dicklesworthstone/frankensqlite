@@ -67401,6 +67401,22 @@ impl Connection {
                     predicate: Option<Expr>,
                 }
 
+                // bd-gu1bi (REVIEW3-P1): an index key is recomputed TWO ways and the
+                // stored key must match EITHER. d17976bd3 decodes the row payload
+                // canonically (UTF-16 -> Unicode) so encoding-INSENSITIVE text exprs
+                // like `lower(y)` re-encode to the stored key. But encoding-SENSITIVE
+                // exprs need the DB-encoded bytes: stock evaluates `CAST(y AS BLOB)`
+                // against the stored UTF-16 bytes, and stock-legal unpaired surrogates
+                // survive byte-for-byte — both of which the canonical decode's lossy
+                // round-trip diverges from (false "malformed" + a spurious first-open
+                // migration). The byte-preserving decode reproduces those. A genuinely
+                // corrupt key matches NEITHER valid recompute, so accepting either
+                // keeps detection power while ending the false verdicts.
+                struct IntegrityExpectedKey {
+                    encoding_canonical: Vec<u8>,
+                    byte_preserving: Vec<u8>,
+                }
+
                 let integrity_eval_collation_context = if quick {
                     None
                 } else {
@@ -67462,7 +67478,7 @@ impl Connection {
                 };
                 let mut expected_index_keys = index_specs
                     .iter()
-                    .map(|_| HashMap::<i64, Vec<u8>>::new())
+                    .map(|_| HashMap::<i64, IntegrityExpectedKey>::new())
                     .collect::<Vec<_>>();
                 let mut table_rowids = HashSet::new();
                 let rowid_alias_col_idx = rowid_alias_col_by_root_page
@@ -67522,6 +67538,25 @@ impl Connection {
                                 rowid_alias_col_idx,
                                 column_defaults,
                             )?;
+                            // Byte-preserving decode of the SAME payload for the raw
+                            // recompute candidate (bd-gu1bi). `parse_record` is
+                            // UTF-8-hardcoded, leaving UTF-16 TEXT columns as their
+                            // opaque stored bytes, so `CAST(y AS BLOB)` and unpaired
+                            // surrogates reproduce the stored key. The canonical
+                            // `parse_record_with_encoding` already validated these
+                            // bytes above; on the impossible chance the raw parse
+                            // disagrees, fall back to the canonical values (raw ==
+                            // canonical is a harmless single candidate).
+                            let row_values_raw = match parse_record(&payload) {
+                                Some(values_raw) => Self::inflate_table_row_values_for_integrity(
+                                    table,
+                                    rowid,
+                                    &values_raw,
+                                    rowid_alias_col_idx,
+                                    column_defaults,
+                                )?,
+                                None => row_values.clone(),
+                            };
                             table_rowids.insert(rowid);
                             for (index_spec, expected_keys) in
                                 index_specs.iter().zip(expected_index_keys.iter_mut())
@@ -67558,7 +67593,7 @@ impl Connection {
                                 let key = with_sync_function_registry(
                                     Arc::clone(function_registry),
                                     Arc::clone(custom_aggregate_keys),
-                                    || {
+                                    || -> Result<IntegrityExpectedKey> {
                                         let _index_expression_guard =
                                             IndexExpressionEvaluationGuard::push();
                                         let _collation_guard = integrity_eval_collation_context
@@ -67568,16 +67603,40 @@ impl Connection {
                                                     Arc::clone(context),
                                                 )
                                             });
-                                        Self::build_expected_index_key_for_integrity(
-                                            table,
-                                            &index_spec.index.name,
-                                            rowid,
-                                            &row_values,
-                                            &index_spec.positions,
-                                            &index_spec.key_expressions,
-                                            rowid_alias_col_idx,
-                                            self.db_text_encoding.get(),
-                                        )
+                                        // Canonical (DB-encoded) recompute: fixes
+                                        // encoding-insensitive text exprs like lower(y).
+                                        let encoding_canonical =
+                                            Self::build_expected_index_key_for_integrity(
+                                                table,
+                                                &index_spec.index.name,
+                                                rowid,
+                                                &row_values,
+                                                &index_spec.positions,
+                                                &index_spec.key_expressions,
+                                                rowid_alias_col_idx,
+                                                self.db_text_encoding.get(),
+                                            )?;
+                                        // Byte-preserving recompute: fixes
+                                        // encoding-sensitive exprs (CAST->BLOB) and
+                                        // stock-legal unpaired surrogates (bd-gu1bi).
+                                        // Utf8 serialization is byte-identical to
+                                        // serialize_record, so raw values round-trip
+                                        // their stored bytes verbatim.
+                                        let byte_preserving =
+                                            Self::build_expected_index_key_for_integrity(
+                                                table,
+                                                &index_spec.index.name,
+                                                rowid,
+                                                &row_values_raw,
+                                                &index_spec.positions,
+                                                &index_spec.key_expressions,
+                                                rowid_alias_col_idx,
+                                                TextEncoding::Utf8,
+                                            )?;
+                                        Ok(IntegrityExpectedKey {
+                                            encoding_canonical,
+                                            byte_preserving,
+                                        })
                                     },
                                 )?;
                                 expected_keys.insert(rowid, key);
@@ -67710,7 +67769,14 @@ impl Connection {
                                 };
                                 return Err(FrankenError::DatabaseCorrupt { detail });
                             };
-                            if expected_payload.as_slice() != payload.as_slice() {
+                            // Accept the stored key if it matches EITHER recompute
+                            // candidate (bd-gu1bi): the canonical DB-encoded key or the
+                            // byte-preserving key. Only a key matching neither is a
+                            // genuine mismatch.
+                            if expected_payload.encoding_canonical.as_slice() != payload.as_slice()
+                                && expected_payload.byte_preserving.as_slice()
+                                    != payload.as_slice()
+                            {
                                 return Err(FrankenError::DatabaseCorrupt {
                                     detail: format!(
                                         "index `{}` entry for rowid {rowid} does not match the table row payload",
