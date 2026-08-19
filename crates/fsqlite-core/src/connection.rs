@@ -59213,6 +59213,19 @@ impl Connection {
             return Ok(Vec::new());
         }
 
+        // L7 (bd-bzd19): `PRAGMA optimize` on a read-only connection is a silent
+        // no-op in stock SQLite — it can neither create nor update
+        // `sqlite_stat1`, and a freshly opened read-only connection carries no
+        // change counters, so nothing is ever "beneficial". Short-circuit here,
+        // before `optimize_beneficial_tables` takes a write transaction to count
+        // rows, so a `mode=ro` connection returns an empty (exit-0) result rather
+        // than a ReadOnly/Busy error. Verified vs sqlite3 3.46.1: `PRAGMA
+        // optimize`, `optimize(0x02)`, `optimize(0x10)`, and the debug
+        // `optimize(0x03)` all no-op on a `mode=ro` connection.
+        if self.pager.is_readonly() {
+            return Ok(Vec::new());
+        }
+
         let beneficial = self.optimize_beneficial_tables().await?;
 
         // Debug mode: report the ANALYZE statements that WOULD run, one row per
