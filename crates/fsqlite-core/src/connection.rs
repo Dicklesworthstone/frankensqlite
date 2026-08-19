@@ -33948,13 +33948,26 @@ impl Connection {
                     self.log_mem_execution_fallback("select", "correlated_exists_fallback")?;
                     self.execute_correlated_subquery_where_fallback(cx, select, params)
                         .await
-                } else if select_has_unsupported_correlated_scalar_subquery(select, self) {
+                } else if select_has_unsupported_correlated_scalar_subquery(select, self)
+                    && self
+                        .select_uses_builtin_minmax_bare_tracking(select)
+                        .is_none()
+                {
                     // `emit_scalar_subquery` intentionally implements only a
                     // narrow single-table/no-FROM subset. Unsupported
                     // correlated shapes cannot be folded ahead of time, so
                     // evaluate them per outer row with complete SELECT
                     // semantics instead of letting codegen silently emit
                     // NULL or ignore WHERE/cardinality clauses.
+                    //
+                    // bd-3radn H2: EXCEPT when the single-min/max bare-column
+                    // optimization applies — a correlated scalar subquery in the
+                    // output (e.g. `SELECT max(price), (SELECT name) FROM t`)
+                    // must be sourced from the extremum row. This generic
+                    // per-outer-row fallback would evaluate it over an arbitrary
+                    // row instead, so let those queries fall through to the
+                    // min/max extremum-row path below, which inlines the
+                    // subquery against the representative (extremum) row.
                     self.log_mem_execution_fallback(
                         "select",
                         "correlated_scalar_subquery_fallback",
@@ -90276,14 +90289,22 @@ fn walk_minmax_bare_tracking_children(
                 walk_minmax_bare_tracking(v, group_by, state);
             }
         }
-        // Leaves and opaque sub-expressions: a subquery/EXISTS is not a bare
-        // column of this query, and other paths handle those shapes. (Column is
-        // handled by the caller before dispatching here.)
+        // bd-3radn H2: a scalar subquery or EXISTS in the output can correlate
+        // to the outer row (e.g. `(SELECT name)` resolves to the extremum row's
+        // `name`), so it must be sourced from the min()/max() extremum row
+        // exactly like a bare column. Flag has_bare — do NOT descend, since the
+        // subquery's own columns belong to its inner query. This restores the
+        // pre-b7c53f8d2 (bd-0174u) behavior that regressed subqueries to opaque
+        // and returned the wrong row for `SELECT max(x), (SELECT y) FROM t`.
+        Expr::Subquery(_, _) | Expr::Exists { .. } => {
+            state.has_bare = true;
+        }
+        // Leaves: a literal, placeholder, bound outer value, or RAISE carries no
+        // bare column of this query. (Column is handled by the caller before
+        // dispatching here.)
         Expr::Column(_, _)
         | Expr::BoundOuterValue { .. }
         | Expr::Literal(_, _)
-        | Expr::Exists { .. }
-        | Expr::Subquery(_, _)
         | Expr::Raise { .. }
         | Expr::Placeholder(_, _) => {}
     }
