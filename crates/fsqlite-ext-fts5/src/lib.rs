@@ -3034,7 +3034,17 @@ impl Fts5ShadowRows {
             }
         }
         for row in &self.docsize {
-            if row.column_token_counts.len() != column_count {
+            // Tolerate the column-count off-by-one that the averages decode also
+            // tolerates (bd-5915c): when an option keyword doubles as a column
+            // name (`fts5(content, content='')`), the fts5 column parser and a
+            // foreign writer can disagree by one, so a docsize row carries a
+            // SURPLUS trailing-zero token count (the phantom column indexes no
+            // tokens). A shorter row is fine too — the missing trailing columns
+            // are unindexed and read as zero. Only a surplus of NON-zero counts
+            // is a genuine mismatch, mirroring the averages decode's rule.
+            let counts = &row.column_token_counts;
+            if counts.len() > column_count && counts[column_count..].iter().any(|count| *count != 0)
+            {
                 return Err(fts5_data_error("docsize row column count mismatch"));
             }
         }
@@ -14881,6 +14891,53 @@ mod tests {
         11,
     ],
 }"#
+        );
+    }
+
+    /// bd-5915c: `validate_for_open` must tolerate the same docsize column-count
+    /// off-by-one that the averages decode already tolerates — a SURPLUS
+    /// trailing-zero token count (from an option keyword doubling as a column
+    /// name) or a shorter row is accepted; only a non-zero surplus is rejected.
+    #[test]
+    fn test_validate_for_open_tolerates_docsize_trailing_zero_bd5915c() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let base_rows = Fts5ShadowRows {
+            data: Vec::new(),
+            idx: Vec::new(),
+            config: base.encode_config_rows(),
+            content: Vec::new(),
+            docsize: Vec::new(),
+        };
+
+        // Surplus TRAILING-ZERO token count (len 3 for a 2-column table): tolerated.
+        let surplus_zero = Fts5ShadowRows {
+            docsize: vec![Fts5DocsizeRow::new(1, vec![2, 1, 0])],
+            ..base_rows.clone()
+        };
+        assert!(
+            surplus_zero.validate_for_open(2).is_ok(),
+            "a surplus trailing-zero docsize token count must be tolerated"
+        );
+
+        // Shorter row (missing trailing unindexed columns read as zero): tolerated.
+        let short = Fts5ShadowRows {
+            docsize: vec![Fts5DocsizeRow::new(1, vec![2])],
+            ..base_rows.clone()
+        };
+        assert!(
+            short.validate_for_open(2).is_ok(),
+            "a shorter docsize row must be tolerated"
+        );
+
+        // A surplus of NON-zero counts is a genuine mismatch: still rejected.
+        let surplus_nonzero = Fts5ShadowRows {
+            docsize: vec![Fts5DocsizeRow::new(1, vec![2, 1, 5])],
+            ..base_rows.clone()
+        };
+        assert!(
+            surplus_nonzero.validate_for_open(2).is_err(),
+            "a non-zero surplus docsize token count must still be rejected"
         );
     }
 
