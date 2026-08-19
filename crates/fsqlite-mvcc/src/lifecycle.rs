@@ -1813,7 +1813,15 @@ impl TransactionManager {
             // never be the SSI pivot; forcing has_out_rw on it would abort a
             // disjoint read-free writer, violating the core concurrent-writer
             // invariant that such writers never conflict (bd-stujd).
-            txn.has_out_rw |= !read_keys.is_empty();
+            //
+            // bd-vr17w: "read something" must also count Bloom read-set mode.
+            // set_read_set_storage_mode(Bloom) routes reads into read_set_bloom
+            // and leaves read_keys empty, so a Bloom-mode txn that read a key
+            // would otherwise escape this conservative pivot and commit real
+            // write-skew the pre-fix unconditional pivot caught. A genuinely
+            // read-free writer still has BOTH empty, so the bd-stujd
+            // disjoint-writer invariant is preserved.
+            txn.has_out_rw |= !read_keys.is_empty() || txn.read_set_bloom.is_some();
         }
     }
 
