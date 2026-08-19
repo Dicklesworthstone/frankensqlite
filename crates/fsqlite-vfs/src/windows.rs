@@ -1311,22 +1311,35 @@ impl Vfs for WindowsVfs {
         } else {
             flags
         };
-        let os_locks = match WindowsOsLockFiles::open(&resolved) {
-            Ok(os_locks) => os_locks,
-            Err(err) => {
-                drop(file);
-                if created_db_file {
-                    let _ = fs::remove_file(&resolved);
+        // bd-ypl7b / GH#140 (Windows residual): a read-only open must NOT create
+        // the -lock-shared/-reserved/-pending advisory sidecars — doing so mutates
+        // the database directory and cannot open a clean DB on read-only media,
+        // exactly the defect the unix sidecar-less ReadOnlyExisting admission
+        // already fixed (bd-daqmp, a410c2735). A read-only binding takes no
+        // cooperative file locks: reads are MVCC snapshots, and the pager only
+        // calls VfsFile::lock at Reserved/Exclusive on write/maintenance paths
+        // that a read-only open never reaches (writes are rejected up front), so
+        // `os_locks` stays None and the lock methods are never invoked on it.
+        let os_locks = if is_rw {
+            match WindowsOsLockFiles::open(&resolved) {
+                Ok(os_locks) => Some(os_locks),
+                Err(err) => {
+                    drop(file);
+                    if created_db_file {
+                        let _ = fs::remove_file(&resolved);
+                    }
+                    return Err(err);
                 }
-                return Err(err);
             }
+        } else {
+            None
         };
 
         Ok((
             WindowsFile {
                 path: resolved,
                 file: Some(file),
-                os_locks: Some(os_locks),
+                os_locks,
                 stock_main_locks: None,
                 #[cfg(test)]
                 fail_next_stock_main_clone: false,
