@@ -57343,19 +57343,34 @@ impl Connection {
                 // ADD COLUMN back-fills existing rows, so a non-empty table
                 // constrains the default (the restriction is row-gated in C
                 // SQLite — an empty table accepts any default).
+                // bd-kyhpi: count the table's rows through the pager (the
+                // authoritative row source), NOT the lazily-hydrated MemDatabase
+                // mirror. On the FIRST statement to touch a freshly created and
+                // populated table (before any read hydrates the mirror),
+                // `memdb_rows_loaded` is false and `self.db` reports 0 rows — so
+                // the non-constant-default gate below was skipped and e.g.
+                // `ADD COLUMN c DEFAULT (random())` was wrongly admitted on a
+                // non-empty table. `with_pager_write_txn` reuses the active
+                // transaction when one is open (counting uncommitted rows too) or
+                // runs a standalone read otherwise, exactly like
+                // `optimize_beneficial_tables`.
                 let add_column_table_has_rows = {
-                    let schema = self.schema.borrow();
-                    let root_page = schema
-                        .iter()
-                        .find(|t| t.name.eq_ignore_ascii_case(table_name))
-                        .map(|t| t.root_page);
-                    drop(schema);
-                    root_page.is_some_and(|rp| {
-                        self.db
-                            .borrow()
-                            .get_table(rp)
-                            .is_some_and(|t| t.row_count() > 0)
-                    })
+                    let root_page = {
+                        let schema = self.schema.borrow();
+                        schema
+                            .iter()
+                            .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                            .map(|t| t.root_page)
+                    };
+                    match root_page {
+                        Some(rp) => {
+                            self.with_pager_write_txn(async |cx, txn| {
+                                Ok(self.count_btree_entries_in_txn(cx, txn, rp, true).await? > 0)
+                            })
+                            .await?
+                        }
+                        None => false,
+                    }
                 };
                 let default_value = col_def
                     .constraints
@@ -203866,10 +203881,32 @@ fts5(title, body, content=docs, content_rowid=id)'
                 conn.execute("INSERT INTO t(id, name) VALUES (3, 'alpha');")
                     .await
                     .unwrap();
-                conn.execute("ALTER TABLE t ADD COLUMN score INTEGER DEFAULT (1 + 2);")
+                // bd-kyhpi: SQLite forbids a parenthesized-EXPRESSION default on
+                // an ADD COLUMN over a NON-EMPTY table ("Cannot add a column with
+                // non-constant default"); only a bare literal is legal, because it
+                // is what back-fills the existing rows. Verified vs sqlite3 3.46.1.
+                // (This test previously wrongly ADMITTED these expression forms —
+                // it was passing only because the row-presence gate read the
+                // unhydrated MemDatabase mirror and saw the table as empty; that is
+                // the bd-kyhpi bug now fixed, so the reject is asserted here.)
+                assert!(
+                    conn.execute("ALTER TABLE t ADD COLUMN bad INTEGER DEFAULT (1 + 2);")
+                        .await
+                        .is_err(),
+                    "expression default (1 + 2) must be rejected on a non-empty table"
+                );
+                assert!(
+                    conn.execute("ALTER TABLE t ADD COLUMN bad2 TEXT DEFAULT ('x' || 'y');")
+                        .await
+                        .is_err(),
+                    "expression default ('x' || 'y') must be rejected on a non-empty table"
+                );
+                // Bare-literal defaults ARE admitted and back-fill the existing
+                // row (same padded values the rejected expressions would produce).
+                conn.execute("ALTER TABLE t ADD COLUMN score INTEGER DEFAULT 3;")
                     .await
                     .unwrap();
-                conn.execute("ALTER TABLE t ADD COLUMN tag TEXT DEFAULT ('x' || 'y');")
+                conn.execute("ALTER TABLE t ADD COLUMN tag TEXT DEFAULT 'xy';")
                     .await
                     .unwrap();
 
