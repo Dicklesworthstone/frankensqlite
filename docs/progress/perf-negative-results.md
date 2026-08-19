@@ -22091,3 +22091,51 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   genuinely arena-lock-bound (many concurrent disjoint-page publishers with
   cheap/pooled page data), re-measure this patch there — it is correct and the
   design is sound; it just lost on an allocation-bound benchmark.
+
+## 2026-08-19 - REJECT (measured, bd-1dp9.6.2): `format_sqlite_float` full stack-back is a +11.5% single-fn regression under `#![forbid(unsafe_code)]` — the zero-init tax exceeds the small-`Vec` malloc it removes
+
+- Target: the ONE remaining medium single-lever the 2026-07-16 "MAP: EXHAUSTED"
+  entry flagged as a real measured candidate — full `format_sqlite_float`
+  stack-back (`crates/fsqlite-types/src/value.rs`), floats common in
+  CAST/concat/quote/printf/Display. The pre-change fn makes 2 heap allocs per
+  call: (1) `decimal.to_string().into_bytes()` -> the `SqliteFloatDecode.digits:
+  Vec<u8>` (a `u64`, <=20 digits), and (2) the render `String` (the return
+  value). The lever removes alloc (1): `digits` -> stack `[u8; 24]` + `len`,
+  `decimal.to_string()` -> `u64_decimal_digits_into` (LSB-extract into a
+  `[u8; 20]` tmp, reverse into the buffer), the rare carry `Vec::insert(0, b'1')`
+  -> `copy_within(0..n, 1)` + set `[0]`, and all render reads through a
+  `digits() -> &self.digits[..self.len]` accessor (so `[u8;24].get(i)` past `len`
+  can't leak the trailing zeros). The return `String` (alloc 2) is unchanged.
+- Correctness: PROVEN byte-identical. A wide deterministic 81,203-float battery
+  (whole numbers +/-, tenths/thousandths, powers of ten 1e-300..1e300, rounding
+  edges, and a 30k LCG bit-pattern sweep of finite doubles) hashes to the SAME
+  FNV-1a checksum `0xd7105859138c8e18` (1,143,911 output bytes) before and after,
+  and all `fsqlite-types` `test_format_sqlite_float_*` unit tests are unaffected.
+  The refactor is a true isomorphism.
+- Measured (best-of-12 passes over the full battery, same host, `opt-level=3 lto
+  codegen-units=1`, back-to-back rebuilds of the small crate):
+  | build            | ns/call |
+  |------------------|---------|
+  | HEAD (Vec)       | 98.04   |
+  | stack-back (mine)| 109.31  |  (+11.5% SLOWER)
+- Why (attribution): the removed alloc is a ~20-byte small-`Vec` malloc — a
+  fast-path allocation (~5-10 ns) the global allocator serves from a size class.
+  Under `#![forbid(unsafe_code)]` the replacement CANNOT use `MaybeUninit`, so
+  every call must zero-initialize the `[u8; 24]` struct buffer AND the `[u8; 20]`
+  extraction tmp (~44 bytes memset/call), then pay the LSB-extract-then-reverse
+  loop and a `&self.digits[..len]` slice (bounds check) on each of the 8 render
+  reads, and move a larger by-value `SqliteFloatDecode` (inline 24-byte array vs
+  a 3-word `Vec` header). That added machinery exceeds the malloc it saved. This
+  is the exact "pooled-alloc + machinery-overhead risk" the EXHAUSTED map warned
+  to MEASURE; measured, it is not a win. Change reverted to HEAD (not landed).
+- This definitively closes the "one remaining medium lever" thread from the
+  2026-07-16 map: it is a measured REJECT, not an untried opportunity.
+- Retry condition: do NOT re-attempt the digit-buffer stack-back while
+  `#![forbid(unsafe_code)]` holds and the output is a returned owned `String`.
+  It could only pay off if BOTH allocs are removed together via a
+  caller-provided reusable buffer API (`format_sqlite_float_into(&mut String)`
+  for the Display/`write_str` caller, which alone avoids the return alloc) so the
+  fixed stack/zeroing overhead amortizes against two saved mallocs — and even
+  then MEASURE, since the zero-init tax is the dominant added cost. The
+  `format_sqlite_float_into` write-into variant for the single Display caller
+  (`value.rs` `impl Display`) is a separate, narrower lever left untried.
