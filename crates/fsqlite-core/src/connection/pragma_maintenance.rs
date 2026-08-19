@@ -7,9 +7,28 @@ impl Connection {
             Ok(()) => "ok".to_owned(),
             Err(err) => err.to_string(),
         };
-        vec![Row {
+        let mut rows = vec![Row {
             values: vec![SqliteValue::Text(outcome.into())],
-        }]
+        }];
+        // bd-7o1vu (GH#370), complement option (1): surface a legacy orphaned
+        // `%_content` shadow on a CONTENTLESS FTS5 table as an informational
+        // NOTE. The shadow is a well-formed table, so it never fails the
+        // ok/error verdict above (the database stays integrity-CLEAN); the note
+        // only makes the condition discoverable so a user knows the one-time
+        // first-open migration will reclaim it. Appended AFTER the verdict, so
+        // an oracle that reads the first row still observes "ok".
+        for shadow in self.orphaned_fts5_content_shadow_names() {
+            rows.push(Row {
+                values: vec![SqliteValue::Text(
+                    format!(
+                        "note: orphaned FTS5 contentless content shadow table {shadow} \
+                         (reclaimable; the one-time first-open migration drops it)"
+                    )
+                    .into(),
+                )],
+            });
+        }
+        rows
     }
 
     pub(super) async fn pragma_wal_checkpoint_rows(

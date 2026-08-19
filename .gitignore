@@ -409,3 +409,8 @@ claude-upgrade-progress.json
 
 # Empty / scaffolding oracle stubs left ignored (not real e2e cases)
 crates/fsqlite-e2e/tests/*_ignored.rs
+
+# Skill-loop / repo-janitor scratch
+.skill-loop-progress.md
+.skill-loop-progress-*.md
+

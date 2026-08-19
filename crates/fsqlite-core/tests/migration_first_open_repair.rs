@@ -267,3 +267,206 @@ fn opt_out_leaves_corrupt_database_untouched() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// bd-7o1vu (GH#370): reclaim an orphaned `%_content` shadow left on a legacy
+// CONTENTLESS FTS5 table.
+//
+// An OLD build that created a `content=''` FTS5 table ALSO materialized a
+// `%_content` corpus shadow holding the text a second time. At HEAD nothing
+// reads it (contentless binds persisted segments), CREATE no longer makes it,
+// and VACUUM will not remove it — yet the shadow is a well-formed table, so the
+// database stays `integrity_check`-CLEAN (it hits the Ok branch of the
+// first-open migration, not the repair branch). The migration reclaims it after
+// backing up the original; a STORED-content table's legitimate `_content`
+// shadow, and any user table that merely resembles the suffix, are left intact.
+// ---------------------------------------------------------------------------
+
+/// Build a legacy-shaped database with the birth marker still present:
+/// - `t`: a CONTENTLESS fts5 table (`content=''`) PLUS a hand-created,
+///   populated `t_content` table — the orphan an old build would have left.
+/// - `s`: a STORED-content (default) fts5 table that legitimately OWNS its
+///   `s_content` shadow (the negative case: it must NOT be dropped).
+/// - `unrelated_content`: a plain user table that merely resembles a shadow
+///   suffix but is owned by no fts5 vtab (the bonus case: never touched).
+#[cfg(feature = "ext-fts5")]
+async fn craft_legacy_contentless_orphan_db(dir: &Path, name: &str) -> String {
+    let db = dir.join(name).to_string_lossy().into_owned();
+    let conn = Connection::open(&db).await.expect("open");
+    conn.execute("PRAGMA journal_mode=DELETE;")
+        .await
+        .expect("journal_mode");
+    // Contentless FTS5: at HEAD this materializes _data/_idx/_config/_docsize
+    // shadows but NOT a _content corpus shadow.
+    conn.execute("CREATE VIRTUAL TABLE t USING fts5(body, content='');")
+        .await
+        .expect("create contentless fts5");
+    // Simulate the OLD build's orphan: create and populate a `t_content` table
+    // by hand (contentless `t` never owns it at HEAD).
+    conn.execute("CREATE TABLE t_content(id INTEGER PRIMARY KEY, c0);")
+        .await
+        .expect("create orphan t_content");
+    for i in 0..8 {
+        conn.execute(&format!("INSERT INTO t_content VALUES ({i}, 'orphan{i}');"))
+            .await
+            .expect("populate orphan");
+    }
+    // NEGATIVE: a STORED-content (default) fts5 table OWNS its _content shadow.
+    conn.execute("CREATE VIRTUAL TABLE s USING fts5(body);")
+        .await
+        .expect("create default fts5");
+    conn.execute("INSERT INTO s(rowid, body) VALUES (1, 'alpha beta gamma');")
+        .await
+        .expect("insert s");
+    // BONUS: a shadow-suffix-resembling user table owned by no fts5 vtab.
+    conn.execute("CREATE TABLE unrelated_content(x INTEGER PRIMARY KEY, v TEXT);")
+        .await
+        .expect("create unrelated_content");
+    conn.execute("INSERT INTO unrelated_content VALUES (42, 'keep me');")
+        .await
+        .expect("insert unrelated_content");
+    conn.close().await.expect("close");
+    db
+}
+
+#[cfg(feature = "ext-fts5")]
+async fn table_exists(conn: &Connection, name: &str) -> bool {
+    let rows = conn
+        .query(&format!(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='{name}';"
+        ))
+        .await
+        .expect("query sqlite_master");
+    matches!(rows[0].values()[0], SqliteValue::Integer(n) if n > 0)
+}
+
+/// AC: on the first open of a legacy contentless FTS5 archive, the orphaned
+/// `t_content` shadow is DROPped, the original is preserved at the backup, the
+/// marker records `reclaim_orphaned_fts5_content:1`, a subsequent reopen is a
+/// clean no-op, and `integrity_check` is `ok`. The stored-content and unrelated
+/// tables are preserved (negative + bonus).
+#[cfg(feature = "ext-fts5")]
+#[test]
+fn legacy_contentless_fts5_content_shadow_is_reclaimed_on_first_open() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = craft_legacy_contentless_orphan_db(dir.path(), "orphan.db").await;
+        // Model a pre-fix upgrader: strip the birth marker.
+        std::fs::remove_file(migration_marker_path(&db)).expect("strip marker");
+        assert!(
+            read_migration_marker(&db).is_none(),
+            "precondition: a pre-fix database has no marker"
+        );
+
+        // First open under current code triggers the reclaim.
+        let conn = Connection::open(&db).await.expect("open triggers migration");
+        assert!(
+            !table_exists(&conn, "t_content").await,
+            "the orphaned contentless _content shadow is dropped"
+        );
+        // NEGATIVE: a stored-content fts5 table keeps its own _content shadow.
+        assert!(
+            table_exists(&conn, "s_content").await,
+            "a STORED-content FTS5 table keeps its _content shadow"
+        );
+        // BONUS: a user table resembling a shadow suffix is untouched.
+        assert!(
+            table_exists(&conn, "unrelated_content").await,
+            "a user table resembling a shadow suffix is not touched"
+        );
+        // Integrity stays CLEAN: the orphan is gone, so no note either.
+        assert_eq!(
+            integrity_lines(&conn).await,
+            vec!["ok".to_owned()],
+            "reclaimed database is clean with no orphan note"
+        );
+        conn.close().await.unwrap();
+
+        // The marker records exactly one reclaimed shadow.
+        let marker = read_migration_marker(&db).expect("marker written after reclaim");
+        assert_eq!(marker.last_upgrade_version, CURRENT_MIGRATION_VERSION);
+        assert!(
+            marker
+                .repairs_applied
+                .iter()
+                .any(|repair| repair == "reclaim_orphaned_fts5_content:1"),
+            "repairs_applied records the reclaim: {marker:?}"
+        );
+        // The original is preserved before the destructive drop.
+        assert!(
+            pre_migration_backup_path(&db).exists(),
+            "original preserved at the pre-migration backup"
+        );
+
+        // Idempotent: a second open sees the marker (AlreadyMigrated) and does
+        // not re-run the reclaim; the shadow stays dropped, survivors intact.
+        std::fs::remove_file(pre_migration_backup_path(&db)).unwrap();
+        let conn2 = Connection::open(&db).await.expect("reopen (AlreadyMigrated)");
+        assert!(!table_exists(&conn2, "t_content").await, "shadow stays dropped");
+        assert!(table_exists(&conn2, "s_content").await, "stored-content shadow intact");
+        assert!(
+            table_exists(&conn2, "unrelated_content").await,
+            "unrelated table intact"
+        );
+        assert_eq!(integrity_lines(&conn2).await, vec!["ok".to_owned()]);
+        conn2.close().await.unwrap();
+        assert!(
+            !pre_migration_backup_path(&db).exists(),
+            "second open must not re-run the reclaim (no new backup)"
+        );
+
+        // Stock C SQLite (rusqlite) reads the reclaimed image as clean.
+        assert_eq!(
+            stock_integrity(&db),
+            "ok",
+            "stock oracle: the reclaimed database is clean"
+        );
+    });
+}
+
+/// AC (complement, option 1): while an orphan is still present (here because the
+/// birth marker is kept, so the migration does not run), `PRAGMA integrity_check`
+/// keeps the CLEAN `ok` verdict as its first row AND appends an informational
+/// NOTE that names the orphaned contentless `_content` shadow — so the condition
+/// is discoverable. A stored-content shadow is not noted.
+#[cfg(feature = "ext-fts5")]
+#[test]
+fn integrity_check_notes_orphaned_contentless_content_shadow() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Keep the birth marker: the migration is AlreadyMigrated and does NOT
+        // run, so the orphan survives and the note is observable.
+        let db = craft_legacy_contentless_orphan_db(dir.path(), "note.db").await;
+        assert!(
+            read_migration_marker(&db).is_some(),
+            "precondition: birth marker present (migration will not run)"
+        );
+
+        let conn = Connection::open(&db).await.expect("reopen (AlreadyMigrated)");
+        assert!(
+            table_exists(&conn, "t_content").await,
+            "orphan survives when the migration does not run"
+        );
+
+        let lines = integrity_lines(&conn).await;
+        // Verdict stays CLEAN — the first row is "ok".
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("ok"),
+            "the ok/error verdict is unchanged: {lines:?}"
+        );
+        // An informational NOTE names the orphaned contentless content shadow.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("note:") && line.contains("t_content")),
+            "an informational note names the orphaned contentless content shadow: {lines:?}"
+        );
+        // A stored-content shadow is NOT flagged.
+        assert!(
+            !lines.iter().any(|line| line.contains("s_content")),
+            "a legitimate stored-content shadow is not noted: {lines:?}"
+        );
+        conn.close().await.unwrap();
+    });
+}

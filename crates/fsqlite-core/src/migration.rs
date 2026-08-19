@@ -228,16 +228,47 @@ pub(crate) async fn run_first_open_migration(
     // corruption classes if any are present.
     match conn.validate_database_integrity(false).await {
         Ok(()) => {
-            // Clean — record the marker so the walk runs at most once.
+            // bd-7o1vu (GH#370): a legacy CONTENTLESS FTS5 table can carry an
+            // orphaned `%_content` corpus shadow. It is integrity-CLEAN, so it
+            // reaches THIS Ok branch, not the repair branch below. Reclaim it —
+            // but, because the clean path does not otherwise mutate the
+            // database, take the pre-migration backup HERE first (the Err branch
+            // already has one). If the backup fails, skip the reclaim and leave
+            // the database untouched — and do not stamp the marker, so a later
+            // open retries — exactly as the Err branch does on backup failure.
+            let mut repairs_applied = Vec::new();
+            if !conn.orphaned_fts5_content_shadow_names().is_empty() {
+                if let Err(err) = backup_original(&db_path) {
+                    tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "could not back up database before reclaiming orphaned FTS5 content shadows; leaving it untouched");
+                    return MigrationOutcome::CleanNoRepair;
+                }
+                match conn.reclaim_orphaned_fts5_content_shadows().await {
+                    Ok(dropped) if !dropped.is_empty() => {
+                        repairs_applied
+                            .push(format!("reclaim_orphaned_fts5_content:{}", dropped.len()));
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "reclaim_orphaned_fts5_content_shadows failed during migration");
+                    }
+                }
+            }
+            // Record the marker so the walk runs at most once.
             let marker = MigrationMarker {
                 last_upgrade_version: CURRENT_MIGRATION_VERSION,
                 last_run_at: now_unix_secs(),
-                repairs_applied: Vec::new(),
+                repairs_applied: repairs_applied.clone(),
             };
             if let Err(err) = write_marker_atomic(&db_path, &marker) {
                 tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "failed to write migration marker for a clean database");
             }
-            MigrationOutcome::CleanNoRepair
+            if repairs_applied.is_empty() {
+                MigrationOutcome::CleanNoRepair
+            } else {
+                MigrationOutcome::Repaired {
+                    repairs: repairs_applied,
+                }
+            }
         }
         Err(integrity_err) => {
             // Preserve the original before any mutation.
@@ -260,6 +291,19 @@ pub(crate) async fn run_first_open_migration(
                 Ok(_) => {}
                 Err(err) => {
                     tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "repair_orphaned_pages failed during migration");
+                }
+            }
+
+            // bd-7o1vu (GH#370): also reclaim any orphaned CONTENTLESS FTS5
+            // `%_content` shadows here — the pre-migration backup was already
+            // taken above, so no additional backup is needed.
+            match conn.reclaim_orphaned_fts5_content_shadows().await {
+                Ok(dropped) if !dropped.is_empty() => {
+                    repairs_applied.push(format!("reclaim_orphaned_fts5_content:{}", dropped.len()));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "reclaim_orphaned_fts5_content_shadows failed during migration");
                 }
             }
 
