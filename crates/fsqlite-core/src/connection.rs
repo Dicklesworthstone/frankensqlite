@@ -37576,6 +37576,10 @@ impl DatabaseBuilderReservation {
                 (1, 1) => fsqlite_vfs::validate_reserved_database_artifacts(
                     &self.path,
                     fsqlite_vfs::WindowsLockSidecarPolicy::AllowExpected,
+                    // bd-mnane: no pre-open witness threaded at this connection-side
+                    // claim-validation site; preserves prior AllowExpected behavior.
+                    // The reserved-bootstrap open path (pager.rs) carries the witness.
+                    None,
                 ),
                 (2, 2) => Ok(()),
                 (write_version, read_version) => Err(FrankenError::DatabaseCorrupt {
@@ -37605,6 +37609,7 @@ impl DatabaseBuilderReservation {
             fsqlite_vfs::validate_reserved_database_artifacts(
                 &self.path,
                 fsqlite_vfs::WindowsLockSidecarPolicy::RejectAll,
+                None,
             )
             .is_ok()
         }
@@ -37647,6 +37652,7 @@ impl DatabaseBuilderReservation {
         fsqlite_vfs::validate_reserved_database_artifacts(
             &self.path,
             fsqlite_vfs::WindowsLockSidecarPolicy::RejectAll,
+            None,
         )?;
         claim.record_bootstrap_succeeded();
         claim.finish_bootstrapped();
@@ -240877,6 +240883,7 @@ mod pager_routing_tests {
         fsqlite_vfs::validate_reserved_database_artifacts(
             target,
             fsqlite_vfs::WindowsLockSidecarPolicy::AllowExpected,
+            None,
         )
         .expect("reserved builder image has no recovery or WAL companion");
         for suffix in ["-wal-cert", "-wal-cert-head"] {

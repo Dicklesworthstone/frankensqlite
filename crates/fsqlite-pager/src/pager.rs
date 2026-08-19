@@ -31,8 +31,8 @@ use fsqlite_types::{
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_vfs::{
-    DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen, WindowsLockSidecarPolicy,
-    validate_reserved_database_artifacts,
+    DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen, PreOpenLockSidecars,
+    WindowsLockSidecarPolicy, validate_reserved_database_artifacts,
 };
 use fsqlite_vfs::{
     FileIdentity, SyncKind, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionState,
@@ -15770,7 +15770,7 @@ where
         };
         #[cfg(all(feature = "native", any(unix, windows)))]
         if disposition == ReadWriteOpenDisposition::ReservedEmpty && pending_namespace.is_some() {
-            validate_reserved_database_artifacts(&db_path, WindowsLockSidecarPolicy::RejectAll)?;
+            validate_reserved_database_artifacts(&db_path, WindowsLockSidecarPolicy::RejectAll, None)?;
         }
         #[cfg(all(feature = "native", any(unix, windows)))]
         let namespace_expected_identity = pending_namespace
@@ -16123,6 +16123,13 @@ where
                 return Err(FrankenError::CannotOpen { path: db_path });
             }
             let reserved_bootstrap = disposition == ReadWriteOpenDisposition::ReservedEmpty;
+            // bd-mnane: snapshot which Windows advisory-lock sidecars pre-exist
+            // BEFORE we take any cooperative lock (which creates our own), so the
+            // AllowExpected reserved validation below rejects a foreign/stale
+            // reservation while permitting the sidecars our own open creates.
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            let pre_open_lock_sidecars =
+                reserved_bootstrap.then(|| PreOpenLockSidecars::snapshot(&db_path));
             let mut bootstrap_lock = reserved_bootstrap.then(|| {
                 BeginExternalLockState::new(&group_commit_queue, Arc::clone(&db_file), cx)
             });
@@ -16146,6 +16153,7 @@ where
                         validate_reserved_database_artifacts(
                             &db_path,
                             WindowsLockSidecarPolicy::AllowExpected,
+                            pre_open_lock_sidecars.as_ref(),
                         )?;
                     }
                     Self::ensure_reserved_recovery_artifacts_absent(cx, &*vfs, &db_path)?;

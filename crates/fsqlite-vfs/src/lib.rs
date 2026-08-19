@@ -248,7 +248,7 @@ pub use metrics::{GLOBAL_VFS_METRICS, TracingFile, VfsMetrics};
 pub use namespace::{
     DatabaseNamespaceBinding, DatabaseNamespaceGenerationTransition,
     NamespaceGenerationTransitionOutcome, NamespaceOpenIntent, PendingNamespaceOpen,
-    WindowsLockSidecarPolicy, begin_database_namespace_generation_transition,
+    PreOpenLockSidecars, WindowsLockSidecarPolicy, begin_database_namespace_generation_transition,
     cleanup_abandoned_private_database, validate_reserved_database_artifacts,
 };
 pub use shm::ShmRegion;

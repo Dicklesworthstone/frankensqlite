@@ -2004,11 +2004,59 @@ pub enum WindowsLockSidecarPolicy {
     AllowExpected,
 }
 
+/// A pre-open snapshot of which Windows advisory-lock sidecars already existed
+/// BEFORE this handle began opening (i.e. before it took any cooperative lock,
+/// which is what creates the `-lock-shared/-reserved/-pending` sidecars).
+///
+/// bd-mnane: `WindowsLockSidecarPolicy::AllowExpected` must permit the sidecars
+/// OUR own open creates, but a sidecar that pre-existed our open is a foreign (or
+/// stale) reservation — not one our accepted main-file handle created — so it
+/// must still be rejected. The path-derived sidecar names are identical whoever
+/// created them, and (per the bead analysis) there is no handle-level owner
+/// tracking, so ownership is established by *timing*: anything present before we
+/// took a lock is not ours. Take this snapshot before the reserved bootstrap's
+/// first `shared_db_lock`, then hand it to
+/// [`validate_reserved_database_artifacts`].
+#[derive(Clone, Debug, Default)]
+pub struct PreOpenLockSidecars {
+    /// The `-lock-*` sidecar paths that already existed at snapshot time. Empty
+    /// on a clean reserved-empty slot (and always empty off Windows, where these
+    /// advisory sidecars do not exist).
+    preexisting: Vec<std::path::PathBuf>,
+}
+
+impl PreOpenLockSidecars {
+    /// Snapshot which advisory-lock sidecars already exist for `database_path`.
+    /// MUST be called before this handle takes any cooperative lock — otherwise
+    /// our own freshly created sidecars would be misread as foreign.
+    #[must_use]
+    pub fn snapshot(database_path: &Path) -> Self {
+        let mut preexisting = Vec::new();
+        #[cfg(windows)]
+        for suffix in ["-lock-shared", "-lock-reserved", "-lock-pending"] {
+            let candidate = sidecar_path(database_path, suffix);
+            if std::fs::symlink_metadata(&candidate).is_ok() {
+                preexisting.push(candidate);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = database_path;
+        Self { preexisting }
+    }
+
+    /// The sidecar paths that pre-existed our open (foreign / stale reservations).
+    #[must_use]
+    pub fn preexisting_sidecars(&self) -> &[std::path::PathBuf] {
+        &self.preexisting
+    }
+}
+
 /// Validate that no recovery artifact belongs to a caller-reserved empty DB.
 /// This function performs reads only and never creates or removes entries.
 pub fn validate_reserved_database_artifacts(
     database_path: &Path,
     windows_lock_sidecars: WindowsLockSidecarPolicy,
+    pre_open_lock_sidecars: Option<&PreOpenLockSidecars>,
 ) -> Result<()> {
     validate_stable_path(database_path)?;
     for suffix in ["-journal", "-wal", "-wal-fec", "-shm"] {
@@ -2016,13 +2064,30 @@ pub fn validate_reserved_database_artifacts(
     }
 
     #[cfg(windows)]
-    if windows_lock_sidecars == WindowsLockSidecarPolicy::RejectAll {
-        for suffix in ["-lock-shared", "-lock-reserved", "-lock-pending"] {
-            reject_existing_entry(database_path, &sidecar_path(database_path, suffix))?;
+    match windows_lock_sidecars {
+        WindowsLockSidecarPolicy::RejectAll => {
+            for suffix in ["-lock-shared", "-lock-reserved", "-lock-pending"] {
+                reject_existing_entry(database_path, &sidecar_path(database_path, suffix))?;
+            }
+        }
+        WindowsLockSidecarPolicy::AllowExpected => {
+            // bd-mnane: permit the sidecars OUR open created, but reject any that
+            // PRE-EXISTED our open (captured in `pre_open_lock_sidecars`) — a
+            // foreign or stale reservation, not one our accepted handle created.
+            // Without this witness a foreign process's lock sidecar is silently
+            // mistaken for our own and its reservation is masked.
+            if let Some(pre_open) = pre_open_lock_sidecars {
+                for candidate in pre_open.preexisting_sidecars() {
+                    reject_existing_entry(database_path, candidate)?;
+                }
+            }
         }
     }
     #[cfg(not(windows))]
-    let _ = windows_lock_sidecars;
+    {
+        let _ = windows_lock_sidecars;
+        let _ = pre_open_lock_sidecars;
+    }
 
     let wal_fec_temp = sidecar_path(database_path, "-wal-fec").with_extension("wal-fec.tmp");
     reject_existing_entry(database_path, &wal_fec_temp)?;
@@ -3889,7 +3954,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let database = dir.path().join("artifacts.db");
         create_database(&database, b"");
-        validate_reserved_database_artifacts(&database, WindowsLockSidecarPolicy::RejectAll)
+        validate_reserved_database_artifacts(&database, WindowsLockSidecarPolicy::RejectAll, None)
             .expect("artifact-free reservation");
 
         fs::write(
@@ -3898,7 +3963,7 @@ mod tests {
         )
         .expect("seed segment");
         assert!(matches!(
-            validate_reserved_database_artifacts(&database, WindowsLockSidecarPolicy::RejectAll),
+            validate_reserved_database_artifacts(&database, WindowsLockSidecarPolicy::RejectAll, None),
             Err(FrankenError::CannotOpen { .. })
         ));
 
@@ -3907,7 +3972,7 @@ mod tests {
         let temp = sidecar_path(&second, "-wal-fec").with_extension("wal-fec.tmp");
         fs::write(temp, b"partial rewrite").expect("seed WAL-FEC rewrite temp");
         assert!(matches!(
-            validate_reserved_database_artifacts(&second, WindowsLockSidecarPolicy::RejectAll),
+            validate_reserved_database_artifacts(&second, WindowsLockSidecarPolicy::RejectAll, None),
             Err(FrankenError::CannotOpen { .. })
         ));
     }
