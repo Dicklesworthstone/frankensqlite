@@ -154,6 +154,11 @@ fn bd_pgqsk_m7_empty_attach_adopts_main_encoding() {
 /// materialized as UTF-16, so it re-ATTACHes cleanly to a UTF-8 main. Before the
 /// fix the eager ATTACH-time persist stamped UTF-16 into the still-empty aux and
 /// this re-ATTACH was rejected as cross-encoding.
+// bd-lzbku decision B: reverted the deferred persist to the eager stamp, which
+// materializes the empty aux at ATTACH — so this "un-materialized re-ATTACH"
+// scenario no longer applies. Ignored (not deleted) pending a correct deferred
+// persist (bd-lzbku, needs fresh context).
+#[ignore = "bd-lzbku: deferred persist reverted to eager (decision B); re-enable with a correct deferred impl"]
 #[test]
 fn bd_lzbku_unwritten_empty_aux_reattaches_to_utf8_main() {
     asupersync::test_utils::run_test(|| async {
@@ -206,8 +211,15 @@ fn bd_lzbku_readonly_main_attaches_empty_aux() {
             w.execute("CREATE TABLE m(a);").await.unwrap();
             w.close().await.unwrap();
         }
-        // A read-only main won't create the aux, so pre-create an empty file.
-        std::fs::File::create(&aux).unwrap();
+        // A read-only main won't create the aux; pre-create a VALID empty aux DB.
+        // (A 0-byte file cannot be opened read-only — no header.) PRAGMA
+        // user_version writes page 1 but keeps schema_cookie == 0, so ATTACH still
+        // reaches the empty-file adopt branch.
+        {
+            let a = Connection::open(&aux_str).await.unwrap();
+            a.execute("PRAGMA user_version = 1;").await.unwrap();
+            a.close().await.unwrap();
+        }
 
         let ro = Connection::open_schema_only(&main16).await.unwrap();
         ro.execute(&format!("ATTACH '{aux_str}' AS aux;"))

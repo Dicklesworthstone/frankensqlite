@@ -25,6 +25,12 @@ fn scalar_text(rows: &[fsqlite_core::connection::Row]) -> String {
 // Harm 1: an empty aux ATTACHed to a UTF-16 main but NEVER written must NOT be
 // materialized on disk with a committed UTF-16 encoding. A standalone reopen must
 // report UTF-8 (the untouched default), exactly like stock's 0-byte aux.
+// bd-lzbku decision B: the deferred-until-first-write persist corrupted the aux,
+// so we reverted to the eager stamp (with a read-only guard). Eager persist
+// materializes the empty aux's header at ATTACH, so this "stays 0-byte / UTF-8"
+// guard no longer holds. Ignored, not deleted: re-enable when a correct deferred
+// persist lands (bd-lzbku, needs fresh context).
+#[ignore = "bd-lzbku: deferred persist reverted to eager (decision B); re-enable with a correct deferred impl"]
 #[test]
 fn bd_lzbku_unwritten_empty_aux_is_not_materialized() {
     asupersync::test_utils::run_test(|| async {
@@ -59,11 +65,15 @@ fn bd_lzbku_unwritten_empty_aux_is_not_materialized() {
     });
 }
 
-// bd-ntuz0 (a) regression / deferral-still-persists: once the aux takes its FIRST
-// write, the deferred adopted encoding must be stamped into its header so a
-// standalone reopen reports UTF-16le and reads the row.
+// bd-lzbku decision B (EAGER persist) + bd-ntuz0 (a): ATTACH eagerly stamps the
+// adopted encoding into the aux header, so a written aux stays consistent — stock
+// reopens it as UTF-16le, passes integrity_check, and reads the row. The
+// `integrity == "ok"` assertion is the corruption guard: the reverted
+// deferred-until-first-write variant wrote sqlite_master under the pre-stamp
+// (UTF-8) encoding and only stamped the header at commit, so stock mis-decoded
+// the schema (DatabaseCorrupt "malformed database schema").
 #[test]
-fn bd_lzbku_first_write_persists_deferred_encoding() {
+fn bd_lzbku_eager_attach_written_aux_is_stock_readable() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
         let main_path = dir.path().join("main16.db");

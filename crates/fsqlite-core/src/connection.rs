@@ -11420,15 +11420,6 @@ pub struct Connection {
     /// record-encode/`MakeRecord` write path is not yet encoding-aware. UTF-8
     /// until a UTF-16 database is admitted read-only.
     db_text_encoding: Cell<TextEncoding>,
-    /// bd-lzbku: a text encoding that this (attached) database adopted from the
-    /// main database at ATTACH time but whose on-disk header persist is DEFERRED
-    /// to the first write txn. Stock leaves a brand-new/empty aux at 0 bytes and
-    /// writes nothing until the first real write, so eagerly rewriting page 1 at
-    /// ATTACH (a) materializes a still-schema-empty aux with a committed encoding
-    /// that a later cross-encoding ATTACH rejects, and (b) fails outright when the
-    /// aux is read-only. `Some` means the next write txn must stamp the header
-    /// encoding (bytes 56..60) before its own changes; `take`n on flush.
-    pending_adopted_header_encoding: Cell<Option<TextEncoding>>,
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
@@ -13117,7 +13108,6 @@ impl Connection {
             local_ddl_epoch: Cell::new(0),
             force_full_schema_reload_once: Cell::new(false),
             db_text_encoding: Cell::new(TextEncoding::Utf8),
-            pending_adopted_header_encoding: Cell::new(None),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             inherited_recursive_program_depth: Cell::new(0),
@@ -13642,7 +13632,6 @@ impl Connection {
             local_ddl_epoch: Cell::new(0),
             force_full_schema_reload_once: Cell::new(false),
             db_text_encoding: Cell::new(TextEncoding::Utf8),
-            pending_adopted_header_encoding: Cell::new(None),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             inherited_recursive_program_depth: Cell::new(0),
@@ -35945,24 +35934,26 @@ impl Connection {
                     if attached_connection.schema_cookie() == 0 {
                         let adopted = self.db_text_encoding.get();
                         attached_connection.db_text_encoding.set(adopted);
-                        // bd-ntuz0 (a): the adopted encoding must reach the aux's
-                        // on-disk header (bytes 56..60), else a standalone reopen
-                        // reads the wrong encoding (the aux would be UTF-8 on disk
-                        // while its live value says UTF-16).
+                        // bd-ntuz0 (a): PERSIST the adopted encoding into the aux's
+                        // header (bytes 56..60) so a standalone reopen reads the
+                        // adopted encoding, not the UTF-8 open-time default. Stock
+                        // creates a UTF-16le aux from a UTF-16le main; match on disk.
                         //
-                        // bd-lzbku: DEFER that header write to the aux's first write
-                        // txn instead of persisting eagerly here. Stock leaves a
-                        // brand-new/empty aux at 0 bytes until the first real write,
-                        // so an eager page-1 rewrite (1) materializes a schema-empty
-                        // aux with a committed encoding that a later cross-encoding
-                        // ATTACH then rejects, and (2) FAILS outright when the aux is
-                        // read-only (opened schema-only -> no write txn available). A
-                        // read-only aux never writes, so it needs no persist at all —
-                        // its reads use the live adopted value.
+                        // bd-lzbku (decision B): the deferred-until-first-write
+                        // variant corrupted the aux (the schema was written UTF-8
+                        // before the header was stamped UTF-16le), so revert to the
+                        // eager stamp here. KEEP ONLY the read-only guard — a
+                        // read-only aux has no write txn, so skip the persist and let
+                        // its reads use the live adopted value (fixes harm #2 safely).
+                        // This re-accepts the P3 harm-#1 edge (an unwritten empty aux
+                        // is materialized and rejects a later cross-encoding
+                        // re-ATTACH) to eliminate the P0 corruption; the correct
+                        // deferred design is left open on bd-lzbku for fresh-context
+                        // work.
                         if !attached_connection.pager.is_readonly() {
                             attached_connection
-                                .pending_adopted_header_encoding
-                                .set(Some(adopted));
+                                .update_database_header_metadata(None, None, None, None, Some(adopted))
+                                .await?;
                         }
                     } else {
                         return Err(FrankenError::function_error(
@@ -53767,33 +53758,12 @@ impl Connection {
                 .await?;
             *self.active_txn.borrow_mut() = Some(txn);
         }
-        // bd-lzbku: before the caller's own changes, flush any deferred
-        // adopted-encoding header persist. ATTACH of an empty aux adopts the main
-        // database's encoding in-memory and defers the on-disk page-1 write to the
-        // aux's first write txn (here). Stamp it DIRECTLY on this txn via
-        // `persist_text_encoding_in_txn` — never through a nested write-txn wrapper
-        // (`update_database_header_metadata`), which would re-enter this very flush
-        // with the flag still set and recurse forever. It thus commits atomically
-        // with the caller's changes. On success clear the flag; on failure fold into
-        // `result` so the auto path below rolls back and the still-set flag retries
-        // on the next write.
         let result = {
             let mut guard = self.active_txn.borrow_mut();
             let txn = guard
                 .as_mut()
                 .ok_or_else(|| FrankenError::internal("transaction missing after ensure"))?;
-            match self.pending_adopted_header_encoding.get() {
-                Some(adopted) => {
-                    match Self::persist_text_encoding_in_txn(&cx, txn, adopted).await {
-                        Ok(()) => {
-                            self.pending_adopted_header_encoding.set(None);
-                            f(&cx, txn).await
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                None => f(&cx, txn).await,
-            }
+            f(&cx, txn).await
         };
         if auto {
             let mut guard = self.active_txn.borrow_mut();
@@ -85849,37 +85819,6 @@ impl Connection {
     }
 
     // ── Schema cookie and change counter tracking (bd-3mmj) ─────────
-
-    /// bd-lzbku: stamp the database text `encoding` into page 1's header WITHIN an
-    /// existing write txn, WITHOUT re-entering `with_pager_write_txn`. Used to flush
-    /// the deferred adopted-encoding persist from inside the aux's first write txn
-    /// (a nested wrapper call would recurse back through that flush). Mirrors the
-    /// encoding branch of `update_database_header_metadata`.
-    async fn persist_text_encoding_in_txn(
-        cx: &Cx,
-        txn: &mut TransactionKind,
-        encoding: TextEncoding,
-    ) -> Result<()> {
-        let page1 = txn.get_page(cx, PageNumber::ONE).await?;
-        let mut page_bytes = page1.as_ref().to_vec();
-        if page_bytes.len() < DATABASE_HEADER_SIZE {
-            return Err(FrankenError::internal(format!(
-                "page 1 too short for database header: {} bytes",
-                page_bytes.len()
-            )));
-        }
-        let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-        header_bytes.copy_from_slice(&page_bytes[..DATABASE_HEADER_SIZE]);
-        let mut header = DatabaseHeader::from_bytes(&header_bytes)
-            .map_err(|e| FrankenError::internal(format!("invalid database header: {e}")))?;
-        header.text_encoding = encoding;
-        let encoded = header
-            .to_bytes()
-            .map_err(|e| FrankenError::internal(format!("failed to encode header: {e}")))?;
-        page_bytes[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded);
-        txn.write_page(cx, PageNumber::ONE, &page_bytes).await?;
-        Ok(())
-    }
 
     /// Persist selected database header metadata fields on page 1.
     async fn update_database_header_metadata(
