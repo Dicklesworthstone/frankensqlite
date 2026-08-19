@@ -22786,7 +22786,7 @@ impl Connection {
     fn select_uses_builtin_minmax_bare_tracking(
         &self,
         select: &SelectStatement,
-    ) -> Option<(bool, Expr)> {
+    ) -> Option<(bool, Expr, Option<Expr>)> {
         let tracking = select_minmax_bare_tracking(select)?;
         let name = if tracking.0 { "max" } else { "min" };
         (!self.application_function_replaces_builtin(name, 1)).then_some(tracking)
@@ -76533,7 +76533,9 @@ impl Connection {
             // argument or FILTER again while computing the aggregate would
             // duplicate UDF side effects and could choose a bare row that does
             // not correspond to the reported value.
-            let minmax_cache = if let Some((is_max, tracked_arg)) = &minmax_bare_tracking {
+            let minmax_cache = if let Some((is_max, tracked_arg, tracked_filter)) =
+                &minmax_bare_tracking
+            {
                 let expected_name = if *is_max { "max" } else { "min" };
                 let (descriptor_index, arg_col, arg_expr, filter, collation) = result_descriptors
                     .iter()
@@ -76555,14 +76557,30 @@ impl Connection {
                         )),
                         GroupByColumn::Plain(_) | GroupByColumn::Agg { .. } => None,
                     })
-                    // bd-0174u: when the tracked min()/max() is NESTED inside a
-                    // mixed output expression (e.g. `max(price) || name`), there is
-                    // no separate top-level Agg descriptor to borrow the argument,
-                    // filter, or collation from. Fall back to the argument the
-                    // detector captured; the extremum row is computed from it
-                    // directly below, and the nested aggregate itself is evaluated
-                    // within its Plain expression against that representative row.
-                    .unwrap_or_else(|| (usize::MAX, None, Some(tracked_arg), None, None));
+                    // bd-0174u / bd-3radn M5: when the tracked min()/max() is
+                    // NESTED inside a mixed output expression (e.g.
+                    // `max(price) FILTER(...) || name`), there is no separate
+                    // top-level Agg descriptor to borrow the argument, FILTER, or
+                    // COLLATE from. Recover the FILTER from the detector and the
+                    // COLLATE from the tracked argument so the extremum row is
+                    // computed over the filtered rows under the right collation —
+                    // dropping either chose the wrong extremum row (bd-3radn M5).
+                    // The nested aggregate is then evaluated within its Plain
+                    // expression against that representative row.
+                    .unwrap_or_else(|| {
+                        let collation = if let Expr::Collate { collation, .. } = tracked_arg {
+                            Some(collation.as_str())
+                        } else {
+                            None
+                        };
+                        (
+                            usize::MAX,
+                            None,
+                            Some(tracked_arg),
+                            tracked_filter.as_ref(),
+                            collation,
+                        )
+                    });
 
                 let mut best: Option<(&Vec<SqliteValue>, usize)> = None;
                 let mut aggregate_values = Vec::with_capacity(group_rows.len());
@@ -90107,7 +90125,7 @@ fn frame_bound_has_expr(bound: &FrameBound, predicate: fn(&Expr) -> bool) -> boo
 /// (there must be exactly one, a builtin `min`/`max` with one argument and no
 /// `OVER`), and a bare column reference anywhere outside that aggregate's
 /// argument (and not a GROUP BY key) satisfies the bare-column requirement.
-fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr)> {
+fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr, Option<Expr>)> {
     if !select.body.compounds.is_empty() {
         return None;
     }
@@ -90146,8 +90164,11 @@ fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr)>
 /// Traversal state for [`select_minmax_bare_tracking`].
 #[derive(Default)]
 struct MinMaxBareTrackingWalk {
-    /// The single tracked `(is_max, arg_expr)` once its aggregate is found.
-    minmax: Option<(bool, Expr)>,
+    /// The single tracked `(is_max, arg_expr, filter)` once its aggregate is
+    /// found. `filter` is the `min()`/`max()` FILTER clause (bd-3radn M5),
+    /// needed to compute the extremum row when the aggregate is NESTED in a
+    /// mixed output expression (no top-level Agg descriptor to borrow it from).
+    minmax: Option<(bool, Expr, Option<Expr>)>,
     /// Count of aggregate function calls seen across all result columns.
     agg_count: usize,
     /// Whether a bare (non-aggregate, non-GROUP-BY) column reference was found.
@@ -90179,8 +90200,9 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
         }
         // An aggregate function call. The optimization requires the query's ONLY
         // aggregate to be a single builtin min()/max() with one argument.
-        Expr::FunctionCall { name, args, .. }
-            if is_agg_fn(name) && !is_scalar_max_min(name, args) =>
+        Expr::FunctionCall {
+            name, args, filter, ..
+        } if is_agg_fn(name) && !is_scalar_max_min(name, args) =>
         {
             state.agg_count += 1;
             if state.agg_count > 1 {
@@ -90199,7 +90221,7 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
                 state.bail = true;
                 return;
             }
-            state.minmax = Some((lname == "max", arg.clone()));
+            state.minmax = Some((lname == "max", arg.clone(), filter.as_deref().cloned()));
             // Do NOT descend into the aggregate argument: its column references
             // belong to the aggregate, not to the bare-column set. A nested
             // aggregate there is a "misuse of aggregate" that other paths reject.

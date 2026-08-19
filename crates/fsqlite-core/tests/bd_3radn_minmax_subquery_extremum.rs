@@ -85,3 +85,60 @@ fn h2_scalar_subquery_output_sourced_from_extremum_row() {
         .await;
     });
 }
+
+#[test]
+fn m5_nested_minmax_filter_sources_the_filtered_extremum_row() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for ddl in [
+            "CREATE TABLE t(name TEXT, price INTEGER)",
+            "INSERT INTO t VALUES('a',10),('b',30),('c',20)",
+        ] {
+            f.execute(ddl).await.unwrap();
+            r.execute_batch(ddl).unwrap();
+        }
+
+        // Nested min/max control (no FILTER): the extremum row is 'b' (price 30).
+        assert_agree(&f, &r, "SELECT max(price) || '/' || name FROM t").await;
+        // bd-3radn M5: a NESTED min/max carrying a FILTER must compute the
+        // extremum over the FILTERED rows. Excluding 'b' makes 'c' (price 20) the
+        // extremum, so the bare `name` is 'c' -> "20/c". Dropping the FILTER in
+        // the extremum-row fallback chose 'b' -> "30/b" (or "20/b").
+        assert_agree(
+            &f,
+            &r,
+            "SELECT (max(price) FILTER (WHERE name <> 'b')) || '/' || name FROM t",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn m5_nested_minmax_collate_sources_the_collated_extremum_row() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for ddl in [
+            "CREATE TABLE t(name TEXT, price INTEGER)",
+            "INSERT INTO t VALUES('Z',1),('a',2),('m',3)",
+        ] {
+            f.execute(ddl).await.unwrap();
+            r.execute_batch(ddl).unwrap();
+        }
+
+        // bd-3radn M5: a NESTED max carrying a COLLATE NOCASE must select the
+        // extremum ROW under NOCASE. The bare `price` reveals which row was
+        // chosen: NOCASE makes 'Z' (folds to 'z', the largest) the extremum ->
+        // price 1; BINARY would pick 'm' (ASCII 109 > 'Z' 90) -> price 3.
+        // Asserting on `price` isolates the extremum-ROW collation (the M5
+        // fallback fix) from the separate nested-aggregate-VALUE collation path.
+        assert_agree(&f, &r, "SELECT (max(name) IS NOT NULL), price FROM t").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT (max(name COLLATE NOCASE) IS NOT NULL), price FROM t",
+        )
+        .await;
+    });
+}
