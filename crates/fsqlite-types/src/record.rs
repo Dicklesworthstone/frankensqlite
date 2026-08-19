@@ -1118,6 +1118,20 @@ impl RecordDecodeScratch {
 /// blob is kept separately for output.
 #[allow(clippy::cast_possible_truncation)]
 pub fn parse_record_prefix(data: &[u8], max_cols: usize) -> Option<Vec<SqliteValue>> {
+    parse_record_prefix_with_encoding(data, max_cols, TextEncoding::Utf8)
+}
+
+/// Encoding-aware [`parse_record_prefix`]: decodes the leading `max_cols` values
+/// under the database `encoding`. The sorter spills the raw record bytes (in the
+/// DB encoding) but must decode its sort-key prefix under the SAME encoding —
+/// otherwise a spilled UTF-16 sort key is decoded as UTF-8 mojibake and orders
+/// differently from the in-memory path, so spilling silently reorders the output
+/// on a UTF-16 database (bd-7c6g7 #5).
+pub fn parse_record_prefix_with_encoding(
+    data: &[u8],
+    max_cols: usize,
+    encoding: TextEncoding,
+) -> Option<Vec<SqliteValue>> {
     if max_cols == 0 {
         return Some(Vec::new());
     }
@@ -1147,7 +1161,8 @@ pub fn parse_record_prefix(data: &[u8], max_cols: usize) -> Option<Vec<SqliteVal
             return None;
         }
 
-        let value = decode_value(serial_type, &data[body_offset..end], profile_enabled)?;
+        let value =
+            decode_value_with_encoding(serial_type, &data[body_offset..end], encoding, profile_enabled)?;
         values.push(value);
         body_offset = end;
     }
@@ -3567,6 +3582,31 @@ mod tests {
             utf8_scratch.cached_value(0).and_then(SqliteValue::as_text),
             Some(text)
         );
+    }
+
+    #[test]
+    fn parse_record_prefix_with_encoding_decodes_utf16_key() {
+        // bd-7c6g7 #5: the sorter decodes its spilled sort-key prefix under the
+        // DB encoding. A UTF-16 text key must decode to the correct string, not
+        // UTF-8 mojibake (which would sort differently from the in-memory path).
+        let row: Vec<SqliteValue> = vec![
+            SqliteValue::Text(SmallText::new("grüße")),
+            SqliteValue::Integer(7),
+            SqliteValue::Text(SmallText::new("trailing")),
+        ];
+        let record = serialize_record_with_encoding(&row, TextEncoding::Utf16le);
+
+        // Decode only the first 2 columns (the sort-key prefix).
+        let prefix = parse_record_prefix_with_encoding(&record, 2, TextEncoding::Utf16le)
+            .expect("utf16 prefix decodes");
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(prefix[0].as_text(), Some("grüße"));
+        assert_eq!(prefix[1], SqliteValue::Integer(7));
+
+        // The Utf8 default must NOT recover the string — proving the encoding is
+        // load-bearing for the spilled sort key.
+        let utf8_prefix = parse_record_prefix(&record, 2).expect("utf8 prefix decodes");
+        assert_ne!(utf8_prefix[0].as_text(), Some("grüße"));
     }
 
     #[test]

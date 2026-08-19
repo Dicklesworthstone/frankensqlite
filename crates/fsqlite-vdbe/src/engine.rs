@@ -1767,7 +1767,11 @@ impl SorterCursor {
         // Collect all runs: disk runs first, then in-memory remainder.
         let mut run_iters: Vec<RunIterator> = Vec::with_capacity(self.spill_runs.len() + 1);
         for run in &self.spill_runs {
-            run_iters.push(RunIterator::from_file(&run.path, self.key_columns)?);
+            run_iters.push(RunIterator::from_file(
+                &run.path,
+                self.key_columns,
+                self.text_encoding,
+            )?);
         }
         if !self.rows.is_empty() {
             let mem_rows = std::mem::take(&mut self.rows);
@@ -1874,6 +1878,8 @@ enum RunIterator {
         current: Option<SorterRow>,
         /// Number of leading sort-key columns to decode from spilled records.
         key_columns: usize,
+        /// DB storage encoding for decoding spilled sort-key TEXT (bd-7c6g7 #5).
+        text_encoding: TextEncoding,
     },
     /// Records from an in-memory Vec (used for the final unsorted batch).
     Memory {
@@ -1883,13 +1889,18 @@ enum RunIterator {
 }
 
 impl RunIterator {
-    fn from_file(path: &std::path::Path, key_columns: usize) -> Result<Self> {
+    fn from_file(
+        path: &std::path::Path,
+        key_columns: usize,
+        text_encoding: TextEncoding,
+    ) -> Result<Self> {
         let file = std::fs::File::open(path)
             .map_err(|e| FrankenError::internal(format!("sorter run open: {e}")))?;
         Ok(Self::File {
             reader: std::io::BufReader::new(file),
             current: None,
             key_columns,
+            text_encoding,
         })
     }
 
@@ -1920,6 +1931,7 @@ impl RunIterator {
                 reader,
                 current,
                 key_columns,
+                text_encoding,
             } => {
                 use std::io::Read;
                 let mut len_buf = [0u8; 4];
@@ -1930,11 +1942,15 @@ impl RunIterator {
                         reader
                             .read_exact(&mut buf)
                             .map_err(|e| FrankenError::internal(format!("sorter run read: {e}")))?;
-                        // Decode only the sort-key prefix — not all columns.
-                        let values = fsqlite_types::record::parse_record_prefix(&buf, *key_columns)
-                            .ok_or_else(|| {
-                                FrankenError::internal("sorter run: malformed record")
-                            })?;
+                        // Decode only the sort-key prefix — not all columns — and
+                        // under the DB encoding so a spilled UTF-16 key sorts the
+                        // same as the in-memory path (bd-7c6g7 #5).
+                        let values = fsqlite_types::record::parse_record_prefix_with_encoding(
+                            &buf,
+                            *key_columns,
+                            *text_encoding,
+                        )
+                        .ok_or_else(|| FrankenError::internal("sorter run: malformed record"))?;
                         *current = Some(SorterRow {
                             values,
                             blob: buf,
