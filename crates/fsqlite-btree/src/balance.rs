@@ -3875,6 +3875,75 @@ mod tests {
     }
 
     #[test]
+    fn test_conflict_topology_policy_stable_and_clamped_under_repeated_hotspot() {
+        // bd-1dp9.6.7.13.2 AC#3 (policy stability under repeated hotspot
+        // patterns): a rising/sustained hotspot must drive the split advice
+        // MONOTONICALLY toward the contended edge, stay within the EXPLICIT
+        // clamps at every heat level (bounded — no overreaction), and be
+        // DETERMINISTIC (identical heat -> identical advice, no oscillation),
+        // for BOTH the flat topology policy and the adaptive fill-factor ramp.
+        // This is the "explicit, bounded, explainable, reversible" guarantee,
+        // independent of the bench-gated p95/p99 throughput question.
+        let _guard = crate::instrumentation::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hot_page = pn(48);
+        // Explicit adaptive clamps (instrumentation.rs ADAPTIVE_FILL_FACTOR_*):
+        // the enacted fill target must never leave [left floor, right ceil].
+        const ADAPTIVE_LEFT_FLOOR_BPS: usize = 1_500;
+        const ADAPTIVE_RIGHT_CEIL_BPS: usize = 9_000;
+        let heat_ramp = [1u64, 2, 4, 8, 16, 33, 64, 128, 256, 512];
+
+        for adaptive in [false, true] {
+            crate::instrumentation::set_conflict_topology_policy_mode(
+                crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+            );
+            crate::instrumentation::set_adaptive_fill_factor_enabled(adaptive);
+            let mut prev = 0usize;
+            for &heat in &heat_ramp {
+                crate::instrumentation::reset_conflict_topology_policy_state();
+                crate::instrumentation::record_conflict_topology_heat(hot_page, heat, 4);
+                let t = leaf_table_split_policy_for_page(Some(hot_page), 12, 11)
+                    .target_left_basis_points;
+                assert!(
+                    (ADAPTIVE_LEFT_FLOOR_BPS..=ADAPTIVE_RIGHT_CEIL_BPS).contains(&t),
+                    "adaptive={adaptive}: split target {t} left the explicit clamp \
+                     [{ADAPTIVE_LEFT_FLOOR_BPS},{ADAPTIVE_RIGHT_CEIL_BPS}] at heat {heat}"
+                );
+                assert!(
+                    t >= prev,
+                    "adaptive={adaptive}: split target regressed under RISING heat \
+                     ({t} < {prev} at heat {heat}) — policy must be monotone, not oscillate"
+                );
+                prev = t;
+            }
+            // Determinism / non-oscillation: replaying the SAME heat yields the
+            // identical advice every time.
+            let replay: Vec<usize> = (0..4)
+                .map(|_| {
+                    crate::instrumentation::reset_conflict_topology_policy_state();
+                    crate::instrumentation::record_conflict_topology_heat(hot_page, 33, 4);
+                    leaf_table_split_policy_for_page(Some(hot_page), 12, 11)
+                        .target_left_basis_points
+                })
+                .collect();
+            assert!(
+                replay.windows(2).all(|w| w[0] == w[1]),
+                "adaptive={adaptive}: identical heat must yield identical advice \
+                 (stable, non-oscillating): {replay:?}"
+            );
+        }
+
+        // Kill switch: restore the default (disabled adaptive, enforced topology)
+        // so no residual policy state leaks to sibling tests.
+        crate::instrumentation::set_adaptive_fill_factor_enabled(false);
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+        );
+    }
+
+    #[test]
     fn test_apply_child_replacement_noop_skips_parent_rewrite() {
         run_async(async {
             let cx = Cx::new();
