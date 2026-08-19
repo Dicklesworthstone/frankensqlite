@@ -101,6 +101,84 @@ fn bd_fts5_lazy_delete_all_clears_without_promote() {
     });
 }
 
+/// bd-zdsh2 regression guard: `BEGIN; INSERT INTO t(t) VALUES('delete-all');
+/// ROLLBACK` on a reopened (lazily-bound) contentless fts5 table must restore
+/// every row — the index reset is rolled back with the pager. Frank already
+/// gets the OBSERVABLE result right here (the query re-reads the rolled-back
+/// durable image), so this passes with OR without the bd-zdsh2 instance-txn
+/// registration; it locks in the correct rollback behavior. The bd-zdsh2 fix
+/// itself is defensive instance-consistency hardening (registering a live-vtab
+/// txn for delete-all like the delete-rowids path) whose suspected `count(*)=0`
+/// symptom did not reproduce via a normal reopen.
+#[test]
+fn bd_zdsh2_delete_all_rollback_preserves_lazy_binding() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_delete_all_rollback.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        // Write a contentless_delete corpus, then reopen so it binds lazily.
+        {
+            let conn = Connection::open(&db_str).await.unwrap();
+            conn.execute(
+                "CREATE VIRTUAL TABLE t USING fts5(body, content='', contentless_delete=1);",
+            )
+            .await
+            .unwrap();
+            for id in 1..=6 {
+                conn.execute(&format!(
+                    "INSERT INTO t(rowid, body) VALUES ({id}, 'common term{id}');"
+                ))
+                .await
+                .unwrap();
+            }
+            conn.close().await.unwrap();
+        }
+
+        let conn = Connection::open(&db_str).await.unwrap();
+        let before = conn
+            .query("SELECT rowid FROM t WHERE t MATCH 'common' ORDER BY rowid;")
+            .await
+            .unwrap();
+        assert_eq!(rowids(&before), vec![1, 2, 3, 4, 5, 6], "reopened corpus");
+
+        // delete-all inside an explicit transaction, then ROLLBACK.
+        conn.execute("BEGIN;").await.unwrap();
+        conn.execute("INSERT INTO t(t) VALUES('delete-all');")
+            .await
+            .unwrap();
+        conn.execute("ROLLBACK;").await.unwrap();
+
+        // The ROLLBACK must restore every row: the in-memory index reset is undone
+        // with the pager, not left applied on the lazy binding.
+        let after = conn
+            .query("SELECT rowid FROM t WHERE t MATCH 'common' ORDER BY rowid;")
+            .await
+            .unwrap();
+        assert_eq!(
+            rowids(&after),
+            vec![1, 2, 3, 4, 5, 6],
+            "ROLLBACK must restore the delete-all on a lazy binding"
+        );
+        conn.close().await.unwrap();
+
+        // Stock reopens and reads the preserved (rolled-back) corpus.
+        let stock = rusqlite::Connection::open(&db_path).unwrap();
+        let matched: Vec<i64> = stock
+            .prepare("SELECT rowid FROM t WHERE t MATCH 'common'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            matched,
+            vec![1, 2, 3, 4, 5, 6],
+            "stock reads the rolled-back corpus"
+        );
+    });
+}
+
 #[test]
 fn bd_fts5_delete_all_rejects_non_contentless() {
     asupersync::test_utils::run_test(|| async {

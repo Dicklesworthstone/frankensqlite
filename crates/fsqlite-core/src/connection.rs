@@ -47396,6 +47396,23 @@ impl Connection {
                     "'delete-all' may only be used with a contentless or external content fts5 table",
                 ));
             }
+            // bd-zdsh2: register the live-vtab transaction BEFORE the delete-all
+            // mutates the instance (persist_..._delete_all -> mark_lazy_on_disk),
+            // mirroring the bd-90m1n fix for execute_live_vtab_delete_rowids and
+            // fixing the reviewer-flagged asymmetry between the two mutation paths.
+            // This keeps the live-vtab instance's transactional bookkeeping
+            // consistent so a ROLLBACK restores the pre-delete-all instance state.
+            // (The observable `count(*)=0`-after-ROLLBACK symptom the review
+            // suspected does NOT reproduce via a normal reopen — the query
+            // re-reads the rolled-back durable image — so this is defensive
+            // consistency hardening, not a fix for a demonstrated divergence.)
+            if self.is_live_fts5_instance(insert.table.name.as_str()) {
+                let cx = self.op_cx()?;
+                let table_name = insert.table.name.as_str();
+                self.with_active_live_vtab_instance(&cx, table_name, "xBegin", |instance| {
+                    self.begin_live_vtab_transaction_if_needed(table_name, instance, &cx)
+                })?;
+            }
             self.persist_rootpage_zero_fts5_contentless_delete_all(insert.table.name.as_str())
                 .await?;
             self.reset_statement_change_count();
