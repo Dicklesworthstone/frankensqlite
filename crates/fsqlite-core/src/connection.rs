@@ -35745,9 +35745,18 @@ impl Connection {
                 // is already populated in a different encoding (bd-pgqsk M7).
                 if attached_connection.db_text_encoding.get() != self.db_text_encoding.get() {
                     if attached_connection.schema_cookie() == 0 {
+                        let adopted = self.db_text_encoding.get();
+                        attached_connection.db_text_encoding.set(adopted);
+                        // bd-ntuz0 (a): PERSIST the adopted encoding into the
+                        // attached file's header (bytes 56..60), not just the live
+                        // value — otherwise the aux is created UTF-8 on disk (its
+                        // header keeps the open-time default) while the live value
+                        // says UTF-16, so a standalone reopen reads the wrong
+                        // encoding. Stock creates a UTF-16le aux from a UTF-16le
+                        // main; match that on-disk.
                         attached_connection
-                            .db_text_encoding
-                            .set(self.db_text_encoding.get());
+                            .update_database_header_metadata(None, None, None, None, Some(adopted))
+                            .await?;
                     } else {
                         return Err(FrankenError::function_error(
                             "attached databases must use the same text encoding as main database",
@@ -67881,30 +67890,35 @@ impl Connection {
         // name is rejected at prepare regardless of database state, matching
         // stock's "unsupported encoding: <name>" (bd-pgqsk L5).
         if pragma_name == "encoding"
-            && let Some(requested) = pragma.value.as_ref().and_then(|value| {
-                let expr = match value {
-                    PragmaValue::Assign(expr) | PragmaValue::Call(expr) => expr,
-                };
-                match expr {
-                    Expr::Literal(Literal::String(text), _) => Some(text.clone()),
-                    Expr::Column(column, _) if column.table.is_none() => {
-                        Some(column.column.to_string())
-                    }
-                    _ => None,
-                }
-            })
+            && let Some(value) = pragma.value.as_ref()
         {
-            // Normalize like stock: case-insensitive, optional dash. `UTF-16`
-            // resolves to the native default UTF-16le.
-            let normalized: String = requested
-                .chars()
-                .filter(|character| *character != '-')
-                .flat_map(char::to_lowercase)
-                .collect();
+            let expr = match value {
+                PragmaValue::Assign(expr) | PragmaValue::Call(expr) => expr,
+            };
+            let requested = match expr {
+                Expr::Literal(Literal::String(text), _) => text.clone(),
+                Expr::Column(column, _) if column.table.is_none() => {
+                    column.column.to_string()
+                }
+                // A non-string encoding argument (e.g. `PRAGMA encoding = 5`) is
+                // unsupported; stock rejects it at prepare rather than silently
+                // ignoring it (bd-ntuz0 b).
+                _ => {
+                    return Err(FrankenError::function_error(
+                        "unsupported encoding".to_owned(),
+                    ));
+                }
+            };
+            // Normalize like stock: case-insensitive, with the SINGLE optional
+            // dash after `UTF` — NOT arbitrary dash removal. Stock accepts exactly
+            // utf8/utf-8, utf16/utf-16, utf16le/utf-16le, utf16be/utf-16be and
+            // rejects mangled spellings such as `U-T-F-8` / `UTF--16` /
+            // `utf-16-le` (bd-ntuz0 b). `UTF-16` resolves to native UTF-16le.
+            let normalized: String = requested.chars().flat_map(char::to_lowercase).collect();
             let target = match normalized.as_str() {
-                "utf8" => TextEncoding::Utf8,
-                "utf16" | "utf16le" => TextEncoding::Utf16le,
-                "utf16be" => TextEncoding::Utf16be,
+                "utf8" | "utf-8" => TextEncoding::Utf8,
+                "utf16" | "utf-16" | "utf16le" | "utf-16le" => TextEncoding::Utf16le,
+                "utf16be" | "utf-16be" => TextEncoding::Utf16be,
                 _ => {
                     return Err(FrankenError::function_error(format!(
                         "unsupported encoding: {requested}"
