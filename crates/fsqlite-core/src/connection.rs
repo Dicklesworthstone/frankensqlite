@@ -62863,9 +62863,8 @@ impl Connection {
         if !self.select_has_bare_pragma_table_function(select) {
             return Cow::Borrowed(select);
         }
-        let cte_names = Self::top_level_cte_names(select);
         let mut owned = select.clone();
-        self.rewrite_bare_pragma_in_body(&mut owned.body, &cte_names);
+        self.rewrite_bare_pragma_in_statement(&mut owned, &[]);
         Cow::Owned(owned)
     }
 
@@ -62890,8 +62889,22 @@ impl Connection {
     /// bd-bzd19 L11: stock resolves `pragma_database_list` (etc.) in every one
     /// of those positions, so the bare-to-call rewrite must reach all of them.
     fn select_has_bare_pragma_table_function(&self, select: &SelectStatement) -> bool {
-        let cte_names = Self::top_level_cte_names(select);
-        self.select_body_has_bare_pragma_tvf(&select.body, &cte_names)
+        self.statement_has_bare_pragma_tvf(select, &[])
+    }
+
+    /// Whether any SELECT core reachable from `stmt` — including its CTE
+    /// definition bodies and nested subqueries — has a bare pragma TVF source.
+    /// bd-7p5z3(a): the walk must reach `WITH w AS (SELECT ... FROM
+    /// pragma_database_list)` bodies, not only the primary query. Expression-
+    /// position subqueries (e.g. `SELECT (SELECT count(*) FROM
+    /// pragma_database_list)`) remain a separate gap tracked on bd-7p5z3.
+    fn statement_has_bare_pragma_tvf(&self, stmt: &SelectStatement, outer_scope: &[String]) -> bool {
+        let scope = Self::extend_cte_scope(outer_scope, stmt);
+        stmt.with.as_ref().is_some_and(|with| {
+            with.ctes
+                .iter()
+                .any(|cte| self.statement_has_bare_pragma_tvf(&cte.query, &scope))
+        }) || self.select_body_has_bare_pragma_tvf(&stmt.body, &scope)
     }
 
     fn select_body_has_bare_pragma_tvf(&self, body: &SelectBody, cte_names: &[String]) -> bool {
@@ -62934,8 +62947,7 @@ impl Connection {
             }
             TableOrSubquery::ParenJoin(from) => self.from_clause_has_bare_pragma_tvf(from, cte_names),
             TableOrSubquery::Subquery { query, .. } => {
-                let inner_scope = Self::extend_cte_scope(cte_names, query);
-                self.select_body_has_bare_pragma_tvf(&query.body, &inner_scope)
+                self.statement_has_bare_pragma_tvf(query, cte_names)
             }
             TableOrSubquery::TableFunction { .. } => false,
         }
@@ -62954,6 +62966,20 @@ impl Connection {
             || cte_names
                 .iter()
                 .any(|cte_name| cte_name.eq_ignore_ascii_case(name))
+    }
+
+    /// Rewrite bare pragma TVFs everywhere in a statement: its CTE definition
+    /// bodies first (so `WITH w AS (SELECT ... FROM pragma_database_list)`
+    /// resolves), then the primary/compound bodies. Mirrors the detection walk
+    /// in [`Self::statement_has_bare_pragma_tvf`]. bd-7p5z3(a).
+    fn rewrite_bare_pragma_in_statement(&self, stmt: &mut SelectStatement, outer_scope: &[String]) {
+        let scope = Self::extend_cte_scope(outer_scope, stmt);
+        if let Some(with) = &mut stmt.with {
+            for cte in &mut with.ctes {
+                self.rewrite_bare_pragma_in_statement(&mut cte.query, &scope);
+            }
+        }
+        self.rewrite_bare_pragma_in_body(&mut stmt.body, &scope);
     }
 
     fn rewrite_bare_pragma_in_body(&self, body: &mut SelectBody, cte_names: &[String]) {
@@ -63006,8 +63032,7 @@ impl Connection {
                 self.rewrite_bare_pragma_in_from_clause(from, cte_names);
             }
             TableOrSubquery::Subquery { query, .. } => {
-                let inner_scope = Self::extend_cte_scope(cte_names, query);
-                self.rewrite_bare_pragma_in_body(&mut query.body, &inner_scope);
+                self.rewrite_bare_pragma_in_statement(query, cte_names);
             }
             TableOrSubquery::TableFunction { .. } => {}
         }

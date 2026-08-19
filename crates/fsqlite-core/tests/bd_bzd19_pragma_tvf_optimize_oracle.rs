@@ -172,6 +172,39 @@ fn nested_cte_shadows_bare_pragma_tvf_in_subquery() {
 }
 
 // ---------------------------------------------------------------------------
+// bd-7p5z3(a): the bare pragma-TVF rewrite must also reach CTE *definition*
+// bodies, not just the main/compound/subquery FROM positions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bare_pragma_tvf_in_cte_body() {
+    asupersync::test_utils::run_test(|| async {
+        agree(
+            &[],
+            "WITH w AS (SELECT name FROM pragma_database_list) SELECT name FROM w",
+            "bd-7p5z3(a): bare pragma_database_list inside a CTE definition body",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn bare_pragma_tvf_in_cte_body_sibling_shadow() {
+    asupersync::test_utils::run_test(|| async {
+        // The sibling CTE named pragma_database_list shadows the pragma-TVF for
+        // the bare reference inside w's body, exactly as in stock.
+        agree(
+            &[],
+            "WITH pragma_database_list(x) AS (SELECT 7), \
+                  w AS (SELECT x FROM pragma_database_list) \
+             SELECT x FROM w",
+            "bd-7p5z3(a): a sibling CTE shadows the pragma-TVF inside another CTE body",
+        )
+        .await;
+    });
+}
+
+// ---------------------------------------------------------------------------
 // L7: PRAGMA optimize on a read-only connection is a silent no-op.
 // ---------------------------------------------------------------------------
 
