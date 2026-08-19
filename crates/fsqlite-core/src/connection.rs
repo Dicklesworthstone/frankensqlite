@@ -49111,10 +49111,20 @@ impl Connection {
                 .is_none_or(|table| !table.without_rowid)
         };
         let projected_columns = if is_rowid_table {
+            // Project the IMPLICIT rowid via the shadow-aware alias, mirroring the
+            // DELETE collector (bd-uur1d) and the RAISE(IGNORE) UPDATE rewrite's
+            // own `ignore_skip_rowid_alias` skip-filter (~35151): on a table with a
+            // user column literally named `rowid`, bare `rowid` resolves to that
+            // USER column, so the IN-list would carry user values against a true-
+            // rowid filter and match the wrong rows. `ignore_skip_rowid_alias`
+            // picks the first of rowid/_rowid_/oid that is NOT a user column, so it
+            // always resolves to the true rowid (bd-zaar8). `OLD.rowid`/`NEW.rowid`
+            // in trigger bodies still resolve the user column from the `*` below.
+            let rowid_alias = self.ignore_skip_rowid_alias(&update.table.name.name);
             vec![
                 ResultColumn::Expr {
                     expr: Expr::Column(
-                        fsqlite_ast::ColumnRef::bare("rowid"),
+                        fsqlite_ast::ColumnRef::bare(rowid_alias),
                         fsqlite_ast::Span::new(0, 0),
                     ),
                     alias: None,
