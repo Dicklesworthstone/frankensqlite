@@ -11346,11 +11346,15 @@ impl VdbeEngine {
                                                             &index_desc_flags,
                                                             &index_collations,
                                                             &BUILTIN_COLLATION_REGISTRY,
-                                                            // Unique-index prefix fast-path ordering;
-                                                            // BINARY-on-UTF-16 index-key order is
-                                                            // bld9w.5 (index keys). Utf8 keeps today's
-                                                            // behavior on this admission-gated path.
-                                                            TextEncoding::Utf8,
+                                                            // bd-7c6g7 #7: on-disk index-key order
+                                                            // follows the DB storage encoding
+                                                            // (bld9w.5). The unique-index blind-append
+                                                            // fast path must compare its ascending
+                                                            // check under the SAME encoding as the
+                                                            // sibling probes — a hardcoded Utf8 here
+                                                            // mis-orders a UTF-16 DB's keys and can
+                                                            // append out of order.
+                                                            sc.text_encoding,
                                                         ) == Ordering::Less)
                                                             .then_some(new_prefix)
                                                     })
