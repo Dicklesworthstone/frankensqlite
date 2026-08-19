@@ -104834,6 +104834,26 @@ fn rewrite_row_value_comparisons_in_select_core(core: &mut SelectCore) {
 }
 
 ///
+/// True when a subquery's SELECT projects a wildcard (`*` or `table.*`) in any
+/// branch, so its result width cannot be determined without a resolved FROM
+/// scope. Used to fail open in `rewrite_in_expr`'s row-value classification,
+/// which carries no CTE scope and would otherwise under-count a `SELECT *` over
+/// an out-of-scope CTE (bd-wpiq6 M8).
+fn select_projects_wildcard(select: &SelectStatement) -> bool {
+    let core_projects_wildcard = |core: &SelectCore| match core {
+        SelectCore::Select { columns, .. } => columns
+            .iter()
+            .any(|column| matches!(column, ResultColumn::Star | ResultColumn::TableStar(_))),
+        SelectCore::Values(_) => false,
+    };
+    core_projects_wildcard(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| core_projects_wildcard(core))
+}
+
 /// When `rewrite_in_subqueries` is true, eagerly evaluate ALL
 /// `IN (SELECT ...)` into literal lists.  When false, only eagerly
 /// evaluate IN subqueries that VDBE codegen cannot handle (those with
@@ -105098,14 +105118,24 @@ fn rewrite_in_expr<'a>(
                         _ => 1,
                     }
                 };
+                // This rewrite carries no CTE scope, so `select_result_column_count`
+                // under-counts a `SELECT *` subquery over an out-of-scope CTE to 1.
+                // Fail OPEN: a wildcard-projecting subquery peer's true width may be
+                // >1, so treat it as row-value-capable rather than forcing the
+                // scalar rule (and a false arity error) on the OTHER operand
+                // (bd-wpiq6 M8). Explicit-column widths stay authoritative.
+                let operand_may_be_row_value = |expr: &Expr| -> bool {
+                    operand_width(expr) > 1
+                        || matches!(expr, Expr::Subquery(sub, _) if select_projects_wildcard(sub))
+                };
                 // Grant the exemption only when the operand IS the subquery:
                 // if it merely contains one deeper down (CASE arm, function
                 // argument), that inner position is scalar and must keep the
                 // arity error.
-                let left_faces_row_value =
-                    matches!(left.as_ref(), Expr::Subquery(_, _)) && operand_width(right) > 1;
-                let right_faces_row_value =
-                    matches!(right.as_ref(), Expr::Subquery(_, _)) && operand_width(left) > 1;
+                let left_faces_row_value = matches!(left.as_ref(), Expr::Subquery(_, _))
+                    && operand_may_be_row_value(right);
+                let right_faces_row_value = matches!(right.as_ref(), Expr::Subquery(_, _))
+                    && operand_may_be_row_value(left);
                 {
                     let _row_value_guard = BoolCellRestoreGuard::new(
                         &conn.scalar_subquery_row_value_context,
