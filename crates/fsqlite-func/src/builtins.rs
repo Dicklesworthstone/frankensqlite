@@ -2532,14 +2532,23 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 i += 1;
                 let p = params.get(param_idx).map_or(0, SqliteValue::to_integer);
                 param_idx += 1;
-                // bd-9zzr0 L1: SQLite takes the ABSOLUTE value of a negative
-                // dynamic precision (unlike C's "no precision") —
-                // printf('%.*d', -3, 42) == printf('%.3d', 42) == '042'.
-                precision = Some(
-                    usize::try_from(p.unsigned_abs())
-                        .unwrap_or(usize::MAX)
-                        .min(100_000_000),
-                );
+                // bd-9zzr0 L1 / bd-77dkj: SQLite takes the ABSOLUTE value of a
+                // negative dynamic precision (unlike C's "no precision") —
+                // printf('%.*d', -3, 42) == printf('%.3d', 42) == '042'. Stock
+                // first CASTS the precision arg to i32, so a huge i64 like
+                // -4294967293 becomes i32 3 ('042'), NOT a 100M-digit zero-pad
+                // blowup; and INT32_MIN (no positive counterpart) escapes to
+                // "no precision".
+                let p32 = p as i32;
+                precision = if p32 == i32::MIN {
+                    None
+                } else {
+                    Some(
+                        usize::try_from(p32.unsigned_abs())
+                            .unwrap_or(usize::MAX)
+                            .min(100_000_000),
+                    )
+                };
             } else {
                 let mut prec = 0usize;
                 while i < chars.len() && chars[i].is_ascii_digit() {
@@ -2888,12 +2897,15 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 };
                 // bd-9zzr0 M9: %c precision is a REPEAT count for the emitted
                 // char — printf('%.5c', 'A') == "AAAAA". Without precision the
-                // char is emitted once; an empty argument emits none.
+                // char is emitted once; an empty argument emits none. bd-77dkj:
+                // precision 0 (and 1) still emits the char ONCE — stock clamps
+                // the repeat count to a minimum of 1 (printf('%.0c','A') == 'A'),
+                // it does NOT drop the char like a naive repeat(0) would.
                 // Field width applies, counted in CHARACTERS (the '0' flag is
                 // ignored — padding is always spaces, right- or left-justified;
                 // bd-ul4c0/bd-47mu0).
                 let content = match text.chars().next() {
-                    Some(c) => c.to_string().repeat(precision.unwrap_or(1)),
+                    Some(c) => c.to_string().repeat(precision.map_or(1, |p| p.max(1))),
                     None => String::new(),
                 };
                 let pad = width.saturating_sub(content.chars().count());
@@ -6103,6 +6115,16 @@ mod tests {
         assert_eq!(run(&[txt("[%.3q]"), txt("ab'cdef")]), "[ab'']");
         assert_eq!(run(&[txt("[%.3Q]"), txt("ab'cdef")]), "['ab''']");
         assert_eq!(run(&[txt("[%.3w]"), txt("a\"bcdef")]), "[a\"\"b]");
+        // bd-77dkj: %c precision 0 (and 1) still emits the char ONCE (min repeat 1);
+        // stock printf('%.0c','A') == 'A', not '' (a naive repeat(0) dropped it).
+        assert_eq!(run(&[txt("[%.0c]"), txt("A")]), "[A]");
+        assert_eq!(run(&[txt("[%.1c]"), txt("A")]), "[A]");
+        // bd-77dkj: a dynamic precision is CAST TO i32 first. A huge i64 like
+        // -4294967293 becomes i32 3 -> "042" (not a 100M-digit zero-pad blowup);
+        // INT32_MIN escapes to "no precision".
+        assert_eq!(run(&[txt("[%.*d]"), int(-4_294_967_293), int(42)]), "[042]");
+        assert_eq!(run(&[txt("[%.*d]"), int(-2_147_483_648), int(42)]), "[42]");
+        assert_eq!(run(&[txt("[%.*d]"), int(-1), int(42)]), "[42]");
     }
 
     #[test]
