@@ -688,7 +688,23 @@ impl DatabaseNamespaceBinding {
             return Err(cannot_open(&self.stable_path));
         }
         match self.probe_generation() {
-            GenerationProbe::Current => Ok(()),
+            // bd-r3dt7: re-check quiesced AFTER the probe. Between the leading
+            // `is_quiesced()` and this probe a peer could have superseded and
+            // quiesced this binding (releasing its advisory locks), then renamed
+            // the same identity back onto the stable path — so the probe reads
+            // `Current` on a now-lock-less lease. Without this re-check that one
+            // call would report the quiesced binding as a live generation (only
+            // the NEXT call fails closed on the leading `is_quiesced()`). The
+            // re-check runs through the same lease mutex as `quiesce()`, so it
+            // linearizes against a concurrent supersession and closes the
+            // one-call resurrection window.
+            GenerationProbe::Current => {
+                if self.is_quiesced() {
+                    Err(cannot_open(&self.stable_path))
+                } else {
+                    Ok(())
+                }
+            }
             GenerationProbe::Superseded => {
                 // The bound generation is provably gone: release the retained
                 // descriptors/locks so they cannot write through the superseded
