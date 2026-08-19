@@ -60,13 +60,13 @@ const SETUP: &[&str] = &[
     "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
     "CREATE VIEW vw AS SELECT id, v FROM t",
     "CREATE TRIGGER vw_ins INSTEAD OF INSERT ON vw BEGIN \
-       SELECT CASE WHEN NEW.v < 0 THEN RAISE(IGNORE) END; \
+       SELECT RAISE(IGNORE) WHERE NEW.v < 0; \
        INSERT INTO t(id, v) VALUES (NEW.id, NEW.v); END",
     "CREATE TRIGGER vw_del INSTEAD OF DELETE ON vw BEGIN \
-       SELECT CASE WHEN OLD.v = 10 THEN RAISE(IGNORE) END; \
+       SELECT RAISE(IGNORE) WHERE OLD.v = 10; \
        DELETE FROM t WHERE id = OLD.id; END",
     "CREATE TRIGGER vw_upd INSTEAD OF UPDATE ON vw BEGIN \
-       SELECT CASE WHEN NEW.v = 999 THEN RAISE(IGNORE) END; \
+       SELECT RAISE(IGNORE) WHERE NEW.v = 999; \
        UPDATE t SET v = NEW.v WHERE id = OLD.id; END",
 ];
 
@@ -129,6 +129,50 @@ fn non_ignored_rows_still_return() {
             SETUP,
             "INSERT INTO vw(id, v) VALUES (5, 50), (6, 60) RETURNING id, v",
             "M3: rows that are NOT ignored must still return normally",
+        )
+        .await;
+    });
+}
+
+// L9: a user column literally named `rowid` shadows the implicit rowid. The
+// RAISE(IGNORE) skip-filter rewrites the DML to `<rowid> IN (<true rowids>)`;
+// using the shadowed column name would match the wrong rows (or none).
+#[test]
+fn update_ignore_skip_filter_survives_user_rowid_column() {
+    asupersync::test_utils::run_test(|| async {
+        agree(
+            &[
+                "CREATE TABLE t(rowid INTEGER, v INTEGER)",
+                "INSERT INTO t VALUES (100, 1), (200, 2), (300, 3)",
+                "CREATE TRIGGER trg BEFORE UPDATE ON t BEGIN \
+                   SELECT RAISE(IGNORE) WHERE NEW.v = 12; END",
+                "UPDATE t SET v = v + 10",
+            ],
+            "SELECT rowid, v FROM t ORDER BY rowid",
+            "L9 UPDATE: only the true non-ignored rows update (100->11, 200 kept, 300->13)",
+        )
+        .await;
+    });
+}
+
+#[test]
+#[ignore = "bd-1mcjr L9 DELETE still RED: on a table with a user `rowid` column the \
+RAISE(IGNORE) rewrite now emits `_rowid_ IN (<true rowids>)` (is_rowid_ref recognizes \
+`_rowid_`), but the recompiled DELETE deletes nothing — a deeper codegen issue in the \
+compile_table_delete `_rowid_ IN` recompile path (the UPDATE path works via \
+execute_update_row_by_row). Follow-up: bd-uur1d."]
+fn delete_ignore_skip_filter_survives_user_rowid_column() {
+    asupersync::test_utils::run_test(|| async {
+        agree(
+            &[
+                "CREATE TABLE t(rowid INTEGER, v INTEGER)",
+                "INSERT INTO t VALUES (100, 1), (200, 2), (300, 3)",
+                "CREATE TRIGGER trg BEFORE DELETE ON t BEGIN \
+                   SELECT RAISE(IGNORE) WHERE OLD.v = 2; END",
+                "DELETE FROM t",
+            ],
+            "SELECT rowid, v FROM t ORDER BY rowid",
+            "L9 DELETE: only the ignored row (200) survives",
         )
         .await;
     });

@@ -35017,9 +35017,11 @@ impl Connection {
                                 })
                             })
                             .collect();
+                        let rowid_alias =
+                            self.ignore_skip_rowid_alias(&effective_update.table.name.name);
                         effective_update.where_clause = Some(Expr::In {
                             expr: Box::new(Expr::Column(
-                                fsqlite_ast::ColumnRef::bare("rowid"),
+                                fsqlite_ast::ColumnRef::bare(rowid_alias),
                                 fsqlite_ast::Span::new(0, 0),
                             )),
                             not: false,
@@ -35239,9 +35241,11 @@ impl Connection {
                         self.reset_statement_change_count();
                         return Ok(Vec::new());
                     }
+                    let rowid_alias =
+                        self.ignore_skip_rowid_alias(&effective_delete.table.name.name);
                     effective_delete.where_clause = Some(Expr::In {
                         expr: Box::new(Expr::Column(
-                            fsqlite_ast::ColumnRef::bare("rowid"),
+                            fsqlite_ast::ColumnRef::bare(rowid_alias),
                             fsqlite_ast::Span::new(0, 0),
                         )),
                         not: false,
@@ -35324,9 +35328,11 @@ impl Connection {
                                 })
                             })
                             .collect();
+                        let rowid_alias =
+                            self.ignore_skip_rowid_alias(&effective_delete.table.name.name);
                         effective_delete.where_clause = Some(Expr::In {
                             expr: Box::new(Expr::Column(
-                                fsqlite_ast::ColumnRef::bare("rowid"),
+                                fsqlite_ast::ColumnRef::bare(rowid_alias),
                                 fsqlite_ast::Span::new(0, 0),
                             )),
                             not: false,
@@ -41574,6 +41580,32 @@ impl Connection {
                 .map(|column| column.name.clone())
                 .collect()
         })
+    }
+
+    /// bd-1mcjr L9: the RAISE(IGNORE) row-skip filter rewrites the DML to
+    /// `<rowid> IN (<matched true rowids>)`. A user column named `rowid` (or
+    /// `_rowid_` / `oid`) shadows the implicit rowid, so an unqualified `rowid`
+    /// there would resolve to that column and filter the WRONG rows. Return the
+    /// first rowid alias NOT used as a column name; fall back to `rowid` only
+    /// when a table shadows all three (a case SQLite itself cannot address by
+    /// name).
+    fn ignore_skip_rowid_alias(&self, table_name: &str) -> &'static str {
+        let columns: Option<Vec<String>> = self.schema_index_of(table_name).and_then(|index| {
+            self.schema.borrow().get(index).map(|table| {
+                table
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect()
+            })
+        });
+        let Some(columns) = columns else {
+            return "rowid";
+        };
+        ["rowid", "_rowid_", "oid"]
+            .into_iter()
+            .find(|alias| !columns.iter().any(|c| c.eq_ignore_ascii_case(alias)))
+            .unwrap_or("rowid")
     }
 
     /// Index of the unqualified view binding by case-insensitive name.
