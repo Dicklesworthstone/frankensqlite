@@ -3697,13 +3697,25 @@ pub fn parallel_wal_coordinator_for_path(db_path: &Path) -> CoordinatorRef {
 
 /// Remove a parallel WAL coordinator for the given database path.
 pub fn remove_parallel_wal_coordinator(db_path: &Path) {
-    if let Some(coordinators) = PARALLEL_WAL_COORDINATORS.get() {
+    // bd-xv5cm M5: extract the coordinator under the global map lock, then
+    // release the lock BEFORE the blocking `stop()` (which joins the epoch-ticker
+    // thread via `BlockingTaskHandle::wait()`). Holding
+    // `PARALLEL_WAL_COORDINATORS` across that join pins the process-global
+    // registry behind a blocking wait, serializing every OTHER path's
+    // coordinator lookup/teardown behind an unrelated coordinator's shutdown
+    // (and would deadlock outright should the joined work ever need the map).
+    // The map removal is O(1); the join must run outside the critical section.
+    let Some(coordinators) = PARALLEL_WAL_COORDINATORS.get() else {
+        return;
+    };
+    let coordinator = {
         let mut coordinators = coordinators
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(coordinator) = coordinators.remove(db_path) {
-            coordinator.stop();
-        }
+        coordinators.remove(db_path)
+    };
+    if let Some(coordinator) = coordinator {
+        coordinator.stop();
     }
 }
 
@@ -4064,6 +4076,47 @@ mod tests {
         assert!(Arc::ptr_eq(&coord1, &coord2));
 
         // Cleanup.
+        remove_parallel_wal_coordinator(&path);
+    }
+
+    #[test]
+    fn test_remove_coordinator_stops_running_ticker_bd_xv5cm_m5() {
+        // bd-xv5cm M5: `remove_parallel_wal_coordinator` must release the global
+        // `PARALLEL_WAL_COORDINATORS` map lock BEFORE the blocking `stop()`, which
+        // joins the epoch-ticker thread via `BlockingTaskHandle::wait()`.
+        // Previously the join ran while the map lock was held, pinning the
+        // process-global registry behind an unrelated coordinator's shutdown
+        // (a latency/deadlock hazard). This exercises the real running-ticker
+        // removal path — registered in the map + a live ticker — which no other
+        // test covers (they remove without a ticker, or stop() without removal):
+        // the removal must join/stop the ticker and drop the map entry, no hang.
+        let path = PathBuf::from("/tmp/bd_xv5cm_m5_remove_running_ticker.db");
+        // Clear any entry a prior run left in the process-global map.
+        remove_parallel_wal_coordinator(&path);
+
+        let runtime = test_runtime();
+        let cx = test_cx();
+        let coordinator = parallel_wal_coordinator_for_path(&path);
+        coordinator
+            .start_on_runtime(&runtime.handle(), &cx)
+            .expect("epoch ticker should start");
+        assert!(coordinator.is_running(), "ticker must be running before removal");
+
+        // Extracts the coordinator under the map lock, then joins the ticker
+        // OUTSIDE the lock.
+        remove_parallel_wal_coordinator(&path);
+
+        // The removed coordinator's ticker was joined/stopped ...
+        assert!(
+            !coordinator.is_running(),
+            "removal must stop (join) the running ticker"
+        );
+        // ... and its map entry is gone (a fresh lookup builds a NEW coordinator).
+        let fresh = parallel_wal_coordinator_for_path(&path);
+        assert!(
+            !Arc::ptr_eq(&fresh, &coordinator),
+            "remove_parallel_wal_coordinator must drop the map entry"
+        );
         remove_parallel_wal_coordinator(&path);
     }
 
