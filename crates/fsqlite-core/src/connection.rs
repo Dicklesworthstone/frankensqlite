@@ -44575,10 +44575,19 @@ impl Connection {
                 // that case a bare `DELETE FROM t INDEXED BY pi` empties the table
                 // like stock instead of failing with "no query solution". When
                 // the truncate opt is disabled (WHERE, a trigger, RETURNING, or an
-                // FK parent), stock opens the index and errors, so keep the check.
+                // *enforced* FK parent), stock opens the index and errors, so keep
+                // the check.
+                //
+                // bd-1m280: stock `sqlite3FkRequired` is FALSE when PRAGMA
+                // foreign_keys is OFF (the default), so a WHERE-less DELETE on an
+                // FK-parent table still takes the truncate opt then. A static
+                // parent check wrongly disabled the truncate with fk OFF, so frank
+                // erred on an uncovered forced partial index where stock silently
+                // truncates. Gate the parent check on FK enforcement.
                 let uses_truncate_opt = delete.where_clause.is_none()
                     && delete.returning.is_empty()
-                    && !self.table_is_foreign_key_parent(&delete.table.name.name)
+                    && !(self.fk_enforcement_enabled()
+                        && self.table_is_foreign_key_parent(&delete.table.name.name))
                     && !self.has_matching_triggers(
                         &delete.table.name.name,
                         fsqlite_ast::TriggerTiming::Before,
