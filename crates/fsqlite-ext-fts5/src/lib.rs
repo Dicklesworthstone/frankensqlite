@@ -1820,6 +1820,11 @@ pub fn encode_contentless_delete_all_flush(
     structure.levels.clear();
     structure.write_counter = structure.write_counter.saturating_add(1);
 
+    // delete-all clears the index, so zero the ranking averages: total_rows and
+    // every token total go to 0 (there are no indexed documents left). For an
+    // EXTERNAL-CONTENT table the rows still live in the content source and stay
+    // visible via the preserved `_docsize` shadow (bd-2mzkj) — the averages
+    // record counts INDEXED documents, of which there are now none.
     let averages = Fts5AveragesRecord::new(0, vec![0; column_count]);
 
     Ok(Fts5DeleteAllFlush {
@@ -9631,7 +9636,25 @@ impl Fts5Table {
 
         let metadata = self.apply_config_rows(&rows.config)?;
         if self.config.content_mode() != ContentMode::Contentless || !rows.content.is_empty() {
-            self.apply_content_rows(&rows.content);
+            if rows.content.is_empty() && !rows.docsize.is_empty() {
+                // bd-2mzkj: an EXTERNAL-CONTENT table (content='<table>') with no
+                // persisted segments — e.g. after 'delete-all' cleared the index —
+                // keeps no internal `_content`, so `rows.content` is empty even
+                // though the rows still exist in the content source (which
+                // FrankenSQLite never re-reads on reload). Recover the document set
+                // from the preserved `_docsize` rowids with NULL-projected columns:
+                // `count(*)` and non-MATCH scans then see every row, while MATCH
+                // stays empty (no postings). Without this, `apply_content_rows(&[])`
+                // would rebuild an empty corpus and report `count(*) = 0`.
+                let documents = rows
+                    .docsize
+                    .iter()
+                    .map(|row| (row.rowid, Vec::new()))
+                    .collect();
+                self.rebuild_documents(documents);
+            } else {
+                self.apply_content_rows(&rows.content);
+            }
         } else {
             self.rebuild_documents(Vec::new());
         }
