@@ -33758,6 +33758,19 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Select(select) => {
+                // bd-pgqsk M6: fold `<never-true-const> AND E` in the filter
+                // clauses (WHERE/HAVING/JOIN-ON) BEFORE any execution routing, so
+                // an aggregate / GROUP BY shape reaches the right branch with the
+                // dead (possibly erroring) subquery already dropped — the routing
+                // otherwise excludes those shapes from the short-circuit path.
+                let mut folded_select_owner;
+                let select = if select_has_foldable_filter_never_true_and(select) {
+                    folded_select_owner = select.clone();
+                    fold_select_filters_never_true(&mut folded_select_owner);
+                    &folded_select_owner
+                } else {
+                    select
+                };
                 // bd-c9v0f + bd-pw68x: reject out-of-range ORDER BY/GROUP BY
                 // ordinals and unknown INDEXED BY hints, matching SQLite.
                 self.validate_select_ordinals_and_hints(select)?;
@@ -96702,12 +96715,18 @@ async fn rewrite_in_select_core(
             }
         }
         if let Some(wh) = where_clause.as_mut() {
+            // Filter context: fold `<never-true-const> AND E` -> 0 so an erroring
+            // subquery in the dead branch is dropped, not eagerly hoisted below
+            // (bd-pgqsk M6). Covers aggregate / GROUP BY shapes too, since it
+            // rewrites the predicate itself rather than gating a routing choice.
+            fold_never_true_and_in_filter(wh);
             rewrite_in_expr(wh, conn, rewrite_in, params).await?;
         }
         for expr in group_by.iter_mut() {
             rewrite_in_expr(expr, conn, rewrite_in, params).await?;
         }
         if let Some(hv) = having.as_mut() {
+            fold_never_true_and_in_filter(hv);
             rewrite_in_expr(hv, conn, rewrite_in, params).await?;
         }
         for window in windows.iter_mut() {
@@ -96721,6 +96740,7 @@ async fn rewrite_in_select_core(
         if let Some(from) = from.as_mut() {
             for join in from.joins.iter_mut() {
                 if let Some(JoinConstraint::On(on_expr)) = join.constraint.as_mut() {
+                    fold_never_true_and_in_filter(on_expr);
                     rewrite_in_expr(on_expr, conn, rewrite_in, params).await?;
                 }
             }
@@ -119100,6 +119120,187 @@ fn validate_registered_collation(collation: &str, registry: &CollationRegistry) 
         Err(FrankenError::FunctionError(format!(
             "no such collation sequence: {collation}"
         )))
+    }
+}
+
+/// Fold a purely-constant expression to its `SqliteValue`, for the filter-context
+/// truth test in [`fold_never_true_and_in_filter`]. Returns `None` for anything
+/// that is not a compile-time constant (a column, subquery, function, …), which
+/// is left for normal evaluation. (bd-pgqsk M6)
+fn try_fold_constant_value(expr: &Expr) -> Option<SqliteValue> {
+    match expr {
+        Expr::Literal(literal, _) => match literal {
+            Literal::Null => Some(SqliteValue::Null),
+            Literal::Integer(n) => Some(SqliteValue::Integer(*n)),
+            Literal::Float(f) => Some(SqliteValue::Float(*f)),
+            Literal::String(s) => Some(SqliteValue::Text(s.clone().into())),
+            Literal::Blob(b) => Some(SqliteValue::Blob(b.clone().into())),
+            Literal::True => Some(SqliteValue::Integer(1)),
+            Literal::False => Some(SqliteValue::Integer(0)),
+            Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOp::Plus,
+            expr: inner,
+            ..
+        } => try_fold_constant_value(inner),
+        Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr: inner,
+            ..
+        } => match try_fold_constant_value(inner)? {
+            SqliteValue::Integer(n) => Some(SqliteValue::Integer(n.wrapping_neg())),
+            SqliteValue::Float(f) => Some(SqliteValue::Float(-f)),
+            SqliteValue::Null => Some(SqliteValue::Null),
+            _ => None,
+        },
+        Expr::Collate { expr: inner, .. } => try_fold_constant_value(inner),
+        _ => None,
+    }
+}
+
+/// True when `expr` is a compile-time constant that can never be TRUE (NULL or a
+/// falsy value), so a filter-context `AND` with it as one operand is never TRUE.
+fn and_operand_is_constant_never_true(expr: &Expr) -> bool {
+    try_fold_constant_value(expr).is_some_and(|value| !is_sqlite_truthy(&value))
+}
+
+/// In a FILTER context (WHERE / HAVING / JOIN-ON), fold every `X AND Y`
+/// conjunction whose one operand is a constant that can never be TRUE down to the
+/// integer literal `0`. The conjunction can never be TRUE, so the row is filtered
+/// and the OTHER operand is never evaluated — matching stock's short-circuit.
+/// Folding it BEFORE the eager subquery hoist in `rewrite_in_expr` drops any
+/// erroring subquery in the dead branch instead of materializing it.
+///
+/// Descends only through `AND`/`OR` (both preserve filter-truth under the
+/// NULL-or-FALSE => FALSE rewrite); a `NOT` inverts that equivalence, so it — and
+/// every value position — is left untouched. Only integer `0` is folded in a
+/// VALUE context (that stays in `rewrite_in_expr`): a value-context `NULL AND E`
+/// is `NULL`/`FALSE` and must evaluate `E`, which stock does. (bd-pgqsk M6)
+fn fold_never_true_and_in_filter(expr: &mut Expr) {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+            span,
+        } => {
+            let span = *span;
+            fold_never_true_and_in_filter(left);
+            fold_never_true_and_in_filter(right);
+            if and_operand_is_constant_never_true(left)
+                || and_operand_is_constant_never_true(right)
+            {
+                *expr = Expr::Literal(Literal::Integer(0), span);
+            }
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            fold_never_true_and_in_filter(left);
+            fold_never_true_and_in_filter(right);
+        }
+        _ => {}
+    }
+}
+
+/// Cheap detector mirroring [`fold_never_true_and_in_filter`]'s reach: true iff
+/// some `AND` reachable through `AND`/`OR` has a constant-never-true operand, so
+/// the fold would change `expr`. Used to avoid cloning a SELECT when nothing
+/// folds. (bd-pgqsk M6)
+fn filter_expr_has_never_true_and(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            and_operand_is_constant_never_true(left)
+                || and_operand_is_constant_never_true(right)
+                || filter_expr_has_never_true_and(left)
+                || filter_expr_has_never_true_and(right)
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => filter_expr_has_never_true_and(left) || filter_expr_has_never_true_and(right),
+        _ => false,
+    }
+}
+
+/// Apply [`fold_never_true_and_in_filter`] to a SELECT core's filter clauses
+/// (WHERE / HAVING / JOIN-ON). (bd-pgqsk M6)
+fn fold_select_core_filters_never_true(core: &mut SelectCore) {
+    if let SelectCore::Select {
+        where_clause,
+        having,
+        from,
+        ..
+    } = core
+    {
+        if let Some(wh) = where_clause.as_mut() {
+            fold_never_true_and_in_filter(wh);
+        }
+        if let Some(hv) = having.as_mut() {
+            fold_never_true_and_in_filter(hv);
+        }
+        if let Some(from) = from.as_mut() {
+            for join in from.joins.iter_mut() {
+                if let Some(JoinConstraint::On(on)) = join.constraint.as_mut() {
+                    fold_never_true_and_in_filter(on);
+                }
+            }
+        }
+    }
+}
+
+/// True iff any filter clause (WHERE / HAVING / JOIN-ON) of `select` or a
+/// compound arm holds a foldable never-true `AND`. (bd-pgqsk M6)
+fn select_has_foldable_filter_never_true_and(select: &SelectStatement) -> bool {
+    let core_has = |core: &SelectCore| {
+        let SelectCore::Select {
+            where_clause,
+            having,
+            from,
+            ..
+        } = core
+        else {
+            return false;
+        };
+        where_clause
+            .as_ref()
+            .is_some_and(|expr| filter_expr_has_never_true_and(expr))
+            || having
+                .as_ref()
+                .is_some_and(|expr| filter_expr_has_never_true_and(expr))
+            || from.as_ref().is_some_and(|from| {
+                from.joins.iter().any(|join| {
+                    matches!(&join.constraint, Some(JoinConstraint::On(on))
+                        if filter_expr_has_never_true_and(on))
+                })
+            })
+    };
+    core_has(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| core_has(core))
+}
+
+/// Fold every never-true filter `AND` across a SELECT and its compound arms,
+/// BEFORE execution routing, so aggregate / GROUP BY shapes reach the correct
+/// branch with a dead subquery already dropped. (bd-pgqsk M6)
+fn fold_select_filters_never_true(select: &mut SelectStatement) {
+    fold_select_core_filters_never_true(&mut select.body.select);
+    for (_, core) in select.body.compounds.iter_mut() {
+        fold_select_core_filters_never_true(core);
     }
 }
 
