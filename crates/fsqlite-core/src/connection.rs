@@ -14795,7 +14795,11 @@ impl Connection {
                 index.name, BOUNDED_VALIDATION_MAX_RECORD_BYTES
             )));
         }
-        let record = serialize_record(&values);
+        // bd-7c6g7 #6: serialize the expected index key under the DB storage
+        // encoding so it matches the on-disk key byte-exact. A UTF-8-hardcoded
+        // serialize on a UTF-16 database made every recomputed key diverge and
+        // the bounded integrity checker report false corruption on a clean image.
+        let record = serialize_record_with_encoding(&values, self.db_text_encoding.get());
         if record.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
             return Err(Self::bounded_validation_refusal(format!(
                 "index `{}` computed record {} exceeds the fixed {}-byte bound",
@@ -14873,12 +14877,13 @@ impl Connection {
                 .await?
         {
             let payload_values =
-                parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{}` rowid {rowid} payload is not a valid SQLite record",
-                        table.name
-                    ),
-                })?;
+                parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                            table.name
+                        ),
+                    })?;
             let row_values = Self::inflate_table_row_values_for_integrity(
                 table,
                 rowid,
@@ -14963,9 +14968,10 @@ impl Connection {
                     )));
                 }
                 let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: format!("index `{}` contains an invalid record", index.name),
-                    })?;
+                    parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!("index `{}` contains an invalid record", index.name),
+                        })?;
                 if values.len() != index.key_term_count().saturating_add(1)
                     || !matches!(values.last(), Some(SqliteValue::Integer(_)))
                 {
@@ -15075,13 +15081,20 @@ impl Connection {
                 loop {
                     position = position.checked_add(1).ok_or(FrankenError::TooBig)?;
                     let payload = walk.payload(cx).await?;
-                    let payload_values =
-                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "WITHOUT ROWID table `{}` row {position} payload is not a valid SQLite record",
-                                table.name
-                            ),
-                        })?;
+                    // bd-7c6g7 #6: decode the row under the DB storage encoding so
+                    // index-key/NOCASE/FK transforms run on real codepoints, not
+                    // UTF-8 mojibake of a UTF-16 payload (which reported a clean
+                    // image as corrupt).
+                    let payload_values = parse_record_with_encoding(
+                        &payload,
+                        self.db_text_encoding.get(),
+                    )
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "WITHOUT ROWID table `{}` row {position} payload is not a valid SQLite record",
+                            table.name
+                        ),
+                    })?;
                     let row_values = Self::inflate_table_row_values_for_integrity(
                         table,
                         position,
@@ -15179,9 +15192,10 @@ impl Connection {
                     )));
                 }
                 let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: format!("index `{}` contains an invalid record", index.name),
-                    })?;
+                    parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!("index `{}` contains an invalid record", index.name),
+                        })?;
                 if values.len() != expected_entry_len {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -15470,12 +15484,13 @@ impl Connection {
                     )));
                 }
                 let stored =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "FOREIGN KEY parent index `{}` yielded an invalid record",
-                            index.name
-                        ),
-                    })?;
+                    parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "FOREIGN KEY parent index `{}` yielded an invalid record",
+                                index.name
+                            ),
+                        })?;
                 if stored.len() != index.key_term_count().saturating_add(1)
                     || !matches!(stored.last(), Some(SqliteValue::Integer(_)))
                 {
