@@ -942,6 +942,16 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// purely a latency-hiding hint and must not affect correctness.
     fn prefetch_page_hint(&self, _cx: &Cx, _page_no: PageNumber) {}
 
+    /// Drop a just-freed page's buffer from the shared page cache.
+    ///
+    /// Default is a no-op. Pager-backed transactions override it to evict the
+    /// buffer so the bounded DROP teardown path (bd-pirr5, GH#371) releases each
+    /// freed page's memory instead of retaining the whole b-tree in the pool.
+    /// The page is already on the freelist and re-read fresh if it is
+    /// re-allocated, so this only bounds resident memory and never affects
+    /// correctness.
+    fn forget_cached_page(&self, _page_no: PageNumber) {}
+
     /// Write a page within this transaction.
     ///
     /// Acquires a page-level lock and records the write for SSI
@@ -1816,6 +1826,10 @@ impl TransactionHandle for TransactionKind {
 
     fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
         dispatch_transaction_kind!(self, txn => txn.prefetch_page_hint(cx, page_no));
+    }
+
+    fn forget_cached_page(&self, page_no: PageNumber) {
+        dispatch_transaction_kind!(self, txn => txn.forget_cached_page(page_no));
     }
 
     fn write_page<'a>(

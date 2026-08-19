@@ -22075,6 +22075,21 @@ where
         }
     }
 
+    fn forget_cached_page(&self, page_no: PageNumber) {
+        // bd-pirr5 (GH#371): drop a just-freed page from BOTH resident caches so a
+        // bounded DROP teardown keeps only its DFS working set in memory instead
+        // of the whole b-tree (and its overflow chains). Without this a large
+        // WITHOUT-ROWID teardown exhausts the buffer pool / grows RSS with table
+        // size. The page is already on the freelist and re-read fresh if it is
+        // re-allocated, so this only bounds resident memory.
+        //   1. the shared page pool (mirrors the checkpoint/truncate eviction);
+        //   2. the per-transaction read cache, which otherwise retains a cloned
+        //      PageData for every page read during the walk up to the pool
+        //      capacity — the term that made RSS still track table size.
+        self.cache.evict(page_no);
+        self.txn_read_cache.borrow_mut().remove(&page_no);
+    }
+
     fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
         if self.has_pending_recovery_barrier() {
             return;
