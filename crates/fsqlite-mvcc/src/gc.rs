@@ -503,7 +503,7 @@ mod tests {
     /// values `[1, 2, ..., n]`, linked newest→oldest. Returns the head index
     /// and the list of all allocated indices (oldest first).
     fn build_chain(
-        arena: &mut VersionArena,
+        arena: &VersionArena,
         pgno: PageNumber,
         n: u32,
     ) -> (VersionIdx, Vec<VersionIdx>) {
@@ -521,7 +521,7 @@ mod tests {
 
     /// Helper: build a chain and install the head into a `ChainHeadTable`.
     fn build_chain_in_table(
-        arena: &mut VersionArena,
+        arena: &VersionArena,
         chain_heads: &ChainHeadTable,
         pgno: PageNumber,
         n: u32,
@@ -711,7 +711,7 @@ mod tests {
 
         // Build chain: seq 1 → 2 → 3 → 4 → 5 (head=5).
         let chain_heads = ChainHeadTable::new();
-        let (_head, indices) = build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
+        let (_head, indices) = build_chain_in_table(&arena, &chain_heads, pgno, 5);
 
         // Horizon at seq 3 means: keep version 3 as the last safe version.
         // Versions 1 and 2 should be freed.
@@ -751,7 +751,7 @@ mod tests {
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(4242).unwrap();
         let chain_heads = ChainHeadTable::new();
-        build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
+        build_chain_in_table(&arena, &chain_heads, pgno, 5);
         let registry = Arc::new(VersionGuardRegistry::default());
         let before = GLOBAL_EBR_METRICS.snapshot();
 
@@ -786,7 +786,7 @@ mod tests {
         let pgno = PageNumber::new(7).unwrap();
 
         let chain_heads = ChainHeadTable::new();
-        build_chain_in_table(&mut arena, &chain_heads, pgno, 3);
+        build_chain_in_table(&arena, &chain_heads, pgno, 3);
 
         // Horizon at 0: everything is above it — no pruning.
         let horizon = CommitSeq::new(0);
@@ -846,7 +846,7 @@ mod tests {
         let pgno = PageNumber::new(10).unwrap();
 
         let chain_heads = ChainHeadTable::new();
-        build_chain_in_table(&mut arena, &chain_heads, pgno, 8);
+        build_chain_in_table(&arena, &chain_heads, pgno, 8);
 
         let free_before = arena.free_count();
 
@@ -888,7 +888,7 @@ mod tests {
 
         // Chain: seq 1, 2, 3, 4, 5, 6, 7, 8, 9, 10.
         let chain_heads = ChainHeadTable::new();
-        let (head, indices) = build_chain_in_table(&mut arena, &chain_heads, pgno, 10);
+        let (head, indices) = build_chain_in_table(&arena, &chain_heads, pgno, 10);
 
         // Horizon at 6: a snapshot at commit_seq 6 would see version 6.
         // Versions 7-10 are above horizon (needed by newer snapshots).
@@ -930,7 +930,7 @@ mod tests {
         // Set up 3 pages, each with 5 versions.
         for i in 1..=3 {
             let pgno = PageNumber::new(i).unwrap();
-            build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
+            build_chain_in_table(&arena, &chain_heads, pgno, 5);
             todo.enqueue(pgno);
         }
 
@@ -959,7 +959,7 @@ mod tests {
             .collect();
 
         for &pgno in &pages {
-            build_chain_in_table(&mut arena, &chain_heads, pgno, 12);
+            build_chain_in_table(&arena, &chain_heads, pgno, 12);
         }
 
         let duplicate_pressure = [8_u32, 1, 8, 3, 5, 3, 2, 7, 6, 4, 1];
@@ -1051,7 +1051,7 @@ mod tests {
         // Enqueue 100 pages (more than GC_PAGES_BUDGET=64).
         for i in 1..=100 {
             let pgno = PageNumber::new(i).unwrap();
-            build_chain_in_table(&mut arena, &chain_heads, pgno, 3);
+            build_chain_in_table(&arena, &chain_heads, pgno, 3);
             todo.enqueue(pgno);
         }
 
@@ -1086,7 +1086,7 @@ mod tests {
         // Page 6: budget=0, loop exits.
         for i in 1..=10 {
             let pgno = PageNumber::new(i).unwrap();
-            build_chain_in_table(&mut arena, &chain_heads, pgno, 1000);
+            build_chain_in_table(&arena, &chain_heads, pgno, 1000);
             todo.enqueue(pgno);
         }
 
@@ -1120,7 +1120,7 @@ mod tests {
 
         for i in 1..=8 {
             let pgno = PageNumber::new(i).unwrap();
-            build_chain_in_table(&mut arena, &chain_heads, pgno, 1025);
+            build_chain_in_table(&arena, &chain_heads, pgno, 1025);
             todo.enqueue(pgno);
         }
 
@@ -1223,7 +1223,7 @@ mod tests {
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(1).unwrap();
         let chain_heads = ChainHeadTable::new();
-        build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
+        build_chain_in_table(&arena, &chain_heads, pgno, 5);
 
         // This compiles and runs: proof that prune_page_chain is pure in-memory.
         let result = prune_page_chain(pgno, CommitSeq::new(3), &mut arena, &chain_heads);
@@ -1247,7 +1247,7 @@ mod tests {
 
         for i in 1..=100 {
             let pgno = PageNumber::new(i).unwrap();
-            build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
+            build_chain_in_table(&arena, &chain_heads, pgno, 5);
             todo.enqueue(pgno);
         }
         assert_eq!(todo.len(), 100);
@@ -1297,7 +1297,7 @@ mod tests {
 
         // Chain: seq 1, 2, 3, 4, 5 (head=5).
         let chain_heads = ChainHeadTable::new();
-        build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
+        build_chain_in_table(&arena, &chain_heads, pgno, 5);
 
         // Horizon at 3: keep versions 3,4,5. Free versions 1,2.
         let result = prune_page_chain(pgno, CommitSeq::new(3), &mut arena, &chain_heads);
@@ -1335,7 +1335,7 @@ mod tests {
         // 3 pages, each with 5 versions.
         for i in 1..=3 {
             let pgno = PageNumber::new(i).unwrap();
-            build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
+            build_chain_in_table(&arena, &chain_heads, pgno, 5);
             todo.enqueue(pgno);
         }
 
@@ -1365,7 +1365,7 @@ mod tests {
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(33).unwrap();
         let chain_heads = ChainHeadTable::new();
-        let (_head, indices) = build_chain_in_table(&mut arena, &chain_heads, pgno, 10);
+        let (_head, indices) = build_chain_in_table(&arena, &chain_heads, pgno, 10);
 
         // Active transaction started at begin_seq=5 → horizon cannot go past 5.
         let horizon = CommitSeq::new(5);
@@ -1395,7 +1395,7 @@ mod tests {
 
         for page in 1_u32..=64 {
             let pgno = PageNumber::new(page).expect("page number in range");
-            build_chain_in_table(&mut arena, &chain_heads, pgno, 1_000);
+            build_chain_in_table(&arena, &chain_heads, pgno, 1_000);
         }
 
         let mut todo = GcTodo::new();
@@ -1427,7 +1427,7 @@ mod tests {
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(777).unwrap();
         let chain_heads = ChainHeadTable::new();
-        build_chain_in_table(&mut arena, &chain_heads, pgno, 40);
+        build_chain_in_table(&arena, &chain_heads, pgno, 40);
 
         let active_txns = 7_u64;
         let keep = active_txns + 1;
@@ -1461,7 +1461,7 @@ mod tests {
             let mut arena = VersionArena::new();
             let pgno = PageNumber::new(900).expect("fixed test pgno should be valid");
             let chain_heads = ChainHeadTable::new();
-            build_chain_in_table(&mut arena, &chain_heads, pgno, n);
+            build_chain_in_table(&arena, &chain_heads, pgno, n);
 
             let result = prune_page_chain(pgno, CommitSeq::new(horizon), &mut arena, &chain_heads);
 
@@ -1511,7 +1511,7 @@ mod tests {
             let pgno_step = PageNumber::new(901).expect("fixed test pgno should be valid");
             let mut arena_step = VersionArena::new();
             let chain_heads_step = ChainHeadTable::new();
-            build_chain_in_table(&mut arena_step, &chain_heads_step, pgno_step, n);
+            build_chain_in_table(&arena_step, &chain_heads_step, pgno_step, n);
 
             let r_low = prune_page_chain(
                 pgno_step,
@@ -1530,7 +1530,7 @@ mod tests {
             let pgno_direct = PageNumber::new(902).expect("fixed test pgno should be valid");
             let mut arena_direct = VersionArena::new();
             let chain_heads_direct = ChainHeadTable::new();
-            build_chain_in_table(&mut arena_direct, &chain_heads_direct, pgno_direct, n);
+            build_chain_in_table(&arena_direct, &chain_heads_direct, pgno_direct, n);
 
             let r_direct = prune_page_chain(
                 pgno_direct,
@@ -1560,7 +1560,7 @@ mod tests {
             let mut arena = VersionArena::new();
             let pgno = PageNumber::new(903).expect("fixed test pgno should be valid");
             let chain_heads = ChainHeadTable::new();
-            build_chain_in_table(&mut arena, &chain_heads, pgno, n);
+            build_chain_in_table(&arena, &chain_heads, pgno, n);
 
             let keep_u64 = u64::from(active_txns) + 1;
             let n_u64 = u64::from(n);
