@@ -870,7 +870,14 @@ pub fn decode_column_from_offset_reuse_with_encoding(
     // Fast path: if the hint's raw bytes match, reuse its Arc allocation.
     if let Some(hint) = hint {
         match (classify_serial_type(col.serial_type), hint) {
-            (SerialTypeClass::Text, SqliteValue::Text(arc)) if arc.as_bytes_direct() == bytes => {
+            // bd-gmruy: the hint holds CANONICAL (UTF-8) text bytes while `bytes`
+            // is the RAW record column — byte-identical only when the DB encoding
+            // is UTF-8. On UTF-16 a cached canonical value can coincide with
+            // unrelated raw bytes (cached "a\0" == raw `61 00` for 'a'), a false
+            // reuse; gate the TEXT fast path on UTF-8 (BLOBs are raw regardless).
+            (SerialTypeClass::Text, SqliteValue::Text(arc))
+                if encoding == TextEncoding::Utf8 && arc.as_bytes_direct() == bytes =>
+            {
                 if profile_enabled {
                     note_decoded_value(hint);
                 }
@@ -919,7 +926,14 @@ pub fn decode_column_from_offset_reuse_with_encoding_shared(
     // Fast path: if the hint's raw bytes match, reuse its Arc allocation.
     if let Some(hint) = hint {
         match (classify_serial_type(col.serial_type), hint) {
-            (SerialTypeClass::Text, SqliteValue::Text(arc)) if arc.as_bytes_direct() == bytes => {
+            // bd-gmruy: the hint holds CANONICAL (UTF-8) text bytes while `bytes`
+            // is the RAW record column — byte-identical only when the DB encoding
+            // is UTF-8. On UTF-16 a cached canonical value can coincide with
+            // unrelated raw bytes (cached "a\0" == raw `61 00` for 'a'), a false
+            // reuse; gate the TEXT fast path on UTF-8 (BLOBs are raw regardless).
+            (SerialTypeClass::Text, SqliteValue::Text(arc))
+                if encoding == TextEncoding::Utf8 && arc.as_bytes_direct() == bytes =>
+            {
                 if profile_enabled {
                     note_decoded_value(hint);
                 }

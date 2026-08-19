@@ -18709,7 +18709,14 @@ async fn find_conflicting_rowid_in_index_collated(
                 desc_flags,
                 collations,
                 collation_registry,
-                sc.text_encoding,
+                // bd-gmruy: BOTH operands are raw `parse_record` decodes (DB-encoded
+                // bytes reinterpreted as UTF-8), so compare them byte-wise under
+                // `Utf8` — exactly as bd-nmd19 fixed the sibling blind-append guard.
+                // Passing `sc.text_encoding` here would transcode the already-raw
+                // bytes a second time; it is equality-preserving for valid injective
+                // input (hence symptom-free today) but inconsistent, and SQLite's
+                // ASCII-only NOCASE still folds correctly on the raw bytes.
+                TextEncoding::Utf8,
             ) == Ordering::Equal
         {
             let rowid = index_entry_rowid_at(
