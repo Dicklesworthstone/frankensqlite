@@ -61744,15 +61744,11 @@ impl Connection {
         let event = fsqlite_ast::TriggerEvent::Insert;
         let mut returning_rows = Vec::new();
         for new_values in &new_rows {
-            self.fire_instead_of_triggers(
-                &view_name,
-                &column_names,
-                &event,
-                None,
-                Some(new_values),
-            )
-            .await?;
-            if !insert.returning.is_empty() {
+            let skipped = self
+                .fire_instead_of_triggers(&view_name, &column_names, &event, None, Some(new_values))
+                .await?;
+            // bd-1mcjr M3: a RAISE(IGNORE) row is skipped — emit no RETURNING row.
+            if !skipped && !insert.returning.is_empty() {
                 returning_rows.push(self.project_instead_of_view_returning(
                     &insert.returning,
                     &column_names,
@@ -61819,16 +61815,18 @@ impl Connection {
                     &mut new_values,
                 )?;
             }
-            self.fire_instead_of_triggers(
-                &view_name,
-                &column_names,
-                &event,
-                Some(&old_values),
-                Some(&new_values),
-            )
-            .await?;
-            // RETURNING references the post-update (NEW) row.
-            if !update.returning.is_empty() {
+            let skipped = self
+                .fire_instead_of_triggers(
+                    &view_name,
+                    &column_names,
+                    &event,
+                    Some(&old_values),
+                    Some(&new_values),
+                )
+                .await?;
+            // RETURNING references the post-update (NEW) row; a RAISE(IGNORE)
+            // row is skipped and emits no RETURNING row (bd-1mcjr M3).
+            if !skipped && !update.returning.is_empty() {
                 returning_rows.push(self.project_instead_of_view_returning(
                     &update.returning,
                     &column_names,
@@ -61854,16 +61852,12 @@ impl Connection {
         let event = fsqlite_ast::TriggerEvent::Delete;
         let mut returning_rows = Vec::new();
         for (_old_rowid, old_values) in &old_rows {
-            self.fire_instead_of_triggers(
-                &view_name,
-                &column_names,
-                &event,
-                Some(old_values),
-                None,
-            )
-            .await?;
-            // RETURNING references the deleted (OLD) row.
-            if !delete.returning.is_empty() {
+            let skipped = self
+                .fire_instead_of_triggers(&view_name, &column_names, &event, Some(old_values), None)
+                .await?;
+            // RETURNING references the deleted (OLD) row; a RAISE(IGNORE) row is
+            // skipped and emits no RETURNING row (bd-1mcjr M3).
+            if !skipped && !delete.returning.is_empty() {
                 returning_rows.push(self.project_instead_of_view_returning(
                     &delete.returning,
                     &column_names,
@@ -61986,6 +61980,10 @@ impl Connection {
     /// Fire all INSTEAD OF triggers on `view_name` matching `event`, binding a
     /// frame with the supplied OLD/NEW rows (indexed by `column_names`).
     /// Mirrors `fire_after_triggers` but uses a view-derived frame (no rowid).
+    /// Fire the INSTEAD OF triggers for a view DML event. Returns `true` when a
+    /// trigger body raised `RAISE(IGNORE)` (the row was skipped) so the caller
+    /// suppresses that row's `RETURNING` projection — matching stock SQLite,
+    /// which emits no RETURNING row for an ignored row (bd-1mcjr M3).
     async fn fire_instead_of_triggers(
         &self,
         view_name: &str,
@@ -61993,7 +61991,7 @@ impl Connection {
         event: &fsqlite_ast::TriggerEvent,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
@@ -62006,7 +62004,7 @@ impl Connection {
             .collect();
         drop(triggers);
         if matching.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let base_frame = TriggerFrame {
             table_name: view_name.to_owned(),
@@ -62041,11 +62039,11 @@ impl Connection {
                 bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
                 match self.execute_bound_trigger_statement(bound_stmt).await? {
                     TriggerStatementOutcome::Continue => {}
-                    TriggerStatementOutcome::SkipDml => return Ok(()),
+                    TriggerStatementOutcome::SkipDml => return Ok(true),
                 }
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     fn local_view_index_for_relation(&self, name: &QualifiedName) -> Option<usize> {
