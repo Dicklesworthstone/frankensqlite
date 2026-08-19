@@ -345,3 +345,129 @@ fn bd_2mzkj_external_content_delete_all_preserves_content_visibility() {
         assert_eq!(stock_match, 0, "stock: delete-all cleared the index");
     });
 }
+
+/// bd-plxob(a): after an external-content `'delete-all'`, a non-MATCH scan must
+/// project the REAL column bodies read from the content SOURCE — not NULL. The
+/// bd-2mzkj keeper above only asserts row COUNTS/MATCH; a NULL body still counts
+/// as a row, so this pins the actual values.
+#[test]
+fn bd_plxob_external_content_delete_all_projects_real_bodies() {
+    asupersync::test_utils::run_test(|| async {
+        fn body_values(rows: &[fsqlite_core::connection::Row]) -> Vec<Option<String>> {
+            rows.iter()
+                .map(|row| match &row.values()[0] {
+                    SqliteValue::Text(s) => Some(s.to_string()),
+                    SqliteValue::Null => None,
+                    other => panic!("unexpected body value: {other:?}"),
+                })
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("plxob_bodies.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db_str).await.unwrap();
+        conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, body TEXT);")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'hello world'), (2, 'foo bar');")
+            .await
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(body, content='src', content_rowid='id');")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t(rowid, body) VALUES (1, 'hello world'), (2, 'foo bar');")
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        // Reopen so t binds lazily — the state delete-all targets.
+        let conn = Connection::open(&db_str).await.unwrap();
+        conn.execute("INSERT INTO t(t) VALUES('delete-all');")
+            .await
+            .unwrap();
+
+        let bodies = body_values(&conn.query("SELECT body FROM t ORDER BY rowid;").await.unwrap());
+        assert_eq!(
+            bodies,
+            vec![Some("hello world".to_owned()), Some("foo bar".to_owned())],
+            "bd-plxob(a): external-content scan after delete-all must read bodies from the content source, not NULL"
+        );
+        conn.close().await.unwrap();
+
+        // Stock oracle reads the same image identically.
+        let stock = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = stock.prepare("SELECT body FROM t ORDER BY rowid;").unwrap();
+        let stock_bodies: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect();
+        assert_eq!(
+            stock_bodies,
+            vec!["hello world".to_owned(), "foo bar".to_owned()],
+            "stock: external-content bodies after delete-all"
+        );
+    });
+}
+
+/// bd-plxob(b): `INSERT INTO t(t) VALUES('rebuild')` on an external-content table
+/// must re-index the content SOURCE (stock behavior), not the empty in-memory
+/// documents. Previously frank rebuilt from `all_rows()` and produced count(*)=0.
+#[test]
+fn bd_plxob_external_content_rebuild_reindexes_source() {
+    asupersync::test_utils::run_test(|| async {
+        fn scalar(rows: &[fsqlite_core::connection::Row]) -> i64 {
+            match rows[0].values()[0] {
+                SqliteValue::Integer(n) => n,
+                ref other => panic!("expected integer, got {other:?}"),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("plxob_rebuild.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db_str).await.unwrap();
+        conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, body TEXT);")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'hello world'), (2, 'foo bar');")
+            .await
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(body, content='src', content_rowid='id');")
+            .await
+            .unwrap();
+
+        // No explicit INSERT INTO t: the index is empty until 'rebuild' pulls the
+        // rows from the content source.
+        conn.execute("INSERT INTO t(t) VALUES('rebuild');")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scalar(&conn.query("SELECT count(*) FROM t;").await.unwrap()),
+            2,
+            "bd-plxob(b): 'rebuild' must index the 2 source rows"
+        );
+        assert_eq!(
+            scalar(
+                &conn
+                    .query("SELECT count(*) FROM t WHERE t MATCH 'hello';")
+                    .await
+                    .unwrap()
+            ),
+            1,
+            "bd-plxob(b): 'rebuild' must make MATCH work against source content"
+        );
+        conn.close().await.unwrap();
+
+        // Stock oracle: the frank-written image is stock-readable and consistent.
+        let stock = rusqlite::Connection::open(&db_path).unwrap();
+        let integ: String = stock
+            .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integ, "ok", "stock integrity_check after external-content rebuild");
+    });
+}

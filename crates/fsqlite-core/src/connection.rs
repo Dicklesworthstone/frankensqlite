@@ -19842,13 +19842,70 @@ impl Connection {
                 ),
             })?;
         let root = page_number_from_schema_root(root_page, &docsize_name, "fts5 docsize shadow")?;
+
+        // bd-plxob: an EXTERNAL-content table (`content='<table>'`) keeps its bodies
+        // in the content SOURCE, which frank does not persist internally. After
+        // `'delete-all'` the in-memory documents are empty, so a NULL-projected scan
+        // diverges from stock (which reads the source). Read the source table by
+        // rowid here and project the real column values. A true contentless table
+        // (`content=''`) has no source and correctly keeps the NULL projection.
+        let content_source = self.fts5_external_content_source_schema(src);
+        let rowid_alias_columns = self.rowid_alias_columns.borrow().clone();
+        let col_count = src.col_names.len();
+
         self.with_integrity_txn(async |cx, txn| {
+            let content_by_rowid = if let Some(content_table) = &content_source {
+                let (page_size, reserved_per_page) = {
+                    let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+                    let header = parse_database_header_checked(page1.as_ref())?;
+                    (header.page_size, header.reserved_per_page)
+                };
+                let source_rows = self
+                    .read_storage_table_rows_for_reload(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        content_table,
+                        &rowid_alias_columns,
+                    )
+                    .await?;
+                let mut map: HashMap<i64, Vec<SqliteValue>> =
+                    HashMap::with_capacity(source_rows.len());
+                for (source_rowid, values) in source_rows {
+                    // Mirror the reload projection
+                    // (read_fts5_rootpage_zero_content_rows_for_reload): the content
+                    // table carries the rowid-alias column first, then one column per
+                    // FTS5 column in declaration order.
+                    let content_values = if values.len() == col_count.saturating_add(1) {
+                        &values[1..]
+                    } else {
+                        values.as_slice()
+                    };
+                    let mut projected: Vec<SqliteValue> =
+                        content_values.iter().take(col_count).cloned().collect();
+                    while projected.len() < col_count {
+                        projected.push(SqliteValue::Null);
+                    }
+                    map.insert(source_rowid, projected);
+                }
+                Some(map)
+            } else {
+                None
+            };
+
             let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
             let mut rows = Vec::new();
             if cursor.first(cx).await? {
                 loop {
                     let rowid = cursor.rowid(cx).await?;
-                    let mut row = vec![SqliteValue::Null; src.col_names.len()];
+                    let mut row = match &content_by_rowid {
+                        Some(map) => map
+                            .get(&rowid)
+                            .cloned()
+                            .unwrap_or_else(|| vec![SqliteValue::Null; col_count]),
+                        None => vec![SqliteValue::Null; col_count],
+                    };
                     if src.hidden_rowid_projection.is_some() {
                         row.push(SqliteValue::Integer(rowid));
                     }
@@ -19861,6 +19918,117 @@ impl Connection {
             Ok(rows)
         })
         .await
+    }
+
+    /// bd-plxob: resolve the external content SOURCE table for a `content='<table>'`
+    /// FTS5 vtab so lazy scans can project real column bodies from it. Returns
+    /// `None` for internal-content (`_content`-backed) or true contentless
+    /// (`content=''`) tables — neither has an external source to read.
+    #[cfg(feature = "ext-fts5")]
+    fn fts5_external_content_source_schema(&self, src: &JoinTableSource) -> Option<TableSchema> {
+        let content_name = {
+            let ddl = self.original_ddl_sql.borrow();
+            let create_sql = ddl.get(&src.table_name.to_ascii_lowercase())?;
+            let Ok(Statement::CreateVirtualTable(create_stmt)) = parse_single_statement(create_sql)
+            else {
+                return None;
+            };
+            if !create_stmt.module.eq_ignore_ascii_case("fts5") {
+                return None;
+            }
+            let name = virtual_table_option_value(&create_stmt.args, "content")?;
+            if name.is_empty() {
+                return None; // contentless: no source
+            }
+            name
+        };
+        self.schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&content_name))
+            .cloned()
+    }
+
+    /// bd-plxob(b): read the EXTERNAL content SOURCE rows for a `'rebuild'`,
+    /// projecting each row's FTS5 columns as text (the shape `insert_document`
+    /// consumes). Stock's `'rebuild'` re-indexes the content source; frank's old
+    /// path re-indexed the in-memory documents, which are empty after a lazy
+    /// delete-all — leaving `count(*)=0`. Returns `None` for non-external tables
+    /// (the caller then rebuilds from the in-memory documents, as before).
+    #[cfg(feature = "ext-fts5")]
+    async fn fts5_read_external_content_rows_for_rebuild(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<Vec<(i64, Vec<String>)>>> {
+        let (content_table, col_count) = {
+            let ddl = self.original_ddl_sql.borrow();
+            let Some(create_sql) = ddl.get(&table_name.to_ascii_lowercase()) else {
+                return Ok(None);
+            };
+            let Ok(Statement::CreateVirtualTable(create_stmt)) = parse_single_statement(create_sql)
+            else {
+                return Ok(None);
+            };
+            if !create_stmt.module.eq_ignore_ascii_case("fts5") {
+                return Ok(None);
+            }
+            let Some(content_name) = virtual_table_option_value(&create_stmt.args, "content") else {
+                return Ok(None);
+            };
+            if content_name.is_empty() {
+                return Ok(None); // contentless: no source
+            }
+            let col_count = parse_virtual_table_column_infos(&create_stmt.args).len();
+            let Some(content_table) = self
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&content_name))
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            (content_table, col_count)
+        };
+        let rowid_alias_columns = self.rowid_alias_columns.borrow().clone();
+        let rows = self
+            .with_integrity_txn(async |cx, txn| {
+                let (page_size, reserved_per_page) = {
+                    let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+                    let header = parse_database_header_checked(page1.as_ref())?;
+                    (header.page_size, header.reserved_per_page)
+                };
+                let source_rows = self
+                    .read_storage_table_rows_for_reload(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        &content_table,
+                        &rowid_alias_columns,
+                    )
+                    .await?;
+                Ok(source_rows
+                    .into_iter()
+                    .map(|(rowid, values)| {
+                        let content_values = if values.len() == col_count.saturating_add(1) {
+                            &values[1..]
+                        } else {
+                            values.as_slice()
+                        };
+                        (
+                            rowid,
+                            content_values
+                                .iter()
+                                .take(col_count)
+                                .map(SqliteValue::to_text)
+                                .collect::<Vec<String>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await?;
+        Ok(Some(rows))
     }
 
     /// Promote a lazy on-disk FTS5 table into the in-memory representation for
@@ -47469,6 +47637,14 @@ impl Connection {
         match command {
             Fts5MaintenanceCommand::Optimize => {}
             Fts5MaintenanceCommand::Rebuild => {
+                // bd-plxob(b): for EXTERNAL content, `'rebuild'` re-indexes the
+                // content SOURCE (stock behavior), not the in-memory documents,
+                // which are empty after a lazy delete-all (leaving count(*)=0).
+                // Read the source rows up front (needs a txn) before borrowing the
+                // instance. `None` => not external content: rebuild from all_rows().
+                let external_rows = self
+                    .fts5_read_external_content_rows_for_rebuild(insert.table.name.as_str())
+                    .await?;
                 let key = insert.table.name.to_ascii_uppercase();
                 let mut instances = self.vtab_instances.borrow_mut();
                 #[cfg(feature = "ext-fts5")]
@@ -47477,7 +47653,7 @@ impl Connection {
                 {
                     fts5.ensure_rebuild_supported()?;
                     fts5.ensure_shadow_rows_materializable_for_mutation()?;
-                    let rows = fts5.all_rows();
+                    let rows = external_rows.unwrap_or_else(|| fts5.all_rows());
                     for (rowid, _) in &rows {
                         fts5.delete_document(*rowid);
                     }
