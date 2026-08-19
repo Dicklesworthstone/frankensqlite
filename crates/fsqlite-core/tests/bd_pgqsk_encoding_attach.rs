@@ -148,6 +148,77 @@ fn bd_pgqsk_m7_empty_attach_adopts_main_encoding() {
     });
 }
 
+/// bd-lzbku (a): attaching a brand-new EMPTY file to a UTF-16 main adopts the
+/// encoding only IN MEMORY and DEFERS the on-disk header persist to the aux's
+/// first write. If the aux is DETACHed before any write, it was never
+/// materialized as UTF-16, so it re-ATTACHes cleanly to a UTF-8 main. Before the
+/// fix the eager ATTACH-time persist stamped UTF-16 into the still-empty aux and
+/// this re-ATTACH was rejected as cross-encoding.
+#[test]
+fn bd_lzbku_unwritten_empty_aux_reattaches_to_utf8_main() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let main16 = dir.path().join("m16.db").to_string_lossy().into_owned();
+        let main8 = dir.path().join("m8.db").to_string_lossy().into_owned();
+        let aux = dir.path().join("aux.db");
+        let aux_str = aux.to_string_lossy().into_owned();
+
+        // UTF-16 main; ATTACH empty aux (adopts UTF-16 in-memory, defers persist);
+        // DETACH WITHOUT writing to the aux -> never materialized as UTF-16.
+        let c16 = Connection::open(&main16).await.unwrap();
+        c16.execute("PRAGMA encoding = 'UTF-16le';").await.unwrap();
+        c16.execute("CREATE TABLE m(a);").await.unwrap();
+        c16.execute(&format!("ATTACH '{aux_str}' AS aux;"))
+            .await
+            .unwrap_or_else(|e| panic!("empty cross-encoding ATTACH must succeed: {e:?}"));
+        c16.execute("DETACH aux;").await.unwrap();
+        c16.close().await.unwrap();
+
+        // A UTF-8 (default) main re-ATTACHes the same, still-UTF-8, empty aux.
+        let c8 = Connection::open(&main8).await.unwrap();
+        c8.execute("CREATE TABLE m8(a);").await.unwrap();
+        c8.execute(&format!("ATTACH '{aux_str}' AS aux;"))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("re-ATTACH of an un-materialized empty aux to a UTF-8 main must succeed: {e:?}")
+            });
+        c8.close().await.unwrap();
+    });
+}
+
+/// bd-lzbku (b): a read-only main opens its attached databases schema-only
+/// (read-only pager). Attaching an empty aux to such a main must SUCCEED — the
+/// aux adopts the main's encoding in memory, and the deferred header persist is
+/// skipped entirely for a read-only aux (no write txn exists). Before the fix
+/// the eager ATTACH-time header write failed outright on the read-only pager.
+#[test]
+fn bd_lzbku_readonly_main_attaches_empty_aux() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let main16 = dir.path().join("m16.db").to_string_lossy().into_owned();
+        let aux = dir.path().join("aux.db");
+        let aux_str = aux.to_string_lossy().into_owned();
+
+        // Build a UTF-16 main, then reopen it READ-ONLY.
+        {
+            let w = Connection::open(&main16).await.unwrap();
+            w.execute("PRAGMA encoding = 'UTF-16le';").await.unwrap();
+            w.execute("CREATE TABLE m(a);").await.unwrap();
+            w.close().await.unwrap();
+        }
+        // A read-only main won't create the aux, so pre-create an empty file.
+        std::fs::File::create(&aux).unwrap();
+
+        let ro = Connection::open_schema_only(&main16).await.unwrap();
+        ro.execute(&format!("ATTACH '{aux_str}' AS aux;"))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("ATTACH of an empty aux to a read-only main must succeed: {e:?}")
+            });
+        ro.close().await.unwrap();
+    });
+}
+
 /// bd-dbpl2: the encoding choice is re-settable while the database is EMPTY
 /// (schema_cookie == 0) — a later `PRAGMA encoding` overrides the earlier one,
 /// matching stock — but becomes one-way (locked) after the first schema object.

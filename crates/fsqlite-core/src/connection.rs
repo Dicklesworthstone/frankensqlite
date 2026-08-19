@@ -53762,33 +53762,31 @@ impl Connection {
         }
         // bd-lzbku: before the caller's own changes, flush any deferred
         // adopted-encoding header persist. ATTACH of an empty aux adopts the main
-        // database's encoding in-memory and defers the on-disk page-1 write to
-        // here — the aux's first write txn. Re-enters `update_database_header_metadata`
-        // with `active_txn` already Some (auto=false), so it stamps page 1 within
-        // THIS txn and commits alongside the caller's changes. Kept out of the
-        // borrow below (it re-borrows `active_txn`); a failure folds into `result`
-        // so the auto path rolls back, and the flag is cleared only on success so a
-        // transient failure retries on the next write.
-        let pending_flush = match self.pending_adopted_header_encoding.get() {
-            Some(adopted) => {
-                let r = self
-                    .update_database_header_metadata(None, None, None, None, Some(adopted))
-                    .await;
-                if r.is_ok() {
-                    self.pending_adopted_header_encoding.set(None);
-                }
-                r
-            }
-            None => Ok(()),
-        };
-        let result = if let Err(e) = pending_flush {
-            Err(e)
-        } else {
+        // database's encoding in-memory and defers the on-disk page-1 write to the
+        // aux's first write txn (here). Stamp it DIRECTLY on this txn via
+        // `persist_text_encoding_in_txn` — never through a nested write-txn wrapper
+        // (`update_database_header_metadata`), which would re-enter this very flush
+        // with the flag still set and recurse forever. It thus commits atomically
+        // with the caller's changes. On success clear the flag; on failure fold into
+        // `result` so the auto path below rolls back and the still-set flag retries
+        // on the next write.
+        let result = {
             let mut guard = self.active_txn.borrow_mut();
             let txn = guard
                 .as_mut()
                 .ok_or_else(|| FrankenError::internal("transaction missing after ensure"))?;
-            f(&cx, txn).await
+            match self.pending_adopted_header_encoding.get() {
+                Some(adopted) => {
+                    match Self::persist_text_encoding_in_txn(&cx, txn, adopted).await {
+                        Ok(()) => {
+                            self.pending_adopted_header_encoding.set(None);
+                            f(&cx, txn).await
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                None => f(&cx, txn).await,
+            }
         };
         if auto {
             let mut guard = self.active_txn.borrow_mut();
@@ -68343,9 +68341,9 @@ impl Connection {
                 // unsupported; stock rejects it at prepare rather than silently
                 // ignoring it (bd-ntuz0 b).
                 _ => {
-                    return Err(FrankenError::function_error(
-                        "unsupported encoding".to_owned(),
-                    ));
+                    return Err(FrankenError::function_error(format!(
+                        "unsupported encoding: {expr}"
+                    )));
                 }
             };
             // Normalize like stock: case-insensitive, with the SINGLE optional
@@ -85747,6 +85745,37 @@ impl Connection {
     }
 
     // ── Schema cookie and change counter tracking (bd-3mmj) ─────────
+
+    /// bd-lzbku: stamp the database text `encoding` into page 1's header WITHIN an
+    /// existing write txn, WITHOUT re-entering `with_pager_write_txn`. Used to flush
+    /// the deferred adopted-encoding persist from inside the aux's first write txn
+    /// (a nested wrapper call would recurse back through that flush). Mirrors the
+    /// encoding branch of `update_database_header_metadata`.
+    async fn persist_text_encoding_in_txn(
+        cx: &Cx,
+        txn: &mut TransactionKind,
+        encoding: TextEncoding,
+    ) -> Result<()> {
+        let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+        let mut page_bytes = page1.as_ref().to_vec();
+        if page_bytes.len() < DATABASE_HEADER_SIZE {
+            return Err(FrankenError::internal(format!(
+                "page 1 too short for database header: {} bytes",
+                page_bytes.len()
+            )));
+        }
+        let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+        header_bytes.copy_from_slice(&page_bytes[..DATABASE_HEADER_SIZE]);
+        let mut header = DatabaseHeader::from_bytes(&header_bytes)
+            .map_err(|e| FrankenError::internal(format!("invalid database header: {e}")))?;
+        header.text_encoding = encoding;
+        let encoded = header
+            .to_bytes()
+            .map_err(|e| FrankenError::internal(format!("failed to encode header: {e}")))?;
+        page_bytes[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded);
+        txn.write_page(cx, PageNumber::ONE, &page_bytes).await?;
+        Ok(())
+    }
 
     /// Persist selected database header metadata fields on page 1.
     async fn update_database_header_metadata(
