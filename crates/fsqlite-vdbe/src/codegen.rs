@@ -19436,7 +19436,7 @@ fn codegen_select_group_by_aggregate(
                 distinct_flag,
                 0,
                 accum_reg,
-                P4::FuncName(agg.name.clone()),
+                agg_func_p4(&agg.name, agg.collation.as_ref()),
                 0,
             );
         } else {
@@ -19464,12 +19464,17 @@ fn codegen_select_group_by_aggregate(
                 emit_expr(b, extra_expr, extra_reg, None);
             }
             let step_p5 = u16::try_from(agg.num_args).unwrap_or_default();
+            // bd-lgwjd(a): thread the aggregate's declared collation into the
+            // GROUP BY substrate AggStep (a direct `max(name)` under GROUP BY was
+            // emitted BINARY here, ignoring `agg.collation`). `agg_func_p4` yields
+            // a plain FuncName when no collation is present, so non-collated
+            // aggregates are unchanged.
             b.emit_op(
                 Opcode::AggStep,
                 distinct_flag,
                 arg_base,
                 accum_reg,
-                P4::FuncName(agg.name.clone()),
+                agg_func_p4(&agg.name, agg.collation.as_ref()),
                 step_p5,
             );
         }
