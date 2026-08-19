@@ -987,6 +987,11 @@ static FSQLITE_CACHED_READ_SNAPSHOT_PARKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_BEGIN_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMMIT_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_MEMDB_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
+// bd-pfxzd (GH#368): times `reload_memdb_from_txn_with_mode` took the FULL
+// sqlite_master B-tree scan path (the schema-cookie fast path did NOT fire).
+// A per-write in-txn refresh that took the fast path (bd-ixf69) never lands
+// here; N INSERTs in one txn must keep this O(1), not O(N).
+static FSQLITE_MEMDB_TXN_SCHEMA_FULL_SCANS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_WRITE_TXN_REUSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_WRITE_TXN_PARKS: AtomicU64 = AtomicU64::new(0);
 // bd-otbu1 / I1: Retained autocommit counters for file-backed databases.
@@ -1293,6 +1298,10 @@ pub struct HotPathProfileSnapshot {
     pub commit_refresh_count: u64,
     /// bd-db300.5.2.2.1: Times memdb-from-pager refresh was executed (not skipped).
     pub memdb_refresh_count: u64,
+    /// bd-pfxzd (GH#368): times the in-txn memdb reload took the FULL sqlite_master
+    /// scan (the schema-cookie fast path missed). Must stay O(1) per transaction
+    /// regardless of write-statement count.
+    pub memdb_txn_schema_full_scans: u64,
     pub execute_body_time_ns: u64,
     pub direct_write_flush_calls: u64,
     pub direct_write_flush_time_ns: u64,
@@ -1749,6 +1758,7 @@ pub fn reset_hot_path_profile() {
     FSQLITE_BEGIN_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMMIT_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_MEMDB_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_MEMDB_TXN_SCHEMA_FULL_SCANS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_WRITE_TXN_REUSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_WRITE_TXN_PARKS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_RETAINED_AUTOCOMMIT_REUSES.store(0, AtomicOrdering::Relaxed);
@@ -1958,6 +1968,8 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         begin_refresh_count: FSQLITE_BEGIN_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
         commit_refresh_count: FSQLITE_COMMIT_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
         memdb_refresh_count: FSQLITE_MEMDB_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
+        memdb_txn_schema_full_scans: FSQLITE_MEMDB_TXN_SCHEMA_FULL_SCANS
+            .load(AtomicOrdering::Relaxed),
         execute_body_time_ns: FSQLITE_EXECUTE_BODY_TIME_NS.load(AtomicOrdering::Relaxed),
         direct_write_flush_calls: FSQLITE_DIRECT_WRITE_FLUSH_CALLS.load(AtomicOrdering::Relaxed),
         direct_write_flush_time_ns: FSQLITE_DIRECT_WRITE_FLUSH_TIME_NS
@@ -87077,6 +87089,13 @@ impl Connection {
             let eligible_preserved_live_vtab_keys = self
                 .pending_local_live_vtab_keys_for_reload(bound_visible_commit_seq, schema_cookie);
 
+            // bd-pfxzd (GH#368): reached only when the schema-cookie fast path did
+            // NOT fire — this is the O(corpus) sqlite_master scan the per-write
+            // in-txn refresh must avoid per statement (guarded by the reload-counter
+            // keeper: N INSERTs in one txn keep this O(1), not O(N)).
+            if hot_path_profile_enabled() {
+                FSQLITE_MEMDB_TXN_SCHEMA_FULL_SCANS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
             // Read sqlite_master entries from page 1's B-tree.
             let (master_entries, max_master_rowid) = {
                 let mut entries = Vec::new();
