@@ -57420,8 +57420,15 @@ impl Connection {
                     schema_table_index_or_view_name_exists(&schema, &views, new_name);
                 drop(views);
                 if name_conflicts {
-                    return Err(FrankenError::Internal(format!(
-                        "table, index, or view {new_name} already exists"
+                    // Stock sqlite3 reports SQLITE_ERROR with this exact message
+                    // for any rename onto an existing table/index/view name,
+                    // including a case-only (`t` -> `T`) or identical rename
+                    // (`name_conflicts` is computed case-insensitively). Verified
+                    // vs 3.46.1 CLI and bundled 3.53.2. `FunctionError` renders it
+                    // verbatim under SQLITE_ERROR; `Internal` would prefix
+                    // "internal error:" under SQLITE_INTERNAL. bd-3nppp.
+                    return Err(FrankenError::FunctionError(format!(
+                        "there is already another table or index with this name: {new_name}"
                     )));
                 }
                 let mut renamed_table = schema[table_idx].clone();
@@ -58220,15 +58227,23 @@ impl Connection {
     #[cfg(feature = "ext-fts5")]
     async fn execute_alter_table_rename_fts5(&self, old_name: &str, new_name: &str) -> Result<()> {
         // Reject a rename onto an existing table/index/view, mirroring the
-        // generic rename path's precedence.
+        // generic rename path's precedence. A case-only (`t` -> `T`) or an
+        // identical (`t` -> `t`) rename collides with the vtab's own name and
+        // is rejected too: stock sqlite3 never lets RENAME change a name's
+        // stored case. Checked case-insensitively so the collision fires here
+        // rather than falling through to `preflight_fts5_shadow_table_names`,
+        // which would misreport "internal error: table T_data already exists".
+        // Verified against both oracles (sqlite3 3.46.1 CLI and bundled 3.53.2
+        // via rusqlite): stock reports SQLITE_ERROR with this exact message.
+        // `FunctionError` renders the message verbatim under ErrorCode::Error
+        // (SQLITE_ERROR), matching stock; `Internal` would prefix "internal
+        // error:" under SQLITE_INTERNAL. bd-3nppp.
         {
             let schema = self.schema.borrow();
             let views = self.views.borrow();
-            if !old_name.eq_ignore_ascii_case(new_name)
-                && schema_table_index_or_view_name_exists(&schema, &views, new_name)
-            {
-                return Err(FrankenError::Internal(format!(
-                    "table, index, or view {new_name} already exists"
+            if schema_table_index_or_view_name_exists(&schema, &views, new_name) {
+                return Err(FrankenError::FunctionError(format!(
+                    "there is already another table or index with this name: {new_name}"
                 )));
             }
         }

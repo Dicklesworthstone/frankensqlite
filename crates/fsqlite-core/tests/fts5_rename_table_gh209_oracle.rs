@@ -257,6 +257,83 @@ fn fts5_rename_table_survives_reopen_gh209() {
 }
 
 #[test]
+fn fts5_case_only_rename_matches_stock_message_bd_3nppp() {
+    // bd-3nppp: `ALTER TABLE t RENAME TO T` (case-only) on an fts5 table must be
+    // REJECTED with stock sqlite3's exact message and error code, not frank's
+    // internal shadow-name preflight error ("internal error: table T_data
+    // already exists" / SQLITE_INTERNAL). Both oracles agree and reject with
+    // SQLITE_ERROR: "there is already another table or index with this name: T"
+    // (verified against sqlite3 3.46.1 CLI and bundled 3.53.2 via rusqlite).
+    // Stock never lets RENAME change a name's stored case. A non-fts5 control
+    // asserts the ordinary rename path matches the same stock message.
+    asupersync::test_utils::run_test(|| async {
+        // --- stock oracle (bundled, fts5-capable) ---
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        r.execute_batch("CREATE VIRTUAL TABLE t USING fts5(a, b);")
+            .unwrap();
+        let stock_msg = r
+            .execute_batch("ALTER TABLE t RENAME TO T;")
+            .expect_err("stock must reject a case-only fts5 rename")
+            .to_string();
+        assert_eq!(
+            stock_msg, "there is already another table or index with this name: T",
+            "stock oracle message drifted"
+        );
+
+        // --- frank: same op, error must match stock verbatim ---
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(a, b)")
+            .await
+            .expect("create fts5");
+        let frank_msg = conn
+            .execute("ALTER TABLE t RENAME TO T")
+            .await
+            .expect_err("frank must reject a case-only fts5 rename")
+            .to_string();
+        assert_eq!(
+            frank_msg, stock_msg,
+            "frank's case-only fts5 rename error must match stock verbatim"
+        );
+
+        // The vtab + its shadows must be untouched (reject, not partial-apply).
+        let names = frank_table_names(&conn).await;
+        for expected in ["t", "t_config", "t_content", "t_data", "t_docsize", "t_idx"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "fts5 table + shadows must survive the rejected rename, got {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == "T" || n.starts_with("T_")),
+            "no upper-cased catalog entries may appear after a rejected rename, got {names:?}"
+        );
+
+        // --- non-fts5 control: ordinary case-only rename, same stock message ---
+        let r2 = rusqlite::Connection::open_in_memory().unwrap();
+        r2.execute_batch("CREATE TABLE p(a, b);").unwrap();
+        let stock_ctrl = r2
+            .execute_batch("ALTER TABLE p RENAME TO P;")
+            .expect_err("stock must reject a case-only ordinary rename")
+            .to_string();
+        assert_eq!(
+            stock_ctrl,
+            "there is already another table or index with this name: P"
+        );
+        let conn2 = Connection::open(":memory:").await.unwrap();
+        conn2.execute("CREATE TABLE p(a, b)").await.unwrap();
+        let frank_ctrl = conn2
+            .execute("ALTER TABLE p RENAME TO P")
+            .await
+            .expect_err("frank must reject a case-only ordinary rename")
+            .to_string();
+        assert_eq!(
+            frank_ctrl, stock_ctrl,
+            "frank's ordinary case-only rename error must match stock verbatim"
+        );
+    });
+}
+
+#[test]
 fn non_fts5_rename_still_works_gh209() {
     // Regression guard: narrowing the live-vtab rename guard to FTS5 must not
     // disturb ordinary table renames.
