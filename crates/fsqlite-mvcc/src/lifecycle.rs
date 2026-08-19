@@ -884,8 +884,27 @@ impl TransactionManager {
             TransactionMode::Serialized
         };
 
-        let snapshot = self.load_consistent_snapshot();
         let snapshot_established = kind != BeginKind::Deferred;
+
+        // bd-9orb5: for a snapshot-establishing txn, publish a PROVISIONAL
+        // retention floor at the current committed watermark BEFORE loading the
+        // snapshot, then correct it to the exact `snapshot.high` after the load.
+        // Registration formerly happened only AFTER the load, leaving a window in
+        // which a concurrent `ssi_witness_publish` could compute the eviction
+        // floor `min_live_begin` without this txn (when it is the only would-be
+        // live txn, `drop_floor` degrades to `u64::MAX`) and safe-drop a
+        // committed witness with `commit_seq > this txn's begin` — leaving the
+        // rw-antidependency against that committer undiscoverable (a write-skew
+        // the M1 hardening otherwise closes). The watermark is monotonic and is
+        // read before the load, so `provisional <= snapshot.high`; the floor is
+        // therefore never higher than this txn's real begin and can never drop a
+        // witness this txn needs.
+        if snapshot_established {
+            let provisional = CommitSeq::new(self.shm.load_commit_seq().get());
+            self.register_active_snapshot(txn_id, provisional);
+        }
+
+        let snapshot = self.load_consistent_snapshot();
 
         let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snapshot, mode);
         // Pin an EBR guard so that any version retired during this txn's
@@ -896,6 +915,8 @@ impl TransactionManager {
         txn.snapshot_established = snapshot_established;
         if snapshot_established {
             mvcc_snapshot_established();
+            // Correct the provisional floor to the exact loaded snapshot high
+            // (a no-op refcount move when no commit landed during the window).
             self.register_active_snapshot(txn_id, snapshot.high);
         }
         // PRAGMA is per-connection and takes effect at BEGIN (not retroactive).
@@ -1647,10 +1668,23 @@ impl TransactionManager {
     /// so a live txn is always registered there: retaining only registered
     /// txns can never evict a live witness.
     fn ssi_witness_drain_orphaned(&self) {
-        let live: HashSet<TxnId> = self.active_snapshot_highs.lock().keys().copied().collect();
+        // bd-0iree: hold the `active_snapshot_highs` lock ACROSS the
+        // `ssi_active_witnesses` retain. Collecting the live set and releasing
+        // the lock first opened a race: a concurrent `begin()` that registered
+        // its snapshot (`register_active_snapshot`, line ~899) and inserted its
+        // witness (`ssi_witness_begin`, line ~907) between the collect and the
+        // retain would have its LIVE witness evicted here, after which its
+        // `record_read`/`record_write` silently no-op — letting it commit as an
+        // unvalidated SSI pivot (write-skew admitted). Holding the lock closes
+        // the window: any txn already registered is seen as live, and a txn not
+        // yet registered has not yet inserted a witness (in `begin()`
+        // registration precedes the witness insert). Lock order highs -> witnesses
+        // matches `begin()`; no path takes them in the reverse order, so this
+        // cannot deadlock.
+        let live = self.active_snapshot_highs.lock();
         self.ssi_active_witnesses
             .lock()
-            .retain(|txn_id, _| live.contains(txn_id));
+            .retain(|txn_id, _| live.contains_key(txn_id));
     }
 
     /// Run the existing rw-antidependency edge discovery for a committing
