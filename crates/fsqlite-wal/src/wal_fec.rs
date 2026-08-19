@@ -1939,10 +1939,14 @@ fn process_repair_work_item(
     else {
         return Ok(WalFecWorkOutcome::Canceled);
     };
+    let group = WalFecGroupRecord::new(work_item.meta.clone(), repair_symbols)?;
+    // bd-xv5cm M4: re-check cancellation IMMEDIATELY before the append. The
+    // pipeline's Drop sets `cancel_flag`; without this final gate a work item that
+    // passed the earlier checks could still append a group AFTER the pipeline was
+    // dropped/cancelled — a post-Drop write to a sidecar that may be finalizing.
     if cancel_flag.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
         return Ok(WalFecWorkOutcome::Canceled);
     }
-    let group = WalFecGroupRecord::new(work_item.meta.clone(), repair_symbols)?;
     append_wal_fec_group(&work_item.sidecar_path, &group)?;
     Ok(WalFecWorkOutcome::Completed)
 }
@@ -2324,15 +2328,24 @@ pub fn append_wal_fec_group(sidecar_path: &Path, group: &WalFecGroupRecord) -> R
         "appending wal-fec group"
     );
 
+    // bd-xv5cm M4: frame the ENTIRE group (metadata + every repair symbol) into
+    // one buffer, then append it with a SINGLE `write_all`, instead of N+1
+    // separate framed writes. A crash or I/O error partway through the old
+    // multi-write append left a half-written group in the sidecar; a later
+    // successful append then framed AFTER it, so scan misread the partial group's
+    // tail as the next group's metadata and poisoned every following group. A
+    // single buffered append lands the whole group, or on a torn write leaves a
+    // truncated tail that scan already tolerates.
+    let mut record = Vec::new();
+    push_length_prefixed(&mut record, &group.meta.to_record_bytes(), "group metadata")?;
+    for symbol in &group.repair_symbols {
+        push_length_prefixed(&mut record, &symbol.to_bytes(), "repair symbol")?;
+    }
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(sidecar_path)?;
-    let meta_bytes = group.meta.to_record_bytes();
-    write_length_prefixed(&mut file, &meta_bytes, "group metadata")?;
-    for symbol in &group.repair_symbols {
-        write_length_prefixed(&mut file, &symbol.to_bytes(), "repair symbol")?;
-    }
+    file.write_all(&record)?;
     file.sync_data()?;
     info!(
         group_id = %group_id,
@@ -2366,18 +2379,41 @@ pub fn scan_wal_fec(sidecar_path: &Path) -> Result<WalFecScanResult> {
             );
             break;
         };
-        let meta = WalFecGroupMeta::from_record_bytes(meta_bytes)?;
+        let meta = match WalFecGroupMeta::from_record_bytes(meta_bytes) {
+            Ok(meta) => meta,
+            Err(err) => {
+                // bd-xv5cm M4: a misframed / corrupt group-metadata record must
+                // NOT poison the whole scan. Stop here and return the groups
+                // parsed so far — the corrupt bytes and everything after them are
+                // unusable, exactly like a truncated tail.
+                truncated_tail = true;
+                warn!(
+                    sidecar = %sidecar_path.display(),
+                    cursor,
+                    error = %err,
+                    "corrupt wal-fec group metadata — stopping scan, retaining preceding groups"
+                );
+                break;
+            }
+        };
         let r_repair_usize =
             usize::try_from(meta.r_repair).map_err(|_| FrankenError::WalCorrupt {
                 detail: format!("r_repair {} does not fit in usize", meta.r_repair),
             })?;
 
-        // Prevent OOM panics from maliciously large r_repair values.
-        // Each repair symbol requires at least 4 bytes for its length prefix.
+        // Guard against a corrupt (maliciously large) r_repair before allocating.
+        // Each repair symbol needs at least 4 bytes for its length prefix; if the
+        // remaining buffer cannot hold them the metadata is corrupt — treat it as
+        // a corrupt tail (bd-xv5cm M4) rather than poisoning the whole scan.
         if bytes.len().saturating_sub(cursor) < r_repair_usize.saturating_mul(4) {
-            return Err(FrankenError::WalCorrupt {
-                detail: format!("r_repair {} exceeds remaining buffer", meta.r_repair),
-            });
+            truncated_tail = true;
+            warn!(
+                sidecar = %sidecar_path.display(),
+                group_id = %meta.group_id(),
+                r_repair = meta.r_repair,
+                "wal-fec r_repair exceeds remaining buffer — stopping scan, retaining preceding groups"
+            );
+            break;
         }
 
         let mut repair_symbols = Vec::with_capacity(r_repair_usize);
@@ -2393,17 +2429,22 @@ pub fn scan_wal_fec(sidecar_path: &Path) -> Result<WalFecScanResult> {
                 );
                 break;
             };
-            let symbol = SymbolRecord::from_bytes(symbol_bytes).map_err(|err| {
-                error!(
-                    sidecar = %sidecar_path.display(),
-                    group_id = %meta.group_id(),
-                    error = %err,
-                    "invalid wal-fec repair symbol"
-                );
-                FrankenError::WalCorrupt {
-                    detail: format!("invalid wal-fec repair symbol: {err}"),
+            let symbol = match SymbolRecord::from_bytes(symbol_bytes) {
+                Ok(symbol) => symbol,
+                Err(err) => {
+                    // bd-xv5cm M4: a corrupt repair symbol truncates the usable
+                    // tail — retain the preceding groups instead of erroring the
+                    // whole scan.
+                    truncated_tail = true;
+                    warn!(
+                        sidecar = %sidecar_path.display(),
+                        group_id = %meta.group_id(),
+                        error = %err,
+                        "corrupt wal-fec repair symbol — stopping scan, retaining preceding groups"
+                    );
+                    break;
                 }
-            })?;
+            };
             repair_symbols.push(symbol);
         }
 
@@ -3112,6 +3153,12 @@ fn scan_wal_fec_for_recovery(sidecar_path: &Path) -> Result<Vec<WalFecRecoveryGr
         let Some(meta_bytes) = read_length_prefixed(&bytes, &mut cursor)? else {
             break;
         };
+        // NOTE (bd-xv5cm M4): unlike `scan_wal_fec`, the RECOVERY scan intentionally
+        // hard-errors on a corrupt group metadata so `recover_wal_fec_group_with_decoder`
+        // reports `SidecarUnreadable` and falls back to SQLite-compatible truncation.
+        // (Corrupt repair SYMBOLS are already tolerated below.) Making this lenient
+        // would need a corruption signal threaded to the recovery outcome to keep the
+        // `SidecarUnreadable` fallback reason — left as a follow-up.
         let meta = WalFecGroupMeta::from_record_bytes(meta_bytes)?;
         let mut repair_symbols = Vec::new();
         let mut corruption_observations = 0_u32;
@@ -3194,15 +3241,19 @@ fn scan_offset_after_optional_pragma_header(bytes: &[u8]) -> Result<usize> {
     Ok(WAL_FEC_PRAGMA_HEADER_BYTES)
 }
 
-fn write_length_prefixed(file: &mut fs::File, payload: &[u8], what: &str) -> Result<()> {
+/// Append a length-prefixed `payload` (u32 LE length, then bytes) to an in-memory
+/// buffer. bd-xv5cm M4: a group is framed into one buffer and written with a
+/// single `write_all`, so a group is never appended as several separate framed
+/// writes (which could tear across a crash/error and misframe the sidecar).
+fn push_length_prefixed(buf: &mut Vec<u8>, payload: &[u8], what: &str) -> Result<()> {
     let len_u32 = u32::try_from(payload.len()).map_err(|_| FrankenError::WalCorrupt {
         detail: format!(
             "{what} too large for wal-fec length prefix: {}",
             payload.len()
         ),
     })?;
-    file.write_all(&len_u32.to_le_bytes())?;
-    file.write_all(payload)?;
+    buf.extend_from_slice(&len_u32.to_le_bytes());
+    buf.extend_from_slice(payload);
     Ok(())
 }
 

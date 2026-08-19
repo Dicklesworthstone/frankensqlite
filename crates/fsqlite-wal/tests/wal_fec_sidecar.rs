@@ -203,6 +203,79 @@ fn test_wal_fec_group_layout() {
 }
 
 #[test]
+fn test_scan_wal_fec_corrupt_meta_retains_preceding_groups_bd_xv5cm_m4() {
+    // bd-xv5cm M4: a misframed / corrupt group-metadata record mid-sidecar must
+    // NOT poison the whole scan. `scan_wal_fec` must return the valid groups
+    // parsed before it (with `truncated_tail = true`), not `Err`. Pre-fix the
+    // metadata parse `?`-propagated, discarding every preceding valid group —
+    // exactly the "poisoning" the non-atomic multi-write append could produce.
+    use std::io::Write;
+
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("corrupt_tail.wal-fec");
+
+    // Two fully-valid groups, each appended with the single-buffer single-write
+    // path (bd-xv5cm M4 append fix).
+    let meta_a = sample_meta(SampleMetaSpec {
+        start_frame_no: 10,
+        k_source: 3,
+        r_repair: 2,
+        wal_salt1: 0x1111_2222,
+        wal_salt2: 0x3333_4444,
+        object_tag: b"corrupt-a",
+        seed_base: 5,
+        db_size_pages: 2048,
+    });
+    let group_a = WalFecGroupRecord::new(meta_a.clone(), sample_repair_symbols(&meta_a))
+        .expect("group a should validate");
+    append_wal_fec_group(&sidecar_path, &group_a).expect("append a should succeed");
+
+    let meta_b = sample_meta(SampleMetaSpec {
+        start_frame_no: 20,
+        k_source: 3,
+        r_repair: 2,
+        wal_salt1: 0x5555_6666,
+        wal_salt2: 0x7777_8888,
+        object_tag: b"corrupt-b",
+        seed_base: 6,
+        db_size_pages: 2048,
+    });
+    let group_b = WalFecGroupRecord::new(meta_b.clone(), sample_repair_symbols(&meta_b))
+        .expect("group b should validate");
+    append_wal_fec_group(&sidecar_path, &group_b).expect("append b should succeed");
+
+    // Append a length-prefixed but corrupt metadata record: a valid u32 length
+    // prefix followed by garbage that `WalFecGroupMeta::from_record_bytes`
+    // rejects (bad magic). This is the shape a torn/partial append could leave.
+    let garbage = [0xFFu8; 64];
+    let mut corrupt = Vec::new();
+    corrupt.extend_from_slice(&u32::try_from(garbage.len()).unwrap().to_le_bytes());
+    corrupt.extend_from_slice(&garbage);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&sidecar_path)
+        .expect("open sidecar for corrupt append")
+        .write_all(&corrupt)
+        .expect("append corrupt tail");
+
+    // The scan must retain BOTH valid groups and flag the truncated/corrupt tail,
+    // never erroring the whole scan.
+    let scan =
+        scan_wal_fec(&sidecar_path).expect("a corrupt metadata tail must not poison the scan");
+    assert!(
+        scan.truncated_tail,
+        "the corrupt metadata tail must set truncated_tail"
+    );
+    assert_eq!(
+        scan.groups.len(),
+        2,
+        "both valid preceding groups must be retained"
+    );
+    assert_eq!(scan.groups[0].meta.group_id(), meta_a.group_id());
+    assert_eq!(scan.groups[1].meta.group_id(), meta_b.group_id());
+}
+
+#[test]
 fn test_wal_fec_salt_binding() {
     let meta = sample_meta(SampleMetaSpec {
         start_frame_no: 2,
