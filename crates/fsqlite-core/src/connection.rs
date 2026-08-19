@@ -75581,6 +75581,10 @@ impl Connection {
                                 | BinaryOp::Le
                                 | BinaryOp::Gt
                                 | BinaryOp::Ge
+                                // bd-rl7i9 (c): NULL-safe IS / IS NOT over row
+                                // values, e.g. `(SELECT 1,2) IS (1,2)`.
+                                | BinaryOp::Is
+                                | BinaryOp::IsNot
                         ) && (matches!(left_ref, Expr::RowValue(..))
                             || matches!(right_ref, Expr::RowValue(..)))
                         {
@@ -137082,6 +137086,34 @@ fn eval_join_row_value_comparison(
                 op,
                 BinaryOp::Le | BinaryOp::Ge
             ))))
+        }
+        // bd-rl7i9 (c): row-value IS / IS NOT is NULL-safe element-wise
+        // equality — two rows are identical iff every position is either both
+        // NULL or both non-NULL and equal. Unlike `=`, it never yields NULL.
+        BinaryOp::Is | BinaryOp::IsNot => {
+            let mut all_identical = true;
+            for i in 0..left_vals.len() {
+                let both_null = left_vals[i].is_null() && right_vals[i].is_null();
+                let both_equal = !left_vals[i].is_null()
+                    && !right_vals[i].is_null()
+                    && compare_join_expr_values(
+                        left_elems[i],
+                        &left_vals[i],
+                        right_elems[i],
+                        &right_vals[i],
+                        col_map,
+                    ) == std::cmp::Ordering::Equal;
+                if !(both_null || both_equal) {
+                    all_identical = false;
+                    break;
+                }
+            }
+            let result = if op == BinaryOp::Is {
+                all_identical
+            } else {
+                !all_identical
+            };
+            Ok(SqliteValue::Integer(i64::from(result)))
         }
         _ => unreachable!("callers guard to comparison operators only"),
     }
