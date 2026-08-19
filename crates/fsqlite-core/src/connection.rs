@@ -35562,13 +35562,24 @@ impl Connection {
                 // from its own header on open, so the attached value here reflects
                 // the file's real encoding. frank's decode layer *could* read a
                 // cross-encoding attachment, but stock forbids the cross-encoding
-                // comparisons/joins it would enable — match the rejection. (A
-                // brand-new empty attachment keeps the default UTF-8, matching a
-                // UTF-8 main.)
+                // comparisons/joins it would enable — match the rejection.
+                //
+                // BUT a brand-new / EMPTY attached file (no schema object yet, so
+                // schema_cookie == 0) has no committed encoding — its header just
+                // carries the UTF-8 default. Stock lets such a file ADOPT the
+                // main database's encoding rather than rejecting, which is what a
+                // UTF-16 export flow relies on. Only reject when the attached file
+                // is already populated in a different encoding (bd-pgqsk M7).
                 if attached_connection.db_text_encoding.get() != self.db_text_encoding.get() {
-                    return Err(FrankenError::function_error(
-                        "attached databases must use the same text encoding as main database",
-                    ));
+                    if attached_connection.schema_cookie() == 0 {
+                        attached_connection
+                            .db_text_encoding
+                            .set(self.db_text_encoding.get());
+                    } else {
+                        return Err(FrankenError::function_error(
+                            "attached databases must use the same text encoding as main database",
+                        ));
+                    }
                 }
                 self.attached_schemas
                     .borrow_mut()
@@ -67446,38 +67457,46 @@ impl Connection {
             return self.execute_optimize(pragma.value.as_ref()).await;
         }
 
-        // The v0.2 runtime is UTF-8-only. SQLite normally permits an encoding
-        // choice before the first schema object is created, but silently
-        // accepting a UTF-16 choice here would promise a format that the
-        // bootstrap admission gate below cannot decode. Reject every supported
-        // SQLite UTF-16 spelling before any connection or pager state changes.
+        // `PRAGMA encoding = '<name>'` — validate and resolve the requested
+        // encoding name, then set it on an empty database. Every supported
+        // spelling is handled here (not only UTF-16): a valid name is settable
+        // only before the first schema object (schema_cookie == 0), matching
+        // stock, and is a silent no-op on a non-empty database. An UNSUPPORTED
+        // name is rejected at prepare regardless of database state, matching
+        // stock's "unsupported encoding: <name>" (bd-pgqsk L5).
         if pragma_name == "encoding"
-            && let Some(target) = pragma.value.as_ref().and_then(|value| {
+            && let Some(requested) = pragma.value.as_ref().and_then(|value| {
                 let expr = match value {
                     PragmaValue::Assign(expr) | PragmaValue::Call(expr) => expr,
                 };
-                let requested = match expr {
-                    Expr::Literal(Literal::String(text), _) => Some(text.to_ascii_lowercase()),
+                match expr {
+                    Expr::Literal(Literal::String(text), _) => Some(text.clone()),
                     Expr::Column(column, _) if column.table.is_none() => {
-                        Some(column.column.to_ascii_lowercase())
+                        Some(column.column.to_string())
                     }
-                    _ => None,
-                };
-                // Only UTF-16 requests are intercepted here; 'UTF-16' resolves to
-                // the native default UTF-16le, matching stock sqlite3. UTF-8 and
-                // unknown spellings fall through to the normal pragma handling.
-                match requested.as_deref() {
-                    Some("utf-16" | "utf-16le") => Some(TextEncoding::Utf16le),
-                    Some("utf-16be") => Some(TextEncoding::Utf16be),
                     _ => None,
                 }
             })
         {
-            // bd-bld9w.7: the database text encoding may be set only before the
-            // first schema object is created (schema_cookie == 0), matching stock;
-            // on a non-empty database it is a silent no-op, never an error. Persist
-            // into BOTH the live db_text_encoding (consulted by the write path) and
-            // header bytes 56..60 (consulted by the header-backed `PRAGMA encoding`
+            // Normalize like stock: case-insensitive, optional dash. `UTF-16`
+            // resolves to the native default UTF-16le.
+            let normalized: String = requested
+                .chars()
+                .filter(|character| *character != '-')
+                .flat_map(char::to_lowercase)
+                .collect();
+            let target = match normalized.as_str() {
+                "utf8" => TextEncoding::Utf8,
+                "utf16" | "utf16le" => TextEncoding::Utf16le,
+                "utf16be" => TextEncoding::Utf16be,
+                _ => {
+                    return Err(FrankenError::function_error(format!(
+                        "unsupported encoding: {requested}"
+                    )));
+                }
+            };
+            // Persist into BOTH the live db_text_encoding (consulted by the write
+            // path) and header bytes 56..60 (the header-backed `PRAGMA encoding`
             // reader and every reopen).
             if self.schema_cookie() == 0 {
                 self.db_text_encoding.set(target);
