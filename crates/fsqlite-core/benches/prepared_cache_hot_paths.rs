@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::env;
 use std::hint::black_box;
 use std::time::Instant;

@@ -1122,7 +1122,9 @@ pub fn parse_record_prefix(data: &[u8], max_cols: usize) -> Option<Vec<SqliteVal
 }
 
 /// Encoding-aware [`parse_record_prefix`]: decodes the leading `max_cols` values
-/// under the database `encoding`. The sorter spills the raw record bytes (in the
+/// under the database `encoding`.
+///
+/// The sorter spills the raw record bytes (in the
 /// DB encoding) but must decode its sort-key prefix under the SAME encoding —
 /// otherwise a spilled UTF-16 sort key is decoded as UTF-8 mojibake and orders
 /// differently from the in-memory path, so spilling silently reorders the output
