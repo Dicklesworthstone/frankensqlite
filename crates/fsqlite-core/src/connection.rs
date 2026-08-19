@@ -492,6 +492,27 @@ fn take_retained_flush_commit_error_once() -> Option<FrankenError> {
     FSQLITE_RETAINED_FLUSH_COMMIT_ERROR_ONCE.with_borrow_mut(Option::take)
 }
 
+// Test-only one-shot fault injection for a transient error at statement dispatch
+// BEFORE any retained-batch flush runs (bd-zbyi0). Lets the counterkeeper drive
+// the retry LOOP path: attempt 1 fails transient with the batch still parked, so
+// the retained-flush drop is deferred into a later retry iteration (where the
+// first-attempt gate no longer applies).
+#[cfg(test)]
+std::thread_local! {
+    static FSQLITE_PRE_FLUSH_DISPATCH_ERROR_ONCE: RefCell<Option<FrankenError>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_pre_flush_dispatch_error_once(error: FrankenError) {
+    FSQLITE_PRE_FLUSH_DISPATCH_ERROR_ONCE.with_borrow_mut(|slot| *slot = Some(error));
+}
+
+#[cfg(test)]
+fn take_pre_flush_dispatch_error_once() -> Option<FrankenError> {
+    FSQLITE_PRE_FLUSH_DISPATCH_ERROR_ONCE.with_borrow_mut(Option::take)
+}
+
 /// Maximum trigger recursion depth (F-PGM.11).
 ///
 /// SQLite defines `SQLITE_MAX_TRIGGER_DEPTH = 1000`, but each Rust recursion
@@ -33050,7 +33071,15 @@ impl Connection {
                     .execute_statement_once_after_background_status(statement, params)
                     .await;
                 if !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error))
+                    || self.retained_flush_dropped_pending_writes.get()
                 {
+                    // bd-zbyi0: a retry iteration whose retained flush dropped
+                    // acknowledged writes is non-idempotent, exactly like the
+                    // first attempt (bd-irmuw) — surface the error instead of
+                    // re-running the statement batch-less and returning a false
+                    // Ok. The first-attempt gate above only covers a flush that
+                    // drops during attempt 1; a transient BEFORE the flush on
+                    // attempt 1 defers the drop into this loop.
                     break;
                 }
             }
@@ -33070,6 +33099,13 @@ impl Connection {
             if matches!(statement, Statement::Pragma(_))
                 && let Some(error) = take_pragma_dispatch_error_once()
             {
+                return Err(error);
+            }
+            // bd-zbyi0: inject a one-shot transient at dispatch BEFORE any
+            // retained-batch flush, so the counterkeeper can defer the flush-drop
+            // into a retry iteration and exercise the retry-loop guard.
+            #[cfg(test)]
+            if let Some(error) = take_pre_flush_dispatch_error_once() {
                 return Err(error);
             }
             // bd-xl98m (GH #207/#213): route the parenless eponymous no-arg pragma
@@ -196915,6 +196951,48 @@ mod autocommit_txn_tests {
             let result = conn.query("SELECT id FROM t ORDER BY id").await;
             let error = result.expect_err(
                 "a flush-commit failure that dropped acknowledged writes must surface, not return Ok",
+            );
+            assert!(
+                error.is_transient(),
+                "the surfaced error should be the transient flush-commit failure, got {error:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_retained_autocommit_flush_drop_in_retry_loop_surfaces_bd_zbyi0() {
+        // bd-zbyi0 (P1, follow-up to bd-irmuw ca0efc609): the first-attempt gate
+        // only bars a retained-flush drop on attempt 1. If attempt 1 fails
+        // transient BEFORE the flush (batch still parked) — e.g. a memdb-reload
+        // BusySnapshot straddling a checkpoint TRUNCATE — the flush-drop is
+        // deferred into a retry ITERATION, whose break condition must ALSO refuse
+        // to re-run the statement batch-less. Otherwise acknowledged INSERTs
+        // vanish with a false Ok, one interleaving deeper than bd-irmuw.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            // A non-zero busy_timeout so the autocommit retry loop actually iterates.
+            conn.execute("PRAGMA busy_timeout = 5000;").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (2)").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (3)").await.unwrap();
+            assert!(
+                conn.retained_autocommit_txn.borrow().is_some(),
+                "the three inserts must be parked in the retained batch"
+            );
+            // Attempt 1: a transient Busy at dispatch BEFORE the flush — the batch
+            // stays parked, so the first-attempt drop gate does NOT fire and the
+            // retry loop is entered.
+            arm_pre_flush_dispatch_error_once(FrankenError::Busy);
+            // The retry iteration then reaches the flush, whose commit fails
+            // transient-Busy and rolls back the parked batch.
+            arm_retained_flush_commit_error_once(FrankenError::Busy);
+            let result = conn.query("SELECT id FROM t ORDER BY id").await;
+            let error = result.expect_err(
+                "a retry-loop retained-flush drop must surface, not silently re-run \
+                 batch-less and return Ok",
             );
             assert!(
                 error.is_transient(),
