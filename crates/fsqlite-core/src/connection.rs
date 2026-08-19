@@ -131298,6 +131298,21 @@ fn emit_binary_expr(
     target_reg: i32,
     bind_state: &mut BindParamState,
 ) -> Result<()> {
+    // bd-x25ka(c): a literal `X AND 0` compile-folds to the integer 0 and DROPS X —
+    // stock never lowers, evaluates, or resolves the discarded operand. Emit the
+    // constant here, BEFORE the eager operand emit below, so a dead-branch bare
+    // column or subquery (e.g. inside a `CASE WHEN nosuchcol AND 0` test that this
+    // codegen path reaches without the rewrite-stage fold) is not lowered and does
+    // not raise a spurious error where stock returns the ELSE branch. Only the
+    // literal integer 0 triggers this; the FALSE keyword / NULL / 0.0 stay eager
+    // and resolve the other operand (matching stock, verified vs sqlite3).
+    if matches!(op, BinaryOp::And)
+        && (matches!(left, Expr::Literal(Literal::Integer(0), _))
+            || matches!(right, Expr::Literal(Literal::Integer(0), _)))
+    {
+        emit_literal(builder, &Literal::Integer(0), target_reg);
+        return Ok(());
+    }
     let left_reg = builder.alloc_temp();
     let right_reg = builder.alloc_temp();
     emit_expr(builder, left, left_reg, bind_state)?;
@@ -133218,6 +133233,18 @@ fn emit_searched_case_when_condition(
             right,
             ..
         } => {
+            // bd-x25ka(c): a literal `X AND 0` is FALSE regardless of X, and stock
+            // never lowers/evaluates/resolves the discarded operand — so the WHEN
+            // fails straight to `false_label` without emitting either operand (e.g.
+            // `CASE WHEN nosuchcol AND 0` -> ELSE, nosuchcol dropped). Only the
+            // literal integer 0 absorbs here; FALSE / NULL / 0.0 fall through and
+            // resolve the other operand, matching stock (verified vs sqlite3).
+            if matches!(left.as_ref(), Expr::Literal(Literal::Integer(0), _))
+                || matches!(right.as_ref(), Expr::Literal(Literal::Integer(0), _))
+            {
+                builder.emit_jump_to_label(Opcode::Goto, 0, 0, false_label, P4::None, 0);
+                return Ok(());
+            }
             // A AND B fails the WHEN if either operand is not TRUE; both jump to
             // the same `false_label`, so a false/NULL left short-circuits B.
             emit_searched_case_when_condition(builder, left, scratch, false_label, bind_state)?;
