@@ -646,9 +646,17 @@ impl DatabaseNamespaceBinding {
     /// advisory locks.
     #[must_use]
     pub fn is_quiesced(&self) -> bool {
-        self.lease
-            .lock()
-            .is_ok_and(|lease| matches!(*lease, BindingLease::Quiesced))
+        // bd-l6cnd: fail CLOSED on a poisoned lease mutex, matching `quiesce()`'s
+        // `into_inner()` recovery. `is_ok_and` treated a poisoned lock as
+        // "not quiesced" (fail-open), so a binding that was quiesced by a thread
+        // that then panicked would read back as live and let operations proceed
+        // on already-released descriptors. A poisoned mutex still exposes the
+        // real lease state via `into_inner()`, so read it rather than lie.
+        let lease = match self.lease.lock() {
+            Ok(lease) => lease,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        matches!(*lease, BindingLease::Quiesced)
     }
 
     /// bd-97kjm ask #3 — generation-bound teardown.
