@@ -15512,7 +15512,14 @@ impl Connection {
                         index.name
                     )));
                 }
-                let probe = serialize_record(parent_values);
+                // bd-cquyy: the parent UNIQUE index is seeked with `index_move_to`,
+                // a raw b-tree byte comparison, so the probe record must be encoded
+                // in the DB text encoding to match the index's stored (DB-encoded)
+                // records — the same encoding used to decode `stored` below. A
+                // UTF-8 `serialize_record` probe against a UTF-16 parent index lands
+                // the seek on the wrong entry, so `bounded_unique_terms_equal` fails
+                // and a CLEAN UTF-16 DB with a TEXT FK is falsely reported corrupt.
+                let probe = serialize_record_with_encoding(parent_values, self.db_text_encoding.get());
                 if probe.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
                     return Err(Self::bounded_validation_refusal(format!(
                         "FOREIGN KEY parent probe record for index `{}` exceeds the fixed {BOUNDED_VALIDATION_MAX_RECORD_BYTES}-byte bound",
