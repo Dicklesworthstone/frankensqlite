@@ -45512,38 +45512,68 @@ impl Connection {
         query: &SelectStatement,
         tables: &[TableSchema],
     ) -> Vec<Option<String>> {
+        self.view_result_column_decltypes_at_depth(query, tables, 0)
+    }
+
+    /// bd-pragma-table-info-view-decltype-multisource: resolve each view output
+    /// column's declared type by walking the FROM clause across joins and
+    /// recursing into subquery / nested-view sources (mirroring the multi-source
+    /// NAME resolution and stock `sqlite3ColumnType`). A direct (possibly
+    /// qualified) column reference takes its source column's `type_name`
+    /// verbatim; an expression, or a column from an unresolved source (table
+    /// function / parenthesized join), yields `None` (empty type, like stock).
+    fn view_result_column_decltypes_at_depth(
+        &self,
+        query: &SelectStatement,
+        tables: &[TableSchema],
+        depth: usize,
+    ) -> Vec<Option<String>> {
+        // Guard against a pathological source cycle; real views are acyclic.
+        if depth > 16 {
+            return Vec::new();
+        }
         let SelectCore::Select { columns, from, .. } = &query.body.select else {
             return Vec::new();
         };
-        let source_columns: Option<&[ColumnInfo]> = match from {
-            Some(from_clause) if from_clause.joins.is_empty() => match &from_clause.source {
-                TableOrSubquery::Table { name, .. } => tables
-                    .iter()
-                    .find(|t| t.name.eq_ignore_ascii_case(&name.name))
-                    .map(|t| t.columns.as_slice()),
-                _ => None,
-            },
-            _ => None,
-        };
+        // Each FROM source resolved to (effective name = alias or table name,
+        // its output columns as (name, decltype)).
+        let mut sources: Vec<(Option<String>, Vec<(String, Option<String>)>)> = Vec::new();
+        if let Some(from_clause) = from {
+            for source in std::iter::once(&from_clause.source)
+                .chain(from_clause.joins.iter().map(|join| &join.table))
+            {
+                if let Some(resolved) = self.resolve_from_source_decltypes(source, tables, depth) {
+                    sources.push(resolved);
+                }
+            }
+        }
         let mut out: Vec<Option<String>> = Vec::with_capacity(columns.len());
         for column in columns {
             match column {
-                // `*` / `table.*` over a single base table expand to that
-                // table's columns in declaration order (aligned with the names
-                // produced by `select_result_column_names`). Over any other
-                // source we cannot resolve the width here, so signal
-                // "unresolved" by returning empty and let the caller pad.
-                ResultColumn::Star | ResultColumn::TableStar(_) => match source_columns {
-                    Some(cols) => out.extend(cols.iter().map(|c| c.type_name.clone())),
-                    None => return Vec::new(),
-                },
+                ResultColumn::Star => {
+                    if sources.is_empty() {
+                        return Vec::new();
+                    }
+                    for (_, cols) in &sources {
+                        out.extend(cols.iter().map(|(_, decltype)| decltype.clone()));
+                    }
+                }
+                ResultColumn::TableStar(qualifier) => {
+                    match sources.iter().find(|(name, _)| {
+                        name.as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(&qualifier.name))
+                    }) {
+                        Some((_, cols)) => {
+                            out.extend(cols.iter().map(|(_, decltype)| decltype.clone()));
+                        }
+                        None => return Vec::new(),
+                    }
+                }
                 ResultColumn::Expr { expr, .. } => {
                     let decltype = match expr {
-                        Expr::Column(col_ref, _) => source_columns.and_then(|cols| {
-                            cols.iter()
-                                .find(|c| c.name.eq_ignore_ascii_case(col_ref.column.as_ref()))
-                                .and_then(|c| c.type_name.clone())
-                        }),
+                        Expr::Column(col_ref, _) => {
+                            Self::resolve_view_column_ref_decltype(col_ref, &sources)
+                        }
                         _ => None,
                     };
                     out.push(decltype);
@@ -45551,6 +45581,89 @@ impl Connection {
             }
         }
         out
+    }
+
+    /// Resolve one FROM source to (effective name, columns-with-decltypes). Base
+    /// tables read the schema; nested views and subqueries recurse; other sources
+    /// (table functions, parenthesized joins) return `None` so their columns stay
+    /// unresolved (empty type).
+    fn resolve_from_source_decltypes(
+        &self,
+        source: &TableOrSubquery,
+        tables: &[TableSchema],
+        depth: usize,
+    ) -> Option<(Option<String>, Vec<(String, Option<String>)>)> {
+        match source {
+            TableOrSubquery::Table { name, alias, .. } => {
+                let effective = alias.clone().or_else(|| Some(name.name.clone()));
+                if let Some(table) = tables
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(&name.name))
+                {
+                    let cols = table
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.type_name.clone()))
+                        .collect();
+                    return Some((effective, cols));
+                }
+                // Nested view: recurse into its SELECT (clone out of the borrow
+                // first so the recursion can re-borrow `self.views`).
+                let (view_query, view_names) = {
+                    let idx = self.view_index_for_scope(&name.name, PragmaSchemaScope::Unqualified)?;
+                    let views = self.views.borrow();
+                    let view = views.get(idx)?;
+                    let names = if view.columns.is_empty() {
+                        self.select_result_column_names(&view.query, &[], &mut Vec::new())
+                    } else {
+                        view.columns.clone()
+                    };
+                    (view.query.clone(), names)
+                };
+                let types = self.view_result_column_decltypes_at_depth(&view_query, tables, depth + 1);
+                let cols = view_names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, n)| (n, types.get(i).cloned().flatten()))
+                    .collect();
+                Some((effective, cols))
+            }
+            TableOrSubquery::Subquery { query, alias } => {
+                let names = self.select_result_column_names(query, &[], &mut Vec::new());
+                let types = self.view_result_column_decltypes_at_depth(query, tables, depth + 1);
+                let cols = names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, n)| (n, types.get(i).cloned().flatten()))
+                    .collect();
+                Some((alias.clone(), cols))
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_view_column_ref_decltype(
+        col_ref: &ColumnRef,
+        sources: &[(Option<String>, Vec<(String, Option<String>)>)],
+    ) -> Option<String> {
+        let column = col_ref.column.as_ref();
+        match col_ref.table.as_deref() {
+            Some(qualifier) => sources
+                .iter()
+                .find(|(name, _)| {
+                    name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(qualifier))
+                })
+                .and_then(|(_, cols)| {
+                    cols.iter()
+                        .find(|(cn, _)| cn.eq_ignore_ascii_case(column))
+                        .and_then(|(_, dt)| dt.clone())
+                }),
+            None => sources
+                .iter()
+                .flat_map(|(_, cols)| cols.iter())
+                .find(|(cn, _)| cn.eq_ignore_ascii_case(column))
+                .and_then(|(_, dt)| dt.clone()),
+        }
     }
 
     /// Build the `PRAGMA table_info` / `table_xinfo` rows for a VIEW: one row
