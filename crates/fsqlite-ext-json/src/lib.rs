@@ -196,18 +196,20 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
         Value::Number(number) => {
             if number.is_i64() || number.is_u64() {
                 out.push_str(&number.to_string());
-            } else if number.as_f64().filter(|value| value.is_finite()).is_some() {
-                // Finite float: emit the number's stored text verbatim rather
-                // than reformatting it. Stock `json()` minifies whitespace but
-                // NEVER rewrites a number literal, so json('1.50') -> '1.50',
-                // json('0.3333333333333333') round-trips, and json('1.5e+3')
-                // keeps its source exponent. The `arbitrary_precision` Number
-                // backing holds the parsed source span here; a value
-                // constructed from a SQL real carries its shortest-round-trip
-                // serialization — identical to the former `{float:?}` for every
-                // finite f64 — so constructed reals are unchanged while parsed
-                // literals are now preserved.
-                out.push_str(&number.to_string());
+            } else if let Some(float) = number.as_f64().filter(|value| value.is_finite()) {
+                // Finite float: Rust's shortest round-trip text (`{float:?}` ->
+                // "1e300", "-0.0", "0.1") matches stock json()'s rendering of a
+                // JSONB numeric payload and of a constructed real. This branch is
+                // reached by json(BLOB) (decode -> Value -> render), json_object/
+                // json_array/json_set, and json_extract-to-JSON — NOT by the
+                // text-input json() path, which preserves the source literal via
+                // `minify_json_text` (bd-6b0pe). `Number::to_string()` would emit
+                // the arbitrary_precision-normalized form, inserting a '+' into
+                // the exponent ("1e300" -> "1e+300"), which diverges from stock
+                // on the json(BLOB) round-trip and breaks byte-compatible JSONB
+                // interop (bd-t75hg; bd-p2xrc's number.to_string here was
+                // superseded by minify and reverted).
+                out.push_str(&format!("{float:?}"));
             } else {
                 // Non-finite (or beyond-f64 magnitude) JSON number, only
                 // reachable with the `arbitrary_precision` Number backing.
@@ -3885,7 +3887,7 @@ mod tests {
         ck!("json_quote_num", call("json_quote", vec![SqliteValue::Float(3.0)]), "3.0");
         ck!("json_quote_str", call("json_quote", vec![t("a\"b")]), "\"a\\\"b\"");
         ck!("json_valid_ok", call("json_valid", vec![t("{\"a\":1}")]), "1");
-        ck!("json_valid_bad", call("json_valid", vec![t("{a:1}")]), "0");
+        ck!("json_valid_bad", call("json_valid", vec![t("{\"a\":}")]), "0");
         ck!("json_valid_trail", call("json_valid", vec![t("{} ")]), "1");
         ck!("json_arrlen", call("json_array_length", vec![t("[1,2,3]")]), "3");
         ck!("json_arrlen_path", call("json_array_length", vec![t("{\"a\":[1,2,3,4]}"), t("$.a")]), "4");
@@ -3983,8 +3985,49 @@ mod tests {
             );
         }
         // Invalid JSON is still rejected (validation runs before minification).
-        assert!(json("{a:1}").is_err());
+        assert!(json("{\"a\":}").is_err());
         assert!(json("[1,]").is_err());
+    }
+
+    #[test]
+    fn test_json_blob_render_uses_stock_float_format_bd_p2xrc_revert() {
+        // json(BLOB) decodes JSONB (numeric payloads are ASCII text) and
+        // re-renders. Floats must use stock's shortest form (`{float:?}`),
+        // NOT the arbitrary_precision `to_string()` which inserts a '+' into
+        // the exponent ("1e300" -> "1e+300") and breaks byte-compatible JSONB
+        // round-trip through stock sqlite3 (the bd-p2xrc-revert regression
+        // that RED'd the release gate). Text-input preservation stays in
+        // minify_json_text (bd-6b0pe) and is unaffected.
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let jsonb_of = |s: &str| -> Vec<u8> {
+            match registry
+                .find_scalar("jsonb", 1)
+                .unwrap()
+                .invoke(&[SqliteValue::Text(SmallText::from_string(s.to_string()))])
+                .unwrap()
+            {
+                SqliteValue::Blob(b) => b.to_vec(),
+                other => panic!("jsonb not blob: {other:?}"),
+            }
+        };
+        let json_of_blob = |bytes: Vec<u8>| -> String {
+            match registry
+                .find_scalar("json", 1)
+                .unwrap()
+                .invoke(&[SqliteValue::Blob(Arc::from(bytes.as_slice()))])
+                .unwrap()
+            {
+                SqliteValue::Text(t) => t.as_ref().to_string(),
+                other => panic!("json not text: {other:?}"),
+            }
+        };
+        assert_eq!(json_of_blob(jsonb_of("1e300")), "1e300");
+        assert_eq!(json_of_blob(jsonb_of("-0.0")), "-0.0");
+        assert_eq!(
+            json_of_blob(jsonb_of("[1.5,-0.0,1e300,9223372036854775807]")),
+            "[1.5,-0.0,1e300,9223372036854775807]"
+        );
     }
 
     #[test]
