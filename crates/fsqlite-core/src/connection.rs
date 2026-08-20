@@ -158012,7 +158012,8 @@ mod tests {
                 .await
                 .expect_err("renaming to an existing table should fail");
             assert!(
-                err.to_string().contains("already exists"),
+                err.to_string()
+                    .contains("there is already another table or index with this name"),
                 "unexpected error: {err}"
             );
 
@@ -158041,7 +158042,8 @@ mod tests {
                 .await
                 .expect_err("renaming to an existing index should fail");
             assert!(
-                err.to_string().contains("already exists"),
+                err.to_string()
+                    .contains("there is already another table or index with this name"),
                 "unexpected error: {err}"
             );
 
@@ -158077,7 +158079,8 @@ mod tests {
                 .await
                 .expect_err("renaming to an existing view should fail");
             assert!(
-                err.to_string().contains("already exists"),
+                err.to_string()
+                    .contains("there is already another table or index with this name"),
                 "unexpected error: {err}"
             );
 
@@ -237976,38 +237979,69 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_attached_insert_is_rejected_inside_explicit_transaction() {
+    fn test_attached_insert_participates_in_explicit_transaction_bd_bsc69() {
+        // bd-bsc69 / GH#244: a write against an ATTACHed schema inside an explicit
+        // transaction now PARTICIPATES in that transaction (previously it was
+        // rejected with NotImplemented). It succeeds, is visible within the
+        // transaction, and ROLLBACK undoes it while COMMIT persists it to the aux
+        // file — matching stock SQLite. Oracle-verified vs sqlite3 3.46.1:
+        // in-txn count=1, after-rollback=0, after-commit=1.
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             let aux_path = dir.path().join("aux.db");
             let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
 
-            let aux = rusqlite::Connection::open(&aux_path).unwrap();
-            aux.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);", [])
-                .unwrap();
-            drop(aux);
+            {
+                let aux = rusqlite::Connection::open(&aux_path).unwrap();
+                aux.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);", [])
+                    .unwrap();
+            }
 
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
                 .await
                 .unwrap();
+
+            // ROLLBACK path: the attached INSERT succeeds inside BEGIN, is visible
+            // within the transaction, and is undone on ROLLBACK.
             conn.execute("BEGIN;").await.unwrap();
-
-            let err = conn
-                .execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
                 .await
-                .expect_err("attached INSERT inside BEGIN should stay rejected");
-            assert!(
-                matches!(err, FrankenError::NotImplemented(message) if message.contains("explicit transactions/savepoints"))
+                .expect("attached INSERT inside BEGIN now participates in the transaction");
+            let rows = conn.query("SELECT COUNT(*) FROM aux.t;").await.unwrap();
+            assert_eq!(
+                rows[0].values()[0],
+                SqliteValue::Integer(1),
+                "the attached write is visible inside the open transaction"
             );
-
             conn.execute("ROLLBACK;").await.unwrap();
 
-            let aux = rusqlite::Connection::open(&aux_path).unwrap();
-            let row_count: i64 = aux
-                .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
+            {
+                let aux = rusqlite::Connection::open(&aux_path).unwrap();
+                let row_count: i64 = aux
+                    .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(row_count, 0, "ROLLBACK must undo the attached write");
+            }
+
+            // COMMIT path: the attached write persists to the aux file.
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO aux.t VALUES (2, 'beta');")
+                .await
                 .unwrap();
-            assert_eq!(row_count, 0);
+            conn.execute("COMMIT;").await.unwrap();
+
+            {
+                let aux = rusqlite::Connection::open(&aux_path).unwrap();
+                let row_count: i64 = aux
+                    .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(row_count, 1, "COMMIT must persist the attached write");
+                let value: String = aux
+                    .query_row("SELECT value FROM t WHERE id = 2;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(value, "beta");
+            }
         });
     }
 
