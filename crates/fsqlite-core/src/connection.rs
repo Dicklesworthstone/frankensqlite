@@ -5117,6 +5117,9 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
             || full_name_is("fsqlite.gc_stats")
             || full_name_is("gc_stats")
             || full_name_is("fsqlite_gc_stats")
+            || full_name_is("fsqlite.schema_advisor")
+            || full_name_is("schema_advisor")
+            || full_name_is("fsqlite_schema_advisor")
             || full_name_is("fsqlite.txn_stats")
             || full_name_is("txn_stats")
             || full_name_is("fsqlite_txn_stats")
@@ -51150,6 +51153,101 @@ impl Connection {
     }
 
     #[cfg(feature = "diagnostic-pragmas")]
+    /// bd-t6sv2.11: static schema-design advice for concurrent write performance.
+    /// Emits (code, severity, subject, message) rows for a small set of
+    /// high-confidence, non-misleading rules read straight off the loaded schema:
+    /// non-integer single-column PRIMARY KEYs on rowid tables (WITHOUT ROWID
+    /// candidates) and column-prefix-redundant secondary indexes.
+    fn schema_advisor_rows(&self) -> Vec<Row> {
+        let schema = self.schema.borrow();
+        let mut rows: Vec<Row> = Vec::new();
+        {
+            let mut push = |code: &str, severity: &str, subject: &str, message: String| {
+                rows.push(Row {
+                    values: vec![
+                        SqliteValue::Text(code.into()),
+                        SqliteValue::Text(severity.into()),
+                        SqliteValue::Text(subject.into()),
+                        SqliteValue::Text(message.into()),
+                    ],
+                });
+            };
+            for table in schema.iter() {
+                if table.name.starts_with("sqlite_") {
+                    continue;
+                }
+                // Rule 1: a single-column NON-integer PRIMARY KEY on a rowid table
+                // stores an implicit rowid AND a UNIQUE index duplicating the key.
+                // WITHOUT ROWID clusters by the key, drops the duplicate, and
+                // spreads TEXT/UUID inserts across pages under concurrency.
+                if !table.without_rowid
+                    && table.primary_key_constraints.len() == 1
+                    && table.primary_key_constraints[0].len() == 1
+                {
+                    let pk_col = &table.primary_key_constraints[0][0];
+                    let is_integer_pk = table
+                        .columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(pk_col))
+                        .is_some_and(|c| c.is_ipk);
+                    if !is_integer_pk {
+                        push(
+                            "without_rowid_candidate",
+                            "info",
+                            &table.name,
+                            format!(
+                                "PRIMARY KEY '{pk_col}' is non-integer; a rowid table duplicates it \
+                                 in a UNIQUE index. Consider WITHOUT ROWID to cluster by the key and \
+                                 spread inserts across pages under concurrency."
+                            ),
+                        );
+                    }
+                }
+                // Rule 2: a non-unique, non-partial, plain-column index whose key
+                // columns are a strict prefix of another index on the same table is
+                // redundant — the wider index already serves its lookups, and each
+                // extra B-tree adds per-row write overhead.
+                for (i, a) in table.indexes.iter().enumerate() {
+                    if a.is_unique || a.where_clause.is_some() || a.columns.is_empty() {
+                        continue;
+                    }
+                    let redundant = table.indexes.iter().enumerate().any(|(j, b)| {
+                        i != j
+                            && b.columns.len() > a.columns.len()
+                            && b.columns
+                                .iter()
+                                .zip(a.columns.iter())
+                                .all(|(bc, ac)| bc.eq_ignore_ascii_case(ac))
+                    });
+                    if redundant {
+                        push(
+                            "redundant_index",
+                            "info",
+                            &a.name,
+                            format!(
+                                "index '{}' on ({}) is a column prefix of a wider index on the same \
+                                 table; it is likely redundant and adds write overhead.",
+                                a.name,
+                                a.columns.join(", ")
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        if rows.is_empty() {
+            rows.push(Row {
+                values: vec![
+                    SqliteValue::Text("ok".into()),
+                    SqliteValue::Text("info".into()),
+                    SqliteValue::Text(String::new().into()),
+                    SqliteValue::Text("no concurrency schema recommendations".into()),
+                ],
+            });
+        }
+        rows
+    }
+
     fn txn_advisor_rows(&self) -> Vec<Row> {
         let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
         let metrics = self.txn_lifecycle_metrics.borrow();
@@ -70959,6 +71057,11 @@ impl Connection {
             #[cfg(feature = "diagnostic-pragmas")]
             "fsqlite.txn_advisor" | "txn_advisor" | "fsqlite_txn_advisor" => {
                 Ok(self.txn_advisor_rows())
+            }
+            // ── Schema-design advisor for concurrency PRAGMA (bd-t6sv2.11) ─
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.schema_advisor" | "schema_advisor" | "fsqlite_schema_advisor" => {
+                Ok(self.schema_advisor_rows())
             }
             #[cfg(feature = "diagnostic-pragmas")]
             "fsqlite.txn_advisor_long_txn_ms"
@@ -210126,6 +210229,47 @@ fts5(title, body, content=docs, content_rowid=id)'
             assert!(
                 reported >= before && reported <= after,
                 "gc_stats versions_reclaimed {reported} must be within [{before}, {after}]"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pragma_schema_advisor_recommends_without_rowid_and_redundant_index_bd_t6sv2_11() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            // TEXT PRIMARY KEY on a rowid table -> WITHOUT ROWID candidate (Rule 1).
+            conn.execute("CREATE TABLE u(id TEXT PRIMARY KEY, v);")
+                .await
+                .unwrap();
+            // i_a(a) is a column prefix of i_ab(a,b) -> i_a redundant (Rule 2).
+            conn.execute("CREATE TABLE t(a, b, c);").await.unwrap();
+            conn.execute("CREATE INDEX i_ab ON t(a, b);").await.unwrap();
+            conn.execute("CREATE INDEX i_a ON t(a);").await.unwrap();
+
+            let rows = conn.query("PRAGMA schema_advisor;").await.unwrap();
+            let text = |v: &SqliteValue| match v {
+                SqliteValue::Text(s) => s.to_string(),
+                _ => String::new(),
+            };
+            let mut without_rowid = false;
+            let mut redundant = false;
+            for r in &rows {
+                let code = text(&r.values()[0]);
+                let subject = text(&r.values()[2]);
+                if code == "without_rowid_candidate" && subject.eq_ignore_ascii_case("u") {
+                    without_rowid = true;
+                }
+                if code == "redundant_index" && subject.eq_ignore_ascii_case("i_a") {
+                    redundant = true;
+                }
+            }
+            assert!(
+                without_rowid,
+                "TEXT-PK rowid table u should get a WITHOUT ROWID recommendation"
+            );
+            assert!(
+                redundant,
+                "prefix index i_a should be flagged redundant vs i_ab"
             );
         });
     }
