@@ -5114,6 +5114,9 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
             || full_name_is("fsqlite.write_amplification")
             || full_name_is("write_amplification")
             || full_name_is("fsqlite_write_amplification")
+            || full_name_is("fsqlite.gc_stats")
+            || full_name_is("gc_stats")
+            || full_name_is("fsqlite_gc_stats")
             || full_name_is("fsqlite.txn_stats")
             || full_name_is("txn_stats")
             || full_name_is("fsqlite_txn_stats")
@@ -70738,6 +70741,89 @@ impl Connection {
                             SqliteValue::Integer(to_i64_u64(
                                 snapshot.checkpoint_frames_backfilled_total,
                             )),
+                        ],
+                    },
+                ])
+            }
+            // ── Version-chain GC observability PRAGMA (bd-t6sv2.15) ───────
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.gc_stats" | "gc_stats" | "fsqlite_gc_stats" => {
+                let to_i64_u64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+                // Process-global epoch-based-reclamation metrics (bd-t6sv2.15):
+                // version-chain GC/tuning observability from GLOBAL_EBR_METRICS —
+                // reclamation, blocked-GC, chain-depth distribution, guard load.
+                let snapshot = fsqlite_mvcc::ebr::GLOBAL_EBR_METRICS.snapshot();
+                // Average sampled chain length * 100 (integer; 0 with no samples).
+                let avg_chain_length_x100 = snapshot
+                    .chain_length_sum_total
+                    .saturating_mul(100)
+                    .checked_div(snapshot.chain_length_samples_total)
+                    .unwrap_or(0);
+                Ok(vec![
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("versions_reclaimed".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.gc_freed_count)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("gc_blocked_count".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.gc_blocked_count)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("max_chain_length".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.max_chain_length_observed)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("avg_chain_length_x100".into()),
+                            SqliteValue::Integer(to_i64_u64(avg_chain_length_x100)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("chain_length_samples".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.chain_length_samples_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("active_guards_high_water".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.active_guards_high_water)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("guards_pinned".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.guards_pinned_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("guards_unpinned".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.guards_unpinned_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("retirements_deferred".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.retirements_deferred_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("flush_calls".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.flush_calls_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("stale_reader_warnings".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.stale_reader_warnings_total)),
                         ],
                     },
                 ])
@@ -209876,6 +209962,50 @@ fts5(title, body, content=docs, content_rowid=id)'
                     >= metrics.get("wal_physical_bytes").unwrap()
             );
             conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_pragma_gc_stats_reports_ebr_metrics_bd_t6sv2_15() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            // Exercise the MVCC/version path so the EBR counters are live.
+            conn.execute("CREATE TABLE t(x);").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1),(2),(3);")
+                .await
+                .unwrap();
+            conn.execute("UPDATE t SET x = x + 10;").await.unwrap();
+
+            let before = fsqlite_mvcc::ebr::GLOBAL_EBR_METRICS.snapshot().gc_freed_count;
+            let metrics = txn_metrics_map(&conn.query("PRAGMA gc_stats;").await.unwrap());
+            let after = fsqlite_mvcc::ebr::GLOBAL_EBR_METRICS.snapshot().gc_freed_count;
+
+            for key in [
+                "versions_reclaimed",
+                "gc_blocked_count",
+                "max_chain_length",
+                "avg_chain_length_x100",
+                "chain_length_samples",
+                "active_guards_high_water",
+                "guards_pinned",
+                "guards_unpinned",
+                "retirements_deferred",
+                "flush_calls",
+                "stale_reader_warnings",
+            ] {
+                assert!(
+                    metrics.contains_key(key),
+                    "PRAGMA gc_stats must report {key}"
+                );
+            }
+            // The reported (process-global, monotonic) reclaim count read at PRAGMA
+            // time must lie within the snapshots taken around it.
+            let reported =
+                u64::try_from(*metrics.get("versions_reclaimed").unwrap()).unwrap_or(0);
+            assert!(
+                reported >= before && reported <= after,
+                "gc_stats versions_reclaimed {reported} must be within [{before}, {after}]"
+            );
         });
     }
 
