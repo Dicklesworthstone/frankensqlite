@@ -37146,6 +37146,24 @@ impl Connection {
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // bd-insert-select-returning-param-77yt5: the per-row replay
+        // (`build_insert_select_replay_sql`) stringifies RETURNING and runs it with
+        // only the inserted row's column values as params, so a RETURNING `?`
+        // (which refers to the ORIGINAL statement's bind params) would bind out of
+        // range. Resolve the RETURNING placeholders to literals here — params are
+        // available and the placeholders are already `Numbered` (once-entry
+        // canonicalize), so binding uses their global index — before the replay.
+        let resolved_insert;
+        let insert = match params {
+            Some(p) if !insert.returning.is_empty() => {
+                let mut cloned = insert.clone();
+                let mut bind_state = BindParamState::default();
+                bind_placeholders_in_result_columns(&mut cloned.returning, &mut bind_state, p)?;
+                resolved_insert = cloned;
+                &resolved_insert
+            }
+            _ => insert,
+        };
         Ok(self
             .execute_insert_select_fallback_outcome(insert, select_stmt, params)
             .await?
