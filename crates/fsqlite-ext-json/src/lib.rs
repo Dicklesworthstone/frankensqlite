@@ -3736,6 +3736,61 @@ mod tests {
     use super::*;
     use fsqlite_func::FunctionRegistry;
 
+    #[test]
+    fn test_json_fn_oracle_edges_2026_08() {
+        // Oracle: sqlite3 3.46.1. json_extract path semantics: a SINGLE path
+        // returns the natural SQL value (JSON string unquoted, number as int/real,
+        // true->1, json null / missing path -> SQL NULL); MULTIPLE paths return a
+        // JSON array where a missing key is `null`; `$[#-1]` indexes from the end.
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let i = SqliteValue::Integer;
+        let f = SqliteValue::Float;
+        let nul = SqliteValue::Null;
+        let run = |func: &dyn ScalarFunction, args: &[SqliteValue]| -> SqliteValue {
+            func.invoke(args).unwrap()
+        };
+
+        // json_extract — single path returns the natural SQL value.
+        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":1}"#), t("$.a")]), i(1));
+        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":1}"#), t("$.b")]), nul.clone());
+        assert_eq!(run(&JsonExtractFunc, &[t("[10,20,30]"), t("$[0]")]), i(10));
+        assert_eq!(run(&JsonExtractFunc, &[t("[10,20,30]"), t("$[#-1]")]), i(30));
+        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":"x"}"#), t("$.a")]), t("x"));
+        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":null}"#), t("$.a")]), nul.clone());
+        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":1.5}"#), t("$.a")]), f(1.5));
+        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":true}"#), t("$.a")]), i(1));
+        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":1e3}"#), t("$.a")]), f(1000.0));
+        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":{"b":2}}"#), t("$.a")]), t(r#"{"b":2}"#));
+        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"x":[1,{"y":9}]}"#), t("$.x[1].y")]), i(9));
+        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":1}"#), t("$")]), t(r#"{"a":1}"#));
+        assert_eq!(run(&JsonExtractFunc, &[t("5"), t("$")]), i(5));
+        assert_eq!(run(&JsonExtractFunc, &[t(r#""hi""#), t("$")]), t("hi"));
+        assert_eq!(run(&JsonExtractFunc, &[t("[1,2,3]"), t("$[5]")]), nul.clone());
+        // multiple paths -> JSON array; a missing key becomes json `null`.
+        assert_eq!(
+            run(&JsonExtractFunc, &[t(r#"{"a":1,"b":2}"#), t("$.a"), t("$.b")]),
+            t("[1,2]")
+        );
+        assert_eq!(
+            run(&JsonExtractFunc, &[t(r#"{"a":1}"#), t("$.a"), t("$.b")]),
+            t("[1,null]")
+        );
+
+        // json_type / json_valid.
+        assert_eq!(run(&JsonTypeFunc, &[t("[1,2]")]), t("array"));
+        assert_eq!(run(&JsonTypeFunc, &[t(r#"{"a":1}"#), t("$.a")]), t("integer"));
+        assert_eq!(run(&JsonTypeFunc, &[t("[1,2]"), t("$[9]")]), nul.clone());
+        assert_eq!(run(&JsonValidFunc, &[t("{bad}")]), i(0));
+        assert_eq!(run(&JsonValidFunc, &[t(r#"{"a":1}"#)]), i(1));
+
+        // json_quote / json_array / json_array_length / json().
+        assert_eq!(run(&JsonQuoteFunc, &[f(3.0)]), t("3.0"));
+        assert_eq!(run(&JsonArrayFunc, &[i(1), t("x"), nul.clone()]), t(r#"[1,"x",null]"#));
+        assert_eq!(run(&JsonArrayLengthFunc, &[t("[1,2,3]")]), i(3));
+        assert_eq!(run(&JsonArrayLengthFunc, &[t(r#"{"a":1}"#)]), i(0));
+        assert_eq!(run(&JsonFunc, &[t("  [1,  2]  ")]), t("[1,2]"));
+    }
+
     #[allow(dead_code)]
     #[derive(Debug)]
     struct JsonTableRowStructure {
