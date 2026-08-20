@@ -16231,6 +16231,16 @@ where
             (header, false)
         } else {
             if file_size < DATABASE_HEADER_SIZE as u64 {
+                // bd-qgh42 follow-up: a ReservedEmpty open falls back to
+                // open-existing when its VFS reserved open rejects a populated
+                // slot. A non-empty file too small to hold a header is not a
+                // coherent DB, so it refuses with the uniform reserved-open
+                // CannotOpen contract (every sibling reserved refusal surfaces
+                // CannotOpen) rather than leaking the raw DatabaseCorrupt
+                // diagnostic a normal open would.
+                if reserved_empty_existing_size.is_some() {
+                    return Err(FrankenError::CannotOpen { path: db_path });
+                }
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
                         "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
@@ -16266,6 +16276,15 @@ where
                         )
                     }
                     Err(error) => {
+                        // bd-qgh42 follow-up: a non-empty file with an incoherent
+                        // header reached here via the ReservedEmpty open-existing
+                        // fallback; refuse with the uniform reserved-open
+                        // CannotOpen contract rather than the raw corruption error.
+                        if reserved_empty_existing_size.is_some() {
+                            return Err(FrankenError::CannotOpen {
+                                path: db_path.clone(),
+                            });
+                        }
                         return Err(map_database_header_error(&error, "invalid database header"));
                     }
                 };
