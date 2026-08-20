@@ -1475,6 +1475,16 @@ fn parse_args(args: &[SqliteValue]) -> Option<ParsedDateTimeArgs> {
         modifier.eq_ignore_ascii_case("subsec") || modifier.eq_ignore_ascii_case("subsecond")
     });
     let (jdn, modifier_subsec) = apply_modifiers(parsed.jdn, &modifiers, parsed.raw_numeric)?;
+    // C SQLite's date functions return NULL when the *computed* result (after
+    // every modifier) leaves the representable Julian-day range — not only when
+    // the raw numeric input does (checked above). Mirror date.c's validJulianDay
+    // on the final value so a modifier that overflows past 9999-12-31 23:59:59
+    // (or below Julian day 0) yields NULL rather than a malformed 5-digit-year
+    // string or an out-of-range julianday()/unixepoch() number. Verified against
+    // SQLite 3.53: e.g. datetime('9999-12-31 23:59:59','+1 second') is NULL.
+    if !(0.0..=AUTO_JDN_MAX).contains(&jdn) {
+        return None;
+    }
     Some(ParsedDateTimeArgs {
         jdn,
         subsec: first_position_subsec || modifier_subsec,
@@ -2104,6 +2114,56 @@ mod tests {
             }
             other => panic!("expected Float, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_computed_result_out_of_range_returns_null() {
+        // C SQLite returns NULL when a modifier pushes the *computed* time
+        // outside the representable Julian-day range — past 9999-12-31 23:59:59
+        // or below Julian day 0 — for every date function, rather than emitting
+        // a malformed 5-digit-year string or an out-of-range julianday()/
+        // unixepoch() number. Verified against SQLite 3.53. Guards the
+        // post-modifier range check in `parse_args`.
+        let over_datetime = &[text("9999-12-31 23:59:59"), text("+1 second")];
+        assert_eq!(DateTimeFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
+        assert_eq!(TimeFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
+        assert_eq!(JuliandayFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
+        assert_eq!(UnixepochFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
+        assert_eq!(
+            DateFunc.invoke(&[text("9999-12-31"), text("+1 day")]).unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            DateTimeFunc.invoke(&[text("9999-12-31"), text("+1 month")]).unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            StrftimeFunc
+                .invoke(&[text("%Y-%m-%d"), text("9999-12-31 23:59:59"), text("+1 second")])
+                .unwrap(),
+            SqliteValue::Null
+        );
+        // Lower bound: a result below Julian day 0 (before ~4714 BC) is NULL.
+        assert_eq!(
+            DateTimeFunc
+                .invoke(&[text("-4714-11-24 12:00:00"), text("-1 day")])
+                .unwrap(),
+            SqliteValue::Null
+        );
+
+        // Valid boundary / in-range cases must still succeed (no over-rejection):
+        assert_text(
+            &DateTimeFunc.invoke(&[text("9999-12-31 23:59:59")]).unwrap(),
+            "9999-12-31 23:59:59",
+        );
+        // A negative *year* whose Julian day is still >= 0 stays valid (rendered,
+        // not NULL) — SQLite formats such instants (e.g. -0001-12-31 ...).
+        assert!(matches!(
+            DateTimeFunc
+                .invoke(&[text("0000-01-01"), text("-1 second")])
+                .unwrap(),
+            SqliteValue::Text(_)
+        ));
     }
 
     // ── RFC3339 / ISO-8601 timezone suffix parsing ────────────────────
