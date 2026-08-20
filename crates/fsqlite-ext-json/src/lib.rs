@@ -73,8 +73,13 @@ enum EditMode {
 ///
 /// Returns a canonical minified JSON string or a `FunctionError` if invalid.
 pub fn json(input: &str) -> Result<String> {
-    let value = parse_json_text(input)?;
-    encode_json_text("json serialize failed", &value)
+    // Stock json() on text minifies whitespace but preserves every token of the
+    // source verbatim (number literals, string escapes, duplicate keys). Parse
+    // only to validate, then lexically minify — re-serializing a parsed
+    // `serde_json::Value` would normalize exponents, unescape `\/`, and drop
+    // duplicate keys (bd-6b0pe / bd-p2xrc).
+    parse_json_text(input)?;
+    Ok(minify_json_text(input))
 }
 
 /// Validate JSON text under flags compatible with SQLite `json_valid`.
@@ -140,6 +145,43 @@ fn encode_json_text(context: &str, value: &Value) -> Result<String> {
     write_canonical_json_text(value, &mut out)
         .map_err(|error| FrankenError::function_error(format!("{context}: {error}")))?;
     Ok(out)
+}
+
+/// Minify already-validated JSON *text* the way stock `json()` does: strip only
+/// insignificant (inter-token) whitespace and preserve every token verbatim.
+///
+/// Stock SQLite's `json()` never rewrites the parsed source — number literals
+/// keep their exact form (`1e2`, `1E2`, `1e+2`, `1e02` are all distinct;
+/// `1.50` keeps its trailing zero), string escapes are preserved (`"a\/b"`
+/// stays `\/`, not `/`), and duplicate object keys are kept. Round-tripping
+/// through `serde_json::Value` loses all of that (exponents are normalised to
+/// `e+NN`, `\/` is unescaped, duplicate keys are dropped), so the text-input
+/// path lexically minifies the source instead of re-serialising a parsed tree.
+/// The caller MUST have validated `input` as well-formed JSON first.
+fn minify_json_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if matches!(ch, ' ' | '\t' | '\n' | '\r') {
+            // Insignificant whitespace between tokens — drop it.
+        } else {
+            out.push(ch);
+            if ch == '"' {
+                in_string = true;
+            }
+        }
+    }
+    out
 }
 
 /// Minified JSON writer with stock-SQLite-canonical float text: `{:?}` is
@@ -2536,6 +2578,15 @@ impl ScalarFunction for JsonFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
+        // TEXT input: stock json() minifies whitespace but preserves every
+        // token of the source verbatim (number literals incl. exponent form,
+        // string escapes like `\/`, duplicate keys). Parse only to validate,
+        // then lexically minify the source rather than re-serialising a parsed
+        // `serde_json::Value` (which normalises exponents, unescapes `\/`, and
+        // drops duplicate keys) — bd-6b0pe / bd-p2xrc.
+        if let SqliteValue::Text(text) = &args[0] {
+            return Ok(SqliteValue::Text(json(text)?.into()));
+        }
         let input = json_arg_value(self.name(), args, 0)?;
         let encoded = encode_json_text("json serialize failed", &input)?;
         Ok(SqliteValue::Text(encoded.into()))
@@ -3896,6 +3947,44 @@ mod tests {
         ck_num("json_e_notation", call("json_extract", vec![t("[1e3]"), t("$[0]")]), 1000.0);
 
         assert!(fails.is_empty(), "json oracle divergences:\n{}", fails.join("\n"));
+    }
+
+    #[test]
+    fn test_json_text_minify_preserves_source_bd_6b0pe() {
+        // Stock json() on TEXT input strips only insignificant whitespace and
+        // preserves every token of the source verbatim (verified vs sqlite3
+        // 3.46.1). Round-tripping through serde_json::Value used to normalise
+        // exponents (1e2 -> 1e+2), unescape `\/`, and drop duplicate keys.
+        for (input, expect) in [
+            // exponent notation preserved exactly (bd-6b0pe)
+            ("1e2", "1e2"),
+            ("1E2", "1E2"),
+            ("1e+2", "1e+2"),
+            ("1e02", "1e02"),
+            ("[1e+2, 1E2, 1e2]", "[1e+2,1E2,1e2]"),
+            (r#"{"a":1.5E+3}"#, r#"{"a":1.5E+3}"#),
+            // mantissa/precision still preserved (bd-p2xrc)
+            ("1.50", "1.50"),
+            ("2.500000", "2.500000"),
+            // string escapes preserved verbatim, not canonicalised
+            (r#"{"a":"a\/b"}"#, r#"{"a":"a\/b"}"#),
+            (r#"["a\tb"]"#, r#"["a\tb"]"#),
+            // in-string whitespace kept; inter-token whitespace stripped
+            (r#"[ "a  b" , 1 ]"#, r#"["a  b",1]"#),
+            (r#"{ "a" : [ 1 , 2 ] , "b" : "c" }"#, r#"{"a":[1,2],"b":"c"}"#),
+            // duplicate object keys preserved (stock does not dedup on parse)
+            (r#"{"a":1,"a":2}"#, r#"{"a":1,"a":2}"#),
+            (r#"{"x":1e2,"x":3e4}"#, r#"{"x":1e2,"x":3e4}"#),
+        ] {
+            assert_eq!(
+                json(input).unwrap(),
+                expect,
+                "json({input:?}) must minify whitespace but preserve the source verbatim"
+            );
+        }
+        // Invalid JSON is still rejected (validation runs before minification).
+        assert!(json("{a:1}").is_err());
+        assert!(json("[1,]").is_err());
     }
 
     #[test]
