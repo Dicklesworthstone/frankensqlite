@@ -2433,7 +2433,10 @@ impl ScalarFunction for FormatFunc {
             return Ok(SqliteValue::Null);
         }
         let params = &args[1..];
-        let result = sqlite_format(&fmt_str, params)?;
+        let Some(result) = sqlite_format(&fmt_str, params)? else {
+            // bd-mcgdb: a too-big printf result renders as SQL NULL, not an error.
+            return Ok(SqliteValue::Null);
+        };
         Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
 
@@ -2446,9 +2449,21 @@ impl ScalarFunction for FormatFunc {
     }
 }
 
+/// SQLite's maximum result length for the printf()/format() SQL functions
+/// (SQLITE_MAX_LENGTH default). A field whose width, or integer/char precision,
+/// would grow the result to this many bytes makes printf() return NULL — matching
+/// C SQLite, which reports SQLITE_TOOBIG and yields a NULL result (bd-mcgdb).
+const PRINTF_MAX_LENGTH: usize = 1_000_000_000;
+/// C SQLite caps the fractional/significant digit count of a float conversion
+/// (%f/%e/%g) at this many digits rather than erroring (bd-mcgdb).
+const PRINTF_FLOAT_PRECISION_CAP: usize = 100_000_000;
+
 /// Simplified SQLite format/printf implementation.
 /// Supports: %d, %f, %e, %g, %s, %q, %Q, %w, %%, %n (no-op).
-fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
+///
+/// Returns `Ok(None)` when the formatted result would reach `PRINTF_MAX_LENGTH`
+/// bytes; the caller renders that as SQL NULL (bd-mcgdb).
+fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
     let mut result = String::new();
     let chars: Vec<char> = fmt.chars().collect();
     let mut i = 0;
@@ -2513,13 +2528,12 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 width = usize::try_from(w).unwrap_or(0).min(100_000_000);
             }
         } else {
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                width = width
-                    .saturating_mul(10)
-                    .saturating_add(chars[i] as usize - '0' as usize)
-                    .min(100_000_000); // Prevent OOM from malicious formats
-                i += 1;
-            }
+            // bd-mcgdb: match C SQLite's field-width parse exactly — accumulate the
+            // digit run with 32-bit wrapping, then take the low 31 bits. So
+            // %2147483648d -> width 0 (0x80000000 & 0x7fffffff), %3000000000d ->
+            // 852516352, %4294967295d -> 2147483647. A width that reaches
+            // PRINTF_MAX_LENGTH later NULLs the whole result.
+            width = parse_printf_field(&chars, &mut i);
         }
 
         // Parse precision: a literal number, or `*` to take the precision from
@@ -2550,15 +2564,10 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     )
                 };
             } else {
-                let mut prec = 0usize;
-                while i < chars.len() && chars[i].is_ascii_digit() {
-                    prec = prec
-                        .saturating_mul(10)
-                        .saturating_add(chars[i] as usize - '0' as usize)
-                        .min(100_000_000); // Prevent OOM from malicious formats
-                    i += 1;
-                }
-                precision = Some(prec);
+                // bd-mcgdb: same 32-bit-wrapping-then-low-31-bits fold as width.
+                // Integer/char conversions NULL the result past PRINTF_MAX_LENGTH;
+                // float conversions clamp instead (handled below at the spec).
+                precision = Some(parse_printf_field(&chars, &mut i));
             }
         }
 
@@ -2568,6 +2577,30 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
 
         let spec = chars[i];
         i += 1;
+
+        // bd-mcgdb: enforce SQLite's SQLITE_MAX_LENGTH before materializing.
+        // A field padded to >= 1e9 bytes (any conversion), or an integer/char
+        // conversion whose precision demands >= 1e9 digits/repeats, makes
+        // printf() return NULL. Float conversions instead cap their digit count
+        // (C SQLite's dtoa limit) and never NULL on precision alone. Detecting
+        // this here — before format_integer/pad_string build the padding —
+        // avoids allocating the ~GB string just to discard it.
+        if width >= PRINTF_MAX_LENGTH {
+            return Ok(None);
+        }
+        match spec {
+            'f' | 'e' | 'E' | 'g' | 'G' => {
+                if let Some(p) = precision.as_mut() {
+                    *p = (*p).min(PRINTF_FLOAT_PRECISION_CAP);
+                }
+            }
+            'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'c' => {
+                if precision.is_some_and(|p| p >= PRINTF_MAX_LENGTH) {
+                    return Ok(None);
+                }
+            }
+            _ => {}
+        }
 
         match spec {
             // A literal `%` honors the field width like any other conversion
@@ -2964,8 +2997,30 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
         }
         // Suppress unused warnings
         let _ = (left_align, show_sign, space_sign, zero_pad);
+
+        // bd-mcgdb: catch cumulative overflow across multiple fields (each field
+        // is individually bounded < PRINTF_MAX_LENGTH by the guards above).
+        if result.len() >= PRINTF_MAX_LENGTH {
+            return Ok(None);
+        }
     }
-    Ok(result)
+    Ok(Some(result))
+}
+
+/// Parse a printf width/precision digit run the way C SQLite does: accumulate
+/// with 32-bit wrapping arithmetic, then mask off the sign bit so the effective
+/// value is the low 31 bits. Reproduces SQLite's behavior at and beyond the
+/// INT_MAX boundary — e.g. "2147483648" -> 0, "3000000000" -> 852516352,
+/// "4294967295" -> 2147483647 (bd-mcgdb). Advances `*i` past the digits.
+fn parse_printf_field(chars: &[char], i: &mut usize) -> usize {
+    let mut acc: u32 = 0;
+    while *i < chars.len() && chars[*i].is_ascii_digit() {
+        acc = acc
+            .wrapping_mul(10)
+            .wrapping_add(chars[*i] as u32 - '0' as u32);
+        *i += 1;
+    }
+    (acc & 0x7FFF_FFFF) as usize
 }
 
 /// Truncate `val` to `precision` BYTES, flooring to the previous char boundary
@@ -6342,6 +6397,71 @@ mod tests {
         assert_eq!(run(&[txt("[%.*d]"), int(-4_294_967_293), int(42)]), "[042]");
         assert_eq!(run(&[txt("[%.*d]"), int(-2_147_483_648), int(42)]), "[42]");
         assert_eq!(run(&[txt("[%.*d]"), int(-1), int(42)]), "[42]");
+    }
+
+    #[test]
+    fn test_printf_int_max_width_precision_overflow_bd_mcgdb() {
+        // bd-mcgdb. Oracle: sqlite3 3.46.1. A literal width/precision digit run
+        // is accumulated with 32-bit wrapping then masked to its low 31 bits;
+        // if the resulting field would pad the result to >= SQLITE_MAX_LENGTH
+        // (1e9) bytes, printf() returns NULL (not an error, not a 100MB string).
+        // Float precision instead caps its digit count and never NULLs.
+        let f = FormatFunc;
+        // Some(text) for a TEXT result, None for SQL NULL.
+        let run = |args: &[SqliteValue]| -> Option<String> {
+            match f.invoke(args).unwrap() {
+                SqliteValue::Text(s) => Some(s.as_str().to_owned()),
+                SqliteValue::Null => None,
+                other => panic!("expected text or null, got {other:?}"),
+            }
+        };
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let int = SqliteValue::Integer;
+        let some = |s: &str| Some(s.to_owned());
+
+        // --- %d width fold: low 31 bits of the 32-bit-wrapped digit run. ---
+        // 2147483648 = 0x80000000 -> masks to 0 (no padding).
+        assert_eq!(run(&[txt("%2147483648d"), int(5)]), some("5"));
+        assert_eq!(run(&[txt("%2147483649d"), int(5)]), some("5")); // width 1
+        assert_eq!(run(&[txt("%2147483650d"), int(5)]), some(" 5")); // width 2
+        // Past 2^32 wraps again: 4294967296 -> 0, 4294967301 -> 5.
+        assert_eq!(run(&[txt("%4294967296d"), int(5)]), some("5"));
+        assert_eq!(run(&[txt("%4294967301d"), int(5)]), some("    5"));
+        // Multi-wrap (> 2^33): 8589934592 = 2*2^32 -> 0, +5 -> width 5.
+        assert_eq!(run(&[txt("%8589934592d"), int(5)]), some("5"));
+        assert_eq!(run(&[txt("%8589934597d"), int(5)]), some("    5"));
+
+        // --- Width that folds to >= 1e9 -> NULL (never a giant string). ---
+        assert_eq!(run(&[txt("%1000000000d"), int(5)]), None);
+        assert_eq!(run(&[txt("%2147483647d"), int(5)]), None); // INT_MAX
+        assert_eq!(run(&[txt("%4294967295d"), int(5)]), None); // masks to INT_MAX
+        assert_eq!(run(&[txt("%1000000000s"), txt("ab")]), None);
+
+        // --- %s width fold. ---
+        assert_eq!(run(&[txt("%2147483648s"), txt("ab")]), some("ab")); // width 0
+        assert_eq!(run(&[txt("%4294967301s"), txt("ab")]), some("   ab")); // width 5
+
+        // --- Integer precision folds the same way; >= 1e9 zero-pad -> NULL. ---
+        assert_eq!(run(&[txt("%.2147483648d"), int(5)]), some("5")); // precision 0
+        assert_eq!(run(&[txt("%.4294967301d"), int(5)]), some("00005")); // precision 5
+        assert_eq!(run(&[txt("%.1000000000d"), int(5)]), None);
+        // %c precision is a repeat count and folds/NULLs identically.
+        assert_eq!(run(&[txt("%.2147483648c"), txt("A")]), some("A")); // min repeat 1
+        assert_eq!(run(&[txt("%.4294967301c"), txt("A")]), some("AAAAA"));
+        assert_eq!(run(&[txt("%.1000000000c"), txt("A")]), None);
+
+        // --- Float precision folds then CAPS (dtoa limit) — never NULL. ---
+        // 2147483648 -> 0 fractional digits, 2147483649 -> 1, 4294967296 -> 0.
+        assert_eq!(run(&[txt("%.2147483648f"), int(5)]), some("5"));
+        assert_eq!(run(&[txt("%.2147483649f"), int(5)]), some("5.0"));
+        assert_eq!(run(&[txt("%.4294967296f"), int(5)]), some("5"));
+        // %g strips trailing zeros, so even a huge precision stays short.
+        assert_eq!(run(&[txt("%.1000000000g"), int(5)]), some("5"));
+
+        // --- Normal small widths/precisions are unaffected. ---
+        assert_eq!(run(&[txt("%5d"), int(5)]), some("    5"));
+        assert_eq!(run(&[txt("%-5d"), int(5)]), some("5    "));
+        assert_eq!(run(&[txt("%.3d"), int(5)]), some("005"));
     }
 
     #[test]
