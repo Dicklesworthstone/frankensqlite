@@ -11359,6 +11359,11 @@ pub struct Connection {
     /// Connection-level flag: when set, plain `BEGIN` is promoted to
     /// `BEGIN CONCURRENT`.  Controlled by `PRAGMA fsqlite.concurrent_mode`.
     concurrent_mode_default: RefCell<bool>,
+    /// bd-jcjkf: DQS ("double-quoted string") compat. Stock SQLite's default is
+    /// ON — a double-quoted identifier that does not resolve to a real
+    /// column/table falls back to a string literal. Default `true` for
+    /// byte-exact parity with the stock CLI; a follow-up PRAGMA flips it.
+    dqs_enabled: Cell<bool>,
     /// Commit-path safety regime. `Safe` (default) always runs the full
     /// SSI validation. `LabUnsafe` enables the `ssi_e_process_gate` skip
     /// path. Controlled by `PRAGMA fsqlite.write_merge`.
@@ -13141,6 +13146,7 @@ impl Connection {
             concurrent_txn: Cell::new(false),
             pending_transaction_cleanup: Cell::new(false),
             concurrent_mode_default: RefCell::new(true),
+            dqs_enabled: Cell::new(true),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
             fused_lane_tracing_suppression_warned: Cell::new(false),
@@ -13665,6 +13671,7 @@ impl Connection {
             concurrent_txn: Cell::new(false),
             pending_transaction_cleanup: Cell::new(false),
             concurrent_mode_default: RefCell::new(true),
+            dqs_enabled: Cell::new(true),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
             fused_lane_tracing_suppression_warned: Cell::new(false),
@@ -23526,7 +23533,140 @@ impl Connection {
     /// When `sql` contains multiple statements, only the result rows from the
     /// **last** statement are returned. Intermediate statement results are
     /// discarded. This matches common SQL driver semantics (last statement wins).
+    // ===== bd-jcjkf: DQS ("double-quoted string") fallback (shapes 1+2) =====
+    //
+    // Stock SQLite's legacy default (SQLITE_DQS=3) treats a double-quoted
+    // identifier that does NOT resolve to a real column/table as a STRING
+    // LITERAL. Frank resolves double-quoted refs to columns correctly but,
+    // absent this fallback, errors when the ref is unresolvable. Rather than
+    // thread a `double_quoted` flag through the AST + both resolvers, mirror
+    // stock's ACTUAL semantics ("try to resolve; on failure treat the token as a
+    // string") as a lazy, span-precise SQL-text rewrite-retry at the statement
+    // entry: run normally; on a resolution error naming a double-quoted token,
+    // splice that token's `"X"` -> `'X'` in the SQL text and re-dispatch. Bounded
+    // by the count of distinct double-quoted names; single-statement only (so a
+    // committed earlier statement is never re-executed); fails safe (any gap ->
+    // the original error, never silent corruption). Shape 3 (INSERT VALUES("x")
+    // -> silent NULL, no error to trigger the retry) is tracked by bd-82jdw.
+
+    /// Byte ranges + names of every double-quoted identifier token in `sql`.
+    fn double_quoted_identifier_tokens(sql: &str) -> Vec<(u32, u32, String)> {
+        Lexer::tokenize(sql)
+            .into_iter()
+            .filter_map(|tok| match tok.kind {
+                fsqlite_parser::TokenKind::QuotedId(name, true) => {
+                    Some((tok.span.start, tok.span.end, name.to_string()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Extract the unresolved column name from a DQS-eligible resolution error.
+    ///
+    /// Handles codegen `no such column: X in table T` (and the bare
+    /// `no such column: X` form), plus the FROM-less `expression form is not
+    /// supported ... Column(ColumnRef { .. column: "X" .. })` form which embeds
+    /// the name in the `{expr:?}` debug. Returns None otherwise (fails safe).
+    fn dqs_missing_column_name(err: &FrankenError) -> Option<String> {
+        let msg = match err {
+            FrankenError::Internal(m) | FrankenError::NotImplemented(m) => m.as_str(),
+            _ => return None,
+        };
+        if let Some(i) = msg.find("no such column: ") {
+            let rest = &msg[i + "no such column: ".len()..];
+            let name = rest.split(" in table ").next().unwrap_or(rest).trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+        if let Some(i) = msg.find("column: \"") {
+            let rest = &msg[i + "column: \"".len()..];
+            if let Some(j) = rest.find('"') {
+                let name = &rest[..j];
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Replace each double-quoted-token byte range holding `name` with a literal.
+    ///
+    /// Emits a single-quoted string literal of the same content, applying
+    /// right-to-left so earlier byte offsets stay valid.
+    fn splice_dqs_ranges(sql: &str, ranges: &[(u32, u32)], name: &str) -> String {
+        let mut sorted: Vec<(u32, u32)> = ranges.to_vec();
+        sorted.sort_by_key(|&(start, _)| std::cmp::Reverse(start));
+        let literal = format!("'{}'", name.replace('\'', "''"));
+        let mut out = sql.to_string();
+        for (start, end) in sorted {
+            out.replace_range(start as usize..end as usize, &literal);
+        }
+        out
+    }
+
+    /// One DQS rewrite step.
+    ///
+    /// If `err` names a double-quoted token not yet rewritten, splice that token
+    /// to a string literal and return the new SQL; otherwise None (surface the
+    /// original error).
+    fn dqs_rewrite_once(
+        sql: &str,
+        err: &FrankenError,
+        rewritten: &mut HashSet<String>,
+    ) -> Option<String> {
+        let name = Self::dqs_missing_column_name(err)?;
+        if !rewritten.insert(name.clone()) {
+            return None;
+        }
+        let ranges: Vec<(u32, u32)> = Self::double_quoted_identifier_tokens(sql)
+            .into_iter()
+            .filter(|(_, _, n)| n == &name)
+            .map(|(start, end, _)| (start, end))
+            .collect();
+        if ranges.is_empty() {
+            return None;
+        }
+        Some(Self::splice_dqs_ranges(sql, &ranges, &name))
+    }
+
+    /// True if `sql` parses to exactly one statement — the DQS retry only fires
+    /// here so a committed earlier statement in a batch is never re-executed.
+    fn dqs_single_statement(&self, sql: &str) -> bool {
+        self.cached_parse_multi(sql)
+            .map(|stmts| stmts.len() == 1)
+            .unwrap_or(false)
+    }
+
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
+        let first = match self.query_impl(sql).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+            return Err(first);
+        }
+        let mut rewritten = HashSet::new();
+        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            Some(s) => s,
+            None => return Err(first),
+        };
+        loop {
+            match self.query_impl(&cur).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        Some(s) => s,
+                        None => return Err(e),
+                    };
+                }
+            }
+        }
+    }
+
+    async fn query_impl(&self, sql: &str) -> Result<Vec<Row>> {
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -23557,6 +23697,37 @@ impl Connection {
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
     pub async fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        let first = match self.query_with_params_impl(sql, params).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+            return Err(first);
+        }
+        let mut rewritten = HashSet::new();
+        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            Some(s) => s,
+            None => return Err(first),
+        };
+        loop {
+            match self.query_with_params_impl(&cur, params).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        Some(s) => s,
+                        None => return Err(e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Prepare and execute SQL as a query with bound SQL parameters.
+    async fn query_with_params_impl(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>> {
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -23723,6 +23894,32 @@ impl Connection {
     /// rows.  For SELECT and other statement types it returns the number of
     /// result rows.
     pub async fn execute(&self, sql: &str) -> Result<usize> {
+        let first = match self.execute_impl(sql).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+            return Err(first);
+        }
+        let mut rewritten = HashSet::new();
+        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            Some(s) => s,
+            None => return Err(first),
+        };
+        loop {
+            match self.execute_impl(&cur).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        Some(s) => s,
+                        None => return Err(e),
+                    };
+                }
+            }
+        }
+    }
+
+    async fn execute_impl(&self, sql: &str) -> Result<usize> {
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -23902,6 +24099,32 @@ impl Connection {
 
     /// Prepare and execute SQL with bound SQL parameters.
     pub async fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
+        let first = match self.execute_with_params_impl(sql, params).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+            return Err(first);
+        }
+        let mut rewritten = HashSet::new();
+        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            Some(s) => s,
+            None => return Err(first),
+        };
+        loop {
+            match self.execute_with_params_impl(&cur, params).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        Some(s) => s,
+                        None => return Err(e),
+                    };
+                }
+            }
+        }
+    }
+
+    async fn execute_with_params_impl(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
         self.execute_with_params_with_statement_savepoint_policy(sql, params, false)
             .await
     }
