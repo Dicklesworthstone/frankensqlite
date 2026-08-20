@@ -1803,6 +1803,28 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         self.create_child_with_runtime_affinity(false)
     }
 
+    /// Like [`Self::create_child_for_spawn`], but ALSO snapshots the parent's
+    /// current mask depth into the child so a spawned sub-operation that is part
+    /// of completing a masked section stays mask-protected — its
+    /// [`Self::checkpoint`] will not abort while the caller's masked op is in
+    /// flight. Use ONLY where the spawned work must finish for the caller's
+    /// masked operation to complete (e.g. dirty-page-eviction writeback during a
+    /// masked read); the mask is a snapshot, so the child stays masked for its
+    /// own (bounded) lifetime rather than tracking the parent's later unwind.
+    /// When the parent is unmasked this is identical to
+    /// [`Self::create_child_for_spawn`]. bd-twmyh: the plain spawn-child inherits
+    /// cancellation but not the mask, so its `checkpoint()` aborts mid-writeback
+    /// under a post-VACUUM masked read.
+    #[must_use]
+    pub fn create_child_for_spawn_preserving_mask(&self) -> Self {
+        let child = self.create_child_for_spawn();
+        let depth = self.inner.mask_depth.load(Ordering::Acquire);
+        if depth > 0 {
+            child.inner.mask_depth.store(depth, Ordering::Release);
+        }
+        child
+    }
+
     fn create_child_with_runtime_affinity(&self, inherit_runtime_affinity: bool) -> Self {
         let mut child = Self::with_budget_and_cancel_dispatch(
             self.budget,

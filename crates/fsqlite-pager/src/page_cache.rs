@@ -3831,7 +3831,10 @@ impl ShardedPageCache {
                 })?;
             let scope = native_cx.scope_with_budget(cx.native_spawn_budget(&native_cx));
             let task_cache = Arc::clone(self);
-            let task_cx = cx.create_child_for_spawn();
+            // bd-twmyh: preserve the caller's mask so a dirty-page-eviction
+            // writeback spawned during a masked read (e.g. post-VACUUM rebind)
+            // does not abort at its own checkpoint. No-op when unmasked.
+            let task_cx = cx.create_child_for_spawn_preserving_mask();
             let mut writeback = native_cx
                 .spawn_in(&scope, move |task_native_cx| async move {
                     task_cx.set_native_cx(task_native_cx);
