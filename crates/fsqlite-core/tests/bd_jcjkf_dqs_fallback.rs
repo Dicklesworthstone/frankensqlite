@@ -105,44 +105,51 @@ fn dqs_single_quote_in_name_is_escaped() {
 }
 
 /// bd-82jdw (DQS shape 3): a double-quoted identifier used as an INSERT VALUES
-/// value falls back to a string literal (was silently NULL).
-///
-/// IGNORED: a simple `INSERT ... VALUES(...)` takes the prepared fast lane
-/// (ad_hoc_execute_supports_prepared_reuse -> VDBE), which still resolves a bare
-/// column to NULL. The interpreted-path fix (evaluate_insert_source_row now
-/// errors "no such column") lands, but completing shape 3 needs a proactive DQS
-/// splice at the execute entry (or a VDBE-codegen error). Tracked on bd-82jdw.
-#[ignore = "bd-82jdw: prepared fast-lane INSERT VALUES still NULLs a bare column"]
+/// value falls back to a string literal (was silently NULL). Handled by the
+/// proactive DQS splice at the execute entry, which covers every INSERT path
+/// (prepared fast lane included) — single, multi-column, escaping, multi-row.
 #[test]
 fn dqs_shape3_insert_values_double_quoted_is_string() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
-        conn.execute("CREATE TABLE t(c TEXT);").await.unwrap();
+        conn.execute("CREATE TABLE t(a TEXT, b TEXT);").await.unwrap();
 
-        conn.execute("INSERT INTO t VALUES(\"litstr\");").await.unwrap();
-        let r = conn.query("SELECT c FROM t;").await.unwrap();
-        assert_eq!(r[0].values()[0], SqliteValue::Text("litstr".into()));
+        conn.execute("INSERT INTO t(a) VALUES(\"litstr\");").await.unwrap();
+        // Two double-quoted values in one row; the second escapes a single quote.
+        conn.execute("INSERT INTO t(a, b) VALUES(\"x\", \"a'b\");").await.unwrap();
+        // Multi-row.
+        conn.execute("INSERT INTO t(a) VALUES(\"r1\"), (\"r2\");").await.unwrap();
+
+        let a: Vec<SqliteValue> = conn
+            .query("SELECT a FROM t;")
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect();
+        for want in ["litstr", "x", "r1", "r2"] {
+            assert!(
+                a.contains(&SqliteValue::Text(want.into())),
+                "expected DQS value {want:?} among {a:?}"
+            );
+        }
+        let esc = conn.query("SELECT b FROM t WHERE a = 'x';").await.unwrap();
+        assert_eq!(esc[0].values()[0], SqliteValue::Text("a'b".into()));
     });
 }
 
-/// bd-82jdw: an UNQUOTED bare identifier in a VALUES row is a stock error
-/// (no such column) — not silently NULL, and not a DQS string.
-///
-/// IGNORED for the same prepared-fast-lane reason as above: the interpreted
-/// path errors correctly, but the prepared lane still returns NULL. bd-82jdw.
-#[ignore = "bd-82jdw: prepared fast-lane INSERT VALUES still NULLs a bare column"]
+/// bd-82jdw: the splice is VALUES-value-position precise. A double-quoted TABLE
+/// name is an identifier, not a value — it must NOT be spliced to a string
+/// (which would make the INSERT target a non-existent table).
 #[test]
-fn dqs_shape3_insert_values_unquoted_bare_column_errors() {
+fn dqs_shape3_insert_values_splice_spares_table_name() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(c TEXT);").await.unwrap();
 
-        let r = conn.execute("INSERT INTO t VALUES(foo);").await;
-        assert!(
-            r.is_err(),
-            "an unquoted bare column in VALUES must error (no such column), got {r:?}"
-        );
-        let rows = conn.query("SELECT count(*) FROM t;").await.unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+        // "t" stays the table; only the value "lit" becomes the string 'lit'.
+        conn.execute("INSERT INTO \"t\" VALUES(\"lit\");").await.unwrap();
+        let r = conn.query("SELECT c FROM t;").await.unwrap();
+        assert_eq!(r[0].values()[0], SqliteValue::Text("lit".into()));
     });
 }

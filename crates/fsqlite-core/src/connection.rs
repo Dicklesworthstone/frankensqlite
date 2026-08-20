@@ -23573,12 +23573,81 @@ impl Connection {
             .unwrap_or(false)
     }
 
+    /// bd-82jdw (DQS shape 3): rewrite double-quoted INSERT-VALUES value columns.
+    ///
+    /// A double-quoted identifier used as a VALUES value is a string literal
+    /// under DQS-ON, but every INSERT execution path — the prepared/VDBE fast
+    /// lane included — resolves the bare column to NULL, and no error fires to
+    /// trigger the on-error retry that handles shapes 1+2. A VALUES row has no
+    /// source, so such a column can only be a DQS string: splice each
+    /// double-quoted top-level VALUES column `"X"` -> `'X'` up front. Only value
+    /// columns are touched (their AST spans), so a double-quoted table name,
+    /// column-list name, or ON CONFLICT / RETURNING column is left alone. Returns
+    /// the rewritten SQL, or None if nothing applies.
+    fn dqs_insert_values_rewrite(&self, sql: &str) -> Option<String> {
+        let stmts = self.cached_parse_multi(sql).ok()?;
+        if stmts.len() != 1 {
+            return None;
+        }
+        let Statement::Insert(insert) = stmts[0].as_ref() else {
+            return None;
+        };
+        let fsqlite_ast::InsertSource::Values(rows) = &insert.source else {
+            return None;
+        };
+        let dq_tokens = Self::double_quoted_identifier_tokens(sql);
+        if dq_tokens.is_empty() {
+            return None;
+        }
+        let mut ranges: Vec<(u32, u32, String)> = Vec::new();
+        for row in rows {
+            for expr in row {
+                if let Expr::Column(col_ref, span) = expr
+                    && col_ref.table.is_none()
+                    && dq_tokens.iter().any(|(start, end, name)| {
+                        *start == span.start
+                            && *end == span.end
+                            && name.as_str() == col_ref.column.as_ref()
+                    })
+                {
+                    ranges.push((span.start, span.end, col_ref.column.to_string()));
+                }
+            }
+        }
+        if ranges.is_empty() {
+            return None;
+        }
+        // Splice right-to-left so earlier byte offsets stay valid; each range
+        // becomes its own column name as a single-quote-escaped string literal.
+        ranges.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+        let mut out = sql.to_string();
+        for (start, end, name) in ranges {
+            let literal = format!("'{}'", name.replace('\'', "''"));
+            out.replace_range(start as usize..end as usize, &literal);
+        }
+        Some(out)
+    }
+
+    /// Apply the proactive INSERT-VALUES DQS rewrite when enabled. A cheap
+    /// double-quote pre-check keeps the common path allocation-free (no parse).
+    fn dqs_proactive_rewrite<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
+        if !self.dqs_enabled.get() || !sql.contains('"') {
+            return std::borrow::Cow::Borrowed(sql);
+        }
+        match self.dqs_insert_values_rewrite(sql) {
+            Some(rewritten) => std::borrow::Cow::Owned(rewritten),
+            None => std::borrow::Cow::Borrowed(sql),
+        }
+    }
+
     /// Prepare and execute SQL as a query.
     ///
     /// When `sql` contains multiple statements, only the result rows from the
     /// **last** statement are returned. Intermediate statement results are
     /// discarded. This matches common SQL driver semantics (last statement wins).
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
+        let rewritten = self.dqs_proactive_rewrite(sql);
+        let sql = rewritten.as_ref();
         let first = match self.query_impl(sql).await {
             Ok(v) => return Ok(v),
             Err(e) => e,
@@ -23635,6 +23704,8 @@ impl Connection {
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
     pub async fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        let rewritten = self.dqs_proactive_rewrite(sql);
+        let sql = rewritten.as_ref();
         let first = match self.query_with_params_impl(sql, params).await {
             Ok(v) => return Ok(v),
             Err(e) => e,
@@ -23832,6 +23903,8 @@ impl Connection {
     /// rows.  For SELECT and other statement types it returns the number of
     /// result rows.
     pub async fn execute(&self, sql: &str) -> Result<usize> {
+        let rewritten = self.dqs_proactive_rewrite(sql);
+        let sql = rewritten.as_ref();
         let first = match self.execute_impl(sql).await {
             Ok(v) => return Ok(v),
             Err(e) => e,
@@ -24037,6 +24110,8 @@ impl Connection {
 
     /// Prepare and execute SQL with bound SQL parameters.
     pub async fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
+        let rewritten = self.dqs_proactive_rewrite(sql);
+        let sql = rewritten.as_ref();
         let first = match self.execute_with_params_impl(sql, params).await {
             Ok(v) => return Ok(v),
             Err(e) => e,
@@ -47139,13 +47214,13 @@ impl Connection {
             // statement entry splice a double-quoted `"X"` -> `'X'` (bd-jcjkf).
             // The error precedes any row write, so the retry cannot double an
             // effect. (Nested bare refs like `VALUES(1 + "x")` stay a follow-up.)
-            if let Expr::Column(col_ref, _) = expr {
-                if col_ref.table.is_none() {
-                    return Err(FrankenError::Internal(format!(
-                        "no such column: {}",
-                        col_ref.column
-                    )));
-                }
+            if let Expr::Column(col_ref, _) = expr
+                && col_ref.table.is_none()
+            {
+                return Err(FrankenError::Internal(format!(
+                    "no such column: {}",
+                    col_ref.column
+                )));
             }
             values.push(
                 self.eval_expr_with_subqueries(expr, empty_row, empty_col_map, params)
