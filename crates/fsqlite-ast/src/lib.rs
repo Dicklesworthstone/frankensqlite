@@ -7,6 +7,7 @@
 //! Reference: §10.3–10.4 of the FrankenSQLite specification.
 
 mod display;
+pub use display::quote_ident_if_needed;
 pub mod rebase;
 
 use std::fmt;
