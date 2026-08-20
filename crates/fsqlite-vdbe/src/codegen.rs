@@ -24290,9 +24290,16 @@ fn emit_without_rowid_row_insert(
         },
     ) = upsert
     {
-        // An omitted conflict target must fire on any uniqueness constraint, so
-        // probe the UNIQUE secondary indexes too; an explicit target is PK-only
-        // (an explicit secondary-UNIQUE target is refused earlier).
+        // Conflict-target routing:
+        //  - omitted target  -> DO UPDATE fires on ANY uniqueness constraint;
+        //    probe the PRIMARY KEY and every UNIQUE secondary index.
+        //  - explicit PRIMARY KEY -> PK-only (find_upsert_target_index returns
+        //    None for the PK, which is the table btree, not in `table.indexes`).
+        //  - explicit secondary UNIQUE (bd-yqjjx) -> DO UPDATE fires ONLY on
+        //    that index; probe just it, leaving PK/other-index collisions to the
+        //    statement-level conflict action.
+        let explicit_target_index =
+            find_upsert_target_index(table, clause.target.as_ref()).map(|(offset, _)| offset);
         let probe_unique_secondaries = clause.target.is_none();
         return emit_without_rowid_upsert_row(
             b,
@@ -24307,6 +24314,7 @@ fn emit_without_rowid_row_insert(
             returning,
             schema,
             probe_unique_secondaries,
+            explicit_target_index,
         );
     }
 
@@ -24572,8 +24580,11 @@ fn emit_without_rowid_row_insert(
 /// omitted conflict target, SQLite 3.35+) — each UNIQUE secondary index in
 /// index order. On the first uniqueness conflict the table cursor is positioned
 /// on the conflicting row and DO UPDATE is applied to it; with no conflict the
-/// attempted row is inserted. An explicit secondary-UNIQUE index target is
-/// rejected by the caller before this runs.
+/// attempted row is inserted. When `explicit_target_index` is `Some(idx)` (an
+/// explicit secondary-UNIQUE conflict target, bd-yqjjx) only that index is
+/// probed — a PRIMARY KEY or other-index collision is not the named arbiter, so
+/// it falls through to the ordinary insert and surfaces as the statement-level
+/// conflict action rather than a DO UPDATE.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 #[allow(clippy::too_many_arguments)]
 fn emit_without_rowid_upsert_row(
@@ -24589,6 +24600,7 @@ fn emit_without_rowid_upsert_row(
     returning: &[ResultColumn],
     schema: &[TableSchema],
     probe_unique_secondaries: bool,
+    explicit_target_index: Option<usize>,
 ) -> Result<(), CodegenError> {
     let n_cols = table.columns.len();
     let n_pk = pk_indices.len();
@@ -24597,107 +24609,165 @@ fn emit_without_rowid_upsert_row(
     let do_insert = b.emit_label();
     let do_update = b.emit_label();
 
-    // Probe the PRIMARY KEY: build a PK-prefix key and test for an existing row.
-    let pk_probe_regs = b.alloc_regs(n_pk as i32);
-    for (j, &pk_col) in pk_indices.iter().enumerate() {
+    if let Some(target_idx) = explicit_target_index {
+        // Explicit secondary-UNIQUE conflict target (bd-yqjjx): DO UPDATE fires
+        // ONLY on a conflict against THIS index. A PRIMARY KEY collision, or a
+        // collision on any OTHER unique index, is not this target — it must fall
+        // through to the ordinary insert and surface as the statement-level
+        // conflict action (ABORT by default). So there is deliberately no
+        // PK-for-update probe here; probe only the target index, exactly like a
+        // single iteration of the omitted-target secondary loop below.
+        let index = &table.indexes[target_idx];
+        let idx_cursor = table_cursor + 1 + target_idx as i32;
+        let n_idx_cols = index.key_term_count();
+        let scan_ctx = ScanCtx {
+            cursor: table_cursor,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: Some(val_regs),
+            secondaries: &[],
+        };
+        let idx_key_regs = b.alloc_regs(n_idx_cols as i32);
+        for key_pos in 0..n_idx_cols {
+            emit_index_key_term(b, index, key_pos, idx_key_regs + key_pos as i32, &scan_ctx);
+        }
+        let idx_probe_rec = b.alloc_reg();
         b.emit_op(
-            Opcode::Copy,
-            val_regs + pk_col as i32,
-            pk_probe_regs + j as i32,
-            0,
+            Opcode::MakeRecord,
+            idx_key_regs,
+            n_idx_cols as i32,
+            idx_probe_rec,
             P4::None,
             0,
         );
-    }
-    let pk_probe_rec = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        pk_probe_regs,
-        n_pk as i32,
-        pk_probe_rec,
-        P4::None,
-        0,
-    );
-    // NoConflict jumps when there is NO existing PK match; a match falls through
-    // with the table cursor positioned on the conflicting row.
-    let pk_no_conflict = b.emit_label();
-    b.emit_jump_to_label(
-        Opcode::NoConflict,
-        table_cursor,
-        pk_probe_rec,
-        pk_no_conflict,
-        P4::None,
-        0,
-    );
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, do_update, P4::None, 0);
-    b.resolve_label(pk_no_conflict);
-
-    // Omitted conflict target: SQLite fires DO UPDATE on whichever uniqueness
-    // constraint is violated, checked in constraint order — the PRIMARY KEY
-    // (above), then each UNIQUE secondary index in index order. Probe each
-    // UNIQUE index against the attempted-insert values; on the first hit,
-    // position the table cursor on that row via its PK suffix and run the same
-    // DO UPDATE block. An explicit PRIMARY KEY target skips this (PK-only).
-    if probe_unique_secondaries {
-        for (idx_offset, index) in table.indexes.iter().enumerate() {
-            if !index.is_unique {
-                continue;
-            }
-            let idx_cursor = table_cursor + 1 + idx_offset as i32;
-            let n_idx_cols = index.key_term_count();
-            let next_index = b.emit_label();
-            let scan_ctx = ScanCtx {
-                cursor: table_cursor,
-                table,
-                table_alias: None,
-                schema: None,
-                register_base: Some(val_regs),
-                secondaries: &[],
-            };
-            let idx_key_regs = b.alloc_regs(n_idx_cols as i32);
-            for key_pos in 0..n_idx_cols {
-                emit_index_key_term(b, index, key_pos, idx_key_regs + key_pos as i32, &scan_ctx);
-            }
-            let idx_probe_rec = b.alloc_reg();
+        // No existing entry shares these key terms (a NULL key term never
+        // conflicts — SQLite UNIQUE semantics) -> ordinary insert.
+        b.emit_jump_to_label(
+            Opcode::NoConflict,
+            idx_cursor,
+            idx_probe_rec,
+            do_insert,
+            P4::None,
+            0,
+        );
+        // Conflict: position the table cursor on the conflicting row via the
+        // index entry's PK suffix, then run DO UPDATE. If the index and table
+        // are inconsistent (row missing), fall through to the plain insert,
+        // which re-surfaces the conflict as an ABORT.
+        emit_without_rowid_index_to_table_seek(
+            b,
+            table,
+            table_cursor,
+            idx_cursor,
+            index,
+            pk_indices,
+            do_insert,
+        );
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, do_update, P4::None, 0);
+    } else {
+        // Probe the PRIMARY KEY: build a PK-prefix key and test for an existing row.
+        let pk_probe_regs = b.alloc_regs(n_pk as i32);
+        for (j, &pk_col) in pk_indices.iter().enumerate() {
             b.emit_op(
-                Opcode::MakeRecord,
-                idx_key_regs,
-                n_idx_cols as i32,
-                idx_probe_rec,
+                Opcode::Copy,
+                val_regs + pk_col as i32,
+                pk_probe_regs + j as i32,
+                0,
                 P4::None,
                 0,
             );
-            // NoConflict jumps to `next_index` when no existing entry shares
-            // these key terms (a NULL key term never conflicts — SQLite UNIQUE
-            // semantics). On a conflict the index cursor is positioned on the
-            // conflicting entry.
-            b.emit_jump_to_label(
-                Opcode::NoConflict,
-                idx_cursor,
-                idx_probe_rec,
-                next_index,
-                P4::None,
-                0,
-            );
-            // Position the table cursor on the conflicting row via the index
-            // entry's PK suffix, then run DO UPDATE. If the index and table are
-            // inconsistent (row missing), fall through to the plain insert,
-            // which re-surfaces the conflict as an ABORT.
-            emit_without_rowid_index_to_table_seek(
-                b,
-                table,
-                table_cursor,
-                idx_cursor,
-                index,
-                pk_indices,
-                do_insert,
-            );
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, do_update, P4::None, 0);
-            b.resolve_label(next_index);
         }
+        let pk_probe_rec = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            pk_probe_regs,
+            n_pk as i32,
+            pk_probe_rec,
+            P4::None,
+            0,
+        );
+        // NoConflict jumps when there is NO existing PK match; a match falls through
+        // with the table cursor positioned on the conflicting row.
+        let pk_no_conflict = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::NoConflict,
+            table_cursor,
+            pk_probe_rec,
+            pk_no_conflict,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, do_update, P4::None, 0);
+        b.resolve_label(pk_no_conflict);
+
+        // Omitted conflict target: SQLite fires DO UPDATE on whichever uniqueness
+        // constraint is violated, checked in constraint order — the PRIMARY KEY
+        // (above), then each UNIQUE secondary index in index order. Probe each
+        // UNIQUE index against the attempted-insert values; on the first hit,
+        // position the table cursor on that row via its PK suffix and run the same
+        // DO UPDATE block. An explicit PRIMARY KEY target skips this (PK-only).
+        if probe_unique_secondaries {
+            for (idx_offset, index) in table.indexes.iter().enumerate() {
+                if !index.is_unique {
+                    continue;
+                }
+                let idx_cursor = table_cursor + 1 + idx_offset as i32;
+                let n_idx_cols = index.key_term_count();
+                let next_index = b.emit_label();
+                let scan_ctx = ScanCtx {
+                    cursor: table_cursor,
+                    table,
+                    table_alias: None,
+                    schema: None,
+                    register_base: Some(val_regs),
+                    secondaries: &[],
+                };
+                let idx_key_regs = b.alloc_regs(n_idx_cols as i32);
+                for key_pos in 0..n_idx_cols {
+                    emit_index_key_term(b, index, key_pos, idx_key_regs + key_pos as i32, &scan_ctx);
+                }
+                let idx_probe_rec = b.alloc_reg();
+                b.emit_op(
+                    Opcode::MakeRecord,
+                    idx_key_regs,
+                    n_idx_cols as i32,
+                    idx_probe_rec,
+                    P4::None,
+                    0,
+                );
+                // NoConflict jumps to `next_index` when no existing entry shares
+                // these key terms (a NULL key term never conflicts — SQLite UNIQUE
+                // semantics). On a conflict the index cursor is positioned on the
+                // conflicting entry.
+                b.emit_jump_to_label(
+                    Opcode::NoConflict,
+                    idx_cursor,
+                    idx_probe_rec,
+                    next_index,
+                    P4::None,
+                    0,
+                );
+                // Position the table cursor on the conflicting row via the index
+                // entry's PK suffix, then run DO UPDATE. If the index and table are
+                // inconsistent (row missing), fall through to the plain insert,
+                // which re-surfaces the conflict as an ABORT.
+                emit_without_rowid_index_to_table_seek(
+                    b,
+                    table,
+                    table_cursor,
+                    idx_cursor,
+                    index,
+                    pk_indices,
+                    do_insert,
+                );
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, do_update, P4::None, 0);
+                b.resolve_label(next_index);
+            }
+        }
+        // No uniqueness conflict anywhere: perform the ordinary insert.
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, do_insert, P4::None, 0);
     }
-    // No uniqueness conflict anywhere: perform the ordinary insert.
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, do_insert, P4::None, 0);
 
     // --- Conflict path: DO UPDATE against the existing row (cursor positioned) ---
     b.resolve_label(do_update);
@@ -24911,9 +24981,11 @@ fn codegen_insert_without_rowid(
             UpsertAction::Update { .. } => stmt.or_conflict,
         }
     };
-    // DO UPDATE against a *secondary* UNIQUE index target is not yet supported:
-    // the WITHOUT ROWID upsert probe positions on the PRIMARY KEY only. Validate
-    // the assignment targets and `excluded.*` references up front for error parity.
+    // Validate the DO UPDATE assignment targets and `excluded.*` references up
+    // front for error parity. Every conflict-target shape is now emittable: the
+    // WITHOUT ROWID upsert probe (emit_without_rowid_upsert_row) covers the
+    // PRIMARY KEY, an omitted target (any UNIQUE constraint), and an explicit
+    // secondary-UNIQUE index target (bd-yqjjx) — so there is no refusal here.
     if let Some(UpsertClause {
         action: UpsertAction::Update {
             assignments,
@@ -24922,18 +24994,6 @@ fn codegen_insert_without_rowid(
         ..
     }) = upsert_clause
     {
-        if find_upsert_target_index(table, upsert_clause.and_then(|c| c.target.as_ref())).is_some()
-        {
-            return Err(CodegenError::Unsupported(
-                "ON CONFLICT DO UPDATE with a secondary UNIQUE index conflict target on WITHOUT \
-                 ROWID tables is not yet supported (only the PRIMARY KEY target is supported)"
-                    .to_owned(),
-            ));
-        }
-        // An omitted conflict target fires on any uniqueness constraint. The
-        // WITHOUT ROWID upsert probe now covers the PRIMARY KEY and every UNIQUE
-        // secondary index (emit_without_rowid_upsert_row), so this shape is
-        // supported — no refusal here.
         for assign in assignments {
             validate_assignment_target(table, &assign.target)?;
             validate_upsert_expr_columns(&assign.value, table, target_alias)?;
