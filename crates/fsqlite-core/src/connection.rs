@@ -45049,6 +45049,67 @@ impl Connection {
         }
     }
 
+    /// Collect the `Expr::Column` nodes in `expr` that are qualified to
+    /// `table`/`alias`, restricted to the operand positions
+    /// [`Self::query_term_rejects_null`] inspects (comparison / arithmetic / IN /
+    /// BETWEEN / LIKE / IS NULL). A column elsewhere (function args, CASE) can
+    /// never make a conjunct null-rejecting, so it is skipped. (bd-vi8lh (a))
+    fn collect_null_reject_candidate_columns<'a>(
+        expr: &'a Expr,
+        table: &str,
+        alias: Option<&str>,
+        out: &mut Vec<&'a Expr>,
+    ) {
+        match expr {
+            Expr::Column(col, _) => {
+                if col.table.as_deref().is_some_and(|q| {
+                    q.eq_ignore_ascii_case(table)
+                        || alias.is_some_and(|a| q.eq_ignore_ascii_case(a))
+                }) {
+                    out.push(expr);
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::collect_null_reject_candidate_columns(left, table, alias, out);
+                Self::collect_null_reject_candidate_columns(right, table, alias, out);
+            }
+            Expr::UnaryOp { expr: inner, .. } | Expr::IsNull { expr: inner, .. } => {
+                Self::collect_null_reject_candidate_columns(inner, table, alias, out);
+            }
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                ..
+            } => {
+                Self::collect_null_reject_candidate_columns(inner, table, alias, out);
+                Self::collect_null_reject_candidate_columns(low, table, alias, out);
+                Self::collect_null_reject_candidate_columns(high, table, alias, out);
+            }
+            Expr::In { expr: inner, .. } | Expr::Like { expr: inner, .. } => {
+                Self::collect_null_reject_candidate_columns(inner, table, alias, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a WHERE conjunct `term` is null-rejecting on ANY column qualified
+    /// to `table`/`alias` — i.e. the term can never be TRUE when a row of that
+    /// table is NULL-extended. bd-vi8lh (a): an outer-join right table with such
+    /// a WHERE term STRENGTH-REDUCES from LEFT to INNER, so its WHERE terms
+    /// become available to cover a forced partial index (matching stock's
+    /// LEFT->INNER reduction). STRICT — only genuinely null-rejecting terms on
+    /// EXPLICITLY qualified columns of this table qualify; over-strict is safe
+    /// (it only rejects an otherwise-usable index), a false positive is UNSAFE
+    /// (it would expose WHERE terms that do not hold for null-extended rows).
+    fn where_term_rejects_null_on_table(term: &Expr, table: &str, alias: Option<&str>) -> bool {
+        let mut candidates: Vec<&Expr> = Vec::new();
+        Self::collect_null_reject_candidate_columns(term, table, alias, &mut candidates);
+        candidates
+            .iter()
+            .any(|col| Self::query_term_rejects_null(term, col))
+    }
+
     /// Whether a single normalized query WHERE/ON conjunct `query_term` logically
     /// covers the partial-index predicate conjunct `predicate`, mirroring
     /// SQLite's `sqlite3ExprImpliesExpr` (bd-wlo29 H3): an `exprCompare`/commute
@@ -45199,9 +45260,34 @@ impl Connection {
                         if let Some(predicate) = &partial_predicate {
                             // The conjuncts the join tree actually exposes to this
                             // source (bd-wlo29 H4): an outer-join right table sees
-                            // only its own ON terms, never the global set.
+                            // only its own ON terms, never the global set — UNLESS
+                            // a WHERE term is null-rejecting on one of its columns,
+                            // which strength-reduces the LEFT join to INNER
+                            // (bd-vi8lh (a)); then the WHERE terms AND its own ON
+                            // terms both cover the forced partial index, matching
+                            // stock (LEFT JOIN t INDEXED BY pi ON a.i=t.j WHERE
+                            // t.b=5 -> stock row). Prepare-only accept/reject; the
+                            // WHERE terms still filter null-extended rows at
+                            // execution, so this cannot itself drop preserved rows.
+                            let strength_reduced_chain: Vec<&Expr>;
                             let available: &[&Expr] = if source_is_outer_right[si] {
-                                &outer_on_for_source[si]
+                                let strength_reduced = regular_conjuncts.iter().any(|conj| {
+                                    Self::where_term_rejects_null_on_table(
+                                        conj,
+                                        name.name.as_str(),
+                                        alias.as_deref(),
+                                    )
+                                });
+                                if strength_reduced {
+                                    strength_reduced_chain = regular_conjuncts
+                                        .iter()
+                                        .copied()
+                                        .chain(outer_on_for_source[si].iter().copied())
+                                        .collect();
+                                    &strength_reduced_chain
+                                } else {
+                                    &outer_on_for_source[si]
+                                }
                             } else {
                                 &regular_conjuncts
                             };

@@ -20,6 +20,7 @@
 //!   targets and derived-table (subquery) sources skipped it entirely.
 
 use fsqlite_core::connection::Connection;
+use fsqlite_types::value::SqliteValue;
 
 async fn conn(ddl: &[&str]) -> Connection {
     let conn = Connection::open(":memory:").await.unwrap();
@@ -235,5 +236,100 @@ fn l10_derived_table_source_is_checked() {
             "SELECT * FROM (SELECT a FROM t INDEXED BY g WHERE a = 1);",
         )
         .await;
+    });
+}
+
+// ------------------------------------------------------------------ (a) -----
+// bd-vi8lh (a): a LEFT-JOIN right table STRENGTH-REDUCES to INNER when a WHERE
+// term is null-rejecting on one of its columns; the WHERE terms then cover its
+// forced partial index (stock's LEFT->INNER reduction). SAFETY: the check is
+// prepare-only accept/reject; execution still filters null-extended rows, so an
+// accepted case is verified ROW-FOR-ROW against the stock oracle (sqlite3
+// 3.46.1), not just allow/reject — an accept that returned wrong rows would be a
+// separate execution bug.
+
+async fn int_rows(conn: &Connection, sql: &str) -> Vec<i64> {
+    conn.query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("`{sql}` must be allowed, got: {e:?}"))
+        .iter()
+        .map(|row| match &row.values()[0] {
+            SqliteValue::Integer(n) => *n,
+            other => panic!("`{sql}` expected integer rows, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn h4_left_join_strength_reduction_cover_vi8lh() {
+    asupersync::test_utils::run_test(|| async {
+        // a(i)=1,2,3; t(j,b)=(1,5); partial index pi ON t(j) WHERE b IS NOT NULL.
+        let c = conn(&[
+            "CREATE TABLE a(i);",
+            "CREATE TABLE t(j, b);",
+            "INSERT INTO a(i) VALUES (1),(2),(3);",
+            "INSERT INTO t(j, b) VALUES (1, 5);",
+            "CREATE INDEX pi ON t(j) WHERE b IS NOT NULL;",
+        ])
+        .await;
+
+        // WHERE t.b = 5 is null-rejecting on t.b -> LEFT->INNER; the WHERE term
+        // covers pi's `b IS NOT NULL`. Execution filters a.i=2,3 (they null-extend
+        // and t.b=5 is not true). Stock: ACCEPT, rows=[1].
+        assert_eq!(
+            int_rows(
+                &c,
+                "SELECT a.i FROM a LEFT JOIN t INDEXED BY pi ON a.i = t.j WHERE t.b = 5 ORDER BY a.i;",
+            )
+            .await,
+            vec![1],
+            "WHERE t.b=5 strength-reduces and returns stock's [1]",
+        );
+        // A NULL-propagating operand (t.b + 0 = 5) also strength-reduces (reuses
+        // facet (b) expr_null_propagates_from). Stock: ACCEPT, rows=[1].
+        assert_eq!(
+            int_rows(
+                &c,
+                "SELECT a.i FROM a LEFT JOIN t INDEXED BY pi ON a.i = t.j WHERE t.b + 0 = 5 ORDER BY a.i;",
+            )
+            .await,
+            vec![1],
+            "WHERE t.b+0=5 (null-propagating) strength-reduces and returns [1]",
+        );
+
+        // t.b IS NULL is NULL-tolerant -> NO strength reduction. Stock: REJECT.
+        reject_query(
+            &c,
+            "SELECT a.i FROM a LEFT JOIN t INDEXED BY pi ON a.i = t.j WHERE t.b IS NULL;",
+        )
+        .await;
+        // A WHERE term on the OTHER table (a.i > 0) does not strength-reduce t.
+        // Stock: REJECT.
+        reject_query(
+            &c,
+            "SELECT a.i FROM a LEFT JOIN t INDEXED BY pi ON a.i = t.j WHERE a.i > 0;",
+        )
+        .await;
+        // Pure LEFT join, ON-only: `a.i=t.j` does not cover `b IS NOT NULL`, and
+        // no WHERE term strength-reduces. Stock: REJECT.
+        reject_query(
+            &c,
+            "SELECT a.i FROM a LEFT JOIN t INDEXED BY pi ON a.i = t.j;",
+        )
+        .await;
+
+        // CONTROL (must NOT regress): the null-rejecting term lives in the ON, so
+        // it covers pi for the UNPRESERVED right table via the existing outer-ON
+        // path (no strength reduction needed); the LEFT join stays PRESERVED so
+        // all a rows survive. Stock: ACCEPT, rows=[1,2,3].
+        assert_eq!(
+            int_rows(
+                &c,
+                "SELECT a.i FROM a LEFT JOIN t INDEXED BY pi ON a.i = t.j AND t.b = 5 ORDER BY a.i;",
+            )
+            .await,
+            vec![1, 2, 3],
+            "ON-covers control: LEFT preserved, all rows [1,2,3] (no regression)",
+        );
     });
 }
