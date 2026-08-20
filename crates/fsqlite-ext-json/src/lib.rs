@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
-    ColumnContext, FunctionRegistry, IndexInfo, JSON_SUBTYPE, ScalarFunction, VirtualTable,
-    VirtualTableCursor,
+    AggregateFunction, ColumnContext, FunctionRegistry, IndexInfo, JSON_SUBTYPE, ScalarFunction,
+    VirtualTable, VirtualTableCursor,
 };
 use fsqlite_types::{SmallText, SqliteValue, cx::Cx};
 use serde_json::{Map, Number, Value};
@@ -3699,6 +3699,61 @@ impl ScalarFunction for JsonPrettyFunc {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// json_group_array(X) / json_group_object(NAME, VALUE) — JSON aggregates
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `json_group_array(X)` — aggregate every argument value (including SQL NULL,
+/// which becomes JSON `null`) into a JSON array, reusing `json_array` so the
+/// element encoding is identical to the scalar constructor.
+pub struct JsonGroupArrayFunc;
+
+impl AggregateFunction for JsonGroupArrayFunc {
+    type State = Vec<SqliteValue>;
+    fn initial_state(&self) -> Self::State {
+        Vec::new()
+    }
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        state.push(args[0].clone());
+        Ok(())
+    }
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        Ok(SqliteValue::Text(SmallText::from_string(json_array(&state)?)))
+    }
+    fn num_args(&self) -> i32 {
+        1
+    }
+    fn name(&self) -> &str {
+        "json_group_array"
+    }
+}
+
+/// `json_group_object(NAME, VALUE)` — aggregate (name, value) pairs into a JSON
+/// object, reusing `json_object`. The flattened `[k0, v0, k1, v1, …]` buffer
+/// feeds `json_object` directly, matching its key/value encoding and validation.
+pub struct JsonGroupObjectFunc;
+
+impl AggregateFunction for JsonGroupObjectFunc {
+    type State = Vec<SqliteValue>;
+    fn initial_state(&self) -> Self::State {
+        Vec::new()
+    }
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        state.push(args[0].clone());
+        state.push(args[1].clone());
+        Ok(())
+    }
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        Ok(SqliteValue::Text(SmallText::from_string(json_object(&state)?)))
+    }
+    fn num_args(&self) -> i32 {
+        2
+    }
+    fn name(&self) -> &str {
+        "json_group_object"
+    }
+}
+
 /// Register JSON1 scalar functions into a `FunctionRegistry`.
 pub fn register_json_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(JsonFunc);
@@ -3729,6 +3784,8 @@ pub fn register_json_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(JsonArrayLengthFunc);
     registry.register_scalar(JsonErrorPositionFunc);
     registry.register_scalar(JsonPrettyFunc);
+    registry.register_aggregate(JsonGroupArrayFunc);
+    registry.register_aggregate(JsonGroupObjectFunc);
 }
 
 #[cfg(test)]

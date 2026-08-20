@@ -9178,6 +9178,11 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
     "count",
     "group_concat",
     "string_agg",
+    // JSON1 collection aggregates (fsqlite-ext-json, always registered). They
+    // have no scalar overload, so the name-only predicate is safe — the wrong
+    // arity is rejected downstream by `find_aggregate`.
+    "json_group_array",
+    "json_group_object",
     "max",
     "min",
     "sum",
