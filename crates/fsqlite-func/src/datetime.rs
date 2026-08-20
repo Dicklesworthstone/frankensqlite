@@ -49,27 +49,6 @@ use crate::{FunctionRegistry, ScalarFunction};
 // wasm32 has no stable host-local timezone provider through this crate path,
 // so wasm builds keep these modifiers as explicit UTC no-ops.
 
-/// Return the UTC offset in seconds, interpreting the components as **local** time.
-///
-/// Used by the `utc` modifier (local → UTC): the input JDN is local time,
-/// so we ask chrono "what UTC offset applies at this local time?"
-#[cfg(not(target_arch = "wasm32"))]
-fn utc_offset_for_local_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
-    use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
-    let date = NaiveDate::from_ymd_opt(y, mo, d).unwrap_or_default();
-    let time = NaiveTime::from_hms_opt(h, mi, s).unwrap_or_default();
-    let naive = NaiveDateTime::new(date, time);
-    match Local.from_local_datetime(&naive).earliest() {
-        Some(dt) => dt.offset().local_minus_utc() as i64,
-        None => 0, // ambiguous or nonexistent time (DST gap)
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn utc_offset_for_local_datetime(_y: i32, _mo: u32, _d: u32, _h: u32, _mi: u32, _s: u32) -> i64 {
-    0
-}
-
 /// Return the UTC offset in seconds, interpreting the components as **UTC** time.
 ///
 /// Used by the `localtime` modifier (UTC → local): the input JDN is UTC,
@@ -99,11 +78,43 @@ fn utc_offset_for_utc_jdn(jdn: f64) -> i64 {
     utc_offset_for_utc_datetime(y as i32, mo as u32, d as u32, h as u32, mi as u32, s as u32)
 }
 
-/// Compute the UTC offset for the `utc` modifier (local → UTC).
-fn utc_offset_for_local_jdn(jdn: f64) -> i64 {
-    let (y, mo, d) = jdn_to_ymd(jdn);
-    let (h, mi, s, _frac) = jdn_to_hms(jdn);
-    utc_offset_for_local_datetime(y as i32, mo as u32, d as u32, h as u32, mi as u32, s as u32)
+/// Convert a local-time JDN to UTC for the `utc` modifier, mirroring SQLite's
+/// iterative fixed-point solver (date.c, the `utc` modifier case): find the UTC
+/// instant whose localtime() reproduces the given local wall-clock, iterating up
+/// to 4 times. Unlike a single-offset lookup, this resolves DST-transition
+/// ambiguity to the pre-transition offset exactly as stock does — both the
+/// spring-forward GAP (a nonexistent local time) and the fall-back FOLD (a local
+/// time that occurs twice) — while staying exact for all unambiguous times.
+/// bd-tl6ly.
+#[cfg(not(target_arch = "wasm32"))]
+fn local_jdn_to_utc_jdn(local_jdn: f64) -> f64 {
+    let orig = local_jdn;
+    let mut guess = orig;
+    let mut err = 0.0_f64;
+    let mut cnt = 0u32;
+    loop {
+        guess -= err;
+        // localtime(guess-as-UTC), expressed as a JDN, is `guess` plus the local
+        // UTC offset in effect at that instant.
+        let off = utc_offset_for_utc_jdn(guess);
+        let localized = guess + off as f64 / 86400.0;
+        err = localized - orig;
+        // Mirror sqlite's `while( iErr && cnt++<3 )`: real-timezone offsets are
+        // whole minutes, so a sub-second residual is convergence; the 4-iteration
+        // cap makes the gap's ±1h oscillation terminate on the same UTC value
+        // stock lands on.
+        if err.abs() < 0.5 / 86400.0 || cnt >= 3 {
+            break;
+        }
+        cnt += 1;
+    }
+    guess
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_jdn_to_utc_jdn(local_jdn: f64) -> f64 {
+    // wasm has no host-local timezone provider through this path; `utc` is a no-op.
+    local_jdn
 }
 
 // ── Julian Day Number Conversions ─────────────────────────────────────────
@@ -553,11 +564,11 @@ fn apply_modifier(jdn: f64, modifier: &str) -> Option<f64> {
         let offset = utc_offset_for_utc_jdn(jdn);
         return Some(jdn + offset as f64 / 86400.0);
     }
-    // 'utc' — convert local time to UTC.  The input JDN is local time, so
-    // we compute the offset by interpreting the datetime as local.
+    // 'utc' — convert local time to UTC via sqlite's iterative fixed-point
+    // solver, so a DST-transition-ambiguous local time resolves to the
+    // pre-transition offset exactly as stock does (bd-tl6ly).
     if m == "utc" {
-        let offset = utc_offset_for_local_jdn(jdn);
-        return Some(jdn - offset as f64 / 86400.0);
+        return Some(local_jdn_to_utc_jdn(jdn));
     }
 
     // 'subsec' / 'subsecond' — this is a flag that affects output formatting,
@@ -1703,6 +1714,39 @@ pub fn register_datetime_builtins(registry: &mut FunctionRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // bd-tl6ly: the `utc` modifier must resolve DST-transition ambiguity to the
+    // pre-transition offset exactly as stock sqlite3 does. This is TZ-dependent,
+    // so it is gated on TZ=America/New_York (set_var is unsafe / forbidden here,
+    // so the harness/CI must run the process with that TZ); it skips otherwise
+    // so it stays portable. Expected values were captured from sqlite3 3.46.1.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn utc_modifier_dst_transition_matches_stock_bd_tl6ly() {
+        if std::env::var("TZ").ok().as_deref() != Some("America/New_York") {
+            eprintln!(
+                "SKIP utc_modifier_dst_transition_matches_stock_bd_tl6ly: needs TZ=America/New_York"
+            );
+            return;
+        }
+        let utc_of = |y, mo, d, h, mi, s| -> (i64, i64, i64, i64, i64, i64) {
+            let jdn = ymdhms_to_jdn(y, mo, d, h, mi, s, 0.0);
+            let out = apply_modifier(jdn, "utc").expect("utc modifier");
+            let (yy, mm, dd) = jdn_to_ymd(out);
+            let (hh, nn, ss, _f) = jdn_to_hms(out);
+            (yy, mm, dd, hh, nn, ss)
+        };
+        // normal winter EST(-5): 2024-01-15 12:00 local -> 17:00 UTC
+        assert_eq!(utc_of(2024, 1, 15, 12, 0, 0), (2024, 1, 15, 17, 0, 0));
+        // normal summer EDT(-4): 2024-07-15 12:00 local -> 16:00 UTC
+        assert_eq!(utc_of(2024, 7, 15, 12, 0, 0), (2024, 7, 15, 16, 0, 0));
+        // near-transition, unambiguous EDT: 2024-03-10 06:30 -> 10:30 (-4)
+        assert_eq!(utc_of(2024, 3, 10, 6, 30, 0), (2024, 3, 10, 10, 30, 0));
+        // spring-forward GAP (02:30 is nonexistent) -> pre-transition EST(-5) -> 07:30
+        assert_eq!(utc_of(2024, 3, 10, 2, 30, 0), (2024, 3, 10, 7, 30, 0));
+        // fall-back FOLD (01:30 occurs twice) -> pre-transition EDT(-4) -> 05:30
+        assert_eq!(utc_of(2024, 11, 3, 1, 30, 0), (2024, 11, 3, 5, 30, 0));
+    }
 
     fn text(s: &str) -> SqliteValue {
         SqliteValue::Text(s.into())
