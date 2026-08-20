@@ -1,0 +1,373 @@
+// bd-jcjkf — DQS-ON engine: resolve-fail-triggered rewrite-retry.
+// DRAFT-UNVERIFIED (disk 100%, no build). FREEZE-SAFE: `.rs.draft` is never compiled
+// by cargo, so a co-lane build cannot break on it. APPLY (one commit when disk clears):
+// paste these items into crates/fsqlite-core/src/connection.rs (the free fns go at
+// module scope near the any_function_call_in_* family ~95166; the two methods go in
+// `impl Connection`), apply the pragma plumbing (dqs_pragma_plumbing.draft.md) and the
+// keeper (git mv dqs_compat.rs.draft dqs_compat.rs), then build + verify.
+//
+// DESIGN (mirrors stock's "try to resolve; else treat the double-quoted token as a
+// string"): run the statement normally; on a no-such-column error naming X, if
+// dqs_enabled AND the ORIGINAL SQL re-lexes to a QuotedId(X, true) token, rewrite the
+// bare Expr::Column(X) nodes whose span belongs to a double-quoted token into
+// Literal::String(X), and retry. Span membership => "this occurrence was double-quoted"
+// (so a BARE `x` typo is never rescued); name match => "this is the errored name".
+//
+// KNOWN LIMITATION (documented, near-impossible in real SQL): if the SAME identifier is
+// double-quoted in TWO occurrences — one resolvable as a real column, one not — a single
+// error names X and we rewrite BOTH double-quoted X occurrences (the error does not carry
+// the failing occurrence's span). Stock resolves per-occurrence. Realistic DQS use
+// (FROM-less literals, VALUES/WHERE strings, concat) never collides a real column name
+// with a string literal, so this is a theoretical gap. CORRECT-PER-OCCURRENCE FOLLOW-UP:
+// thread the failing col-ref's Span into FrankenError::NoSuchColumn / CodegenError::
+// ColumnNotFound and rewrite only that span (filed as a note on bd-jcjkf).
+//
+// SAFE TO RETRY: no-such-column is a resolution/compile error surfaced BEFORE any row
+// write or observable side effect, so re-dispatch cannot double an effect.
+
+// ===========================================================================
+// (A) Module-scope free functions (paste near any_function_call_in_statement, ~95166)
+// ===========================================================================
+
+/// bd-jcjkf: byte-spans (and names) of every double-quoted identifier token in `sql`.
+/// CONFIRMED (read-only): Lexer::tokenize -> Vec<Token{kind,span:Span}>, QuotedId(Arc<str>,
+/// is_double_quoted). Only called on the error path (a no-such-column failure), so the
+/// common success path never pays for it.
+fn double_quoted_identifier_spans(sql: &str) -> Vec<(fsqlite_ast::Span, Arc<str>)> {
+    fsqlite_parser::Lexer::tokenize(sql)
+        .into_iter()
+        .filter_map(|tok| match tok.kind {
+            fsqlite_parser::TokenKind::QuotedId(name, true) => Some((tok.span, name)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// bd-jcjkf: extract the column name X from a no-such-column-family error, if any.
+/// Handles the structured variant AND the main codegen path's Internal string
+/// ("no such column: {column} in table {table}"). Returns None for any other error, so
+/// non-column errors surface unchanged.
+/// CONFIRM AT BUILD: audit every DQS entry path's error. FROM-less interpreted SELECT
+/// projection ("SELECT \"hello\"") MUST reach here with the name recoverable; if a site
+/// emits a nameless "no such column in WHERE/GROUP BY/..." (connection.rs ~74271/74289/
+/// 74297/75397), enrich it to `NoSuchColumn { name }` (small local change) — otherwise
+/// that path's DQS literal is not rescued (fails safe: original error surfaces).
+fn dqs_missing_column_name(error: &FrankenError) -> Option<String> {
+    match error {
+        FrankenError::NoSuchColumn { name } => Some(name.clone()),
+        // Main codegen mapping: FrankenError::Internal("no such column: {col} in table {t}")
+        // (connection.rs codegen_error_to_franken ~118841). Also plain "no such column: X".
+        FrankenError::Internal(msg) => {
+            let rest = msg.strip_prefix("no such column: ")?;
+            let name = rest.split(" in table ").next().unwrap_or(rest).trim();
+            (!name.is_empty()).then(|| name.to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// bd-jcjkf: rewrite every bare `Expr::Column(target)` whose span belongs to a
+/// double-quoted token into `Expr::Literal(String(target))`. Returns the count rewritten
+/// (0 => nothing matched => stop retrying). `dq_spans` are the spans of double-quoted
+/// tokens named `target` (so only double-quoted occurrences are converted; bare `target`
+/// is left as an error-worthy column).
+fn rewrite_dqs_columns_in_statement(
+    statement: &mut Statement,
+    target: &str,
+    dq_spans: &[fsqlite_ast::Span],
+) -> usize {
+    let mut n = 0;
+    match statement {
+        Statement::Select(select) => rewrite_dqs_in_select(select, target, dq_spans, &mut n),
+        Statement::Insert(insert) => rewrite_dqs_in_insert(insert, target, dq_spans, &mut n),
+        Statement::Update(update) => rewrite_dqs_in_update(update, target, dq_spans, &mut n),
+        Statement::Delete(delete) => rewrite_dqs_in_delete(delete, target, dq_spans, &mut n),
+        _ => {}
+    }
+    n
+}
+
+fn rewrite_dqs_in_expr(expr: &mut Expr, target: &str, dq_spans: &[fsqlite_ast::Span], n: &mut usize) {
+    // Post-order: children first, then self (so a matched Column is replaced last).
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_dqs_in_expr(left, target, dq_spans, n);
+            rewrite_dqs_in_expr(right, target, dq_spans, n);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => rewrite_dqs_in_expr(expr, target, dq_spans, n),
+        Expr::Between { expr, low, high, .. } => {
+            rewrite_dqs_in_expr(expr, target, dq_spans, n);
+            rewrite_dqs_in_expr(low, target, dq_spans, n);
+            rewrite_dqs_in_expr(high, target, dq_spans, n);
+        }
+        Expr::In { expr, set, .. } => {
+            rewrite_dqs_in_expr(expr, target, dq_spans, n);
+            match set {
+                InSet::List(exprs) => {
+                    for e in exprs { rewrite_dqs_in_expr(e, target, dq_spans, n); }
+                }
+                InSet::Subquery(query) => rewrite_dqs_in_select(query, target, dq_spans, n),
+                InSet::Table(_) => {}
+            }
+        }
+        Expr::Like { expr, pattern, escape, .. } => {
+            rewrite_dqs_in_expr(expr, target, dq_spans, n);
+            rewrite_dqs_in_expr(pattern, target, dq_spans, n);
+            if let Some(escape) = escape { rewrite_dqs_in_expr(escape, target, dq_spans, n); }
+        }
+        Expr::Case { operand, whens, else_expr, .. } => {
+            if let Some(op) = operand { rewrite_dqs_in_expr(op, target, dq_spans, n); }
+            for (w, t) in whens {
+                rewrite_dqs_in_expr(w, target, dq_spans, n);
+                rewrite_dqs_in_expr(t, target, dq_spans, n);
+            }
+            if let Some(e) = else_expr { rewrite_dqs_in_expr(e, target, dq_spans, n); }
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            rewrite_dqs_in_select(subquery, target, dq_spans, n);
+        }
+        Expr::FunctionCall { args, order_by, filter, over, .. } => {
+            if let FunctionArgs::List(list) = args {
+                for e in list { rewrite_dqs_in_expr(e, target, dq_spans, n); }
+            }
+            for term in order_by { rewrite_dqs_in_expr(&mut term.expr, target, dq_spans, n); }
+            if let Some(f) = filter { rewrite_dqs_in_expr(f, target, dq_spans, n); }
+            if let Some(w) = over { rewrite_dqs_in_window_spec(w, target, dq_spans, n); }
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            rewrite_dqs_in_expr(expr, target, dq_spans, n);
+            rewrite_dqs_in_expr(path, target, dq_spans, n);
+        }
+        Expr::RowValue(exprs, _) => {
+            for e in exprs { rewrite_dqs_in_expr(e, target, dq_spans, n); }
+        }
+        // Leaves that cannot contain a nested Column:
+        Expr::Literal(_, _)
+        | Expr::Column(_, _)          // handled below (self), no children
+        | Expr::Placeholder(_, _)
+        | Expr::Raise { .. }
+        | Expr::BoundOuterValue { .. } => {}
+    }
+
+    // Self: convert a matching double-quoted bare column into a string literal.
+    if let Expr::Column(col_ref, span) = expr {
+        if col_ref.table.is_none()
+            && col_ref.column.as_ref() == target
+            && dq_spans.iter().any(|s| *s == *span)
+        {
+            let literal = col_ref.column.to_string();
+            *expr = Expr::Literal(Literal::String(literal), *span);
+            *n += 1;
+        }
+    }
+}
+
+fn rewrite_dqs_in_window_spec(w: &mut WindowSpec, target: &str, dq: &[fsqlite_ast::Span], n: &mut usize) {
+    for e in &mut w.partition_by { rewrite_dqs_in_expr(e, target, dq, n); }
+    for term in &mut w.order_by { rewrite_dqs_in_expr(&mut term.expr, target, dq, n); }
+    if let Some(frame) = &mut w.frame {
+        if let FrameBound::Preceding(e) | FrameBound::Following(e) = &mut frame.start {
+            rewrite_dqs_in_expr(e, target, dq, n);
+        }
+        if let Some(FrameBound::Preceding(e) | FrameBound::Following(e)) = &mut frame.end {
+            rewrite_dqs_in_expr(e, target, dq, n);
+        }
+    }
+}
+
+fn rewrite_dqs_in_table_or_subquery(src: &mut TableOrSubquery, target: &str, dq: &[fsqlite_ast::Span], n: &mut usize) {
+    match src {
+        TableOrSubquery::Table { .. } => {}
+        TableOrSubquery::Subquery { query, .. } => rewrite_dqs_in_select(query, target, dq, n),
+        TableOrSubquery::TableFunction { args, .. } => {
+            for e in args { rewrite_dqs_in_expr(e, target, dq, n); }
+        }
+        TableOrSubquery::ParenJoin(from) => rewrite_dqs_in_from(from, target, dq, n),
+    }
+}
+
+fn rewrite_dqs_in_from(from: &mut FromClause, target: &str, dq: &[fsqlite_ast::Span], n: &mut usize) {
+    rewrite_dqs_in_table_or_subquery(&mut from.source, target, dq, n);
+    for join in &mut from.joins {
+        rewrite_dqs_in_table_or_subquery(&mut join.table, target, dq, n);
+        if let Some(JoinConstraint::On(e)) = &mut join.constraint {
+            rewrite_dqs_in_expr(e, target, dq, n);
+        }
+    }
+}
+
+fn rewrite_dqs_in_select(select: &mut SelectStatement, target: &str, dq: &[fsqlite_ast::Span], n: &mut usize) {
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes { rewrite_dqs_in_select(&mut cte.query, target, dq, n); }
+    }
+    rewrite_dqs_in_select_core(&mut select.body.select, target, dq, n);
+    for (_, core) in &mut select.body.compounds { rewrite_dqs_in_select_core(core, target, dq, n); }
+    for term in &mut select.order_by { rewrite_dqs_in_expr(&mut term.expr, target, dq, n); }
+    if let Some(limit) = &mut select.limit {
+        rewrite_dqs_in_expr(&mut limit.limit, target, dq, n);
+        if let Some(off) = &mut limit.offset { rewrite_dqs_in_expr(off, target, dq, n); }
+    }
+}
+
+fn rewrite_dqs_in_select_core(core: &mut SelectCore, target: &str, dq: &[fsqlite_ast::Span], n: &mut usize) {
+    match core {
+        SelectCore::Select { columns, from, where_clause, group_by, having, windows, .. } => {
+            for col in columns {
+                if let ResultColumn::Expr { expr, .. } = col { rewrite_dqs_in_expr(expr, target, dq, n); }
+            }
+            if let Some(f) = from { rewrite_dqs_in_from(f, target, dq, n); }
+            if let Some(w) = where_clause { rewrite_dqs_in_expr(w, target, dq, n); }
+            for e in group_by { rewrite_dqs_in_expr(e, target, dq, n); }
+            if let Some(h) = having { rewrite_dqs_in_expr(h, target, dq, n); }
+            for win in windows { rewrite_dqs_in_window_spec(&mut win.spec, target, dq, n); }
+        }
+        SelectCore::Values(rows) => {
+            for row in rows { for e in row { rewrite_dqs_in_expr(e, target, dq, n); } }
+        }
+    }
+}
+
+fn rewrite_dqs_in_insert(insert: &mut InsertStatement, target: &str, dq: &[fsqlite_ast::Span], n: &mut usize) {
+    if let Some(with) = &mut insert.with {
+        for cte in &mut with.ctes { rewrite_dqs_in_select(&mut cte.query, target, dq, n); }
+    }
+    match &mut insert.source {
+        InsertSource::Values(rows) => {
+            for row in rows { for e in row { rewrite_dqs_in_expr(e, target, dq, n); } }
+        }
+        InsertSource::Select(select) => rewrite_dqs_in_select(select, target, dq, n),
+        InsertSource::DefaultValues => {}
+    }
+    for clause in &mut insert.upsert {
+        if let Some(t) = &mut clause.target {
+            if let Some(w) = &mut t.where_clause { rewrite_dqs_in_expr(w, target, dq, n); }
+        }
+        if let UpsertAction::Update { assignments, where_clause } = &mut clause.action {
+            for a in assignments { rewrite_dqs_in_expr(&mut a.value, target, dq, n); }
+            if let Some(w) = where_clause { rewrite_dqs_in_expr(w, target, dq, n); }
+        }
+    }
+    for col in &mut insert.returning {
+        if let ResultColumn::Expr { expr, .. } = col { rewrite_dqs_in_expr(expr, target, dq, n); }
+    }
+}
+
+fn rewrite_dqs_in_update(update: &mut UpdateStatement, target: &str, dq: &[fsqlite_ast::Span], n: &mut usize) {
+    if let Some(with) = &mut update.with {
+        for cte in &mut with.ctes { rewrite_dqs_in_select(&mut cte.query, target, dq, n); }
+    }
+    for a in &mut update.assignments { rewrite_dqs_in_expr(&mut a.value, target, dq, n); }
+    if let Some(from) = &mut update.from { rewrite_dqs_in_from(from, target, dq, n); }
+    if let Some(w) = &mut update.where_clause { rewrite_dqs_in_expr(w, target, dq, n); }
+    for col in &mut update.returning {
+        if let ResultColumn::Expr { expr, .. } = col { rewrite_dqs_in_expr(expr, target, dq, n); }
+    }
+    for term in &mut update.order_by { rewrite_dqs_in_expr(&mut term.expr, target, dq, n); }
+    if let Some(limit) = &mut update.limit {
+        rewrite_dqs_in_expr(&mut limit.limit, target, dq, n);
+        if let Some(off) = &mut limit.offset { rewrite_dqs_in_expr(off, target, dq, n); }
+    }
+}
+
+fn rewrite_dqs_in_delete(delete: &mut DeleteStatement, target: &str, dq: &[fsqlite_ast::Span], n: &mut usize) {
+    if let Some(with) = &mut delete.with {
+        for cte in &mut with.ctes { rewrite_dqs_in_select(&mut cte.query, target, dq, n); }
+    }
+    if let Some(w) = &mut delete.where_clause { rewrite_dqs_in_expr(w, target, dq, n); }
+    for col in &mut delete.returning {
+        if let ResultColumn::Expr { expr, .. } = col { rewrite_dqs_in_expr(expr, target, dq, n); }
+    }
+    for term in &mut delete.order_by { rewrite_dqs_in_expr(&mut term.expr, target, dq, n); }
+    if let Some(limit) = &mut delete.limit {
+        rewrite_dqs_in_expr(&mut limit.limit, target, dq, n);
+        if let Some(off) = &mut limit.offset { rewrite_dqs_in_expr(off, target, dq, n); }
+    }
+}
+
+// ===========================================================================
+// (B) impl Connection method — the fallback wrapper
+// ===========================================================================
+//
+// This is the single hook. The cleanest integration is to route the three public
+// entries (execute ~23725, query ~23492, execute_with_params ~23867) through it. Each
+// currently does roughly: parse -> dispatch(&statement, params). Wrap that dispatch:
+//
+//   let mut owned: Statement = (*cached_arc).clone();   // never mutate the parse cache
+//   self.dqs_dispatch_retry(sql, &mut owned, |stmt| self.<original_dispatch>(stmt, params)).await
+//
+// The closure runs the ORIGINAL dispatch on the (possibly rewritten) statement. On a
+// no-such-column error for a double-quoted name, rewrite + retry. Generic over the
+// dispatch's Ok type (Vec<Row> for query, usize for execute).
+//
+// CONFIRM AT BUILD: exact entry shapes (some paths route through prepared-statement reuse
+// / precompiled DML where the AST is dropped — for those, a double-quoted-unresolvable
+// name fails at PREPARE with the SQL text still in hand, so wrap `prepare` to re-prepare
+// the rewritten SQL; the simplest robust hook is at the SQL/statement boundary before
+// prepare. Start by wrapping the plain execute/query interpreter path — it is where the
+// FROM-less "SELECT \"x\"" cases (the bug's primary examples) resolve.)
+//
+// async fn dqs_dispatch_retry<T, F, Fut>(
+//     &self,
+//     sql: &str,
+//     statement: &mut Statement,
+//     mut dispatch: F,
+// ) -> Result<T>
+// where
+//     F: FnMut(&Statement) -> Fut,
+//     Fut: core::future::Future<Output = Result<T>>,
+// {
+//     // Fast path: DQS off, or no double-quoted identifiers at all -> never intercept.
+//     if !self.dqs_enabled.get() {
+//         return dispatch(statement).await;
+//     }
+//     let dq = double_quoted_identifier_spans(sql);
+//     if dq.is_empty() {
+//         return dispatch(statement).await;
+//     }
+//     let mut rewritten: std::collections::HashSet<String> = std::collections::HashSet::new();
+//     loop {
+//         match dispatch(statement).await {
+//             Ok(v) => return Ok(v),
+//             Err(e) => {
+//                 let Some(name) = dqs_missing_column_name(&e) else { return Err(e) };
+//                 // Only rescue a DOUBLE-QUOTED name, and each name at most once (progress).
+//                 let spans: Vec<fsqlite_ast::Span> =
+//                     dq.iter().filter(|(_, n)| n.as_ref() == name).map(|(s, _)| *s).collect();
+//                 if spans.is_empty() || !rewritten.insert(name.clone()) {
+//                     return Err(e);
+//                 }
+//                 let count = rewrite_dqs_columns_in_statement(statement, &name, &spans);
+//                 if count == 0 {
+//                     return Err(e); // nothing to rewrite -> surface the original error
+//                 }
+//                 // loop: re-dispatch the rewritten statement
+//             }
+//         }
+//     }
+// }
+//
+// NOTE on borrow shape: the `dispatch` closure capturing `self` while we also `&mut
+// statement` may need the closure to take `&Statement` and be constructed at each call
+// site (not capturing `self` inside the generic) — at the call sites prefer an inline
+// loop over this helper if the borrow checker resists, e.g.:
+//   let dq = ...; let mut seen = HashSet::new();
+//   let mut out = self.orig_dispatch(&stmt, params).await;
+//   while let Err(e) = &out {
+//       let Some(name) = dqs_missing_column_name(e) else { break };
+//       ... rewrite ... ; out = self.orig_dispatch(&stmt, params).await;
+//   }
+//   out
+// Keep the progress guard (each name rescued at most once) to bound the loop.
+
+// ===========================================================================
+// (C) Imports needed at module scope (all already imported in connection.rs per
+//     the bd-oo4s5 walker work): Expr, InSet, Literal, FunctionArgs, SelectStatement,
+//     SelectCore, ResultColumn, TableOrSubquery, FromClause, JoinConstraint, WindowSpec,
+//     FrameBound, InsertStatement, UpdateStatement, DeleteStatement, InsertSource,
+//     UpsertAction, Statement, Arc. fsqlite_ast::Span and fsqlite_parser::{Lexer,
+//     TokenKind} are the only additions to confirm are in scope (Span is used widely;
+//     Lexer/TokenKind may need `use fsqlite_parser::{Lexer, TokenKind};`).
+// ===========================================================================

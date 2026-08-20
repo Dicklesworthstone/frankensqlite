@@ -1,0 +1,174 @@
+//! bd-jcjkf — DQS-ON ("double-quoted string") compatibility keeper.
+//!
+//! DRAFT-UNVERIFIED (disk 100%, no build). FREEZE-SAFE: `.rs.draft` is not a
+//! `.rs` file, so cargo never compiles it — a co-lane build cannot break on it.
+//! APPLY (one commit, when disk clears): `git mv dqs_compat.rs.draft dqs_compat.rs`
+//! together with the DQS engine (bd_jcjkf_dqs_design_draft.md) and the pragma
+//! plumbing (dqs_pragma_plumbing.rs.draft). Then build + run:
+//!   cargo test -p fsqlite-core --test dqs_compat
+//! CI NOTE (AGENTS.md bd-ohk1x): fsqlite-core/tests/ integration targets are only
+//! run in CI if named in a workflow. Either wire `--test dqs_compat` into a
+//! workflow, OR move these fns inline into connection.rs's autocommit/DQS test
+//! module (they use only the public API, so both placements compile).
+//!
+//! Oracle: stock SQLite's DQS default is ON (SQLITE_DQS=3) — an unresolvable
+//! double-quoted identifier falls back to a string literal. A double-quoted name
+//! that DOES resolve to a real column stays a column. Expected values below are
+//! the documented stock behavior; a few are cross-checked against rusqlite.
+
+use fsqlite_core::connection::Connection;
+use fsqlite_types::value::SqliteValue;
+
+fn text(s: &str) -> SqliteValue {
+    SqliteValue::Text(s.into())
+}
+
+/// (1) Bare unresolvable double-quoted identifier => string literal.
+#[test]
+fn dqs_on_bare_double_quoted_is_string_literal_bd_jcjkf() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+
+        // SELECT "hello"  ->  'hello'
+        let rows = conn.query("SELECT \"hello\"").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &text("hello"));
+
+        // "abc" || "def"  ->  'abcdef' (both operands fall back to strings)
+        let rows = conn.query("SELECT \"abc\" || \"def\"").await.unwrap();
+        assert_eq!(rows[0].get(0).unwrap(), &text("abcdef"));
+
+        // WHERE "x" = "x"  ->  true (1): both sides are the same string literal
+        let rows = conn.query("SELECT 1 WHERE \"x\" = \"x\"").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1));
+
+        // WHERE "x" = "y"  ->  no row (distinct string literals)
+        let rows = conn.query("SELECT 1 WHERE \"x\" = \"y\"").await.unwrap();
+        assert!(rows.is_empty());
+    });
+}
+
+/// (2) Double-quoted string literal usable in DML VALUES; reads back as the text.
+#[test]
+fn dqs_on_double_quoted_in_insert_values_bd_jcjkf() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
+            .await
+            .unwrap();
+        // label has no column named `lit` in scope -> "lit" is the string 'lit'.
+        conn.execute("INSERT INTO t(id, label) VALUES (1, \"lit\")")
+            .await
+            .unwrap();
+        let rows = conn.query("SELECT label FROM t WHERE id = 1").await.unwrap();
+        assert_eq!(rows[0].get(0).unwrap(), &text("lit"));
+    });
+}
+
+/// (3) A double-quoted name that RESOLVES to a real column stays a column
+///     (DQS must NOT shadow real columns).
+#[test]
+fn dqs_on_resolvable_double_quoted_stays_column_bd_jcjkf() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t (c TEXT)").await.unwrap();
+        conn.execute("INSERT INTO t(c) VALUES ('real')").await.unwrap();
+        // "c" is a real column -> returns the column value 'real', NOT the string 'c'.
+        let rows = conn.query("SELECT \"c\" FROM t").await.unwrap();
+        assert_eq!(rows[0].get(0).unwrap(), &text("real"));
+    });
+}
+
+/// (4) Per-occurrence precision: the SAME name as both a real column (resolves)
+///     and — where it cannot resolve — a DQS literal, handled independently.
+///     `k` is a real column of t; the outer FROM-less use of "k" is a literal.
+#[test]
+fn dqs_on_same_name_column_and_literal_per_occurrence_bd_jcjkf() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t (k TEXT)").await.unwrap();
+        conn.execute("INSERT INTO t(k) VALUES ('col')").await.unwrap();
+        // Inner "k" resolves to the column ('col'); the outer bare "k" (no FROM in
+        // that scope) is unresolvable -> string 'k'. Compared: 'col' <> 'k' -> no row.
+        let rows = conn
+            .query("SELECT \"k\" FROM t WHERE (SELECT \"k\") = k")
+            .await
+            .unwrap();
+        // (SELECT "k") is the literal 'k'; k is 'col' -> 'k' <> 'col' -> empty.
+        assert!(rows.is_empty());
+        // Sanity: the inner column path still yields the real value on its own.
+        let rows = conn.query("SELECT \"k\" FROM t").await.unwrap();
+        assert_eq!(rows[0].get(0).unwrap(), &text("col"));
+    });
+}
+
+/// (5) NEGATIVE (needs pragma plumbing bd-e8jzh): with DQS OFF, an unresolvable
+///     double-quoted identifier is an ERROR again (strict, typo-safe).
+#[test]
+fn dqs_off_bare_double_quoted_errors_bd_jcjkf() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("PRAGMA fsqlite.dqs = OFF").await.unwrap();
+        let err = conn
+            .query("SELECT \"hello\"")
+            .await
+            .expect_err("with DQS OFF an unresolvable double-quoted id must error");
+        assert!(
+            err.to_string().contains("no such column"),
+            "expected a no-such-column error, got {err}"
+        );
+        // Re-enable and confirm the fallback returns.
+        conn.execute("PRAGMA fsqlite.dqs = ON").await.unwrap();
+        let rows = conn.query("SELECT \"hello\"").await.unwrap();
+        assert_eq!(rows[0].get(0).unwrap(), &text("hello"));
+    });
+}
+
+/// (6) REGRESSION: a BARE (unquoted) unresolvable identifier still errors under
+///     DQS-ON — DQS only rescues DOUBLE-QUOTED tokens, never bare typos.
+#[test]
+fn dqs_on_bare_unquoted_typo_still_errors_bd_jcjkf() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t (c TEXT)").await.unwrap();
+        // `nope` is unquoted and not a column -> must still be an error, not 'nope'.
+        let err = conn
+            .query("SELECT nope FROM t")
+            .await
+            .expect_err("a bare unquoted unknown identifier must remain an error");
+        assert!(
+            err.to_string().contains("no such column"),
+            "expected no-such-column, got {err}"
+        );
+        // And single-quoted strings are unaffected (already literals).
+        let rows = conn.query("SELECT 'plain'").await.unwrap();
+        assert_eq!(rows[0].get(0).unwrap(), &text("plain"));
+    });
+}
+
+/// (7) Oracle cross-check against stock C SQLite (rusqlite) for the canonical
+///     DQS fallbacks — both engines must agree byte-for-byte.
+#[test]
+fn dqs_on_matches_stock_rusqlite_bd_jcjkf() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "SELECT \"hello\"",
+            "SELECT \"a\" || \"b\"",
+            "SELECT 1 WHERE \"z\" = \"z\"",
+        ] {
+            let f = frank.query(sql).await.unwrap();
+            let f_val: Option<String> = f.first().and_then(|r| match r.get(0) {
+                Some(SqliteValue::Text(t)) => Some(t.to_string()),
+                Some(SqliteValue::Integer(i)) => Some(i.to_string()),
+                _ => None,
+            });
+            let s_val: Option<String> = stock
+                .query_row(sql, [], |row| row.get::<_, String>(0).or_else(|_| row.get::<_, i64>(0).map(|i| i.to_string())))
+                .ok();
+            assert_eq!(f_val, s_val, "DQS divergence on `{sql}`");
+        }
+    });
+}
