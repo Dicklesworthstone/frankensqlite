@@ -15,6 +15,7 @@
 
 pub mod connection_pool;
 pub mod metrics;
+pub mod metrics_net;
 pub mod page_cache;
 
 use fsqlite_types::sync_primitives::{Duration, Instant, Mutex};
