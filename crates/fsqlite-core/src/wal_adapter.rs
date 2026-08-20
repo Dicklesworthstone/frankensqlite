@@ -2469,7 +2469,7 @@ where
             Ok(size) if size >= 92 => size,
             _ => return,
         };
-        let mut db_file = match self.cached_verification_db.take() {
+        let db_file = match self.cached_verification_db.take() {
             Some(cached) => cached,
             None => {
                 let main_db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
@@ -2538,10 +2538,7 @@ where
     /// all-zero legacy sentinel when identity is unknown/legacy so a certificate
     /// authored before capture never claims a foreign identity.
     fn db_file_id_for_written_certificate(&self) -> [u8; 16] {
-        match self.db_file_identity {
-            Some(id) => id,
-            None => [0u8; 16],
-        }
+        self.db_file_identity.unwrap_or_default()
     }
 
     async fn conflicts_after_generation_change(

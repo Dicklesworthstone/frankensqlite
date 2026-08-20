@@ -227,6 +227,20 @@ pub fn write_ident(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
     }
 }
 
+/// Conditionally-quoted identifier as a `String`.
+///
+/// Quotes only when SQLite would (special characters, a keyword, or empty),
+/// matching stock's minimal `sqlite_master` rendering. The `String` form of
+/// [`write_ident`], reusing the same `needs_quoting` predicate.
+#[must_use]
+pub fn quote_ident_if_needed(name: &str) -> String {
+    if needs_quoting(name) {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    } else {
+        name.to_owned()
+    }
+}
+
 pub fn write_qualified_name(
     f: &mut fmt::Formatter<'_>,
     name: &crate::QualifiedName,

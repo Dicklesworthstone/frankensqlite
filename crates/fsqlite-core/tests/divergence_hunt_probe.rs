@@ -2149,3 +2149,177 @@ fn omitted_conflict_target_upsert_parity() {
         );
     }
 }
+
+/// Window functions + FILTER clauses vs the modern (rusqlite ~3.53) oracle —
+/// from a scalar-divergence probe sweep. Two findings are locked in here:
+///
+///  1. VALUE parity: the mainstream and edge window/FILTER surface matches
+///     MODERN SQLite exactly. In particular `min`/`max` FILTER over a moving
+///     ROWS frame where the *current row fails the filter* is filter-consistent
+///     (frank and SQLite 3.53 both exclude the filtered-out current row). The
+///     `-7` seen from the stale 3.46.1 CLI was a since-fixed C-SQLite bug, so it
+///     is deliberately NOT chased — this case guards frank's correct behaviour.
+///
+///  2. ERROR-TEXT parity: FILTER on a non-aggregate *window* function reports
+///     SQLite's canonical "FILTER clause may only be used with aggregate window
+///     functions", while FILTER on a plain scalar keeps the generic message.
+#[test]
+fn window_and_filter_parity() {
+    const T: &[&str] = &[
+        "CREATE TABLE t(id INTEGER, grp TEXT, val INTEGER, fval REAL, txt TEXT)",
+        "INSERT INTO t VALUES (1,'a',10,1.5,'apple'),(2,'a',20,2.5,'banana'),\
+         (3,'a',NULL,3.5,'cherry'),(4,'b',5,NULL,'date'),(5,'b',5,4.5,'egg'),\
+         (6,'b',30,5.5,NULL),(7,'c',NULL,NULL,'fig'),(8,'c',-7,0.0,'grape')",
+    ];
+    // Integer/text/NULL results only (float text-rendering is covered elsewhere
+    // and is oracle-version sensitive), so these assert exact tagged-row parity.
+    let cases: Vec<Case> = vec![
+        Case { setup: T, sql: "SELECT id, min(val) FILTER (WHERE val>0) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, max(val) FILTER (WHERE val>0) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, sum(val) FILTER (WHERE val>5) OVER (PARTITION BY grp) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, count(*) FILTER (WHERE txt IS NOT NULL) OVER (ORDER BY id) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, rank() OVER (ORDER BY val NULLS FIRST) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, rank() OVER (ORDER BY val NULLS LAST) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, sum(val) OVER (ORDER BY val RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, sum(val) OVER (ORDER BY val GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, lag(val,-1) OVER (ORDER BY id) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, nth_value(val,2) OVER (PARTITION BY grp ORDER BY id) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT grp, count(val) FILTER (WHERE val IS NOT NULL) FROM t GROUP BY grp ORDER BY grp" },
+        Case { setup: T, sql: "SELECT sum(DISTINCT val) FILTER (WHERE val>0) FROM t" },
+        Case { setup: T, sql: "SELECT id, group_concat(txt) FILTER (WHERE grp<>'b') OVER (ORDER BY id) FROM t ORDER BY id" },
+    ];
+
+    let mut divergences = Vec::new();
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            check(&mut divergences, c).await;
+        }
+        // ERROR-TEXT parity: FILTER on a non-aggregate window function must use
+        // SQLite's canonical message (not frank's generic non-aggregate text).
+        let werr = frank_rows(
+            T,
+            "SELECT row_number() FILTER (WHERE val>0) OVER (ORDER BY id) FROM t",
+        )
+        .await
+        .expect_err("frank must reject FILTER on row_number()");
+        assert!(
+            werr.contains("FILTER clause may only be used with aggregate window functions"),
+            "window-FILTER error text diverged: {werr}"
+        );
+        // A plain scalar FILTER without OVER keeps the generic message (guards
+        // against over-broadening the fix).
+        let serr = frank_rows(T, "SELECT abs(val) FILTER (WHERE val>0) FROM t")
+            .await
+            .expect_err("frank must reject FILTER on abs()");
+        assert!(
+            serr.contains("FILTER may not be used with non-aggregate abs()"),
+            "scalar-FILTER error text diverged: {serr}"
+        );
+    });
+
+    assert!(
+        divergences.is_empty(),
+        "\n===== {} WINDOW/FILTER DIVERGENCE(S) vs C SQLite (of {} cases) =====\n{}\n",
+        divergences.len(),
+        cases.len(),
+        divergences.join("\n\n")
+    );
+}
+
+/// Correlated subquery inside `IN (...)` in an UPDATE/DELETE WHERE (bd-t7m7y).
+/// VDBE codegen cannot lower a correlated IN probe ("IN probe codegen invariant
+/// failed"); the DML dispatcher now resolves matching rowids via the interpreted
+/// SELECT path (as SELECT already does) and rewrites to `rowid IN (...)`. Each
+/// case runs the mutation in `setup` and compares the resulting table against the
+/// oracle. No `LIMIT`/`ORDER BY` on the DML — bundled rusqlite lacks
+/// `ENABLE_UPDATE_DELETE_LIMIT`, so DML-LIMIT parity is verified elsewhere (CLI).
+#[test]
+fn correlated_in_dml_parity() {
+    // Two-table correlation (IN subquery references another table, keyed on the
+    // outer row) plus a self-correlated variant and a non-PK-first table. Each
+    // case re-declares the fixture inline so the setup slices are 'static.
+    const DUMP: &str =
+        "SELECT quote(id)||'|'||quote(grp)||'|'||quote(val)||'|'||quote(flag) FROM t ORDER BY id";
+
+    let cases: Vec<Case> = vec![
+        // UPDATE with a correlated IN referencing another table.
+        Case {
+            setup: &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER, flag INTEGER)",
+                "INSERT INTO t VALUES (1,'a',10,0),(2,'a',20,0),(3,'b',5,0),(4,'b',30,0),(5,'c',7,0),(6,'c',NULL,0)",
+                "CREATE TABLE u(uid INTEGER, grp TEXT, threshold INTEGER)",
+                "INSERT INTO u VALUES (1,'a',15),(2,'b',10),(3,'c',6)",
+                "UPDATE t SET flag=1 WHERE grp IN (SELECT grp FROM u WHERE u.threshold < t.val)",
+            ],
+            sql: DUMP,
+        },
+        // DELETE with a correlated IN referencing another table.
+        Case {
+            setup: &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER, flag INTEGER)",
+                "INSERT INTO t VALUES (1,'a',10,0),(2,'a',20,0),(3,'b',5,0),(4,'b',30,0),(5,'c',7,0),(6,'c',NULL,0)",
+                "CREATE TABLE u(uid INTEGER, grp TEXT, threshold INTEGER)",
+                "INSERT INTO u VALUES (1,'a',15),(2,'b',10),(3,'c',6)",
+                "DELETE FROM t WHERE val IN (SELECT threshold FROM u WHERE u.grp=t.grp)",
+            ],
+            sql: DUMP,
+        },
+        // Correlated NOT IN (NULL-aware) in an UPDATE.
+        Case {
+            setup: &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER, flag INTEGER)",
+                "INSERT INTO t VALUES (1,'a',10,0),(2,'a',20,0),(3,'b',5,0),(4,'b',30,0),(5,'c',7,0),(6,'c',NULL,0)",
+                "CREATE TABLE u(uid INTEGER, grp TEXT, threshold INTEGER)",
+                "INSERT INTO u VALUES (1,'a',15),(2,'b',10),(3,'c',6)",
+                "UPDATE t SET flag=2 WHERE grp NOT IN (SELECT grp FROM u WHERE u.threshold > t.val)",
+            ],
+            sql: DUMP,
+        },
+        // DELETE with a correlated IN that matches some rows.
+        Case {
+            setup: &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER, flag INTEGER)",
+                "INSERT INTO t VALUES (1,'a',10,0),(2,'a',20,0),(3,'b',5,0),(4,'b',30,0),(5,'c',7,0),(6,'c',NULL,0)",
+                "CREATE TABLE u(uid INTEGER, grp TEXT, threshold INTEGER)",
+                "INSERT INTO u VALUES (1,'a',15),(2,'b',10),(3,'c',6)",
+                "DELETE FROM t WHERE id IN (SELECT uid FROM u WHERE u.grp=t.grp AND t.val > u.threshold)",
+            ],
+            sql: DUMP,
+        },
+        // Self-correlated IN (subquery over the target table itself).
+        Case {
+            setup: &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER, flag INTEGER)",
+                "INSERT INTO t VALUES (1,'a',10,0),(2,'a',20,0),(3,'b',5,0),(4,'b',30,0),(5,'c',7,0),(6,'c',NULL,0)",
+                "UPDATE t SET flag=3 WHERE val IN (SELECT val FROM t t2 WHERE t2.grp=t.grp AND t2.id<>t.id)",
+            ],
+            sql: DUMP,
+        },
+        // Non-PK-first table: rowid must be resolved correctly, not column 1.
+        Case {
+            setup: &[
+                "CREATE TABLE w(name TEXT, n INTEGER)",
+                "INSERT INTO w VALUES ('x',10),('y',20),('z',5)",
+                "CREATE TABLE q(qid INTEGER, name TEXT, threshold INTEGER)",
+                "INSERT INTO q VALUES (1,'x',5),(2,'y',30)",
+                "DELETE FROM w WHERE name IN (SELECT name FROM q WHERE q.threshold < w.n)",
+            ],
+            sql: "SELECT quote(name)||'|'||quote(n) FROM w ORDER BY n",
+        },
+    ];
+
+    let mut divergences = Vec::new();
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            check(&mut divergences, c).await;
+        }
+    });
+
+    assert!(
+        divergences.is_empty(),
+        "\n===== {} CORRELATED-IN DML DIVERGENCE(S) vs C SQLite (of {} cases) =====\n{}\n",
+        divergences.len(),
+        cases.len(),
+        divergences.join("\n\n")
+    );
+}

@@ -67,7 +67,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-#[cfg(test)]
 use std::time::Duration;
 
 #[cfg(test)]
@@ -1083,14 +1082,14 @@ enum OperationReceive<T> {
 /// worst-case cooperative spin on the should-never-happen wedge path.
 const POST_CANCEL_WORKER_GRACE: Duration = Duration::from_secs(2);
 
-/// Test override (milliseconds) for [`POST_CANCEL_WORKER_GRACE`]; 0 = use the
-/// production grace. Keeps the wedged-worker keeper fast on the real test runtime.
-///
-/// THREAD-LOCAL, not a global: the `current_thread` test runtime polls each test's
-/// caller future on that test's own `block_on` thread, so a per-thread override
-/// isolates the wedged-worker keeper's short grace from other cancellation tests
-/// running in parallel (which must observe the full production grace so their
-/// post-cancel wait stays pending until the worker responds).
+// Test override (milliseconds) for `POST_CANCEL_WORKER_GRACE`; 0 = use the
+// production grace. Keeps the wedged-worker keeper fast on the real test runtime.
+//
+// THREAD-LOCAL, not a global: the `current_thread` test runtime polls each test's
+// caller future on that test's own `block_on` thread, so a per-thread override
+// isolates the wedged-worker keeper's short grace from other cancellation tests
+// running in parallel (which must observe the full production grace so their
+// post-cancel wait stays pending until the worker responds).
 #[cfg(test)]
 thread_local! {
     static TEST_POST_CANCEL_WORKER_GRACE_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1190,8 +1189,7 @@ async fn recv_async_operation_response<T>(
                 }
             };
             match resolved {
-                None => Err(FrankenError::Interrupt),
-                Some(Err(FrankenError::Abort)) => Err(FrankenError::Interrupt),
+                None | Some(Err(FrankenError::Abort)) => Err(FrankenError::Interrupt),
                 Some(result) => result,
             }
         }

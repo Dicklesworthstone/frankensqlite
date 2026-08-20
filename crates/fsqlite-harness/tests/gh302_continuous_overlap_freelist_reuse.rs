@@ -377,7 +377,7 @@ fn test_gh302_page_count_bounded_under_racing_writer_churn() {
                             }
                             match conn.execute("COMMIT;").await {
                                 Ok(_) => break,
-                                Err(error) if error.is_transient() => continue,
+                                Err(error) if error.is_transient() => {}
                                 Err(error) => panic!("commit failed: {error:?}"),
                             }
                         }

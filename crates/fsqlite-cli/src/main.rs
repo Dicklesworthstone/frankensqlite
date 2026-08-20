@@ -137,10 +137,9 @@ impl OutputMode {
         match self {
             Self::List => " | ",
             Self::Column => "  ",
-            Self::Csv => ",",
+            Self::Csv | Self::Quote => ",",
             Self::Tabs => "\t",
             Self::Line => "",
-            Self::Quote => ",",
         }
     }
 }

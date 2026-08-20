@@ -309,12 +309,12 @@ try {
             Write-Info "Downloading $archiveName"
             Invoke-Download "$base/$archiveName" $archive
             if (-not $NoVerify) {
-                $manifest = Join-Path $TempDirectory 'SHA256SUMS.txt'
-                $signature = Join-Path $TempDirectory 'SHA256SUMS.txt.minisig'
-                Invoke-Download "$base/SHA256SUMS.txt" $manifest
+                $manifest = Join-Path $TempDirectory 'SHA256SUMS'
+                $signature = Join-Path $TempDirectory 'SHA256SUMS.minisig'
+                Invoke-Download "$base/SHA256SUMS" $manifest
                 $minisign = Get-Command minisign -ErrorAction SilentlyContinue
                 if ($minisign) {
-                    Invoke-Download "$base/SHA256SUMS.txt.minisig" $signature
+                    Invoke-Download "$base/SHA256SUMS.minisig" $signature
                     & $minisign.Source -Vm $manifest -x $signature -P $selectedMinisignPublicKey | Out-Null
                     if ($LASTEXITCODE -ne 0) { Fail 'Release checksum signature verification failed' }
                     Write-Ok 'release manifest signature verified'

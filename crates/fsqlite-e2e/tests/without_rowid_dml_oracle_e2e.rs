@@ -969,3 +969,91 @@ fn without_rowid_update_or_replace_victim_fk_enforcement() {
         .await;
     });
 }
+
+// bd-yqjjx: ON CONFLICT (<secondary-unique-col>) DO UPDATE on a WITHOUT ROWID
+// table. Previously refused as Unsupported (only the PRIMARY KEY target was
+// emittable); the explicit secondary-UNIQUE arbiter now probes just that index.
+
+/// The named secondary-UNIQUE arbiter fires DO UPDATE when the attempted row
+/// collides on that index (and not the PK).
+#[test]
+fn without_rowid_explicit_secondary_upsert_target_bd_yqjjx() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (a TEXT PRIMARY KEY, b INTEGER UNIQUE) WITHOUT ROWID",
+                "INSERT INTO wr VALUES ('x',1),('y',2)",
+                // b=1 already exists on row 'x'; target is b -> DO UPDATE that row.
+                "INSERT INTO wr VALUES ('z',1) ON CONFLICT(b) DO UPDATE SET a='updated'",
+                // b=9 is new: no b-conflict -> ordinary insert.
+                "INSERT INTO wr VALUES ('w',9) ON CONFLICT(b) DO UPDATE SET a='never'",
+            ],
+            &["SELECT a, b FROM wr ORDER BY b"],
+            "without_rowid_explicit_secondary_upsert_target_bd_yqjjx",
+        )
+        .await;
+    });
+}
+
+/// A PRIMARY KEY collision under a secondary-UNIQUE target is NOT the named
+/// arbiter: it falls through to the ordinary insert and aborts (both engines).
+#[test]
+fn without_rowid_explicit_secondary_target_pk_conflict_aborts_bd_yqjjx() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (a TEXT PRIMARY KEY, b INTEGER UNIQUE) WITHOUT ROWID",
+                "INSERT INTO wr VALUES ('x',1)",
+                // Collides on the PK a='x', not on b -> ABORT, no DO UPDATE.
+                "INSERT INTO wr VALUES ('x',5) ON CONFLICT(b) DO UPDATE SET a='no'",
+            ],
+            &["SELECT a, b FROM wr ORDER BY b"],
+            "without_rowid_explicit_secondary_target_pk_conflict_aborts_bd_yqjjx",
+        )
+        .await;
+    });
+}
+
+/// `excluded.*` and a `WHERE` guard resolve inside an explicit-secondary-target
+/// DO UPDATE: the WHERE-false collision leaves the row untouched.
+#[test]
+fn without_rowid_explicit_secondary_upsert_excluded_and_where_bd_yqjjx() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (a TEXT PRIMARY KEY, b INTEGER UNIQUE, n INTEGER) WITHOUT ROWID",
+                "INSERT INTO wr VALUES ('x',1,10),('y',2,20)",
+                // b=1 conflict; WHERE true -> set n from excluded.
+                "INSERT INTO wr VALUES ('z',1,77) ON CONFLICT(b) DO UPDATE SET n=excluded.n \
+                 WHERE excluded.n > n",
+                // b=2 conflict; WHERE false (excluded.n < existing) -> untouched.
+                "INSERT INTO wr VALUES ('q',2,5) ON CONFLICT(b) DO UPDATE SET n=excluded.n \
+                 WHERE excluded.n > n",
+            ],
+            &["SELECT a, b, n FROM wr ORDER BY b"],
+            "without_rowid_explicit_secondary_upsert_excluded_and_where_bd_yqjjx",
+        )
+        .await;
+    });
+}
+
+/// A composite secondary-UNIQUE arbiter (UNIQUE(b,c)) on a WITHOUT ROWID table.
+#[test]
+fn without_rowid_explicit_multicol_secondary_upsert_target_bd_yqjjx() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE wr (a TEXT PRIMARY KEY, b INTEGER, c INTEGER, UNIQUE(b,c)) \
+                 WITHOUT ROWID",
+                "INSERT INTO wr VALUES ('x',1,1),('y',1,2)",
+                // (b,c)=(1,1) conflict on row 'x' -> DO UPDATE that row.
+                "INSERT INTO wr VALUES ('z',1,1) ON CONFLICT(b,c) DO UPDATE SET a='updated'",
+                // (b,c)=(1,3) new -> ordinary insert.
+                "INSERT INTO wr VALUES ('w',1,3) ON CONFLICT(b,c) DO UPDATE SET a='never'",
+            ],
+            &["SELECT a, b, c FROM wr ORDER BY b, c"],
+            "without_rowid_explicit_multicol_secondary_upsert_target_bd_yqjjx",
+        )
+        .await;
+    });
+}

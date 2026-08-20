@@ -73,8 +73,13 @@ enum EditMode {
 ///
 /// Returns a canonical minified JSON string or a `FunctionError` if invalid.
 pub fn json(input: &str) -> Result<String> {
-    let value = parse_json_text(input)?;
-    encode_json_text("json serialize failed", &value)
+    // Stock json() on text minifies whitespace but preserves every token of the
+    // source verbatim (number literals, string escapes, duplicate keys). Parse
+    // only to validate, then lexically minify — re-serializing a parsed
+    // `serde_json::Value` would normalize exponents, unescape `\/`, and drop
+    // duplicate keys (bd-6b0pe / bd-p2xrc).
+    parse_json_text(input)?;
+    Ok(minify_json_text(input))
 }
 
 /// Validate JSON text under flags compatible with SQLite `json_valid`.
@@ -142,6 +147,43 @@ fn encode_json_text(context: &str, value: &Value) -> Result<String> {
     Ok(out)
 }
 
+/// Minify already-validated JSON *text* the way stock `json()` does: strip only
+/// insignificant (inter-token) whitespace and preserve every token verbatim.
+///
+/// Stock SQLite's `json()` never rewrites the parsed source — number literals
+/// keep their exact form (`1e2`, `1E2`, `1e+2`, `1e02` are all distinct;
+/// `1.50` keeps its trailing zero), string escapes are preserved (`"a\/b"`
+/// stays `\/`, not `/`), and duplicate object keys are kept. Round-tripping
+/// through `serde_json::Value` loses all of that (exponents are normalised to
+/// `e+NN`, `\/` is unescaped, duplicate keys are dropped), so the text-input
+/// path lexically minifies the source instead of re-serialising a parsed tree.
+/// The caller MUST have validated `input` as well-formed JSON first.
+fn minify_json_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if matches!(ch, ' ' | '\t' | '\n' | '\r') {
+            // Insignificant whitespace between tokens — drop it.
+        } else {
+            out.push(ch);
+            if ch == '"' {
+                in_string = true;
+            }
+        }
+    }
+    out
+}
+
 /// Minified JSON writer with stock-SQLite-canonical float text: `{:?}` is
 /// Rust's shortest round-trip form ("1e300", "-0.0", "0.1"), whereas
 /// `serde_json::to_string` renders exponents with a non-canonical '+'
@@ -155,14 +197,26 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
             if number.is_i64() || number.is_u64() {
                 out.push_str(&number.to_string());
             } else if let Some(float) = number.as_f64().filter(|value| value.is_finite()) {
+                // Finite float: Rust's shortest round-trip text (`{float:?}` ->
+                // "1e300", "-0.0", "0.1") matches stock json()'s rendering of a
+                // JSONB numeric payload and of a constructed real. This branch is
+                // reached by json(BLOB) (decode -> Value -> render), json_object/
+                // json_array/json_set, and json_extract-to-JSON — NOT by the
+                // text-input json() path, which preserves the source literal via
+                // `minify_json_text` (bd-6b0pe). `Number::to_string()` would emit
+                // the arbitrary_precision-normalized form, inserting a '+' into
+                // the exponent ("1e300" -> "1e+300"), which diverges from stock
+                // on the json(BLOB) round-trip and breaks byte-compatible JSONB
+                // interop (bd-t75hg; bd-p2xrc's number.to_string here was
+                // superseded by minify and reverted).
                 out.push_str(&format!("{float:?}"));
             } else {
-                // Non-finite JSON number (only reachable with the
-                // `arbitrary_precision` Number backing). SQLite renders
-                // +Inf/-Inf as a numeric literal and preserves the source
-                // text of a parsed value: a constructed value carries the
-                // canonical `9.0e+999`, a parsed value carries its source
-                // (`9e999`) — stock's construct-vs-preserve asymmetry
+                // Non-finite (or beyond-f64 magnitude) JSON number, only
+                // reachable with the `arbitrary_precision` Number backing.
+                // SQLite renders +Inf/-Inf as a numeric literal and preserves
+                // the source text of a parsed value: a constructed value
+                // carries the canonical `9.0e+999`, a parsed value carries its
+                // source (`9e999`) — stock's construct-vs-preserve asymmetry
                 // (GH#212, bd-t75hg).
                 out.push_str(&render_non_finite_number(number));
             }
@@ -2526,6 +2580,15 @@ impl ScalarFunction for JsonFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
+        // TEXT input: stock json() minifies whitespace but preserves every
+        // token of the source verbatim (number literals incl. exponent form,
+        // string escapes like `\/`, duplicate keys). Parse only to validate,
+        // then lexically minify the source rather than re-serialising a parsed
+        // `serde_json::Value` (which normalises exponents, unescapes `\/`, and
+        // drops duplicate keys) — bd-6b0pe / bd-p2xrc.
+        if let SqliteValue::Text(text) = &args[0] {
+            return Ok(SqliteValue::Text(json(text)?.into()));
+        }
         let input = json_arg_value(self.name(), args, 0)?;
         let encoded = encode_json_text("json serialize failed", &input)?;
         Ok(SqliteValue::Text(encoded.into()))
@@ -3759,6 +3822,212 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(out, SqliteValue::Integer(3));
+    }
+
+    // Conformance guard: pins a batch of JSON scalar behaviors to the C SQLite
+    // oracle (verified against sqlite3 3.46.1) and reports every divergence in
+    // one run. Anchors the bd-p2xrc fix — stock json() minifies whitespace but
+    // never rewrites a number literal, so parsed reals keep their exact source
+    // text (json('1.50') -> '1.50', json('0.3333333333333333') round-trips,
+    // json('1.5e+3') keeps its exponent) while a real constructed from a SQL
+    // value renders canonically (json_array(1.0) -> '[1.0]'). Residual
+    // unsigned/uppercase-exponent exactness (json('1e2') -> '1e+2') is bd-6b0pe.
+    #[test]
+    fn test_json_scalar_conformance_oracle_bd_p2xrc() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s.to_string()));
+        let call = |name: &str, args: Vec<SqliteValue>| -> SqliteValue {
+            registry
+                .find_scalar(name, args.len() as i32)
+                .unwrap_or_else(|| panic!("missing scalar {name}/{}", args.len()))
+                .invoke(&args)
+                .unwrap_or_else(|e| panic!("{name} invoke failed: {e:?}"))
+        };
+        let as_text = |v: &SqliteValue| -> String {
+            match v {
+                SqliteValue::Text(s) => s.as_ref().to_string(),
+                SqliteValue::Integer(i) => i.to_string(),
+                SqliteValue::Float(f) => format!("{f}"),
+                SqliteValue::Null => "NULL".to_string(),
+                other => format!("{other:?}"),
+            }
+        };
+        let mut fails: Vec<String> = Vec::new();
+        macro_rules! ck {
+            ($label:expr, $got:expr, $expect:expr) => {{
+                let g = as_text(&$got);
+                if g != $expect {
+                    fails.push(format!("{}: got {:?} expected {:?}", $label, g, $expect));
+                }
+            }};
+        }
+        // JSON-string / text / integer results (exact, version-independent)
+        ck!("json_min", call("json", vec![t(" { \"a\" : 1 , \"b\" : [ 1,2 ] } ")]), "{\"a\":1,\"b\":[1,2]}");
+        ck!("json_type", call("json_type", vec![t("{\"a\":1}")]), "object");
+        ck!("json_type_path", call("json_type", vec![t("{\"a\":[1,2]}"), t("$.a")]), "array");
+        ck!("json_type_int", call("json_type", vec![t("123")]), "integer");
+        ck!("json_type_real", call("json_type", vec![t("1.5")]), "real");
+        ck!("json_type_true", call("json_type", vec![t("true")]), "true");
+        ck!("json_type_null", call("json_type", vec![t("null")]), "null");
+        ck!("jx_obj", call("json_extract", vec![t("{\"a\":1,\"b\":2}"), t("$.a")]), "1");
+        ck!("jx_multi", call("json_extract", vec![t("{\"a\":1,\"b\":2}"), t("$.a"), t("$.b")]), "[1,2]");
+        ck!("jx_whole", call("json_extract", vec![t("{\"a\":1}"), t("$")]), "{\"a\":1}");
+        ck!("jx_text", call("json_extract", vec![t("{\"a\":\"x\"}"), t("$.a")]), "x");
+        ck!("jx_arr", call("json_extract", vec![t("[10,20,30]"), t("$[1]")]), "20");
+        ck!("jx_neg", call("json_extract", vec![t("[10,20,30]"), t("$[#-1]")]), "30");
+        ck!("jx_nested_obj", call("json_extract", vec![t("{\"a\":{\"b\":9}}"), t("$.a")]), "{\"b\":9}");
+        ck!("arrow", call("->", vec![t("{\"a\":{\"b\":5}}"), t("$.a")]), "{\"b\":5}");
+        ck!("arrow2", call("->>", vec![t("{\"a\":{\"b\":5}}"), t("$.a.b")]), "5");
+        ck!("arrow_str", call("->", vec![t("{\"a\":\"hi\"}"), t("$.a")]), "\"hi\"");
+        ck!("arrow2_str", call("->>", vec![t("{\"a\":\"hi\"}"), t("$.a")]), "hi");
+        ck!("json_array", call("json_array", vec![SqliteValue::Integer(1), t("x"), SqliteValue::Null, SqliteValue::Float(2.5)]), "[1,\"x\",null,2.5]");
+        ck!("json_object", call("json_object", vec![t("a"), SqliteValue::Integer(1), t("b"), t("y")]), "{\"a\":1,\"b\":\"y\"}");
+        ck!("json_object_dup", call("json_object", vec![t("a"), SqliteValue::Integer(1), t("a"), SqliteValue::Integer(2)]), "{\"a\":1,\"a\":2}");
+        ck!("json_quote_num", call("json_quote", vec![SqliteValue::Float(3.0)]), "3.0");
+        ck!("json_quote_str", call("json_quote", vec![t("a\"b")]), "\"a\\\"b\"");
+        ck!("json_valid_ok", call("json_valid", vec![t("{\"a\":1}")]), "1");
+        ck!("json_valid_bad", call("json_valid", vec![t("{\"a\":}")]), "0");
+        ck!("json_valid_trail", call("json_valid", vec![t("{} ")]), "1");
+        ck!("json_arrlen", call("json_array_length", vec![t("[1,2,3]")]), "3");
+        ck!("json_arrlen_path", call("json_array_length", vec![t("{\"a\":[1,2,3,4]}"), t("$.a")]), "4");
+        ck!("json_set", call("json_set", vec![t("{\"a\":1}"), t("$.a"), SqliteValue::Integer(99), t("$.b"), SqliteValue::Integer(2)]), "{\"a\":99,\"b\":2}");
+        ck!("json_insert_exist", call("json_insert", vec![t("{\"a\":1}"), t("$.a"), SqliteValue::Integer(99)]), "{\"a\":1}");
+        ck!("json_replace_miss", call("json_replace", vec![t("{\"a\":1}"), t("$.b"), SqliteValue::Integer(2)]), "{\"a\":1}");
+        ck!("json_remove", call("json_remove", vec![t("{\"a\":1,\"b\":2}"), t("$.a")]), "{\"b\":2}");
+        ck!("json_patch", call("json_patch", vec![t("{\"a\":1,\"b\":2}"), t("{\"b\":null,\"c\":3}")]), "{\"a\":1,\"c\":3}");
+        ck!("json_bignum", call("json", vec![t("{\"a\":12345678901234567890}")]), "{\"a\":12345678901234567890}");
+        ck!("json_neg_zero", call("json_extract", vec![t("[-0]"), t("$[0]")]), "0");
+        // ── deeper batch ──
+        ck!("jx_true", call("json_extract", vec![t("{\"a\":true}"), t("$.a")]), "1");
+        ck!("jx_false", call("json_extract", vec![t("{\"a\":false}"), t("$.a")]), "0");
+        ck!("jx_json_null", call("json_extract", vec![t("{\"a\":null}"), t("$.a")]), "NULL");
+        ck!("jx_deep", call("json_extract", vec![t("{\"a\":{\"b\":{\"c\":7}}}"), t("$.a.b.c")]), "7");
+        ck!("jx_quoted_key", call("json_extract", vec![t("{\"a b\":1}"), t("$.\"a b\"")]), "1");
+        ck!("jx_i64max", call("json_extract", vec![t("[9223372036854775807]"), t("$[0]")]), "9223372036854775807");
+        ck!("arr_of_jsontext", call("json_array", vec![t("[1,2]")]), "[\"[1,2]\"]");
+        ck!("arr_of_real", call("json_array", vec![SqliteValue::Float(1.0)]), "[1.0]");
+        ck!("arr_of_real2", call("json_array", vec![SqliteValue::Float(2.50)]), "[2.5]");
+        ck!("obj_val_real", call("json_object", vec![t("a"), SqliteValue::Float(1.0)]), "{\"a\":1.0}");
+        ck!("json_scalar_int", call("json", vec![t("5")]), "5");
+        ck!("json_scalar_str", call("json", vec![t("\"hi\"")]), "\"hi\"");
+        ck!("json_scalar_real", call("json", vec![t("1.50")]), "1.50");
+        ck!("json_num_1500", call("json", vec![t("1.500")]), "1.500");
+        ck!("json_num_eplus", call("json", vec![t("1.5e+3")]), "1.5e+3");
+        ck!("json_num_eneg", call("json", vec![t("1e-7")]), "1e-7");
+        ck!("json_num_leadzero", call("json", vec![t("0.10")]), "0.10");
+        ck!("json_num_neg", call("json", vec![t("-1.50")]), "-1.50");
+        ck!("json_num_neg0real", call("json", vec![t("-0.0")]), "-0.0");
+        ck!("json_num_16dig", call("json", vec![t("0.3333333333333333")]), "0.3333333333333333");
+        ck!("json_num_obj", call("json", vec![t("{\"a\":1.50,\"b\":2.0}")]), "{\"a\":1.50,\"b\":2.0}");
+        ck!("json_num_arr_ws", call("json", vec![t("[1.50, 2.30]")]), "[1.50,2.30]");
+        ck!("json_pretty", call("json_pretty", vec![t("{\"a\":1,\"b\":[2,3]}")]), "{\n    \"a\": 1,\n    \"b\": [\n        2,\n        3\n    ]\n}");
+        ck!("json_err_pos_ok", call("json_error_position", vec![t("{\"a\":1}")]), "0");
+        ck!("json_err_pos_bad", call("json_error_position", vec![t("{\"a\":}")]), "6");
+        ck!("json_valid_2arg1", call("json_valid", vec![t("{\"a\":1}"), SqliteValue::Integer(1)]), "1");
+        ck!("json_valid_2arg6", call("json_valid", vec![t("{\"a\":1}"), SqliteValue::Integer(6)]), "1");
+        ck!("json_valid_5x", call("json_valid", vec![t("{\"x\":"), SqliteValue::Integer(6)]), "0");
+        ck!("arrow_int_key", call("->", vec![t("[1,2,3]"), SqliteValue::Integer(0)]), "1");
+        ck!("arrow2_int_key", call("->>", vec![t("[1,2,3]"), SqliteValue::Integer(2)]), "3");
+        ck!("json_set_create", call("json_set", vec![t("{\"a\":1}"), t("$.b.c"), SqliteValue::Integer(5)]), "{\"a\":1,\"b\":{\"c\":5}}");
+        ck!("json_set_append", call("json_set", vec![t("{\"a\":[1,2]}"), t("$.a[#]"), SqliteValue::Integer(3)]), "{\"a\":[1,2,3]}");
+        ck!("json_arrlen_obj", call("json_array_length", vec![t("{\"a\":1}")]), "0");
+        ck!("json_remove_arr_idx", call("json_remove", vec![t("[1,2,3]"), t("$[1]")]), "[1,3]");
+        ck!("json_insert_arr", call("json_insert", vec![t("[1,2]"), t("$[#]"), SqliteValue::Integer(3)]), "[1,2,3]");
+        ck!("json_quote_null", call("json_quote", vec![SqliteValue::Null]), "null");
+        ck!("json_obj_num_key", call("json_object", vec![t("1"), SqliteValue::Integer(2)]), "{\"1\":2}");
+
+        // Float results: compare numerically (float→text is oracle-version-sensitive)
+        let mut ck_num = |label: &str, got: SqliteValue, expect: f64| {
+            match got {
+                SqliteValue::Float(f) if (f - expect).abs() < 1e-9 => {}
+                SqliteValue::Integer(i) if (i as f64 - expect).abs() < 1e-9 => {}
+                other => fails.push(format!("{label}: got {other:?} expected ~{expect}")),
+            }
+        };
+        ck_num("json_deep_num", call("json_extract", vec![t("{\"a\":1.50}"), t("$.a")]), 1.5);
+        ck_num("json_e_notation", call("json_extract", vec![t("[1e3]"), t("$[0]")]), 1000.0);
+
+        assert!(fails.is_empty(), "json oracle divergences:\n{}", fails.join("\n"));
+    }
+
+    #[test]
+    fn test_json_text_minify_preserves_source_bd_6b0pe() {
+        // Stock json() on TEXT input strips only insignificant whitespace and
+        // preserves every token of the source verbatim (verified vs sqlite3
+        // 3.46.1). Round-tripping through serde_json::Value used to normalise
+        // exponents (1e2 -> 1e+2), unescape `\/`, and drop duplicate keys.
+        for (input, expect) in [
+            // exponent notation preserved exactly (bd-6b0pe)
+            ("1e2", "1e2"),
+            ("1E2", "1E2"),
+            ("1e+2", "1e+2"),
+            ("1e02", "1e02"),
+            ("[1e+2, 1E2, 1e2]", "[1e+2,1E2,1e2]"),
+            (r#"{"a":1.5E+3}"#, r#"{"a":1.5E+3}"#),
+            // mantissa/precision still preserved (bd-p2xrc)
+            ("1.50", "1.50"),
+            ("2.500000", "2.500000"),
+            // string escapes preserved verbatim, not canonicalised
+            (r#"{"a":"a\/b"}"#, r#"{"a":"a\/b"}"#),
+            (r#"["a\tb"]"#, r#"["a\tb"]"#),
+            // in-string whitespace kept; inter-token whitespace stripped
+            (r#"[ "a  b" , 1 ]"#, r#"["a  b",1]"#),
+            (r#"{ "a" : [ 1 , 2 ] , "b" : "c" }"#, r#"{"a":[1,2],"b":"c"}"#),
+            // duplicate object keys preserved (stock does not dedup on parse)
+            (r#"{"a":1,"a":2}"#, r#"{"a":1,"a":2}"#),
+            (r#"{"x":1e2,"x":3e4}"#, r#"{"x":1e2,"x":3e4}"#),
+        ] {
+            assert_eq!(
+                json(input).unwrap(),
+                expect,
+                "json({input:?}) must minify whitespace but preserve the source verbatim"
+            );
+        }
+        // Invalid JSON is still rejected (validation runs before minification).
+        assert!(json("{\"a\":}").is_err());
+        assert!(json("[1,]").is_err());
+    }
+
+    #[test]
+    fn test_json_blob_render_uses_stock_float_format_bd_p2xrc_revert() {
+        // json(BLOB) decodes JSONB (numeric payloads are ASCII text) and
+        // re-renders. Floats must use stock's shortest form (`{float:?}`),
+        // NOT the arbitrary_precision `to_string()` which inserts a '+' into
+        // the exponent ("1e300" -> "1e+300") and breaks byte-compatible JSONB
+        // round-trip through stock sqlite3 (the bd-p2xrc-revert regression
+        // that RED'd the release gate). Text-input preservation stays in
+        // minify_json_text (bd-6b0pe) and is unaffected.
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let jsonb_of = |s: &str| -> Vec<u8> {
+            match registry
+                .find_scalar("jsonb", 1)
+                .unwrap()
+                .invoke(&[SqliteValue::Text(SmallText::from_string(s.to_string()))])
+                .unwrap()
+            {
+                SqliteValue::Blob(b) => b.to_vec(),
+                other => panic!("jsonb not blob: {other:?}"),
+            }
+        };
+        let json_of_blob = |bytes: Vec<u8>| -> String {
+            match registry
+                .find_scalar("json", 1)
+                .unwrap()
+                .invoke(&[SqliteValue::Blob(Arc::from(bytes.as_slice()))])
+                .unwrap()
+            {
+                SqliteValue::Text(t) => t.as_ref().to_string(),
+                other => panic!("json not text: {other:?}"),
+            }
+        };
+        assert_eq!(json_of_blob(jsonb_of("1e300")), "1e300");
+        assert_eq!(json_of_blob(jsonb_of("-0.0")), "-0.0");
+        assert_eq!(
+            json_of_blob(jsonb_of("[1.5,-0.0,1e300,9223372036854775807]")),
+            "[1.5,-0.0,1e300,9223372036854775807]"
+        );
     }
 
     #[test]

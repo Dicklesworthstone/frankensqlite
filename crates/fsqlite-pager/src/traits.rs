@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::pager::SimpleTransaction;
+use crate::pager::{RollbackCleanup, SimpleTransaction};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
@@ -877,6 +877,11 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
     /// The backend is consumed and stored internally. It must be set before
     /// calling `set_journal_mode(Wal)`.
     fn set_wal_backend(&self, backend: Box<dyn WalBackend>) -> Result<()>;
+
+    /// Set the post-commit rollback-journal cleanup strategy (bd-sw2k5), which
+    /// selects the `PRAGMA journal_mode` behavior among the non-WAL modes
+    /// (delete / truncate / persist). Has no effect while in WAL mode.
+    fn set_rollback_cleanup(&self, cleanup: RollbackCleanup) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,6 +1295,10 @@ impl MvccPager for MockMvccPager {
     fn set_wal_backend(&self, _backend: Box<dyn WalBackend>) -> Result<()> {
         Ok(())
     }
+
+    fn set_rollback_cleanup(&self, _cleanup: RollbackCleanup) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Test/mock transaction handle exported for cross-crate tests.
@@ -1448,6 +1457,10 @@ impl MvccPager for MemoryMockMvccPager {
     }
 
     fn set_wal_backend(&self, _backend: Box<dyn WalBackend>) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_rollback_cleanup(&self, _cleanup: RollbackCleanup) -> Result<()> {
         Ok(())
     }
 }

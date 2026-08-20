@@ -49,15 +49,14 @@ async fn fq(f: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
 fn rq(r: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let mut st = r.prepare(sql).map_err(|e| e.to_string())?;
     let n = st.column_count();
-    Ok(st
-        .query_map([], |row| {
-            Ok((0..n)
-                .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
-                .collect())
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?)
+    st.query_map([], |row| {
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect())
+    })
+    .map_err(|e| e.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| e.to_string())
 }
 async fn fx(f: &Connection, sql: &str) -> Result<(), String> {
     f.execute(sql)

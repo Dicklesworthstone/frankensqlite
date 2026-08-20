@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite"
-version = "0.3.6"
+version = "0.3.7"
 description = "Public API facade"
 edition.workspace = true
 license-file.workspace = true

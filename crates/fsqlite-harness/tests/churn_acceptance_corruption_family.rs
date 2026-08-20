@@ -178,7 +178,6 @@ fn churn_acceptance_corruption_family() {
                                             }
                                         }
                                         thread::sleep(std::time::Duration::from_millis(1));
-                                        continue;
                                     }
                                     Err(err) => {
                                         drop(conn.execute("ROLLBACK;").await);

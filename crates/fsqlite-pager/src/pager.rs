@@ -6796,6 +6796,26 @@ enum JournalInvalidation {
     Truncate,
 }
 
+/// How the rollback journal is finalized after a successful commit, selecting
+/// the SQLite `PRAGMA journal_mode` behavior for the non-WAL modes (bd-sw2k5).
+///
+/// The pager stays in its `JournalMode::Delete` rollback path for all of these;
+/// this only governs the post-commit cleanup step in `commit_journal`:
+/// * `Delete` — invalidate the header (make non-hot), then unlink the file.
+/// * `Truncate` — truncate the file to zero length; keep it (no unlink).
+/// * `Persist` — zero the header; keep the (now non-hot) file (no unlink).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RollbackCleanup {
+    /// `journal_mode=delete` (also the default, and the frank mapping for the
+    /// not-yet-specialized `memory` / `off` modes).
+    #[default]
+    Delete,
+    /// `journal_mode=truncate`.
+    Truncate,
+    /// `journal_mode=persist`.
+    Persist,
+}
+
 async fn durable_invalidate_journal<F: VfsFile>(
     cx: &Cx,
     journal_file: &mut F,
@@ -6891,6 +6911,59 @@ async fn classify_rollback_journal_prefix<F: VfsFile>(
         Err(FrankenError::DatabaseCorrupt {
             detail: format!("rollback journal has invalid magic: {prefix:02x?}"),
         })
+    }
+}
+
+/// Open the rollback journal for a fresh transaction, reclaiming a retained
+/// NON-HOT leftover instead of failing a fail-if-exists create (bd-sw2k5).
+///
+/// `journal_mode=truncate`/`persist` keep a non-hot journal after commit
+/// (`truncate` a 0-byte file, `persist` a magic-zeroed one), and frank re-opens
+/// the journal per transaction (unlike stock SQLite, which keeps one handle open
+/// across transactions). So the default `CREATE|EXCLUSIVE` open — `create_new`,
+/// fail-if-exists — would spuriously reject the next write on the same
+/// connection. Strategy: try-`EXCLUSIVE`-then-reclaim-non-hot:
+///
+/// 1. Try the fail-if-exists `CREATE|EXCLUSIVE` open. This is the fast path and
+///    the crash-safety guard: it refuses to silently reuse an existing journal.
+/// 2. On an `AlreadyExists` collision — every VFS backend maps it to
+///    [`FrankenError::Io`] with [`std::io::ErrorKind::AlreadyExists`]; the
+///    io_uring VFS delegates its `open` to the Unix VFS — re-open the existing
+///    file WITHOUT `EXCLUSIVE` and reclaim it only if it classifies NON-HOT. A
+///    HOT leftover (which must have been recovered at connection open, not left
+///    for a fresh commit) keeps the original collision error so its pending
+///    rollback data is never overwritten.
+///
+/// The caller re-initializes the returned handle with its own `truncate(0)` +
+/// fresh header write, so a reclaimed leftover is indistinguishable from a
+/// freshly created journal. `journal_mode=delete` unlinks its journal after
+/// commit, so no leftover exists and step 1 always succeeds.
+async fn open_rollback_journal_reclaiming_non_hot<V: Vfs>(
+    cx: &Cx,
+    vfs: &V,
+    journal_path: &Path,
+) -> Result<V::File> {
+    let exclusive_flags = VfsOpenFlags::CREATE
+        | VfsOpenFlags::EXCLUSIVE
+        | VfsOpenFlags::READWRITE
+        | VfsOpenFlags::MAIN_JOURNAL;
+    match vfs.open(cx, Some(journal_path), exclusive_flags) {
+        Ok((journal_file, _)) => Ok(journal_file),
+        Err(FrankenError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A leftover journal exists — only possible under truncate/persist,
+            // which keep the file. Re-open without EXCLUSIVE and reclaim it iff
+            // it is non-hot.
+            let reuse_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (existing, _) = vfs.open(cx, Some(journal_path), reuse_flags)?;
+            match classify_rollback_journal_prefix(cx, &existing).await? {
+                (RollbackJournalPrefixState::NonHot, _) => Ok(existing),
+                // Never overwrite a hot journal: surface the original
+                // fail-if-exists collision so the caller aborts. Connection-open
+                // recovery — not a fresh commit — owns hot-journal replay.
+                (RollbackJournalPrefixState::Hot, _) => Err(FrankenError::Io(err)),
+            }
+        }
+        Err(other) => Err(other),
     }
 }
 
@@ -7016,6 +7089,10 @@ pub(crate) struct PagerInner<F: VfsFile> {
     durable_freelist_view: HashSet<u32>,
     /// Current journal mode (rollback journal vs WAL).
     journal_mode: JournalMode,
+    /// Post-commit rollback-journal cleanup strategy (bd-sw2k5). Selects the
+    /// `PRAGMA journal_mode` behavior among the non-WAL modes (delete /
+    /// truncate / persist); a per-connection setting, not published state.
+    rollback_cleanup: RollbackCleanup,
     /// WAL commit sync policy derived from `PRAGMA synchronous`.
     wal_commit_sync_policy: WalCommitSyncPolicy,
     /// Whether this pager has a locally failed rollback-journal commit that
@@ -12961,6 +13038,19 @@ where
         inner.access_mode.is_readonly()
     }
 
+    /// Set the post-commit rollback-journal cleanup strategy (bd-sw2k5). Chosen
+    /// by `PRAGMA journal_mode` among the non-WAL modes; the pager stays in its
+    /// `JournalMode::Delete` rollback path and this only governs how
+    /// `commit_journal` finalizes the journal file.
+    fn set_rollback_cleanup(&self, cleanup: RollbackCleanup) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        inner.rollback_cleanup = cleanup;
+        Ok(())
+    }
+
     // bd-h9o9r: a sync mutex guard is held across an await in this
     // function's body; reachable-deadlock audit and lock-scope repair
     // belong to the Phase-C pager reconstruction.
@@ -13935,11 +14025,12 @@ where
                 &journal_path,
             )?;
             *recovery_owner_receipt = Some(recovery_owner);
-            let journal_flags = VfsOpenFlags::CREATE
-                | VfsOpenFlags::EXCLUSIVE
-                | VfsOpenFlags::READWRITE
-                | VfsOpenFlags::MAIN_JOURNAL;
-            let (mut journal_file, _) = pager.vfs.open(cx, Some(&journal_path), journal_flags)?;
+            // bd-sw2k5: reclaim a retained non-hot journal (truncate/persist keep
+            // one after commit) rather than fail the fail-if-exists EXCLUSIVE
+            // create; a hot leftover stays fail-closed. The file-identity check
+            // and the `truncate(0)` below still run on whichever handle returns.
+            let mut journal_file =
+                open_rollback_journal_reclaiming_non_hot(cx, &*pager.vfs, &journal_path).await?;
             let journal_identity = journal_file.file_identity()?.ok_or_else(|| {
                 FrankenError::internal(
                     "rollback-journal VFS did not provide a stable file identity",
@@ -16231,6 +16322,16 @@ where
             (header, false)
         } else {
             if file_size < DATABASE_HEADER_SIZE as u64 {
+                // bd-qgh42 follow-up: a ReservedEmpty open falls back to
+                // open-existing when its VFS reserved open rejects a populated
+                // slot. A non-empty file too small to hold a header is not a
+                // coherent DB, so it refuses with the uniform reserved-open
+                // CannotOpen contract (every sibling reserved refusal surfaces
+                // CannotOpen) rather than leaking the raw DatabaseCorrupt
+                // diagnostic a normal open would.
+                if reserved_empty_existing_size.is_some() {
+                    return Err(FrankenError::CannotOpen { path: db_path });
+                }
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
                         "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
@@ -16266,6 +16367,15 @@ where
                         )
                     }
                     Err(error) => {
+                        // bd-qgh42 follow-up: a non-empty file with an incoherent
+                        // header reached here via the ReservedEmpty open-existing
+                        // fallback; refuse with the uniform reserved-open
+                        // CannotOpen contract rather than the raw corruption error.
+                        if reserved_empty_existing_size.is_some() {
+                            return Err(FrankenError::CannotOpen {
+                                path: db_path.clone(),
+                            });
+                        }
                         return Err(map_database_header_error(&error, "invalid database header"));
                     }
                 };
@@ -16404,6 +16514,7 @@ where
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
                 journal_mode: initial_journal_mode,
+                rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
                 rollback_journal_recovery_owner: None,
@@ -16812,6 +16923,7 @@ where
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
                 journal_mode: JournalMode::Delete,
+                rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
                 access_mode: PagerAccessMode::ReadOnly,
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
@@ -19255,8 +19367,19 @@ where
     V: Vfs + Send,
     V::File: Send + Sync + 'static,
 {
-    async fn invalidate_journal_after_commit(cx: &Cx, journal_file: &mut V::File) -> Result<()> {
-        durable_invalidate_journal(cx, journal_file, JournalInvalidation::ZeroMagic).await
+    async fn invalidate_journal_after_commit(
+        cx: &Cx,
+        journal_file: &mut V::File,
+        cleanup: RollbackCleanup,
+    ) -> Result<()> {
+        // bd-sw2k5: `journal_mode=truncate` empties the journal file; `delete`
+        // and `persist` zero the magic header (making it non-hot) — `delete`
+        // then unlinks the file (done by the caller), `persist` keeps it.
+        let invalidation = match cleanup {
+            RollbackCleanup::Truncate => JournalInvalidation::Truncate,
+            RollbackCleanup::Delete | RollbackCleanup::Persist => JournalInvalidation::ZeroMagic,
+        };
+        durable_invalidate_journal(cx, journal_file, invalidation).await
     }
 
     /// Commit using the rollback journal protocol.
@@ -19463,11 +19586,15 @@ where
                 journal_path,
             )?;
             *owned_recovery = Some(recovery_owner);
-            let jrnl_flags = VfsOpenFlags::CREATE
-                | VfsOpenFlags::EXCLUSIVE
-                | VfsOpenFlags::READWRITE
-                | VfsOpenFlags::MAIN_JOURNAL;
-            let (mut jrnl_file, _) = vfs.open(cx, Some(journal_path), jrnl_flags)?;
+            // bd-sw2k5: reclaim a retained non-hot journal instead of failing
+            // the fail-if-exists EXCLUSIVE create on the next write. truncate and
+            // persist keep the <db>-journal after commit and frank re-opens it
+            // per transaction, so a plain EXCLUSIVE create would reject the 2nd
+            // write on a connection; the helper reuses a non-hot leftover and
+            // stays fail-closed on a hot one. The `truncate(0)` + header rewrite
+            // below re-initializes whichever handle it returns.
+            let mut jrnl_file =
+                open_rollback_journal_reclaiming_non_hot(cx, &**vfs, journal_path).await?;
 
             let requested_sector_size = db_file.sector_size().max(jrnl_file.sector_size());
             let sector_size = if (512..=65_536).contains(&requested_sector_size)
@@ -19581,12 +19708,16 @@ where
 
             db_file.durable_sync(&cleanup_cx, SyncKind::FullDurable)?;
 
+            // bd-sw2k5: the PRAGMA journal_mode cleanup strategy (delete /
+            // truncate / persist) selected for this rollback commit.
+            let cleanup = inner.rollback_cleanup;
+
             // Phase 3: Make the journal non-hot before best-effort deletion.
             // If invalidation fails, restore and sync the complete hot header
             // so rollback is definite. Only if restoration itself fails may a
             // truncate+sync choose the already-durable database as committed.
             if let Err(invalidate_err) =
-                Self::invalidate_journal_after_commit(&cleanup_cx, &mut jrnl_file).await
+                Self::invalidate_journal_after_commit(&cleanup_cx, &mut jrnl_file, cleanup).await
             {
                 let restore_result = durable_write_and_verify_journal_header(
                     &cleanup_cx,
@@ -19622,7 +19753,11 @@ where
             )?;
             match jrnl_file.close(&cleanup_cx) {
                 Ok(()) => {
-                    if let Err(delete_err) = vfs.delete(&cleanup_cx, journal_path, true) {
+                    // bd-sw2k5: only `delete` mode unlinks the journal file;
+                    // `truncate`/`persist` keep the (now non-hot) file in place.
+                    if cleanup == RollbackCleanup::Delete
+                        && let Err(delete_err) = vfs.delete(&cleanup_cx, journal_path, true)
+                    {
                         tracing::warn!(
                             error = %delete_err,
                             journal = %journal_path.display(),

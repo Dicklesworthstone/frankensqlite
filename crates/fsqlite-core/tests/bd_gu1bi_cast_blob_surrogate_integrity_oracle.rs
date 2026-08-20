@@ -60,7 +60,7 @@ async fn integrity_check(conn: &Connection) -> Vec<String> {
         .collect()
 }
 
-/// Open the stock-written DB with fsqlite and assert integrity_check == ["ok"]
+/// Open the stock-written DB with fsqlite and assert integrity_check == `["ok"]`
 /// with no spurious first-open migration.
 async fn assert_fsqlite_integrity_ok(path: &Path, label: &str) {
     let fconn = Connection::open(path.to_str().unwrap())

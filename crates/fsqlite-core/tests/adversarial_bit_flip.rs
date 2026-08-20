@@ -96,9 +96,8 @@ fn stock_verdict(db: &str) -> Verdict {
         return Verdict::Caught;
     };
     match conn.query_row("PRAGMA integrity_check;", [], |r| r.get::<_, String>(0)) {
-        Err(_) => Verdict::Caught,
         Ok(line) if line == "ok" => Verdict::SilentlyAccepted(vec![line]),
-        Ok(_) => Verdict::Caught,
+        _ => Verdict::Caught,
     }
 }
 

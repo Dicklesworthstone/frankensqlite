@@ -75,12 +75,11 @@ fn stock_orphan_report(path: &Path) -> (usize, Option<u32>, Option<u32>, usize) 
     let lines = stock_integrity_lines(path);
     let mut orphans: Vec<u32> = Vec::new();
     for line in &lines {
-        if let Some(rest) = line.strip_prefix("Page ") {
-            if let Some(num) = rest.strip_suffix(" is never used") {
-                if let Ok(p) = num.trim().parse::<u32>() {
-                    orphans.push(p);
-                }
-            }
+        if let Some(rest) = line.strip_prefix("Page ")
+            && let Some(num) = rest.strip_suffix(" is never used")
+            && let Ok(p) = num.trim().parse::<u32>()
+        {
+            orphans.push(p);
         }
     }
     for l in &lines {
@@ -289,7 +288,6 @@ fn run_churn(db: &str, with_index: bool) -> i64 {
                                     }
                                     Err(e) if e.is_transient() => {
                                         let _ = conn.execute("ROLLBACK;").await;
-                                        continue;
                                     }
                                     Err(e) => return Err(format!("t{tid} commit: {e}")),
                                 }

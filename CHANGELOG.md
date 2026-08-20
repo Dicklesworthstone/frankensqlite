@@ -17,13 +17,14 @@ as a 27-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) (2026-08-19) through HEAD ([`b3bb22566db22caf4e91c4cd264d730d86d520fd`](https://github.com/Dicklesworthstone/frankensqlite/commit/b3bb22566db22caf4e91c4cd264d730d86d520fd)). The 0.3.6 row below matches the published GitHub Release. v0.3.2–v0.3.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
+Scope window: [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) (2026-08-19) through the 0.3.7 version bump ([`8cc00ba7cd61141605ec7c27a0ecb92aa5264e22`](https://github.com/Dicklesworthstone/frankensqlite/commit/8cc00ba7cd61141605ec7c27a0ecb92aa5264e22)). **0.3.7 is a release candidate; the `v0.3.7` tag is cut after the release gate.** The 0.3.6 row below matches the published GitHub Release. v0.3.2–v0.3.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...main) | HEAD | 2026-08-19 | GH#370/#371 + janitor docs-reorg |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...main) | HEAD | 2026-08-20 | (no post-0.3.7 changes yet) |
+| [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...main) | Release (pending tag) | 2026-08-20 | GH#345/#366/#368/#369/#370/#371/#244 + bd-xv5cm 7-facet concurrency hardening + REVIEW3 |
 | [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) | Release | 2026-08-19 | FTS5 reopen/hydration + binary release |
 | [v0.3.5](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.3.5) | Tag | 2026-08-17 | crates.io snapshot; non-leading PK WITHOUT ROWID (no GitHub Release) |
 | [v0.3.4](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.4) | Release | 2026-08-16 | GH#353 WITHOUT ROWID composite-UNIQUE auto-index |
@@ -32,42 +33,51 @@ Scope window: [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) (as of 2026-08-19)
+## [Unreleased] -- development on `main` since v0.3.7
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...main>
 
-50 non-merge commits after the v0.3.6 tag.
+No post-0.3.7 changes yet; the version bump is the current tip.
 
-### Delivered capability
+---
 
-- Post-0.3.6 FTS5/SSI/ATTACH follow-through (GH#370/#371).
-- Remaining root reports relocated (`docs/UPGRADE_LOG.md`, `docs/planning/HEADS_UP_CONNECTION_RS_WIP.md`).
+## [0.3.7] -- 2026-08-20 (release candidate; tag `v0.3.7` is cut after the release gate)
 
-### Closed workstreams
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...main>
 
-- GitHub issues #370 and #371.
-- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankensqlite/blob/main/.beads/issues.jsonl).
+182 non-merge commits after the [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) tag. The version bump — all 28 crate package versions plus the 27 internal workspace-dependency pins raised 0.3.6 → 0.3.7 with `Cargo.lock` refreshed — landed in [`8cc00ba7cd61141605ec7c27a0ecb92aa5264e22`](https://github.com/Dicklesworthstone/frankensqlite/commit/8cc00ba7cd61141605ec7c27a0ecb92aa5264e22); `cargo check --workspace` is green.
 
-### Janitor docs-reorg (2026-08-19)
+### GitHub issues closed
 
-- Untracked skill-loop scratch; moved remaining root planning beads into `docs/planning/` ([`b72874ce02435cc0030a671526fbf6bd09fafec5`](https://github.com/Dicklesworthstone/frankensqlite/commit/b72874ce02435cc0030a671526fbf6bd09fafec5)).
-- Relocated remaining root reports: `UPGRADE_LOG.md` → [`docs/UPGRADE_LOG.md`](https://github.com/Dicklesworthstone/frankensqlite/blob/main/docs/UPGRADE_LOG.md); `HEADS_UP_CONNECTION_RS_WIP.md` → [`docs/planning/HEADS_UP_CONNECTION_RS_WIP.md`](https://github.com/Dicklesworthstone/frankensqlite/blob/main/docs/planning/HEADS_UP_CONNECTION_RS_WIP.md) ([`b3bb22566db22caf4e91c4cd264d730d86d520fd`](https://github.com/Dicklesworthstone/frankensqlite/commit/b3bb22566db22caf4e91c4cd264d730d86d520fd)).
+- **GH#345** — subquery-`WHEN` trigger ingestion no longer re-parses the schema on every write, and lazy per-read memdb hydration removes the O(rows²) reload ([`8f0bc0967c4e83e6cafc944555580084dca07c52`](https://github.com/Dicklesworthstone/frankensqlite/commit/8f0bc0967c4e83e6cafc944555580084dca07c52), [`40c40094090179aece36eeac9e3e75b439b0cdbe`](https://github.com/Dicklesworthstone/frankensqlite/commit/40c40094090179aece36eeac9e3e75b439b0cdbe)).
+- **GH#366** — a coherent populated database reopened via `ReservedEmpty` opens instead of being falsely rejected ([`e3b5e68af2af6d692fef3f81bba6ddca9e5a1da5`](https://github.com/Dicklesworthstone/frankensqlite/commit/e3b5e68af2af6d692fef3f81bba6ddca9e5a1da5)).
+- **GH#368 / GH#369** — memdb read-amplification pair: in-txn `sqlite_master` scans are counted for regression guarding, and memdb FK-parent hits are trusted only when the mirror is fully hydrated ([`d62a51b183fb6467323f1e89b400841672ac2d35`](https://github.com/Dicklesworthstone/frankensqlite/commit/d62a51b183fb6467323f1e89b400841672ac2d35), [`7bac82eb43cfb43e86455c10062dff12d5c84439`](https://github.com/Dicklesworthstone/frankensqlite/commit/7bac82eb43cfb43e86455c10062dff12d5c84439)).
+- **GH#370** — reclaim orphaned `%_content` on legacy contentless FTS5 archives ([`a00e152cced9ab0fcf8005c26e2d6bcea0e94619`](https://github.com/Dicklesworthstone/frankensqlite/commit/a00e152cced9ab0fcf8005c26e2d6bcea0e94619)).
+- **GH#371** — bound WITHOUT-ROWID / large-table `DROP` teardown memory, closing a P0 OOM ([`7a3625a7d23edcf9f433225f4545a90e6bbcae8f`](https://github.com/Dicklesworthstone/frankensqlite/commit/7a3625a7d23edcf9f433225f4545a90e6bbcae8f)).
+- **GH#244** — attached-schema writes participate in explicit transactions via lazy child-txn enrollment with commit/rollback fan-out ([`f430ce46d0763cbf0581c01d388f468c0057ff8e`](https://github.com/Dicklesworthstone/frankensqlite/commit/f430ce46d0763cbf0581c01d388f468c0057ff8e)).
 
-### Representative commits
+### Concurrency hardening — bd-xv5cm (7 facets)
 
-- [`b3bb22566db22caf4e91c4cd264d730d86d520fd`](https://github.com/Dicklesworthstone/frankensqlite/commit/b3bb22566db22caf4e91c4cd264d730d86d520fd) — janitor relocate remaining root reports.
-- [`a00e152cced9ab0fcf8005c26e2d6bcea0e94619`](https://github.com/Dicklesworthstone/frankensqlite/commit/a00e152cced9ab0fcf8005c26e2d6bcea0e94619) — GH#370 orphaned `%_content` reclaim.
+- **L1** — a group-commit queue is removed only when the registry is its sole owner ([`0a1ab35b3d581f7cd1b964e79c756587019b1e19`](https://github.com/Dicklesworthstone/frankensqlite/commit/0a1ab35b3d581f7cd1b964e79c756587019b1e19)).
+- **L2** — the post-cancel wait for the worker's authoritative outcome is bounded ([`14c7e59879e91300c8b2bf17a1e0f25bc2c3d2ab`](https://github.com/Dicklesworthstone/frankensqlite/commit/14c7e59879e91300c8b2bf17a1e0f25bc2c3d2ab)).
+- **L3** — an autocommit `SELECT` that calls a user function is never auto-retried ([`b38b09d9f62728a8a336c8fbb643184c1f95f341`](https://github.com/Dicklesworthstone/frankensqlite/commit/b38b09d9f62728a8a336c8fbb643184c1f95f341)).
+- **L4** — BusyRecovery identity is preserved on retry exhaustion (folded into [`f430ce46d0763cbf0581c01d388f468c0057ff8e`](https://github.com/Dicklesworthstone/frankensqlite/commit/f430ce46d0763cbf0581c01d388f468c0057ff8e)).
+- **M4** — atomic single-write wal-fec append with a graceful scan over a corrupt tail ([`01c3965e4f1c4cb83b7f73aa1b626e9bb634c505`](https://github.com/Dicklesworthstone/frankensqlite/commit/01c3965e4f1c4cb83b7f73aa1b626e9bb634c505)).
+- **M5** — the coordinator-map lock is released before the blocking ticker join ([`ad2e949b31efab42d1e6bb3a96c4775791867512`](https://github.com/Dicklesworthstone/frankensqlite/commit/ad2e949b31efab42d1e6bb3a96c4775791867512)).
+- **L5** — chunk-id assertion. Batch closed at [`b0aa79f4b2aee44fd663e712e27816e30a30c48a`](https://github.com/Dicklesworthstone/frankensqlite/commit/b0aa79f4b2aee44fd663e712e27816e30a30c48a).
 
-### Post-0.3.6 correctness
+### Correctness & conformance
 
-- Reclaim orphaned `%_content` on legacy contentless FTS5 archives (GH#370, [`a00e152cced9ab0fcf8005c26e2d6bcea0e94619`](https://github.com/Dicklesworthstone/frankensqlite/commit/a00e152cced9ab0fcf8005c26e2d6bcea0e94619)).
-- Bound WITHOUT-ROWID / large-table DROP teardown memory (GH#371, [`7a3625a7d23edcf9f433225f4545a90e6bbcae8f`](https://github.com/Dicklesworthstone/frankensqlite/commit/7a3625a7d23edcf9f433225f4545a90e6bbcae8f)).
-- External-content FTS5 scans + rebuild read the SOURCE (REVIEW3-P2, [`4b8a2504fa0d845d94d5c0b7ca44f05a0f7a3348`](https://github.com/Dicklesworthstone/frankensqlite/commit/4b8a2504fa0d845d94d5c0b7ca44f05a0f7a3348)); external-content delete-all keeps rows visible and clears only the index ([`ee2e3a7ea975a1de5093760d246b8026cd578b8c`](https://github.com/Dicklesworthstone/frankensqlite/commit/ee2e3a7ea975a1de5093760d246b8026cd578b8c)).
-- Dual-recompute index keys under `integrity_check` so CAST-AS-BLOB + surrogate UTF-16 indexes stop false-flagging ([`96ae9d73c1eb5cc664bfd4e5613aa426c3a2bbdb`](https://github.com/Dicklesworthstone/frankensqlite/commit/96ae9d73c1eb5cc664bfd4e5613aa426c3a2bbdb)).
-- Trust memdb FK parent hits only when the mirror is fully hydrated ([`7bac82eb43cfb43e86455c10062dff12d5c84439`](https://github.com/Dicklesworthstone/frankensqlite/commit/7bac82eb43cfb43e86455c10062dff12d5c84439)).
-- Row-value element collation and nested subquery operands ([`40f43ccab5db4aa3371741273da9f4882d387b65`](https://github.com/Dicklesworthstone/frankensqlite/commit/40f43ccab5db4aa3371741273da9f4882d387b65)).
-- SSI `lost_below` armed at max `commit_seq` over the drained prefix ([`992c1d3ffcacc54200870c295f4a69c56909b7f4`](https://github.com/Dicklesworthstone/frankensqlite/commit/992c1d3ffcacc54200870c295f4a69c56909b7f4)).
-- Deferred ATTACH encoding stamped on the live write txn ([`2da36f586436047fbea96a603064a88cb4fa6b13`](https://github.com/Dicklesworthstone/frankensqlite/commit/2da36f586436047fbea96a603064a88cb4fa6b13)); only cost-reordered table WHERE folds (subquery) AND never-true ([`e9896efc07f85ee567ab010c02a046b4eb865249`](https://github.com/Dicklesworthstone/frankensqlite/commit/e9896efc07f85ee567ab010c02a046b4eb865249)).
+- Same-event triggers fire newest-first (LIFO), matching C SQLite ([`a60f6c60602602eab88c43a4c2a0db6c769472ba`](https://github.com/Dicklesworthstone/frankensqlite/commit/a60f6c60602602eab88c43a4c2a0db6c769472ba)).
+- `json()` preserves number-literal source text and minifies its input instead of re-serializing through a lossy value round-trip ([`6b1ecba70e746f0884f168628fb81786bb5b119f`](https://github.com/Dicklesworthstone/frankensqlite/commit/6b1ecba70e746f0884f168628fb81786bb5b119f), [`6d5cbe28dbaf7297ead06c0a202965cbbe031b1d`](https://github.com/Dicklesworthstone/frankensqlite/commit/6d5cbe28dbaf7297ead06c0a202965cbbe031b1d)).
+- `printf` `%!` alt-form-2 floats emit exact-double cap digits ([`d3cab54d7e2a1b1ccfe67ec4064bec6ae218b525`](https://github.com/Dicklesworthstone/frankensqlite/commit/d3cab54d7e2a1b1ccfe67ec4064bec6ae218b525)); unsigned datetime modifiers are accepted as positive ([`1da56ea84bf658a8353accb9f2f921105757cc1d`](https://github.com/Dicklesworthstone/frankensqlite/commit/1da56ea84bf658a8353accb9f2f921105757cc1d)); the `utc` modifier resolves DST-transition ambiguity via SQLite's iterative solver ([`49437629d18b70b0a10fce65571f56acdd7d1519`](https://github.com/Dicklesworthstone/frankensqlite/commit/49437629d18b70b0a10fce65571f56acdd7d1519)).
+- Third-wave fresh-eyes review (REVIEW3): `HAVING` column-reference resolution ([`3875fb93a236aede5c32e78e6d4a86829e970107`](https://github.com/Dicklesworthstone/frankensqlite/commit/3875fb93a236aede5c32e78e6d4a86829e970107)); literal `X AND 0` folding in the VDBE binary-op emitter so dead `CASE WHEN` branches drop ([`9d0a9205b340463215cdb388afcbd84d4b8eb59a`](https://github.com/Dicklesworthstone/frankensqlite/commit/9d0a9205b340463215cdb388afcbd84d4b8eb59a)); external-content FTS5 scans and rebuild read the SOURCE ([`4b8a2504fa0d845d94d5c0b7ca44f05a0f7a3348`](https://github.com/Dicklesworthstone/frankensqlite/commit/4b8a2504fa0d845d94d5c0b7ca44f05a0f7a3348)); dual-recompute index keys under `integrity_check` so CAST-AS-BLOB and surrogate UTF-16 indexes stop false-flagging ([`96ae9d73c1eb5cc664bfd4e5613aa426c3a2bbdb`](https://github.com/Dicklesworthstone/frankensqlite/commit/96ae9d73c1eb5cc664bfd4e5613aa426c3a2bbdb)).
+- FTS5 index-shadow reclaim: external-content delete-all keeps rows visible and clears only the index/doclist shadows ([`ee2e3a7ea975a1de5093760d246b8026cd578b8c`](https://github.com/Dicklesworthstone/frankensqlite/commit/ee2e3a7ea975a1de5093760d246b8026cd578b8c)), complementing the orphaned `%_content` reclaim above.
+- `CAST(blob AS TEXT/numeric)` relabels bytes via the database text encoding ([`194e97de83c90f483d81e9ced2c1142e87952e0d`](https://github.com/Dicklesworthstone/frankensqlite/commit/194e97de83c90f483d81e9ced2c1142e87952e0d)); INDEXED-BY partial-cover LEFT→INNER strength reduction ([`56f90d8064c3a405f2c26eba4d8987726c0e075a`](https://github.com/Dicklesworthstone/frankensqlite/commit/56f90d8064c3a405f2c26eba4d8987726c0e075a)); ATTACH deferred-encoding reverted to an eager stamp to eliminate an aux-corruption hazard ([`f75649ef87f03bdb71074c15cabf01fbdfacfde0`](https://github.com/Dicklesworthstone/frankensqlite/commit/f75649ef87f03bdb71074c15cabf01fbdfacfde0)).
+
+### Tracker
+
+- Beads: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankensqlite/blob/main/.beads/issues.jsonl).
 
 ---
 

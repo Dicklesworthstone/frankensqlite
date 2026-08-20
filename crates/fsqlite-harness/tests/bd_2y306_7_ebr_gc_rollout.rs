@@ -38,7 +38,7 @@ fn dummy_version(pgno: u32, seq: u64) -> PageVersion {
 /// Populate arena with `n_pages` pages, each having `chain_depth` versions.
 /// Returns (arena, chain_heads, todo) ready for gc_tick.
 fn populate_arena(n_pages: u32, chain_depth: u64) -> (VersionArena, ChainHeadTable, GcTodo) {
-    let mut arena = VersionArena::new();
+    let arena = VersionArena::new();
     let chain_heads = ChainHeadTable::new();
     let mut todo = GcTodo::new();
 

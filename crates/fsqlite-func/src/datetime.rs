@@ -871,9 +871,25 @@ fn build_small_text(write: impl Fn(&mut dyn core::fmt::Write) -> core::fmt::Resu
     }
 }
 
+/// Write a calendar year the way C SQLite's `date()`/`datetime()` render it: a
+/// 4-digit zero-padded field, but with the minus sign kept *outside* the padding
+/// for negative (proleptic BC) years — e.g. -1 renders as `-0001`, not `-001`
+/// (Rust's `{:04}` would count the sign inside the width). `strftime('%Y')`
+/// differs — it keeps the sign inside a 4-wide field — and is handled separately.
+fn write_year(w: &mut dyn core::fmt::Write, y: i64) -> core::fmt::Result {
+    if y < 0 {
+        write!(w, "-{:04}", y.unsigned_abs())
+    } else {
+        write!(w, "{y:04}")
+    }
+}
+
 fn format_date(jdn: f64) -> SmallText {
     let (y, m, d) = jdn_to_ymd(jdn);
-    build_small_text(move |w| write!(w, "{y:04}-{m:02}-{d:02}"))
+    build_small_text(move |w| {
+        write_year(w, y)?;
+        write!(w, "-{m:02}-{d:02}")
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -922,10 +938,16 @@ fn format_datetime(jdn: f64, subsec: bool, unmodified: Option<UnmodifiedHms>) ->
     let (h, mi) = (hms.hour, hms.minute);
     if subsec {
         let (s, ms) = rounded_second_and_millis(hms);
-        build_small_text(move |w| write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{ms:03}"))
+        build_small_text(move |w| {
+            write_year(w, y)?;
+            write!(w, "-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{ms:03}")
+        })
     } else {
         let s = hms.second;
-        build_small_text(move |w| write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"))
+        build_small_text(move |w| {
+            write_year(w, y)?;
+            write!(w, "-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+        })
     }
 }
 
@@ -1475,6 +1497,16 @@ fn parse_args(args: &[SqliteValue]) -> Option<ParsedDateTimeArgs> {
         modifier.eq_ignore_ascii_case("subsec") || modifier.eq_ignore_ascii_case("subsecond")
     });
     let (jdn, modifier_subsec) = apply_modifiers(parsed.jdn, &modifiers, parsed.raw_numeric)?;
+    // C SQLite's date functions return NULL when the *computed* result (after
+    // every modifier) leaves the representable Julian-day range — not only when
+    // the raw numeric input does (checked above). Mirror date.c's validJulianDay
+    // on the final value so a modifier that overflows past 9999-12-31 23:59:59
+    // (or below Julian day 0) yields NULL rather than a malformed 5-digit-year
+    // string or an out-of-range julianday()/unixepoch() number. Verified against
+    // SQLite 3.53: e.g. datetime('9999-12-31 23:59:59','+1 second') is NULL.
+    if !(0.0..=AUTO_JDN_MAX).contains(&jdn) {
+        return None;
+    }
     Some(ParsedDateTimeArgs {
         jdn,
         subsec: first_position_subsec || modifier_subsec,
@@ -2104,6 +2136,100 @@ mod tests {
             }
             other => panic!("expected Float, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_computed_result_out_of_range_returns_null() {
+        // C SQLite returns NULL when a modifier pushes the *computed* time
+        // outside the representable Julian-day range — past 9999-12-31 23:59:59
+        // or below Julian day 0 — for every date function, rather than emitting
+        // a malformed 5-digit-year string or an out-of-range julianday()/
+        // unixepoch() number. Verified against SQLite 3.53. Guards the
+        // post-modifier range check in `parse_args`.
+        let over_datetime = &[text("9999-12-31 23:59:59"), text("+1 second")];
+        assert_eq!(DateTimeFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
+        assert_eq!(TimeFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
+        assert_eq!(JuliandayFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
+        assert_eq!(UnixepochFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
+        assert_eq!(
+            DateFunc.invoke(&[text("9999-12-31"), text("+1 day")]).unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            DateTimeFunc.invoke(&[text("9999-12-31"), text("+1 month")]).unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            StrftimeFunc
+                .invoke(&[text("%Y-%m-%d"), text("9999-12-31 23:59:59"), text("+1 second")])
+                .unwrap(),
+            SqliteValue::Null
+        );
+        // Lower bound: a result below Julian day 0 (before ~4714 BC) is NULL.
+        assert_eq!(
+            DateTimeFunc
+                .invoke(&[text("-4714-11-24 12:00:00"), text("-1 day")])
+                .unwrap(),
+            SqliteValue::Null
+        );
+
+        // Valid boundary / in-range cases must still succeed (no over-rejection):
+        assert_text(
+            &DateTimeFunc.invoke(&[text("9999-12-31 23:59:59")]).unwrap(),
+            "9999-12-31 23:59:59",
+        );
+        // A negative *year* whose Julian day is still >= 0 stays valid (rendered,
+        // not NULL) — SQLite formats such instants (e.g. -0001-12-31 ...).
+        assert!(matches!(
+            DateTimeFunc
+                .invoke(&[text("0000-01-01"), text("-1 second")])
+                .unwrap(),
+            SqliteValue::Text(_)
+        ));
+    }
+
+    #[test]
+    fn test_negative_year_padding_matches_sqlite() {
+        // C SQLite's date()/datetime() render a negative (proleptic BC) year with
+        // the sign OUTSIDE a 4-digit zero-padded magnitude: -1 -> "-0001", not the
+        // "-001" that a naive `{:04}` (sign inside the width) produces. Verified
+        // against SQLite 3.53.
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("0000-01-01"), text("-1 second")])
+                .unwrap(),
+            "-0001-12-31 23:59:59",
+        );
+        assert_text(
+            &DateFunc.invoke(&[text("0000-01-01"), text("-1 day")]).unwrap(),
+            "-0001-12-31",
+        );
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("0000-01-01"), text("-100 years")])
+                .unwrap(),
+            "-0100-01-01 00:00:00",
+        );
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("0000-01-01"), text("-4000 years")])
+                .unwrap(),
+            "-4000-01-01 00:00:00",
+        );
+        // Non-negative years are unchanged (regression guard).
+        assert_text(
+            &DateTimeFunc.invoke(&[text("2024-03-15 14:30:00")]).unwrap(),
+            "2024-03-15 14:30:00",
+        );
+        assert_text(&DateFunc.invoke(&[text("0000-01-01")]).unwrap(), "0000-01-01");
+        // strftime('%Y') keeps the sign INSIDE a 4-wide field ("-001"), matching
+        // SQLite's separate strftime path — this fix must not touch it.
+        assert_text(
+            &StrftimeFunc
+                .invoke(&[text("%Y"), text("0000-01-01"), text("-1 day")])
+                .unwrap(),
+            "-001",
+        );
     }
 
     // ── RFC3339 / ISO-8601 timezone suffix parsing ────────────────────

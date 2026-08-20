@@ -19,8 +19,8 @@
 //!
 //! REPRO / EXPECTED SIGNAL:
 //!   * pre-fix:  the fresh connection's first SELECT fails with
-//!               `Database(BusySnapshot { .. })` on a large fraction of
-//!               iterations (the standalone repro reported ~21/30).
+//!    `Database(BusySnapshot { .. })` on a large fraction of
+//!    iterations (the standalone repro reported ~21/30).
 //!   * post-fix: 0/N failed reads.
 //! Because this is a genuine data race, one green run is not proof — the loop
 //! below runs `ITERATIONS` (60) fresh-open→first-SELECT attempts while a writer
@@ -32,8 +32,8 @@
 //!   * connection A (writer):       autocommit INSERT in a loop.
 //!   * connection B (checkpointer): `PRAGMA wal_checkpoint(TRUNCATE)` in a loop.
 //!   * connection C (reader):       per iteration, a FRESHLY-OPENED connection
-//!                                  issues its FIRST statement — a `SELECT` —
-//!                                  and must return `Ok`, never `BusySnapshot`.
+//!    issues its FIRST statement — a `SELECT` —
+//!    and must return `Ok`, never `BusySnapshot`.
 //! Each connection lives on its own OS thread with a private current-thread
 //! asupersync runtime (mirrors the GH #333 keeper's runtime/spawn pattern).
 //!

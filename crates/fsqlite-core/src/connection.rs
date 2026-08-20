@@ -126,8 +126,8 @@ pub use fsqlite_pager::pager::DatabaseImageReceipt;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
-    PagerCommitProfileSnapshot, PagerCommitState, PagerPublishedSnapshot, SimplePager,
-    TransactionKind, WalCommitSyncPolicy, page_buffer_pool_metrics_snapshot,
+    PagerCommitProfileSnapshot, PagerCommitState, PagerPublishedSnapshot, RollbackCleanup,
+    SimplePager, TransactionKind, WalCommitSyncPolicy, page_buffer_pool_metrics_snapshot,
     pager_commit_profile_snapshot, reset_page_buffer_pool_metrics, reset_pager_commit_profile,
 };
 use fsqlite_parser::lexer::Lexer;
@@ -979,6 +979,16 @@ static FSQLITE_COMMIT_FINALIZE_SEQ_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMMIT_HANDLE_FINALIZE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMMIT_POST_WRITE_MAINTENANCE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+// bd-nsktt (Track H / bd-db300.8): forced-single-writer file-backed commit attribution.
+// `..._FILEBACKED_COMMITS` counts committed file-backed writes made in forced
+// single-writer mode (`!concurrent_txn`); `..._SHARED_PAGER_COMMITS` is the subset
+// that ran while the pager was shared by peer connections (open_connection_count > 1)
+// — the honest-comparison scenario where the pager's single-connection fast path
+// (`single_connection_fast_path_enabled`, pager.rs) is disabled and the single writer
+// still pays for concurrency machinery it cannot use. The ratio quantifies the
+// avoidable-overhead exposure the reduction beads (bd-gkj4s/bd-cznar) target.
+static FSQLITE_SINGLE_WRITER_FILEBACKED_COMMITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_SINGLE_WRITER_SHARED_PAGER_COMMITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CONCURRENT_COMMIT_PLAN_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CONCURRENT_COMMIT_PLAN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CONCURRENT_COMMIT_PLAN_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -1327,6 +1337,12 @@ pub struct HotPathProfileSnapshot {
     pub commit_handle_finalize_time_ns: u64,
     pub commit_post_write_maintenance_time_ns: u64,
     pub finalize_post_publish_time_ns: u64,
+    /// bd-nsktt (Track H): file-backed autocommit write commits made in forced
+    /// single-writer mode, and the subset (`..._shared_pager`) that ran with the
+    /// pager shared by peer connections — where the single-connection fast path is
+    /// disabled and the single writer pays for concurrency machinery it cannot use.
+    pub single_writer_filebacked_commits: u64,
+    pub single_writer_shared_pager_commits: u64,
     pub concurrent_commit_plan_attempts: u64,
     pub concurrent_commit_plan_successes: u64,
     pub concurrent_commit_plan_errors: u64,
@@ -1600,6 +1616,21 @@ fn record_hot_path_duration(metric: &AtomicU64, start: Option<Instant>) {
     record_hot_path_elapsed_ns(metric, hot_path_elapsed_ns(start));
 }
 
+/// bd-nsktt (Track H): attribute a committed file-backed write made in forced
+/// single-writer mode, and whether the pager was shared by peer connections at
+/// that moment (`shared_pager` = open connection count > 1). Gated behind
+/// `hot_path_profile_enabled()` so it is zero-cost off the profiling path.
+#[inline]
+fn record_single_writer_filebacked_commit(shared_pager: bool) {
+    if !hot_path_profile_enabled() {
+        return;
+    }
+    FSQLITE_SINGLE_WRITER_FILEBACKED_COMMITS.fetch_add(1, AtomicOrdering::Relaxed);
+    if shared_pager {
+        FSQLITE_SINGLE_WRITER_SHARED_PAGER_COMMITS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
 #[inline]
 fn hot_path_elapsed_ns(start: Option<Instant>) -> Option<u64> {
     let start = start?;
@@ -1751,6 +1782,8 @@ pub fn reset_hot_path_profile() {
     FSQLITE_COMMIT_HANDLE_FINALIZE_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMMIT_POST_WRITE_MAINTENANCE_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_SINGLE_WRITER_FILEBACKED_COMMITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_SINGLE_WRITER_SHARED_PAGER_COMMITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CONCURRENT_COMMIT_PLAN_ATTEMPTS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CONCURRENT_COMMIT_PLAN_SUCCESSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CONCURRENT_COMMIT_PLAN_ERRORS.store(0, AtomicOrdering::Relaxed);
@@ -2000,6 +2033,10 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         commit_post_write_maintenance_time_ns: FSQLITE_COMMIT_POST_WRITE_MAINTENANCE_TIME_NS
             .load(AtomicOrdering::Relaxed),
         finalize_post_publish_time_ns: FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS
+            .load(AtomicOrdering::Relaxed),
+        single_writer_filebacked_commits: FSQLITE_SINGLE_WRITER_FILEBACKED_COMMITS
+            .load(AtomicOrdering::Relaxed),
+        single_writer_shared_pager_commits: FSQLITE_SINGLE_WRITER_SHARED_PAGER_COMMITS
             .load(AtomicOrdering::Relaxed),
         concurrent_commit_plan_attempts: FSQLITE_CONCURRENT_COMMIT_PLAN_ATTEMPTS
             .load(AtomicOrdering::Relaxed),
@@ -3915,6 +3952,20 @@ impl PagerBackend {
         }
     }
 
+    /// bd-sw2k5: select the rollback-journal cleanup strategy (`PRAGMA
+    /// journal_mode` delete/truncate/persist behavior for the non-WAL modes).
+    fn set_rollback_cleanup(&self, cleanup: RollbackCleanup) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.set_rollback_cleanup(cleanup),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.set_rollback_cleanup(cleanup),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.set_rollback_cleanup(cleanup),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.set_rollback_cleanup(cleanup),
+        }
+    }
+
     async fn install_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<()> {
         self.validate_namespace_binding()?;
         let wal_path = wal_path_for_db_path(db_path);
@@ -4930,6 +4981,9 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     }
     if full_name_is("fsqlite.concurrent_mode") || full_name_is("concurrent_mode") {
         return &["concurrent_mode"];
+    }
+    if full_name_is("fsqlite.dqs") || full_name_is("dqs") {
+        return &["dqs"];
     }
     if full_name_is("fsqlite.concurrency")
         || full_name_is("concurrency")
@@ -6405,7 +6459,13 @@ impl PreparedQueryFastPath {
                 &FSQLITE_DIRECT_COUNT_STAR_ROWID_RANGE_QUERY_ROW_HITS
             }
         };
-        counter.fetch_add(1, AtomicOrdering::Relaxed);
+        // bd-xu639: record only when profiling is enabled (a thread-local
+        // override in test mode) so a parallel `--test-threads` run cannot
+        // inflate another test's exact hit-count snapshot through this
+        // process-global counter. Production reads these only while profiling.
+        if hot_path_profile_enabled() {
+            counter.fetch_add(1, AtomicOrdering::Relaxed);
+        }
     }
 }
 
@@ -7444,8 +7504,10 @@ impl PreparedStatement<'_> {
                 return Ok(None);
             };
 
-        FSQLITE_DIRECT_COUNT_STAR_QUERY_ROW_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         if hot_path_profile_enabled() {
+            // bd-xu639: gate this process-global hit counter behind profiling
+            // so parallel test runs don't inflate another test's snapshot.
+            FSQLITE_DIRECT_COUNT_STAR_QUERY_ROW_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
@@ -7509,9 +7571,11 @@ impl PreparedStatement<'_> {
             return Ok(None);
         };
 
-        FSQLITE_DIRECT_COUNT_INDEXED_ROWID_PROBE_QUERY_ROW_HITS
-            .fetch_add(1, AtomicOrdering::Relaxed);
         if hot_path_profile_enabled() {
+            // bd-xu639: gate this process-global hit counter behind profiling
+            // so parallel test runs don't inflate another test's snapshot.
+            FSQLITE_DIRECT_COUNT_INDEXED_ROWID_PROBE_QUERY_ROW_HITS
+                .fetch_add(1, AtomicOrdering::Relaxed);
             FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
@@ -7601,8 +7665,10 @@ impl PreparedStatement<'_> {
             }
         };
 
-        FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_ROW_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         if hot_path_profile_enabled() {
+            // bd-xu639: gate this process-global hit counter behind profiling
+            // so parallel test runs don't inflate another test's snapshot.
+            FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_ROW_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
@@ -11322,6 +11388,11 @@ pub struct Connection {
     /// Connection-level flag: when set, plain `BEGIN` is promoted to
     /// `BEGIN CONCURRENT`.  Controlled by `PRAGMA fsqlite.concurrent_mode`.
     concurrent_mode_default: RefCell<bool>,
+    /// bd-jcjkf: DQS ("double-quoted string") compat. Stock SQLite's default is
+    /// ON — a double-quoted identifier that does not resolve to a real
+    /// column/table falls back to a string literal. Default `true` for
+    /// byte-exact parity with the stock CLI; a follow-up PRAGMA flips it.
+    dqs_enabled: Cell<bool>,
     /// Commit-path safety regime. `Safe` (default) always runs the full
     /// SSI validation. `LabUnsafe` enables the `ssi_e_process_gate` skip
     /// path. Controlled by `PRAGMA fsqlite.write_merge`.
@@ -13104,6 +13175,7 @@ impl Connection {
             concurrent_txn: Cell::new(false),
             pending_transaction_cleanup: Cell::new(false),
             concurrent_mode_default: RefCell::new(true),
+            dqs_enabled: Cell::new(true),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
             fused_lane_tracing_suppression_warned: Cell::new(false),
@@ -13628,6 +13700,7 @@ impl Connection {
             concurrent_txn: Cell::new(false),
             pending_transaction_cleanup: Cell::new(false),
             concurrent_mode_default: RefCell::new(true),
+            dqs_enabled: Cell::new(true),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
             fused_lane_tracing_suppression_warned: Cell::new(false),
@@ -14253,29 +14326,6 @@ impl Connection {
         Self::bounded_validation_refusal(detail)
     }
 
-    fn validate_bounded_ast_render_budget(
-        root: BoundedCollationAstNode<'_>,
-        object_name: &str,
-    ) -> Result<()> {
-        match first_unsupported_bounded_ast(root, false, None, None, BoundedSchemaExpressionRole::Unrestricted) {
-            Ok(None) => Ok(()),
-            Ok(Some(unsupported)) => Err(Self::bounded_ast_unsupported_refusal(
-                object_name,
-                unsupported,
-            )),
-            Err(BoundedCollationTraversalLimit::Nodes) => {
-                Err(Self::bounded_validation_refusal(format!(
-                    "`{object_name}` expression AST exceeds the fixed {BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES}-node rendering limit"
-                )))
-            }
-            Err(BoundedCollationTraversalLimit::Depth) => {
-                Err(Self::bounded_validation_refusal(format!(
-                    "`{object_name}` expression AST exceeds the fixed rendering depth limit {BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH}"
-                )))
-            }
-        }
-    }
-
     fn validate_bounded_ast_semantics(
         &self,
         root: BoundedCollationAstNode<'_>,
@@ -14301,7 +14351,7 @@ impl Connection {
         object_name: &str,
         expression_role: BoundedSchemaExpressionRole,
         supported_function: &dyn Fn(&str, &FunctionArgs, bool) -> bool,
-        supported_like: Option<&dyn Fn(&LikeOp, &Expr, Option<&Expr>) -> bool>,
+        supported_like: Option<BoundedSupportedLikeFn<'_>>,
     ) -> Result<()> {
         match first_unsupported_bounded_ast(
             root,
@@ -15341,52 +15391,6 @@ impl Connection {
                 detail: format!(
                     "index `{}` contains {actual_count} entries but WITHOUT ROWID table `{}` requires exactly {expected_count}",
                     index.name, table.name
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    async fn bounded_mark_durable_freelist<T: TransactionHandle + ?Sized>(
-        cx: &Cx,
-        txn: &T,
-        page_size: PageSize,
-        owners: &mut crate::bounded_validation::PrivatePageOwnership,
-        freelist_trunk: u32,
-        freelist_count: u32,
-    ) -> Result<()> {
-        let mut counted = 0_u32;
-        let mut next = PageNumber::new(freelist_trunk);
-        let mut trunk_index = 0_usize;
-        while let Some(trunk_page) = next {
-            owners.mark(page_size, trunk_page, 4, "freelist trunk")?;
-            let page = txn.get_page(cx, trunk_page).await?;
-            let trunk =
-                fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(|error| {
-                    FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "freelist trunk page {} is malformed: {error}",
-                            trunk_page.get()
-                        ),
-                    }
-                })?;
-            counted = counted.checked_add(1).ok_or(FrankenError::TooBig)?;
-            for leaf in trunk.leaf_pages.iter().copied() {
-                owners.mark(page_size, leaf, 4, "freelist leaf")?;
-                counted = counted.checked_add(1).ok_or(FrankenError::TooBig)?;
-            }
-            next = trunk.next_trunk;
-            trunk_index = trunk_index.saturating_add(1);
-            if u32::try_from(trunk_index).unwrap_or(u32::MAX) > freelist_count {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "freelist trunk cycle or overlong chain".to_owned(),
-                });
-            }
-        }
-        if counted != freelist_count {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "freelist header claims {freelist_count} pages but structural walk found {counted}"
                 ),
             });
         }
@@ -23395,13 +23399,20 @@ impl Connection {
             let snapshot_generation = self.function_registry_generation();
             let statement_snapshot = self.freeze_statement_values_snapshot(parsed.as_ref());
 
-            // Relation lookup must observe the original parsed AST. Rewriting can
-            // eagerly evaluate or erase subqueries, which would otherwise move a
-            // missing-relation diagnostic from prepare time to execution (or hide
-            // it entirely). Non-catalog structural semantics still run on the
-            // canonical rewritten statement below.
-            let relation_result = self.with_fallback_function_registry(|| {
-                self.validate_statement_select_relations(statement_snapshot.as_ref())
+            // Structural validation must observe the ORIGINAL parsed AST, exactly
+            // like the direct execute path (`validate_statement_select_structure`
+            // at execute time). Rewriting can eagerly evaluate or erase subqueries
+            // — e.g. a single-row `SELECT 1 ORDER BY <expr>` drops its ORDER BY —
+            // which would otherwise move a missing-relation OR structural
+            // diagnostic (an unresolved ORDER BY name, a compound-arm width
+            // mismatch) from prepare time to execution, or hide it entirely so a
+            // prepared malformed SELECT silently returns a row. Validating the full
+            // structure (relations + non-catalog semantics) here keeps prepared and
+            // direct execution byte-for-byte consistent (select_structure_depth_first
+            // precedence). The rewritten statement is still validated below for any
+            // post-rewrite-only semantics.
+            let structure_result = self.with_fallback_function_registry(|| {
+                self.validate_statement_select_structure(statement_snapshot.as_ref())
             });
             if self.function_registry_generation() != snapshot_generation {
                 if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
@@ -23409,7 +23420,7 @@ impl Connection {
                 }
                 continue;
             }
-            relation_result?;
+            structure_result?;
             let statement_result = {
                 let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                     .then(|| {
@@ -23484,12 +23495,214 @@ impl Connection {
         unreachable!("registry-stability loop always returns")
     }
 
+    // ===== bd-jcjkf: DQS ("double-quoted string") fallback (shapes 1+2) =====
+    //
+    // Stock SQLite's legacy default (SQLITE_DQS=3) treats a double-quoted
+    // identifier that does NOT resolve to a real column/table as a STRING
+    // LITERAL. Frank resolves double-quoted refs to columns correctly but,
+    // absent this fallback, errors when the ref is unresolvable. Rather than
+    // thread a `double_quoted` flag through the AST + both resolvers, mirror
+    // stock's ACTUAL semantics ("try to resolve; on failure treat the token as a
+    // string") as a lazy, span-precise SQL-text rewrite-retry at the statement
+    // entry: run normally; on a resolution error naming a double-quoted token,
+    // splice that token's `"X"` -> `'X'` in the SQL text and re-dispatch. Bounded
+    // by the count of distinct double-quoted names; single-statement only (so a
+    // committed earlier statement is never re-executed); fails safe (any gap ->
+    // the original error, never silent corruption). Shape 3 (INSERT VALUES("x")
+    // -> silent NULL, no error to trigger the retry) is tracked by bd-82jdw.
+
+    /// Byte ranges + names of every double-quoted identifier token in `sql`.
+    fn double_quoted_identifier_tokens(sql: &str) -> Vec<(u32, u32, String)> {
+        Lexer::tokenize(sql)
+            .into_iter()
+            .filter_map(|tok| match tok.kind {
+                fsqlite_parser::TokenKind::QuotedId(name, true) => {
+                    Some((tok.span.start, tok.span.end, name.to_string()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Extract the unresolved column name from a DQS-eligible resolution error.
+    ///
+    /// Handles codegen `no such column: X in table T` (and the bare
+    /// `no such column: X` form), plus the FROM-less `expression form is not
+    /// supported ... Column(ColumnRef { .. column: "X" .. })` form which embeds
+    /// the name in the `{expr:?}` debug. Returns None otherwise (fails safe).
+    fn dqs_missing_column_name(err: &FrankenError) -> Option<String> {
+        let msg = match err {
+            FrankenError::Internal(m) | FrankenError::NotImplemented(m) => m.as_str(),
+            _ => return None,
+        };
+        if let Some(i) = msg.find("no such column: ") {
+            let rest = &msg[i + "no such column: ".len()..];
+            let name = rest.split(" in table ").next().unwrap_or(rest).trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+        if let Some(i) = msg.find("column: \"") {
+            let rest = &msg[i + "column: \"".len()..];
+            if let Some(j) = rest.find('"') {
+                let name = &rest[..j];
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Replace each double-quoted-token byte range holding `name` with a literal.
+    ///
+    /// Emits a single-quoted string literal of the same content, applying
+    /// right-to-left so earlier byte offsets stay valid.
+    fn splice_dqs_ranges(sql: &str, ranges: &[(u32, u32)], name: &str) -> String {
+        let mut sorted: Vec<(u32, u32)> = ranges.to_vec();
+        sorted.sort_by_key(|&(start, _)| std::cmp::Reverse(start));
+        let literal = format!("'{}'", name.replace('\'', "''"));
+        let mut out = sql.to_string();
+        for (start, end) in sorted {
+            out.replace_range(start as usize..end as usize, &literal);
+        }
+        out
+    }
+
+    /// One DQS rewrite step.
+    ///
+    /// If `err` names a double-quoted token not yet rewritten, splice that token
+    /// to a string literal and return the new SQL; otherwise None (surface the
+    /// original error).
+    fn dqs_rewrite_once(
+        sql: &str,
+        err: &FrankenError,
+        rewritten: &mut HashSet<String>,
+    ) -> Option<String> {
+        let name = Self::dqs_missing_column_name(err)?;
+        if !rewritten.insert(name.clone()) {
+            return None;
+        }
+        let ranges: Vec<(u32, u32)> = Self::double_quoted_identifier_tokens(sql)
+            .into_iter()
+            .filter(|(_, _, n)| n == &name)
+            .map(|(start, end, _)| (start, end))
+            .collect();
+        if ranges.is_empty() {
+            return None;
+        }
+        Some(Self::splice_dqs_ranges(sql, &ranges, &name))
+    }
+
+    /// True if `sql` parses to exactly one statement — the DQS retry only fires
+    /// here so a committed earlier statement in a batch is never re-executed.
+    fn dqs_single_statement(&self, sql: &str) -> bool {
+        self.cached_parse_multi(sql)
+            .map(|stmts| stmts.len() == 1)
+            .unwrap_or(false)
+    }
+
+    /// bd-82jdw (DQS shape 3): rewrite double-quoted INSERT-VALUES value columns.
+    ///
+    /// A double-quoted identifier used as a VALUES value is a string literal
+    /// under DQS-ON, but every INSERT execution path — the prepared/VDBE fast
+    /// lane included — resolves the bare column to NULL, and no error fires to
+    /// trigger the on-error retry that handles shapes 1+2. A VALUES row has no
+    /// source, so such a column can only be a DQS string: splice each
+    /// double-quoted top-level VALUES column `"X"` -> `'X'` up front. Only value
+    /// columns are touched (their AST spans), so a double-quoted table name,
+    /// column-list name, or ON CONFLICT / RETURNING column is left alone. Returns
+    /// the rewritten SQL, or None if nothing applies.
+    fn dqs_insert_values_rewrite(&self, sql: &str) -> Option<String> {
+        let stmts = self.cached_parse_multi(sql).ok()?;
+        if stmts.len() != 1 {
+            return None;
+        }
+        let Statement::Insert(insert) = stmts[0].as_ref() else {
+            return None;
+        };
+        let fsqlite_ast::InsertSource::Values(rows) = &insert.source else {
+            return None;
+        };
+        let dq_tokens = Self::double_quoted_identifier_tokens(sql);
+        if dq_tokens.is_empty() {
+            return None;
+        }
+        let mut ranges: Vec<(u32, u32, String)> = Vec::new();
+        for row in rows {
+            for expr in row {
+                if let Expr::Column(col_ref, span) = expr
+                    && col_ref.table.is_none()
+                    && dq_tokens.iter().any(|(start, end, name)| {
+                        *start == span.start
+                            && *end == span.end
+                            && name.as_str() == col_ref.column.as_ref()
+                    })
+                {
+                    ranges.push((span.start, span.end, col_ref.column.to_string()));
+                }
+            }
+        }
+        if ranges.is_empty() {
+            return None;
+        }
+        // Splice right-to-left so earlier byte offsets stay valid; each range
+        // becomes its own column name as a single-quote-escaped string literal.
+        ranges.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+        let mut out = sql.to_string();
+        for (start, end, name) in ranges {
+            let literal = format!("'{}'", name.replace('\'', "''"));
+            out.replace_range(start as usize..end as usize, &literal);
+        }
+        Some(out)
+    }
+
+    /// Apply the proactive INSERT-VALUES DQS rewrite when enabled. A cheap
+    /// double-quote pre-check keeps the common path allocation-free (no parse).
+    fn dqs_proactive_rewrite<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
+        if !self.dqs_enabled.get() || !sql.contains('"') {
+            return std::borrow::Cow::Borrowed(sql);
+        }
+        match self.dqs_insert_values_rewrite(sql) {
+            Some(rewritten) => std::borrow::Cow::Owned(rewritten),
+            None => std::borrow::Cow::Borrowed(sql),
+        }
+    }
+
     /// Prepare and execute SQL as a query.
     ///
     /// When `sql` contains multiple statements, only the result rows from the
     /// **last** statement are returned. Intermediate statement results are
     /// discarded. This matches common SQL driver semantics (last statement wins).
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
+        let rewritten = self.dqs_proactive_rewrite(sql);
+        let sql = rewritten.as_ref();
+        let first = match self.query_impl(sql).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+            return Err(first);
+        }
+        let mut rewritten = HashSet::new();
+        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            Some(s) => s,
+            None => return Err(first),
+        };
+        loop {
+            match self.query_impl(&cur).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        Some(s) => s,
+                        None => return Err(e),
+                    };
+                }
+            }
+        }
+    }
+
+    async fn query_impl(&self, sql: &str) -> Result<Vec<Row>> {
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -23520,6 +23733,39 @@ impl Connection {
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
     pub async fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        let rewritten = self.dqs_proactive_rewrite(sql);
+        let sql = rewritten.as_ref();
+        let first = match self.query_with_params_impl(sql, params).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+            return Err(first);
+        }
+        let mut rewritten = HashSet::new();
+        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            Some(s) => s,
+            None => return Err(first),
+        };
+        loop {
+            match self.query_with_params_impl(&cur, params).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        Some(s) => s,
+                        None => return Err(e),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Prepare and execute SQL as a query with bound SQL parameters.
+    async fn query_with_params_impl(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>> {
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -23686,6 +23932,34 @@ impl Connection {
     /// rows.  For SELECT and other statement types it returns the number of
     /// result rows.
     pub async fn execute(&self, sql: &str) -> Result<usize> {
+        let rewritten = self.dqs_proactive_rewrite(sql);
+        let sql = rewritten.as_ref();
+        let first = match self.execute_impl(sql).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+            return Err(first);
+        }
+        let mut rewritten = HashSet::new();
+        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            Some(s) => s,
+            None => return Err(first),
+        };
+        loop {
+            match self.execute_impl(&cur).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        Some(s) => s,
+                        None => return Err(e),
+                    };
+                }
+            }
+        }
+    }
+
+    async fn execute_impl(&self, sql: &str) -> Result<usize> {
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -23865,6 +24139,34 @@ impl Connection {
 
     /// Prepare and execute SQL with bound SQL parameters.
     pub async fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
+        let rewritten = self.dqs_proactive_rewrite(sql);
+        let sql = rewritten.as_ref();
+        let first = match self.execute_with_params_impl(sql, params).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+            return Err(first);
+        }
+        let mut rewritten = HashSet::new();
+        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            Some(s) => s,
+            None => return Err(first),
+        };
+        loop {
+            match self.execute_with_params_impl(&cur, params).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        Some(s) => s,
+                        None => return Err(e),
+                    };
+                }
+            }
+        }
+    }
+
+    async fn execute_with_params_impl(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
         self.execute_with_params_with_statement_savepoint_policy(sql, params, false)
             .await
     }
@@ -33552,9 +33854,47 @@ impl Connection {
         &self,
         statement: &Statement,
     ) -> Result<()> {
-        if !Self::statement_validates_select_relations(statement)
-            || !self.committed_pager_refresh_allowed()
+        if !Self::statement_validates_select_relations(statement) {
+            return Ok(());
+        }
+
+        // issue-62: a :memory: `INSERT INTO <live-vtab> SELECT ... FROM <multi
+        // JOIN>` streams join rows into the target. Under lazy MemDatabase
+        // hydration the row mirror is unloaded, so the streaming join scans each
+        // source through a per-source SQL query instead of the direct mem-scan.
+        // Hydrate the mirror HERE — in the pre-dispatch validation phase, BEFORE
+        // the statement acquires its write transaction — so the scan takes the
+        // mem-scan fast path. Doing it pre-write is essential: an in-txn reload
+        // resets the memdb visible-commit-seq and drops the freshly streamed
+        // rows. This must run BEFORE the `committed_pager_refresh_allowed()` gate
+        // below, which is always false for :memory:. Scoped to autocommit (no
+        // active or explicit user txn) — an explicit transaction keeps the
+        // correct per-source SQL scan, which reads the connection's own
+        // uncommitted writes that a committed-image reload would miss.
+        if self.pager.is_memory()
+            && !self.memdb_rows_loaded.get()
+            && self.active_txn.borrow().is_none()
+            && !self.in_transaction.get()
+            && self.statement_inserts_select_into_live_vtab(statement)
         {
+            let op_cx = self.op_cx_after_background_status();
+            // The prior source INSERTs may still be held in a retained autocommit
+            // batch (unpublished) with a deferred active-txn memdb reload pending.
+            // Publish/settle both so the committed pager image below is
+            // authoritative for the join sources, then rebuild the mirror once.
+            if self.retained_autocommit_txn.borrow().is_some() {
+                self.flush_retained_autocommit_txn(&op_cx).await?;
+            }
+            self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
+            if !self.memdb_rows_loaded.get()
+                && self.pending_memdb_direct_upserts.borrow().is_empty()
+                && !self.memdb_requires_active_txn_reload.get()
+            {
+                self.reload_memdb_from_pager_with_mode(&op_cx, true).await?;
+            }
+        }
+
+        if !self.committed_pager_refresh_allowed() {
             return Ok(());
         }
 
@@ -33564,6 +33904,19 @@ impl Connection {
             .refresh_memdb_if_stale_with_publication(&op_cx, "autocommit_begin")
             .await?;
         Ok(())
+    }
+
+    /// Whether `statement` is an `INSERT INTO <live virtual table> SELECT ...`
+    /// (no CTE) — the streaming live-vtab insert shape whose join-source scans
+    /// benefit from a hydrated MemDatabase mirror (issue-62).
+    fn statement_inserts_select_into_live_vtab(&self, statement: &Statement) -> bool {
+        matches!(
+            statement,
+            Statement::Insert(insert)
+                if insert.with.is_none()
+                    && matches!(&insert.source, InsertSource::Select(_))
+                    && self.has_live_vtab_instance(insert.table.name.as_str())
+        )
     }
 
     fn statement_validates_select_relations(statement: &Statement) -> bool {
@@ -34096,6 +34449,11 @@ impl Connection {
         Err(FrankenError::Unsupported)
     }
 
+    /// Test-only convenience dispatcher: run a statement with a fresh op-Cx and
+    /// no FK-scope override. Production code calls
+    /// `execute_statement_dispatch_with_fk_scope` directly; this thin wrapper is
+    /// exercised only by the poisoned-runtime unit test, hence `#[cfg(test)]`.
+    #[cfg(test)]
     async fn execute_statement_dispatch(
         &self,
         statement: &Statement,
@@ -35370,6 +35728,30 @@ impl Connection {
                 let (mut effective_update, _limited_row_count_hint) = self
                     .materialize_update_limit_scope(&canonical_update, params)
                     .await?;
+                // A correlated subquery inside `IN (...)` in the WHERE cannot be
+                // lowered by VDBE codegen; resolve the matching rowids via the
+                // interpreted SELECT path and rewrite to `rowid IN (...)` so the
+                // UPDATE executes by rowid. Live virtual tables route through their
+                // module below, so they are skipped here. (bd-t7m7y)
+                let corr_in_rewrite = if self
+                    .has_live_vtab_instance(&effective_update.table.name.name)
+                {
+                    None
+                } else {
+                    self.rewrite_correlated_in_where_to_rowids(
+                        &effective_update.table,
+                        effective_update.where_clause.as_ref(),
+                        &effective_update.order_by,
+                        effective_update.limit.as_ref(),
+                        params,
+                    )
+                    .await?
+                };
+                if let Some(rewritten) = corr_in_rewrite {
+                    effective_update.order_by.clear();
+                    effective_update.limit = None;
+                    effective_update.where_clause = Some(rewritten);
+                }
                 let table_name = &effective_update.table.name.name;
                 // Reject assigning to a generated column before routing to the
                 // compiled or row-by-row lane (bd-gh-generated-column-update-target).
@@ -35754,6 +36136,29 @@ impl Connection {
                         set: fsqlite_ast::InSet::List(rowid_literals),
                         span: fsqlite_ast::Span::new(0, 0),
                     });
+                }
+                // A correlated subquery inside `IN (...)` in the WHERE cannot be
+                // lowered by VDBE codegen; resolve the matching rowids via the
+                // interpreted SELECT path and rewrite to `rowid IN (...)` so the
+                // DELETE executes by rowid. (bd-t7m7y)
+                let corr_in_rewrite = if self
+                    .has_live_vtab_instance(&effective_delete.table.name.name)
+                {
+                    None
+                } else {
+                    self.rewrite_correlated_in_where_to_rowids(
+                        &effective_delete.table,
+                        effective_delete.where_clause.as_ref(),
+                        &effective_delete.order_by,
+                        effective_delete.limit.as_ref(),
+                        params,
+                    )
+                    .await?
+                };
+                if let Some(rewritten) = corr_in_rewrite {
+                    effective_delete.order_by.clear();
+                    effective_delete.limit = None;
+                    effective_delete.where_clause = Some(rewritten);
                 }
                 let table_name = &effective_delete.table.name.name;
                 let delete_event = fsqlite_ast::TriggerEvent::Delete;
@@ -38320,9 +38725,6 @@ enum BoundedAstUnsupported {
 /// admitted for shape and then never used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoundedSchemaExpressionRole {
-    /// No shape restrictions. Used by the collation-rendering budget walk,
-    /// which asks only whether the AST can be rendered within its limits.
-    Unrestricted,
     /// A CHECK constraint or column default: the bounded evaluator recomputes
     /// this expression against real rows, so every shape it cannot reproduce
     /// exactly must be refused. This is the historical `true` behaviour and is
@@ -38345,7 +38747,7 @@ impl BoundedSchemaExpressionRole {
     /// row-values and IN-table shorthand stay refused everywhere they were
     /// before; each would need its own argument to relax, and none has one.
     const fn rejects_shapes(self) -> bool {
-        !matches!(self, Self::Unrestricted)
+        matches!(self, Self::Evaluated | Self::Unevaluated)
     }
 
     /// Whether a subquery is refused by SHAPE.
@@ -38425,11 +38827,16 @@ impl BoundedSchemaExpressionRole {
     }
 }
 
+/// A borrowed scalar-function-admission predicate for the bounded AST walk.
+type BoundedSupportedFn<'a> = &'a dyn Fn(&str, &FunctionArgs, bool) -> bool;
+/// A borrowed LIKE/GLOB-admission predicate for the bounded AST walk.
+type BoundedSupportedLikeFn<'a> = &'a dyn Fn(&LikeOp, &Expr, Option<&Expr>) -> bool;
+
 fn first_unsupported_bounded_ast(
     root: BoundedCollationAstNode<'_>,
     reject_custom_collations: bool,
-    supported_function: Option<&dyn Fn(&str, &FunctionArgs, bool) -> bool>,
-    supported_like: Option<&dyn Fn(&LikeOp, &Expr, Option<&Expr>) -> bool>,
+    supported_function: Option<BoundedSupportedFn<'_>>,
+    supported_like: Option<BoundedSupportedLikeFn<'_>>,
     expression_role: BoundedSchemaExpressionRole,
 ) -> std::result::Result<Option<BoundedAstUnsupported>, BoundedCollationTraversalLimit> {
     let mut pending = vec![(root, 0_usize)];
@@ -38626,17 +39033,10 @@ fn first_unsupported_bounded_ast(
                 }
                 Statement::Analyze(_) => {
                     return Ok(Some(BoundedAstUnsupported::Statement("ANALYZE")));
-                }
-                // Fail closed on statement kinds this line grew after the
-                // traversal was written. An admission gate that silently
-                // accepts a construct it does not recognise is worse than no
-                // gate: the walkers would then be asked to prove something
-                // nobody checked they can evaluate.
-                _ => {
-                    return Ok(Some(BoundedAstUnsupported::Statement(
-                        "statement kind unknown to the bounded admission traversal",
-                    )));
-                }
+                } // NOTE: this match is exhaustive over `Statement` on purpose —
+                // it fails closed by construction. A new `Statement` variant
+                // makes it non-exhaustive (a compile error) so the admission
+                // traversal cannot silently accept a construct nobody checked.
             },
             BoundedCollationAstNode::Expr(expr) => match expr {
                 Expr::Literal(literal, _) => {
@@ -39099,10 +39499,6 @@ impl Drop for BoundedCheckFunctionRegistryGuard {
             let _ = stack.borrow_mut().pop();
         });
     }
-}
-
-fn current_bounded_check_function_registry() -> Option<Arc<FunctionRegistry>> {
-    CURRENT_BOUNDED_CHECK_FUNCTION_REGISTRY.with(|stack| stack.borrow().last().cloned())
 }
 
 struct BoundedCheckEvaluationBudgetGuard;
@@ -40105,7 +40501,8 @@ impl Connection {
                                     if *conflict == ConflictAction::Replace {
                                         conflicting_rowids.insert(mem_row.0);
                                     } else {
-                                        unique_violation_col = Some(col_info.name.clone());
+                                        unique_violation_col =
+                                            Some(format!("{}.{}", table_name, col_info.name));
                                     }
                                     break;
                                 }
@@ -40164,7 +40561,7 @@ impl Connection {
                                 if *conflict == ConflictAction::Replace {
                                     conflicting_rowids.insert(mem_row.0);
                                 } else {
-                                    unique_violation_col = Some(idx.key_label());
+                                    unique_violation_col = Some(idx.key_label_qualified(table_name));
                                 }
                                 break;
                             }
@@ -40180,9 +40577,9 @@ impl Connection {
                 if *conflict == ConflictAction::Ignore {
                     continue;
                 }
-                return Err(FrankenError::UniqueViolation {
-                    columns: format!("{}.{}", table_name, col_name),
-                });
+                // bd-a506j F1b: col_name is already table-qualified at both set
+                // sites (single column and composite index key), so emit it as-is.
+                return Err(FrankenError::UniqueViolation { columns: col_name });
             }
 
             // For REPLACE: delete rows that conflict on non-IPK UNIQUE columns.
@@ -45060,11 +45457,12 @@ impl Connection {
                     Self::normalize_partial_predicate_columns(item, targets);
                 }
             }
-            Expr::FunctionCall { args, .. } => {
-                if let FunctionArgs::List(items) = args {
-                    for item in items {
-                        Self::normalize_partial_predicate_columns(item, targets);
-                    }
+            Expr::FunctionCall {
+                args: FunctionArgs::List(items),
+                ..
+            } => {
+                for item in items {
+                    Self::normalize_partial_predicate_columns(item, targets);
                 }
             }
             // Literals, placeholders, subqueries, EXISTS, RAISE, and bound
@@ -45184,21 +45582,22 @@ impl Connection {
             return true;
         }
         match expr {
-            Expr::BinaryOp { left, op, right, .. }
-                if matches!(
-                    op,
+            Expr::BinaryOp {
+                left,
+                op:
                     BinaryOp::Add
-                        | BinaryOp::Subtract
-                        | BinaryOp::Multiply
-                        | BinaryOp::Divide
-                        | BinaryOp::Modulo
-                        | BinaryOp::Concat
-                        | BinaryOp::BitAnd
-                        | BinaryOp::BitOr
-                        | BinaryOp::ShiftLeft
-                        | BinaryOp::ShiftRight
-                ) =>
-            {
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo
+                    | BinaryOp::Concat
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight,
+                right,
+                ..
+            } => {
                 Self::expr_null_propagates_from(left, col)
                     || Self::expr_null_propagates_from(right, col)
             }
@@ -46304,6 +46703,98 @@ impl Connection {
             .await
     }
 
+    /// Whether `table_name` is an ordinary rowid table (not WITHOUT ROWID), so a
+    /// `rowid IN (...)` rewrite can key on its rowid.
+    fn table_is_rowid_table(&self, table_name: &str) -> bool {
+        self.schema_index_of(table_name)
+            .and_then(|index| {
+                self.schema
+                    .borrow()
+                    .get(index)
+                    .map(|table| !table.without_rowid)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Resolve the rowids of the rows a single-table WHERE matches, by running it
+    /// as `SELECT <rowid> FROM <table> WHERE <where> [ORDER BY] [LIMIT]` through
+    /// the interpreted SELECT path — which substitutes correlated outer refs per
+    /// row (unlike VDBE `IN`-probe codegen). Non-integer first values (e.g. a
+    /// WITHOUT ROWID table with no rowid) are dropped; callers gate on a rowid table.
+    async fn select_matching_rowids(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        where_clause: Option<&Expr>,
+        order_by: &[fsqlite_ast::OrderingTerm],
+        limit: Option<&fsqlite_ast::LimitClause>,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<i64>> {
+        let rowid_alias = self.ignore_skip_rowid_alias(&table_ref.name.name);
+        let rowid_col = ResultColumn::Expr {
+            expr: Expr::Column(
+                fsqlite_ast::ColumnRef::bare(rowid_alias),
+                fsqlite_ast::Span::new(0, 0),
+            ),
+            alias: None,
+        };
+        let select =
+            Self::build_single_table_select(table_ref, vec![rowid_col], where_clause, order_by, limit);
+        let rows = self
+            .execute_statement(&Statement::Select(select), params)
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| match row.values().first() {
+                Some(SqliteValue::Integer(i)) => Some(*i),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Build a `<rowid_alias> IN (<literals>)` predicate for a resolved rowid set.
+    fn rowid_in_list_where(&self, table_name: &str, rowids: &[i64]) -> Expr {
+        let rowid_literals: Vec<Expr> = rowids
+            .iter()
+            .map(|&i| Expr::Literal(Literal::Integer(i), fsqlite_ast::Span::new(0, 0)))
+            .collect();
+        let rowid_alias = self.ignore_skip_rowid_alias(table_name);
+        Expr::In {
+            expr: Box::new(Expr::Column(
+                fsqlite_ast::ColumnRef::bare(rowid_alias),
+                fsqlite_ast::Span::new(0, 0),
+            )),
+            not: false,
+            set: fsqlite_ast::InSet::List(rowid_literals),
+            span: fsqlite_ast::Span::new(0, 0),
+        }
+    }
+
+    /// VDBE codegen cannot lower a correlated subquery inside `IN (...)` in an
+    /// UPDATE/DELETE WHERE ("IN probe codegen invariant failed") — the probe path
+    /// never threads the outer scan context. When the WHERE contains such a
+    /// correlated IN and the target is a rowid table, resolve the matching rowids
+    /// via the interpreted SELECT path (which SELECT already uses for correlated
+    /// IN, bd-zvk68) and return a `rowid IN (<literals>)` replacement WHERE, so
+    /// the DML executes by rowid. Returns `None` to leave the WHERE unchanged.
+    async fn rewrite_correlated_in_where_to_rowids(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        where_clause: Option<&Expr>,
+        order_by: &[fsqlite_ast::OrderingTerm],
+        limit: Option<&fsqlite_ast::LimitClause>,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<Expr>> {
+        let has_correlated_in = where_clause
+            .is_some_and(|wh| expr_has_correlated_in_subquery(wh, &self.schema.borrow()));
+        if !has_correlated_in || !self.table_is_rowid_table(&table_ref.name.name) {
+            return Ok(None);
+        }
+        let rowids = self
+            .select_matching_rowids(table_ref, where_clause, order_by, limit, params)
+            .await?;
+        Ok(Some(self.rowid_in_list_where(&table_ref.name.name, &rowids)))
+    }
+
     /// Freeze stable row locators for a multi-row UPDATE before its first
     /// mutation. Rowid tables use an unshadowed hidden rowid alias (or INTEGER
     /// PRIMARY KEY); WITHOUT ROWID tables use the complete declared primary key.
@@ -46933,6 +47424,23 @@ impl Connection {
         let empty_col_map: &[(String, String, bool)] = &[];
         let mut values = Vec::with_capacity(row_exprs.len());
         for expr in row_exprs {
+            // bd-82jdw (DQS shape 3): a bare column reference in a VALUES row is
+            // never resolvable — a VALUES row has no source row. Stock SQLite
+            // errors "no such column: X" for an unquoted one, and (under the
+            // DQS-ON default) treats a double-quoted one as a STRING LITERAL.
+            // Erroring here instead of the prior silent NULL matches stock for
+            // the unquoted case AND lets the DQS-ON rewrite-retry at the
+            // statement entry splice a double-quoted `"X"` -> `'X'` (bd-jcjkf).
+            // The error precedes any row write, so the retry cannot double an
+            // effect. (Nested bare refs like `VALUES(1 + "x")` stay a follow-up.)
+            if let Expr::Column(col_ref, _) = expr
+                && col_ref.table.is_none()
+            {
+                return Err(FrankenError::Internal(format!(
+                    "no such column: {}",
+                    col_ref.column
+                )));
+            }
             values.push(
                 self.eval_expr_with_subqueries(expr, empty_row, empty_col_map, params)
                     .await?,
@@ -47604,7 +48112,7 @@ impl Connection {
             };
             if let Some((delete_enabled, columns)) = contentless {
                 if !delete_enabled {
-                    return Err(FrankenError::function_error(&format!(
+                    return Err(FrankenError::function_error(format!(
                         "cannot UPDATE contentless fts5 table: {table_name}"
                     )));
                 }
@@ -47624,7 +48132,7 @@ impl Connection {
                     .iter()
                     .any(|col| !assigned.contains(&col.to_ascii_lowercase()))
                 {
-                    return Err(FrankenError::function_error(&format!(
+                    return Err(FrankenError::function_error(format!(
                         "cannot UPDATE a subset of columns on fts5 contentless-delete table: {table_name}"
                     )));
                 }
@@ -47738,13 +48246,13 @@ impl Connection {
             // origin-targeted). Falls through to promote only when the delete
             // can't be tombstoned — e.g. a row predates origin tracking, so its
             // `_docsize.origin` is NULL. (bd-fts5-lazy-shadow-reads-itcc4.3)
-            if is_lazy && !self.rootpage_zero_fts5_has_internal_content_shadow(table_name) {
-                if let Some(deleted) = self
+            if is_lazy
+                && !self.rootpage_zero_fts5_has_internal_content_shadow(table_name)
+                && let Some(deleted) = self
                     .persist_rootpage_zero_fts5_contentless_incremental_delete(table_name, rowids)
                     .await?
-                {
-                    return Ok(deleted);
-                }
+            {
+                return Ok(deleted);
             }
             if is_lazy {
                 self.promote_lazy_fts5_table(table_name).await?;
@@ -53944,6 +54452,21 @@ impl Connection {
         );
         if committed_write && !self.pager.is_memory() {
             self.sync_filebacked_post_commit_visibility_floor();
+            // bd-nsktt (Track H): attribute this file-backed autocommit write commit
+            // when it ran in FORCED single-writer mode (the benchmark comparison
+            // workload), and whether the pager was shared by peer connections
+            // (open count > 1) — the subset where the pager single-connection fast
+            // path is disabled and the single writer still pays for concurrency
+            // machinery it cannot use. `is_concurrent_txn` is the mode captured at
+            // begin, before commit finalization reset `concurrent_txn`.
+            if !is_concurrent_txn {
+                record_single_writer_filebacked_commit(
+                    self._shared_mvcc_state
+                        .open_connection_count
+                        .load(AtomicOrdering::Acquire)
+                        > 1,
+                );
+            }
         }
         if committed_write {
             self.arm_pending_local_live_vtab_preservation(
@@ -55087,7 +55610,7 @@ impl Connection {
                 return Ok(false);
             };
             let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-            Ok(cursor.first(cx).await?)
+            cursor.first(cx).await
         })
         .await
     }
@@ -58617,7 +59140,7 @@ impl Connection {
             let mut schema = self.schema.borrow_mut();
             for table in schema.iter_mut() {
                 if table.name.eq_ignore_ascii_case(old_name) {
-                    table.name = new_name.to_owned();
+                    new_name.clone_into(&mut table.name);
                     continue;
                 }
                 if let Some(new_def) = old_shadow_names
@@ -59348,7 +59871,7 @@ impl Connection {
     ) -> Result<VdbeProgram> {
         let (idx_col_positions, key_exprs, where_expr) =
             self.bind_index_runtime_dependencies(table, index)?;
-        let columns_label = format!("{}.{}", table.name, index.key_label());
+        let columns_label = index.key_label_qualified(&table.name);
 
         self.with_codegen_function_context(|| {
             Self::compile_index_backfill(
@@ -60845,7 +61368,7 @@ impl Connection {
             // — its deferred obligation is discharged.
             None => Ok(()),
             Some(row) => {
-                self.check_fk_parent_exists(table_name, &row.values().to_vec())
+                self.check_fk_parent_exists(table_name, row.values())
                     .await
             }
         }
@@ -62433,9 +62956,16 @@ impl Connection {
         // re-enter itself), not by table name. This allows trigger A on
         // table T to fire trigger B on table T during A's body.
 
+        // Fire same-event triggers in reverse-creation order (LIFO, newest
+        // first) to match C SQLite, whose per-table trigger list is built by
+        // prepending so the most recently created trigger fires first.
+        // `self.triggers` is kept in creation order (append on CREATE;
+        // sqlite_master reload scans by rowid = creation order), so reversing
+        // at the firing site is stable across reopen (bd-5vr3b).
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
+            .rev()
             .filter(|t| {
                 t.table_name.eq_ignore_ascii_case(table_name)
                     && t.timing == fsqlite_ast::TriggerTiming::Before
@@ -62508,9 +63038,13 @@ impl Connection {
         // NOTE: recursive_triggers guard moved into the per-trigger loop
         // below. C SQLite checks by trigger NAME, not table name.
 
+        // Reverse-creation (LIFO, newest first) order to match C SQLite — see
+        // fire_before_triggers (bd-5vr3b). Stable across reopen because
+        // `self.triggers` is always in creation order.
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
+            .rev()
             .filter(|t| {
                 t.table_name.eq_ignore_ascii_case(table_name)
                     && t.timing == fsqlite_ast::TriggerTiming::After
@@ -62958,9 +63492,13 @@ impl Connection {
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
     ) -> Result<bool> {
+        // Reverse-creation (LIFO, newest first) order to match C SQLite — see
+        // fire_before_triggers (bd-5vr3b). Stable across reopen because
+        // `self.triggers` is always in creation order.
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
+            .rev()
             .filter(|trigger| {
                 trigger.table_name.eq_ignore_ascii_case(view_name)
                     && trigger.timing == fsqlite_ast::TriggerTiming::InsteadOf
@@ -63238,6 +63776,9 @@ impl Connection {
         self.from_clause_has_bare_pragma_tvf(from, cte_names)
     }
 
+    // `from_` here refers to the SQL FROM clause, not a type conversion, so
+    // clippy's wrong_self_convention heuristic is a false positive.
+    #[allow(clippy::wrong_self_convention)]
     fn from_clause_has_bare_pragma_tvf(&self, from: &FromClause, cte_names: &[String]) -> bool {
         self.source_is_bare_pragma_tvf(&from.source, cte_names)
             || from
@@ -68966,6 +69507,27 @@ impl Connection {
                     }])
                 }
             }
+            // bd-jcjkf / bd-e8jzh: DQS ("double-quoted string") compat gate.
+            // ON (default) makes an unresolvable double-quoted identifier fall
+            // back to a string literal (stock SQLITE_DQS default = 3); OFF
+            // restores strict, typo-safe resolution. Frank-native mirror of
+            // SQLITE_DBCONFIG_DQS_DDL / SQLITE_DBCONFIG_DQS_DML (stock exposes it
+            // as a dbconfig, not a pragma). Boolean form modeled on
+            // fsqlite.stmt_microbatch; the DQS rewrite-retry engine reads
+            // self.dqs_enabled.get() as its only gate.
+            "fsqlite.dqs" | "dqs" => {
+                if let Some(ref val) = pragma.value {
+                    let enabled = parse_pragma_bool(val)?;
+                    self.dqs_enabled.set(enabled);
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(enabled))],
+                    }])
+                } else {
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(self.dqs_enabled.get()))],
+                    }])
+                }
+            }
             // Read-only introspection of the active write-concurrency model
             // (bd-nao48). Makes the `journal_mode = 'wal'` -> page-level MVCC
             // divergence explicit so callers do not silently assume SQLite's
@@ -70253,12 +70815,15 @@ impl Connection {
                                         'C' | 'c' => "NUMERIC",
                                         _ => "",
                                     });
-                                let notnull = i64::from(col.notnull);
+                                let pk = pk_positions.get(i).copied().unwrap_or(0);
+                                // bd-a506j F2: WITHOUT ROWID PK columns are implicitly
+                                // NOT NULL (stock reports notnull=1, and frank already
+                                // ENFORCES it). Reflect that in table_info/table_xinfo.
+                                let notnull = i64::from(col.notnull || (t.without_rowid && pk > 0));
                                 let dflt =
                                     col.default_value.as_ref().map_or(SqliteValue::Null, |s| {
                                         SqliteValue::Text(s.clone().into())
                                     });
-                                let pk = pk_positions.get(i).copied().unwrap_or(0);
                                 let mut values = vec![
                                     SqliteValue::Integer(cid),
                                     SqliteValue::Text(col.name.clone().into()),
@@ -71385,17 +71950,29 @@ impl Connection {
                 }
                 Err(err) => Err(err),
             }
-        } else if self.pager.journal_mode() != JournalMode::Delete {
-            // SQLite checkpoints outstanding WAL frames before leaving WAL mode
-            // so the main database remains self-contained for external readers.
-            if self.pager.journal_mode() == JournalMode::Wal {
-                self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
-            }
-            self.pager
-                .set_journal_mode(&cx, JournalMode::Delete)
-                .await?;
-            Ok(())
         } else {
+            // bd-sw2k5: every non-WAL mode uses the pager's Delete rollback
+            // path; the requested sub-mode only selects the post-commit journal
+            // cleanup. `memory`/`off` are accepted but not yet specialized, so
+            // they fall through to the crash-safe Delete cleanup.
+            let cleanup = if journal_mode.eq_ignore_ascii_case("truncate") {
+                RollbackCleanup::Truncate
+            } else if journal_mode.eq_ignore_ascii_case("persist") {
+                RollbackCleanup::Persist
+            } else {
+                RollbackCleanup::Delete
+            };
+            if self.pager.journal_mode() != JournalMode::Delete {
+                // SQLite checkpoints outstanding WAL frames before leaving WAL
+                // mode so the main database stays self-contained for readers.
+                if self.pager.journal_mode() == JournalMode::Wal {
+                    self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
+                }
+                self.pager
+                    .set_journal_mode(&cx, JournalMode::Delete)
+                    .await?;
+            }
+            self.pager.set_rollback_cleanup(cleanup)?;
             Ok(())
         }
     }
@@ -77868,7 +78445,7 @@ impl Connection {
                     // dropping either chose the wrong extremum row (bd-3radn M5).
                     // The nested aggregate is then evaluated within its Plain
                     // expression against that representative row.
-                    .unwrap_or_else(|| {
+                    .unwrap_or({
                         (
                             usize::MAX,
                             None,
@@ -92645,9 +93222,23 @@ fn validate_function_call_header(
     let is_aggregate =
         is_current_aggregate_or_json_fn(name, args) && !is_scalar_max_min(name, args);
     if filter.is_some() && !is_aggregate {
-        return Err(FrankenError::FunctionError(format!(
-            "FILTER may not be used with non-aggregate {name}()"
-        )));
+        // SQLite (3.53) reports two different messages here. A genuine
+        // non-aggregate *window* function (row_number/rank/ntile/lag/...) used
+        // with OVER gets the window-specific text; every other non-aggregate
+        // (a plain scalar, with or without OVER) keeps the generic message.
+        let is_window_fn = over.is_some() && {
+            let num_args = aggregate_args_len_for_lookup(args);
+            with_current_sync_function_registry(|registry| {
+                registry
+                    .unwrap_or_else(|| shared_builtin_function_registry().as_ref())
+                    .window_accepts_arg_count(name, num_args)
+            }) == Some(true)
+        };
+        return Err(FrankenError::FunctionError(if is_window_fn {
+            "FILTER clause may only be used with aggregate window functions".to_owned()
+        } else {
+            format!("FILTER may not be used with non-aggregate {name}()")
+        }));
     }
     if distinct && over.is_some() {
         return Err(FrankenError::FunctionError(
@@ -95094,10 +95685,10 @@ fn any_function_call_in_select(
         if any_function_call_in_expr(&limit.limit, pred) {
             return true;
         }
-        if let Some(offset) = &limit.offset {
-            if any_function_call_in_expr(offset, pred) {
-                return true;
-            }
+        if let Some(offset) = &limit.offset
+            && any_function_call_in_expr(offset, pred)
+        {
+            return true;
         }
     }
     false
@@ -95118,10 +95709,10 @@ fn any_function_call_in_select_core(
             ..
         } => {
             for column in columns {
-                if let ResultColumn::Expr { expr, .. } = column {
-                    if any_function_call_in_expr(expr, pred) {
-                        return true;
-                    }
+                if let ResultColumn::Expr { expr, .. } = column
+                    && any_function_call_in_expr(expr, pred)
+                {
+                    return true;
                 }
             }
             if let Some(from_clause) = from {
@@ -95132,27 +95723,27 @@ fn any_function_call_in_select_core(
                     if any_function_call_in_table_or_subquery(&join.table, pred) {
                         return true;
                     }
-                    if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                        if any_function_call_in_expr(expr, pred) {
-                            return true;
-                        }
+                    if let Some(JoinConstraint::On(expr)) = &join.constraint
+                        && any_function_call_in_expr(expr, pred)
+                    {
+                        return true;
                     }
                 }
             }
-            if let Some(expr) = where_clause {
-                if any_function_call_in_expr(expr, pred) {
-                    return true;
-                }
+            if let Some(expr) = where_clause
+                && any_function_call_in_expr(expr, pred)
+            {
+                return true;
             }
             for expr in group_by {
                 if any_function_call_in_expr(expr, pred) {
                     return true;
                 }
             }
-            if let Some(expr) = having {
-                if any_function_call_in_expr(expr, pred) {
-                    return true;
-                }
+            if let Some(expr) = having
+                && any_function_call_in_expr(expr, pred)
+            {
+                return true;
             }
             for window in windows {
                 if any_function_call_in_window_spec(&window.spec, pred) {
@@ -95197,10 +95788,10 @@ fn any_function_call_in_table_or_subquery(
                 if any_function_call_in_table_or_subquery(&join.table, pred) {
                     return true;
                 }
-                if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                    if any_function_call_in_expr(expr, pred) {
-                        return true;
-                    }
+                if let Some(JoinConstraint::On(expr)) = &join.constraint
+                    && any_function_call_in_expr(expr, pred)
+                {
+                    return true;
                 }
             }
             false
@@ -95267,10 +95858,10 @@ fn any_function_call_in_expr(
             else_expr,
             ..
         } => {
-            if let Some(operand) = operand {
-                if any_function_call_in_expr(operand, pred) {
-                    return true;
-                }
+            if let Some(operand) = operand
+                && any_function_call_in_expr(operand, pred)
+            {
+                return true;
             }
             for (when_expr, then_expr) in whens {
                 if any_function_call_in_expr(when_expr, pred)
@@ -95309,15 +95900,15 @@ fn any_function_call_in_expr(
                     return true;
                 }
             }
-            if let Some(filter) = filter {
-                if any_function_call_in_expr(filter, pred) {
-                    return true;
-                }
+            if let Some(filter) = filter
+                && any_function_call_in_expr(filter, pred)
+            {
+                return true;
             }
-            if let Some(window) = over {
-                if any_function_call_in_window_spec(window, pred) {
-                    return true;
-                }
+            if let Some(window) = over
+                && any_function_call_in_window_spec(window, pred)
+            {
+                return true;
             }
             false
         }
@@ -95350,15 +95941,15 @@ fn any_function_call_in_window_spec(
         }
     }
     if let Some(frame) = &window.frame {
-        if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = &frame.start {
-            if any_function_call_in_expr(expr, pred) {
-                return true;
-            }
+        if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = &frame.start
+            && any_function_call_in_expr(expr, pred)
+        {
+            return true;
         }
-        if let Some(FrameBound::Preceding(expr) | FrameBound::Following(expr)) = &frame.end {
-            if any_function_call_in_expr(expr, pred) {
-                return true;
-            }
+        if let Some(FrameBound::Preceding(expr) | FrameBound::Following(expr)) = &frame.end
+            && any_function_call_in_expr(expr, pred)
+        {
+            return true;
         }
     }
     false
@@ -95435,15 +96026,15 @@ fn any_function_call_in_update(
             return true;
         }
     }
-    if let Some(from) = &update.from {
-        if any_function_call_in_from_clause(from, pred) {
-            return true;
-        }
+    if let Some(from) = &update.from
+        && any_function_call_in_from_clause(from, pred)
+    {
+        return true;
     }
-    if let Some(where_clause) = &update.where_clause {
-        if any_function_call_in_expr(where_clause, pred) {
-            return true;
-        }
+    if let Some(where_clause) = &update.where_clause
+        && any_function_call_in_expr(where_clause, pred)
+    {
+        return true;
     }
     if any_function_call_in_result_columns(&update.returning, pred) {
         return true;
@@ -95462,10 +96053,10 @@ fn any_function_call_in_delete(
             }
         }
     }
-    if let Some(where_clause) = &delete.where_clause {
-        if any_function_call_in_expr(where_clause, pred) {
-            return true;
-        }
+    if let Some(where_clause) = &delete.where_clause
+        && any_function_call_in_expr(where_clause, pred)
+    {
+        return true;
     }
     if any_function_call_in_result_columns(&delete.returning, pred) {
         return true;
@@ -95477,12 +96068,11 @@ fn any_function_call_in_upsert_clause(
     clause: &UpsertClause,
     pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
 ) -> bool {
-    if let Some(target) = &clause.target {
-        if let Some(where_clause) = &target.where_clause {
-            if any_function_call_in_expr(where_clause, pred) {
-                return true;
-            }
-        }
+    if let Some(target) = &clause.target
+        && let Some(where_clause) = &target.where_clause
+        && any_function_call_in_expr(where_clause, pred)
+    {
+        return true;
     }
     match &clause.action {
         UpsertAction::Nothing => false,
@@ -95507,10 +96097,10 @@ fn any_function_call_in_result_columns(
     pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
 ) -> bool {
     for column in columns {
-        if let ResultColumn::Expr { expr, .. } = column {
-            if any_function_call_in_expr(expr, pred) {
-                return true;
-            }
+        if let ResultColumn::Expr { expr, .. } = column
+            && any_function_call_in_expr(expr, pred)
+        {
+            return true;
         }
     }
     false
@@ -95527,10 +96117,10 @@ fn any_function_call_in_from_clause(
         if any_function_call_in_table_or_subquery(&join.table, pred) {
             return true;
         }
-        if let Some(JoinConstraint::On(expr)) = &join.constraint {
-            if any_function_call_in_expr(expr, pred) {
-                return true;
-            }
+        if let Some(JoinConstraint::On(expr)) = &join.constraint
+            && any_function_call_in_expr(expr, pred)
+        {
+            return true;
         }
     }
     false
@@ -95550,10 +96140,10 @@ fn any_function_call_in_order_by_limit(
         if any_function_call_in_expr(&limit.limit, pred) {
             return true;
         }
-        if let Some(offset) = &limit.offset {
-            if any_function_call_in_expr(offset, pred) {
-                return true;
-            }
+        if let Some(offset) = &limit.offset
+            && any_function_call_in_expr(offset, pred)
+        {
+            return true;
         }
     }
     false
@@ -96904,6 +97494,22 @@ fn frankenerror_from_vdbe_halt(code: i32, message: String) -> FrankenError {
             name: String::new(),
         };
     }
+    // bd-a506j F3: route the remaining SQLITE_CONSTRAINT (19) halts to their clean
+    // variants so they surface with the exact stock text under SQLITE_CONSTRAINT,
+    // instead of "internal error: VDBE halted with code 19: <msg>". Mirrors CHECK.
+    if let Some(column) = message.strip_prefix("NOT NULL constraint failed: ") {
+        return FrankenError::NotNullViolation {
+            column: column.to_owned(),
+        };
+    }
+    if let Some(columns) = message.strip_prefix("UNIQUE constraint failed: ") {
+        return FrankenError::UniqueViolation {
+            columns: columns.to_owned(),
+        };
+    }
+    if message == "FOREIGN KEY constraint failed" {
+        return FrankenError::ForeignKeyViolation;
+    }
     FrankenError::Internal(format!("VDBE halted with code {code}: {message}"))
 }
 
@@ -97562,10 +98168,14 @@ fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
         .as_ref()
         .map(|predicate| format!(" WHERE {predicate}"))
         .unwrap_or_default();
+    // bd-eapu1: render the minimal stock form (quote only when needed, no
+    // implicit ASC) so the ALTER RENAME COLUMN/TABLE re-render and the
+    // sqlite_master reconstruction fallback match SQLite's `sqlite_master.sql`
+    // instead of a canonical always-quoted `"ix" ON "t"("c" ASC)` form.
     format!(
         "CREATE {unique}INDEX {} ON {}({}){where_clause}",
-        quote_identifier(&index.name),
-        quote_identifier(table_name),
+        fsqlite_ast::quote_ident_if_needed(&index.name),
+        fsqlite_ast::quote_ident_if_needed(table_name),
         cols
     )
 }
@@ -97575,7 +98185,7 @@ fn render_create_index_terms_sql(index: &IndexSchema) -> String {
     (0..term_count)
         .filter_map(|i| {
             let mut term = if index.key_expressions.is_empty() {
-                quote_identifier(index.columns.get(i)?)
+                fsqlite_ast::quote_ident_if_needed(index.columns.get(i)?)
             } else {
                 index.key_expressions.get(i)?.clone()
             };
@@ -97585,12 +98195,13 @@ fn render_create_index_terms_sql(index: &IndexSchema) -> String {
                 && let Some(collation) = index.key_collations.get(i).and_then(|c| c.as_deref())
             {
                 term.push_str(" COLLATE ");
-                term.push_str(&quote_identifier(collation));
+                term.push_str(&fsqlite_ast::quote_ident_if_needed(collation));
             }
+            // bd-eapu1: omit implicit ASC (stock renders only DESC); ASC is the
+            // default sort direction and SQLite's sqlite_master text leaves it off.
             match index.key_sort_directions.get(i).copied() {
-                Some(SortDirection::Asc) => term.push_str(" ASC"),
                 Some(SortDirection::Desc) => term.push_str(" DESC"),
-                None => {}
+                Some(SortDirection::Asc) | None => {}
             }
             Some(term)
         })
@@ -97922,10 +98533,10 @@ fn subst_cte_refs_in_nested_select(
     body: &SelectStatement,
     inlined: &mut usize,
 ) {
-    if let Some(with) = &select.with {
-        if with.ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(name)) {
-            return;
-        }
+    if let Some(with) = &select.with
+        && with.ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(name))
+    {
+        return;
     }
     subst_cte_refs_in_select(select, name, body, inlined);
 }
@@ -119995,9 +120606,7 @@ async fn execute_program_with_row_cap(
                 values: values.into_vec(),
             })
             .collect()),
-        ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
-            "VDBE halted with code {code}: {message}",
-        ))),
+        ExecOutcome::Error { code, message } => Err(frankenerror_from_vdbe_halt(code, message)),
     }
 }
 
@@ -120086,9 +120695,7 @@ async fn execute_program_exactly_one_row_with_row_cap(
             QueryRowCollectionOutcome::NoRows => Err(FrankenError::QueryReturnedNoRows),
             QueryRowCollectionOutcome::MultipleRows => Err(FrankenError::QueryReturnedMultipleRows),
         },
-        ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
-            "VDBE halted with code {code}: {message}",
-        ))),
+        ExecOutcome::Error { code, message } => Err(frankenerror_from_vdbe_halt(code, message)),
     }
 }
 
@@ -157945,7 +158552,8 @@ mod tests {
                 .await
                 .expect_err("renaming to an existing table should fail");
             assert!(
-                err.to_string().contains("already exists"),
+                err.to_string()
+                    .contains("there is already another table or index with this name"),
                 "unexpected error: {err}"
             );
 
@@ -157974,7 +158582,8 @@ mod tests {
                 .await
                 .expect_err("renaming to an existing index should fail");
             assert!(
-                err.to_string().contains("already exists"),
+                err.to_string()
+                    .contains("there is already another table or index with this name"),
                 "unexpected error: {err}"
             );
 
@@ -158010,7 +158619,8 @@ mod tests {
                 .await
                 .expect_err("renaming to an existing view should fail");
             assert!(
-                err.to_string().contains("already exists"),
+                err.to_string()
+                    .contains("there is already another table or index with this name"),
                 "unexpected error: {err}"
             );
 
@@ -158022,6 +158632,139 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
+        });
+    }
+
+    #[test]
+    fn test_constraint_errors_surface_clean_not_internal_wrapped_bd_a506j() {
+        // bd-a506j F3: NOT NULL / UNIQUE constraint halts must surface as their clean
+        // SQLITE_CONSTRAINT variants (stock text), not wrapped as "internal error: VDBE
+        // halted with code 19: ...". Oracle: sqlite3 3.46.1 emits "<msg> (19)".
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER NOT NULL);")
+                .await
+                .unwrap();
+            let err = conn
+                .execute("INSERT INTO t VALUES (NULL);")
+                .await
+                .expect_err("NULL into NOT NULL column must fail");
+            assert!(
+                matches!(err, FrankenError::NotNullViolation { .. }),
+                "NOT NULL must surface as the clean variant, got {err}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("NOT NULL constraint failed"), "got {msg}");
+            assert!(
+                !msg.contains("internal error") && !msg.contains("VDBE halted"),
+                "constraint error must not be internal-wrapped, got {msg}"
+            );
+
+            conn.execute("CREATE TABLE u (a, b, PRIMARY KEY(a, b));")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO u VALUES (1, 2);").await.unwrap();
+            let err = conn
+                .execute("INSERT INTO u VALUES (1, 2);")
+                .await
+                .expect_err("duplicate PK must fail");
+            assert!(
+                matches!(err, FrankenError::UniqueViolation { .. }),
+                "UNIQUE must surface as the clean variant, got {err}"
+            );
+            assert!(
+                !err.to_string().contains("internal error"),
+                "UNIQUE error must not be internal-wrapped, got {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_table_info_without_rowid_pk_columns_are_notnull_bd_a506j() {
+        // bd-a506j F2: WITHOUT ROWID PK columns are implicitly NOT NULL; table_info must
+        // report notnull=1 (stock 3.46.1 does; frank already ENFORCES it). notnull is
+        // result column index 3 (cid, name, type, notnull, dflt_value, pk).
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE wr (a TEXT, b INT, c INT, PRIMARY KEY(a, b)) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+            let rows = conn.query("PRAGMA table_info(wr);").await.unwrap();
+            assert_eq!(rows.len(), 3);
+            for row in &rows {
+                let name = &row.values()[1];
+                let notnull = &row.values()[3];
+                let pk = &row.values()[5];
+                let is_pk = matches!(pk, SqliteValue::Integer(p) if *p > 0);
+                if is_pk {
+                    assert_eq!(
+                        *notnull,
+                        SqliteValue::Integer(1),
+                        "WITHOUT ROWID PK column {name:?} must report notnull=1"
+                    );
+                } else {
+                    assert_eq!(
+                        *notnull,
+                        SqliteValue::Integer(0),
+                        "non-PK column {name:?} keeps its declared nullability"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_composite_pk_unique_error_qualifies_each_column_bd_a506j_f1b() {
+        // bd-a506j F1b: a composite PK / multi-column UNIQUE conflict must qualify
+        // EVERY key column ("t.a, t.b"), not just the first ("t.a, b"). Single-column
+        // keys stay "t.a". Expected strings oracle-verified vs sqlite3 3.46.1.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+
+            // composite PK on a rowid table (enforced via a unique autoindex)
+            conn.execute("CREATE TABLE c (a, b, PRIMARY KEY(a, b));")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO c VALUES (1, 2);").await.unwrap();
+            let err = conn
+                .execute("INSERT INTO c VALUES (1, 2);")
+                .await
+                .expect_err("duplicate composite PK must fail");
+            assert_eq!(err.to_string(), "UNIQUE constraint failed: c.a, c.b");
+
+            // WITHOUT ROWID composite PK
+            conn.execute("CREATE TABLE w (a TEXT, b INT, PRIMARY KEY(a, b)) WITHOUT ROWID;")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO w VALUES ('x', 1);").await.unwrap();
+            let err = conn
+                .execute("INSERT INTO w VALUES ('x', 1);")
+                .await
+                .expect_err("duplicate WITHOUT ROWID composite PK must fail");
+            assert_eq!(err.to_string(), "UNIQUE constraint failed: w.a, w.b");
+
+            // multi-column UNIQUE index
+            conn.execute("CREATE TABLE m (x, y);").await.unwrap();
+            conn.execute("CREATE UNIQUE INDEX mi ON m(x, y);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO m VALUES (1, 2);").await.unwrap();
+            let err = conn
+                .execute("INSERT INTO m VALUES (1, 2);")
+                .await
+                .expect_err("duplicate multi-column UNIQUE must fail");
+            assert_eq!(err.to_string(), "UNIQUE constraint failed: m.x, m.y");
+
+            // single-column UNIQUE stays correctly qualified (no regression)
+            conn.execute("CREATE TABLE s (v UNIQUE);").await.unwrap();
+            conn.execute("INSERT INTO s VALUES (7);").await.unwrap();
+            let err = conn
+                .execute("INSERT INTO s VALUES (7);")
+                .await
+                .expect_err("duplicate single-column UNIQUE must fail");
+            assert_eq!(err.to_string(), "UNIQUE constraint failed: s.v");
         });
     }
 
@@ -158466,6 +159209,62 @@ mod tests {
             let rows = conn.query("SELECT new_col FROM t;").await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+        });
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_index_sql_is_minimal_stock_form_bd_eapu1() {
+        // bd-eapu1: after ALTER TABLE RENAME COLUMN, the stored sqlite_master.sql for
+        // an affected index must be re-rendered in SQLite's MINIMAL form (quote only
+        // when needed, no implicit ASC), not the old canonical always-quoted+ASC form
+        // (`"ix" ON "t"("c" ASC)`). Expected strings oracle-verified vs sqlite3 3.46.1.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(a, b);").await.unwrap();
+            conn.execute("CREATE INDEX ix ON t(b);").await.unwrap();
+            conn.execute("CREATE INDEX ix2 ON t(b DESC);").await.unwrap();
+            conn.execute("ALTER TABLE t RENAME COLUMN b TO c;")
+                .await
+                .unwrap();
+
+            // Local macro (not an async closure — avoids the returned-future
+            // lifetime trap) that fetches sqlite_master.sql for a name.
+            macro_rules! sql_of {
+                ($name:expr) => {{
+                    let rows = conn
+                        .query(&format!(
+                            "SELECT sql FROM sqlite_master WHERE name='{}';",
+                            $name
+                        ))
+                        .await
+                        .unwrap();
+                    match rows[0].values()[0].clone() {
+                        SqliteValue::Text(s) => s.to_string(),
+                        other => panic!("expected TEXT sql, got {other:?}"),
+                    }
+                }};
+            }
+
+            // plain: minimal, unquoted, NO implicit ASC
+            assert_eq!(sql_of!("ix"), "CREATE INDEX ix ON t(c)");
+            // DESC preserved
+            assert_eq!(sql_of!("ix2"), "CREATE INDEX ix2 ON t(c DESC)");
+
+            // conditional quoting: a keyword column stays quoted only because it needs it
+            conn.execute("CREATE TABLE t2(a, \"order\");").await.unwrap();
+            conn.execute("CREATE INDEX ixk ON t2(\"order\");")
+                .await
+                .unwrap();
+            conn.execute("ALTER TABLE t2 RENAME COLUMN a TO aa;")
+                .await
+                .unwrap();
+            assert_eq!(sql_of!("ixk"), "CREATE INDEX ixk ON t2(\"order\")");
+
+            // NOTE (documented residual, approach-(a) limitation): ALTER TABLE RENAME
+            // *TABLE* leaves stock quoting the substituted new table name
+            // (`ON "t3"(b)`) via its textual edit, whereas the minimal re-render emits
+            // `ON t3(b)`. Both are valid; only the stored text's new-table-name quoting
+            // differs. RENAME COLUMN (the bd-eapu1 repro) is byte-exact, asserted above.
         });
     }
 
@@ -165691,6 +166490,81 @@ mod tests {
     }
 
     #[test]
+    fn test_same_event_trigger_firing_order_lifo_bd_5vr3b() {
+        asupersync::test_utils::run_test(|| async {
+            // C SQLite fires multiple same-event triggers in reverse-creation
+            // order (LIFO, newest first); frank used to fire in creation order
+            // (FIFO) — the exact opposite (bd-5vr3b).
+            async fn markers(conn: &Connection) -> Vec<String> {
+                let rows = conn
+                    .query("SELECT marker FROM log ORDER BY id;")
+                    .await
+                    .unwrap();
+                rows.iter()
+                    .map(|r| match &row_values(r)[0] {
+                        SqliteValue::Text(s) => s.to_string(),
+                        other => panic!("marker not text: {other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+            }
+            async fn setup(conn: &Connection) {
+                conn.execute("CREATE TABLE t (id INTEGER);").await.unwrap();
+                conn.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, marker TEXT);")
+                    .await
+                    .unwrap();
+            }
+
+            // Scenario A: z_first created before a_second -> a_second (newest)
+            // fires FIRST, so the log reads a,z. Rules out creation-order FIFO.
+            let conn = Connection::open(":memory:").await.unwrap();
+            setup(&conn).await;
+            conn.execute("CREATE TRIGGER z_first AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('z'); END;").await.unwrap();
+            conn.execute("CREATE TRIGGER a_second AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('a'); END;").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            assert_eq!(
+                markers(&conn).await,
+                vec!["a", "z"],
+                "newest-created trigger (a_second) must fire first"
+            );
+
+            // Scenario B: swap the names so alphabetical order would predict the
+            // opposite. Proves the order is creation-recency, NOT name order.
+            let conn2 = Connection::open(":memory:").await.unwrap();
+            setup(&conn2).await;
+            conn2.execute("CREATE TRIGGER a_first AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('a'); END;").await.unwrap();
+            conn2.execute("CREATE TRIGGER z_second AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('z'); END;").await.unwrap();
+            conn2.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            assert_eq!(
+                markers(&conn2).await,
+                vec!["z", "a"],
+                "newest-created trigger (z_second) must fire first, not name order"
+            );
+
+            // Scenario C: reopen from disk preserves LIFO. Reload scans
+            // sqlite_master by rowid (creation order), so reversing at the
+            // firing site stays stable across reopen.
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("trg_order.db");
+            let db_path = db_path.to_str().unwrap();
+            {
+                let c = Connection::open(db_path).await.unwrap();
+                setup(&c).await;
+                c.execute("CREATE TRIGGER z_first AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('z'); END;").await.unwrap();
+                c.execute("CREATE TRIGGER a_second AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('a'); END;").await.unwrap();
+                c.close().await.unwrap();
+            }
+            let reopened = Connection::open(db_path).await.unwrap();
+            reopened.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            assert_eq!(
+                markers(&reopened).await,
+                vec!["a", "z"],
+                "LIFO firing order must survive reopen"
+            );
+            reopened.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_trigger_when_clause_uses_new_frame_values() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -167392,7 +168266,7 @@ mod tests {
                 Ok(Some(status)) => {
                     assert!(
                         status.success(),
-                        "the configured trigger cap did not fail cleanly on a requested 1 MiB \
+                        "the configured trigger cap did not fail cleanly on a requested 4 MiB \
                          stack: {status}"
                     );
                     break;
@@ -167405,7 +168279,7 @@ mod tests {
                     let wait_result = child.wait();
                     panic!(
                         "the configured trigger cap did not finish within 60 seconds on a \
-                         requested 1 MiB stack; kill={kill_result:?}, wait={wait_result:?}"
+                         requested 4 MiB stack; kill={kill_result:?}, wait={wait_result:?}"
                     );
                 }
                 Err(error) => {
@@ -167426,14 +168300,20 @@ mod tests {
             return;
         }
 
-        // F-PGM.11: Recursive triggers must be bounded at MAX_TRIGGER_DEPTH.
-        // Request a 1 MiB helper-thread stack so compiler frame growth cannot
-        // silently move the process-abort boundary below the configured typed
-        // error boundary. Platforms may provide a larger stack; the parent
-        // test above contains either an abort or a hang.
+        // F-PGM.11: Recursive triggers must be bounded at MAX_TRIGGER_DEPTH,
+        // failing with the typed `TriggerRecursionDepthExceeded` error before the
+        // native stack can overflow. Trigger dispatch still Rust-recurses at
+        // ~210 KiB/level over a ~380 KiB base (measured, opt-level=1 profile), so
+        // admitting all MAX_TRIGGER_DEPTH (=8) levels needs ~2.1 MiB of stack.
+        // Pin an explicit 4 MiB helper stack — the boundary documented on
+        // MAX_TRIGGER_DEPTH — giving ~2x the measured requirement: the typed cap
+        // fires cleanly here, while a per-level frame regression past ~450 KiB
+        // would still overflow this stack and re-trip the probe. Shrinking the
+        // budget to 1 MiB, or reaching SQLite's 1000-depth parity, needs the heap
+        // trigger trampoline (bd-4uema / bd-7mnz8 / bd-3lj3), not a stack bump.
         std::thread::Builder::new()
             .name("recursive-trigger-depth-limit".to_owned())
-            .stack_size(1024 * 1024)
+            .stack_size(4 * 1024 * 1024)
             .spawn(|| {
                 asupersync::test_utils::run_test(|| async {
                     // Without recursive_triggers=ON, the default behavior
@@ -187884,10 +188764,16 @@ mod tests {
             conn.execute("COMMIT;").await.unwrap();
             drop(hook_guard);
 
-            assert_eq!(
-                hook_calls.load(AtomicOrdering::SeqCst),
-                1,
-                "the deterministic post-durable/pre-MVCC-publish race hook must fire once"
+            // bd-xu639: the commit-window hook is a PROCESS-GLOBAL test hook and
+            // must stay global — test_issue59_direct_fk_check_query_sees_parent_after_dml
+            // fires it from a separate std::thread, so it cannot be thread-local.
+            // Under `--test-threads` load a concurrent connection's commit can
+            // fire it too, inflating an exact global count. Assert it fired for
+            // OUR commit at least once; a regression that never reaches the
+            // post-durable/pre-MVCC-publish injection point still fails at 0.
+            assert!(
+                hook_calls.load(AtomicOrdering::SeqCst) >= 1,
+                "the deterministic post-durable/pre-MVCC-publish race hook must fire for our commit"
             );
             let pager_visible = conn.pager.published_snapshot().visible_commit_seq;
             assert_eq!(
@@ -195626,6 +196512,20 @@ mod transaction_lifecycle_tests {
     fn test_prepared_count_indexed_rowid_probe_parameterized_bound() {
         asupersync::test_utils::run_test(|| async {
             let _serial = super::fsqlite_core_test_serializer();
+            // bd-xu639: the direct_*_query_row_hits counters now record only
+            // while profiling is enabled (a thread-local override in test mode),
+            // so enable it on this thread. Combined with the serializer above,
+            // this makes the process-global counter reads below immune to
+            // concurrent `--test-threads` queries. Restore on the way out so a
+            // reused test-runner thread starts clean.
+            super::set_hot_path_profile_enabled(true);
+            struct RestoreProfileEnabled;
+            impl Drop for RestoreProfileEnabled {
+                fn drop(&mut self) {
+                    super::set_hot_path_profile_enabled(false);
+                }
+            }
+            let _restore_profile_enabled = RestoreProfileEnabled;
 
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t(val INTEGER)").await.unwrap();
@@ -229240,6 +230140,63 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_single_writer_shared_pager_commit_counter_bd_nsktt() {
+        // bd-nsktt (Track H / bd-db300.8): a forced-single-writer file-backed WRITE
+        // commit made while the pager is shared by peer connections (open count > 1)
+        // increments BOTH single_writer_filebacked_commits and
+        // single_writer_shared_pager_commits — the honest-comparison scenario where
+        // the pager single-connection fast path is disabled and the single writer
+        // still pays for concurrency machinery it cannot use. This is the attribution
+        // metric that quantifies the avoidable-overhead exposure the reduction beads
+        // (bd-gkj4s / bd-cznar) target.
+        asupersync::test_utils::run_test(|| async {
+            let _profile_guard = StatementReuseHotPathProfileGuard::new();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bd_nsktt_single_writer_shared_pager.db");
+            let db_path_str = db_path.to_str().unwrap();
+
+            let writer = Connection::open(db_path_str).await.unwrap();
+            writer
+                .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+                .await
+                .unwrap();
+            writer
+                .execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+
+            // A second live connection on the same path shares the pager, so
+            // open_connection_count > 1 and the single-connection fast path is off.
+            let peer = Connection::open(db_path_str).await.unwrap();
+            peer.execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+                .await
+                .unwrap();
+
+            reset_hot_path_profile();
+            writer.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            let snap = hot_path_profile_snapshot();
+
+            assert!(
+                snap.single_writer_filebacked_commits >= 1,
+                "forced single-writer file-backed commit must be attributed (got {})",
+                snap.single_writer_filebacked_commits
+            );
+            assert!(
+                snap.single_writer_shared_pager_commits >= 1,
+                "the shared-pager subset must be attributed (got {})",
+                snap.single_writer_shared_pager_commits
+            );
+            assert!(
+                snap.single_writer_shared_pager_commits
+                    <= snap.single_writer_filebacked_commits,
+                "shared-pager commits are a subset of single-writer file-backed commits"
+            );
+
+            drop(peer);
+        });
+    }
+
+    #[test]
     fn test_file_backed_single_writer_begin_reloads_stale_memdb_from_open_txn() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
@@ -237777,38 +238734,69 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_attached_insert_is_rejected_inside_explicit_transaction() {
+    fn test_attached_insert_participates_in_explicit_transaction_bd_bsc69() {
+        // bd-bsc69 / GH#244: a write against an ATTACHed schema inside an explicit
+        // transaction now PARTICIPATES in that transaction (previously it was
+        // rejected with NotImplemented). It succeeds, is visible within the
+        // transaction, and ROLLBACK undoes it while COMMIT persists it to the aux
+        // file — matching stock SQLite. Oracle-verified vs sqlite3 3.46.1:
+        // in-txn count=1, after-rollback=0, after-commit=1.
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             let aux_path = dir.path().join("aux.db");
             let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
 
-            let aux = rusqlite::Connection::open(&aux_path).unwrap();
-            aux.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);", [])
-                .unwrap();
-            drop(aux);
+            {
+                let aux = rusqlite::Connection::open(&aux_path).unwrap();
+                aux.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);", [])
+                    .unwrap();
+            }
 
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
                 .await
                 .unwrap();
+
+            // ROLLBACK path: the attached INSERT succeeds inside BEGIN, is visible
+            // within the transaction, and is undone on ROLLBACK.
             conn.execute("BEGIN;").await.unwrap();
-
-            let err = conn
-                .execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
                 .await
-                .expect_err("attached INSERT inside BEGIN should stay rejected");
-            assert!(
-                matches!(err, FrankenError::NotImplemented(message) if message.contains("explicit transactions/savepoints"))
+                .expect("attached INSERT inside BEGIN now participates in the transaction");
+            let rows = conn.query("SELECT COUNT(*) FROM aux.t;").await.unwrap();
+            assert_eq!(
+                rows[0].values()[0],
+                SqliteValue::Integer(1),
+                "the attached write is visible inside the open transaction"
             );
-
             conn.execute("ROLLBACK;").await.unwrap();
 
-            let aux = rusqlite::Connection::open(&aux_path).unwrap();
-            let row_count: i64 = aux
-                .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
+            {
+                let aux = rusqlite::Connection::open(&aux_path).unwrap();
+                let row_count: i64 = aux
+                    .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(row_count, 0, "ROLLBACK must undo the attached write");
+            }
+
+            // COMMIT path: the attached write persists to the aux file.
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO aux.t VALUES (2, 'beta');")
+                .await
                 .unwrap();
-            assert_eq!(row_count, 0);
+            conn.execute("COMMIT;").await.unwrap();
+
+            {
+                let aux = rusqlite::Connection::open(&aux_path).unwrap();
+                let row_count: i64 = aux
+                    .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(row_count, 1, "COMMIT must persist the attached write");
+                let value: String = aux
+                    .query_row("SELECT value FROM t WHERE id = 2;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(value, "beta");
+            }
         });
     }
 

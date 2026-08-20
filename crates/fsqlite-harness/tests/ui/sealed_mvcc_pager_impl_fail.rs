@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_pager::{JournalMode, MockTransaction, MvccPager, TransactionMode, WalBackend};
+use fsqlite_pager::{JournalMode, MockTransaction, MvccPager, RollbackCleanup, TransactionMode, WalBackend};
 use fsqlite_types::cx::Cx;
 
 struct ExternalPager;
@@ -34,6 +34,10 @@ impl MvccPager for ExternalPager {
     }
 
     fn set_wal_backend(&self, _backend: Box<dyn WalBackend>) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_rollback_cleanup(&self, _cleanup: RollbackCleanup) -> Result<()> {
         Ok(())
     }
 }

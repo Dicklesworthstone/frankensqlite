@@ -241,8 +241,7 @@ fn connection_open_refuses_newer_format_db() {
         // fsqlite must refuse to open it.
         let err = Connection::open(path.to_string_lossy().as_ref())
             .await
-            .err()
-            .expect("Connection::open must refuse a newer-format database");
+            .expect_err("Connection::open must refuse a newer-format database");
 
         // The refusal diagnostic names the newer-format cause regardless of
         // which storage layer (pager open vs integrity walk) rejects it first.
