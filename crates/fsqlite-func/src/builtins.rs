@@ -3399,6 +3399,19 @@ fn is_exact_sci_tie(mag: f64, prec: usize) -> bool {
 /// left to `format!`, which already rounds them exactly as SQLite does; only a
 /// confirmed exact tie is adjusted. A leading `-` is preserved for negatives.
 fn format_fixed_round_half_away(val: f64, prec: usize) -> String {
+    // An f64 carries at most ~767 significant fractional digits, and Rust's
+    // `format!("{val:.prec$}")` rejects very large precisions outright
+    // ("Formatting argument out of range", observed above ~5e4) — so a printf
+    // like `%.100000f` panicked the process. C SQLite instead zero-fills a
+    // float's fractional part past its significance (up to its own cap). Match
+    // that without panicking: format at a bounded precision that still captures
+    // every significant digit, then append '0' up to the requested `prec`.
+    const MAX_FMT_PREC: usize = 1024;
+    if prec > MAX_FMT_PREC {
+        let mut s = format_fixed_round_half_away(val, MAX_FMT_PREC);
+        s.extend(core::iter::repeat_n('0', prec - MAX_FMT_PREC));
+        return s;
+    }
     let base = format!("{val:.prec$}");
     let mag = val.abs();
     if !is_exact_decimal_tie(mag, prec) {
@@ -6253,6 +6266,39 @@ mod tests {
         for (spec, v, want) in cases {
             assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
         }
+    }
+
+    #[test]
+    fn test_printf_large_float_precision_no_panic() {
+        // Regression: printf('%.100000f', 1.5) panicked ("Formatting argument
+        // out of range") because Rust's `format!` rejects very large float
+        // precisions. It must instead zero-fill past the value's significance,
+        // as C SQLite does (verified against SQLite 3.53). No panic; exact width.
+        let f = FormatFunc;
+        let run = |args: &[SqliteValue]| -> String {
+            match f.invoke(args).unwrap() {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let real = SqliteValue::Float;
+
+        // 1.5 at precision 100000: "1." + "5" + 99999 zeros -> length 100002.
+        let big = run(&[txt("%.100000f"), real(1.5)]);
+        assert_eq!(big.len(), 100_002);
+        assert!(big.starts_with("1.5"));
+        assert!(big["1.5".len()..].bytes().all(|b| b == b'0'));
+
+        // Just above the internal MAX_FMT_PREC (1024): recursion + zero-fill.
+        let mid = run(&[txt("%.2000f"), real(0.25)]);
+        assert_eq!(mid.len(), 2002);
+        assert!(mid.starts_with("0.25"));
+        assert!(mid["0.25".len()..].bytes().all(|b| b == b'0'));
+
+        // Moderate precisions are unchanged (no behavioural regression).
+        assert_eq!(run(&[txt("%.10f"), real(1.5)]), "1.5000000000");
+        assert_eq!(run(&[txt("%.4f"), real(2.0)]), "2.0000");
     }
 
     #[test]
