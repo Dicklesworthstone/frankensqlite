@@ -22,6 +22,7 @@ counters are lock-free atomics).
 |---------|--------|
 | *(default)* | Recording enabled; poll via the callable API below. |
 | `FRANKENSQLITE_METRICS_DISABLE=1` | **Hard opt-out.** Every `inc`/`observe`/`set` becomes a branch-guarded no-op and the exposition functions return an empty string. Read once at process start via `LazyLock`, so the disable check adds a single predictable branch. |
+| `FRANKENSQLITE_STATSD_ADDR=host:port` | **Opt-in StatsD push.** Names the StatsD/DogStatsD server (e.g. `127.0.0.1:8125`) that `StatsdPusher::from_env()` sends to. Unset ⇒ no StatsD push. |
 
 Set the environment variable before the process starts:
 
@@ -74,7 +75,7 @@ fsqlite_fsync_duration_seconds_sum 0.734
 fsqlite_fsync_duration_seconds_count 512
 ```
 
-### 3. StatsD (push) — serializer available now, UDP push loop planned
+### 3. StatsD (push) — available now
 
 StatsD is a *push* protocol: a client periodically emits UDP datagrams that the
 server aggregates over each flush interval. Because a StatsD counter sample
@@ -89,11 +90,28 @@ cumulative snapshot and emits:
 Uses the DogStatsD tagged dialect (the only widely-supported StatsD variant that
 can carry the `response`/`result` labels).
 
+The `StatsdPusher` wraps the encoder over a UDP socket (fire-and-forget, no async
+runtime). Point it at your server with `FRANKENSQLITE_STATSD_ADDR` and call
+`push_once` on your own interval — datagrams larger than a safe UDP payload
+(1432 bytes) are split on line boundaries automatically:
+
+```rust
+use fsqlite_observability::metrics::{self, StatsdPusher};
+
+// Opt-in: Ok(None) unless FRANKENSQLITE_STATSD_ADDR is set.
+if let Ok(Some(mut pusher)) = StatsdPusher::from_env() {
+    // once per flush interval, from your scheduler / a dedicated thread:
+    let _ = pusher.push_once(metrics::global());
+}
+```
+
+To render the datagram without sending it (e.g. a custom transport), use the
+encoder directly:
+
 ```rust
 use fsqlite_observability::metrics::{self, StatsdEncoder};
 
 let mut enc = StatsdEncoder::new();
-// Call once per flush interval; feed the datagram to your UDP sender:
 let datagram: String = enc.encode(metrics::global());
 ```
 
@@ -179,14 +197,12 @@ defaults, not measured guarantees.
 
 ## Roadmap
 
-The recording registry and both serializers ship today. Remaining increments
-(tracked on `bd-zywqc.11`):
+The recording registry, both serializers, and the StatsD UDP push transport
+ship today. Remaining increments (tracked on `bd-zywqc.11`):
 
 - **HTTP `/metrics` endpoint** — opt-in Prometheus pull, default
   `localhost:9009` (implemented with `std::net`/asupersync; tokio is forbidden
   in this project).
-- **StatsD UDP push loop** — periodic `send_to` driving [`StatsdEncoder`], bound
-  from `FRANKENSQLITE_STATSD_ADDR`.
 - **Engine hot-path wiring** — incrementing these metrics from the actual
   fsync / commit / conflict / sweeper / integrity sites.
 - **Overhead gate** — verify opt-in metrics add < 2% on the 8-writer soak.

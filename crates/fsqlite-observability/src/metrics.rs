@@ -14,14 +14,15 @@
 //! **Opt-out (AC#4):** `FRANKENSQLITE_METRICS_DISABLE=1` makes every `inc`/
 //! `observe`/`set` a cheap branch-guarded no-op (read once via `LazyLock`).
 //!
-//! This module is the self-contained foundation (registry + exposition + tests).
-//! Exposition today: Prometheus pull ([`MetricsRegistry::render_prometheus`])
-//! and StatsD push datagrams ([`StatsdEncoder`], AC#6). Follow-on increments
-//! (tracked on the bead): the network transport — HTTP `/metrics` server and
-//! the StatsD UDP push loop (both `std::net`/asupersync, since tokio is
-//! forbidden) — the engine hot-path wiring that increments these metrics, and
-//! the perf/soak gate.
+//! Exposition today: Prometheus pull ([`MetricsRegistry::render_prometheus`]),
+//! StatsD push datagrams ([`StatsdEncoder`]), and a UDP StatsD transport
+//! ([`StatsdPusher`], AC#6) that sends over `std::net` (fire-and-forget, no
+//! async runtime). Follow-on increments (tracked on the bead): the HTTP
+//! `/metrics` server (`std::net`/asupersync, since tokio is forbidden), the
+//! engine hot-path wiring that increments these metrics, and the perf/soak gate.
 
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -563,6 +564,136 @@ impl StatsdEncoder {
     }
 }
 
+/// Environment variable naming the StatsD/DogStatsD server to push to
+/// (`host:port`, e.g. `127.0.0.1:8125`). Unset or empty ⇒ StatsD push disabled
+/// (the whole surface is opt-in).
+pub const STATSD_ADDR_ENV: &str = "FRANKENSQLITE_STATSD_ADDR";
+
+/// Maximum StatsD UDP datagram payload emitted, in bytes. Conservative safe
+/// value for a standard 1500-byte Ethernet MTU (1500 − 20 IP − 8 UDP, minus
+/// headroom); matches the common DogStatsD client default. Multi-line datagrams
+/// are split on line boundaries to stay at or under this size.
+const STATSD_MAX_DATAGRAM: usize = 1432;
+
+/// Pack newline-terminated StatsD lines into datagrams no larger than `max`
+/// bytes, never splitting a line across datagrams. A single line longer than
+/// `max` is emitted on its own (a StatsD server tolerates an oversized packet
+/// better than a truncated, unparseable metric).
+fn pack_statsd_lines(datagram: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for line in datagram.lines() {
+        let needed = line.len() + 1; // include the trailing '\n'
+        if !cur.is_empty() && cur.len() + needed > max {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(line);
+        cur.push('\n');
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// UDP StatsD/DogStatsD pusher (AC#6 transport).
+///
+/// Owns a bound sender socket, the destination address, and the stateful
+/// [`StatsdEncoder`] so successive pushes emit correct per-flush deltas. Because
+/// StatsD is fire-and-forget UDP, no async runtime is involved. Drive it by
+/// calling [`StatsdPusher::push_once`] on a fixed interval from the embedder's
+/// scheduler:
+///
+/// ```no_run
+/// # use fsqlite_observability::metrics::{self, StatsdPusher};
+/// if let Ok(Some(mut pusher)) = StatsdPusher::from_env() {
+///     // once per flush interval:
+///     let _ = pusher.push_once(metrics::global());
+/// }
+/// ```
+#[derive(Debug)]
+pub struct StatsdPusher {
+    socket: UdpSocket,
+    target: SocketAddr,
+    encoder: StatsdEncoder,
+}
+
+impl StatsdPusher {
+    /// Bind a sender socket for destination `dest`. The socket binds an
+    /// ephemeral local port on the wildcard address matching `dest`'s family.
+    ///
+    /// # Errors
+    /// Returns any [`std::io::Error`] from binding the local UDP socket.
+    pub fn bind(dest: SocketAddr) -> io::Result<Self> {
+        let bind_addr: SocketAddr = if dest.is_ipv6() {
+            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+        } else {
+            (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+        };
+        let socket = UdpSocket::bind(bind_addr)?;
+        Ok(Self {
+            socket,
+            target: dest,
+            encoder: StatsdEncoder::new(),
+        })
+    }
+
+    /// Construct from [`STATSD_ADDR_ENV`]. Returns `Ok(None)` when the variable
+    /// is unset/empty or metrics are disabled (the surface is opt-in), so the
+    /// caller can treat "no StatsD configured" as an ordinary non-error state.
+    ///
+    /// # Errors
+    /// Returns an error only when the variable is *set* but the address cannot
+    /// be resolved, or the local socket cannot bind.
+    pub fn from_env() -> io::Result<Option<Self>> {
+        if metrics_disabled() {
+            return Ok(None);
+        }
+        let Some(spec) = std::env::var(STATSD_ADDR_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let dest = spec.to_socket_addrs()?.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{STATSD_ADDR_ENV}={spec:?} resolved to no socket address"),
+            )
+        })?;
+        Self::bind(dest).map(Some)
+    }
+
+    /// Encode the current `reg` state and push it to the StatsD server as one or
+    /// more UDP datagrams (split on line boundaries to respect
+    /// [`STATSD_MAX_DATAGRAM`]). Advances the internal delta snapshot.
+    ///
+    /// Returns the total bytes sent — `0` when the datagram is empty (metrics
+    /// disabled, or no counter changes and — impossible in practice — no gauges).
+    ///
+    /// # Errors
+    /// Returns the first [`std::io::Error`] from `send_to`.
+    pub fn push_once(&mut self, reg: &MetricsRegistry) -> io::Result<usize> {
+        let datagram = self.encoder.encode(reg);
+        if datagram.is_empty() {
+            return Ok(0);
+        }
+        let mut sent = 0;
+        for chunk in pack_statsd_lines(&datagram, STATSD_MAX_DATAGRAM) {
+            sent += self.socket.send_to(chunk.as_bytes(), self.target)?;
+        }
+        Ok(sent)
+    }
+
+    /// The local address the sender socket is bound to.
+    ///
+    /// # Errors
+    /// Returns any [`std::io::Error`] from the underlying `local_addr` call.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,5 +872,85 @@ mod tests {
             r.commits_total.inc();
             assert!(StatsdEncoder::new().encode(&r).is_empty());
         }
+    }
+
+    #[test]
+    fn pack_statsd_lines_splits_on_line_boundaries() {
+        let dg = "aaaa\nbbbb\ncccc\n"; // three 5-byte (incl \n) lines
+        // max=10 fits two lines (10 bytes) per datagram, so 2 datagrams: 2 + 1.
+        let chunks = pack_statsd_lines(dg, 10);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], "aaaa\nbbbb\n");
+        assert_eq!(chunks[1], "cccc\n");
+        for c in &chunks {
+            assert!(c.len() <= 10, "chunk over max: {c:?}");
+        }
+        // An oversized single line is emitted on its own rather than dropped.
+        let big = "x".repeat(50);
+        let chunks = pack_statsd_lines(&format!("{big}\n"), 10);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], format!("{big}\n"));
+    }
+
+    #[test]
+    fn statsd_pusher_sends_to_loopback_server() {
+        use std::net::UdpSocket;
+        use std::time::Duration;
+
+        // A loopback UDP receiver stands in for the "local statsd server" (AC#6).
+        let server = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set timeout");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let mut pusher = StatsdPusher::bind(server_addr).expect("bind pusher");
+        // Sender bound its own ephemeral port, distinct from the server's.
+        assert_ne!(pusher.local_addr().unwrap(), server_addr);
+
+        let reg = MetricsRegistry::default();
+        reg.commits_total.inc_by(7);
+        reg.conflicts_rebased_total.inc_by(3);
+        reg.commit_duration_seconds.observe(0.004);
+        reg.active_writers.set(2);
+
+        let sent = pusher.push_once(&reg).expect("push_once");
+        assert!(sent > 0);
+
+        let mut buf = [0u8; 2048];
+        let (n, from) = server.recv_from(&mut buf).expect("recv datagram");
+        // The sender bound the wildcard address (0.0.0.0), so the kernel picks
+        // 127.0.0.1 as the loopback source IP; only the source *port* is
+        // guaranteed to match the sender socket's bound port.
+        assert_eq!(from.port(), pusher.local_addr().unwrap().port());
+        let text = std::str::from_utf8(&buf[..n]).expect("utf8 datagram");
+
+        // First push carries cumulative counters as deltas, gauges absolute.
+        assert!(text.contains("fsqlite.commits_total:7|c\n"), "{text}");
+        assert!(
+            text.contains("fsqlite.conflicts_total:3|c|#response:rebased\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fsqlite.commit_duration_seconds.count:1|c\n"),
+            "{text}"
+        );
+        assert!(text.contains("fsqlite.active_writers:2|g\n"), "{text}");
+
+        // Second push with no new counter activity: only gauges are re-sent.
+        let sent2 = pusher.push_once(&reg).expect("push_once 2");
+        assert!(sent2 > 0);
+        let (n2, _) = server.recv_from(&mut buf).expect("recv datagram 2");
+        let text2 = std::str::from_utf8(&buf[..n2]).expect("utf8 datagram 2");
+        assert!(!text2.contains("fsqlite.commits_total"), "{text2}");
+        assert!(text2.contains("fsqlite.active_writers:2|g\n"), "{text2}");
+    }
+
+    #[test]
+    fn statsd_pusher_from_env_is_ok() {
+        // Deterministic without mutating process env (unsafe in Rust 2024): in a
+        // default environment `FRANKENSQLITE_STATSD_ADDR` is unset ⇒ Ok(None);
+        // if an operator set it, `from_env` still resolves without erroring.
+        assert!(StatsdPusher::from_env().is_ok());
     }
 }
