@@ -1236,6 +1236,19 @@ fn quote_sql_value(value: &SqliteValue, use_unistr_quote: bool) -> String {
     match value {
         SqliteValue::Null => "NULL".to_owned(),
         SqliteValue::Integer(i) => i.to_string(),
+        // bd-quote-inf-literal-nk5la: quote() must emit a RE-PARSEABLE SQL
+        // literal, and "Inf" is not a recognized numeric literal. C SQLite renders
+        // infinity as a huge-exponent number here (which re-parses to ±Inf):
+        // quote(1e308*10) == '9.0e+999', quote(-1e308*10) == '-9.0e+999'. The
+        // general value->text path (CAST/concat/display) still uses "Inf" via
+        // format_sqlite_float, which matches stock there.
+        SqliteValue::Float(f) if f.is_infinite() => {
+            if f.is_sign_positive() {
+                "9.0e+999".to_owned()
+            } else {
+                "-9.0e+999".to_owned()
+            }
+        }
         SqliteValue::Float(f) => format_sqlite_float(*f),
         SqliteValue::Text(s) => quote_sql_text_literal(s.as_str(), use_unistr_quote),
         SqliteValue::Blob(b) => {
@@ -3805,6 +3818,23 @@ mod tests {
         assert_eq!(run(1.23456, 4_294_967_298), SqliteValue::Float(1.23));
         assert_eq!(run(1.23456, -4_294_967_295), SqliteValue::Float(1.2));
         assert_eq!(run(1.23456, 2), SqliteValue::Float(1.23)); // normal, no regression
+    }
+
+    #[test]
+    fn test_quote_infinity_bd_nk5la() {
+        // bd-quote-inf-literal-nk5la. Oracle: sqlite3 3.46.1. quote() must emit a
+        // RE-PARSEABLE literal, so infinity renders as '9.0e+999'/'-9.0e+999'
+        // (which re-parse to +/-Inf), NOT 'Inf'. Finite values are unchanged.
+        let q = |v: SqliteValue| -> String {
+            match QuoteFunc.invoke(&[v]).unwrap() {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        assert_eq!(q(SqliteValue::Float(f64::INFINITY)), "9.0e+999");
+        assert_eq!(q(SqliteValue::Float(f64::NEG_INFINITY)), "-9.0e+999");
+        assert_eq!(q(SqliteValue::Float(1.5)), "1.5"); // finite unchanged
+        assert_eq!(q(SqliteValue::Integer(42)), "42");
     }
 
     #[test]
