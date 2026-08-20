@@ -7775,9 +7775,15 @@ impl VdbeEngine {
             return Ok(());
         }
 
+        // bd-1dp9.6.7.11.2: reuse one buffer across the loop instead of a fresh
+        // `Vec` allocation per iteration (the owned `payload()` churn). The
+        // decoded `values` are owned (parse_record copies out), so the buffer is
+        // free to be cleared and refilled next iteration.
+        let mut key_buf = Vec::new();
         loop {
-            let key = sc.cursor.payload(&sc.cx).await?;
-            let values = parse_record(&key).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            key_buf.clear();
+            sc.cursor.payload_into(&sc.cx, &mut key_buf).await?;
+            let values = parse_record(&key_buf).ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "REPLACE cleanup encountered a malformed secondary-index record".to_owned(),
             })?;
             let entry_rowid = values
@@ -18690,8 +18696,12 @@ async fn find_conflicting_rowid_in_index_collated(
         return Ok(None);
     }
 
+    // bd-1dp9.6.7.11.2: reuse one buffer across the loop instead of a fresh `Vec`
+    // per iteration; `existing_values` are owned (parse_record copies out).
+    let mut existing_key = Vec::new();
     loop {
-        let existing_key = sc.cursor.payload(&sc.cx).await?;
+        existing_key.clear();
+        sc.cursor.payload_into(&sc.cx, &mut existing_key).await?;
         let existing_values = parse_record(&existing_key).ok_or_else(|| {
             FrankenError::internal(
                 "find_conflicting_rowid_in_index_collated: malformed index entry record",
