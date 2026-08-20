@@ -42,6 +42,12 @@ fn values_columnn_in_scalar_subquery_matches_stock() {
             "SELECT (SELECT sum(column1) FROM (VALUES (1,'x'),(2,'y'),(4,'y')) WHERE column2='y')",
             // Unaliased nested derived table (subquery, not VALUES).
             "SELECT (SELECT sum(column1) FROM (SELECT column1 FROM (VALUES (1),(2),(3)) WHERE column1 > 1))",
+            // Anonymous COMPOUND and ORDER-BY derived tables with a named column
+            // `x` — the same anonymous-subquery path, so the sentinel covers them.
+            "SELECT (SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1))",
+            "SELECT (SELECT sum(x) FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 3))",
+            "SELECT (SELECT max(x) FROM (SELECT 5 x UNION SELECT 9 EXCEPT SELECT 1))",
+            "SELECT (SELECT sum(x) FROM (SELECT 2 x UNION SELECT 1 ORDER BY x))",
             // Regression guards — these already worked and must stay correct.
             "SELECT (SELECT count(*) FROM (VALUES (1),(2)))",
             "WITH t(x) AS (VALUES (1),(2),(3)) SELECT (SELECT sum(x) FROM t)",
