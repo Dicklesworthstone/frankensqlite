@@ -1,4 +1,4 @@
-// DRAFT (bd-1mcjr L6) — no build performed; apply during the next build window.
+// DRAFT (bd-1mcjr L6) — NOT applied, NOT built. Reference spec only.
 // Fix for: interpreted INSTEAD-OF view-DML numbers `?` PER-CLAUSE from 1, whereas
 // C SQLite numbers `?` GLOBALLY in text order (WITH → source/SET → WHERE →
 // RETURNING). Root cause recorded on bd-1mcjr / e315b0645.
@@ -188,7 +188,7 @@ fn bind_placeholders_in_delete_statement(
 //     bind_placeholders_in_delete_statement / resolved_delete.
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PART 3 — verification plan (run when builds resume):
+// PART 3 — verification steps (unbuilt; listed for whoever applies this spec):
 //   * Keeper (crates/fsqlite-core/tests, oracle = rusqlite 3.53 via a param-bound
 //     harness — divergence_hunt uses NO params, so add a small #[test] that binds):
 //       CREATE TABLE t(a,b,c); CREATE VIEW v AS SELECT * FROM t;
