@@ -67,7 +67,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-#[cfg(test)]
 use std::time::Duration;
 
 #[cfg(test)]
