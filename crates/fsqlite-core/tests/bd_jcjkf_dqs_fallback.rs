@@ -103,3 +103,46 @@ fn dqs_single_quote_in_name_is_escaped() {
         assert_eq!(r[0].values()[0], SqliteValue::Text("a'b".into()));
     });
 }
+
+/// bd-82jdw (DQS shape 3): a double-quoted identifier used as an INSERT VALUES
+/// value falls back to a string literal (was silently NULL).
+///
+/// IGNORED: a simple `INSERT ... VALUES(...)` takes the prepared fast lane
+/// (ad_hoc_execute_supports_prepared_reuse -> VDBE), which still resolves a bare
+/// column to NULL. The interpreted-path fix (evaluate_insert_source_row now
+/// errors "no such column") lands, but completing shape 3 needs a proactive DQS
+/// splice at the execute entry (or a VDBE-codegen error). Tracked on bd-82jdw.
+#[ignore = "bd-82jdw: prepared fast-lane INSERT VALUES still NULLs a bare column"]
+#[test]
+fn dqs_shape3_insert_values_double_quoted_is_string() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t(c TEXT);").await.unwrap();
+
+        conn.execute("INSERT INTO t VALUES(\"litstr\");").await.unwrap();
+        let r = conn.query("SELECT c FROM t;").await.unwrap();
+        assert_eq!(r[0].values()[0], SqliteValue::Text("litstr".into()));
+    });
+}
+
+/// bd-82jdw: an UNQUOTED bare identifier in a VALUES row is a stock error
+/// (no such column) — not silently NULL, and not a DQS string.
+///
+/// IGNORED for the same prepared-fast-lane reason as above: the interpreted
+/// path errors correctly, but the prepared lane still returns NULL. bd-82jdw.
+#[ignore = "bd-82jdw: prepared fast-lane INSERT VALUES still NULLs a bare column"]
+#[test]
+fn dqs_shape3_insert_values_unquoted_bare_column_errors() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t(c TEXT);").await.unwrap();
+
+        let r = conn.execute("INSERT INTO t VALUES(foo);").await;
+        assert!(
+            r.is_err(),
+            "an unquoted bare column in VALUES must error (no such column), got {r:?}"
+        );
+        let rows = conn.query("SELECT count(*) FROM t;").await.unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+    });
+}

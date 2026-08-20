@@ -47129,6 +47129,23 @@ impl Connection {
         let empty_col_map: &[(String, String, bool)] = &[];
         let mut values = Vec::with_capacity(row_exprs.len());
         for expr in row_exprs {
+            // bd-82jdw (DQS shape 3): a bare column reference in a VALUES row is
+            // never resolvable — a VALUES row has no source row. Stock SQLite
+            // errors "no such column: X" for an unquoted one, and (under the
+            // DQS-ON default) treats a double-quoted one as a STRING LITERAL.
+            // Erroring here instead of the prior silent NULL matches stock for
+            // the unquoted case AND lets the DQS-ON rewrite-retry at the
+            // statement entry splice a double-quoted `"X"` -> `'X'` (bd-jcjkf).
+            // The error precedes any row write, so the retry cannot double an
+            // effect. (Nested bare refs like `VALUES(1 + "x")` stay a follow-up.)
+            if let Expr::Column(col_ref, _) = expr {
+                if col_ref.table.is_none() {
+                    return Err(FrankenError::Internal(format!(
+                        "no such column: {}",
+                        col_ref.column
+                    )));
+                }
+            }
             values.push(
                 self.eval_expr_with_subqueries(expr, empty_row, empty_col_map, params)
                     .await?,
