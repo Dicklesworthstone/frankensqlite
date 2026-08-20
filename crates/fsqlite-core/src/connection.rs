@@ -71170,7 +71170,7 @@ impl Connection {
                         // Build the entries in creation order first so the hidden
                         // WITHOUT ROWID PRIMARY KEY auto-index can be spliced in at
                         // its canonical ordinal before the reversal below.
-                        let mut entries: Vec<(String, i64, &'static str)> = t
+                        let mut entries: Vec<(String, i64, &'static str, i64)> = t
                             .indexes
                             .iter()
                             .map(|idx| {
@@ -71187,7 +71187,11 @@ impl Connection {
                                 } else {
                                     "c"
                                 };
-                                (idx.name.clone(), i64::from(idx.is_unique), origin)
+                                // bd-pragma-index-list-partial-0lqvb: the `partial`
+                                // column is 1 for a partial index (created WITH a
+                                // WHERE clause), matching stock.
+                                let partial = i64::from(idx.where_clause.is_some());
+                                (idx.name.clone(), i64::from(idx.is_unique), origin, partial)
                             })
                             .collect();
 
@@ -71213,12 +71217,12 @@ impl Connection {
                                 let name = format!("sqlite_autoindex_{}_{pk_ordinal}", t.name);
                                 let pos = entries
                                     .iter()
-                                    .position(|(nm, _, _)| {
+                                    .position(|(nm, _, _, _)| {
                                         parse_autoindex_ordinal(nm, &t.name)
                                             .is_some_and(|o| o > pk_ordinal)
                                     })
                                     .unwrap_or(entries.len());
-                                entries.insert(pos, (name, 1, "pk"));
+                                entries.insert(pos, (name, 1, "pk", 0));
                             }
                         }
 
@@ -71226,13 +71230,13 @@ impl Connection {
                             .iter()
                             .rev()
                             .enumerate()
-                            .map(|(seq, (name, is_unique, origin))| Row {
+                            .map(|(seq, (name, is_unique, origin, partial))| Row {
                                 values: vec![
                                     SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
                                     SqliteValue::Text(name.clone().into()),
                                     SqliteValue::Integer(*is_unique),
                                     SqliteValue::Text((*origin).into()),
-                                    SqliteValue::Integer(0),
+                                    SqliteValue::Integer(*partial),
                                 ],
                             })
                             .collect();
