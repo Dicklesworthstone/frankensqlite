@@ -20177,8 +20177,21 @@ fn codegen_insert_values(
             ));
         }
 
-        // Emit value expressions into registers.
+        // Emit value expressions into registers. A bare column reference in a
+        // VALUES row is never resolvable — a VALUES row has no source row — so
+        // stock SQLite errors "no such column: X" rather than resolving it to
+        // NULL (bd-xxqg5). DQS-ON double-quoted values are already rewritten to
+        // string literals before codegen (bd-82jdw dqs_proactive_rewrite), so
+        // only an unquoted bare column can reach here.
         for (i, val_expr) in row_values.iter().enumerate() {
+            if let Expr::Column(col_ref, _) = val_expr
+                && col_ref.table.is_none()
+            {
+                return Err(CodegenError::ColumnNotFound {
+                    table: table.name.clone(),
+                    column: col_ref.column.to_string(),
+                });
+            }
             let reg = source_regs + i as i32;
             emit_expr(b, val_expr, reg, None);
         }

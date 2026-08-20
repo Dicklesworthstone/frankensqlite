@@ -153,3 +153,23 @@ fn dqs_shape3_insert_values_splice_spares_table_name() {
         assert_eq!(r[0].values()[0], SqliteValue::Text("lit".into()));
     });
 }
+
+/// bd-xxqg5: an UNQUOTED bare identifier used as an INSERT VALUES value is a
+/// stock error ("no such column"), not a silently-inserted NULL. (The
+/// double-quoted DQS case is bd-82jdw's proactive splice; this is the
+/// unquoted-typo case, caught in the VDBE INSERT-VALUES codegen.)
+#[test]
+fn insert_values_unquoted_bare_column_errors_bd_xxqg5() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t(c TEXT);").await.unwrap();
+
+        let r = conn.execute("INSERT INTO t VALUES(foo);").await;
+        assert!(
+            r.is_err(),
+            "an unquoted bare column in VALUES must error (no such column), got {r:?}"
+        );
+        let rows = conn.query("SELECT count(*) FROM t;").await.unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+    });
+}
