@@ -13,10 +13,10 @@ wasm = ["fsqlite-pager/wasm"]
 bench-internals = []
 
 [dependencies]
-fsqlite-types = { path = "../fsqlite-types", version = "0.3.0", default-features = false }
+fsqlite-types = { workspace = true, default-features = false }
 fsqlite-error = { workspace = true }
 fsqlite-func = { workspace = true }
-fsqlite-pager = { version = "0.3.0", path = "../fsqlite-pager", default-features = false }
+fsqlite-pager = { workspace = true, default-features = false }
 tracing = { workspace = true }
 hashbrown = { workspace = true }
 serde = { workspace = true }

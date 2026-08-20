@@ -52,18 +52,18 @@ ext-rtree = [
 ]
 
 [dependencies]
-fsqlite-types = { path = "../fsqlite-types", version = "0.3.0", default-features = false }
+fsqlite-types = { workspace = true, default-features = false }
 fsqlite-error = { workspace = true }
-fsqlite-vfs = { version = "0.3.0", path = "../fsqlite-vfs", default-features = false }
-fsqlite-pager = { version = "0.3.0", path = "../fsqlite-pager", default-features = false }
-fsqlite-wal = { version = "0.3.0", path = "../fsqlite-wal", default-features = false }
-fsqlite-mvcc = { version = "0.3.0", path = "../fsqlite-mvcc", default-features = false }
+fsqlite-vfs = { workspace = true, default-features = false }
+fsqlite-pager = { workspace = true, default-features = false }
+fsqlite-wal = { workspace = true, default-features = false }
+fsqlite-mvcc = { workspace = true, default-features = false }
 fsqlite-observability = { workspace = true }
-fsqlite-btree = { version = "0.3.0", path = "../fsqlite-btree", default-features = false }
+fsqlite-btree = { workspace = true, default-features = false }
 fsqlite-ast = { workspace = true }
 fsqlite-parser = { workspace = true }
-fsqlite-planner = { version = "0.3.0", path = "../fsqlite-planner", default-features = false }
-fsqlite-vdbe = { version = "0.3.0", path = "../fsqlite-vdbe", default-features = false }
+fsqlite-planner = { workspace = true, default-features = false }
+fsqlite-vdbe = { workspace = true, default-features = false }
 fsqlite-func = { workspace = true }
 fsqlite-ext-json = { workspace = true, optional = true }
 fsqlite-ext-fts5 = { workspace = true, optional = true }

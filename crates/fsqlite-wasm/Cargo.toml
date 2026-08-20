@@ -44,12 +44,12 @@ tracing = [
 console_error_panic_hook = { version = "0.1", optional = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-vfs = { version = "0.3.0", path = "../fsqlite-vfs", default-features = false, features = ["wasm"] }
+fsqlite-vfs = { workspace = true, default-features = false, features = ["wasm"] }
 fsqlite-ast = { workspace = true }
 fsqlite-parser = { workspace = true }
-fsqlite-planner = { version = "0.3.0", path = "../fsqlite-planner", default-features = false, features = ["wasm"] }
+fsqlite-planner = { workspace = true, default-features = false, features = ["wasm"] }
 fsqlite-func = { workspace = true }
-fsqlite-pager = { version = "0.3.0", path = "../fsqlite-pager", default-features = false, features = ["wasm"] }
+fsqlite-pager = { workspace = true, default-features = false, features = ["wasm"] }
 js-sys = "0.3.102"
 wasm-bindgen = "0.2.125"
 # Required by `wasm_bindgen`'s codegen for `async fn` exports (they lower to
@@ -57,20 +57,20 @@ wasm-bindgen = "0.2.125"
 wasm-bindgen-futures = "0.4"
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "linux"))'.dependencies]
-fsqlite-core = { version = "0.3.0", path = "../fsqlite-core", default-features = false, features = ["linux-asupersync-uring"] }
+fsqlite-core = { workspace = true, default-features = false, features = ["linux-asupersync-uring"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))'.dependencies]
-fsqlite-core = { version = "0.3.0", path = "../fsqlite-core", default-features = false, features = ["native"] }
+fsqlite-core = { workspace = true, default-features = false, features = ["native"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 asupersync = { workspace = true }
-fsqlite-core = { version = "0.3.0", path = "../fsqlite-core", default-features = false, features = ["wasm"] }
+fsqlite-core = { workspace = true, default-features = false, features = ["wasm"] }
 tracing = { workspace = true, optional = true, features = ["release_max_level_error"] }
 tracing-wasm = { version = "0.2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-fsqlite-btree = { version = "0.3.0", path = "../fsqlite-btree", default-features = false, features = ["wasm"] }
-fsqlite-vdbe = { version = "0.3.0", path = "../fsqlite-vdbe", default-features = false, features = ["wasm"] }
+fsqlite-btree = { workspace = true, default-features = false, features = ["wasm"] }
+fsqlite-vdbe = { workspace = true, default-features = false, features = ["wasm"] }
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
 wasm-bindgen-test = "0.3.75"
 

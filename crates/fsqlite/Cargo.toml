@@ -11,8 +11,8 @@ asupersync = { workspace = true, optional = true }
 futures-lite = { workspace = true, optional = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-core = { version = "0.3.0", path = "../fsqlite-core", default-features = false }
-fsqlite-vfs = { version = "0.3.0", path = "../fsqlite-vfs", default-features = false }
+fsqlite-core = { workspace = true, default-features = false }
+fsqlite-vfs = { workspace = true, default-features = false }
 fsqlite-ext-json = { workspace = true, optional = true }
 fsqlite-ext-fts5 = { workspace = true, optional = true }
 fsqlite-ext-fts3 = { workspace = true, optional = true }

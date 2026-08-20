@@ -25,9 +25,9 @@ bench-internals = [
 
 [dependencies]
 asupersync = { workspace = true }
-fsqlite = { path = "../fsqlite", version = "0.3.0", default-features = false, features = ["json", "fts5", "rtree"] }
+fsqlite = { workspace = true, default-features = false, features = ["json", "fts5", "rtree"] }
 fsqlite-btree = { workspace = true }
-fsqlite-core = { path = "../fsqlite-core", version = "0.3.0", default-features = false }
+fsqlite-core = { workspace = true, default-features = false }
 # Regular (not dev) dependency: mt-mvcc-bench reads the in-process registry
 # commit-lock counters (registry_commit_lock_metrics) after each writer arm.
 # Already in the dependency graph via fsqlite-core, so this adds visibility,
@@ -37,7 +37,7 @@ fsqlite-error = { workspace = true }
 fsqlite-harness = { workspace = true }
 fsqlite-parser = { workspace = true }
 fsqlite-vdbe = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.3.0", default-features = false }
+fsqlite-vfs = { workspace = true, default-features = false }
 fsqlite-types = { workspace = true }
 fsqlite-wal = { workspace = true }
 ftui = { workspace = true, features = ["crossterm"], optional = true }
