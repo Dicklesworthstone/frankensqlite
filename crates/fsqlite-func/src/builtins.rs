@@ -3754,6 +3754,38 @@ mod tests {
         assert_eq!(run(&TrimFunc, &[t("  abc  ")]), t("abc"));
     }
 
+    #[test]
+    fn test_hex_unhex_char_unicode_oracle_edges_2026_08() {
+        // Oracle: sqlite3 3.46.1. hex() coerces to the argument's text/blob bytes
+        // (uppercase); unhex() NULLs on odd length / non-hex and takes an ignore
+        // set; char() maps codepoints (incl. beyond BMP) to UTF-8, zero args ->
+        // empty; unicode() returns the first codepoint, empty string -> NULL.
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let int = SqliteValue::Integer;
+        let blob = |b: &[u8]| SqliteValue::Blob(std::sync::Arc::from(b));
+        let run = |f: &dyn ScalarFunction, args: &[SqliteValue]| -> SqliteValue { f.invoke(args).unwrap() };
+
+        // hex.
+        assert_eq!(run(&HexFunc, &[t("abc")]), t("616263"));
+        assert_eq!(run(&HexFunc, &[blob(&[0x00, 0xFF])]), t("00FF"));
+        assert_eq!(run(&HexFunc, &[int(255)]), t("323535")); // integer -> text "255" -> hex
+        // unhex: 2-arg ignore-set; NULL on odd length / non-hex.
+        assert_eq!(run(&UnhexFunc, &[t("414243")]), blob(b"ABC"));
+        assert_eq!(run(&UnhexFunc, &[t("4142"), t("")]), blob(b"AB"));
+        assert_eq!(run(&UnhexFunc, &[t("zz")]), SqliteValue::Null);
+        assert_eq!(run(&UnhexFunc, &[t("4")]), SqliteValue::Null);
+        // char: codepoints -> UTF-8, incl. beyond the BMP; zero args -> empty.
+        assert_eq!(run(&CharFunc, &[int(65), int(66), int(67)]), t("ABC"));
+        assert_eq!(run(&CharFunc, &[int(0x1_F600)]), t("😀"));
+        assert_eq!(run(&CharFunc, &[]), t(""));
+        // unicode: first codepoint; empty string -> NULL.
+        assert_eq!(run(&UnicodeFunc, &[t("A")]), int(65));
+        assert_eq!(run(&UnicodeFunc, &[t("€")]), int(8364));
+        assert_eq!(run(&UnicodeFunc, &[t("")]), SqliteValue::Null);
+        // typeof.
+        assert_eq!(run(&TypeofFunc, &[SqliteValue::Float(1.0)]), t("real"));
+    }
+
     fn assert_wrong_arg_count(registry: &FunctionRegistry, name: &str, arity: i32) {
         let function = registry
             .find_scalar(name, arity)
