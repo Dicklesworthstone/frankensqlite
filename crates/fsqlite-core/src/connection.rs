@@ -63236,6 +63236,20 @@ impl Connection {
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // bd-1mcjr L6: pre-resolve placeholders in global text order so the
+        // interpreted clause processors below see only literals (they otherwise
+        // renumber `?` per clause from 1, diverging from stock's global numbering).
+        let resolved_insert;
+        let (insert, params) = match params {
+            Some(p) => {
+                let mut cloned = insert.clone();
+                let mut bind_state = BindParamState::default();
+                bind_placeholders_in_insert_statement(&mut cloned, &mut bind_state, p)?;
+                resolved_insert = cloned;
+                (&resolved_insert, None)
+            }
+            None => (insert, params),
+        };
         let view_name = insert.table.name.clone();
         let column_names = self.view_trigger_column_names(&view_name)?;
         let new_rows = self
@@ -63269,6 +63283,21 @@ impl Connection {
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // bd-1mcjr L6: pre-resolve placeholders in global text order (WITH → SET →
+        // FROM → WHERE → RETURNING) so the interpreted clause processors below —
+        // including select_matching_rows' WHERE, which otherwise re-numbers `?`
+        // from 1 — see only literals, matching stock's global numbering.
+        let resolved_update;
+        let (update, params) = match params {
+            Some(p) => {
+                let mut cloned = update.clone();
+                let mut bind_state = BindParamState::default();
+                bind_placeholders_in_update_statement(&mut cloned, &mut bind_state, p)?;
+                resolved_update = cloned;
+                (&resolved_update, None)
+            }
+            None => (update, params),
+        };
         let view_name = update.table.name.name.clone();
         let column_names = self.view_trigger_column_names(&view_name)?;
         let matched_rows = self
@@ -63346,6 +63375,20 @@ impl Connection {
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // bd-1mcjr L6: pre-resolve placeholders in global text order (WITH → WHERE →
+        // RETURNING) so the interpreted clause processors below see only literals
+        // (they otherwise renumber `?` per clause from 1, diverging from stock).
+        let resolved_delete;
+        let (delete, params) = match params {
+            Some(p) => {
+                let mut cloned = delete.clone();
+                let mut bind_state = BindParamState::default();
+                bind_placeholders_in_delete_statement(&mut cloned, &mut bind_state, p)?;
+                resolved_delete = cloned;
+                (&resolved_delete, None)
+            }
+            None => (delete, params),
+        };
         let view_name = delete.table.name.name.clone();
         let column_names = self.view_trigger_column_names(&view_name)?;
         let old_rows = self.collect_delete_trigger_rows(delete, params).await?;
@@ -134564,6 +134607,134 @@ fn bind_placeholders_in_expr(
         Expr::Placeholder(placeholder, span) => {
             let literal = bind_placeholder_to_literal(placeholder, bind_state, params)?;
             *expr = Expr::Literal(literal, *span);
+        }
+    }
+    Ok(())
+}
+
+/// bd-1mcjr L6: bind every `?`/`?N`/`:name` placeholder in a RESULT-column list
+/// (RETURNING / SELECT projection), threading the shared counter in list order.
+fn bind_placeholders_in_result_columns(
+    columns: &mut [ResultColumn],
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    for column in columns {
+        if let ResultColumn::Expr { expr, .. } = column {
+            bind_placeholders_in_expr(expr, bind_state, params)?;
+        }
+    }
+    Ok(())
+}
+
+/// bd-1mcjr L6: thread ONE running `BindParamState` across an INSERT statement in
+/// C-SQLite text order — WITH → source (VALUES rows / SELECT) → ON CONFLICT
+/// (upsert) → RETURNING — so `?` numbering matches stock. Placeholders are
+/// substituted with their bound literal in place.
+fn bind_placeholders_in_insert_statement(
+    insert: &mut fsqlite_ast::InsertStatement,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    if let Some(with_clause) = &mut insert.with {
+        for cte in &mut with_clause.ctes {
+            bind_placeholders_in_select_statement(&mut cte.query, bind_state, params)?;
+        }
+    }
+    match &mut insert.source {
+        fsqlite_ast::InsertSource::Values(rows) => {
+            for row in rows {
+                for value in row {
+                    bind_placeholders_in_expr(value, bind_state, params)?;
+                }
+            }
+        }
+        fsqlite_ast::InsertSource::Select(select) => {
+            bind_placeholders_in_select_statement(select, bind_state, params)?;
+        }
+        fsqlite_ast::InsertSource::DefaultValues => {}
+    }
+    for upsert in &mut insert.upsert {
+        if let Some(target) = &mut upsert.target
+            && let Some(where_clause) = &mut target.where_clause
+        {
+            bind_placeholders_in_expr(where_clause, bind_state, params)?;
+        }
+        if let fsqlite_ast::UpsertAction::Update {
+            assignments,
+            where_clause,
+        } = &mut upsert.action
+        {
+            for assignment in assignments {
+                bind_placeholders_in_expr(&mut assignment.value, bind_state, params)?;
+            }
+            if let Some(where_clause) = where_clause {
+                bind_placeholders_in_expr(where_clause, bind_state, params)?;
+            }
+        }
+    }
+    bind_placeholders_in_result_columns(&mut insert.returning, bind_state, params)
+}
+
+/// bd-1mcjr L6: thread ONE running `BindParamState` across an UPDATE statement in
+/// C-SQLite text order — WITH → SET → FROM → WHERE → RETURNING → ORDER BY → LIMIT.
+/// (RETURNING and ORDER BY/LIMIT are mutually exclusive in stock, so their
+/// relative order here is immaterial.)
+fn bind_placeholders_in_update_statement(
+    update: &mut fsqlite_ast::UpdateStatement,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    if let Some(with_clause) = &mut update.with {
+        for cte in &mut with_clause.ctes {
+            bind_placeholders_in_select_statement(&mut cte.query, bind_state, params)?;
+        }
+    }
+    for assignment in &mut update.assignments {
+        bind_placeholders_in_expr(&mut assignment.value, bind_state, params)?;
+    }
+    if let Some(from_clause) = &mut update.from {
+        bind_placeholders_in_from_clause(from_clause, bind_state, params)?;
+    }
+    if let Some(where_clause) = &mut update.where_clause {
+        bind_placeholders_in_expr(where_clause, bind_state, params)?;
+    }
+    bind_placeholders_in_result_columns(&mut update.returning, bind_state, params)?;
+    for ordering in &mut update.order_by {
+        bind_placeholders_in_expr(&mut ordering.expr, bind_state, params)?;
+    }
+    if let Some(limit_clause) = &mut update.limit {
+        bind_placeholders_in_expr(&mut limit_clause.limit, bind_state, params)?;
+        if let Some(offset) = &mut limit_clause.offset {
+            bind_placeholders_in_expr(offset, bind_state, params)?;
+        }
+    }
+    Ok(())
+}
+
+/// bd-1mcjr L6: thread ONE running `BindParamState` across a DELETE statement in
+/// C-SQLite text order — WITH → WHERE → RETURNING → ORDER BY → LIMIT.
+fn bind_placeholders_in_delete_statement(
+    delete: &mut fsqlite_ast::DeleteStatement,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    if let Some(with_clause) = &mut delete.with {
+        for cte in &mut with_clause.ctes {
+            bind_placeholders_in_select_statement(&mut cte.query, bind_state, params)?;
+        }
+    }
+    if let Some(where_clause) = &mut delete.where_clause {
+        bind_placeholders_in_expr(where_clause, bind_state, params)?;
+    }
+    bind_placeholders_in_result_columns(&mut delete.returning, bind_state, params)?;
+    for ordering in &mut delete.order_by {
+        bind_placeholders_in_expr(&mut ordering.expr, bind_state, params)?;
+    }
+    if let Some(limit_clause) = &mut delete.limit {
+        bind_placeholders_in_expr(&mut limit_clause.limit, bind_state, params)?;
+        if let Some(offset) = &mut limit_clause.offset {
+            bind_placeholders_in_expr(offset, bind_state, params)?;
         }
     }
     Ok(())
