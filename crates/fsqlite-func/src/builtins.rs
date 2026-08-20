@@ -2477,6 +2477,10 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
         }
         i += 1;
         if i >= chars.len() {
+            // A trailing bare `%` at the end of the format string stays literal
+            // in stock SQLite: printf('abc%') == 'abc%', printf('%') == '%'
+            // (bd-printf-incomplete-conversion-edge).
+            result.push('%');
             break;
         }
 
@@ -2572,7 +2576,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
         }
 
         if i >= chars.len() {
-            break;
+            // A `%` that consumed flags/width/precision but then hit EOF with no
+            // conversion char (printf('%5'), printf('%-'), printf('%.*'), ...) is
+            // an incomplete conversion: stock SQLite NULLs the whole call
+            // (bd-printf-incomplete-conversion-edge).
+            return Ok(None);
         }
 
         let spec = chars[i];
@@ -6490,6 +6498,43 @@ mod tests {
         assert_eq!(run(&[txt("%5d"), int(5)]), some("    5"));
         assert_eq!(run(&[txt("%-5d"), int(5)]), some("5    "));
         assert_eq!(run(&[txt("%.3d"), int(5)]), some("005"));
+    }
+
+    #[test]
+    fn test_printf_incomplete_conversion_edges_bd_ybftw() {
+        // bd-printf-incomplete-conversion-edge. Oracle: sqlite3 3.46.1.
+        // Two EOF edges of a `%` conversion diverge in opposite directions:
+        //  (1) a trailing BARE `%` (nothing consumed after it) stays LITERAL;
+        //  (2) a `%` that consumed flags/width/precision but then hit EOF with
+        //      no conversion char is incomplete and NULLs the whole call.
+        let f = FormatFunc;
+        let run = |args: &[SqliteValue]| -> Option<String> {
+            match f.invoke(args).unwrap() {
+                SqliteValue::Text(s) => Some(s.as_str().to_owned()),
+                SqliteValue::Null => None,
+                other => panic!("expected text or null, got {other:?}"),
+            }
+        };
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let some = |s: &str| Some(s.to_owned());
+
+        // (1) Trailing bare `%` -> literal `%`.
+        assert_eq!(run(&[txt("%")]), some("%"));
+        assert_eq!(run(&[txt("abc%")]), some("abc%"));
+        // A bare `%` ignores any surplus argument, still literal.
+        assert_eq!(run(&[txt("x%"), SqliteValue::Integer(9)]), some("x%"));
+        // `%%` is a COMPLETE escape (not incomplete) and is unaffected.
+        assert_eq!(run(&[txt("%%")]), some("%"));
+        assert_eq!(run(&[txt("abc%%def")]), some("abc%def"));
+
+        // (2) `%` + flags/width/precision + EOF (no spec) -> NULL.
+        for bad in [
+            "%5", "%-", "%.", "%+", "%#", "% ", "%05", "%-5", "%.3", "%5.3",
+        ] {
+            assert_eq!(run(&[txt(bad)]), None, "printf('{bad}') must be NULL");
+        }
+        // A literal prefix does not survive an incomplete trailing conversion.
+        assert_eq!(run(&[txt("abc%5")]), None);
     }
 
     #[test]
