@@ -399,20 +399,88 @@ fn gh244_autocommit_attached_write_unchanged() {
     });
 }
 
+// bd-qahvh: savepoint fan-out to attached participants. These FLIP the former
+// gh244_savepoint_scoped_attached_write_still_errors (which asserted the write
+// errored). Expected values are stock SQLite semantics (one savepoint stack
+// across main + attached).
+
 #[test]
-fn gh244_savepoint_scoped_attached_write_still_errors() {
+fn gh244_qahvh_savepoint_rollback_to_undoes_attached_write() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
         let f = open_with_attached_aux(dir.path()).await;
-        fx(&f, "BEGIN").await.unwrap();
-        fx(&f, "SAVEPOINT sp").await.unwrap();
-        // Savepoint fan-out is a follow-up; the attached write must still cleanly
-        // error (NotImplemented) rather than silently diverge cross-DB state.
-        let result = fx(&f, "UPDATE aux.t SET x=9").await;
-        assert!(
-            result.is_err(),
-            "bd-bsc69: a savepoint-scoped attached write must still error until \
-             savepoint participation lands"
+        // The child enrolls on its first attached write — HERE, AFTER `SAVEPOINT
+        // sp` — so this also exercises the lazy-enroll savepoint-stack replay.
+        for s in [
+            "BEGIN",
+            "SAVEPOINT sp",
+            "UPDATE aux.t SET x=9",
+            "ROLLBACK TO sp",
+            "COMMIT",
+        ] {
+            fx(&f, s)
+                .await
+                .unwrap_or_else(|e| panic!("bd-qahvh `{s}`: {e}"));
+        }
+        assert_eq!(
+            fq(&f, "SELECT x FROM aux.t").await.unwrap(),
+            vec![vec!["1".to_owned()]],
+            "bd-qahvh: ROLLBACK TO sp undoes the attached write (x stays 1); COMMIT continues"
+        );
+    });
+}
+
+#[test]
+fn gh244_qahvh_savepoint_release_keeps_attached_write() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = open_with_attached_aux(dir.path()).await;
+        // RELEASE merges the savepoint into the enclosing txn; the attached write
+        // survives and COMMIT persists it (x = 9).
+        for s in [
+            "BEGIN",
+            "SAVEPOINT sp",
+            "UPDATE aux.t SET x=9",
+            "RELEASE sp",
+            "COMMIT",
+        ] {
+            fx(&f, s)
+                .await
+                .unwrap_or_else(|e| panic!("bd-qahvh `{s}`: {e}"));
+        }
+        assert_eq!(
+            fq(&f, "SELECT x FROM aux.t").await.unwrap(),
+            vec![vec!["9".to_owned()]],
+            "bd-qahvh: RELEASE keeps the attached write; COMMIT persists x=9"
+        );
+    });
+}
+
+#[test]
+fn gh244_qahvh_nested_savepoint_partial_rollback() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = open_with_attached_aux(dir.path()).await;
+        // Nested: the child enrolls on the sp1 write, then sp2 is opened AFTER
+        // enroll (exercises fan-out to an already-enrolled child). ROLLBACK TO sp2
+        // undoes only the sp2 write; the sp1 write (x=2) survives to COMMIT.
+        for s in [
+            "BEGIN",
+            "SAVEPOINT sp1",
+            "UPDATE aux.t SET x=2",
+            "SAVEPOINT sp2",
+            "UPDATE aux.t SET x=3",
+            "ROLLBACK TO sp2",
+            "COMMIT",
+        ] {
+            fx(&f, s)
+                .await
+                .unwrap_or_else(|e| panic!("bd-qahvh `{s}`: {e}"));
+        }
+        assert_eq!(
+            fq(&f, "SELECT x FROM aux.t").await.unwrap(),
+            vec![vec!["2".to_owned()]],
+            "bd-qahvh: nested savepoint — sp2 write undone, sp1 write (x=2) kept"
         );
     });
 }

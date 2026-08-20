@@ -17542,18 +17542,18 @@ impl Connection {
     ///   diverge cross-DB state).
     async fn prepare_attached_target_write_in_explicit_transaction(
         &self,
-        action: &'static str,
+        _action: &'static str,
         schema: &str,
     ) -> Result<()> {
         if self.pager.is_readonly() {
             return Err(FrankenError::ReadOnly);
         }
         if self.in_transaction.get() {
-            if !self.savepoints.borrow().is_empty() {
-                return Err(FrankenError::NotImplemented(format!(
-                    "{action} against attached schema {schema} inside a savepoint is not yet supported"
-                )));
-            }
+            // bd-qahvh: an attached write inside a SAVEPOINT now participates in
+            // the outer transaction too. `ensure_attached_child_transaction`
+            // replays main's active savepoint stack onto a freshly-enrolled child
+            // so a later RELEASE / ROLLBACK TO on main fans out to a matching child
+            // savepoint (bd-bsc69 previously rejected this savepoint-scoped case).
             self.ensure_attached_child_transaction(schema).await?;
         }
         Ok(())
@@ -17563,11 +17563,26 @@ impl Connection {
     /// it participates in the outer explicit transaction. The child promotes to
     /// its default CONCURRENT mode.
     async fn ensure_attached_child_transaction(&self, schema: &str) -> Result<()> {
+        // bd-qahvh: snapshot main's active savepoint stack (the borrow is dropped
+        // before the await) so a child that enrolls AFTER those savepoints were
+        // opened replays them and thus owns a matching savepoint to RELEASE /
+        // ROLLBACK TO. SQLite runs ONE savepoint stack across main + attached;
+        // frank's lazy per-child transactions must reconstruct it on enroll.
+        let active_savepoints: Vec<String> = self
+            .savepoints
+            .borrow()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
         self.with_attached_connection_async(schema, async |child| {
             if !child.in_transaction.get() {
                 child
                     .execute_begin(fsqlite_ast::BeginStatement { mode: None })
                     .await?;
+                for name in &active_savepoints {
+                    let child_cx = child.op_cx()?;
+                    child.execute_savepoint_with_cx(&child_cx, name).await?;
+                }
             }
             Ok(())
         })
@@ -17622,6 +17637,56 @@ impl Connection {
                 );
             }
         }
+    }
+
+    /// bd-qahvh: open savepoint `name` on every enrolled attached participant so
+    /// each child's savepoint stack stays in lockstep with main's. No-op when
+    /// there are no participants, so the normal SAVEPOINT path is unaffected.
+    async fn savepoint_attached_participants(&self, cx: &Cx, name: &str) -> Result<()> {
+        for key in self.attached_transaction_participants() {
+            self.with_attached_connection_async(&key, async |child| {
+                child.execute_savepoint_with_cx(cx, name).await
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// bd-qahvh: RELEASE savepoint `name` on every enrolled participant, in
+    /// lockstep with main. No-op when there are no participants.
+    async fn release_attached_participants(&self, cx: &Cx, name: &str) -> Result<()> {
+        for key in self.attached_transaction_participants() {
+            self.with_attached_connection_async(&key, async |child| {
+                child.execute_release_with_cx(cx, name).await
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// bd-qahvh: ROLLBACK TO savepoint `name` on every enrolled participant so an
+    /// attached write made after the savepoint is undone in lockstep with main
+    /// while the child transaction (and the savepoint) survives. No-op when there
+    /// are no participants.
+    async fn rollback_to_savepoint_attached_participants(
+        &self,
+        cx: &Cx,
+        name: &str,
+    ) -> Result<()> {
+        for key in self.attached_transaction_participants() {
+            self.with_attached_connection_async(&key, async |child| {
+                child
+                    .execute_rollback_with_cx(
+                        cx,
+                        &fsqlite_ast::RollbackStatement {
+                            to_savepoint: Some(name.to_owned()),
+                        },
+                    )
+                    .await
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     fn attached_table_supports_last_insert_rowid(&self, table_name: &str) -> bool {
@@ -66638,13 +66703,16 @@ impl Connection {
             live_vtab_result?;
             live_vtab_registry_result?;
         }
-        // GH#244: after a full ROLLBACK completes (via any caller of this
-        // helper), unwind every attached participant enrolled during the
-        // transaction. ROLLBACK TO SAVEPOINT does not fan out — savepoint
-        // participation is a follow-up and never enrolls a child. `Box::pin`
-        // breaks the async cycle (this helper -> child.execute_rollback_with_cx
-        // -> here); it terminates at runtime because a child has no participants.
-        if rb.to_savepoint.is_none() {
+        // GH#244 / bd-qahvh: after the main ROLLBACK completes (via any caller of
+        // this helper), fan out to every attached participant enrolled during the
+        // transaction. A full ROLLBACK unwinds each child's transaction; a ROLLBACK
+        // TO SAVEPOINT undoes each child's writes since the savepoint while its
+        // transaction and savepoint survive. `Box::pin` breaks the async cycle
+        // (this helper -> child.execute_rollback_with_cx -> here); it terminates
+        // because a child has no participants of its own.
+        if let Some(sp_name) = rb.to_savepoint.as_deref() {
+            Box::pin(self.rollback_to_savepoint_attached_participants(cx, sp_name)).await?;
+        } else {
             Box::pin(self.rollback_attached_participants(cx)).await;
         }
         Ok(())
@@ -66822,6 +66890,11 @@ impl Connection {
             rowid_alloc_mark,
         });
         self.txn_metrics_set_savepoint_depth(self.savepoints.borrow().len());
+        // bd-qahvh: fan the new savepoint out to enrolled attached participants so
+        // their stacks mirror main's. `Box::pin` breaks the async recursion (this
+        // fn -> child.execute_savepoint_with_cx -> here); it terminates because a
+        // child has no participants of its own. No-op when none are enrolled.
+        Box::pin(self.savepoint_attached_participants(cx, name)).await?;
         Ok(())
     }
 
@@ -66890,6 +66963,11 @@ impl Connection {
         let depth = savepoints.len();
         drop(savepoints);
         self.txn_metrics_set_savepoint_depth(depth);
+        // bd-qahvh: RELEASE fans out to enrolled participants. The idx==0 implicit
+        // RELEASE-as-COMMIT above already delegated to execute_commit_with_cx
+        // (which fans out the commit), so this covers only the non-commit release.
+        // `Box::pin` breaks the async recursion; no-op when none are enrolled.
+        Box::pin(self.release_attached_participants(cx, name)).await?;
         Ok(())
     }
 
