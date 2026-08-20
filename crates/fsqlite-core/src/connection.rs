@@ -33891,19 +33891,35 @@ impl Connection {
             // so this only pays a cheap FROM-source scan on the common path.
             let rewritten_statement = self.rewrite_statement_bare_pragma_table_functions(statement);
             let statement: &Statement = rewritten_statement.as_ref();
-            // bd-l6-view-insert-subquery-numbering-2qtn7: globally number an INSERT's
-            // `?` placeholders (recursing into VALUES subqueries) BEFORE the
-            // pre-dispatch non-correlated-subquery fold runs. Otherwise a
-            // `(SELECT ?)` in a VALUES row is folded to a literal by re-numbering its
-            // `?` from 1 (binding param#1), and the enclosing counter never counts
-            // the subquery's slot — diverging from stock's global `?` numbering.
-            let insert_canonical_statement;
-            let statement: &Statement = if let Statement::Insert(insert) = statement {
-                insert_canonical_statement =
-                    Statement::Insert(canonicalize_insert_placeholders(insert)?);
-                &insert_canonical_statement
-            } else {
-                statement
+            // bd-l6-view-insert-subquery-numbering-2qtn7: globally number a DML
+            // statement's `?` placeholders (recursing into subqueries) BEFORE the
+            // pre-dispatch non-correlated-subquery fold runs. Otherwise a `(SELECT ?)`
+            // in a VALUES row / SET value / WHERE is folded to a literal by
+            // re-numbering its `?` from 1 (binding param#1), and the enclosing
+            // counter never counts the subquery's slot — diverging from stock's
+            // global `?` numbering (this silently mis-bound UPDATE ... WHERE to
+            // param#1, updating zero rows, and gave DELETE ... RETURNING the wrong
+            // param). The per-DML dispatch arms also canonicalize, but that runs
+            // AFTER the fold; doing it here — idempotent for already-`Numbered`
+            // placeholders — is what makes it precede the fold.
+            let dml_canonical_statement;
+            let statement: &Statement = match statement {
+                Statement::Insert(insert) => {
+                    dml_canonical_statement =
+                        Statement::Insert(canonicalize_insert_placeholders(insert)?);
+                    &dml_canonical_statement
+                }
+                Statement::Update(update) => {
+                    dml_canonical_statement =
+                        Statement::Update(canonicalize_update_placeholders(update)?);
+                    &dml_canonical_statement
+                }
+                Statement::Delete(delete) => {
+                    dml_canonical_statement =
+                        Statement::Delete(canonicalize_delete_placeholders(delete)?);
+                    &dml_canonical_statement
+                }
+                _ => statement,
             };
             self.refresh_select_schema_before_relation_validation(statement)
                 .await?;
@@ -133370,6 +133386,40 @@ fn canonicalize_update_placeholders(
         }
     }
 
+    Ok(normalized)
+}
+
+/// bd-l6-view-insert-subquery-numbering-2qtn7: number every `?` in a DELETE
+/// GLOBALLY in C-SQLite text order (WITH → WHERE → RETURNING → ORDER BY → LIMIT),
+/// recursing into subqueries, so a `(SELECT ?)` in the WHERE joins the global
+/// sequence instead of re-numbering from 1. Mirrors `canonicalize_update_placeholders`.
+fn canonicalize_delete_placeholders(
+    delete: &fsqlite_ast::DeleteStatement,
+) -> Result<fsqlite_ast::DeleteStatement> {
+    let mut normalized = delete.clone();
+    let mut bind_state = BindParamState::default();
+    if let Some(with_clause) = &mut normalized.with {
+        for cte in &mut with_clause.ctes {
+            canonicalize_select_placeholders_in_statement(&mut cte.query, &mut bind_state)?;
+        }
+    }
+    if let Some(where_clause) = &mut normalized.where_clause {
+        canonicalize_expr_placeholders(where_clause, &mut bind_state)?;
+    }
+    for column in &mut normalized.returning {
+        if let ResultColumn::Expr { expr, .. } = column {
+            canonicalize_expr_placeholders(expr, &mut bind_state)?;
+        }
+    }
+    for ordering in &mut normalized.order_by {
+        canonicalize_expr_placeholders(&mut ordering.expr, &mut bind_state)?;
+    }
+    if let Some(limit_clause) = &mut normalized.limit {
+        canonicalize_expr_placeholders(&mut limit_clause.limit, &mut bind_state)?;
+        if let Some(offset) = &mut limit_clause.offset {
+            canonicalize_expr_placeholders(offset, &mut bind_state)?;
+        }
+    }
     Ok(normalized)
 }
 

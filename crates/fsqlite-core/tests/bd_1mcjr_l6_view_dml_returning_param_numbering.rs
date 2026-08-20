@@ -192,3 +192,60 @@ fn l6_insert_subquery_non_view_general() {
         .await;
     });
 }
+
+#[test]
+fn l6_update_set_subquery_where_returning_global() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-l6-view-insert-subquery-numbering-2qtn7 (UPDATE arm): SET b=(SELECT ?=88)
+        // WHERE id=?=1 RETURNING b, ?=55. A per-scope renumber binds WHERE id to
+        // param#1 (=88) → matches no row → zero rows updated (frank was []).
+        agree_p(
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+                "INSERT INTO t VALUES (1, 10, 20)",
+            ],
+            "UPDATE t SET b = (SELECT ?) WHERE id = ? RETURNING b, ?",
+            &[iv(88), iv(1), iv(55)],
+            &[88, 1, 55],
+            "UPDATE SET-subquery / WHERE / RETURNING must number ? globally",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn l6_update_two_subqueries_global() {
+    asupersync::test_utils::run_test(|| async {
+        // SET a=(SELECT ?=41), b=(SELECT ?=42) WHERE id=?=1 RETURNING a, b, ?=43.
+        agree_p(
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+                "INSERT INTO t VALUES (1, 10, 20)",
+            ],
+            "UPDATE t SET a = (SELECT ?), b = (SELECT ?) WHERE id = ? RETURNING a, b, ?",
+            &[iv(41), iv(42), iv(1), iv(43)],
+            &[41, 42, 1, 43],
+            "UPDATE two SET-subqueries must number ? globally",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn l6_delete_where_subquery_returning_global() {
+    asupersync::test_utils::run_test(|| async {
+        // WHERE a=(SELECT ?=10) RETURNING id, ?=77. A per-scope renumber gives
+        // RETURNING ? param#1 (=10) instead of #2 (=77).
+        agree_p(
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)",
+                "INSERT INTO t VALUES (1, 10)",
+            ],
+            "DELETE FROM t WHERE a = (SELECT ?) RETURNING id, ?",
+            &[iv(10), iv(77)],
+            &[10, 77],
+            "DELETE WHERE-subquery / RETURNING must number ? globally",
+        )
+        .await;
+    });
+}
