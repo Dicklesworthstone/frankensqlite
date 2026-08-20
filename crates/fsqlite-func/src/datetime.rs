@@ -759,15 +759,24 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<(f64,
     let num_str = parts.next().ok_or(())?;
     let unit = parts.next().ok_or(())?.trim();
 
-    // SQLite uses exact math only if the value is an integer.
-    let num = if let Ok(n) = num_str.parse::<i64>() {
-        n
+    // SQLite splits a month/year modifier into an INTEGER count, applied by
+    // calendar month/year recomposition, plus a fractional remainder applied as
+    // FLAT days AFTER that recomposition: a fractional month adds `frac * 30`
+    // days, a fractional year adds `frac * 365` days, signed like the modifier
+    // (bd-datetime-fractional-month-year-ag5fo). So `+1.5 months` on 2020-01-15 is +1 month (→ 02-15) then +15
+    // days (→ 03-01), NOT `1.5 * average-month-length`. Integer-only values leave
+    // the fractional term at zero and take the pure calendar path unchanged.
+    let (int_num, num_frac) = if let Ok(n) = num_str.parse::<i64>() {
+        (n, 0.0_f64)
     } else if let Ok(f) = num_str.parse::<f64>() {
-        if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-            f as i64
-        } else {
+        let int_part = f.trunc();
+        if !f.is_finite() || int_part < i64::MIN as f64 || int_part > i64::MAX as f64 {
             return Err(());
         }
+        // `num_str` is the unsigned magnitude (the sign was stripped above), so
+        // `int_part >= 0` and `num_frac` is in [0, 1); the modifier `sign` gives
+        // both the recomposition direction and the fractional-day direction.
+        (int_part as i64, f - int_part)
     } else {
         return Err(());
     };
@@ -775,20 +784,19 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<(f64,
     let (y, mo, d) = jdn_to_ymd(jdn);
     let (h, mi, s, frac) = jdn_to_hms(jdn);
 
-    let total_months = match unit.trim_end_matches('s') {
+    let unit = unit.trim_end_matches('s');
+    let (total_months, frac_days) = match unit {
         "month" => {
-            if let Some(val) = num.checked_mul(sign) {
-                val
-            } else {
+            let Some(months) = int_num.checked_mul(sign) else {
                 return Ok(None);
-            }
+            };
+            (months, num_frac * sign as f64 * 30.0)
         }
         "year" => {
-            if let Some(val) = num.checked_mul(sign).and_then(|v| v.checked_mul(12)) {
-                val
-            } else {
+            let Some(months) = int_num.checked_mul(sign).and_then(|v| v.checked_mul(12)) else {
                 return Ok(None);
-            }
+            };
+            (months, num_frac * sign as f64 * 365.0)
         }
         _ => return Err(()),
     };
@@ -813,7 +821,7 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<(f64,
     // the reported `n_floor` overflow days to clamp back to end-of-month.
     let n_floor = compute_floor(new_y, new_mo, d);
     Ok(Some((
-        ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac),
+        ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac) + frac_days,
         n_floor,
     )))
 }
@@ -2047,6 +2055,120 @@ mod tests {
 
         assert_eq!(StrftimeFunc.invoke(&[]).unwrap(), SqliteValue::Null);
         assert_eq!(StrftimeFunc.invoke(&[null()]).unwrap(), SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_datetime_oracle_edges_2026_08() {
+        // Oracle: sqlite3 3.46.1. Deterministic (TZ-independent) date/time edge
+        // semantics — month/year overflow, floor, weekday, invalid dates, ISO
+        // 8601 week/year boundaries, and the newer strftime codes. Some(text)
+        // for a TEXT result, None for SQL NULL.
+        let date = |args: &[SqliteValue]| -> Option<String> {
+            match DateFunc.invoke(args).unwrap() {
+                SqliteValue::Text(t) => Some(t.as_str().to_owned()),
+                SqliteValue::Null => None,
+                other => panic!("date -> {other:?}"),
+            }
+        };
+        let dtime = |args: &[SqliteValue]| -> Option<String> {
+            match DateTimeFunc.invoke(args).unwrap() {
+                SqliteValue::Text(t) => Some(t.as_str().to_owned()),
+                SqliteValue::Null => None,
+                other => panic!("datetime -> {other:?}"),
+            }
+        };
+        let strf = |args: &[SqliteValue]| -> Option<String> {
+            match StrftimeFunc.invoke(args).unwrap() {
+                SqliteValue::Text(t) => Some(t.as_str().to_owned()),
+                SqliteValue::Null => None,
+                other => panic!("strftime -> {other:?}"),
+            }
+        };
+        let s = |x: &str| Some(x.to_owned());
+
+        // Month/year overflow normalizes forward (ceiling is the default).
+        assert_eq!(date(&[text("2020-01-31"), text("+1 month")]), s("2020-03-02"));
+        assert_eq!(
+            date(&[text("2020-01-31"), text("+1 month"), text("+1 month")]),
+            s("2020-04-02")
+        );
+        assert_eq!(date(&[text("2021-02-28"), text("+1 day")]), s("2021-03-01"));
+        assert_eq!(date(&[text("2020-02-29"), text("+1 year")]), s("2021-03-01"));
+        // A literal date validates day<=31 (NOT days-in-month), then JDN math
+        // normalizes: Feb 30 -> Mar 1.
+        assert_eq!(date(&[text("2020-02-30")]), s("2020-03-01"));
+        // `floor` rolls a month/year overflow back to the last valid day.
+        assert_eq!(
+            date(&[text("2020-01-31"), text("+1 month"), text("floor")]),
+            s("2020-02-29")
+        );
+        assert_eq!(
+            date(&[text("2020-02-29"), text("+1.0 year"), text("floor")]),
+            s("2021-02-28")
+        );
+        // start-of / weekday (0..=6; 7 is out of range -> NULL).
+        assert_eq!(date(&[text("2020-01-31"), text("start of month")]), s("2020-01-01"));
+        assert_eq!(date(&[text("2020-06-15"), text("weekday 0")]), s("2020-06-21"));
+        assert_eq!(date(&[text("2020-06-15"), text("weekday 6")]), s("2020-06-20"));
+        assert_eq!(date(&[text("2020-06-15"), text("weekday 7")]), None);
+        // Fractional month/year (bd-datetime-fractional-month-year-ag5fo): the integer part recomposes the
+        // calendar; the remainder adds FLAT days (30/month, 365/year) AFTER,
+        // signed like the modifier — NOT `value * average-month-length`.
+        assert_eq!(date(&[text("2020-01-15"), text("+1.5 months")]), s("2020-03-01"));
+        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+0.5 months")]), s("2020-01-30 00:00:00"));
+        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+1.5 months")]), s("2020-03-01 00:00:00"));
+        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+2.5 months")]), s("2020-03-30 00:00:00"));
+        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+1.25 months")]), s("2020-02-22 12:00:00"));
+        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+1.75 months")]), s("2020-03-08 12:00:00"));
+        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("-0.5 months")]), s("2019-12-31 00:00:00"));
+        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("-1.5 months")]), s("2019-11-30 00:00:00"));
+        // Integer recomposition (ceiling) happens BEFORE the fractional days.
+        assert_eq!(dtime(&[text("2020-01-31 00:00:00"), text("+1.5 months")]), s("2020-03-17 00:00:00"));
+        // Fractional years use 365 flat days for the remainder.
+        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+1.5 years")]), s("2021-07-16 12:00:00"));
+        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+0.5 years")]), s("2020-07-15 12:00:00"));
+        // Invalid month / unparseable -> NULL.
+        assert_eq!(date(&[text("2020-13-01")]), None);
+        assert_eq!(date(&[text("2020-00-10")]), None);
+        assert_eq!(date(&[text("not-a-date")]), None);
+
+        // datetime rendering.
+        assert_eq!(
+            dtime(&[text("2020-06-15 12:34:56"), text("start of day")]),
+            s("2020-06-15 00:00:00")
+        );
+        assert_eq!(dtime(&[text("2020-01-01"), text("+90 minutes")]), s("2020-01-01 01:30:00"));
+        assert_eq!(dtime(&[text("2020-01-01"), text("+1.5 days")]), s("2020-01-02 12:00:00"));
+        assert_eq!(dtime(&[int(0), text("unixepoch")]), s("1970-01-01 00:00:00"));
+
+        // strftime format codes.
+        assert_eq!(strf(&[text("%f"), text("2020-01-01 00:00:01.25")]), s("01.250"));
+        assert_eq!(strf(&[text("%j"), text("2020-03-01")]), s("061"));
+        assert_eq!(strf(&[text("%w"), text("2020-06-15")]), s("1"));
+        assert_eq!(strf(&[text("%W"), text("2020-01-01")]), s("00"));
+        assert_eq!(strf(&[text("%s"), text("2020-01-01 00:00:00")]), s("1577836800"));
+        assert_eq!(strf(&[text("%e"), text("2020-06-05")]), s(" 5"));
+        assert_eq!(strf(&[text("%I"), text("2020-06-15 13:00:00")]), s("01"));
+        assert_eq!(strf(&[text("%p"), text("2020-06-15 13:00:00")]), s("PM"));
+        assert_eq!(strf(&[text("%P"), text("2020-06-15 13:00:00")]), s("pm"));
+        assert_eq!(strf(&[text("%R"), text("2020-06-15 13:05:00")]), s("13:05"));
+        assert_eq!(strf(&[text("%T"), text("2020-06-15 13:05:07")]), s("13:05:07"));
+        // ISO 8601 week/year boundaries (the trickiest: a January date whose ISO
+        // year is the PRIOR calendar year, and week 53).
+        assert_eq!(strf(&[text("%G"), text("2020-12-31")]), s("2020"));
+        assert_eq!(strf(&[text("%V"), text("2020-12-31")]), s("53"));
+        assert_eq!(strf(&[text("%u"), text("2020-06-15")]), s("1"));
+        assert_eq!(strf(&[text("%g"), text("2021-01-01")]), s("20"));
+        assert_eq!(strf(&[text("%V"), text("2021-01-01")]), s("53"));
+        assert_eq!(strf(&[text("%G-%V-%u"), text("2021-01-01")]), s("2020-53-5"));
+        assert_eq!(strf(&[text("%V"), text("2016-01-01")]), s("53"));
+        assert_eq!(strf(&[text("%V"), text("2018-12-31")]), s("01"));
+
+        // julianday is exact for a round value.
+        assert_eq!(
+            JuliandayFunc.invoke(&[text("2000-01-01 12:00:00")]).unwrap(),
+            SqliteValue::Float(2451545.0)
+        );
     }
 
     #[test]
