@@ -966,9 +966,12 @@ impl ScalarFunction for RoundFunc {
             return Ok(SqliteValue::Null);
         }
         let x = args[0].to_float();
-        // Clamp N to [0, 30] matching SQLite behavior.
+        // Clamp N to [0, 30] matching SQLite behavior. bd-round-ndigits-i32-bv61c:
+        // C SQLite reads N via sqlite3_value_int (i32-truncated) BEFORE clamping,
+        // so a huge i64 like 4294967298 becomes i32 2 (round to 2 places), not a
+        // clamp to 30. i32-truncate first to match.
         let n = if args.len() > 1 {
-            args[1].to_integer().clamp(0, 30)
+            i64::from(args[1].to_integer() as i32).clamp(0, 30)
         } else {
             0
         };
@@ -3787,6 +3790,21 @@ mod tests {
         assert_eq!(run(&[t("abcdef"), int(3), int(i64::MIN)]), t(""));
         assert_eq!(run(&[t("abcdef"), int(i64::MIN), int(i64::MAX)]), t(""));
         assert_eq!(run(&[t("abcdef"), int(i64::MAX), int(-1)]), t("e"));
+    }
+
+    #[test]
+    fn test_round_ndigits_i32_bd_bv61c() {
+        // bd-round-ndigits-i32-bv61c. Oracle: sqlite3 3.46.1. round() reads N via
+        // sqlite3_value_int (i32-truncated) BEFORE clamping to [0,30]: 4294967298
+        // -> i32 2, -4294967295 -> i32 1. Normal (i32-range) N is unaffected.
+        let run = |x: f64, n: i64| -> SqliteValue {
+            RoundFunc
+                .invoke(&[SqliteValue::Float(x), SqliteValue::Integer(n)])
+                .unwrap()
+        };
+        assert_eq!(run(1.23456, 4_294_967_298), SqliteValue::Float(1.23));
+        assert_eq!(run(1.23456, -4_294_967_295), SqliteValue::Float(1.2));
+        assert_eq!(run(1.23456, 2), SqliteValue::Float(1.23)); // normal, no regression
     }
 
     #[test]
