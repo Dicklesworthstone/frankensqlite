@@ -65176,7 +65176,9 @@ impl Connection {
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
     async fn execute_begin(&self, begin: fsqlite_ast::BeginStatement) -> Result<()> {
         if self.in_transaction.get() {
-            return Err(FrankenError::Internal(
+            // Stock emits this verbatim under SQLITE_ERROR; Internal would add
+            // an "internal error:" prefix and report SQLITE_INTERNAL. bd-3nppp.
+            return Err(FrankenError::FunctionError(
                 "cannot start a transaction within a transaction".to_owned(),
             ));
         }
@@ -66057,7 +66059,7 @@ impl Connection {
                 self.clear_prepared_direct_insert_append_hint();
                 self.flush_retained_autocommit_txn(cx).await?;
             }
-            return Err(FrankenError::Internal(
+            return Err(FrankenError::FunctionError(
                 "cannot commit - no transaction is active".to_owned(),
             ));
         }
@@ -66703,7 +66705,7 @@ impl Connection {
                     .iter()
                     .rposition(|e| e.name.eq_ignore_ascii_case(sp_name))
                     .ok_or_else(|| {
-                        FrankenError::Internal(format!("no such savepoint: {sp_name}"))
+                        FrankenError::FunctionError(format!("no such savepoint: {sp_name}"))
                     })?;
                 let entry = &savepoints[idx];
                 (
@@ -66864,7 +66866,7 @@ impl Connection {
             // bd-2yqp6.4.3: SQLite errors on ROLLBACK outside a transaction,
             // matching upstream COMMIT behavior.
             if !self.in_transaction.get() {
-                return Err(FrankenError::Internal(
+                return Err(FrankenError::FunctionError(
                     "cannot rollback - no transaction is active".to_owned(),
                 ));
             }
@@ -67206,7 +67208,7 @@ impl Connection {
             let idx = savepoints
                 .iter()
                 .rposition(|e| e.name.eq_ignore_ascii_case(name))
-                .ok_or_else(|| FrankenError::Internal(format!("no such savepoint: {name}")))?;
+                .ok_or_else(|| FrankenError::FunctionError(format!("no such savepoint: {name}")))?;
             (idx, savepoints[idx].name.clone())
         };
 
@@ -186313,7 +186315,7 @@ mod tests {
             conn.execute("ROLLBACK TO a;").await.unwrap();
 
             let err = conn.execute("RELEASE b;").await.unwrap_err();
-            assert_eq!(err.to_string(), "internal error: no such savepoint: b");
+            assert_eq!(err.to_string(), "no such savepoint: b");
             conn.execute("ROLLBACK;").await.unwrap();
         });
     }
@@ -195272,7 +195274,7 @@ mod transaction_lifecycle_tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err().to_string(),
-                "internal error: cannot start a transaction within a transaction"
+                "cannot start a transaction within a transaction"
             );
         });
     }
@@ -195285,7 +195287,7 @@ mod transaction_lifecycle_tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err().to_string(),
-                "internal error: cannot commit - no transaction is active"
+                "cannot commit - no transaction is active"
             );
         });
     }
@@ -195298,7 +195300,7 @@ mod transaction_lifecycle_tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err().to_string(),
-                "internal error: cannot rollback - no transaction is active"
+                "cannot rollback - no transaction is active"
             );
         });
     }
