@@ -3,7 +3,8 @@
 DRAFT-UNVERIFIED (disk 100%, no build). FREEZE-SAFE: `.md`, never compiled. Oracle =
 sqlite3 3.46.1 vs frank CLI `/data/tmp/p4-verify/debug/fsqlite` (STALE Aug-19 build) —
 so each finding is ALSO verified in HEAD source (authoritative for message strings).
-Apply patches in one commit when disk clears; several change error TYPES/text that
+Apply patches in one commit ONLY after the user announces disk is free AND the
+POST-FREEZE-VERIFY-QUEUE (bc447ef0e) is green; several change error TYPES/text that
 existing tests assert on, so expect rippling test updates (flagged per finding).
 
 ## Oracle diffs (frank vs stock), verified at HEAD in source

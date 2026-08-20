@@ -1,6 +1,7 @@
 // bd-jcjkf — DQS-ON engine: resolve-fail-triggered rewrite-retry.
 // DRAFT-UNVERIFIED (disk 100%, no build). FREEZE-SAFE: `.rs.draft` is never compiled
-// by cargo, so a co-lane build cannot break on it. APPLY (one commit when disk clears):
+// by cargo, so a co-lane build cannot break on it. APPLY (one commit, ONLY after the user
+// announces disk is free AND the POST-FREEZE-VERIFY-QUEUE is green — bc447ef0e):
 // paste these items into crates/fsqlite-core/src/connection.rs (the free fns go at
 // module scope near the any_function_call_in_* family ~95166; the two methods go in
 // `impl Connection`), apply the pragma plumbing (dqs_pragma_plumbing.draft.md) and the

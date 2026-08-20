@@ -2,7 +2,8 @@
 //!
 //! DRAFT-UNVERIFIED (disk 100%, no build). FREEZE-SAFE: `.rs.draft` is not a
 //! `.rs` file, so cargo never compiles it — a co-lane build cannot break on it.
-//! APPLY (one commit, when disk clears): `git mv dqs_compat.rs.draft dqs_compat.rs`
+//! APPLY (one commit, ONLY after the user announces disk is free AND the
+//! POST-FREEZE-VERIFY-QUEUE is green — bc447ef0e): `git mv dqs_compat.rs.draft dqs_compat.rs`
 //! together with the DQS engine (bd_jcjkf_dqs_design_draft.md) and the pragma
 //! plumbing (dqs_pragma_plumbing.rs.draft). Then build + run:
 //!   cargo test -p fsqlite-core --test dqs_compat
