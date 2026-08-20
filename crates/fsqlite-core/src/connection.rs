@@ -979,6 +979,16 @@ static FSQLITE_COMMIT_FINALIZE_SEQ_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMMIT_HANDLE_FINALIZE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMMIT_POST_WRITE_MAINTENANCE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+// bd-nsktt (Track H / bd-db300.8): forced-single-writer file-backed commit attribution.
+// `..._FILEBACKED_COMMITS` counts committed file-backed writes made in forced
+// single-writer mode (`!concurrent_txn`); `..._SHARED_PAGER_COMMITS` is the subset
+// that ran while the pager was shared by peer connections (open_connection_count > 1)
+// — the honest-comparison scenario where the pager's single-connection fast path
+// (`single_connection_fast_path_enabled`, pager.rs) is disabled and the single writer
+// still pays for concurrency machinery it cannot use. The ratio quantifies the
+// avoidable-overhead exposure the reduction beads (bd-gkj4s/bd-cznar) target.
+static FSQLITE_SINGLE_WRITER_FILEBACKED_COMMITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_SINGLE_WRITER_SHARED_PAGER_COMMITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CONCURRENT_COMMIT_PLAN_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CONCURRENT_COMMIT_PLAN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CONCURRENT_COMMIT_PLAN_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -1327,6 +1337,12 @@ pub struct HotPathProfileSnapshot {
     pub commit_handle_finalize_time_ns: u64,
     pub commit_post_write_maintenance_time_ns: u64,
     pub finalize_post_publish_time_ns: u64,
+    /// bd-nsktt (Track H): file-backed autocommit write commits made in forced
+    /// single-writer mode, and the subset (`..._shared_pager`) that ran with the
+    /// pager shared by peer connections — where the single-connection fast path is
+    /// disabled and the single writer pays for concurrency machinery it cannot use.
+    pub single_writer_filebacked_commits: u64,
+    pub single_writer_shared_pager_commits: u64,
     pub concurrent_commit_plan_attempts: u64,
     pub concurrent_commit_plan_successes: u64,
     pub concurrent_commit_plan_errors: u64,
@@ -1600,6 +1616,21 @@ fn record_hot_path_duration(metric: &AtomicU64, start: Option<Instant>) {
     record_hot_path_elapsed_ns(metric, hot_path_elapsed_ns(start));
 }
 
+/// bd-nsktt (Track H): attribute a committed file-backed write made in forced
+/// single-writer mode, and whether the pager was shared by peer connections at
+/// that moment (`shared_pager` = open connection count > 1). Gated behind
+/// `hot_path_profile_enabled()` so it is zero-cost off the profiling path.
+#[inline]
+fn record_single_writer_filebacked_commit(shared_pager: bool) {
+    if !hot_path_profile_enabled() {
+        return;
+    }
+    FSQLITE_SINGLE_WRITER_FILEBACKED_COMMITS.fetch_add(1, AtomicOrdering::Relaxed);
+    if shared_pager {
+        FSQLITE_SINGLE_WRITER_SHARED_PAGER_COMMITS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
 #[inline]
 fn hot_path_elapsed_ns(start: Option<Instant>) -> Option<u64> {
     let start = start?;
@@ -1751,6 +1782,8 @@ pub fn reset_hot_path_profile() {
     FSQLITE_COMMIT_HANDLE_FINALIZE_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMMIT_POST_WRITE_MAINTENANCE_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_SINGLE_WRITER_FILEBACKED_COMMITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_SINGLE_WRITER_SHARED_PAGER_COMMITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CONCURRENT_COMMIT_PLAN_ATTEMPTS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CONCURRENT_COMMIT_PLAN_SUCCESSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CONCURRENT_COMMIT_PLAN_ERRORS.store(0, AtomicOrdering::Relaxed);
@@ -2000,6 +2033,10 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         commit_post_write_maintenance_time_ns: FSQLITE_COMMIT_POST_WRITE_MAINTENANCE_TIME_NS
             .load(AtomicOrdering::Relaxed),
         finalize_post_publish_time_ns: FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS
+            .load(AtomicOrdering::Relaxed),
+        single_writer_filebacked_commits: FSQLITE_SINGLE_WRITER_FILEBACKED_COMMITS
+            .load(AtomicOrdering::Relaxed),
+        single_writer_shared_pager_commits: FSQLITE_SINGLE_WRITER_SHARED_PAGER_COMMITS
             .load(AtomicOrdering::Relaxed),
         concurrent_commit_plan_attempts: FSQLITE_CONCURRENT_COMMIT_PLAN_ATTEMPTS
             .load(AtomicOrdering::Relaxed),
@@ -53944,6 +53981,21 @@ impl Connection {
         );
         if committed_write && !self.pager.is_memory() {
             self.sync_filebacked_post_commit_visibility_floor();
+            // bd-nsktt (Track H): attribute this file-backed autocommit write commit
+            // when it ran in FORCED single-writer mode (the benchmark comparison
+            // workload), and whether the pager was shared by peer connections
+            // (open count > 1) — the subset where the pager single-connection fast
+            // path is disabled and the single writer still pays for concurrency
+            // machinery it cannot use. `is_concurrent_txn` is the mode captured at
+            // begin, before commit finalization reset `concurrent_txn`.
+            if !is_concurrent_txn {
+                record_single_writer_filebacked_commit(
+                    self._shared_mvcc_state
+                        .open_connection_count
+                        .load(AtomicOrdering::Acquire)
+                        > 1,
+                );
+            }
         }
         if committed_write {
             self.arm_pending_local_live_vtab_preservation(
@@ -229236,6 +229288,63 @@ mod pager_routing_tests {
             );
 
             holder.execute("ROLLBACK;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_single_writer_shared_pager_commit_counter_bd_nsktt() {
+        // bd-nsktt (Track H / bd-db300.8): a forced-single-writer file-backed WRITE
+        // commit made while the pager is shared by peer connections (open count > 1)
+        // increments BOTH single_writer_filebacked_commits and
+        // single_writer_shared_pager_commits — the honest-comparison scenario where
+        // the pager single-connection fast path is disabled and the single writer
+        // still pays for concurrency machinery it cannot use. This is the attribution
+        // metric that quantifies the avoidable-overhead exposure the reduction beads
+        // (bd-gkj4s / bd-cznar) target.
+        asupersync::test_utils::run_test(|| async {
+            let _profile_guard = StatementReuseHotPathProfileGuard::new();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("bd_nsktt_single_writer_shared_pager.db");
+            let db_path_str = db_path.to_str().unwrap();
+
+            let writer = Connection::open(db_path_str).await.unwrap();
+            writer
+                .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+                .await
+                .unwrap();
+            writer
+                .execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+
+            // A second live connection on the same path shares the pager, so
+            // open_connection_count > 1 and the single-connection fast path is off.
+            let peer = Connection::open(db_path_str).await.unwrap();
+            peer.execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+                .await
+                .unwrap();
+
+            reset_hot_path_profile();
+            writer.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            let snap = hot_path_profile_snapshot();
+
+            assert!(
+                snap.single_writer_filebacked_commits >= 1,
+                "forced single-writer file-backed commit must be attributed (got {})",
+                snap.single_writer_filebacked_commits
+            );
+            assert!(
+                snap.single_writer_shared_pager_commits >= 1,
+                "the shared-pager subset must be attributed (got {})",
+                snap.single_writer_shared_pager_commits
+            );
+            assert!(
+                snap.single_writer_shared_pager_commits
+                    <= snap.single_writer_filebacked_commits,
+                "shared-pager commits are a subset of single-writer file-backed commits"
+            );
+
+            drop(peer);
         });
     }
 
