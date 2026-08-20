@@ -23528,11 +23528,6 @@ impl Connection {
         unreachable!("registry-stability loop always returns")
     }
 
-    /// Prepare and execute SQL as a query.
-    ///
-    /// When `sql` contains multiple statements, only the result rows from the
-    /// **last** statement are returned. Intermediate statement results are
-    /// discarded. This matches common SQL driver semantics (last statement wins).
     // ===== bd-jcjkf: DQS ("double-quoted string") fallback (shapes 1+2) =====
     //
     // Stock SQLite's legacy default (SQLITE_DQS=3) treats a double-quoted
@@ -23640,6 +23635,11 @@ impl Connection {
             .unwrap_or(false)
     }
 
+    /// Prepare and execute SQL as a query.
+    ///
+    /// When `sql` contains multiple statements, only the result rows from the
+    /// **last** statement are returned. Intermediate statement results are
+    /// discarded. This matches common SQL driver semantics (last statement wins).
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
         let first = match self.query_impl(sql).await {
             Ok(v) => return Ok(v),
