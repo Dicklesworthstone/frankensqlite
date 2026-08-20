@@ -3838,6 +3838,37 @@ mod tests {
     }
 
     #[test]
+    fn test_scalar_minmax_and_printf_inf_2026_08() {
+        // Oracle: sqlite3 3.46.1. SCALAR max()/min() return NULL if ANY arg is
+        // NULL (unlike the aggregates) and order by storage class
+        // (NULL < int/real < text < blob). printf renders infinity as "Inf".
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let int = SqliteValue::Integer;
+        let flt = SqliteValue::Float;
+        let blob = |b: &[u8]| SqliteValue::Blob(std::sync::Arc::from(b));
+
+        assert_eq!(ScalarMaxFunc.invoke(&[int(1), t("a"), flt(2.5)]).unwrap(), t("a"));
+        assert_eq!(ScalarMinFunc.invoke(&[int(1), t("a"), flt(2.5)]).unwrap(), int(1));
+        // blob sorts after text/number, so it is the max.
+        assert_eq!(ScalarMaxFunc.invoke(&[blob(&[1]), t("z"), int(99)]).unwrap(), blob(&[1]));
+        // Any NULL arg -> NULL (scalar-only behavior).
+        assert_eq!(ScalarMaxFunc.invoke(&[SqliteValue::Null, int(5)]).unwrap(), SqliteValue::Null);
+        assert_eq!(ScalarMinFunc.invoke(&[SqliteValue::Null, int(5)]).unwrap(), SqliteValue::Null);
+
+        // printf infinity: "Inf"/"+Inf"/"-Inf", with the sign flag and width.
+        let f = FormatFunc;
+        let run = |args: &[SqliteValue]| -> String {
+            match f.invoke(args).unwrap() {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        assert_eq!(run(&[t("%f"), flt(f64::INFINITY)]), "Inf");
+        assert_eq!(run(&[t("%+f"), flt(f64::INFINITY)]), "+Inf");
+        assert_eq!(run(&[t("%e"), flt(f64::NEG_INFINITY)]), "-Inf");
+    }
+
+    #[test]
     fn test_hex_unhex_char_unicode_oracle_edges_2026_08() {
         // Oracle: sqlite3 3.46.1. hex() coerces to the argument's text/blob bytes
         // (uppercase); unhex() NULLs on odd length / non-hex and takes an ignore
