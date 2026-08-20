@@ -137,10 +137,6 @@ fn l6_delete_where_and_returning_global() {
 }
 
 #[test]
-#[ignore = "bd-l6-view-insert-subquery-numbering-2qtn7: scalar subquery in the interpreted \
-            view-INSERT VALUES source + global ? numbering diverges from stock (pre-existing, \
-            NOT an L6 regression — frank gives [[2,30]] with the fix / [[30,2]] without, oracle \
-            wants [[30,77]]); split from bd-1mcjr L6"]
 fn l6_insert_subquery_source_placeholder_counts() {
     asupersync::test_utils::run_test(|| async {
         // Adversarial: a ? inside a subquery in the VALUES source must consume a
@@ -176,5 +172,23 @@ fn l6_negative_control_dml_without_returning_unaffected() {
         let fr = fq_p(&f, "SELECT id, v FROM t ORDER BY id", &[]).await;
         let rr = rq_p(&r, "SELECT id, v FROM t ORDER BY id", &[]);
         assert_eq!(fr, rr, "no-RETURNING param DML unaffected\n  frank ={fr:?}\n  sqlite={rr:?}");
+    });
+}
+
+#[test]
+fn l6_insert_subquery_non_view_general() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-l6-view-insert-subquery-numbering-2qtn7: the VALUES-subquery global
+        // `?` numbering must hold for a PLAIN table (non-view) too, not only the
+        // interpreted view path — the fix is at the path-agnostic dispatch entry.
+        // VALUES (?=id=2, (SELECT ?)=v=30), RETURNING v, ? = param#3 = 77.
+        agree_p(
+            &["CREATE TABLE t2(id INTEGER PRIMARY KEY, v INTEGER)"],
+            "INSERT INTO t2(id, v) VALUES (?, (SELECT ?)) RETURNING v, ?",
+            &[iv(2), iv(30), iv(77)],
+            &[2, 30, 77],
+            "non-view INSERT VALUES subquery ? must number globally",
+        )
+        .await;
     });
 }
