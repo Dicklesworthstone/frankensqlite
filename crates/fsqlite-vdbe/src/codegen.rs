@@ -4215,6 +4215,7 @@ pub fn codegen_select(
             done_label,
             end_label,
             aggregate_index_eq_seek_allowed(from_index_hint),
+            from_index_hint,
         )
     } else if !stmt.order_by.is_empty() {
         if let Some(index_plan) = ctx
@@ -15478,6 +15479,13 @@ fn codegen_select_aggregate(
     done_label: crate::Label,
     end_label: crate::Label,
     allow_index_seek: bool,
+    // #137 sub-2: the query's FROM index hint. A forced `INDEXED BY <idx>` makes
+    // the aggregate scan the index in STORED order (so order-sensitive aggregates
+    // like SUM's transient overflow match stock) instead of the rowid-order table
+    // scan. `allow_index_seek` is false for a forced hint (it gates the eq-SEEK
+    // fast paths), so the forced index-ORDERED full scan is enabled from this hint
+    // directly, orthogonally to `allow_index_seek`.
+    from_index_hint: Option<&fsqlite_ast::IndexHint>,
 ) -> Result<(), CodegenError> {
     // Resolve SELECT-list aliases referenced from HAVING (e.g.
     // `SELECT SUM(qty) AS total_qty ... HAVING total_qty > 100`).
@@ -15913,7 +15921,128 @@ fn codegen_select_aggregate(
     let where_placeholder_base = b.current_anon_placeholder();
     let mut skip_scan = false;
 
-    if let Some((idx_schema, prefix_exprs)) = index_eq_seek {
+    // #137 sub-2: a forced `INDEXED BY <idx>` on an aggregate must scan the forced
+    // index in its STORED order, not the rowid-order table scan. Resolve the forced
+    // index (a plain, non-partial direct-lookup index — an unusable partial forced
+    // index already errors at prepare per sub-1). NOT gated on `allow_index_seek`
+    // (false for a forced hint). Covering only when no residual WHERE and no bare
+    // output column and every aggregate reads from the index entry; otherwise the
+    // table row is fetched (rowid seek, or a WITHOUT ROWID PK-suffix seek per
+    // sub-4) and any residual WHERE is re-applied per row.
+    let forced_index_ordered =
+        if let Some(fsqlite_ast::IndexHint::IndexedBy(name)) = from_index_hint {
+            table
+                .indexes
+                .iter()
+                .find(|idx| idx.name.eq_ignore_ascii_case(name))
+                .filter(|idx| idx.supports_direct_column_lookup())
+                .map(|forced_idx| {
+                    let covering = where_clause.is_none()
+                        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
+                        && aggregate_seek_is_covering(&agg_columns, forced_idx, table);
+                    (forced_idx, covering)
+                })
+        } else {
+            None
+        };
+
+    if let Some((forced_idx, covering)) = forced_index_ordered {
+        // Index-ordered full scan feeding the shared accumulate/finalize. Forward
+        // Rewind/Next = stored order (ascending for an ASC index, descending for a
+        // DESC index), matching stock's forced-index plan.
+        let idx_cursor = 1_i32;
+        if !covering {
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                table.root_page,
+                0,
+                P4::Table(table.name.clone()),
+                0,
+            );
+        }
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            forced_idx.root_page,
+            0,
+            P4::Index(forced_idx.name.clone()),
+            0,
+        );
+        // Empty index -> finalize with still-Null accumulators (COUNT=0 / SUM=NULL).
+        b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+        let idx_loop_top = b.current_addr();
+        let idx_skip_label = b.emit_label();
+        if !covering {
+            if table.without_rowid {
+                // WITHOUT ROWID: the index entry carries a PK suffix, not a rowid;
+                // seek the table b-tree by the PK columns (sub-4).
+                let pk_indices = without_rowid_pk_indices(table)?;
+                emit_without_rowid_index_to_table_seek(
+                    b,
+                    table,
+                    cursor,
+                    idx_cursor,
+                    forced_idx,
+                    &pk_indices,
+                    idx_skip_label,
+                );
+            } else {
+                let rowid_reg = b.alloc_reg();
+                b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+                b.emit_jump_to_label(
+                    Opcode::SeekRowid,
+                    cursor,
+                    rowid_reg,
+                    idx_skip_label,
+                    P4::None,
+                    0,
+                );
+            }
+            // Re-apply the whole WHERE per row (the forced full index scan enforces
+            // no predicate). Reset the anon-placeholder base so a bound `?` in the
+            // residual is numbered once, matching the non-index path.
+            if let Some(where_expr) = where_clause {
+                b.set_next_anon_placeholder(where_placeholder_base);
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    idx_skip_label,
+                );
+            }
+        }
+        if covering {
+            emit_aggregate_accumulate_body_covering(
+                b,
+                idx_cursor,
+                forced_idx,
+                table,
+                &agg_columns,
+                accum_base,
+            );
+        } else {
+            emit_aggregate_accumulate_body(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                &agg_columns,
+                accum_base,
+                first_row_flag,
+            );
+        }
+        b.resolve_label(idx_skip_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let idx_loop_body = idx_loop_top as i32;
+        b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        skip_scan = true;
+    } else if let Some((idx_schema, prefix_exprs)) = index_eq_seek {
         let idx_cursor = 1_i32;
         let scan_fallback = b.emit_label();
         let duplicate_run_done = b.emit_label();
