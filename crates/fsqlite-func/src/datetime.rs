@@ -2172,6 +2172,58 @@ mod tests {
     }
 
     #[test]
+    fn test_datetime_more_edges_2026_08() {
+        // Oracle: sqlite3 3.46.1. timediff format, %J/%k/%l/%f/%s, subsec, and
+        // out-of-range (past year 9999) -> NULL.
+        let dtime = |args: &[SqliteValue]| -> Option<String> {
+            match DateTimeFunc.invoke(args).unwrap() {
+                SqliteValue::Text(t) => Some(t.as_str().to_owned()),
+                SqliteValue::Null => None,
+                other => panic!("datetime -> {other:?}"),
+            }
+        };
+        let strf = |args: &[SqliteValue]| -> String {
+            match StrftimeFunc.invoke(args).unwrap() {
+                SqliteValue::Text(t) => t.as_str().to_owned(),
+                other => panic!("strftime -> {other:?}"),
+            }
+        };
+        let s = |x: &str| Some(x.to_owned());
+        let txt = |x: &str| SqliteValue::Text(SmallText::from_string(x));
+
+        // timediff(A, B) = A - B, formatted +YYYY-MM-DD HH:MM:SS.SSS.
+        assert_eq!(
+            TimediffFunc.invoke(&[text("2020-03-01"), text("2020-01-15")]).unwrap(),
+            txt("+0000-01-15 00:00:00.000")
+        );
+        assert_eq!(
+            TimediffFunc
+                .invoke(&[text("2020-01-15 12:00:00"), text("2020-01-15 10:30:00")])
+                .unwrap(),
+            txt("+0000-00-00 01:30:00.000")
+        );
+
+        // strftime codes: %J full julian day, %k/%l space-padded hours, %f, %s.
+        assert_eq!(strf(&[text("%J"), text("2000-01-01 18:00:00")]), "2451545.25");
+        assert_eq!(strf(&[text("%k"), text("2020-06-15 09:00:00")]), " 9");
+        assert_eq!(strf(&[text("%l"), text("2020-06-15 13:00:00")]), " 1");
+        assert_eq!(strf(&[text("%f"), text("2020-01-01 00:00:00.999")]), "00.999");
+        assert_eq!(strf(&[text("%s"), text("2020-01-01 00:00:00.5")]), "1577836800");
+
+        // subsec / unixepoch-of-float / out-of-range.
+        assert_eq!(dtime(&[text("2020-01-01 00:00:00"), text("subsec")]), s("2020-01-01 00:00:00.000"));
+        assert_eq!(dtime(&[float(1_577_836_800.5), text("unixepoch")]), s("2020-01-01 00:00:00"));
+        assert_eq!(dtime(&[text("2020-01-01"), text("+100000000 days")]), None);
+
+        // julianday / unixepoch subsec (exact float).
+        assert_eq!(JuliandayFunc.invoke(&[text("1970-01-01")]).unwrap(), SqliteValue::Float(2440587.5));
+        assert_eq!(
+            UnixepochFunc.invoke(&[text("2020-01-01"), text("subsec")]).unwrap(),
+            SqliteValue::Float(1_577_836_800.0)
+        );
+    }
+
+    #[test]
     fn test_first_position_subsec_aliases_use_current_time() {
         for alias in ["subsec", "subsecond"] {
             assert!(matches!(
