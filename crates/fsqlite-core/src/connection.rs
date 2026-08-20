@@ -33826,6 +33826,20 @@ impl Connection {
             // so this only pays a cheap FROM-source scan on the common path.
             let rewritten_statement = self.rewrite_statement_bare_pragma_table_functions(statement);
             let statement: &Statement = rewritten_statement.as_ref();
+            // bd-l6-view-insert-subquery-numbering-2qtn7: globally number an INSERT's
+            // `?` placeholders (recursing into VALUES subqueries) BEFORE the
+            // pre-dispatch non-correlated-subquery fold runs. Otherwise a
+            // `(SELECT ?)` in a VALUES row is folded to a literal by re-numbering its
+            // `?` from 1 (binding param#1), and the enclosing counter never counts
+            // the subquery's slot — diverging from stock's global `?` numbering.
+            let insert_canonical_statement;
+            let statement: &Statement = if let Statement::Insert(insert) = statement {
+                insert_canonical_statement =
+                    Statement::Insert(canonicalize_insert_placeholders(insert)?);
+                &insert_canonical_statement
+            } else {
+                statement
+            };
             self.refresh_select_schema_before_relation_validation(statement)
                 .await?;
             for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
@@ -133278,6 +133292,65 @@ fn canonicalize_update_placeholders(
         }
     }
 
+    Ok(normalized)
+}
+
+/// bd-l6-view-insert-subquery-numbering-2qtn7: number every `?` in an INSERT
+/// GLOBALLY in C-SQLite text order (WITH → source/VALUES incl. nested subqueries →
+/// ON CONFLICT → RETURNING) BEFORE any pre-dispatch subquery fold runs. Without
+/// this, a non-correlated scalar subquery in a VALUES row (`VALUES (?, (SELECT ?))`)
+/// is folded to a literal by re-numbering its `?` from 1 (binding param#1), and the
+/// enclosing counter never counts the subquery's slot — diverging from stock, which
+/// numbers all `?` globally including inside subqueries. Mirrors
+/// `canonicalize_update_placeholders`; `canonicalize_expr_placeholders` recurses
+/// into subqueries so their `?` join the global sequence.
+fn canonicalize_insert_placeholders(
+    insert: &fsqlite_ast::InsertStatement,
+) -> Result<fsqlite_ast::InsertStatement> {
+    let mut normalized = insert.clone();
+    let mut bind_state = BindParamState::default();
+    if let Some(with_clause) = &mut normalized.with {
+        for cte in &mut with_clause.ctes {
+            canonicalize_select_placeholders_in_statement(&mut cte.query, &mut bind_state)?;
+        }
+    }
+    match &mut normalized.source {
+        fsqlite_ast::InsertSource::Values(rows) => {
+            for row in rows {
+                for value in row {
+                    canonicalize_expr_placeholders(value, &mut bind_state)?;
+                }
+            }
+        }
+        fsqlite_ast::InsertSource::Select(select) => {
+            canonicalize_select_placeholders_in_statement(select, &mut bind_state)?;
+        }
+        fsqlite_ast::InsertSource::DefaultValues => {}
+    }
+    for upsert in &mut normalized.upsert {
+        if let Some(target) = &mut upsert.target
+            && let Some(where_clause) = &mut target.where_clause
+        {
+            canonicalize_expr_placeholders(where_clause, &mut bind_state)?;
+        }
+        if let fsqlite_ast::UpsertAction::Update {
+            assignments,
+            where_clause,
+        } = &mut upsert.action
+        {
+            for assignment in assignments {
+                canonicalize_expr_placeholders(&mut assignment.value, &mut bind_state)?;
+            }
+            if let Some(where_clause) = where_clause {
+                canonicalize_expr_placeholders(where_clause, &mut bind_state)?;
+            }
+        }
+    }
+    for column in &mut normalized.returning {
+        if let ResultColumn::Expr { expr, .. } = column {
+            canonicalize_expr_placeholders(expr, &mut bind_state)?;
+        }
+    }
     Ok(normalized)
 }
 

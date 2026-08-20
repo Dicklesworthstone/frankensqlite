@@ -3786,6 +3786,29 @@ mod tests {
         assert_eq!(run(&TypeofFunc, &[SqliteValue::Float(1.0)]), t("real"));
     }
 
+    #[test]
+    fn test_case_length_trig_oracle_edges_2026_08() {
+        use crate::math::{Atan2Func, CosFunc, SinFunc};
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let int = SqliteValue::Integer;
+        let blob = |b: &[u8]| SqliteValue::Blob(std::sync::Arc::from(b));
+        let run = |f: &dyn ScalarFunction, args: &[SqliteValue]| -> SqliteValue { f.invoke(args).unwrap() };
+
+        // upper()/lower() are ASCII-ONLY (SQLite's built-in): non-ASCII unchanged.
+        assert_eq!(run(&UpperFunc, &[t("héllo")]), t("HéLLO"));
+        assert_eq!(run(&UpperFunc, &[t("ß")]), t("ß"));
+        assert_eq!(run(&LowerFunc, &[t("HÉLLO")]), t("hÉllo"));
+        // length: chars for text, BYTES for blob, text-coerced for numbers, NULL->NULL.
+        assert_eq!(run(&LengthFunc, &[t("héllo")]), int(5));
+        assert_eq!(run(&LengthFunc, &[blob(&[0x00, 0xFF])]), int(2));
+        assert_eq!(run(&LengthFunc, &[int(12345)]), int(5));
+        assert_eq!(run(&LengthFunc, &[SqliteValue::Null]), SqliteValue::Null);
+        // trig (exact f64 wrappers).
+        assert_eq!(run(&SinFunc, &[SqliteValue::Float(0.0)]), SqliteValue::Float(0.0));
+        assert_eq!(run(&CosFunc, &[SqliteValue::Float(0.0)]), SqliteValue::Float(1.0));
+        assert_eq!(run(&Atan2Func, &[int(1), int(1)]), SqliteValue::Float((1.0_f64).atan2(1.0)));
+    }
+
     fn assert_wrong_arg_count(registry: &FunctionRegistry, name: &str, arity: i32) {
         let function = registry
             .find_scalar(name, arity)
