@@ -521,11 +521,11 @@ else
     run_with_spinner "Downloading $archive_name" curl_fetch "$base/$archive_name" "$archive" \
       || die "prebuilt artifact download failed; retry or explicitly use --from-source"
     if [[ "$NO_VERIFY" -eq 0 ]]; then
-      manifest="$TMP_DIR/SHA256SUMS.txt"
-      signature="$TMP_DIR/SHA256SUMS.txt.minisig"
-      curl_fetch "$base/SHA256SUMS.txt" "$manifest"
+      manifest="$TMP_DIR/SHA256SUMS"
+      signature="$TMP_DIR/SHA256SUMS.minisig"
+      curl_fetch "$base/SHA256SUMS" "$manifest"
       if command -v minisign >/dev/null 2>&1; then
-        curl_fetch "$base/SHA256SUMS.txt.minisig" "$signature"
+        curl_fetch "$base/SHA256SUMS.minisig" "$signature"
         minisign -Vm "$manifest" -x "$signature" -P "$MINISIGN_PUBLIC_KEY" >/dev/null \
           || die "release checksum signature verification failed"
         ok "release manifest signature verified"
