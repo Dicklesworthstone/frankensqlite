@@ -63,13 +63,15 @@ use smallvec::SmallVec;
 use crate::attach::SchemaRegistry;
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, BoundCollation, ColumnConstraintKind, ColumnRef, CompoundOp,
-    CreateTableBody, CteMaterialized, DefaultValue, Distinctness, DropObjectType, Expr, FrameBound,
+    CreateTableBody, CteMaterialized, DefaultValue, DeleteStatement, Distinctness, DropObjectType,
+    Expr, FrameBound,
     FrameExclude, FrameSpec, FrameType, FromClause, FunctionArgs, GeneratedStorage, InSet,
     InsertSource,
     InsertStatement, JoinClause, JoinConstraint, JoinKind, JsonArrow, LikeOp, LimitClause, Literal,
     NullsOrder, OrderingTerm, PlaceholderType, PragmaValue, QualifiedName, ResultColumn,
     SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement, TableConstraintKind,
-    TableOrSubquery, TimeTravelTarget, UnaryOp, UpsertAction, UpsertClause, ValuesClause,
+    TableOrSubquery, TimeTravelTarget, UnaryOp, UpdateStatement, UpsertAction, UpsertClause,
+    ValuesClause,
     WindowReference, WindowSpec,
 };
 use fsqlite_btree::cursor::{
@@ -24062,27 +24064,60 @@ impl Connection {
         !self.in_transaction.get() && !self.implicit_txn.get() && self.active_txn.borrow().is_none()
     }
 
-    /// bd-xv5cm L3: whether re-executing `statement` on a transient conflict is
-    /// safe — i.e. idempotent. The autocommit read retry (below and in
-    /// `execute_statement_after_background_status`) assumes a `SELECT` is
-    /// side-effect-free, but a `SELECT` that calls a user-registered
-    /// (application) function may have effects FrankenSQLite cannot prove
-    /// idempotent (writes to another store, counters, I/O). Stock SQLite never
-    /// silently re-runs a statement, so a transparent retry that runs such a
-    /// function twice is a defect. Built-in functions (including volatile ones
-    /// like `random()`) are known side-effect-free and stay retryable; only a
-    /// referenced application function bars the retry.
+    /// bd-xv5cm L3 / bd-oo4s5: whether re-executing `statement` on a transient
+    /// conflict is safe — i.e. idempotent. The autocommit retry (the read retry
+    /// in `execute_statement_after_background_status` and the prepared-DML retry
+    /// in `execute_prepared_autocommit_with_conflict_retry`) re-runs the whole
+    /// begin→execute→commit cycle after a full rollback, so in-DB effects (row
+    /// writes, trigger writes, FK cascades) re-apply correctly. But a
+    /// user-registered (application) function may have external effects
+    /// FrankenSQLite cannot prove idempotent (writes to another store, counters,
+    /// I/O). Stock SQLite never silently re-runs a statement, so a transparent
+    /// retry that runs such a function twice is a defect. Built-in functions
+    /// (including volatile ones like `random()`) are known side-effect-free and
+    /// stay retryable; only a referenced application function bars the retry.
+    ///
+    /// bd-oo4s5 generalized this from `SELECT` alone (bd-xv5cm L3, which only
+    /// covered the read path) to every statement shape, because a prepared
+    /// `INSERT`/`UPDATE`/`DELETE` (including `RETURNING`, `INSERT .. SELECT`, and
+    /// a side-effecting function in `WHERE`/`SET`/`VALUES`) retries through the
+    /// prepared chokepoint and would otherwise double-run the function.
     fn statement_retry_is_idempotent(&self, statement: &Statement) -> bool {
-        let Statement::Select(select) = statement else {
-            // Only reads take this retry path; a PRAGMA retry (bd-tc8u7)
-            // restores its own dispatch state and is handled separately.
-            return true;
-        };
         let mut references_application_function = |name: &str, args: &FunctionArgs| {
             self.application_function_kind(name, aggregate_args_len_for_lookup(args))
                 .is_some()
         };
-        !any_function_call_in_select(select, &mut references_application_function)
+        !any_function_call_in_statement(statement, &mut references_application_function)
+    }
+
+    /// bd-oo4s5: whether transparently re-executing this prepared statement on a
+    /// transient autocommit conflict is safe. Mirrors
+    /// [`Self::statement_retry_is_idempotent`] but works from a
+    /// [`PreparedStatement`], whose AST may have been dropped at prepare time on
+    /// the precompiled fast paths.
+    fn prepared_retry_is_idempotent(&self, stmt: &PreparedStatement<'_>) -> bool {
+        // Fast path (the overwhelmingly common case): with no application
+        // function registered on the connection, no statement can invoke one, so
+        // a retry can never re-run a user function — every built-in is
+        // side-effect-free. Cheap enough to gate the whole check.
+        if !self.func_registry.borrow().has_application_functions() {
+            return true;
+        }
+        // Application functions exist. Inspect the retained AST when the prepared
+        // statement kept one (the deferred DML / deferred query paths).
+        if let Some(statement) = stmt.deferred_dml_statement() {
+            return self.statement_retry_is_idempotent(statement);
+        }
+        if let Some(statement) = stmt.deferred_query_statement.as_deref() {
+            return self.statement_retry_is_idempotent(statement);
+        }
+        // Precompiled / fast-path statements dropped the AST at prepare time, and
+        // precompile eligibility does NOT exclude application-function calls
+        // (a precompiled `UPDATE .. SET x = udf()` is admitted). We cannot prove
+        // idempotence without the AST, so — with application functions in play —
+        // conservatively surface the transient instead of possibly re-running a
+        // side-effecting function.
+        false
     }
 
     /// GH #333: execute a prepared statement, transparently re-executing it on
@@ -24109,6 +24144,16 @@ impl Connection {
             .await;
         if !autocommit_entry
             || !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error))
+            // bd-oo4s5: a prepared statement that references a user-registered
+            // application function (in RETURNING, WHERE, SET, VALUES, or an
+            // INSERT .. SELECT subquery) may have external side effects
+            // FrankenSQLite cannot prove idempotent, and stock SQLite never
+            // silently re-runs a statement — surface the transient instead of
+            // transparently re-running the function. Evaluated last so the AST
+            // walk only runs on the rare transient-error path. Generalizes
+            // bd-xv5cm L3 (SELECT, via the statement path) to every shape that
+            // retries through this prepared chokepoint.
+            || !self.prepared_retry_is_idempotent(stmt)
         {
             return result;
         }
@@ -95312,6 +95357,201 @@ fn any_function_call_in_window_spec(
         }
         if let Some(FrameBound::Preceding(expr) | FrameBound::Following(expr)) = &frame.end {
             if any_function_call_in_expr(expr, pred) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// bd-oo4s5: whether any function call anywhere in `statement` satisfies `pred`.
+/// Generalizes [`any_function_call_in_select`] to every DML shape so the
+/// autocommit conflict-retry idempotence guard can detect a referenced
+/// application function in `INSERT`/`UPDATE`/`DELETE` as well as `SELECT`. DDL,
+/// transaction control, and PRAGMA carry no user expressions on the retry path,
+/// so they report `false`.
+fn any_function_call_in_statement(
+    statement: &Statement,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    match statement {
+        Statement::Select(select) => any_function_call_in_select(select, pred),
+        Statement::Insert(insert) => any_function_call_in_insert(insert, pred),
+        Statement::Update(update) => any_function_call_in_update(update, pred),
+        Statement::Delete(delete) => any_function_call_in_delete(delete, pred),
+        _ => false,
+    }
+}
+
+fn any_function_call_in_insert(
+    insert: &InsertStatement,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    if let Some(with) = &insert.with {
+        for cte in &with.ctes {
+            if any_function_call_in_select(&cte.query, pred) {
+                return true;
+            }
+        }
+    }
+    match &insert.source {
+        InsertSource::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    if any_function_call_in_expr(expr, pred) {
+                        return true;
+                    }
+                }
+            }
+        }
+        InsertSource::Select(select) => {
+            if any_function_call_in_select(select, pred) {
+                return true;
+            }
+        }
+        InsertSource::DefaultValues => {}
+    }
+    for clause in &insert.upsert {
+        if any_function_call_in_upsert_clause(clause, pred) {
+            return true;
+        }
+    }
+    any_function_call_in_result_columns(&insert.returning, pred)
+}
+
+fn any_function_call_in_update(
+    update: &UpdateStatement,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    if let Some(with) = &update.with {
+        for cte in &with.ctes {
+            if any_function_call_in_select(&cte.query, pred) {
+                return true;
+            }
+        }
+    }
+    for assignment in &update.assignments {
+        if any_function_call_in_expr(&assignment.value, pred) {
+            return true;
+        }
+    }
+    if let Some(from) = &update.from {
+        if any_function_call_in_from_clause(from, pred) {
+            return true;
+        }
+    }
+    if let Some(where_clause) = &update.where_clause {
+        if any_function_call_in_expr(where_clause, pred) {
+            return true;
+        }
+    }
+    if any_function_call_in_result_columns(&update.returning, pred) {
+        return true;
+    }
+    any_function_call_in_order_by_limit(&update.order_by, update.limit.as_ref(), pred)
+}
+
+fn any_function_call_in_delete(
+    delete: &DeleteStatement,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    if let Some(with) = &delete.with {
+        for cte in &with.ctes {
+            if any_function_call_in_select(&cte.query, pred) {
+                return true;
+            }
+        }
+    }
+    if let Some(where_clause) = &delete.where_clause {
+        if any_function_call_in_expr(where_clause, pred) {
+            return true;
+        }
+    }
+    if any_function_call_in_result_columns(&delete.returning, pred) {
+        return true;
+    }
+    any_function_call_in_order_by_limit(&delete.order_by, delete.limit.as_ref(), pred)
+}
+
+fn any_function_call_in_upsert_clause(
+    clause: &UpsertClause,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    if let Some(target) = &clause.target {
+        if let Some(where_clause) = &target.where_clause {
+            if any_function_call_in_expr(where_clause, pred) {
+                return true;
+            }
+        }
+    }
+    match &clause.action {
+        UpsertAction::Nothing => false,
+        UpsertAction::Update {
+            assignments,
+            where_clause,
+        } => {
+            for assignment in assignments {
+                if any_function_call_in_expr(&assignment.value, pred) {
+                    return true;
+                }
+            }
+            where_clause
+                .as_deref()
+                .is_some_and(|where_clause| any_function_call_in_expr(where_clause, pred))
+        }
+    }
+}
+
+fn any_function_call_in_result_columns(
+    columns: &[ResultColumn],
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    for column in columns {
+        if let ResultColumn::Expr { expr, .. } = column {
+            if any_function_call_in_expr(expr, pred) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn any_function_call_in_from_clause(
+    from: &FromClause,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    if any_function_call_in_table_or_subquery(&from.source, pred) {
+        return true;
+    }
+    for join in &from.joins {
+        if any_function_call_in_table_or_subquery(&join.table, pred) {
+            return true;
+        }
+        if let Some(JoinConstraint::On(expr)) = &join.constraint {
+            if any_function_call_in_expr(expr, pred) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn any_function_call_in_order_by_limit(
+    order_by: &[OrderingTerm],
+    limit: Option<&LimitClause>,
+    pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
+) -> bool {
+    for term in order_by {
+        if any_function_call_in_expr(&term.expr, pred) {
+            return true;
+        }
+    }
+    if let Some(limit) = limit {
+        if any_function_call_in_expr(&limit.limit, pred) {
+            return true;
+        }
+        if let Some(offset) = &limit.offset {
+            if any_function_call_in_expr(offset, pred) {
                 return true;
             }
         }
@@ -198915,6 +199155,124 @@ mod autocommit_txn_tests {
                 .await
                 .expect("a built-in-only SELECT must still transparently retry the transient");
             assert_eq!(rows.len(), 3);
+        });
+    }
+
+    #[test]
+    fn test_side_effecting_udf_dml_does_not_auto_retry_bd_oo4s5() {
+        // bd-oo4s5: bd-xv5cm L3 barred the transparent autocommit retry for a
+        // SELECT that calls a user-registered function, but only via the
+        // statement (read) path. Prepared DML (INSERT/UPDATE/DELETE, including
+        // RETURNING and INSERT .. SELECT) retries through a DIFFERENT chokepoint
+        // (execute_prepared_autocommit_with_conflict_retry, GH #333) that had NO
+        // idempotence guard, so a side-effecting application function referenced
+        // in WHERE/SET/VALUES/RETURNING would double-run on a transient conflict.
+        // The guard is generalized here to every statement shape.
+        use fsqlite_func::ScalarFunction;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct SideEffect(Arc<AtomicUsize>);
+        impl ScalarFunction for SideEffect {
+            fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(args.first().cloned().unwrap_or(SqliteValue::Null))
+            }
+            fn num_args(&self) -> i32 {
+                1
+            }
+            fn name(&self) -> &str {
+                "side_effect"
+            }
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            // (A) Fast path: with NO application function registered, every
+            // prepared DML is retry-idempotent — the common case keeps the GH
+            // #333 transparent retry (the concurrent-writer benefit) with zero
+            // per-statement analysis.
+            let plain = Connection::open(":memory:").await.unwrap();
+            plain
+                .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x)")
+                .await
+                .unwrap();
+            plain.execute("INSERT INTO t VALUES (1, 10)").await.unwrap();
+            for sql in [
+                "INSERT INTO t(id, x) VALUES (2, abs(-2))",
+                "UPDATE t SET x = abs(id) WHERE id = 1",
+                "DELETE FROM t WHERE id = 99",
+            ] {
+                let stmt = plain.prepare(sql).await.unwrap();
+                assert!(
+                    plain.prepared_retry_is_idempotent(&stmt),
+                    "no application function registered: `{sql}` must stay retryable"
+                );
+            }
+
+            // (B) With a side-effecting application function registered, the
+            // generalized statement walk classifies every DML shape that
+            // references it as NON-idempotent (bar retry), while builtin-only DML
+            // stays idempotent. Tested on parsed statements so the classification
+            // is independent of precompile/deferred dispatch decisions.
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x)")
+                .await
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            conn.register_nondeterministic_scalar_function(SideEffect(Arc::clone(&calls)));
+
+            let parse = |sql: &str| {
+                conn.parse_statements_with_statement_scratch(sql)
+                    .unwrap()
+                    .remove(0)
+            };
+
+            for sql in [
+                "INSERT INTO t(id, x) VALUES (1, side_effect(9))",
+                "INSERT INTO t(id, x) SELECT side_effect(id), id FROM t",
+                "UPDATE t SET x = side_effect(id) WHERE id = 1",
+                "UPDATE t SET x = 1 WHERE side_effect(id) = id",
+                "DELETE FROM t WHERE side_effect(id) = id",
+                "INSERT INTO t(id, x) VALUES (2, 3) RETURNING side_effect(id)",
+            ] {
+                assert!(
+                    !conn.statement_retry_is_idempotent(&parse(sql)),
+                    "DML referencing a side-effecting application function must bar \
+                     the transparent retry: `{sql}`"
+                );
+            }
+
+            for sql in [
+                "INSERT INTO t(id, x) VALUES (4, abs(-5))",
+                "UPDATE t SET x = abs(id) WHERE id > 0",
+                "DELETE FROM t WHERE id = 7",
+            ] {
+                assert!(
+                    conn.statement_retry_is_idempotent(&parse(sql)),
+                    "builtin-only DML stays retryable (a volatile builtin is still \
+                     side-effect-free): `{sql}`"
+                );
+            }
+
+            // (C) Integration through the prepared-path guard: a prepared DML
+            // that references the application function is barred (deferred AST is
+            // walked; a precompiled statement whose AST was dropped is
+            // conservatively barred while application functions are in play).
+            let prepared = conn
+                .prepare("UPDATE t SET x = side_effect(id) WHERE id = ?")
+                .await
+                .unwrap();
+            assert!(
+                !conn.prepared_retry_is_idempotent(&prepared),
+                "a prepared UPDATE calling the application function must bar the retry"
+            );
+
+            // The classification is a static AST walk — it must never invoke the
+            // function itself.
+            assert_eq!(
+                calls.load(AtomicOrdering::Relaxed),
+                0,
+                "idempotence classification must never call the UDF"
+            );
         });
     }
 

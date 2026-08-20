@@ -890,6 +890,19 @@ impl FunctionRegistry {
         self.application_functions.contains_key(&canonical)
     }
 
+    /// Whether any application (user-registered) function overload exists at all.
+    ///
+    /// A cheap whole-registry emptiness check used by the autocommit
+    /// conflict-retry idempotence guard (bd-oo4s5): with no application function
+    /// registered, no statement can invoke one, so a transparent retry can never
+    /// re-run a user function with unprovable external side effects. Built-in
+    /// functions (including volatile ones like `random()`) are side-effect-free
+    /// and never bar the retry, so they are irrelevant here.
+    #[must_use]
+    pub fn has_application_functions(&self) -> bool {
+        !self.application_functions.is_empty()
+    }
+
     fn replace_application_function(
         &mut self,
         key: FunctionKey,
