@@ -117,7 +117,7 @@ fn raw_trailing_slack_divergence_via_schema_only_open() {
         let mut bytes = std::fs::read(&db).unwrap();
         let header_page_count = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
         let file_pages_before = bytes.len() / page_size;
-        bytes.extend(std::iter::repeat(0u8).take(page_size)); // one trailing slack page
+        bytes.extend(std::iter::repeat_n(0u8, page_size)); // one trailing slack page
         std::fs::write(&db, &bytes).unwrap();
         let file_pages_after = bytes.len() / page_size;
 
@@ -432,7 +432,7 @@ fn trailing_slack_pages_beyond_page_count_oracle() {
                 u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
             for p in 0..extra_pages {
                 let fill = if garbage { 0xABu8.wrapping_add(p as u8) } else { 0u8 };
-                bytes.extend(std::iter::repeat(fill).take(page_size));
+                bytes.extend(std::iter::repeat_n(fill, page_size));
             }
             std::fs::write(&db, &bytes).expect("write image");
             eprintln!(

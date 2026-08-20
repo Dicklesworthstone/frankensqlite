@@ -7122,14 +7122,14 @@ mod tests {
                                         .await
                                         .ok()
                                         .and_then(|r| r.first().map(|row| {
-                                            format!("{:?}", row_values(row).to_vec())
+                                            format!("{:?}", row_values(row))
                                         }));
                                     let snap_min_max = conn
                                         .query("SELECT MIN(id), MAX(id) FROM accounts;")
                                         .await
                                         .ok()
                                         .and_then(|r| r.first().map(|row| {
-                                            format!("{:?}", row_values(row).to_vec())
+                                            format!("{:?}", row_values(row))
                                         }));
                                     eprintln!(
                                         "DK9RA_DIAG worker={worker_id} from_id={from_id} begin_seq={begin_seq} snap_count={snap_count:?} snap_min_max={snap_min_max:?}"
@@ -7141,7 +7141,7 @@ mod tests {
                                                 .await
                                                 .ok()
                                                 .and_then(|r| r.first().map(|row| {
-                                                    format!("{:?}", row_values(row).to_vec())
+                                                    format!("{:?}", row_values(row))
                                                 }));
                                             let point = fresh
                                                 .query(&format!(
@@ -7186,7 +7186,7 @@ mod tests {
                                                 .await
                                                 .ok()
                                                 .and_then(|r| r.first().map(|row| {
-                                                    format!("{:?}", row_values(row).to_vec())
+                                                    format!("{:?}", row_values(row))
                                                 }));
                                             eprintln!(
                                                 "DK9RA_DIAG_FRESH from_id={from_id} fresh_count={fresh_count:?} point={point:?} range={range:?} cluster=[{}] dups=[{}] integrity={integrity:?}",

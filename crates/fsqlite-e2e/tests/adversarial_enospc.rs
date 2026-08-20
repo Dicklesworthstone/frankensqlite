@@ -90,8 +90,7 @@ fn disk_full_commit_surfaces_sqlite_full_code_and_preserves_page() {
         let mut txn = block_on(pager.begin(&cx, TransactionMode::Immediate)).expect("begin");
         block_on(txn.write_page(&cx, page_no, &page(0x7A))).expect("stage");
         block_on(txn.commit(&cx))
-            .err()
-            .expect("commit into a full disk must fail")
+            .expect_err("commit into a full disk must fail")
     };
     assert!(
         matches!(err, FrankenError::DatabaseFull),

@@ -168,7 +168,6 @@ fn gh364_stale_handoff_from_replaced_file_does_not_reextend_fresh_db() {
         // A fresh, SMALL database created at a different path (its own new id).
         let fresh_db = dir.path().join("fresh_small.db");
         let fresh_pages_before;
-        let fresh_id;
         {
             let conn = open(&fresh_db).await;
             exec(&conn, "PRAGMA journal_mode=WAL;").await;
@@ -180,7 +179,7 @@ fn gh364_stale_handoff_from_replaced_file_does_not_reextend_fresh_db() {
                 .await
                 .expect("close fresh db");
         }
-        fresh_id = read_db_file_id(&fresh_db);
+        let fresh_id = read_db_file_id(&fresh_db);
         assert_ne!(
             fresh_id, old_id,
             "a freshly created database must have a distinct creation-stable identity"

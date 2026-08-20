@@ -354,7 +354,7 @@ fn trigger_ddl_pragma_divergence_probe() {
                         fe.as_ref()
                             .map(|_| "ok")
                             .map_err(std::string::ToString::to_string),
-                        re.as_ref().map(|_| "ok").map_err(|e| e.to_string())
+                        re.as_ref().map(|()| "ok").map_err(|e| e.to_string())
                     );
                     break;
                 }

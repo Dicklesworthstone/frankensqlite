@@ -30,7 +30,7 @@ const UPDATE: &str = "UPDATE issues SET status = ?2, priority = ?3, updated_at =
 fn ext_for(i: usize) -> SqliteValue {
     // ~1/4 of rows carry a non-null external_ref (exercises the UNIQUE partial
     // index); the rest are NULL and excluded from it.
-    if i % 4 == 0 {
+    if i.is_multiple_of(4) {
         text(format!("ext-{i:05}"))
     } else {
         SqliteValue::Null

@@ -132,11 +132,10 @@ fn bd_dhhxp_bare_wal_reads_never_busy_under_single_writer() {
                     // identity-wide process-root finalizations a reader's begin
                     // can observe as BusyRecovery.
                     match rt.block_on(conn.execute("PRAGMA wal_checkpoint(PASSIVE)")) {
-                        Ok(_) => {}
-                        // A checkpoint can legitimately be Busy if a reader is
-                        // mid-snapshot; that is the writer's own retry concern,
-                        // not the reader invariant under test.
-                        Err(FrankenError::Busy | FrankenError::BusyRecovery) => {}
+                        // A checkpoint completing, or a legitimate Busy when a
+                        // reader is mid-snapshot, is the writer's own retry
+                        // concern — not the reader invariant under test.
+                        Ok(_) | Err(FrankenError::Busy | FrankenError::BusyRecovery) => {}
                         Err(e) => return Err(format!("writer checkpoint: {e:?}")),
                     }
                 }

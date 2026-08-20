@@ -14297,29 +14297,6 @@ impl Connection {
         Self::bounded_validation_refusal(detail)
     }
 
-    fn validate_bounded_ast_render_budget(
-        root: BoundedCollationAstNode<'_>,
-        object_name: &str,
-    ) -> Result<()> {
-        match first_unsupported_bounded_ast(root, false, None, None, BoundedSchemaExpressionRole::Unrestricted) {
-            Ok(None) => Ok(()),
-            Ok(Some(unsupported)) => Err(Self::bounded_ast_unsupported_refusal(
-                object_name,
-                unsupported,
-            )),
-            Err(BoundedCollationTraversalLimit::Nodes) => {
-                Err(Self::bounded_validation_refusal(format!(
-                    "`{object_name}` expression AST exceeds the fixed {BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES}-node rendering limit"
-                )))
-            }
-            Err(BoundedCollationTraversalLimit::Depth) => {
-                Err(Self::bounded_validation_refusal(format!(
-                    "`{object_name}` expression AST exceeds the fixed rendering depth limit {BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH}"
-                )))
-            }
-        }
-    }
-
     fn validate_bounded_ast_semantics(
         &self,
         root: BoundedCollationAstNode<'_>,
@@ -14345,7 +14322,7 @@ impl Connection {
         object_name: &str,
         expression_role: BoundedSchemaExpressionRole,
         supported_function: &dyn Fn(&str, &FunctionArgs, bool) -> bool,
-        supported_like: Option<&dyn Fn(&LikeOp, &Expr, Option<&Expr>) -> bool>,
+        supported_like: Option<BoundedSupportedLikeFn<'_>>,
     ) -> Result<()> {
         match first_unsupported_bounded_ast(
             root,
@@ -15385,52 +15362,6 @@ impl Connection {
                 detail: format!(
                     "index `{}` contains {actual_count} entries but WITHOUT ROWID table `{}` requires exactly {expected_count}",
                     index.name, table.name
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    async fn bounded_mark_durable_freelist<T: TransactionHandle + ?Sized>(
-        cx: &Cx,
-        txn: &T,
-        page_size: PageSize,
-        owners: &mut crate::bounded_validation::PrivatePageOwnership,
-        freelist_trunk: u32,
-        freelist_count: u32,
-    ) -> Result<()> {
-        let mut counted = 0_u32;
-        let mut next = PageNumber::new(freelist_trunk);
-        let mut trunk_index = 0_usize;
-        while let Some(trunk_page) = next {
-            owners.mark(page_size, trunk_page, 4, "freelist trunk")?;
-            let page = txn.get_page(cx, trunk_page).await?;
-            let trunk =
-                fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(|error| {
-                    FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "freelist trunk page {} is malformed: {error}",
-                            trunk_page.get()
-                        ),
-                    }
-                })?;
-            counted = counted.checked_add(1).ok_or(FrankenError::TooBig)?;
-            for leaf in trunk.leaf_pages.iter().copied() {
-                owners.mark(page_size, leaf, 4, "freelist leaf")?;
-                counted = counted.checked_add(1).ok_or(FrankenError::TooBig)?;
-            }
-            next = trunk.next_trunk;
-            trunk_index = trunk_index.saturating_add(1);
-            if u32::try_from(trunk_index).unwrap_or(u32::MAX) > freelist_count {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "freelist trunk cycle or overlong chain".to_owned(),
-                });
-            }
-        }
-        if counted != freelist_count {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "freelist header claims {freelist_count} pages but structural walk found {counted}"
                 ),
             });
         }
@@ -34363,6 +34294,11 @@ impl Connection {
         Err(FrankenError::Unsupported)
     }
 
+    /// Test-only convenience dispatcher: run a statement with a fresh op-Cx and
+    /// no FK-scope override. Production code calls
+    /// `execute_statement_dispatch_with_fk_scope` directly; this thin wrapper is
+    /// exercised only by the poisoned-runtime unit test, hence `#[cfg(test)]`.
+    #[cfg(test)]
     async fn execute_statement_dispatch(
         &self,
         statement: &Statement,
@@ -38587,9 +38523,6 @@ enum BoundedAstUnsupported {
 /// admitted for shape and then never used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoundedSchemaExpressionRole {
-    /// No shape restrictions. Used by the collation-rendering budget walk,
-    /// which asks only whether the AST can be rendered within its limits.
-    Unrestricted,
     /// A CHECK constraint or column default: the bounded evaluator recomputes
     /// this expression against real rows, so every shape it cannot reproduce
     /// exactly must be refused. This is the historical `true` behaviour and is
@@ -38612,7 +38545,7 @@ impl BoundedSchemaExpressionRole {
     /// row-values and IN-table shorthand stay refused everywhere they were
     /// before; each would need its own argument to relax, and none has one.
     const fn rejects_shapes(self) -> bool {
-        !matches!(self, Self::Unrestricted)
+        matches!(self, Self::Evaluated | Self::Unevaluated)
     }
 
     /// Whether a subquery is refused by SHAPE.
@@ -38692,11 +38625,16 @@ impl BoundedSchemaExpressionRole {
     }
 }
 
+/// A borrowed scalar-function-admission predicate for the bounded AST walk.
+type BoundedSupportedFn<'a> = &'a dyn Fn(&str, &FunctionArgs, bool) -> bool;
+/// A borrowed LIKE/GLOB-admission predicate for the bounded AST walk.
+type BoundedSupportedLikeFn<'a> = &'a dyn Fn(&LikeOp, &Expr, Option<&Expr>) -> bool;
+
 fn first_unsupported_bounded_ast(
     root: BoundedCollationAstNode<'_>,
     reject_custom_collations: bool,
-    supported_function: Option<&dyn Fn(&str, &FunctionArgs, bool) -> bool>,
-    supported_like: Option<&dyn Fn(&LikeOp, &Expr, Option<&Expr>) -> bool>,
+    supported_function: Option<BoundedSupportedFn<'_>>,
+    supported_like: Option<BoundedSupportedLikeFn<'_>>,
     expression_role: BoundedSchemaExpressionRole,
 ) -> std::result::Result<Option<BoundedAstUnsupported>, BoundedCollationTraversalLimit> {
     let mut pending = vec![(root, 0_usize)];
@@ -38893,17 +38831,10 @@ fn first_unsupported_bounded_ast(
                 }
                 Statement::Analyze(_) => {
                     return Ok(Some(BoundedAstUnsupported::Statement("ANALYZE")));
-                }
-                // Fail closed on statement kinds this line grew after the
-                // traversal was written. An admission gate that silently
-                // accepts a construct it does not recognise is worse than no
-                // gate: the walkers would then be asked to prove something
-                // nobody checked they can evaluate.
-                _ => {
-                    return Ok(Some(BoundedAstUnsupported::Statement(
-                        "statement kind unknown to the bounded admission traversal",
-                    )));
-                }
+                } // NOTE: this match is exhaustive over `Statement` on purpose —
+                // it fails closed by construction. A new `Statement` variant
+                // makes it non-exhaustive (a compile error) so the admission
+                // traversal cannot silently accept a construct nobody checked.
             },
             BoundedCollationAstNode::Expr(expr) => match expr {
                 Expr::Literal(literal, _) => {
@@ -39366,10 +39297,6 @@ impl Drop for BoundedCheckFunctionRegistryGuard {
             let _ = stack.borrow_mut().pop();
         });
     }
-}
-
-fn current_bounded_check_function_registry() -> Option<Arc<FunctionRegistry>> {
-    CURRENT_BOUNDED_CHECK_FUNCTION_REGISTRY.with(|stack| stack.borrow().last().cloned())
 }
 
 struct BoundedCheckEvaluationBudgetGuard;
@@ -45327,11 +45254,12 @@ impl Connection {
                     Self::normalize_partial_predicate_columns(item, targets);
                 }
             }
-            Expr::FunctionCall { args, .. } => {
-                if let FunctionArgs::List(items) = args {
-                    for item in items {
-                        Self::normalize_partial_predicate_columns(item, targets);
-                    }
+            Expr::FunctionCall {
+                args: FunctionArgs::List(items),
+                ..
+            } => {
+                for item in items {
+                    Self::normalize_partial_predicate_columns(item, targets);
                 }
             }
             // Literals, placeholders, subqueries, EXISTS, RAISE, and bound
@@ -45451,21 +45379,22 @@ impl Connection {
             return true;
         }
         match expr {
-            Expr::BinaryOp { left, op, right, .. }
-                if matches!(
-                    op,
+            Expr::BinaryOp {
+                left,
+                op:
                     BinaryOp::Add
-                        | BinaryOp::Subtract
-                        | BinaryOp::Multiply
-                        | BinaryOp::Divide
-                        | BinaryOp::Modulo
-                        | BinaryOp::Concat
-                        | BinaryOp::BitAnd
-                        | BinaryOp::BitOr
-                        | BinaryOp::ShiftLeft
-                        | BinaryOp::ShiftRight
-                ) =>
-            {
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo
+                    | BinaryOp::Concat
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight,
+                right,
+                ..
+            } => {
                 Self::expr_null_propagates_from(left, col)
                     || Self::expr_null_propagates_from(right, col)
             }
@@ -47871,7 +47800,7 @@ impl Connection {
             };
             if let Some((delete_enabled, columns)) = contentless {
                 if !delete_enabled {
-                    return Err(FrankenError::function_error(&format!(
+                    return Err(FrankenError::function_error(format!(
                         "cannot UPDATE contentless fts5 table: {table_name}"
                     )));
                 }
@@ -47891,7 +47820,7 @@ impl Connection {
                     .iter()
                     .any(|col| !assigned.contains(&col.to_ascii_lowercase()))
                 {
-                    return Err(FrankenError::function_error(&format!(
+                    return Err(FrankenError::function_error(format!(
                         "cannot UPDATE a subset of columns on fts5 contentless-delete table: {table_name}"
                     )));
                 }
@@ -48005,13 +47934,13 @@ impl Connection {
             // origin-targeted). Falls through to promote only when the delete
             // can't be tombstoned — e.g. a row predates origin tracking, so its
             // `_docsize.origin` is NULL. (bd-fts5-lazy-shadow-reads-itcc4.3)
-            if is_lazy && !self.rootpage_zero_fts5_has_internal_content_shadow(table_name) {
-                if let Some(deleted) = self
+            if is_lazy
+                && !self.rootpage_zero_fts5_has_internal_content_shadow(table_name)
+                && let Some(deleted) = self
                     .persist_rootpage_zero_fts5_contentless_incremental_delete(table_name, rowids)
                     .await?
-                {
-                    return Ok(deleted);
-                }
+            {
+                return Ok(deleted);
             }
             if is_lazy {
                 self.promote_lazy_fts5_table(table_name).await?;
@@ -55369,7 +55298,7 @@ impl Connection {
                 return Ok(false);
             };
             let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-            Ok(cursor.first(cx).await?)
+            cursor.first(cx).await
         })
         .await
     }
@@ -58899,7 +58828,7 @@ impl Connection {
             let mut schema = self.schema.borrow_mut();
             for table in schema.iter_mut() {
                 if table.name.eq_ignore_ascii_case(old_name) {
-                    table.name = new_name.to_owned();
+                    new_name.clone_into(&mut table.name);
                     continue;
                 }
                 if let Some(new_def) = old_shadow_names
@@ -61127,7 +61056,7 @@ impl Connection {
             // — its deferred obligation is discharged.
             None => Ok(()),
             Some(row) => {
-                self.check_fk_parent_exists(table_name, &row.values().to_vec())
+                self.check_fk_parent_exists(table_name, row.values())
                     .await
             }
         }
@@ -63535,6 +63464,9 @@ impl Connection {
         self.from_clause_has_bare_pragma_tvf(from, cte_names)
     }
 
+    // `from_` here refers to the SQL FROM clause, not a type conversion, so
+    // clippy's wrong_self_convention heuristic is a false positive.
+    #[allow(clippy::wrong_self_convention)]
     fn from_clause_has_bare_pragma_tvf(&self, from: &FromClause, cte_names: &[String]) -> bool {
         self.source_is_bare_pragma_tvf(&from.source, cte_names)
             || from
@@ -78165,7 +78097,7 @@ impl Connection {
                     // dropping either chose the wrong extremum row (bd-3radn M5).
                     // The nested aggregate is then evaluated within its Plain
                     // expression against that representative row.
-                    .unwrap_or_else(|| {
+                    .unwrap_or({
                         (
                             usize::MAX,
                             None,
@@ -95391,10 +95323,10 @@ fn any_function_call_in_select(
         if any_function_call_in_expr(&limit.limit, pred) {
             return true;
         }
-        if let Some(offset) = &limit.offset {
-            if any_function_call_in_expr(offset, pred) {
-                return true;
-            }
+        if let Some(offset) = &limit.offset
+            && any_function_call_in_expr(offset, pred)
+        {
+            return true;
         }
     }
     false
@@ -95415,10 +95347,10 @@ fn any_function_call_in_select_core(
             ..
         } => {
             for column in columns {
-                if let ResultColumn::Expr { expr, .. } = column {
-                    if any_function_call_in_expr(expr, pred) {
-                        return true;
-                    }
+                if let ResultColumn::Expr { expr, .. } = column
+                    && any_function_call_in_expr(expr, pred)
+                {
+                    return true;
                 }
             }
             if let Some(from_clause) = from {
@@ -95429,27 +95361,27 @@ fn any_function_call_in_select_core(
                     if any_function_call_in_table_or_subquery(&join.table, pred) {
                         return true;
                     }
-                    if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                        if any_function_call_in_expr(expr, pred) {
-                            return true;
-                        }
+                    if let Some(JoinConstraint::On(expr)) = &join.constraint
+                        && any_function_call_in_expr(expr, pred)
+                    {
+                        return true;
                     }
                 }
             }
-            if let Some(expr) = where_clause {
-                if any_function_call_in_expr(expr, pred) {
-                    return true;
-                }
+            if let Some(expr) = where_clause
+                && any_function_call_in_expr(expr, pred)
+            {
+                return true;
             }
             for expr in group_by {
                 if any_function_call_in_expr(expr, pred) {
                     return true;
                 }
             }
-            if let Some(expr) = having {
-                if any_function_call_in_expr(expr, pred) {
-                    return true;
-                }
+            if let Some(expr) = having
+                && any_function_call_in_expr(expr, pred)
+            {
+                return true;
             }
             for window in windows {
                 if any_function_call_in_window_spec(&window.spec, pred) {
@@ -95494,10 +95426,10 @@ fn any_function_call_in_table_or_subquery(
                 if any_function_call_in_table_or_subquery(&join.table, pred) {
                     return true;
                 }
-                if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                    if any_function_call_in_expr(expr, pred) {
-                        return true;
-                    }
+                if let Some(JoinConstraint::On(expr)) = &join.constraint
+                    && any_function_call_in_expr(expr, pred)
+                {
+                    return true;
                 }
             }
             false
@@ -95564,10 +95496,10 @@ fn any_function_call_in_expr(
             else_expr,
             ..
         } => {
-            if let Some(operand) = operand {
-                if any_function_call_in_expr(operand, pred) {
-                    return true;
-                }
+            if let Some(operand) = operand
+                && any_function_call_in_expr(operand, pred)
+            {
+                return true;
             }
             for (when_expr, then_expr) in whens {
                 if any_function_call_in_expr(when_expr, pred)
@@ -95606,15 +95538,15 @@ fn any_function_call_in_expr(
                     return true;
                 }
             }
-            if let Some(filter) = filter {
-                if any_function_call_in_expr(filter, pred) {
-                    return true;
-                }
+            if let Some(filter) = filter
+                && any_function_call_in_expr(filter, pred)
+            {
+                return true;
             }
-            if let Some(window) = over {
-                if any_function_call_in_window_spec(window, pred) {
-                    return true;
-                }
+            if let Some(window) = over
+                && any_function_call_in_window_spec(window, pred)
+            {
+                return true;
             }
             false
         }
@@ -95647,15 +95579,15 @@ fn any_function_call_in_window_spec(
         }
     }
     if let Some(frame) = &window.frame {
-        if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = &frame.start {
-            if any_function_call_in_expr(expr, pred) {
-                return true;
-            }
+        if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = &frame.start
+            && any_function_call_in_expr(expr, pred)
+        {
+            return true;
         }
-        if let Some(FrameBound::Preceding(expr) | FrameBound::Following(expr)) = &frame.end {
-            if any_function_call_in_expr(expr, pred) {
-                return true;
-            }
+        if let Some(FrameBound::Preceding(expr) | FrameBound::Following(expr)) = &frame.end
+            && any_function_call_in_expr(expr, pred)
+        {
+            return true;
         }
     }
     false
@@ -95732,15 +95664,15 @@ fn any_function_call_in_update(
             return true;
         }
     }
-    if let Some(from) = &update.from {
-        if any_function_call_in_from_clause(from, pred) {
-            return true;
-        }
+    if let Some(from) = &update.from
+        && any_function_call_in_from_clause(from, pred)
+    {
+        return true;
     }
-    if let Some(where_clause) = &update.where_clause {
-        if any_function_call_in_expr(where_clause, pred) {
-            return true;
-        }
+    if let Some(where_clause) = &update.where_clause
+        && any_function_call_in_expr(where_clause, pred)
+    {
+        return true;
     }
     if any_function_call_in_result_columns(&update.returning, pred) {
         return true;
@@ -95759,10 +95691,10 @@ fn any_function_call_in_delete(
             }
         }
     }
-    if let Some(where_clause) = &delete.where_clause {
-        if any_function_call_in_expr(where_clause, pred) {
-            return true;
-        }
+    if let Some(where_clause) = &delete.where_clause
+        && any_function_call_in_expr(where_clause, pred)
+    {
+        return true;
     }
     if any_function_call_in_result_columns(&delete.returning, pred) {
         return true;
@@ -95774,12 +95706,11 @@ fn any_function_call_in_upsert_clause(
     clause: &UpsertClause,
     pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
 ) -> bool {
-    if let Some(target) = &clause.target {
-        if let Some(where_clause) = &target.where_clause {
-            if any_function_call_in_expr(where_clause, pred) {
-                return true;
-            }
-        }
+    if let Some(target) = &clause.target
+        && let Some(where_clause) = &target.where_clause
+        && any_function_call_in_expr(where_clause, pred)
+    {
+        return true;
     }
     match &clause.action {
         UpsertAction::Nothing => false,
@@ -95804,10 +95735,10 @@ fn any_function_call_in_result_columns(
     pred: &mut impl FnMut(&str, &FunctionArgs) -> bool,
 ) -> bool {
     for column in columns {
-        if let ResultColumn::Expr { expr, .. } = column {
-            if any_function_call_in_expr(expr, pred) {
-                return true;
-            }
+        if let ResultColumn::Expr { expr, .. } = column
+            && any_function_call_in_expr(expr, pred)
+        {
+            return true;
         }
     }
     false
@@ -95824,10 +95755,10 @@ fn any_function_call_in_from_clause(
         if any_function_call_in_table_or_subquery(&join.table, pred) {
             return true;
         }
-        if let Some(JoinConstraint::On(expr)) = &join.constraint {
-            if any_function_call_in_expr(expr, pred) {
-                return true;
-            }
+        if let Some(JoinConstraint::On(expr)) = &join.constraint
+            && any_function_call_in_expr(expr, pred)
+        {
+            return true;
         }
     }
     false
@@ -95847,10 +95778,10 @@ fn any_function_call_in_order_by_limit(
         if any_function_call_in_expr(&limit.limit, pred) {
             return true;
         }
-        if let Some(offset) = &limit.offset {
-            if any_function_call_in_expr(offset, pred) {
-                return true;
-            }
+        if let Some(offset) = &limit.offset
+            && any_function_call_in_expr(offset, pred)
+        {
+            return true;
         }
     }
     false
@@ -98219,10 +98150,10 @@ fn subst_cte_refs_in_nested_select(
     body: &SelectStatement,
     inlined: &mut usize,
 ) {
-    if let Some(with) = &select.with {
-        if with.ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(name)) {
-            return;
-        }
+    if let Some(with) = &select.with
+        && with.ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(name))
+    {
+        return;
     }
     subst_cte_refs_in_select(select, name, body, inlined);
 }
