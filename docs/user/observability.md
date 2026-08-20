@@ -23,6 +23,7 @@ counters are lock-free atomics).
 | *(default)* | Recording enabled; poll via the callable API below. |
 | `FRANKENSQLITE_METRICS_DISABLE=1` | **Hard opt-out.** Every `inc`/`observe`/`set` becomes a branch-guarded no-op and the exposition functions return an empty string. Read once at process start via `LazyLock`, so the disable check adds a single predictable branch. |
 | `FRANKENSQLITE_STATSD_ADDR=host:port` | **Opt-in StatsD push.** Names the StatsD/DogStatsD server (e.g. `127.0.0.1:8125`) that `StatsdPusher::from_env()` sends to. Unset ⇒ no StatsD push. |
+| `FRANKENSQLITE_METRICS_BIND=host:port` | **Opt-in HTTP `/metrics`.** When `metrics_net::autostart_from_env()` is called, binds a Prometheus pull endpoint here (e.g. `127.0.0.1:9009`). Unset ⇒ no HTTP endpoint. Also gated by the hard opt-out above. |
 
 Set the environment variable before the process starts:
 
@@ -34,9 +35,11 @@ FRANKENSQLITE_METRICS_DISABLE=1 ./your-app
 
 ## Exposition formats
 
-Three ways to read the metrics. The **callable API** and both **serializers**
-ship today; the **network transports** that carry those serialized payloads are
-a tracked follow-on (see [Roadmap](#roadmap)).
+Three ways to read the metrics. The **callable API**, both **serializers**, the
+**StatsD UDP push** transport, and the **HTTP `/metrics` endpoint** all ship
+today. What remains is *engine* wiring — auto-starting the endpoint from
+`Connection::open` / a `PRAGMA`, and incrementing the counters at their hot-path
+sites (see [Roadmap](#roadmap)).
 
 ### 1. Callable API (embedded scrape) — available now
 
@@ -54,11 +57,32 @@ reg.commits_total.inc();
 let body = reg.render_prometheus();
 ```
 
-### 2. Prometheus (pull) — serializer available now, HTTP endpoint planned
+### 2. Prometheus (pull) — available now
 
 `render_prometheus()` produces standard Prometheus text exposition. Serve it
-from any HTTP handler you already run, or wait for the built-in endpoint
-(planned; will bind `localhost:9009/metrics`, opt-in). Example output:
+from any HTTP handler you already run, or use the built-in `std::net` endpoint
+(`metrics_net` module; no tokio/hyper/axum). It serves `GET /metrics` from a
+daemon thread with `Content-Type: text/plain; version=0.0.4`, and `404`s any
+other path:
+
+```rust
+use fsqlite_observability::metrics_net;
+
+// Bind an explicit address (":0" picks an ephemeral port); returns the bound addr.
+let addr = metrics_net::start_metrics_http("127.0.0.1:9009")?;
+// ... now `curl http://127.0.0.1:9009/metrics` returns the exposition.
+
+// Or opt in by environment — a no-op unless FRANKENSQLITE_METRICS_BIND is set
+// (and a no-op under FRANKENSQLITE_METRICS_DISABLE=1). Idempotent; binds once.
+metrics_net::autostart_from_env(); // honors FRANKENSQLITE_METRICS_BIND=127.0.0.1:9009
+```
+
+> **Note.** The endpoint is available as a callable API today. Having the engine
+> *auto-start* it at `Connection::open` (and a `PRAGMA enable_metrics_http=1`
+> control with the default `localhost:9009` bind) is the remaining wiring tracked
+> on `bd-zywqc.11`.
+
+Example output:
 
 ```text
 # HELP fsqlite_commits_total Committed transactions.
@@ -197,12 +221,13 @@ defaults, not measured guarantees.
 
 ## Roadmap
 
-The recording registry, both serializers, and the StatsD UDP push transport
-ship today. Remaining increments (tracked on `bd-zywqc.11`):
+The recording registry, both serializers, the StatsD UDP push transport, and the
+HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
+`bd-zywqc.11`):
 
-- **HTTP `/metrics` endpoint** — opt-in Prometheus pull, default
-  `localhost:9009` (implemented with `std::net`/asupersync; tokio is forbidden
-  in this project).
+- **Engine auto-start & `PRAGMA`** — auto-binding the HTTP endpoint from
+  `Connection::open` and a `PRAGMA enable_metrics_http=1` control (default
+  `localhost:9009`), so operators need no explicit `start_metrics_http` call.
 - **Engine hot-path wiring** — incrementing these metrics from the actual
   fsync / commit / conflict / sweeper / integrity sites.
 - **Overhead gate** — verify opt-in metrics add < 2% on the 8-writer soak.
