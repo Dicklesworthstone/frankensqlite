@@ -166,3 +166,35 @@ fn json_group_array_result_is_valid_json() {
         .await;
     });
 }
+
+// The two cases below deliberately omit the ORDER BY subquery so the aggregate
+// folds a bare table scan. That form takes the interpreted group-aggregate path
+// (not the VDBE lowering the subquery cases exercise), so these guard the
+// `is_current_aggregate_fn` classifier being JSON-aware: without it the query
+// is (mis)planned as a per-row scalar scan and returns one NULL per row instead
+// of a single folded array/object. Row visit order is rowid order on both
+// engines for a single heap scan, so the comparison stays deterministic.
+
+#[test]
+fn json_group_array_bare_scan_interpreted_path() {
+    asupersync::test_utils::run_test(|| async {
+        agree(
+            &["CREATE TABLE t(x INTEGER)", "INSERT INTO t VALUES (1),(2),(3)"],
+            "SELECT json_group_array(x) FROM t",
+            "bare json_group_array must fold to one row (interpreted path)",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn json_group_object_bare_scan_interpreted_path() {
+    asupersync::test_utils::run_test(|| async {
+        agree(
+            &["CREATE TABLE t(k TEXT, v INTEGER)", "INSERT INTO t VALUES ('a',1),('b',2)"],
+            "SELECT json_group_object(k, v) FROM t",
+            "bare json_group_object must fold to one row (interpreted path)",
+        )
+        .await;
+    });
+}

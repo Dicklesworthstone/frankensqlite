@@ -108715,6 +108715,11 @@ fn is_current_aggregate_fn(name: &str, args: &FunctionArgs) -> bool {
         return kind.is_aggregate_callable();
     }
     is_agg_fn(name)
+        // json_group_array / json_group_object are unconditional aggregates
+        // (fsqlite-ext-json). Every aggregate-detection caller of this predicate
+        // — collapse gating, nested-aggregate misuse, the interpreted group
+        // evaluator, and HAVING recomputation — must treat them as aggregates.
+        || is_builtin_json_aggregate(name)
         || with_current_sync_custom_aggregate_keys(|keys| {
             keys.is_some_and(|keys| custom_aggregate_overrides_builtin(keys, name, arity))
         })
