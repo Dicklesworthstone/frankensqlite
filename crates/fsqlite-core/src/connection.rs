@@ -45487,6 +45487,112 @@ impl Connection {
         resolved
     }
 
+    /// Resolve the declared SQL type (decltype) of each output column of a
+    /// view's SELECT, mirroring SQLite's `sqlite3ColumnType`: a direct column
+    /// reference reports the SOURCE column's declared type verbatim (e.g.
+    /// `VARCHAR(20)`, not its affinity), while any expression / literal /
+    /// aggregate reports an empty type. Used by `PRAGMA table_info(<view>)`
+    /// (bd-pragma-table-info-view-decltype-moufi).
+    ///
+    /// Only a single bare base table (no joins) is resolved to source-column
+    /// types; a join / subquery / nested view / table-function / FROM-less
+    /// SELECT yields an empty result, which the caller pads to all-empty types
+    /// to match the output column count. This closes the common
+    /// single-base-table view exactly and never emits a WRONG type — SQLite
+    /// itself reports an empty type for expression columns.
+    fn view_result_column_decltypes(
+        &self,
+        query: &SelectStatement,
+        tables: &[TableSchema],
+    ) -> Vec<Option<String>> {
+        let SelectCore::Select { columns, from, .. } = &query.body.select else {
+            return Vec::new();
+        };
+        let source_columns: Option<&[ColumnInfo]> = match from {
+            Some(from_clause) if from_clause.joins.is_empty() => match &from_clause.source {
+                TableOrSubquery::Table { name, .. } => tables
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(&name.name))
+                    .map(|t| t.columns.as_slice()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut out: Vec<Option<String>> = Vec::with_capacity(columns.len());
+        for column in columns {
+            match column {
+                // `*` / `table.*` over a single base table expand to that
+                // table's columns in declaration order (aligned with the names
+                // produced by `select_result_column_names`). Over any other
+                // source we cannot resolve the width here, so signal
+                // "unresolved" by returning empty and let the caller pad.
+                ResultColumn::Star | ResultColumn::TableStar(_) => match source_columns {
+                    Some(cols) => out.extend(cols.iter().map(|c| c.type_name.clone())),
+                    None => return Vec::new(),
+                },
+                ResultColumn::Expr { expr, .. } => {
+                    let decltype = match expr {
+                        Expr::Column(col_ref, _) => source_columns.and_then(|cols| {
+                            cols.iter()
+                                .find(|c| c.name.eq_ignore_ascii_case(col_ref.column.as_ref()))
+                                .and_then(|c| c.type_name.clone())
+                        }),
+                        _ => None,
+                    };
+                    out.push(decltype);
+                }
+            }
+        }
+        out
+    }
+
+    /// Build the `PRAGMA table_info` / `table_xinfo` rows for a VIEW: one row
+    /// per view output column (cid, name, type, notnull, dflt_value, pk, and a
+    /// trailing `hidden` for `table_xinfo`). Views always report notnull=0,
+    /// dflt_value=NULL, pk=0, hidden=0; only the declared type varies (resolved
+    /// via `view_result_column_decltypes`). Column names come from an explicit
+    /// `CREATE VIEW v(...)` list when present, else the SELECT's own output
+    /// names. (bd-pragma-table-info-view-decltype-moufi)
+    fn build_view_table_info_rows(
+        &self,
+        view: &ViewDef,
+        tables: &[TableSchema],
+        is_xinfo: bool,
+    ) -> Vec<Row> {
+        let names: Vec<String> = if view.columns.is_empty() {
+            self.select_result_column_names(&view.query, &[], &mut Vec::new())
+        } else {
+            view.columns.clone()
+        };
+        // Decltypes are computed from the SELECT projection and must align by
+        // position with `names`; a length mismatch (e.g. `*` over a non-simple
+        // source) falls back to all-empty types rather than misaligning.
+        let mut decltypes = self.view_result_column_decltypes(&view.query, tables);
+        if decltypes.len() != names.len() {
+            decltypes = vec![None; names.len()];
+        }
+        names
+            .iter()
+            .zip(decltypes)
+            .enumerate()
+            .map(|(i, (name, decltype))| {
+                let type_str = decltype.unwrap_or_default();
+                let mut values = vec![
+                    SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
+                    SqliteValue::Text(name.clone().into()),
+                    SqliteValue::Text(type_str.into()),
+                    SqliteValue::Integer(0),
+                    SqliteValue::Null,
+                    SqliteValue::Integer(0),
+                ];
+                if is_xinfo {
+                    values.push(SqliteValue::Integer(0));
+                }
+                Row { values }
+            })
+            .collect()
+    }
+
     /// bd-c9v0f + bd-pw68x: reject a top-level SELECT that SQLite would reject:
     /// an ORDER BY / GROUP BY integer ordinal outside `1..=ncol`, or an
     /// `INDEXED BY <name>` naming an index the table does not have. FrankenSQLite
@@ -71226,7 +71332,22 @@ impl Connection {
                             .collect();
                         Ok(rows)
                     }
-                    None => Ok(Vec::new()),
+                    // Not a table — it may be a VIEW. PRAGMA table_info(<view>)
+                    // reports one row per view OUTPUT column
+                    // (bd-pragma-table-info-view-decltype-moufi).
+                    None => {
+                        let view = self
+                            .view_index_for_scope(&table_name, pragma_schema_scope(pragma))
+                            .and_then(|idx| self.views.borrow().get(idx).cloned());
+                        match view {
+                            Some(view) => Ok(self.build_view_table_info_rows(
+                                &view,
+                                &tables,
+                                full_name == "table_xinfo",
+                            )),
+                            None => Ok(Vec::new()),
+                        }
+                    }
                 }
             }
             // PRAGMA index_list(table_name) — return indexes on a table.
