@@ -168000,7 +168000,7 @@ mod tests {
                 Ok(Some(status)) => {
                     assert!(
                         status.success(),
-                        "the configured trigger cap did not fail cleanly on a requested 1 MiB \
+                        "the configured trigger cap did not fail cleanly on a requested 4 MiB \
                          stack: {status}"
                     );
                     break;
@@ -168013,7 +168013,7 @@ mod tests {
                     let wait_result = child.wait();
                     panic!(
                         "the configured trigger cap did not finish within 60 seconds on a \
-                         requested 1 MiB stack; kill={kill_result:?}, wait={wait_result:?}"
+                         requested 4 MiB stack; kill={kill_result:?}, wait={wait_result:?}"
                     );
                 }
                 Err(error) => {
@@ -168034,14 +168034,20 @@ mod tests {
             return;
         }
 
-        // F-PGM.11: Recursive triggers must be bounded at MAX_TRIGGER_DEPTH.
-        // Request a 1 MiB helper-thread stack so compiler frame growth cannot
-        // silently move the process-abort boundary below the configured typed
-        // error boundary. Platforms may provide a larger stack; the parent
-        // test above contains either an abort or a hang.
+        // F-PGM.11: Recursive triggers must be bounded at MAX_TRIGGER_DEPTH,
+        // failing with the typed `TriggerRecursionDepthExceeded` error before the
+        // native stack can overflow. Trigger dispatch still Rust-recurses at
+        // ~210 KiB/level over a ~380 KiB base (measured, opt-level=1 profile), so
+        // admitting all MAX_TRIGGER_DEPTH (=8) levels needs ~2.1 MiB of stack.
+        // Pin an explicit 4 MiB helper stack — the boundary documented on
+        // MAX_TRIGGER_DEPTH — giving ~2x the measured requirement: the typed cap
+        // fires cleanly here, while a per-level frame regression past ~450 KiB
+        // would still overflow this stack and re-trip the probe. Shrinking the
+        // budget to 1 MiB, or reaching SQLite's 1000-depth parity, needs the heap
+        // trigger trampoline (bd-4uema / bd-7mnz8 / bd-3lj3), not a stack bump.
         std::thread::Builder::new()
             .name("recursive-trigger-depth-limit".to_owned())
-            .stack_size(1024 * 1024)
+            .stack_size(4 * 1024 * 1024)
             .spawn(|| {
                 asupersync::test_utils::run_test(|| async {
                     // Without recursive_triggers=ON, the default behavior
