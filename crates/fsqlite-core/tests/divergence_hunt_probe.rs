@@ -2149,3 +2149,79 @@ fn omitted_conflict_target_upsert_parity() {
         );
     }
 }
+
+/// Window functions + FILTER clauses vs the modern (rusqlite ~3.53) oracle —
+/// from a scalar-divergence probe sweep. Two findings are locked in here:
+///
+///  1. VALUE parity: the mainstream and edge window/FILTER surface matches
+///     MODERN SQLite exactly. In particular `min`/`max` FILTER over a moving
+///     ROWS frame where the *current row fails the filter* is filter-consistent
+///     (frank and SQLite 3.53 both exclude the filtered-out current row). The
+///     `-7` seen from the stale 3.46.1 CLI was a since-fixed C-SQLite bug, so it
+///     is deliberately NOT chased — this case guards frank's correct behaviour.
+///
+///  2. ERROR-TEXT parity: FILTER on a non-aggregate *window* function reports
+///     SQLite's canonical "FILTER clause may only be used with aggregate window
+///     functions", while FILTER on a plain scalar keeps the generic message.
+#[test]
+fn window_and_filter_parity() {
+    const T: &[&str] = &[
+        "CREATE TABLE t(id INTEGER, grp TEXT, val INTEGER, fval REAL, txt TEXT)",
+        "INSERT INTO t VALUES (1,'a',10,1.5,'apple'),(2,'a',20,2.5,'banana'),\
+         (3,'a',NULL,3.5,'cherry'),(4,'b',5,NULL,'date'),(5,'b',5,4.5,'egg'),\
+         (6,'b',30,5.5,NULL),(7,'c',NULL,NULL,'fig'),(8,'c',-7,0.0,'grape')",
+    ];
+    // Integer/text/NULL results only (float text-rendering is covered elsewhere
+    // and is oracle-version sensitive), so these assert exact tagged-row parity.
+    let cases: Vec<Case> = vec![
+        Case { setup: T, sql: "SELECT id, min(val) FILTER (WHERE val>0) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, max(val) FILTER (WHERE val>0) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, sum(val) FILTER (WHERE val>5) OVER (PARTITION BY grp) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, count(*) FILTER (WHERE txt IS NOT NULL) OVER (ORDER BY id) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, rank() OVER (ORDER BY val NULLS FIRST) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, rank() OVER (ORDER BY val NULLS LAST) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, sum(val) OVER (ORDER BY val RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, sum(val) OVER (ORDER BY val GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, lag(val,-1) OVER (ORDER BY id) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT id, nth_value(val,2) OVER (PARTITION BY grp ORDER BY id) FROM t ORDER BY id" },
+        Case { setup: T, sql: "SELECT grp, count(val) FILTER (WHERE val IS NOT NULL) FROM t GROUP BY grp ORDER BY grp" },
+        Case { setup: T, sql: "SELECT sum(DISTINCT val) FILTER (WHERE val>0) FROM t" },
+        Case { setup: T, sql: "SELECT id, group_concat(txt) FILTER (WHERE grp<>'b') OVER (ORDER BY id) FROM t ORDER BY id" },
+    ];
+
+    let mut divergences = Vec::new();
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            check(&mut divergences, c).await;
+        }
+        // ERROR-TEXT parity: FILTER on a non-aggregate window function must use
+        // SQLite's canonical message (not frank's generic non-aggregate text).
+        let werr = frank_rows(
+            T,
+            "SELECT row_number() FILTER (WHERE val>0) OVER (ORDER BY id) FROM t",
+        )
+        .await
+        .expect_err("frank must reject FILTER on row_number()");
+        assert!(
+            werr.contains("FILTER clause may only be used with aggregate window functions"),
+            "window-FILTER error text diverged: {werr}"
+        );
+        // A plain scalar FILTER without OVER keeps the generic message (guards
+        // against over-broadening the fix).
+        let serr = frank_rows(T, "SELECT abs(val) FILTER (WHERE val>0) FROM t")
+            .await
+            .expect_err("frank must reject FILTER on abs()");
+        assert!(
+            serr.contains("FILTER may not be used with non-aggregate abs()"),
+            "scalar-FILTER error text diverged: {serr}"
+        );
+    });
+
+    assert!(
+        divergences.is_empty(),
+        "\n===== {} WINDOW/FILTER DIVERGENCE(S) vs C SQLite (of {} cases) =====\n{}\n",
+        divergences.len(),
+        cases.len(),
+        divergences.join("\n\n")
+    );
+}

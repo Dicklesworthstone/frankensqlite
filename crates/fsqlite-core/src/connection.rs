@@ -93045,9 +93045,23 @@ fn validate_function_call_header(
     let is_aggregate =
         is_current_aggregate_or_json_fn(name, args) && !is_scalar_max_min(name, args);
     if filter.is_some() && !is_aggregate {
-        return Err(FrankenError::FunctionError(format!(
-            "FILTER may not be used with non-aggregate {name}()"
-        )));
+        // SQLite (3.53) reports two different messages here. A genuine
+        // non-aggregate *window* function (row_number/rank/ntile/lag/...) used
+        // with OVER gets the window-specific text; every other non-aggregate
+        // (a plain scalar, with or without OVER) keeps the generic message.
+        let is_window_fn = over.is_some() && {
+            let num_args = aggregate_args_len_for_lookup(args);
+            with_current_sync_function_registry(|registry| {
+                registry
+                    .unwrap_or_else(|| shared_builtin_function_registry().as_ref())
+                    .window_accepts_arg_count(name, num_args)
+            }) == Some(true)
+        };
+        return Err(FrankenError::FunctionError(if is_window_fn {
+            "FILTER clause may only be used with aggregate window functions".to_owned()
+        } else {
+            format!("FILTER may not be used with non-aggregate {name}()")
+        }));
     }
     if distinct && over.is_some() {
         return Err(FrankenError::FunctionError(
