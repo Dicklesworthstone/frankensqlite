@@ -103850,12 +103850,20 @@ fn collect_table_or_subquery_inner_alias(source: &TableOrSubquery, out: &mut Vec
             out.push(alias.as_ref().unwrap_or(&name.name).clone());
         }
         TableOrSubquery::Subquery { alias, .. } => {
-            // Aliased subqueries (`FROM (SELECT ...) AS s`) act as inner
-            // tables under their alias. Anonymous subqueries can't be
-            // referenced by qualifier so they don't contribute aliases.
-            if let Some(a) = alias {
-                out.push(a.clone());
-            }
+            // Aliased subqueries (`FROM (SELECT ...) AS s`) act as inner tables
+            // under their alias. An ANONYMOUS derived table (`FROM (VALUES ...)`
+            // or an unaliased `FROM (SELECT ...)`) can't be referenced by a
+            // qualifier, but it DOES provide local unqualified columns
+            // (`column1`.., or the inner projection's names). Register an unnamed
+            // sentinel (the empty string, which matches no real qualifier) so the
+            // correlation detector treats those unqualified refs as LOCAL rather
+            // than as external/correlated outer references — otherwise an empty
+            // `inner_tables` misflags e.g. `column1` in
+            // `SELECT (SELECT count(column1) FROM (VALUES (1),(2)))` as a bare
+            // outer column and rejects the valid scalar subquery (bd-hbv4e). This
+            // mirrors how a NAMED derived table already suppresses that
+            // classification; qualified-ref detection is unaffected.
+            out.push(alias.clone().unwrap_or_default());
         }
         TableOrSubquery::TableFunction { name, alias, .. } => {
             out.push(alias.clone().unwrap_or_else(|| name.clone()));
