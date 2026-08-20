@@ -70482,12 +70482,15 @@ impl Connection {
                                         'C' | 'c' => "NUMERIC",
                                         _ => "",
                                     });
-                                let notnull = i64::from(col.notnull);
+                                let pk = pk_positions.get(i).copied().unwrap_or(0);
+                                // bd-a506j F2: WITHOUT ROWID PK columns are implicitly
+                                // NOT NULL (stock reports notnull=1, and frank already
+                                // ENFORCES it). Reflect that in table_info/table_xinfo.
+                                let notnull = i64::from(col.notnull || (t.without_rowid && pk > 0));
                                 let dflt =
                                     col.default_value.as_ref().map_or(SqliteValue::Null, |s| {
                                         SqliteValue::Text(s.clone().into())
                                     });
-                                let pk = pk_positions.get(i).copied().unwrap_or(0);
                                 let mut values = vec![
                                     SqliteValue::Integer(cid),
                                     SqliteValue::Text(col.name.clone().into()),
@@ -97132,6 +97135,22 @@ fn frankenerror_from_vdbe_halt(code: i32, message: String) -> FrankenError {
             name: String::new(),
         };
     }
+    // bd-a506j F3: route the remaining SQLITE_CONSTRAINT (19) halts to their clean
+    // variants so they surface with the exact stock text under SQLITE_CONSTRAINT,
+    // instead of "internal error: VDBE halted with code 19: <msg>". Mirrors CHECK.
+    if let Some(column) = message.strip_prefix("NOT NULL constraint failed: ") {
+        return FrankenError::NotNullViolation {
+            column: column.to_owned(),
+        };
+    }
+    if let Some(columns) = message.strip_prefix("UNIQUE constraint failed: ") {
+        return FrankenError::UniqueViolation {
+            columns: columns.to_owned(),
+        };
+    }
+    if message == "FOREIGN KEY constraint failed" {
+        return FrankenError::ForeignKeyViolation;
+    }
     FrankenError::Internal(format!("VDBE halted with code {code}: {message}"))
 }
 
@@ -120223,9 +120242,7 @@ async fn execute_program_with_row_cap(
                 values: values.into_vec(),
             })
             .collect()),
-        ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
-            "VDBE halted with code {code}: {message}",
-        ))),
+        ExecOutcome::Error { code, message } => Err(frankenerror_from_vdbe_halt(code, message)),
     }
 }
 
@@ -120314,9 +120331,7 @@ async fn execute_program_exactly_one_row_with_row_cap(
             QueryRowCollectionOutcome::NoRows => Err(FrankenError::QueryReturnedNoRows),
             QueryRowCollectionOutcome::MultipleRows => Err(FrankenError::QueryReturnedMultipleRows),
         },
-        ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
-            "VDBE halted with code {code}: {message}",
-        ))),
+        ExecOutcome::Error { code, message } => Err(frankenerror_from_vdbe_halt(code, message)),
     }
 }
 
@@ -158253,6 +158268,86 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
+        });
+    }
+
+    #[test]
+    fn test_constraint_errors_surface_clean_not_internal_wrapped_bd_a506j() {
+        // bd-a506j F3: NOT NULL / UNIQUE constraint halts must surface as their clean
+        // SQLITE_CONSTRAINT variants (stock text), not wrapped as "internal error: VDBE
+        // halted with code 19: ...". Oracle: sqlite3 3.46.1 emits "<msg> (19)".
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER NOT NULL);")
+                .await
+                .unwrap();
+            let err = conn
+                .execute("INSERT INTO t VALUES (NULL);")
+                .await
+                .expect_err("NULL into NOT NULL column must fail");
+            assert!(
+                matches!(err, FrankenError::NotNullViolation { .. }),
+                "NOT NULL must surface as the clean variant, got {err}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("NOT NULL constraint failed"), "got {msg}");
+            assert!(
+                !msg.contains("internal error") && !msg.contains("VDBE halted"),
+                "constraint error must not be internal-wrapped, got {msg}"
+            );
+
+            conn.execute("CREATE TABLE u (a, b, PRIMARY KEY(a, b));")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO u VALUES (1, 2);").await.unwrap();
+            let err = conn
+                .execute("INSERT INTO u VALUES (1, 2);")
+                .await
+                .expect_err("duplicate PK must fail");
+            assert!(
+                matches!(err, FrankenError::UniqueViolation { .. }),
+                "UNIQUE must surface as the clean variant, got {err}"
+            );
+            assert!(
+                !err.to_string().contains("internal error"),
+                "UNIQUE error must not be internal-wrapped, got {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_table_info_without_rowid_pk_columns_are_notnull_bd_a506j() {
+        // bd-a506j F2: WITHOUT ROWID PK columns are implicitly NOT NULL; table_info must
+        // report notnull=1 (stock 3.46.1 does; frank already ENFORCES it). notnull is
+        // result column index 3 (cid, name, type, notnull, dflt_value, pk).
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE wr (a TEXT, b INT, c INT, PRIMARY KEY(a, b)) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+            let rows = conn.query("PRAGMA table_info(wr);").await.unwrap();
+            assert_eq!(rows.len(), 3);
+            for row in &rows {
+                let name = &row.values()[1];
+                let notnull = &row.values()[3];
+                let pk = &row.values()[5];
+                let is_pk = matches!(pk, SqliteValue::Integer(p) if *p > 0);
+                if is_pk {
+                    assert_eq!(
+                        *notnull,
+                        SqliteValue::Integer(1),
+                        "WITHOUT ROWID PK column {name:?} must report notnull=1"
+                    );
+                } else {
+                    assert_eq!(
+                        *notnull,
+                        SqliteValue::Integer(0),
+                        "non-PK column {name:?} keeps its declared nullability"
+                    );
+                }
+            }
         });
     }
 
