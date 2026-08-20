@@ -2523,13 +2523,22 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
             i += 1;
             let w = params.get(param_idx).map_or(0, SqliteValue::to_integer);
             param_idx += 1;
-            if w < 0 {
+            // bd-printf-dynamic-width-i32-3fpd4: C SQLite reads a `*` width as
+            // `va_arg(int)` — it CASTS the i64 to i32 first, then a negative value
+            // means left-justify with its magnitude, with INT_MIN (no positive
+            // counterpart) collapsing to 0. No 1e8 pre-clamp: a width that reaches
+            // PRINTF_MAX_LENGTH is NULLed by the guard at the conversion, exactly
+            // like the literal `%2147483648d`/`%1000000000d` fold (bd-mcgdb).
+            let w32 = w as i32;
+            if w32 < 0 {
                 left_align = true;
-                width = usize::try_from(w.unsigned_abs())
-                    .unwrap_or(0)
-                    .min(100_000_000);
+                width = if w32 >= -2_147_483_647 {
+                    (-w32) as usize
+                } else {
+                    0
+                };
             } else {
-                width = usize::try_from(w).unwrap_or(0).min(100_000_000);
+                width = w32 as usize;
             }
         } else {
             // bd-mcgdb: match C SQLite's field-width parse exactly — accumulate the
@@ -2561,11 +2570,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 precision = if p32 == i32::MIN {
                     None
                 } else {
-                    Some(
-                        usize::try_from(p32.unsigned_abs())
-                            .unwrap_or(usize::MAX)
-                            .min(100_000_000),
-                    )
+                    // bd-printf-dynamic-width-i32-3fpd4: no 1e8 pre-clamp — the
+                    // per-spec guard NULLs an integer/char conversion past
+                    // PRINTF_MAX_LENGTH and caps a float conversion, exactly like a
+                    // literal precision (bd-mcgdb).
+                    Some(usize::try_from(p32.unsigned_abs()).unwrap_or(usize::MAX))
                 };
             } else {
                 // bd-mcgdb: same 32-bit-wrapping-then-low-31-bits fold as width.
@@ -6681,6 +6690,45 @@ mod tests {
         assert_eq!(run(&[txt("%X"), int(3_735_928_559)]), "DEADBEEF");
         assert_eq!(run(&[txt("%,.2f"), flt(1234.5)]), "1,234.50");
         assert_eq!(run(&[txt("%+.2e"), flt(1234.5)]), "+1.23e+03");
+    }
+
+    #[test]
+    fn test_printf_dynamic_width_precision_bd_3fpd4() {
+        // bd-printf-dynamic-width-i32-3fpd4. Oracle: sqlite3 3.46.1. A `*` width/
+        // precision is read as va_arg(int) — the i64 arg is CAST to i32 — then a
+        // negative width left-justifies (INT_MIN -> 0 pad) and a width reaching
+        // 1e9 NULLs, matching the literal fold (bd-mcgdb). Some(text) / None(NULL).
+        let f = FormatFunc;
+        let run = |args: &[SqliteValue]| -> Option<String> {
+            match f.invoke(args).unwrap() {
+                SqliteValue::Text(s) => Some(s.as_str().to_owned()),
+                SqliteValue::Null => None,
+                other => panic!("expected text or null, got {other:?}"),
+            }
+        };
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let int = SqliteValue::Integer;
+        let flt = SqliteValue::Float;
+        let some = |s: &str| Some(s.to_owned());
+
+        assert_eq!(run(&[txt("%*d"), int(5), int(7)]), some("    7"));
+        assert_eq!(run(&[txt("%*d"), int(-5), int(7)]), some("7    "));
+        // i32 cast: 2147483648 -> INT_MIN -> 0 pad; 4294967296 -> 0; 4294967301 -> 5.
+        assert_eq!(run(&[txt("%*d"), int(2_147_483_648), int(7)]), some("7"));
+        assert_eq!(run(&[txt("%*d"), int(4_294_967_296), int(7)]), some("7"));
+        assert_eq!(run(&[txt("%*d"), int(4_294_967_301), int(7)]), some("    7"));
+        assert_eq!(run(&[txt("%*d"), int(-2_147_483_648), int(7)]), some("7"));
+        // width reaching 1e9 -> NULL (not a giant string).
+        assert_eq!(run(&[txt("%*d"), int(1_000_000_000), int(7)]), None);
+        assert_eq!(run(&[txt("%*d"), int(-2_147_483_647), int(7)]), None);
+        // dynamic precision: normal, negative-abs (bd-9zzr0 preserved),
+        // INT_MIN -> default precision, and >= 1e9 -> NULL for %d.
+        assert_eq!(run(&[txt("%.*f"), int(2), flt(3.14159)]), some("3.14"));
+        assert_eq!(run(&[txt("%.*d"), int(-3), int(42)]), some("042"));
+        assert_eq!(run(&[txt("%.*f"), int(2_147_483_648), flt(5.5)]), some("5.500000"));
+        assert_eq!(run(&[txt("%.*d"), int(1_000_000_000), int(7)]), None);
+        // combined dynamic width + precision.
+        assert_eq!(run(&[txt("%*.*f"), int(10), int(2), flt(3.14159)]), some("      3.14"));
     }
 
     #[test]
