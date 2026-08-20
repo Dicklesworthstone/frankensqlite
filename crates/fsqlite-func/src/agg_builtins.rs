@@ -763,6 +763,43 @@ mod tests {
         func.finalize(state).unwrap()
     }
 
+    #[test]
+    fn test_aggregate_oracle_edges_2026_08() {
+        // Oracle: sqlite3 3.46.1. sum() of integers stays integer and ERRORS on
+        // i64 overflow (does NOT promote to real); total() is always real and 0.0
+        // for an empty/all-NULL input; sum() of all-NULL -> NULL; count() skips
+        // NULLs; max()/min() use SQLite's storage-class ordering (int sorts before
+        // text) and ignore NULLs; group_concat default separator is ",".
+        assert_eq!(run_agg(&SumFunc, &[int(1), int(2)]), int(3));
+        assert_eq!(run_agg(&SumFunc, &[null(), null()]), null());
+        assert_eq!(run_agg(&TotalFunc, &[int(1), int(2)]), SqliteValue::Float(3.0));
+        assert_eq!(run_agg(&TotalFunc, &[null(), null()]), SqliteValue::Float(0.0));
+        assert_float_eq(&run_agg(&AvgFunc, &[int(1), int(2)]), 1.5);
+        assert_eq!(run_agg(&CountFunc, &[int(1), null(), int(3)]), int(2));
+        assert_eq!(run_agg(&AggMaxFunc, &[int(1), text("a"), null()]), text("a"));
+        assert_eq!(run_agg(&AggMinFunc, &[int(1), text("a"), null()]), int(1));
+        assert_eq!(run_agg(&GroupConcatFunc, &[int(1), int(2), int(3)]), text("1,2,3"));
+
+        // sum() of all-integer input ERRORS on i64 overflow rather than wrapping
+        // or promoting to real (C SQLite raises "integer overflow" while stepping;
+        // frank raises it at finalize — observationally identical for a query).
+        let sum = SumFunc;
+        let mut st = sum.initial_state();
+        sum.step(&mut st, &[int(i64::MAX)]).unwrap();
+        sum.step(&mut st, &[int(1)]).unwrap();
+        assert!(sum.finalize(st).is_err(), "sum() must error on i64 overflow");
+        // But a real value in the mix switches to float accumulation (no error),
+        // matching C SQLite's `approx` flag.
+        let mut st2 = sum.initial_state();
+        sum.step(&mut st2, &[int(i64::MAX)]).unwrap();
+        sum.step(&mut st2, &[int(1)]).unwrap();
+        sum.step(&mut st2, &[float(0.5)]).unwrap();
+        assert!(
+            matches!(sum.finalize(st2), Ok(SqliteValue::Float(_))),
+            "sum() with a real present returns the float sum, not an overflow error"
+        );
+    }
+
     // ── avg ───────────────────────────────────────────────────────────
 
     #[test]
