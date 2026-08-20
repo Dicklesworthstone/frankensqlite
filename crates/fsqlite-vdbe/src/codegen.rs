@@ -467,6 +467,23 @@ impl IndexSchema {
             self.key_expressions.join(", ")
         }
     }
+
+    /// bd-a506j F1b: table-qualified key label for constraint-error messages —
+    /// each key column carries the `table.` prefix, matching stock SQLite's
+    /// "UNIQUE constraint failed: t.a, t.b" (not "t.a, b"). Single-column keys
+    /// render "t.a" exactly as before.
+    #[must_use]
+    pub fn key_label_qualified(&self, table: &str) -> String {
+        let cols = if self.key_expressions.is_empty() {
+            &self.columns
+        } else {
+            &self.key_expressions
+        };
+        cols.iter()
+            .map(|c| format!("{table}.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// A validated explicit-index definition before a physical root page exists.
@@ -23640,10 +23657,13 @@ fn emit_wr_record(
 
 /// Human-readable PK label for UNIQUE-violation error messages.
 fn without_rowid_pk_label(table: &TableSchema, pk_indices: &[usize]) -> String {
+    // bd-a506j F1b: qualify each PK column with the table name so the constraint
+    // message reads "t.a, t.b" (stock), not "t.a, b". Callers pass this label
+    // directly (no extra "{table}." prefix).
     pk_indices
         .iter()
         .filter_map(|&i| table.columns.get(i))
-        .map(|c| c.name.as_str())
+        .map(|c| format!("{}.{}", table.name, c.name))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -23718,7 +23738,7 @@ fn emit_without_rowid_index_inserts(
             (0, 0u16)
         };
         let p4_name = if index.is_unique {
-            P4::Table(format!("{}.{}", table.name, index.key_label()))
+            P4::Table(index.key_label_qualified(&table.name))
         } else {
             P4::Table(index.name.clone())
         };
@@ -23942,7 +23962,7 @@ fn emit_without_rowid_update_rewrite(
             table_cursor,
             abort_rec,
             n_pk as i32,
-            P4::Table(format!("{}.{}", table.name, pk_label)),
+            P4::Table(pk_label.clone()),
             1u16 | (oe_flag << 1),
         );
     }
@@ -24113,7 +24133,7 @@ fn emit_without_rowid_update_rewrite(
                 idx_cursor,
                 raise_rec,
                 n_idx_cols as i32,
-                P4::Table(format!("{}.{}", table.name, index.key_label())),
+                P4::Table(index.key_label_qualified(&table.name)),
                 1u16 | (idx_oe << 1),
             );
         }
@@ -24210,7 +24230,7 @@ fn emit_without_rowid_update_rewrite(
         table_cursor,
         rec_reg,
         n_pk as i32,
-        P4::Table(format!("{}.{}", table.name, pk_label)),
+        P4::Table(pk_label.clone()),
         1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE,
     );
     emit_without_rowid_index_inserts(
@@ -24362,7 +24382,7 @@ fn emit_without_rowid_row_insert(
             ErrorCode::Constraint as i32,
             0,
             0,
-            P4::Str(format!("{}.{}", table.name, pk_label)),
+            P4::Str(pk_label.clone()),
             OPFLAG_HALT_UNIQUE,
         );
     }
@@ -24448,7 +24468,7 @@ fn emit_without_rowid_row_insert(
                 ErrorCode::Constraint as i32,
                 0,
                 0,
-                P4::Str(format!("{}.{}", table.name, index.key_label())),
+                P4::Str(index.key_label_qualified(&table.name)),
                 OPFLAG_HALT_UNIQUE,
             );
         }
@@ -24497,7 +24517,7 @@ fn emit_without_rowid_row_insert(
         table_cursor,
         rec_reg,
         n_pk as i32,
-        P4::Table(format!("{}.{}", table.name, pk_label)),
+        P4::Table(pk_label.clone()),
         1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE,
     );
 
@@ -24768,11 +24788,7 @@ fn emit_without_rowid_upsert_row(
         table_cursor,
         rec_reg,
         n_pk as i32,
-        P4::Table(format!(
-            "{}.{}",
-            table.name,
-            without_rowid_pk_label(table, pk_indices)
-        )),
+        P4::Table(without_rowid_pk_label(table, pk_indices)),
         1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE,
     );
     emit_without_rowid_index_inserts(
@@ -26681,7 +26697,7 @@ fn emit_index_inserts_filtered(
         };
         let p4_name = if index.is_unique {
             // Include table name for the error message.
-            P4::Table(format!("{}.{}", table.name, index.key_label()))
+            P4::Table(index.key_label_qualified(&table.name))
         } else {
             P4::Table(index.name.clone())
         };

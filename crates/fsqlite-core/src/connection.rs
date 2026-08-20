@@ -40299,7 +40299,8 @@ impl Connection {
                                     if *conflict == ConflictAction::Replace {
                                         conflicting_rowids.insert(mem_row.0);
                                     } else {
-                                        unique_violation_col = Some(col_info.name.clone());
+                                        unique_violation_col =
+                                            Some(format!("{}.{}", table_name, col_info.name));
                                     }
                                     break;
                                 }
@@ -40358,7 +40359,7 @@ impl Connection {
                                 if *conflict == ConflictAction::Replace {
                                     conflicting_rowids.insert(mem_row.0);
                                 } else {
-                                    unique_violation_col = Some(idx.key_label());
+                                    unique_violation_col = Some(idx.key_label_qualified(table_name));
                                 }
                                 break;
                             }
@@ -40374,9 +40375,9 @@ impl Connection {
                 if *conflict == ConflictAction::Ignore {
                     continue;
                 }
-                return Err(FrankenError::UniqueViolation {
-                    columns: format!("{}.{}", table_name, col_name),
-                });
+                // bd-a506j F1b: col_name is already table-qualified at both set
+                // sites (single column and composite index key), so emit it as-is.
+                return Err(FrankenError::UniqueViolation { columns: col_name });
             }
 
             // For REPLACE: delete rows that conflict on non-IPK UNIQUE columns.
@@ -59576,7 +59577,7 @@ impl Connection {
     ) -> Result<VdbeProgram> {
         let (idx_col_positions, key_exprs, where_expr) =
             self.bind_index_runtime_dependencies(table, index)?;
-        let columns_label = format!("{}.{}", table.name, index.key_label());
+        let columns_label = index.key_label_qualified(&table.name);
 
         self.with_codegen_function_context(|| {
             Self::compile_index_backfill(
@@ -158365,6 +158366,59 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    #[test]
+    fn test_composite_pk_unique_error_qualifies_each_column_bd_a506j_f1b() {
+        // bd-a506j F1b: a composite PK / multi-column UNIQUE conflict must qualify
+        // EVERY key column ("t.a, t.b"), not just the first ("t.a, b"). Single-column
+        // keys stay "t.a". Expected strings oracle-verified vs sqlite3 3.46.1.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+
+            // composite PK on a rowid table (enforced via a unique autoindex)
+            conn.execute("CREATE TABLE c (a, b, PRIMARY KEY(a, b));")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO c VALUES (1, 2);").await.unwrap();
+            let err = conn
+                .execute("INSERT INTO c VALUES (1, 2);")
+                .await
+                .expect_err("duplicate composite PK must fail");
+            assert_eq!(err.to_string(), "UNIQUE constraint failed: c.a, c.b");
+
+            // WITHOUT ROWID composite PK
+            conn.execute("CREATE TABLE w (a TEXT, b INT, PRIMARY KEY(a, b)) WITHOUT ROWID;")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO w VALUES ('x', 1);").await.unwrap();
+            let err = conn
+                .execute("INSERT INTO w VALUES ('x', 1);")
+                .await
+                .expect_err("duplicate WITHOUT ROWID composite PK must fail");
+            assert_eq!(err.to_string(), "UNIQUE constraint failed: w.a, w.b");
+
+            // multi-column UNIQUE index
+            conn.execute("CREATE TABLE m (x, y);").await.unwrap();
+            conn.execute("CREATE UNIQUE INDEX mi ON m(x, y);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO m VALUES (1, 2);").await.unwrap();
+            let err = conn
+                .execute("INSERT INTO m VALUES (1, 2);")
+                .await
+                .expect_err("duplicate multi-column UNIQUE must fail");
+            assert_eq!(err.to_string(), "UNIQUE constraint failed: m.x, m.y");
+
+            // single-column UNIQUE stays correctly qualified (no regression)
+            conn.execute("CREATE TABLE s (v UNIQUE);").await.unwrap();
+            conn.execute("INSERT INTO s VALUES (7);").await.unwrap();
+            let err = conn
+                .execute("INSERT INTO s VALUES (7);")
+                .await
+                .expect_err("duplicate single-column UNIQUE must fail");
+            assert_eq!(err.to_string(), "UNIQUE constraint failed: s.v");
         });
     }
 
