@@ -23439,13 +23439,20 @@ impl Connection {
             let snapshot_generation = self.function_registry_generation();
             let statement_snapshot = self.freeze_statement_values_snapshot(parsed.as_ref());
 
-            // Relation lookup must observe the original parsed AST. Rewriting can
-            // eagerly evaluate or erase subqueries, which would otherwise move a
-            // missing-relation diagnostic from prepare time to execution (or hide
-            // it entirely). Non-catalog structural semantics still run on the
-            // canonical rewritten statement below.
-            let relation_result = self.with_fallback_function_registry(|| {
-                self.validate_statement_select_relations(statement_snapshot.as_ref())
+            // Structural validation must observe the ORIGINAL parsed AST, exactly
+            // like the direct execute path (`validate_statement_select_structure`
+            // at execute time). Rewriting can eagerly evaluate or erase subqueries
+            // — e.g. a single-row `SELECT 1 ORDER BY <expr>` drops its ORDER BY —
+            // which would otherwise move a missing-relation OR structural
+            // diagnostic (an unresolved ORDER BY name, a compound-arm width
+            // mismatch) from prepare time to execution, or hide it entirely so a
+            // prepared malformed SELECT silently returns a row. Validating the full
+            // structure (relations + non-catalog semantics) here keeps prepared and
+            // direct execution byte-for-byte consistent (select_structure_depth_first
+            // precedence). The rewritten statement is still validated below for any
+            // post-rewrite-only semantics.
+            let structure_result = self.with_fallback_function_registry(|| {
+                self.validate_statement_select_structure(statement_snapshot.as_ref())
             });
             if self.function_registry_generation() != snapshot_generation {
                 if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
@@ -23453,7 +23460,7 @@ impl Connection {
                 }
                 continue;
             }
-            relation_result?;
+            structure_result?;
             let statement_result = {
                 let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                     .then(|| {
