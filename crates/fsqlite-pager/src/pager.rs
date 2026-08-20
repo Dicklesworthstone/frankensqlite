@@ -19914,6 +19914,19 @@ where
         publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
         txn_attempt: Option<&Arc<PendingGroupCommitTxnAttempt<V::File>>>,
     ) -> Result<()> {
+        // bd-t6sv2.9: count this commit's LOGICAL page bytes (its distinct dirty
+        // pages * page size) exactly once, here at the single WAL-commit choke
+        // (`commit_wal_group_commit` delegates here) — the write-amplification
+        // denominator paired with the WAL/checkpoint physical counters. Skipped
+        // for an empty write set (no logical write).
+        if let Some(first) = write_pages_sorted.first()
+            && let Some(staged) = write_set.get(first)
+        {
+            let page_size = staged.as_page_bytes().len() as u64;
+            fsqlite_wal::metrics::GLOBAL_WAL_METRICS
+                .record_logical_page_write(write_pages_sorted.len() as u64 * page_size);
+        }
+
         // A prior flusher on this exact handle may have been dropped while
         // restoration was contended. Settle the global lane and this handle,
         // but do not convoy submission behind unrelated exact-handle exits.

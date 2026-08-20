@@ -37,6 +37,11 @@ pub struct WalMetrics {
     pub checkpoint_duration_us_total: AtomicU64,
     /// Total WAL reset operations (after restart/truncate checkpoints).
     pub wal_resets_total: AtomicU64,
+    /// bd-t6sv2.9: total LOGICAL page bytes the engine committed to the WAL
+    /// (distinct dirty pages per commit * page size). Paired with the physical
+    /// counters (`bytes_written_total` for the WAL + `checkpoint_frames_backfilled_total`
+    /// for the checkpoint copy) it yields the write-amplification factor.
+    pub logical_page_bytes_written_total: AtomicU64,
 }
 
 impl WalMetrics {
@@ -51,6 +56,7 @@ impl WalMetrics {
             checkpoint_frames_backfilled_total: AtomicU64::new(0),
             checkpoint_duration_us_total: AtomicU64::new(0),
             wal_resets_total: AtomicU64::new(0),
+            logical_page_bytes_written_total: AtomicU64::new(0),
         }
     }
 
@@ -81,6 +87,14 @@ impl WalMetrics {
         self.wal_resets_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// bd-t6sv2.9: record the LOGICAL page bytes committed by one transaction
+    /// (its distinct dirty-page count * page size), counted once per commit at
+    /// the WAL commit choke — the denominator of the write-amplification factor.
+    pub fn record_logical_page_write(&self, logical_bytes: u64) {
+        self.logical_page_bytes_written_total
+            .fetch_add(logical_bytes, Ordering::Relaxed);
+    }
+
     /// Take a consistent snapshot of all counters.
     #[must_use]
     pub fn snapshot(&self) -> WalMetricsSnapshot {
@@ -94,6 +108,9 @@ impl WalMetrics {
                 .load(Ordering::Relaxed),
             checkpoint_duration_us_total: self.checkpoint_duration_us_total.load(Ordering::Relaxed),
             wal_resets_total: self.wal_resets_total.load(Ordering::Relaxed),
+            logical_page_bytes_written_total: self
+                .logical_page_bytes_written_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -108,6 +125,8 @@ impl WalMetrics {
         self.checkpoint_duration_us_total
             .store(0, Ordering::Relaxed);
         self.wal_resets_total.store(0, Ordering::Relaxed);
+        self.logical_page_bytes_written_total
+            .store(0, Ordering::Relaxed);
     }
 }
 
@@ -131,6 +150,8 @@ pub struct WalMetricsSnapshot {
     pub checkpoint_frames_backfilled_total: u64,
     pub checkpoint_duration_us_total: u64,
     pub wal_resets_total: u64,
+    /// bd-t6sv2.9: logical page bytes committed (write-amplification denominator).
+    pub logical_page_bytes_written_total: u64,
 }
 
 impl WalMetricsSnapshot {
@@ -139,6 +160,35 @@ impl WalMetricsSnapshot {
     pub fn avg_checkpoint_duration_us(&self) -> u64 {
         self.checkpoint_duration_us_total
             .checked_div(self.checkpoint_count)
+            .unwrap_or(0)
+    }
+
+    /// bd-t6sv2.9: total PHYSICAL bytes written for this logical write volume —
+    /// WAL frame bytes plus the checkpoint copy of `checkpoint_frames_backfilled_total`
+    /// pages back into the main database. `page_size` converts the checkpoint frame
+    /// count to bytes (the WAL counters are process-global, so the caller supplies
+    /// its connection's page size).
+    #[must_use]
+    pub fn physical_bytes_written_total(&self, page_size: u64) -> u64 {
+        self.bytes_written_total
+            .saturating_add(self.checkpoint_frames_backfilled_total.saturating_mul(page_size))
+    }
+
+    /// bd-t6sv2.9: write-amplification factor as a percentage (physical / logical *
+    /// 100), rounded to nearest; 0 when nothing logical has been written yet. A
+    /// value near 100 means little amplification; ~200 means each logical page was
+    /// physically written roughly twice (WAL frame + checkpoint backfill).
+    #[must_use]
+    pub fn write_amplification_pct(&self, page_size: u64) -> u64 {
+        let logical = self.logical_page_bytes_written_total;
+        if logical == 0 {
+            return 0;
+        }
+        let physical = self.physical_bytes_written_total(page_size);
+        physical
+            .saturating_mul(100)
+            .saturating_add(logical / 2)
+            .checked_div(logical)
             .unwrap_or(0)
     }
 }
@@ -964,10 +1014,19 @@ mod tests {
             checkpoint_frames_backfilled_total: 90,
             checkpoint_duration_us_total: 5000,
             wal_resets_total: 2,
+            logical_page_bytes_written_total: 409600,
         };
         assert_eq!(snap.avg_checkpoint_duration_us(), 1000);
         let display = format!("{snap}");
         assert!(display.contains("wal_frames_written=100"));
+        // bd-t6sv2.9: physical = WAL bytes + checkpoint backfill (frames * page).
+        assert_eq!(
+            snap.physical_bytes_written_total(4096),
+            409600 + 90 * 4096
+        );
+        // ~190% amplification here (each logical page written to WAL, ~90% also
+        // backfilled at checkpoint).
+        assert!(snap.write_amplification_pct(4096) > 100);
         let zero = WalMetricsSnapshot {
             checkpoint_count: 0,
             ..snap

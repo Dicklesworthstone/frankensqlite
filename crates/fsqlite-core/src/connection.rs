@@ -5111,6 +5111,9 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
             || full_name_is("fsqlite.cache_stats")
             || full_name_is("cache_stats")
             || full_name_is("fsqlite_cache_stats")
+            || full_name_is("fsqlite.write_amplification")
+            || full_name_is("write_amplification")
+            || full_name_is("fsqlite_write_amplification")
             || full_name_is("fsqlite.txn_stats")
             || full_name_is("txn_stats")
             || full_name_is("fsqlite_txn_stats")
@@ -70665,6 +70668,76 @@ impl Connection {
                         values: vec![
                             SqliteValue::Text("capacity_pages".into()),
                             SqliteValue::Integer(to_i64_usize(snapshot.pool_capacity)),
+                        ],
+                    },
+                ])
+            }
+            // ── Write-amplification observability PRAGMA (bd-t6sv2.9) ─────
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.write_amplification"
+            | "write_amplification"
+            | "fsqlite_write_amplification" => {
+                let to_i64_u64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+                // Process-global WAL metrics (bd-t6sv2.9): logical = page bytes the
+                // engine committed; physical = WAL frame bytes + the checkpoint
+                // copy of backfilled frames back into the main DB. This connection's
+                // page size converts the process-global checkpoint frame count to
+                // bytes (page size is uniform per process in practice).
+                let page_size = u64::from(self.pragma_state.borrow().page_size);
+                let snapshot = fsqlite_wal::metrics::GLOBAL_WAL_METRICS.snapshot();
+                Ok(vec![
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("logical_page_bytes".into()),
+                            SqliteValue::Integer(to_i64_u64(
+                                snapshot.logical_page_bytes_written_total,
+                            )),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("wal_physical_bytes".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.bytes_written_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("checkpoint_physical_bytes".into()),
+                            SqliteValue::Integer(to_i64_u64(
+                                snapshot
+                                    .checkpoint_frames_backfilled_total
+                                    .saturating_mul(page_size),
+                            )),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("total_physical_bytes".into()),
+                            SqliteValue::Integer(to_i64_u64(
+                                snapshot.physical_bytes_written_total(page_size),
+                            )),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("write_amplification_pct".into()),
+                            SqliteValue::Integer(to_i64_u64(
+                                snapshot.write_amplification_pct(page_size),
+                            )),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("frames_written".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.frames_written_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("checkpoint_frames_backfilled".into()),
+                            SqliteValue::Integer(to_i64_u64(
+                                snapshot.checkpoint_frames_backfilled_total,
+                            )),
                         ],
                     },
                 ])
@@ -209744,6 +209817,61 @@ fts5(title, body, content=docs, content_rowid=id)'
                 metrics.get("mvcc_multi_version_pages"),
                 Some(&i64::try_from(snapshot.mvcc_multi_version_pages).unwrap_or(i64::MAX))
             );
+        });
+    }
+
+    #[test]
+    fn test_pragma_write_amplification_tracks_logical_and_physical_bd_t6sv2_9() {
+        asupersync::test_utils::run_test(|| async {
+            // File-backed WAL connection so real WAL frames are written (the
+            // :memory: pager never touches GLOBAL_WAL_METRICS).
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("wa.db").to_string_lossy().into_owned();
+            let conn = Connection::open(&db).await.unwrap();
+            conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+            conn.execute("CREATE TABLE t(x);").await.unwrap();
+
+            // Delta-based (the WAL metrics are process-global, so absolute values
+            // are polluted by sibling tests): a commit must bump BOTH the logical
+            // (bd-t6sv2.9) counter and the physical WAL byte counter.
+            let before = fsqlite_wal::metrics::GLOBAL_WAL_METRICS.snapshot();
+            conn.execute("INSERT INTO t VALUES (1),(2),(3);")
+                .await
+                .unwrap();
+            let after = fsqlite_wal::metrics::GLOBAL_WAL_METRICS.snapshot();
+            assert!(
+                after.logical_page_bytes_written_total > before.logical_page_bytes_written_total,
+                "commit must record logical page bytes (bd-t6sv2.9)"
+            );
+            assert!(
+                after.bytes_written_total > before.bytes_written_total,
+                "commit must write physical WAL bytes"
+            );
+
+            // The PRAGMA surfaces every write-amplification row.
+            let metrics = txn_metrics_map(&conn.query("PRAGMA write_amplification;").await.unwrap());
+            for key in [
+                "logical_page_bytes",
+                "wal_physical_bytes",
+                "checkpoint_physical_bytes",
+                "total_physical_bytes",
+                "write_amplification_pct",
+                "frames_written",
+                "checkpoint_frames_backfilled",
+            ] {
+                assert!(
+                    metrics.contains_key(key),
+                    "PRAGMA write_amplification must report {key}"
+                );
+            }
+            assert!(*metrics.get("logical_page_bytes").unwrap() > 0);
+            assert!(*metrics.get("wal_physical_bytes").unwrap() > 0);
+            // total_physical >= wal_physical (checkpoint bytes are non-negative).
+            assert!(
+                metrics.get("total_physical_bytes").unwrap()
+                    >= metrics.get("wal_physical_bytes").unwrap()
+            );
+            conn.close().await.unwrap();
         });
     }
 
