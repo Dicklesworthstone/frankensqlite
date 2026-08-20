@@ -2594,7 +2594,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     *p = (*p).min(PRINTF_FLOAT_PRECISION_CAP);
                 }
             }
-            'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'c' => {
+            'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'c' | 'p' | 'r' => {
                 if precision.is_some_and(|p| p >= PRINTF_MAX_LENGTH) {
                     return Ok(None);
                 }
@@ -2905,7 +2905,10 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 };
                 result.push_str(&pad_string(&rendered, width, left_align));
             }
-            'x' | 'X' => {
+            // %p (pointer) renders identically to %X in SQLite's SQL printf:
+            // uppercase hex of the value's u64 bit pattern (255 -> "FF", -1 ->
+            // "FFFFFFFFFFFFFFFF", non-integers coerced via to_integer).
+            'x' | 'X' | 'p' => {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
                 param_idx += 1;
                 #[allow(clippy::cast_sign_loss)]
@@ -2918,8 +2921,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     precision,
                 );
                 // Alternate form (`#`) prefixes a nonzero value with 0x / 0X.
+                // Only `%X` uses the uppercase `0X`; `%x` and `%p` (which emits
+                // uppercase hex DIGITS but a lowercase pointer prefix, matching
+                // stock: `printf('%#p',255)` == '0xFF') use lowercase `0x`.
                 let prefix = if alt_form && val != 0 {
-                    if spec == 'x' { "0x" } else { "0X" }
+                    if spec == 'X' { "0X" } else { "0x" }
                 } else {
                     ""
                 };
@@ -2989,10 +2995,32 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     }
                 }
             }
+            'r' => {
+                // SQLite's %r ordinal: format the integer with its sign, then
+                // append the English ordinal suffix (st/nd/rd/th) derived from
+                // the ABSOLUTE value's last digits, with the 11/12/13 -> "th"
+                // exception. A non-integer arg coerces via to_integer first
+                // (255->'255th', -1->'-1st', 3.5->'3rd', 'x'->'0th', NULL->'0th').
+                let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
+                param_idx += 1;
+                let abs = val.unsigned_abs();
+                let suffix = match (abs % 10, abs % 100) {
+                    (1, r) if r != 11 => "st",
+                    (2, r) if r != 12 => "nd",
+                    (3, r) if r != 13 => "rd",
+                    _ => "th",
+                };
+                let body = format!("{val}{suffix}");
+                result.push_str(&pad_string(&body, width, left_align));
+            }
             _ => {
-                // Unknown specifier: output literally
-                result.push('%');
-                result.push(spec);
+                // Unsupported/unknown conversion specifier (e.g. `%a` hex-float,
+                // or a positional `%2$s` whose `$` lands here after `2` is parsed
+                // as the field width): stock SQLite NULLs the ENTIRE printf()/
+                // format() result rather than emitting the raw `%<spec>`. The
+                // supported set above is exactly SQLite's documented conversions
+                // (% n d i u f e E g G s z q Q w x X o c). bd-printf-unsupported-spec-null.
+                return Ok(None);
             }
         }
         // Suppress unused warnings
