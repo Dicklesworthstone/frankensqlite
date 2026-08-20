@@ -3966,6 +3966,34 @@ impl PagerBackend {
         }
     }
 
+    /// bd-9hp58 ASK#2: release this connection's namespace-binding advisory-lock
+    /// descriptors (`-ns-use`/`-ns-gate`) at teardown so a closed connection is
+    /// lsof-clean even when a lingering pager/background `Arc` clone would keep
+    /// the binding alive past its last-`Arc` `Drop`. `quiesce()` is idempotent
+    /// and releases the retained descriptors via the lease mutex regardless of
+    /// those clones. Per-connection — each connection owns its own binding (own
+    /// `-ns` fds), so this never touches a sibling connection's locks; and the
+    /// live write path guards via `validate_path_identity` (fd-independent), so
+    /// shedding these sidecar fds cannot cut a live operation.
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn quiesce_namespace_binding(&self) {
+        let binding = match self {
+            Self::Memory(p) => p.namespace_binding(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.namespace_binding(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.namespace_binding(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.namespace_binding(),
+        };
+        if let Some(binding) = binding {
+            binding.quiesce();
+        }
+    }
+
+    #[cfg(not(all(feature = "native", any(unix, windows))))]
+    fn quiesce_namespace_binding(&self) {}
+
     async fn install_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<()> {
         self.validate_namespace_binding()?;
         let wal_path = wal_path_for_db_path(db_path);
@@ -22689,6 +22717,13 @@ impl Connection {
             self._shared_mvcc_state
                 .release_connection_pool_metrics(metrics.connection_id);
         }
+
+        // bd-9hp58 ASK#2: shed this connection's namespace-binding advisory-lock
+        // sidecar fds (`-ns-use`/`-ns-gate`) now that its region/background tasks
+        // are released, so the closed connection is lsof-clean even when a
+        // lingering pager/background `Arc` clone would otherwise keep the binding
+        // alive past its last-`Arc` `Drop`. Idempotent and per-connection.
+        self.pager.quiesce_namespace_binding();
 
         // When the last connection for this path closes, remove stale entries
         // from process-global registries. Without this, the GroupCommitConsolidator
@@ -89564,6 +89599,14 @@ impl Drop for Connection {
 
             self._shared_mvcc_state
                 .release_connection_on_drop(self.runtime_region);
+
+            // bd-9hp58 ASK#2: shed this connection's namespace-binding advisory-
+            // lock sidecar fds (`-ns-use`/`-ns-gate`) on an unawaited drop too,
+            // so a dropped pool is lsof-clean (the bd-2pmu6 /proc/self/fd
+            // acceptance) — the region/background tasks were just cancelled
+            // above. Synchronous and idempotent, so legal in `Drop`;
+            // per-connection, so it never releases a sibling's locks.
+            self.pager.quiesce_namespace_binding();
 
             tracing::warn!(
                 target: "fsqlite::runtime",
