@@ -6445,7 +6445,13 @@ impl PreparedQueryFastPath {
                 &FSQLITE_DIRECT_COUNT_STAR_ROWID_RANGE_QUERY_ROW_HITS
             }
         };
-        counter.fetch_add(1, AtomicOrdering::Relaxed);
+        // bd-xu639: record only when profiling is enabled (a thread-local
+        // override in test mode) so a parallel `--test-threads` run cannot
+        // inflate another test's exact hit-count snapshot through this
+        // process-global counter. Production reads these only while profiling.
+        if hot_path_profile_enabled() {
+            counter.fetch_add(1, AtomicOrdering::Relaxed);
+        }
     }
 }
 
@@ -7484,8 +7490,10 @@ impl PreparedStatement<'_> {
                 return Ok(None);
             };
 
-        FSQLITE_DIRECT_COUNT_STAR_QUERY_ROW_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         if hot_path_profile_enabled() {
+            // bd-xu639: gate this process-global hit counter behind profiling
+            // so parallel test runs don't inflate another test's snapshot.
+            FSQLITE_DIRECT_COUNT_STAR_QUERY_ROW_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
@@ -7549,9 +7557,11 @@ impl PreparedStatement<'_> {
             return Ok(None);
         };
 
-        FSQLITE_DIRECT_COUNT_INDEXED_ROWID_PROBE_QUERY_ROW_HITS
-            .fetch_add(1, AtomicOrdering::Relaxed);
         if hot_path_profile_enabled() {
+            // bd-xu639: gate this process-global hit counter behind profiling
+            // so parallel test runs don't inflate another test's snapshot.
+            FSQLITE_DIRECT_COUNT_INDEXED_ROWID_PROBE_QUERY_ROW_HITS
+                .fetch_add(1, AtomicOrdering::Relaxed);
             FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
@@ -7641,8 +7651,10 @@ impl PreparedStatement<'_> {
             }
         };
 
-        FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_ROW_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         if hot_path_profile_enabled() {
+            // bd-xu639: gate this process-global hit counter behind profiling
+            // so parallel test runs don't inflate another test's snapshot.
+            FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_ROW_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
@@ -188587,10 +188599,16 @@ mod tests {
             conn.execute("COMMIT;").await.unwrap();
             drop(hook_guard);
 
-            assert_eq!(
-                hook_calls.load(AtomicOrdering::SeqCst),
-                1,
-                "the deterministic post-durable/pre-MVCC-publish race hook must fire once"
+            // bd-xu639: the commit-window hook is a PROCESS-GLOBAL test hook and
+            // must stay global — test_issue59_direct_fk_check_query_sees_parent_after_dml
+            // fires it from a separate std::thread, so it cannot be thread-local.
+            // Under `--test-threads` load a concurrent connection's commit can
+            // fire it too, inflating an exact global count. Assert it fired for
+            // OUR commit at least once; a regression that never reaches the
+            // post-durable/pre-MVCC-publish injection point still fails at 0.
+            assert!(
+                hook_calls.load(AtomicOrdering::SeqCst) >= 1,
+                "the deterministic post-durable/pre-MVCC-publish race hook must fire for our commit"
             );
             let pager_visible = conn.pager.published_snapshot().visible_commit_seq;
             assert_eq!(
@@ -196329,6 +196347,20 @@ mod transaction_lifecycle_tests {
     fn test_prepared_count_indexed_rowid_probe_parameterized_bound() {
         asupersync::test_utils::run_test(|| async {
             let _serial = super::fsqlite_core_test_serializer();
+            // bd-xu639: the direct_*_query_row_hits counters now record only
+            // while profiling is enabled (a thread-local override in test mode),
+            // so enable it on this thread. Combined with the serializer above,
+            // this makes the process-global counter reads below immune to
+            // concurrent `--test-threads` queries. Restore on the way out so a
+            // reused test-runner thread starts clean.
+            super::set_hot_path_profile_enabled(true);
+            struct RestoreProfileEnabled;
+            impl Drop for RestoreProfileEnabled {
+                fn drop(&mut self) {
+                    super::set_hot_path_profile_enabled(false);
+                }
+            }
+            let _restore_profile_enabled = RestoreProfileEnabled;
 
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t(val INTEGER)").await.unwrap();
