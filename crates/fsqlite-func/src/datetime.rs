@@ -871,9 +871,25 @@ fn build_small_text(write: impl Fn(&mut dyn core::fmt::Write) -> core::fmt::Resu
     }
 }
 
+/// Write a calendar year the way C SQLite's `date()`/`datetime()` render it: a
+/// 4-digit zero-padded field, but with the minus sign kept *outside* the padding
+/// for negative (proleptic BC) years — e.g. -1 renders as `-0001`, not `-001`
+/// (Rust's `{:04}` would count the sign inside the width). `strftime('%Y')`
+/// differs — it keeps the sign inside a 4-wide field — and is handled separately.
+fn write_year(w: &mut dyn core::fmt::Write, y: i64) -> core::fmt::Result {
+    if y < 0 {
+        write!(w, "-{:04}", y.unsigned_abs())
+    } else {
+        write!(w, "{y:04}")
+    }
+}
+
 fn format_date(jdn: f64) -> SmallText {
     let (y, m, d) = jdn_to_ymd(jdn);
-    build_small_text(move |w| write!(w, "{y:04}-{m:02}-{d:02}"))
+    build_small_text(move |w| {
+        write_year(w, y)?;
+        write!(w, "-{m:02}-{d:02}")
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -922,10 +938,16 @@ fn format_datetime(jdn: f64, subsec: bool, unmodified: Option<UnmodifiedHms>) ->
     let (h, mi) = (hms.hour, hms.minute);
     if subsec {
         let (s, ms) = rounded_second_and_millis(hms);
-        build_small_text(move |w| write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{ms:03}"))
+        build_small_text(move |w| {
+            write_year(w, y)?;
+            write!(w, "-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{ms:03}")
+        })
     } else {
         let s = hms.second;
-        build_small_text(move |w| write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"))
+        build_small_text(move |w| {
+            write_year(w, y)?;
+            write!(w, "-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+        })
     }
 }
 
@@ -2164,6 +2186,50 @@ mod tests {
                 .unwrap(),
             SqliteValue::Text(_)
         ));
+    }
+
+    #[test]
+    fn test_negative_year_padding_matches_sqlite() {
+        // C SQLite's date()/datetime() render a negative (proleptic BC) year with
+        // the sign OUTSIDE a 4-digit zero-padded magnitude: -1 -> "-0001", not the
+        // "-001" that a naive `{:04}` (sign inside the width) produces. Verified
+        // against SQLite 3.53.
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("0000-01-01"), text("-1 second")])
+                .unwrap(),
+            "-0001-12-31 23:59:59",
+        );
+        assert_text(
+            &DateFunc.invoke(&[text("0000-01-01"), text("-1 day")]).unwrap(),
+            "-0001-12-31",
+        );
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("0000-01-01"), text("-100 years")])
+                .unwrap(),
+            "-0100-01-01 00:00:00",
+        );
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("0000-01-01"), text("-4000 years")])
+                .unwrap(),
+            "-4000-01-01 00:00:00",
+        );
+        // Non-negative years are unchanged (regression guard).
+        assert_text(
+            &DateTimeFunc.invoke(&[text("2024-03-15 14:30:00")]).unwrap(),
+            "2024-03-15 14:30:00",
+        );
+        assert_text(&DateFunc.invoke(&[text("0000-01-01")]).unwrap(), "0000-01-01");
+        // strftime('%Y') keeps the sign INSIDE a 4-wide field ("-001"), matching
+        // SQLite's separate strftime path — this fix must not touch it.
+        assert_text(
+            &StrftimeFunc
+                .invoke(&[text("%Y"), text("0000-01-01"), text("-1 day")])
+                .unwrap(),
+            "-001",
+        );
     }
 
     // ── RFC3339 / ISO-8601 timezone suffix parsing ────────────────────
