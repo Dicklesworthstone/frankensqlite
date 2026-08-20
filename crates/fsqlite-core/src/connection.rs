@@ -51252,6 +51252,7 @@ impl Connection {
         rows
     }
 
+    #[cfg(feature = "diagnostic-pragmas")]
     fn txn_advisor_rows(&self) -> Vec<Row> {
         let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
         let metrics = self.txn_lifecycle_metrics.borrow();
