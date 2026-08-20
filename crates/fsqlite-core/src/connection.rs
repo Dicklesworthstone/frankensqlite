@@ -420,6 +420,20 @@ const fn autocommit_statement_conflict_is_retryable(error: &FrankenError) -> boo
     error.is_transient()
 }
 
+/// bd-xv5cm L4: the `SQLITE_BUSY`-family error to surface when a read/txn-begin
+/// retry budget is exhausted, preserving whether the last admission attempt
+/// observed `BusyRecovery` (extended code 261) rather than collapsing every
+/// exhaustion to plain `Busy` (5). Both classify as `ErrorCode::Busy`, so this is
+/// a cosmetic identity fidelity fix, not a behavior change for busy-family
+/// classifiers.
+const fn busy_family_error(last_was_recovery: bool) -> FrankenError {
+    if last_was_recovery {
+        FrankenError::BusyRecovery
+    } else {
+        FrankenError::Busy
+    }
+}
+
 // Test-only PRAGMA dispatch fault injection for the bd-tc8u7 retry boundary.
 //
 // The injected error is consumed before any PRAGMA state changes. Keeping the
@@ -17481,7 +17495,18 @@ impl Connection {
             })
     }
 
-    fn reject_attached_target_write_in_explicit_transaction(
+    /// GH#244 (bd-bsc69): gate + lazy-enroll a write against an attached `schema`.
+    ///
+    /// - Autocommit (no outer txn): no-op — the delegated write autocommits on the
+    ///   child connection exactly as before.
+    /// - Explicit txn, no active savepoint: enroll the attached child as a
+    ///   participant by opening its own (concurrent) transaction, so the delegated
+    ///   write persists atomically with the outer COMMIT (and unwinds on ROLLBACK)
+    ///   instead of autocommitting immediately, un-rollback-ably.
+    /// - Explicit txn WITH an active savepoint: still rejected — savepoint fan-out
+    ///   is a follow-up (a half-correct savepoint participation would silently
+    ///   diverge cross-DB state).
+    async fn prepare_attached_target_write_in_explicit_transaction(
         &self,
         action: &'static str,
         schema: &str,
@@ -17490,11 +17515,79 @@ impl Connection {
             return Err(FrankenError::ReadOnly);
         }
         if self.in_transaction.get() {
-            return Err(FrankenError::NotImplemented(format!(
-                "{action} against attached schema {schema} inside explicit transactions/savepoints is not yet supported"
-            )));
+            if !self.savepoints.borrow().is_empty() {
+                return Err(FrankenError::NotImplemented(format!(
+                    "{action} against attached schema {schema} inside a savepoint is not yet supported"
+                )));
+            }
+            self.ensure_attached_child_transaction(schema).await?;
         }
         Ok(())
+    }
+
+    /// GH#244: open the attached child's own transaction (if not already open) so
+    /// it participates in the outer explicit transaction. The child promotes to
+    /// its default CONCURRENT mode.
+    async fn ensure_attached_child_transaction(&self, schema: &str) -> Result<()> {
+        self.with_attached_connection_async(schema, async |child| {
+            if !child.in_transaction.get() {
+                child
+                    .execute_begin(fsqlite_ast::BeginStatement { mode: None })
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// GH#244: keys of attached children currently enrolled in a transaction. The
+    /// borrow is dropped before any await, so callers can fan out safely.
+    fn attached_transaction_participants(&self) -> Vec<String> {
+        self.attached_connections
+            .borrow()
+            .iter()
+            .filter(|(_, child)| child.in_transaction.get())
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// GH#244: commit every attached child that enrolled as a participant in the
+    /// current transaction. A no-op when there are no participants, so the normal
+    /// (no-attached-write) COMMIT path is byte-for-byte unaffected.
+    async fn commit_attached_participants(&self, cx: &Cx) -> Result<()> {
+        for key in self.attached_transaction_participants() {
+            self.with_attached_connection_async(&key, async |child| {
+                child.execute_commit_with_cx(cx).await
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// GH#244: roll back every attached child that enrolled as a participant so a
+    /// child never survives a main ROLLBACK (or a forced abort). Best-effort per
+    /// child — a failure is logged but does not mask the primary error. No-op when
+    /// there are no participants.
+    async fn rollback_attached_participants(&self, cx: &Cx) {
+        for key in self.attached_transaction_participants() {
+            let outcome = self
+                .with_attached_connection_async(&key, async |child| {
+                    child
+                        .execute_rollback_with_cx(
+                            cx,
+                            &fsqlite_ast::RollbackStatement { to_savepoint: None },
+                        )
+                        .await
+                })
+                .await;
+            if let Err(error) = outcome {
+                tracing::warn!(
+                    schema = %key,
+                    ?error,
+                    "GH#244: attached participant rollback failed"
+                );
+            }
+        }
     }
 
     fn attached_table_supports_last_insert_rowid(&self, table_name: &str) -> bool {
@@ -17556,10 +17649,11 @@ impl Connection {
                     let Some(target_schema) = self.attached_target_schema(&create.name)? else {
                         return Ok(None);
                     };
-                    self.reject_attached_target_write_in_explicit_transaction(
+                    self.prepare_attached_target_write_in_explicit_transaction(
                         "CREATE TABLE",
                         create.name.schema.as_deref().unwrap_or(&target_schema),
-                    )?;
+                    )
+                    .await?;
                     let mut rewritten = create.clone();
                     rewritten.name.schema = None;
                     tracing::debug!(
@@ -17615,14 +17709,15 @@ impl Connection {
                     else {
                         return Ok(None);
                     };
-                    self.reject_attached_target_write_in_explicit_transaction(
+                    self.prepare_attached_target_write_in_explicit_transaction(
                         "CREATE INDEX",
                         create_index
                             .name
                             .schema
                             .as_deref()
                             .unwrap_or(&target_schema),
-                    )?;
+                    )
+                    .await?;
                     let mut rewritten = create_index.clone();
                     rewritten.name.schema = None;
                     tracing::debug!(
@@ -17648,10 +17743,11 @@ impl Connection {
                             "temporary table name must be unqualified".to_owned(),
                         ));
                     }
-                    self.reject_attached_target_write_in_explicit_transaction(
+                    self.prepare_attached_target_write_in_explicit_transaction(
                         "CREATE VIEW",
                         create_view.name.schema.as_deref().unwrap_or(&target_schema),
-                    )?;
+                    )
+                    .await?;
                     let target_exists = self.with_attached_connection(&target_schema, |conn| {
                         Ok(conn
                             .view_index_for_scope(&create_view.name.name, PragmaSchemaScope::Main)
@@ -17691,10 +17787,11 @@ impl Connection {
                     let Some(target_schema) = self.attached_target_schema(&insert.table)? else {
                         return Ok(None);
                     };
-                    self.reject_attached_target_write_in_explicit_transaction(
+                    self.prepare_attached_target_write_in_explicit_transaction(
                         "INSERT",
                         insert.table.schema.as_deref().unwrap_or(&target_schema),
-                    )?;
+                    )
+                    .await?;
                     let mut rewritten = insert.clone();
                     strip_attached_schema_from_insert_delegated_child_clauses(
                         &mut rewritten,
@@ -17807,7 +17904,7 @@ impl Connection {
                     let Some(target_schema) = target_schema else {
                         return Ok(None);
                     };
-                    self.reject_attached_target_write_in_explicit_transaction(
+                    self.prepare_attached_target_write_in_explicit_transaction(
                         "UPDATE",
                         update
                             .table
@@ -17815,7 +17912,8 @@ impl Connection {
                             .schema
                             .as_deref()
                             .unwrap_or(&target_schema),
-                    )?;
+                    )
+                    .await?;
                     let mut rewritten = update.clone();
                     strip_attached_schema_from_update(&mut rewritten, &target_schema);
                     tracing::debug!(
@@ -17871,7 +17969,7 @@ impl Connection {
                     let Some(target_schema) = target_schema else {
                         return Ok(None);
                     };
-                    self.reject_attached_target_write_in_explicit_transaction(
+                    self.prepare_attached_target_write_in_explicit_transaction(
                         "DELETE",
                         delete
                             .table
@@ -17879,7 +17977,8 @@ impl Connection {
                             .schema
                             .as_deref()
                             .unwrap_or(&target_schema),
-                    )?;
+                    )
+                    .await?;
                     let mut rewritten = delete.clone();
                     strip_attached_schema_from_delete(&mut rewritten, &target_schema);
                     tracing::debug!(
@@ -17946,10 +18045,11 @@ impl Connection {
                     let Some(target_schema) = self.attached_target_schema(&drop_stmt.name)? else {
                         return Ok(None);
                     };
-                    self.reject_attached_target_write_in_explicit_transaction(
+                    self.prepare_attached_target_write_in_explicit_transaction(
                         "DROP",
                         drop_stmt.name.schema.as_deref().unwrap_or(&target_schema),
-                    )?;
+                    )
+                    .await?;
                     let mut rewritten = drop_stmt.clone();
                     // An attached catalog is the delegated connection's MAIN.
                     // Keep the scope exact so a connection-local TEMP object in
@@ -22090,11 +22190,16 @@ impl Connection {
         // failing, matching `retry_busy_connection_bootstrap` (which already
         // retries both on the open path) and every downstream busy handler.
         // bd-dhhxp.
-        match pager.begin(cx, mode).await {
+        // bd-xv5cm L4: remember whether the LAST admission attempt observed
+        // `BusyRecovery` vs plain `Busy` so an exhausted retry can surface that
+        // identity (extended code SQLITE_BUSY_RECOVERY = 261) instead of
+        // collapsing every exhaustion to plain `Busy` (5).
+        let mut last_was_recovery = match pager.begin(cx, mode).await {
             Ok(txn) => return Ok(txn),
-            Err(FrankenError::Busy | FrankenError::BusyRecovery) => {}
+            Err(FrankenError::BusyRecovery) => true,
+            Err(FrankenError::Busy) => false,
             Err(err) => return Err(err),
-        }
+        };
 
         let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
         let deadline = Duration::from_millis(busy_timeout_ms);
@@ -22112,7 +22217,7 @@ impl Connection {
                 .borrow()
                 .retry_allowed(started.elapsed())
             {
-                return Err(FrankenError::Busy);
+                return Err(busy_family_error(last_was_recovery));
             }
             perform_begin_busy_retry_handoff(wait).await;
             if refresh_memdb_during_busy_wait {
@@ -22120,22 +22225,29 @@ impl Connection {
             }
             match pager.begin(cx, mode).await {
                 Ok(txn) => return Ok(txn),
-                Err(FrankenError::Busy | FrankenError::BusyRecovery) => {}
+                Err(FrankenError::BusyRecovery) => last_was_recovery = true,
+                Err(FrankenError::Busy) => last_was_recovery = false,
                 Err(err) => return Err(err),
             }
         }
         Err(self.strict_multi_process_busy_refusal(
             "transaction lock admission remained busy through busy_timeout",
+            last_was_recovery,
         ))
     }
 
-    fn strict_multi_process_busy_refusal(&self, detail: &'static str) -> FrankenError {
+    fn strict_multi_process_busy_refusal(
+        &self,
+        detail: &'static str,
+        last_was_recovery: bool,
+    ) -> FrankenError {
         if self.attach_env.strict_multi_process() {
             FrankenError::MultiProcessContractViolation {
                 detail: detail.to_owned(),
             }
         } else {
-            FrankenError::Busy
+            // bd-xv5cm L4: preserve the observed transient identity.
+            busy_family_error(last_was_recovery)
         }
     }
 
@@ -35829,6 +35941,11 @@ impl Connection {
             }
             Statement::Commit => {
                 self.execute_commit_with_cx(cx).await?;
+                // GH#244: once the main transaction is durably committed, commit
+                // any attached participants enrolled during it (no-op when none,
+                // so the normal path is unaffected). On a main-commit Err the `?`
+                // above returns early, correctly leaving children mid-txn.
+                self.commit_attached_participants(cx).await?;
                 Ok(Vec::new())
             }
             Statement::Rollback(rb) => {
@@ -64980,6 +65097,9 @@ impl Connection {
             // bd-hjkbr.1: Record pre-txn time on vtab-sync-failure path
             // (second commit path) so the wall-time ledger stays closed.
             record_hot_path_duration(&FSQLITE_COMMIT_PRE_TXN_TIME_NS, commit_pre_txn_start);
+            // GH#244: the forced abort tore down the main transaction; unwind any
+            // attached participants (best-effort) so none survive a main abort.
+            self.rollback_attached_participants(cx).await;
             return Err(sync_error);
         }
 
@@ -65839,6 +65959,15 @@ impl Connection {
             reload_result?;
             live_vtab_result?;
             live_vtab_registry_result?;
+        }
+        // GH#244: after a full ROLLBACK completes (via any caller of this
+        // helper), unwind every attached participant enrolled during the
+        // transaction. ROLLBACK TO SAVEPOINT does not fan out — savepoint
+        // participation is a follow-up and never enrolls a child. `Box::pin`
+        // breaks the async cycle (this helper -> child.execute_rollback_with_cx
+        // -> here); it terminates at runtime because a child has no participants.
+        if rb.to_savepoint.is_none() {
+            Box::pin(self.rollback_attached_participants(cx)).await;
         }
         Ok(())
     }
@@ -82163,7 +82292,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         if let Some(target_schema) = self.attached_target_schema(&delete.table.name)? {
-            self.reject_attached_target_write_in_explicit_transaction(
+            self.prepare_attached_target_write_in_explicit_transaction(
                 "DELETE",
                 delete
                     .table
@@ -82171,7 +82300,8 @@ impl Connection {
                     .schema
                     .as_deref()
                     .unwrap_or(&target_schema),
-            )?;
+            )
+            .await?;
             let materialized_ctes = self
                 .materialize_with_clause_snapshot(delete.with.as_ref(), params)
                 .await?;
@@ -82218,7 +82348,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         if let Some(target_schema) = self.attached_target_schema(&update.table.name)? {
-            self.reject_attached_target_write_in_explicit_transaction(
+            self.prepare_attached_target_write_in_explicit_transaction(
                 "UPDATE",
                 update
                     .table
@@ -82226,7 +82356,8 @@ impl Connection {
                     .schema
                     .as_deref()
                     .unwrap_or(&target_schema),
-            )?;
+            )
+            .await?;
             let materialized_ctes = self
                 .materialize_with_clause_snapshot(update.with.as_ref(), params)
                 .await?;
@@ -82297,10 +82428,11 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         if let Some(target_schema) = self.attached_target_schema(&insert.table)? {
-            self.reject_attached_target_write_in_explicit_transaction(
+            self.prepare_attached_target_write_in_explicit_transaction(
                 "INSERT",
                 insert.table.schema.as_deref().unwrap_or(&target_schema),
-            )?;
+            )
+            .await?;
             let materialized_ctes = self
                 .materialize_with_clause_snapshot(insert.with.as_ref(), params)
                 .await?;
@@ -198783,6 +198915,34 @@ mod autocommit_txn_tests {
                 .await
                 .expect("a built-in-only SELECT must still transparently retry the transient");
             assert_eq!(rows.len(), 3);
+        });
+    }
+
+    #[test]
+    fn test_busy_timeout_exhaustion_preserves_busyrecovery_identity_bd_xv5cm_l4() {
+        // bd-xv5cm L4: when the read/txn-begin retry budget
+        // (`begin_pager_txn_with_busy_timeout`) is exhausted, it must surface the
+        // LAST observed transient identity — `BusyRecovery` (extended code
+        // SQLITE_BUSY_RECOVERY = 261) vs plain `Busy` (5) — instead of collapsing
+        // every exhaustion to plain `Busy`. Both classify as `ErrorCode::Busy`, so
+        // this is a cosmetic identity-fidelity fix.
+        assert!(matches!(busy_family_error(true), FrankenError::BusyRecovery));
+        assert_eq!(busy_family_error(true).extended_error_code(), 261);
+        assert!(matches!(busy_family_error(false), FrankenError::Busy));
+
+        asupersync::test_utils::run_test(|| async {
+            // The exhaustion return of `begin_pager_txn_with_busy_timeout` for a
+            // non-strict connection preserves the observed identity (pre-fix it
+            // always returned plain `Busy`).
+            let conn = Connection::open(":memory:").await.unwrap();
+            assert!(matches!(
+                conn.strict_multi_process_busy_refusal("exhausted through busy_timeout", true),
+                FrankenError::BusyRecovery
+            ));
+            assert!(matches!(
+                conn.strict_multi_process_busy_refusal("exhausted through busy_timeout", false),
+                FrankenError::Busy
+            ));
         });
     }
 
