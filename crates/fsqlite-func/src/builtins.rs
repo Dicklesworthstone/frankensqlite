@@ -6643,6 +6643,47 @@ mod tests {
     }
 
     #[test]
+    fn test_printf_conversion_flag_edges_2026_08() {
+        // Oracle: sqlite3 3.46.1. %x/%o reinterpret the i64 as u64 (64-bit); the
+        // alt-form flag (#) prefixes 0x/0X/0 for a nonzero value; the comma flag
+        // groups %d and the integer part of %f; %c emits the first char of the
+        // arg's TEXT (not a codepoint, bd-47mu0) and its precision is a repeat
+        // count. All short results.
+        let f = FormatFunc;
+        let run = |args: &[SqliteValue]| -> String {
+            match f.invoke(args).unwrap() {
+                SqliteValue::Text(s) => s.as_str().to_owned(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let int = SqliteValue::Integer;
+        let flt = SqliteValue::Float;
+
+        assert_eq!(run(&[txt("%#x"), int(255)]), "0xff");
+        assert_eq!(run(&[txt("%#X"), int(255)]), "0XFF");
+        assert_eq!(run(&[txt("%#o"), int(8)]), "010");
+        assert_eq!(run(&[txt("%08x"), int(255)]), "000000ff");
+        assert_eq!(run(&[txt("%-8x|"), int(255)]), "ff      |");
+        assert_eq!(run(&[txt("%x"), int(-1)]), "ffffffffffffffff"); // i64 -> u64
+        assert_eq!(run(&[txt("%o"), int(-1)]), "1777777777777777777777");
+        assert_eq!(run(&[txt("%+d"), int(5)]), "+5");
+        assert_eq!(run(&[txt("% d"), int(5)]), " 5");
+        assert_eq!(run(&[txt("%+d"), int(-5)]), "-5");
+        assert_eq!(run(&[txt("%,d"), int(1_234_567)]), "1,234,567");
+        assert_eq!(run(&[txt("%5.3d"), int(7)]), "  007");
+        assert_eq!(run(&[txt("%-+8.3d|"), int(7)]), "+007    |");
+        // %c: first char of the arg's TEXT (bd-47mu0), precision = repeat count.
+        assert_eq!(run(&[txt("%c"), int(65)]), "6");
+        assert_eq!(run(&[txt("%.3c"), int(65)]), "666");
+        assert_eq!(run(&[txt("%5c|"), int(65)]), "    6|");
+        assert_eq!(run(&[txt("%#x"), int(0)]), "0"); // alt-form on 0 -> no prefix
+        assert_eq!(run(&[txt("%X"), int(3_735_928_559)]), "DEADBEEF");
+        assert_eq!(run(&[txt("%,.2f"), flt(1234.5)]), "1,234.50");
+        assert_eq!(run(&[txt("%+.2e"), flt(1234.5)]), "+1.23e+03");
+    }
+
+    #[test]
     #[allow(clippy::excessive_precision)] // literals intentionally name specific f64s
     fn test_format_high_precision_shortest_round_trip() {
         // bd-o8m86: beyond the shortest round-trip decimal (~16-17 sig figs) C
