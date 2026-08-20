@@ -2004,9 +2004,10 @@ pub enum WindowsLockSidecarPolicy {
     AllowExpected,
 }
 
-/// A pre-open snapshot of which Windows advisory-lock sidecars already existed
-/// BEFORE this handle began opening (i.e. before it took any cooperative lock,
-/// which is what creates the `-lock-shared/-reserved/-pending` sidecars).
+/// A pre-open snapshot of which Windows advisory-lock sidecars already existed.
+///
+/// Captured BEFORE this handle began opening (i.e. before it took any cooperative
+/// lock, which is what creates the `-lock-shared/-reserved/-pending` sidecars).
 ///
 /// bd-mnane: `WindowsLockSidecarPolicy::AllowExpected` must permit the sidecars
 /// OUR own open creates, but a sidecar that pre-existed our open is a foreign (or
@@ -2031,7 +2032,12 @@ impl PreOpenLockSidecars {
     /// our own freshly created sidecars would be misread as foreign.
     #[must_use]
     pub fn snapshot(database_path: &Path) -> Self {
+        // `mut` only on Windows, where the loop below pushes the discovered
+        // sidecars; off Windows the vec stays empty and immutable (unused_mut).
+        #[cfg(windows)]
         let mut preexisting = Vec::new();
+        #[cfg(not(windows))]
+        let preexisting = Vec::new();
         #[cfg(windows)]
         for suffix in ["-lock-shared", "-lock-reserved", "-lock-pending"] {
             let candidate = sidecar_path(database_path, suffix);
