@@ -23389,7 +23389,11 @@ impl Connection {
         {
             Ok(())
         } else {
-            Err(FrankenError::Internal(format!(
+            // Stock emits this verbatim under SQLITE_ERROR (both CREATE TABLE
+            // and ALTER TABLE ADD COLUMN). FunctionError renders the message
+            // as-is; Internal would prefix "internal error:" and report
+            // SQLITE_INTERNAL instead. bd-3nppp pattern.
+            Err(FrankenError::FunctionError(format!(
                 "default value of column [{column_name}] is not constant"
             )))
         }
@@ -58439,6 +58443,27 @@ impl Connection {
                 AlterTableAction::RenameTo(_) => {}
             }
         }
+        // bd-alter-table-on-view: ALTER TABLE targeting a VIEW is a prepare-time
+        // SQLITE_ERROR with a view-specific message — the object exists, it just
+        // isn't alterable — NOT "no such table" (which the tables-only schema
+        // lookup below would otherwise report). Messages match stock sqlite3
+        // 3.46.1 verbatim (FunctionError == SQLITE_ERROR, per the bd-3nppp
+        // verbatim-message discipline).
+        if self
+            .view_index_for_scope(table_name, PragmaSchemaScope::Unqualified)
+            .is_some()
+        {
+            return Err(match &alter.action {
+                AlterTableAction::AddColumn(_) => {
+                    FrankenError::function_error("Cannot add a column to a view")
+                }
+                AlterTableAction::RenameTo(_)
+                | AlterTableAction::RenameColumn { .. }
+                | AlterTableAction::DropColumn(_) => {
+                    FrankenError::function_error(format!("view {table_name} may not be altered"))
+                }
+            });
+        }
         let old_name = table_name.clone();
         let targets_main_explicit = alter
             .table
@@ -58470,7 +58495,7 @@ impl Connection {
                         .iter()
                         .any(|column| column.name.eq_ignore_ascii_case(old)) =>
                 {
-                    return Err(FrankenError::Internal(format!("no such column: {old}")));
+                    return Err(FrankenError::FunctionError(format!("no such column: \"{old}\"")));
                 }
                 AlterTableAction::AddColumn(column)
                     if table
@@ -58669,7 +58694,7 @@ impl Connection {
                     .columns
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(old))
-                    .ok_or_else(|| FrankenError::Internal(format!("no such column: {old}")))?;
+                    .ok_or_else(|| FrankenError::FunctionError(format!("no such column: \"{old}\"")))?;
                 if table
                     .columns
                     .iter()
@@ -58769,18 +58794,22 @@ impl Connection {
                 if col_def.constraints.iter().any(|constraint| {
                     matches!(constraint.kind, ColumnConstraintKind::PrimaryKey { .. })
                 }) {
-                    return Err(FrankenError::Internal(format!(
-                        "Cannot add a PRIMARY KEY column {}",
-                        col_def.name
-                    )));
+                    // Stock emits "Cannot add a PRIMARY KEY column" verbatim
+                    // under SQLITE_ERROR — no column name appended. FunctionError
+                    // renders it as-is; Internal would add "internal error:" and
+                    // report SQLITE_INTERNAL. bd-3nppp pattern.
+                    return Err(FrankenError::FunctionError(
+                        "Cannot add a PRIMARY KEY column".to_owned(),
+                    ));
                 }
                 if col_def.constraints.iter().any(|constraint| {
                     matches!(constraint.kind, ColumnConstraintKind::Unique { .. })
                 }) {
-                    return Err(FrankenError::Internal(format!(
-                        "Cannot add a UNIQUE column {}",
-                        col_def.name
-                    )));
+                    // Stock: "Cannot add a UNIQUE column" verbatim under
+                    // SQLITE_ERROR, no column name. bd-3nppp pattern.
+                    return Err(FrankenError::FunctionError(
+                        "Cannot add a UNIQUE column".to_owned(),
+                    ));
                 }
                 // CHECK constraints may not contain a subquery. CREATE TABLE
                 // already rejects these (bd-bkbe6); ALTER TABLE ADD COLUMN
@@ -58820,7 +58849,15 @@ impl Connection {
                     _ => None,
                 });
                 let add_column_table_has_rows =
-                    if default_dv.is_some_and(|dv| !add_column_default_is_literal_constant(dv)) {
+                    if default_dv.is_some_and(|dv| !add_column_default_is_literal_constant(dv))
+                        // A NOT NULL column with no default back-fills existing
+                        // rows with NULL, which SQLite forbids on a non-empty
+                        // table ("Cannot add a NOT NULL column with default value
+                        // NULL"). Without this clause the row-presence gate below
+                        // (`notnull && default_value.is_none() && has_rows`) is
+                        // dead — it needs the count even when there is no default.
+                        || (notnull && default_dv.is_none())
+                    {
                         self.alter_add_column_table_has_rows(table_name).await?
                     } else {
                         false
@@ -58884,7 +58921,7 @@ impl Connection {
                     // i.e. SQLITE_ERROR) rather than Internal's "internal error:"
                     // prefix / SQLITE_INTERNAL code.
                     return Err(FrankenError::FunctionError(
-                        "Cannot add a NOT NULL column without a default value".to_owned(),
+                        "Cannot add a NOT NULL column with default value NULL".to_owned(),
                     ));
                 }
                 // Coerce the back-fill default through the new column's affinity so
@@ -59008,7 +59045,7 @@ impl Connection {
                     .columns
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                    .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
+                    .ok_or_else(|| FrankenError::FunctionError(format!("no such column: \"{col_name}\"")))?;
                 if table.primary_key_constraints.iter().any(|pk| {
                     pk.iter()
                         .any(|pk_col| pk_col.eq_ignore_ascii_case(col_name))
@@ -59172,7 +59209,7 @@ impl Connection {
                     .columns
                     .iter()
                     .position(|column| column.name.eq_ignore_ascii_case(col_name))
-                    .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
+                    .ok_or_else(|| FrankenError::FunctionError(format!("no such column: \"{col_name}\"")))?;
                 table.columns.remove(col_idx);
                 table.check_constraints.retain(|check| {
                     !check
