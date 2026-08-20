@@ -1072,6 +1072,41 @@ enum OperationReceive<T> {
     Cancelled,
 }
 
+/// Defense-in-depth bound (bd-xv5cm L2) for the post-cancel wait on the worker's
+/// authoritative outcome. An in-flight publication arrives near-instantly and a
+/// live worker reaches its next VDBE cancel checkpoint within milliseconds, so
+/// this grace never trips on a slow-but-live worker (even a large fsync under load
+/// completes well within it); it only bounds a worker WEDGED below its cancel
+/// checkpoint (e.g. the bd-4drgt open wedge) so a cancelled caller surfaces
+/// Interrupt instead of blocking forever. Kept modest because the post-cancel wait
+/// polls cooperatively (see `recv_async_operation_response`): the bound is the
+/// worst-case cooperative spin on the should-never-happen wedge path.
+const POST_CANCEL_WORKER_GRACE: Duration = Duration::from_secs(2);
+
+/// Test override (milliseconds) for [`POST_CANCEL_WORKER_GRACE`]; 0 = use the
+/// production grace. Keeps the wedged-worker keeper fast on the real test runtime.
+///
+/// THREAD-LOCAL, not a global: the `current_thread` test runtime polls each test's
+/// caller future on that test's own `block_on` thread, so a per-thread override
+/// isolates the wedged-worker keeper's short grace from other cancellation tests
+/// running in parallel (which must observe the full production grace so their
+/// post-cancel wait stays pending until the worker responds).
+#[cfg(test)]
+thread_local! {
+    static TEST_POST_CANCEL_WORKER_GRACE_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn post_cancel_worker_grace() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = TEST_POST_CANCEL_WORKER_GRACE_MS.with(std::cell::Cell::get);
+        if ms != 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    POST_CANCEL_WORKER_GRACE
+}
+
 async fn recv_async_operation_response<T>(
     preflight: &AsyncCallPreflight,
     rx: &mut oneshot::Receiver<Result<T, FrankenError>>,
@@ -1118,13 +1153,46 @@ async fn recv_async_operation_response<T>(
                 .cancel_reason()
                 .unwrap_or(CancelReason::UserInterrupt);
             control.request_cancel(reason);
-            match rx
-                .recv(&completion_cx)
-                .await
-                .map_err(|_| worker_dead_err())?
-            {
-                Err(FrankenError::Abort) => Err(FrankenError::Interrupt),
-                result => result,
+            // bd-xv5cm L2: wait for the worker's authoritative outcome on the
+            // uncancelled completion context so an in-flight publication still
+            // wins over a late caller Interrupt — but BOUND it. If the worker is
+            // wedged below its next VDBE cancel checkpoint it never observes the
+            // relayed cancel and never responds, which on the detached context
+            // would block this already-cancelled caller forever. Race the recv
+            // against a grace timeout: a live worker's outcome arrives well within
+            // it; a worker still silent after the grace is wedged, so surface the
+            // caller's Interrupt instead of hanging.
+            // Poll for the worker's authoritative outcome non-blockingly, yielding
+            // between attempts so the worker (running on a parallel blocking thread)
+            // can reach its next cancel checkpoint and respond; a live worker's
+            // outcome — including a post-cancel publication — arrives well within
+            // the grace. A worker WEDGED below its checkpoint (e.g. the bd-4drgt
+            // open wedge) never responds, so once the real-time grace elapses we
+            // treat it as wedged and surface the caller's Interrupt instead of
+            // hanging. NOTE: `asupersync::time::sleep` is unusable as this bound —
+            // it is a cancellation point that early-completes under the caller's
+            // already-cancelled cx (asupersync `time/sleep.rs`), which would both
+            // defeat the bound and make this future resolve on a single poll.
+            // `yield_now` is NOT cancellation-aware, so a deadline-bounded
+            // try_recv/yield loop is the uncancellable primitive that also keeps
+            // this future pending while the worker is still running.
+            let deadline = std::time::Instant::now() + post_cancel_worker_grace();
+            let resolved = loop {
+                match rx.try_recv() {
+                    Ok(result) => break Some(result),
+                    Err(oneshot::TryRecvError::Empty) => {
+                        if std::time::Instant::now() >= deadline {
+                            break None;
+                        }
+                        asupersync::runtime::yield_now().await;
+                    }
+                    Err(_) => break Some(Err(worker_dead_err())),
+                }
+            };
+            match resolved {
+                None => Err(FrankenError::Interrupt),
+                Some(Err(FrankenError::Abort)) => Err(FrankenError::Interrupt),
+                Some(result) => result,
             }
         }
     };
@@ -5377,6 +5445,84 @@ mod tests {
             "publication winner must remain durably visible"
         );
         conn.close_sync().expect("close should succeed");
+        drop(runtime);
+    }
+
+    #[test]
+    fn wedged_worker_post_cancel_wait_surfaces_bounded_interrupt_bd_xv5cm_l2() {
+        // bd-xv5cm L2: if the worker WEDGES below its next cancel checkpoint (never
+        // responding after the caller relays `request_cancel`), the post-cancel
+        // authoritative-outcome wait must NOT block the cancelled caller forever.
+        // It is bounded by a grace, after which the caller surfaces Interrupt.
+        // Pre-fix the wait ran on an uncancelled detached context with no bound and
+        // hung. This is the complement of
+        // `publication_wins_native_cancellation_and_returns_committed_result`,
+        // which must still return the committed result for a worker that DOES
+        // respond within the grace.
+        //
+        // Use a short grace so the real test runtime does not wait the full 20s,
+        // and a watchdog so a regression re-introducing the hang ABORTS (fails)
+        // instead of hanging CI.
+        TEST_POST_CANCEL_WORKER_GRACE_MS.with(|g| g.set(50));
+        let done = Arc::new(AtomicBool::new(false));
+        let watchdog_done = Arc::clone(&done);
+        let watchdog = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                if watchdog_done.load(Ordering::Acquire) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            eprintln!(
+                "bd-xv5cm L2 regression: cancelled caller hung on a wedged worker's \
+                 post-cancel wait (never bounded to Interrupt)"
+            );
+            std::process::abort();
+        });
+
+        let mut conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
+        conn.state
+            .hold_before_command_response
+            .store(true, Ordering::Release);
+        let operation = Cx::new();
+        let native = NativeCx::for_testing();
+        operation.set_native_cx(native.clone());
+        let runtime = test_runtime();
+        let result = runtime.block_on(async {
+            let mut execute = Box::pin(conn.execute(
+                &operation,
+                "CREATE TABLE wedged_worker_l2 (id INTEGER PRIMARY KEY)",
+            ));
+            // Drive until the worker is paused at the publication gate — wedged
+            // there because `hold_before_command_response` is never released.
+            while !conn.state.command_response_waiting.load(Ordering::Acquire) {
+                assert!(
+                    future::poll_once(&mut execute).await.is_none(),
+                    "response is held at the publication gate"
+                );
+                future::yield_now().await;
+            }
+            // Cancel the caller. The worker stays wedged (hold never released), so
+            // it never reaches the checkpoint to observe the relayed cancel.
+            native.set_cancel_reason(asupersync::types::CancelReason::user(
+                "wedged worker post-cancel bound test",
+            ));
+            execute.await
+        });
+        assert!(
+            matches!(result, Err(FrankenError::Interrupt)),
+            "a wedged worker must surface a bounded Interrupt, got {result:?}"
+        );
+
+        done.store(true, Ordering::Release);
+        let _ = watchdog.join();
+        // Release the wedged worker so its thread can be joined at close.
+        conn.state
+            .hold_before_command_response
+            .store(false, Ordering::Release);
+        TEST_POST_CANCEL_WORKER_GRACE_MS.with(|g| g.set(0));
+        conn.close_sync().expect("close should join the worker");
         drop(runtime);
     }
 
