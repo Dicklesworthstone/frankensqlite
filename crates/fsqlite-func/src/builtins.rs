@@ -1459,9 +1459,13 @@ impl ScalarFunction for SubstrFunc {
         };
         let has_length = args.len() > 2 && !args[2].is_null();
 
-        let mut p1 = args[1].to_integer();
+        // bd-substr-i32-truncate-t3tbx: C SQLite reads substr's position/length
+        // via sqlite3_value_int, i.e. TRUNCATED to i32 (low 32 bits), before the
+        // 2-phase algorithm below. So substr('x', i64::MAX) sees -1 (from-end),
+        // not a past-end no-op, and a huge i64 length wraps to a negative i32.
+        let mut p1 = i64::from(args[1].to_integer() as i32);
         let mut p2 = if has_length {
-            args[2].to_integer()
+            i64::from(args[2].to_integer() as i32)
         } else {
             1_000_000_000
         };
@@ -1545,9 +1549,13 @@ impl SubstrFunc {
         let len = blob.len() as i64;
         let has_length = args.len() > 2 && !args[2].is_null();
 
-        let mut p1 = args[1].to_integer();
+        // bd-substr-i32-truncate-t3tbx: C SQLite reads substr's position/length
+        // via sqlite3_value_int, i.e. TRUNCATED to i32 (low 32 bits), before the
+        // 2-phase algorithm below. So substr('x', i64::MAX) sees -1 (from-end),
+        // not a past-end no-op, and a huge i64 length wraps to a negative i32.
+        let mut p1 = i64::from(args[1].to_integer() as i32);
         let mut p2 = if has_length {
-            args[2].to_integer()
+            i64::from(args[2].to_integer() as i32)
         } else {
             1_000_000_000
         };
@@ -3761,6 +3769,24 @@ mod tests {
         assert_eq!(run(&ReplaceFunc, &[t("abc"), t(""), t("x")]), t("abc")); // empty needle -> no-op
         assert_eq!(run(&TrimFunc, &[t("xxabcxx"), t("x")]), t("abc"));
         assert_eq!(run(&TrimFunc, &[t("  abc  ")]), t("abc"));
+    }
+
+    #[test]
+    fn test_substr_i64_extreme_bd_t3tbx() {
+        // bd-substr-i32-truncate-t3tbx. Oracle: sqlite3 3.46.1. substr() reads
+        // position/length via sqlite3_value_int (i32-truncated), so i64::MAX -> -1
+        // (from-end -> 'f') and a huge i64 length wraps to a negative i32 (-> '').
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let int = SqliteValue::Integer;
+        let run = |args: &[SqliteValue]| -> SqliteValue { SubstrFunc.invoke(args).unwrap() };
+
+        assert_eq!(run(&[t("abcdef"), int(i64::MAX)]), t("f"));
+        assert_eq!(run(&[t("abcdef"), int(i64::MAX), int(5)]), t("f"));
+        assert_eq!(run(&[t("abcdef"), int(i64::MIN)]), t("abcdef"));
+        assert_eq!(run(&[t("abcdef"), int(1), int(i64::MAX)]), t(""));
+        assert_eq!(run(&[t("abcdef"), int(3), int(i64::MIN)]), t(""));
+        assert_eq!(run(&[t("abcdef"), int(i64::MIN), int(i64::MAX)]), t(""));
+        assert_eq!(run(&[t("abcdef"), int(i64::MAX), int(-1)]), t("e"));
     }
 
     #[test]
