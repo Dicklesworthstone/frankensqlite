@@ -33825,9 +33825,47 @@ impl Connection {
         &self,
         statement: &Statement,
     ) -> Result<()> {
-        if !Self::statement_validates_select_relations(statement)
-            || !self.committed_pager_refresh_allowed()
+        if !Self::statement_validates_select_relations(statement) {
+            return Ok(());
+        }
+
+        // issue-62: a :memory: `INSERT INTO <live-vtab> SELECT ... FROM <multi
+        // JOIN>` streams join rows into the target. Under lazy MemDatabase
+        // hydration the row mirror is unloaded, so the streaming join scans each
+        // source through a per-source SQL query instead of the direct mem-scan.
+        // Hydrate the mirror HERE — in the pre-dispatch validation phase, BEFORE
+        // the statement acquires its write transaction — so the scan takes the
+        // mem-scan fast path. Doing it pre-write is essential: an in-txn reload
+        // resets the memdb visible-commit-seq and drops the freshly streamed
+        // rows. This must run BEFORE the `committed_pager_refresh_allowed()` gate
+        // below, which is always false for :memory:. Scoped to autocommit (no
+        // active or explicit user txn) — an explicit transaction keeps the
+        // correct per-source SQL scan, which reads the connection's own
+        // uncommitted writes that a committed-image reload would miss.
+        if self.pager.is_memory()
+            && !self.memdb_rows_loaded.get()
+            && self.active_txn.borrow().is_none()
+            && !self.in_transaction.get()
+            && self.statement_inserts_select_into_live_vtab(statement)
         {
+            let op_cx = self.op_cx_after_background_status();
+            // The prior source INSERTs may still be held in a retained autocommit
+            // batch (unpublished) with a deferred active-txn memdb reload pending.
+            // Publish/settle both so the committed pager image below is
+            // authoritative for the join sources, then rebuild the mirror once.
+            if self.retained_autocommit_txn.borrow().is_some() {
+                self.flush_retained_autocommit_txn(&op_cx).await?;
+            }
+            self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
+            if !self.memdb_rows_loaded.get()
+                && self.pending_memdb_direct_upserts.borrow().is_empty()
+                && !self.memdb_requires_active_txn_reload.get()
+            {
+                self.reload_memdb_from_pager_with_mode(&op_cx, true).await?;
+            }
+        }
+
+        if !self.committed_pager_refresh_allowed() {
             return Ok(());
         }
 
@@ -33837,6 +33875,19 @@ impl Connection {
             .refresh_memdb_if_stale_with_publication(&op_cx, "autocommit_begin")
             .await?;
         Ok(())
+    }
+
+    /// Whether `statement` is an `INSERT INTO <live virtual table> SELECT ...`
+    /// (no CTE) — the streaming live-vtab insert shape whose join-source scans
+    /// benefit from a hydrated MemDatabase mirror (issue-62).
+    fn statement_inserts_select_into_live_vtab(&self, statement: &Statement) -> bool {
+        matches!(
+            statement,
+            Statement::Insert(insert)
+                if insert.with.is_none()
+                    && matches!(&insert.source, InsertSource::Select(_))
+                    && self.has_live_vtab_instance(insert.table.name.as_str())
+        )
     }
 
     fn statement_validates_select_relations(statement: &Statement) -> bool {
