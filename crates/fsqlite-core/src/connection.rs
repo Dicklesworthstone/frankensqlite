@@ -35714,6 +35714,30 @@ impl Connection {
                 let (mut effective_update, _limited_row_count_hint) = self
                     .materialize_update_limit_scope(&canonical_update, params)
                     .await?;
+                // A correlated subquery inside `IN (...)` in the WHERE cannot be
+                // lowered by VDBE codegen; resolve the matching rowids via the
+                // interpreted SELECT path and rewrite to `rowid IN (...)` so the
+                // UPDATE executes by rowid. Live virtual tables route through their
+                // module below, so they are skipped here. (bd-t7m7y)
+                let corr_in_rewrite = if self
+                    .has_live_vtab_instance(&effective_update.table.name.name)
+                {
+                    None
+                } else {
+                    self.rewrite_correlated_in_where_to_rowids(
+                        &effective_update.table,
+                        effective_update.where_clause.as_ref(),
+                        &effective_update.order_by,
+                        effective_update.limit.as_ref(),
+                        params,
+                    )
+                    .await?
+                };
+                if let Some(rewritten) = corr_in_rewrite {
+                    effective_update.order_by.clear();
+                    effective_update.limit = None;
+                    effective_update.where_clause = Some(rewritten);
+                }
                 let table_name = &effective_update.table.name.name;
                 // Reject assigning to a generated column before routing to the
                 // compiled or row-by-row lane (bd-gh-generated-column-update-target).
@@ -36098,6 +36122,29 @@ impl Connection {
                         set: fsqlite_ast::InSet::List(rowid_literals),
                         span: fsqlite_ast::Span::new(0, 0),
                     });
+                }
+                // A correlated subquery inside `IN (...)` in the WHERE cannot be
+                // lowered by VDBE codegen; resolve the matching rowids via the
+                // interpreted SELECT path and rewrite to `rowid IN (...)` so the
+                // DELETE executes by rowid. (bd-t7m7y)
+                let corr_in_rewrite = if self
+                    .has_live_vtab_instance(&effective_delete.table.name.name)
+                {
+                    None
+                } else {
+                    self.rewrite_correlated_in_where_to_rowids(
+                        &effective_delete.table,
+                        effective_delete.where_clause.as_ref(),
+                        &effective_delete.order_by,
+                        effective_delete.limit.as_ref(),
+                        params,
+                    )
+                    .await?
+                };
+                if let Some(rewritten) = corr_in_rewrite {
+                    effective_delete.order_by.clear();
+                    effective_delete.limit = None;
+                    effective_delete.where_clause = Some(rewritten);
                 }
                 let table_name = &effective_delete.table.name.name;
                 let delete_event = fsqlite_ast::TriggerEvent::Delete;
@@ -46640,6 +46687,98 @@ impl Connection {
         );
         self.execute_statement(&Statement::Select(select), params)
             .await
+    }
+
+    /// Whether `table_name` is an ordinary rowid table (not WITHOUT ROWID), so a
+    /// `rowid IN (...)` rewrite can key on its rowid.
+    fn table_is_rowid_table(&self, table_name: &str) -> bool {
+        self.schema_index_of(table_name)
+            .and_then(|index| {
+                self.schema
+                    .borrow()
+                    .get(index)
+                    .map(|table| !table.without_rowid)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Resolve the rowids of the rows a single-table WHERE matches, by running it
+    /// as `SELECT <rowid> FROM <table> WHERE <where> [ORDER BY] [LIMIT]` through
+    /// the interpreted SELECT path — which substitutes correlated outer refs per
+    /// row (unlike VDBE `IN`-probe codegen). Non-integer first values (e.g. a
+    /// WITHOUT ROWID table with no rowid) are dropped; callers gate on a rowid table.
+    async fn select_matching_rowids(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        where_clause: Option<&Expr>,
+        order_by: &[fsqlite_ast::OrderingTerm],
+        limit: Option<&fsqlite_ast::LimitClause>,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<i64>> {
+        let rowid_alias = self.ignore_skip_rowid_alias(&table_ref.name.name);
+        let rowid_col = ResultColumn::Expr {
+            expr: Expr::Column(
+                fsqlite_ast::ColumnRef::bare(rowid_alias),
+                fsqlite_ast::Span::new(0, 0),
+            ),
+            alias: None,
+        };
+        let select =
+            Self::build_single_table_select(table_ref, vec![rowid_col], where_clause, order_by, limit);
+        let rows = self
+            .execute_statement(&Statement::Select(select), params)
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| match row.values().first() {
+                Some(SqliteValue::Integer(i)) => Some(*i),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Build a `<rowid_alias> IN (<literals>)` predicate for a resolved rowid set.
+    fn rowid_in_list_where(&self, table_name: &str, rowids: &[i64]) -> Expr {
+        let rowid_literals: Vec<Expr> = rowids
+            .iter()
+            .map(|&i| Expr::Literal(Literal::Integer(i), fsqlite_ast::Span::new(0, 0)))
+            .collect();
+        let rowid_alias = self.ignore_skip_rowid_alias(table_name);
+        Expr::In {
+            expr: Box::new(Expr::Column(
+                fsqlite_ast::ColumnRef::bare(rowid_alias),
+                fsqlite_ast::Span::new(0, 0),
+            )),
+            not: false,
+            set: fsqlite_ast::InSet::List(rowid_literals),
+            span: fsqlite_ast::Span::new(0, 0),
+        }
+    }
+
+    /// VDBE codegen cannot lower a correlated subquery inside `IN (...)` in an
+    /// UPDATE/DELETE WHERE ("IN probe codegen invariant failed") — the probe path
+    /// never threads the outer scan context. When the WHERE contains such a
+    /// correlated IN and the target is a rowid table, resolve the matching rowids
+    /// via the interpreted SELECT path (which SELECT already uses for correlated
+    /// IN, bd-zvk68) and return a `rowid IN (<literals>)` replacement WHERE, so
+    /// the DML executes by rowid. Returns `None` to leave the WHERE unchanged.
+    async fn rewrite_correlated_in_where_to_rowids(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        where_clause: Option<&Expr>,
+        order_by: &[fsqlite_ast::OrderingTerm],
+        limit: Option<&fsqlite_ast::LimitClause>,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<Expr>> {
+        let has_correlated_in = where_clause
+            .is_some_and(|wh| expr_has_correlated_in_subquery(wh, &self.schema.borrow()));
+        if !has_correlated_in || !self.table_is_rowid_table(&table_ref.name.name) {
+            return Ok(None);
+        }
+        let rowids = self
+            .select_matching_rowids(table_ref, where_clause, order_by, limit, params)
+            .await?;
+        Ok(Some(self.rowid_in_list_where(&table_ref.name.name, &rowids)))
     }
 
     /// Freeze stable row locators for a multi-row UPDATE before its first
