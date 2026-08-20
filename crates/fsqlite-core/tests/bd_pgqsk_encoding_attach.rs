@@ -154,11 +154,10 @@ fn bd_pgqsk_m7_empty_attach_adopts_main_encoding() {
 /// materialized as UTF-16, so it re-ATTACHes cleanly to a UTF-8 main. Before the
 /// fix the eager ATTACH-time persist stamped UTF-16 into the still-empty aux and
 /// this re-ATTACH was rejected as cross-encoding.
-// bd-lzbku decision B: reverted the deferred persist to the eager stamp, which
-// materializes the empty aux at ATTACH — so this "un-materialized re-ATTACH"
-// scenario no longer applies. Ignored (not deleted) pending a correct deferred
-// persist (bd-lzbku, needs fresh context).
-#[ignore = "bd-lzbku: deferred persist reverted to eager (decision B); re-enable with a correct deferred impl"]
+// bd-lzbku (correct deferred fix): the header persist is deferred to the aux's
+// first write (pending_adopted_header_encoding), so an unwritten empty aux is never
+// materialized and re-ATTACHes to a UTF-8 main. Re-enabled (was #[ignore]d under
+// the eager decision-B revert that materialized page 1 at ATTACH).
 #[test]
 fn bd_lzbku_unwritten_empty_aux_reattaches_to_utf8_main() {
     asupersync::test_utils::run_test(|| async {

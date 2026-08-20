@@ -25,12 +25,10 @@ fn scalar_text(rows: &[fsqlite_core::connection::Row]) -> String {
 // Harm 1: an empty aux ATTACHed to a UTF-16 main but NEVER written must NOT be
 // materialized on disk with a committed UTF-16 encoding. A standalone reopen must
 // report UTF-8 (the untouched default), exactly like stock's 0-byte aux.
-// bd-lzbku decision B: the deferred-until-first-write persist corrupted the aux,
-// so we reverted to the eager stamp (with a read-only guard). Eager persist
-// materializes the empty aux's header at ATTACH, so this "stays 0-byte / UTF-8"
-// guard no longer holds. Ignored, not deleted: re-enable when a correct deferred
-// persist lands (bd-lzbku, needs fresh context).
-#[ignore = "bd-lzbku: deferred persist reverted to eager (decision B); re-enable with a correct deferred impl"]
+// bd-lzbku (correct deferred fix): the header persist is now DEFERRED to the aux's
+// first write (pending_adopted_header_encoding), so an unwritten empty aux is never
+// materialized — this guard holds again (was #[ignore]d under the eager decision-B
+// revert that materialized page 1 at ATTACH).
 #[test]
 fn bd_lzbku_unwritten_empty_aux_is_not_materialized() {
     asupersync::test_utils::run_test(|| async {
@@ -65,15 +63,16 @@ fn bd_lzbku_unwritten_empty_aux_is_not_materialized() {
     });
 }
 
-// bd-lzbku decision B (EAGER persist) + bd-ntuz0 (a): ATTACH eagerly stamps the
-// adopted encoding into the aux header, so a written aux stays consistent — stock
-// reopens it as UTF-16le, passes integrity_check, and reads the row. The
-// `integrity == "ok"` assertion is the corruption guard: the reverted
-// deferred-until-first-write variant wrote sqlite_master under the pre-stamp
-// (UTF-8) encoding and only stamped the header at commit, so stock mis-decoded
-// the schema (DatabaseCorrupt "malformed database schema").
+// bd-lzbku (correct deferred fix) + bd-ntuz0 (a): the aux's FIRST WRITE stamps the
+// deferred adopted encoding into its header (bytes 56..60) consistently with its
+// sqlite_master rows (which the pending flag keeps encoding under the adopted
+// value across reloads), so a written aux stays consistent — stock reopens it as
+// UTF-16le, passes integrity_check, and reads the row. The `integrity == "ok"`
+// assertion is the P0 corruption guard: the earlier deferred variant wrote
+// sqlite_master under a reload-clobbered UTF-8 encoding while stamping the header
+// UTF-16le, so stock mis-decoded the schema (DatabaseCorrupt "malformed schema").
 #[test]
-fn bd_lzbku_eager_attach_written_aux_is_stock_readable() {
+fn bd_lzbku_deferred_attach_written_aux_is_stock_readable() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
         let main_path = dir.path().join("main16.db");

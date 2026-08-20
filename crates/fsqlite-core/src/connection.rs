@@ -11535,6 +11535,18 @@ pub struct Connection {
     /// record-encode/`MakeRecord` write path is not yet encoding-aware. UTF-8
     /// until a UTF-16 database is admitted read-only.
     db_text_encoding: Cell<TextEncoding>,
+    /// bd-lzbku: a text encoding this (attached) database adopted from main at
+    /// ATTACH time whose ON-DISK header persist is DEFERRED to the first write —
+    /// stock leaves a brand-new/empty aux at 0 bytes until its first real write,
+    /// so eagerly rewriting page 1 at ATTACH materializes a schema-empty aux
+    /// (rejected on a later cross-encoding re-ATTACH) and fails for a read-only
+    /// aux. `Some(enc)` while the persist is pending: it (a) OVERRIDES the
+    /// header-driven reload of `db_text_encoding` (else a reload off the still-
+    /// UTF-8 header clobbers the adopted value, so the first CREATE TABLE encodes
+    /// sqlite_master UTF-8 while the header is later stamped UTF-16 — the P0
+    /// corruption), and (b) is stamped into the header (bytes 56..60) and cleared
+    /// on the first DDL's schema-cookie write, so schema rows and header agree.
+    pending_adopted_header_encoding: Cell<Option<TextEncoding>>,
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
@@ -13224,6 +13236,7 @@ impl Connection {
             local_ddl_epoch: Cell::new(0),
             force_full_schema_reload_once: Cell::new(false),
             db_text_encoding: Cell::new(TextEncoding::Utf8),
+            pending_adopted_header_encoding: Cell::new(None),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             inherited_recursive_program_depth: Cell::new(0),
@@ -13749,6 +13762,7 @@ impl Connection {
             local_ddl_epoch: Cell::new(0),
             force_full_schema_reload_once: Cell::new(false),
             db_text_encoding: Cell::new(TextEncoding::Utf8),
+            pending_adopted_header_encoding: Cell::new(None),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             inherited_recursive_program_depth: Cell::new(0),
@@ -36659,26 +36673,28 @@ impl Connection {
                     if attached_connection.schema_cookie() == 0 {
                         let adopted = self.db_text_encoding.get();
                         attached_connection.db_text_encoding.set(adopted);
-                        // bd-ntuz0 (a): PERSIST the adopted encoding into the aux's
-                        // header (bytes 56..60) so a standalone reopen reads the
-                        // adopted encoding, not the UTF-8 open-time default. Stock
-                        // creates a UTF-16le aux from a UTF-16le main; match on disk.
+                        // bd-ntuz0 (a): the adopted encoding must reach the aux's
+                        // on-disk header (bytes 56..60), else a standalone reopen of
+                        // a data-carrying aux reads the wrong encoding.
                         //
-                        // bd-lzbku (decision B): the deferred-until-first-write
-                        // variant corrupted the aux (the schema was written UTF-8
-                        // before the header was stamped UTF-16le), so revert to the
-                        // eager stamp here. KEEP ONLY the read-only guard — a
-                        // read-only aux has no write txn, so skip the persist and let
-                        // its reads use the live adopted value (fixes harm #2 safely).
-                        // This re-accepts the P3 harm-#1 edge (an unwritten empty aux
-                        // is materialized and rejects a later cross-encoding
-                        // re-ATTACH) to eliminate the P0 corruption; the correct
-                        // deferred design is left open on bd-lzbku for fresh-context
-                        // work.
+                        // bd-lzbku (correct deferred fix): DEFER that header write to
+                        // the aux's first write instead of stamping page 1 now. Stock
+                        // leaves a brand-new/empty aux at 0 bytes until its first real
+                        // write, so an eager page-1 rewrite (1) materializes a
+                        // schema-empty aux that a later cross-encoding ATTACH rejects,
+                        // and (2) fails for a read-only aux (no write txn). The
+                        // in-memory adopt above already routes reads/encodes through
+                        // the adopted value; the pending flag additionally (a) keeps a
+                        // header-driven memdb reload from clobbering `db_text_encoding`
+                        // back to the still-UTF-8 header — the P0 corruption the eager
+                        // revert (f75649ef8) killed — and (b) is stamped into the
+                        // header and cleared on the aux's first DDL schema-cookie
+                        // write, so its sqlite_master rows and header agree. A
+                        // read-only aux never writes, so it needs no persist at all.
                         if !attached_connection.pager.is_readonly() {
                             attached_connection
-                                .update_database_header_metadata(None, None, None, None, Some(adopted))
-                                .await?;
+                                .pending_adopted_header_encoding
+                                .set(Some(adopted));
                         }
                     } else {
                         return Err(FrankenError::function_error(
@@ -87006,12 +87022,21 @@ impl Connection {
         // compilation caches have been invalidated. We reopen the bit at
         // the end of this function once the DDL state is fully consistent.
         self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, false);
+        // bd-lzbku: on the aux's first DDL, piggyback the DEFERRED adopted-encoding
+        // header stamp (bytes 56..60) onto this same schema-cookie header write, so
+        // the on-disk encoding matches the (already-adopted) sqlite_master rows,
+        // then clear the pending flag so it fires exactly once. `None` for a
+        // non-adopting connection leaves the encoding byte untouched, as before.
+        let pending_encoding = self.pending_adopted_header_encoding.get();
         if let Err(error) = self
-            .update_database_header_metadata(Some(new_cookie), None, None, None, None)
+            .update_database_header_metadata(Some(new_cookie), None, None, None, pending_encoding)
             .await
         {
             self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, true);
             return Err(error);
+        }
+        if pending_encoding.is_some() {
+            self.pending_adopted_header_encoding.set(None);
         }
         *self.schema_cookie.borrow_mut() = new_cookie;
         self.schema_generation
@@ -88444,7 +88469,19 @@ impl Connection {
             // and the mutation guard. The VDBE self-adopts the same value at
             // cursor open; writes to a non-UTF-8 database are rejected at the
             // write entry (guard_mutation_encoding_supported).
-            self.db_text_encoding.set(header.text_encoding);
+            //
+            // bd-lzbku: a pending adopted encoding (a deferred ATTACH persist that
+            // has not yet reached the header) OVERRIDES the still-UTF-8 on-disk
+            // header here. Without this, this reload clobbers the adopted value and
+            // the aux's first CREATE TABLE encodes sqlite_master under UTF-8 while
+            // the header is later stamped UTF-16le — the P0 corruption the eager
+            // revert killed. Once the first write stamps the header and clears the
+            // flag, later reloads read the persisted adopted encoding directly.
+            self.db_text_encoding.set(
+                self.pending_adopted_header_encoding
+                    .get()
+                    .unwrap_or(header.text_encoding),
+            );
             // Admission belongs on the already-bound reload transaction: its
             // page 1 reflects the installed WAL snapshot, and the check still
             // precedes every schema or row-image mutation below. Opening a
