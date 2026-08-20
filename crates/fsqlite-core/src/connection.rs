@@ -126,8 +126,8 @@ pub use fsqlite_pager::pager::DatabaseImageReceipt;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
-    PagerCommitProfileSnapshot, PagerCommitState, PagerPublishedSnapshot, SimplePager,
-    TransactionKind, WalCommitSyncPolicy, page_buffer_pool_metrics_snapshot,
+    PagerCommitProfileSnapshot, PagerCommitState, PagerPublishedSnapshot, RollbackCleanup,
+    SimplePager, TransactionKind, WalCommitSyncPolicy, page_buffer_pool_metrics_snapshot,
     pager_commit_profile_snapshot, reset_page_buffer_pool_metrics, reset_pager_commit_profile,
 };
 use fsqlite_parser::lexer::Lexer;
@@ -3949,6 +3949,20 @@ impl PagerBackend {
             Self::Unix(p) => p.set_journal_mode(cx, mode).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.set_journal_mode(cx, mode).await,
+        }
+    }
+
+    /// bd-sw2k5: select the rollback-journal cleanup strategy (`PRAGMA
+    /// journal_mode` delete/truncate/persist behavior for the non-WAL modes).
+    fn set_rollback_cleanup(&self, cleanup: RollbackCleanup) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.set_rollback_cleanup(cleanup),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.set_rollback_cleanup(cleanup),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.set_rollback_cleanup(cleanup),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.set_rollback_cleanup(cleanup),
         }
     }
 
@@ -71936,17 +71950,29 @@ impl Connection {
                 }
                 Err(err) => Err(err),
             }
-        } else if self.pager.journal_mode() != JournalMode::Delete {
-            // SQLite checkpoints outstanding WAL frames before leaving WAL mode
-            // so the main database remains self-contained for external readers.
-            if self.pager.journal_mode() == JournalMode::Wal {
-                self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
-            }
-            self.pager
-                .set_journal_mode(&cx, JournalMode::Delete)
-                .await?;
-            Ok(())
         } else {
+            // bd-sw2k5: every non-WAL mode uses the pager's Delete rollback
+            // path; the requested sub-mode only selects the post-commit journal
+            // cleanup. `memory`/`off` are accepted but not yet specialized, so
+            // they fall through to the crash-safe Delete cleanup.
+            let cleanup = if journal_mode.eq_ignore_ascii_case("truncate") {
+                RollbackCleanup::Truncate
+            } else if journal_mode.eq_ignore_ascii_case("persist") {
+                RollbackCleanup::Persist
+            } else {
+                RollbackCleanup::Delete
+            };
+            if self.pager.journal_mode() != JournalMode::Delete {
+                // SQLite checkpoints outstanding WAL frames before leaving WAL
+                // mode so the main database stays self-contained for readers.
+                if self.pager.journal_mode() == JournalMode::Wal {
+                    self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
+                }
+                self.pager
+                    .set_journal_mode(&cx, JournalMode::Delete)
+                    .await?;
+            }
+            self.pager.set_rollback_cleanup(cleanup)?;
             Ok(())
         }
     }
