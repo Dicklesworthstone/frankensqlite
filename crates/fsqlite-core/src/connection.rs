@@ -62485,9 +62485,16 @@ impl Connection {
         // re-enter itself), not by table name. This allows trigger A on
         // table T to fire trigger B on table T during A's body.
 
+        // Fire same-event triggers in reverse-creation order (LIFO, newest
+        // first) to match C SQLite, whose per-table trigger list is built by
+        // prepending so the most recently created trigger fires first.
+        // `self.triggers` is kept in creation order (append on CREATE;
+        // sqlite_master reload scans by rowid = creation order), so reversing
+        // at the firing site is stable across reopen (bd-5vr3b).
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
+            .rev()
             .filter(|t| {
                 t.table_name.eq_ignore_ascii_case(table_name)
                     && t.timing == fsqlite_ast::TriggerTiming::Before
@@ -62560,9 +62567,13 @@ impl Connection {
         // NOTE: recursive_triggers guard moved into the per-trigger loop
         // below. C SQLite checks by trigger NAME, not table name.
 
+        // Reverse-creation (LIFO, newest first) order to match C SQLite — see
+        // fire_before_triggers (bd-5vr3b). Stable across reopen because
+        // `self.triggers` is always in creation order.
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
+            .rev()
             .filter(|t| {
                 t.table_name.eq_ignore_ascii_case(table_name)
                     && t.timing == fsqlite_ast::TriggerTiming::After
@@ -63010,9 +63021,13 @@ impl Connection {
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
     ) -> Result<bool> {
+        // Reverse-creation (LIFO, newest first) order to match C SQLite — see
+        // fire_before_triggers (bd-5vr3b). Stable across reopen because
+        // `self.triggers` is always in creation order.
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
+            .rev()
             .filter(|trigger| {
                 trigger.table_name.eq_ignore_ascii_case(view_name)
                     && trigger.timing == fsqlite_ast::TriggerTiming::InsteadOf
@@ -165739,6 +165754,81 @@ mod tests {
             let rows = conn.query("SELECT msg FROM log;").await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("fired".into()));
+        });
+    }
+
+    #[test]
+    fn test_same_event_trigger_firing_order_lifo_bd_5vr3b() {
+        asupersync::test_utils::run_test(|| async {
+            // C SQLite fires multiple same-event triggers in reverse-creation
+            // order (LIFO, newest first); frank used to fire in creation order
+            // (FIFO) — the exact opposite (bd-5vr3b).
+            async fn markers(conn: &Connection) -> Vec<String> {
+                let rows = conn
+                    .query("SELECT marker FROM log ORDER BY id;")
+                    .await
+                    .unwrap();
+                rows.iter()
+                    .map(|r| match &row_values(r)[0] {
+                        SqliteValue::Text(s) => s.to_string(),
+                        other => panic!("marker not text: {other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+            }
+            async fn setup(conn: &Connection) {
+                conn.execute("CREATE TABLE t (id INTEGER);").await.unwrap();
+                conn.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, marker TEXT);")
+                    .await
+                    .unwrap();
+            }
+
+            // Scenario A: z_first created before a_second -> a_second (newest)
+            // fires FIRST, so the log reads a,z. Rules out creation-order FIFO.
+            let conn = Connection::open(":memory:").await.unwrap();
+            setup(&conn).await;
+            conn.execute("CREATE TRIGGER z_first AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('z'); END;").await.unwrap();
+            conn.execute("CREATE TRIGGER a_second AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('a'); END;").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            assert_eq!(
+                markers(&conn).await,
+                vec!["a", "z"],
+                "newest-created trigger (a_second) must fire first"
+            );
+
+            // Scenario B: swap the names so alphabetical order would predict the
+            // opposite. Proves the order is creation-recency, NOT name order.
+            let conn2 = Connection::open(":memory:").await.unwrap();
+            setup(&conn2).await;
+            conn2.execute("CREATE TRIGGER a_first AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('a'); END;").await.unwrap();
+            conn2.execute("CREATE TRIGGER z_second AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('z'); END;").await.unwrap();
+            conn2.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            assert_eq!(
+                markers(&conn2).await,
+                vec!["z", "a"],
+                "newest-created trigger (z_second) must fire first, not name order"
+            );
+
+            // Scenario C: reopen from disk preserves LIFO. Reload scans
+            // sqlite_master by rowid (creation order), so reversing at the
+            // firing site stays stable across reopen.
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("trg_order.db");
+            let db_path = db_path.to_str().unwrap();
+            {
+                let c = Connection::open(db_path).await.unwrap();
+                setup(&c).await;
+                c.execute("CREATE TRIGGER z_first AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('z'); END;").await.unwrap();
+                c.execute("CREATE TRIGGER a_second AFTER INSERT ON t BEGIN INSERT INTO log(marker) VALUES ('a'); END;").await.unwrap();
+                c.close().await.unwrap();
+            }
+            let reopened = Connection::open(db_path).await.unwrap();
+            reopened.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            assert_eq!(
+                markers(&reopened).await,
+                vec!["a", "z"],
+                "LIFO firing order must survive reopen"
+            );
+            reopened.close().await.unwrap();
         });
     }
 
