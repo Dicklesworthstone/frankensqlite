@@ -38,6 +38,16 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...ma
 
 50 non-merge commits after the v0.3.6 tag.
 
+### Delivered capability
+
+- Post-0.3.6 FTS5/SSI/ATTACH follow-through (GH#370/#371).
+- Remaining root reports relocated (`docs/UPGRADE_LOG.md`, `docs/planning/HEADS_UP_CONNECTION_RS_WIP.md`).
+
+### Closed workstreams
+
+- GitHub issues #370 and #371.
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankensqlite/blob/main/.beads/issues.jsonl).
+
 ### Janitor docs-reorg (2026-08-19)
 
 - Untracked skill-loop scratch; moved remaining root planning beads into `docs/planning/` ([`b72874ce02435cc0030a671526fbf6bd09fafec5`](https://github.com/Dicklesworthstone/frankensqlite/commit/b72874ce02435cc0030a671526fbf6bd09fafec5)).
