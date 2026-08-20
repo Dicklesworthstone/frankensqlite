@@ -2577,10 +2577,17 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
 
         if i >= chars.len() {
             // A `%` that consumed flags/width/precision but then hit EOF with no
-            // conversion char (printf('%5'), printf('%-'), printf('%.*'), ...) is
-            // an incomplete conversion: stock SQLite NULLs the whole call
-            // (bd-printf-incomplete-conversion-edge).
-            return Ok(None);
+            // conversion char (printf('%5'), printf('%-'), printf('%.3'), ...) is
+            // an incomplete conversion. Stock SQLite STOPS here and returns the
+            // output accumulated SO FAR — printf('x%5') == 'x', printf('ab%d%5', 0)
+            // == 'ab0', printf(' %5') == ' ' — it does NOT NULL the whole call.
+            // Only when nothing was accumulated (printf('%5'), printf('%-')) does
+            // the empty result render as SQL NULL, matching how an empty StrAccum
+            // finishes (bd-printf-incomplete-conversion-edge).
+            if result.is_empty() {
+                return Ok(None);
+            }
+            break;
         }
 
         let spec = chars[i];
@@ -6527,14 +6534,21 @@ mod tests {
         assert_eq!(run(&[txt("%%")]), some("%"));
         assert_eq!(run(&[txt("abc%%def")]), some("abc%def"));
 
-        // (2) `%` + flags/width/precision + EOF (no spec) -> NULL.
+        // (2) An incomplete `%` with NOTHING accumulated before it -> NULL
+        // (the empty result renders as SQL NULL, like an empty StrAccum).
         for bad in [
             "%5", "%-", "%.", "%+", "%#", "% ", "%05", "%-5", "%.3", "%5.3",
         ] {
             assert_eq!(run(&[txt(bad)]), None, "printf('{bad}') must be NULL");
         }
-        // A literal prefix does not survive an incomplete trailing conversion.
-        assert_eq!(run(&[txt("abc%5")]), None);
+        // (3) The SAME incomplete conversion, once ANY output exists, returns the
+        // accumulated output so far — it does NOT null the whole call.
+        let int = SqliteValue::Integer;
+        assert_eq!(run(&[txt("abc%5")]), some("abc"));
+        assert_eq!(run(&[txt("x%-")]), some("x"));
+        assert_eq!(run(&[txt(" %5")]), some(" ")); // whitespace-only prefix counts
+        assert_eq!(run(&[txt("%d%5"), int(0)]), some("0"));
+        assert_eq!(run(&[txt("ab%d%5"), int(0)]), some("ab0"));
     }
 
     #[test]
