@@ -6624,7 +6624,25 @@ pub fn remove_group_commit_queue(db_path: &Path) {
         let mut queues = queues
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queues.remove(&key);
+        // bd-xv5cm L1: re-check the entry's live count under the registry lock and
+        // remove it ONLY when the registry is its sole owner (strong_count == 1).
+        // The last-connection close races a concurrent fresh open: on a VFS whose
+        // `file_identity()` is None the identity-keyed weak registry cannot make
+        // the two opens converge, so if that open has already cloned the queue
+        // Arc (strong_count > 1) an unconditional remove would strand it on an
+        // orphaned queue while the next open builds a second one — two live
+        // group-commit queues for one file. Because a fresh open must hold the
+        // registry lock to clone the Arc, a strong_count of 1 observed here proves
+        // no live holder exists (or can appear before we return), so removal is
+        // safe; otherwise the shared entry is retained and every opener converges
+        // on it. A still-referenced entry is reclaimed by a later close (or reused
+        // in place when the path is reopened).
+        if queues
+            .get(&key)
+            .is_some_and(|queue| Arc::strong_count(queue) == 1)
+        {
+            queues.remove(&key);
+        }
     }
 }
 
@@ -55108,5 +55126,49 @@ mod tests {
         assert!(classes.contains(&PagerMetadataPublicationClass::PagePlaneResidency));
         assert!(classes.contains(&PagerMetadataPublicationClass::CertificateDerivedIntent));
         assert_eq!(classes.len(), 3);
+    }
+
+    #[test]
+    fn test_remove_group_commit_queue_retains_live_entry_bd_xv5cm_l1() {
+        // bd-xv5cm L1: `remove_group_commit_queue` (called on last-connection
+        // close) must NOT drop a queue a concurrent fresh open still holds. It now
+        // removes the registry entry only when the registry is its sole owner
+        // (`Arc::strong_count == 1`). Pre-fix the unconditional remove stranded the
+        // live holder on an orphaned queue while the next open built a second one —
+        // two live group-commit queues for one file on a None-identity VFS.
+        let path = PathBuf::from("/tmp/bd_xv5cm_l1_gc_queue_identity.db");
+        // Reclaim any dead entry a prior run left (removes only if unreferenced).
+        remove_group_commit_queue(&path);
+
+        // A "live connection" holds the queue: registry + this Arc => strong_count 2.
+        let held = group_commit_queue_for_path(&path);
+        let held_id = held.queue_id;
+
+        // A racing last-connection close must NOT remove the still-held entry.
+        remove_group_commit_queue(&path);
+
+        // The registry still maps to the SAME queue: a fresh acquire returns the
+        // identical Arc, so every opener converges (no second queue). Pre-fix this
+        // acquire built a distinct queue and the ptr_eq assertion failed.
+        let reacquired = group_commit_queue_for_path(&path);
+        assert!(
+            Arc::ptr_eq(&held, &reacquired),
+            "a live group-commit queue must not be removed — openers must converge"
+        );
+        assert_eq!(reacquired.queue_id, held_id);
+
+        // Once no live holder remains, the entry is genuinely reclaimable.
+        drop(held);
+        drop(reacquired);
+        remove_group_commit_queue(&path);
+
+        // A subsequent acquire now builds a NEW queue (the dead entry was removed).
+        let fresh = group_commit_queue_for_path(&path);
+        assert_ne!(
+            fresh.queue_id, held_id,
+            "after the last holder drops, remove reclaims the entry and a fresh queue is built"
+        );
+        drop(fresh);
+        remove_group_commit_queue(&path);
     }
 }
