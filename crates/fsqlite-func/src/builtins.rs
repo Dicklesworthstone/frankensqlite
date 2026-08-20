@@ -3718,6 +3718,42 @@ mod tests {
         f.invoke(&[a, b])
     }
 
+    #[test]
+    fn test_string_fn_oracle_edges_2026_08() {
+        // Oracle: sqlite3 3.46.1. substr()'s 1-based positions, a 0/negative
+        // start, and a negative length are the classic divergence sources; instr
+        // and replace have empty-needle quirks. All char-based (not byte-based).
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let int = SqliteValue::Integer;
+        let run = |f: &dyn ScalarFunction, args: &[SqliteValue]| -> SqliteValue { f.invoke(args).unwrap() };
+
+        // substr: position 0 means "before char 1", so a length spanning it loses one.
+        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(0)]), t("abcdef"));
+        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(0), int(3)]), t("ab"));
+        // A negative start counts from the end.
+        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(-2)]), t("ef"));
+        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(-2), int(1)]), t("e"));
+        // A negative length selects the chars BEFORE the start position.
+        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(2), int(-1)]), t("a"));
+        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(2), int(-10)]), t("a"));
+        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(-3), int(2)]), t("de"));
+        // A start before the string with a length that never reaches it -> empty.
+        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(-10), int(3)]), t(""));
+        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(10)]), t(""));
+        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(3), int(100)]), t("cdef"));
+        // Char-based (not byte-based) on multi-byte UTF-8.
+        assert_eq!(run(&SubstrFunc, &[t("héllo"), int(2), int(2)]), t("él"));
+
+        // instr / replace / trim.
+        assert_eq!(run(&InstrFunc, &[t("abcabc"), t("bc")]), int(2));
+        assert_eq!(run(&InstrFunc, &[t("abc"), t("")]), int(1)); // empty needle -> 1
+        assert_eq!(run(&InstrFunc, &[t(""), t("x")]), int(0));
+        assert_eq!(run(&ReplaceFunc, &[t("aaa"), t("a"), t("bb")]), t("bbbbbb"));
+        assert_eq!(run(&ReplaceFunc, &[t("abc"), t(""), t("x")]), t("abc")); // empty needle -> no-op
+        assert_eq!(run(&TrimFunc, &[t("xxabcxx"), t("x")]), t("abc"));
+        assert_eq!(run(&TrimFunc, &[t("  abc  ")]), t("abc"));
+    }
+
     fn assert_wrong_arg_count(registry: &FunctionRegistry, name: &str, arity: i32) {
         let function = registry
             .find_scalar(name, arity)
