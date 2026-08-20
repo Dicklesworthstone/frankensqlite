@@ -14,6 +14,7 @@
 //!   observability beads (bd-t6sv2.2, .3, .5, .6, .8, .12).
 
 pub mod connection_pool;
+pub mod metrics;
 pub mod page_cache;
 
 use fsqlite_types::sync_primitives::{Duration, Instant, Mutex};
