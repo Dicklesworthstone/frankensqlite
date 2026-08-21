@@ -35867,9 +35867,22 @@ impl Connection {
                     }
                 }
                 if !is_live_vtab
-                    && (has_before_insert || has_after_insert || self.fk_enforcement_enabled())
                     && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
                     && rows.len() > 1
+                    && (has_before_insert
+                        || has_after_insert
+                        || self.fk_enforcement_enabled()
+                        // bd-01qa9: a multi-row VALUES INSERT that violates a
+                        // constraint on a later row must, under ABORT (the
+                        // default) and OR ABORT, undo the rows it already
+                        // inserted — statement atomicity. The bulk VDBE program
+                        // below leaves the earlier rows behind (it behaves like
+                        // OR FAIL), so route small multi-row VALUES through the
+                        // savepoint-wrapped materialized replay, which rolls the
+                        // statement back correctly (verified equivalent to the
+                        // INSERT ... SELECT replay path). Large bulk (>= the
+                        // morsel threshold) keeps its dedicated fast path.
+                        || rows.len() < MORSEL_INSERT_THRESHOLD)
                 {
                     self.log_mem_execution_fallback(
                         "insert_values",
@@ -61061,9 +61074,19 @@ impl Connection {
                     .map(|attached| attached.schema.clone())
             };
             let Some(attached_schema) = attached_schema else {
-                return Err(FrankenError::not_implemented(
-                    crate::vacuum::ATTACHED_SCHEMA_UNSUPPORTED,
-                ));
+                // "temp" is a real schema (stock VACUUMs it successfully); frank
+                // does not yet VACUUM the temp schema, so keep the unsupported
+                // signal there rather than falsely claiming it is unknown. Any
+                // OTHER unmatched name is "unknown database <schema>" in stock,
+                // not an unsupported-feature error. bd-errmsg-batch3.
+                if schema.eq_ignore_ascii_case("temp") {
+                    return Err(FrankenError::not_implemented(
+                        crate::vacuum::ATTACHED_SCHEMA_UNSUPPORTED,
+                    ));
+                }
+                return Err(FrankenError::function_error(format!(
+                    "unknown database {schema}"
+                )));
             };
             let mut rewritten = vacuum_stmt.clone();
             rewritten.schema = None;
@@ -173444,9 +173467,11 @@ mod tests {
                 .execute("VACUUM aux INTO 'ignored.db';")
                 .await
                 .unwrap_err();
+            // `aux` is not attached here, so stock reports "unknown database aux"
+            // (SQLITE_ERROR), not an unsupported-feature error.
             assert!(
-                matches!(err, FrankenError::NotImplemented(ref feature) if feature == "VACUUM on attached schemas"),
-                "expected attached-schema VACUUM rejection, got {err:?}"
+                matches!(err, FrankenError::FunctionError(ref message) if message == "unknown database aux"),
+                "expected unknown-database rejection, got {err:?}"
             );
         });
     }
