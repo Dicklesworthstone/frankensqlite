@@ -16,15 +16,5 @@ fsqlite-func = { workspace = true }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 json5 = "1.3"
 
-[features]
-# `arbitrary_precision` is a VIRAL serde_json feature: Cargo unifies it across the
-# whole build, switching serde_json's Number backing to a text-map and breaking
-# every downstream f64 deserialization of internally-tagged/untagged/flatten enums
-# (bd-uxmhz / GH#375). It is therefore OFF by default. Opt in only when you need
-# JSON number literals beyond f64 range preserved (`9e999` -> `9.0e+999`, GH#212);
-# with the feature off, non-finite JSON numbers are rejected on parse and a
-# constructed +-Inf renders as JSON null (like NaN).
-arbitrary_precision = ["serde_json/arbitrary_precision"]
-
 [lints]
 workspace = true

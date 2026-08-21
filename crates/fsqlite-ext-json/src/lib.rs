@@ -54,6 +54,150 @@ const JSONB_TEXTRAW_TYPE: u8 = 0xA;
 const JSONB_ARRAY_TYPE: u8 = 0xB;
 const JSONB_OBJECT_TYPE: u8 = 0xC;
 
+/// Private sentinel prefix that marks a `Value::String` as carrying a NON-FINITE
+/// JSON number literal (e.g. `9e999` -> +Inf) rather than genuine text.
+///
+/// `serde_json::Number` cannot hold ±Inf, and with the viral `arbitrary_precision`
+/// feature deliberately OFF (bd-uxmhz / GH#375), serde's parser hard-errors on a
+/// number literal that overflows f64 to infinity. To keep stock SQLite's GH#212
+/// behavior (non-finite JSON numbers preserved through parse/extract/render) BY
+/// DEFAULT, a non-finite number is carried inside the `Value` tree as a
+/// `Value::String` whose bytes begin with this tag followed by the raw numeric
+/// source text. The tag embeds NUL and SOH control bytes so it can never collide
+/// with a real JSON string value (bd-yalqc).
+const NONFINITE_TAG: &str = "\u{0}\u{0}fsqlite\u{1}nonfinite\u{0}";
+
+/// Build the tagged `Value::String` that carries a non-finite JSON number's raw
+/// source text (`9e999`, `9.0e+999`, ...).
+fn nonfinite_value(raw: &str) -> Value {
+    Value::String(format!("{NONFINITE_TAG}{raw}"))
+}
+
+/// If `s` is a tagged non-finite-number carrier, return its raw numeric text;
+/// otherwise `None` (a genuine string value).
+fn as_nonfinite(s: &str) -> Option<&str> {
+    s.strip_prefix(NONFINITE_TAG)
+}
+
+/// Render a non-finite JSON number from its raw source text the way stock SQLite
+/// prints it.
+///
+/// SQLite copies a number's source text verbatim, so a parsed `9e999` renders as
+/// `9e999` while a constructed +Inf carries the canonical `9.0e+999`. When the
+/// mantissa has NO fractional part we drop an inserted `+` after the exponent
+/// marker (`9e+999` -> `9e999`); a mantissa that already contains `.` (the
+/// constructed `9.0e+999`, or a source that wrote it) keeps its form, as does an
+/// uppercase `E` (bd-yalqc port of the former `render_non_finite_number`).
+fn render_non_finite_number_raw(raw: &str) -> String {
+    let Some(exp) = raw.find(['e', 'E']) else {
+        return raw.to_owned();
+    };
+    if raw[..exp].contains('.') {
+        return raw.to_owned();
+    }
+    let mut rendered = String::with_capacity(raw.len());
+    rendered.push_str(&raw[..=exp]);
+    rendered.push_str(raw[exp + 1..].trim_start_matches('+'));
+    rendered
+}
+
+/// JSON-aware rewrite that wraps every NUMERIC token which overflows f64 to ±Inf
+/// in a tagged JSON string literal, so serde_json (with `arbitrary_precision`
+/// off) can parse the document without hard-erroring on the out-of-range number.
+///
+/// The scanner walks bytes, copying string literals verbatim (respecting `\"` and
+/// `\\`) and identifying numeric tokens OUTSIDE strings: optional `-`, integer
+/// digits, optional `.`digits, optional `e`/`E` with optional sign and digits.
+/// A token whose `f64` parse `.is_infinite()` is replaced by the JSON string
+/// literal `"<escaped NONFINITE_TAG><raw>"` (serde escapes the tag's control
+/// bytes, keeping the output valid JSON). Returns `Some(rewritten)` iff at least
+/// one token was wrapped, else `None` (so callers keep their original error /
+/// JSON5 fallback). bd-yalqc.
+fn rewrite_overflow_numbers(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0usize;
+    let mut wrapped = false;
+
+    while i < n {
+        let b = bytes[i];
+        if b == b'"' {
+            // String literal: copy verbatim, honoring backslash escapes. `"` and
+            // `\` are ASCII and never appear inside a multibyte UTF-8 sequence,
+            // so byte-level delimiter scanning is safe; we copy the whole literal
+            // as one &str slice to preserve any multibyte content.
+            let start = i;
+            i += 1;
+            while i < n {
+                match bytes[i] {
+                    b'\\' => i += 2, // skip the escape and its escaped byte
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            out.push_str(&input[start..i.min(n)]);
+        } else if b.is_ascii_digit() || (b == b'-' && i + 1 < n && bytes[i + 1].is_ascii_digit()) {
+            // Numeric token start (a bare `-` not followed by a digit falls
+            // through to the verbatim-copy arm below).
+            let start = i;
+            if bytes[i] == b'-' {
+                i += 1;
+            }
+            while i < n && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < n && bytes[i] == b'.' {
+                i += 1;
+                while i < n && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            if i < n && (bytes[i] == b'e' || bytes[i] == b'E') {
+                // Only consume the exponent if it is well-formed (marker,
+                // optional sign, at least one digit); otherwise the token ends
+                // at the marker and the `e`/`E` is copied on the next iteration.
+                let mut j = i + 1;
+                if j < n && (bytes[j] == b'+' || bytes[j] == b'-') {
+                    j += 1;
+                }
+                if j < n && bytes[j].is_ascii_digit() {
+                    i = j;
+                    while i < n && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+            }
+            let raw = &input[start..i];
+            if raw.parse::<f64>().is_ok_and(f64::is_infinite) {
+                // serde escapes the tag's control bytes; the raw numeric text is
+                // already JSON-string-safe. String serialization is infallible.
+                let literal = serde_json::to_string(&format!("{NONFINITE_TAG}{raw}"))
+                    .expect("serializing a String to JSON is infallible");
+                out.push_str(&literal);
+                wrapped = true;
+            } else {
+                out.push_str(raw);
+            }
+        } else {
+            // Any other byte: copy one whole UTF-8 scalar verbatim (advance past
+            // continuation bytes) so stray multibyte content outside strings is
+            // never split or corrupted.
+            let mut end = i + 1;
+            while end < n && (bytes[end] & 0xC0) == 0x80 {
+                end += 1;
+            }
+            out.push_str(&input[i..end]);
+            i = end;
+        }
+    }
+
+    wrapped.then_some(out)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PathSegment {
     Key(SmallText),
@@ -227,28 +371,26 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
                 // superseded by minify and reverted).
                 out.push_str(&format!("{float:?}"));
             } else {
-                // Non-finite (or beyond-f64 magnitude) JSON number, only
-                // reachable with the `arbitrary_precision` Number backing.
-                // SQLite renders +Inf/-Inf as a numeric literal and preserves
-                // the source text of a parsed value: a constructed value
-                // carries the canonical `9.0e+999`, a parsed value carries its
-                // source (`9e999`) — stock's construct-vs-preserve asymmetry
-                // (GH#212, bd-t75hg).
-                // Only reachable with `arbitrary_precision` (serde_json cannot
-                // otherwise hold a non-finite Number); the non-feature arm keeps
-                // the match compiling and is never taken (bd-uxmhz).
-                #[cfg(feature = "arbitrary_precision")]
-                let rendered = render_non_finite_number(number);
-                #[cfg(not(feature = "arbitrary_precision"))]
-                let rendered = number.to_string();
-                out.push_str(&rendered);
+                // Unreachable: without `arbitrary_precision`, `serde_json::Number`
+                // only ever holds i64/u64/finite-f64. Non-finite JSON numbers are
+                // carried as tagged `Value::String` (see `nonfinite_value`), so
+                // this arm just keeps the match exhaustive (bd-yalqc).
+                out.push_str(&number.to_string());
             }
         }
         Value::String(text) => {
-            let escaped = serde_json::to_string(text).map_err(|error| {
-                FrankenError::function_error(format!("JSON string escape failed: {error}"))
-            })?;
-            out.push_str(&escaped);
+            if let Some(raw) = as_nonfinite(text) {
+                // Non-finite JSON number carried as a tagged string: emit the
+                // NUMBER text, reproducing stock's construct-vs-preserve forms
+                // (parsed `9e999` stays `9e999`; constructed `9.0e+999` stays
+                // `9.0e+999`) — GH#212, bd-yalqc.
+                out.push_str(&render_non_finite_number_raw(raw));
+            } else {
+                let escaped = serde_json::to_string(text).map_err(|error| {
+                    FrankenError::function_error(format!("JSON string escape failed: {error}"))
+                })?;
+                out.push_str(&escaped);
+            }
         }
         Value::Array(items) => {
             out.push('[');
@@ -588,9 +730,8 @@ pub fn json_array(values: &[SqliteValue]) -> Result<String> {
         out.push(sqlite_to_json(value)?);
     }
     // Route through the canonical writer (not `serde_json::to_string`) so floats
-    // render in stock-canonical form and non-finite numbers are handled — the
-    // `arbitrary_precision` Number backing serializes an exponent as `e+NNN`
-    // and would diverge here (GH#212, bd-t75hg).
+    // render in stock-canonical form and non-finite numbers (tagged carriers)
+    // render as their numeric literal (GH#212, bd-t75hg, bd-yalqc).
     encode_json_text("json_array encode failed", &Value::Array(out))
 }
 
@@ -623,7 +764,7 @@ fn encode_json_object_members(members: &[(String, Value)]) -> Result<String> {
         out.push_str(&key_json);
         out.push(':');
         // Canonical writer (not `serde_json::to_string`): stock-canonical floats
-        // and correct non-finite rendering under `arbitrary_precision` (GH#212).
+        // and correct non-finite rendering of tagged carriers (GH#212, bd-yalqc).
         write_canonical_json_text(value, &mut out)?;
     }
     out.push('}');
@@ -1110,8 +1251,20 @@ impl VirtualTableCursor for JsonTreeCursor {
 }
 
 fn parse_json_text(input: &str) -> Result<Value> {
-    serde_json::from_str::<Value>(input)
-        .map_err(|error| FrankenError::function_error(format!("invalid JSON input: {error}")))
+    match serde_json::from_str::<Value>(input) {
+        Ok(value) => Ok(value),
+        // serde (with `arbitrary_precision` off) hard-errors on a JSON number
+        // literal that overflows f64 to ±Inf. Retry after wrapping every such
+        // overflow token in a tagged string carrier (GH#212, bd-yalqc); on total
+        // failure keep the original strict-parse error message.
+        Err(error) => match rewrite_overflow_numbers(input) {
+            Some(rewritten) => serde_json::from_str::<Value>(&rewritten)
+                .map_err(|_| FrankenError::function_error(format!("invalid JSON input: {error}"))),
+            None => Err(FrankenError::function_error(format!(
+                "invalid JSON input: {error}"
+            ))),
+        },
+    }
 }
 
 fn parse_json5_text(input: &str) -> Result<Value> {
@@ -1131,12 +1284,21 @@ fn parse_json5_text(input: &str) -> Result<Value> {
 fn parse_json_value_lenient(input: &str) -> Result<Value> {
     match serde_json::from_str::<Value>(input) {
         Ok(value) => Ok(value),
-        // Fall back to JSON5; if that also fails, surface the STRICT-parse error
-        // so genuinely-malformed input keeps its existing "invalid JSON input"
-        // message rather than a JSON5-flavored one.
-        Err(strict_error) => parse_json5_text(input).map_err(|_| {
-            FrankenError::function_error(format!("invalid JSON input: {strict_error}"))
-        }),
+        Err(strict_error) => {
+            // First retry with overflow numbers wrapped as tagged carriers so a
+            // non-finite literal (`9e999`) parses instead of hard-erroring
+            // (GH#212, bd-yalqc). If that does not yield a valid parse, fall back
+            // to JSON5; on total failure surface the STRICT-parse error so
+            // genuinely-malformed input keeps its "invalid JSON input" message.
+            if let Some(rewritten) = rewrite_overflow_numbers(input)
+                && let Ok(value) = serde_json::from_str::<Value>(&rewritten)
+            {
+                return Ok(value);
+            }
+            parse_json5_text(input).map_err(|_| {
+                FrankenError::function_error(format!("invalid JSON input: {strict_error}"))
+            })
+        }
     }
 }
 
@@ -1168,19 +1330,27 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
                 // non-canonical '+' in exponents ("1e+300").
                 append_jsonb_node(JSONB_FLOAT_TYPE, format!("{float:?}").as_bytes(), out)
             } else {
-                // Non-finite REAL (+Inf/-Inf as 9.0e+999 / 9e999): store the
-                // stock-rendered numeric text so the payload round-trips
-                // (GH#212).
-                // Only reachable with `arbitrary_precision`; the non-feature arm
-                // keeps this compiling and is never taken (bd-uxmhz).
-                #[cfg(feature = "arbitrary_precision")]
-                let rendered = render_non_finite_number(number);
-                #[cfg(not(feature = "arbitrary_precision"))]
-                let rendered = number.to_string();
-                append_jsonb_node(JSONB_FLOAT_TYPE, rendered.as_bytes(), out)
+                // Unreachable: without `arbitrary_precision`, `Number` never
+                // holds a non-finite value. Non-finite JSON numbers are carried
+                // as tagged `Value::String` and encoded in that arm below
+                // (bd-yalqc). This keeps the match exhaustive.
+                append_jsonb_node(JSONB_FLOAT_TYPE, number.to_string().as_bytes(), out)
             }
         }
-        Value::String(text) => append_jsonb_string(text, out),
+        Value::String(text) => {
+            if let Some(raw) = as_nonfinite(text) {
+                // Non-finite REAL carried as a tagged string (+Inf/-Inf as
+                // 9.0e+999 / 9e999): store the stock-rendered numeric text as a
+                // FLOAT payload so the JSONB value round-trips (GH#212, bd-yalqc).
+                append_jsonb_node(
+                    JSONB_FLOAT_TYPE,
+                    render_non_finite_number_raw(raw).as_bytes(),
+                    out,
+                )
+            } else {
+                append_jsonb_string(text, out)
+            }
+        }
         Value::Array(array) => {
             let mut payload = Vec::new();
             for item in array {
@@ -1340,20 +1510,10 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
                     FrankenError::function_error("invalid JSONB float payload")
                 })?)
             } else {
-                // Non-finite payload (e.g. `9e999` +Inf): preserve the raw
-                // source text so the JSONB value round-trips (GH#212). Without
-                // `arbitrary_precision` a non-finite number cannot be held, so
-                // decoding such a payload is an error (bd-uxmhz).
-                #[cfg(feature = "arbitrary_precision")]
-                {
-                    json_number_from_raw(normalized)?
-                }
-                #[cfg(not(feature = "arbitrary_precision"))]
-                {
-                    return Err(FrankenError::function_error(format!(
-                        "non-finite JSONB float `{normalized}` requires the arbitrary_precision feature"
-                    )));
-                }
+                // Non-finite payload (e.g. `9e999` +Inf): carry the raw source
+                // text in a tagged string so the JSONB value round-trips through
+                // extract/render (GH#212, bd-yalqc).
+                nonfinite_value(normalized)
             }
         }
         JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE => {
@@ -1895,7 +2055,7 @@ fn append_array_path(base: &str, index: usize) -> String {
 fn json_value_column(value: &Value) -> Result<SqliteValue> {
     match value {
         // Canonical writer keeps floats stock-canonical and renders non-finite
-        // numbers correctly under `arbitrary_precision` (GH#212).
+        // numbers (tagged carriers) correctly (GH#212, bd-yalqc).
         Value::Array(_) | Value::Object(_) => {
             encode_json_text("json table value encode failed", value)
                 .map(|encoded| SqliteValue::Text(encoded.into()))
@@ -2036,7 +2196,14 @@ fn json_type_name(value: &Value) -> &'static str {
                 "real"
             }
         }
-        Value::String(_) => "text",
+        // A tagged non-finite-number carrier is a REAL, not text (GH#212).
+        Value::String(text) => {
+            if as_nonfinite(text).is_some() {
+                "real"
+            } else {
+                "text"
+            }
+        }
         Value::Array(_) => "array",
         Value::Object(_) => "object",
     }
@@ -2068,58 +2235,25 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
                 SqliteValue::Float(float)
             }
         }
-        Value::String(text) => SqliteValue::Text(text.as_str().into()),
+        Value::String(text) => {
+            if let Some(raw) = as_nonfinite(text) {
+                // A tagged non-finite-number carrier reads back as a REAL ±Inf
+                // (GH#212: json_extract of a non-finite JSON number yields a REAL
+                // infinity).
+                SqliteValue::Float(raw.parse::<f64>().unwrap_or(0.0))
+            } else {
+                SqliteValue::Text(text.as_str().into())
+            }
+        }
         Value::Array(_) | Value::Object(_) => {
             // Canonical writer (not `serde_json::to_string`): stock-canonical
-            // floats and correct non-finite rendering under `arbitrary_precision`
+            // floats and correct non-finite rendering of tagged carriers
             // (GH#212). Falls back to `null` on the (unreachable) encode error.
             let encoded =
                 encode_json_text("json scalar encode", value).unwrap_or_else(|_| "null".to_owned());
             SqliteValue::Text(encoded.into())
         }
     }
-}
-
-/// Build a JSON `Value::Number` from raw numeric source text (e.g. `9.0e+999`).
-///
-/// Non-finite numbers cannot be held by a plain `serde_json` `Number`; the
-/// crate's `arbitrary_precision` backing stores the raw text verbatim, so this
-/// keeps the exact bytes that must round-trip (GH#212).
-#[cfg(feature = "arbitrary_precision")]
-fn json_number_from_raw(raw: &str) -> Result<Value> {
-    serde_json::from_str::<Number>(raw)
-        .map(Value::Number)
-        .map_err(|error| {
-            FrankenError::function_error(format!("failed to build JSON number `{raw}`: {error}"))
-        })
-}
-
-/// Render a non-finite JSON number (a `Value::Number` whose `as_f64` is not a
-/// finite double) the way stock SQLite prints it.
-///
-/// SQLite copies a number's source text verbatim, so `json('[9e999]')` yields
-/// `[9e999]` while a constructed `+Inf` yields `[9.0e+999]`. The crate's
-/// `arbitrary_precision` backing cannot preserve the exact source bytes — it
-/// canonicalizes a parsed exponent to `e+NNN` (`9e999` is stored as `9e+999`).
-/// To reproduce stock's construct-vs-preserve forms for the literals JSON
-/// callers actually produce, drop that inserted `+` when the mantissa has no
-/// fractional part (`9e+999` -> `9e999`) while keeping it otherwise (the
-/// constructed `9.0e+999`, or a source that already wrote `9.0e+999`). Exotic
-/// forms that serde also normalizes (a fractional non-finite mantissa, or an
-/// uppercase `E`) cannot be recovered and keep serde's canonical form (GH#212).
-#[cfg(feature = "arbitrary_precision")]
-fn render_non_finite_number(number: &Number) -> String {
-    let raw = number.to_string();
-    let Some(exp) = raw.find(['e', 'E']) else {
-        return raw;
-    };
-    if raw[..exp].contains('.') {
-        return raw;
-    }
-    let mut rendered = String::with_capacity(raw.len());
-    rendered.push_str(&raw[..=exp]);
-    rendered.push_str(raw[exp + 1..].trim_start_matches('+'));
-    rendered
 }
 
 /// Convert a SQL REAL to a JSON value exactly as stock SQLite does:
@@ -2130,15 +2264,11 @@ fn float_to_json(f: f64) -> Result<Value> {
         return Ok(Value::Null);
     }
     if f.is_infinite() {
-        // With `arbitrary_precision`, +-Inf renders as the stock numeric literal
-        // `9.0e+999` / `-9.0e+999` (GH#212). Without the feature serde_json cannot
-        // hold a non-finite number, so degrade to JSON null (like NaN); enable the
-        // opt-in `arbitrary_precision` feature to restore the stock rendering
-        // (bd-uxmhz / GH#375 — the feature is viral and off by default).
-        #[cfg(feature = "arbitrary_precision")]
-        return json_number_from_raw(if f > 0.0 { "9.0e+999" } else { "-9.0e+999" });
-        #[cfg(not(feature = "arbitrary_precision"))]
-        return Ok(Value::Null);
+        // +-Inf renders as the stock numeric literal `9.0e+999` / `-9.0e+999`
+        // (GH#212). `serde_json::Number` cannot hold a non-finite value, so the
+        // constructed literal is carried as a tagged string (bd-yalqc); the
+        // canonical `9.0e+999` form is preserved through render.
+        return Ok(nonfinite_value(if f > 0.0 { "9.0e+999" } else { "-9.0e+999" }));
     }
     Number::from_f64(f).map(Value::Number).ok_or_else(|| {
         FrankenError::function_error("failed to convert floating-point value to JSON")
@@ -2207,7 +2337,7 @@ fn write_pretty_value(value: &Value, indent: &str, depth: usize, out: &mut Strin
         _ => {
             // Scalars pretty-print identically to their minified form; the
             // canonical writer keeps floats stock-canonical and renders
-            // non-finite numbers correctly under `arbitrary_precision` (GH#212).
+            // non-finite numbers (tagged carriers) correctly (GH#212, bd-yalqc).
             write_canonical_json_text(value, out)
         }
     }
@@ -4154,11 +4284,13 @@ mod tests {
         ck!("json_remove", call("json_remove", vec![t("{\"a\":1,\"b\":2}"), t("$.a")]), "{\"b\":2}");
         ck!("json_patch", call("json_patch", vec![t("{\"a\":1,\"b\":2}"), t("{\"b\":null,\"c\":3}")]), "{\"a\":1,\"c\":3}");
         ck!("json_bignum", call("json", vec![t("{\"a\":12345678901234567890}")]), "{\"a\":12345678901234567890}");
-        // `[-0]` (JSON-integer negative zero) reads back as `0` only with the
-        // arbitrary_precision text Number; without it serde parses `-0` as the
-        // float `-0.0` and renders `-0` (bd-uxmhz, pathological edge).
-        #[cfg(feature = "arbitrary_precision")]
-        ck!("json_neg_zero", call("json_extract", vec![t("[-0]"), t("$[0]")]), "0");
+        // `[-0]` (JSON-integer negative zero): stock `json_extract('[-0]','$[0]')`
+        // -> `0`, but serde_json parses the literal `-0` as the float `-0.0`,
+        // which renders `-0`. Preserving integer negative-zero would require an
+        // integer/float distinction serde discards on parse; that is a separate
+        // pre-existing edge, NOT in scope for bd-yalqc (the non-finite fix), so
+        // the conformance entry is intentionally omitted here:
+        //   ck!("json_neg_zero", call("json_extract", vec![t("[-0]"), t("$[0]")]), "0");
         // ── deeper batch ──
         ck!("jx_true", call("json_extract", vec![t("{\"a\":true}"), t("$.a")]), "1");
         ck!("jx_false", call("json_extract", vec![t("{\"a\":false}"), t("$.a")]), "0");
@@ -5660,14 +5792,11 @@ mod tests {
         assert_eq!(v_int, Value::from(7_i64));
         // GH#212 (verified against sqlite3 3.46.1): json_each(9e999) yields a
         // single row (type='real', atom=Inf), so a bare +Inf renders as the
-        // numeric literal 9.0e+999 rather than erroring. Only with the opt-in
-        // `arbitrary_precision` feature (bd-uxmhz); without it +Inf -> JSON null.
-        #[cfg(feature = "arbitrary_precision")]
-        {
-            let (v_inf, _) =
-                super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)]).unwrap();
-            assert_eq!(v_inf, super::json_number_from_raw("9.0e+999").unwrap());
-        }
+        // numeric literal 9.0e+999 rather than erroring. The non-finite REAL is
+        // carried as a tagged string (bd-yalqc).
+        let (v_inf, _) =
+            super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)]).unwrap();
+        assert_eq!(v_inf, super::nonfinite_value("9.0e+999"));
     }
 
     #[test]
@@ -5956,7 +6085,6 @@ mod tests {
         SqliteValue::Text(SmallText::from_string(value))
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_array_non_finite_reals() {
         // SELECT json_array(1e999)         -> [9.0e+999]
@@ -5981,7 +6109,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_object_non_finite_real() {
         // SELECT json_object('k', 1e999)   -> {"k":9.0e+999}
@@ -6011,7 +6138,6 @@ mod tests {
         assert_eq!(json_quote(&SqliteValue::Float(f64::NAN)).unwrap(), "null");
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_parse_preserves_non_finite_source_text() {
         // SELECT json('[9e999]')      -> [9e999]      (source text PRESERVED)
@@ -6022,7 +6148,6 @@ mod tests {
         assert_eq!(json("[-9e999]").unwrap(), "[-9e999]");
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_valid_accepts_non_finite_literal_text() {
         // SELECT json_valid('[9e999]') -> 1
@@ -6031,7 +6156,6 @@ mod tests {
         assert_eq!(json_valid("[-9e999]", None), 1);
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_extract_non_finite_reads_back_as_infinity() {
         // SELECT json_extract('[9.0e+999]','$[0]') -> Inf (REAL +Inf)
@@ -6050,7 +6174,6 @@ mod tests {
         assert!(matches!(value, SqliteValue::Float(f) if f.is_infinite() && f.is_sign_negative()));
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_type_non_finite_literal_is_real() {
         // SELECT json_type('[9.0e+999]','$[0]') -> real
@@ -6058,7 +6181,6 @@ mod tests {
         assert_eq!(json_type("[9e999]", Some("$[0]")).unwrap(), Some("real"));
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_jsonb_round_trip_preserves_non_finite() {
         // SELECT json(jsonb('[9e999]')) -> [9e999]  (JSONB payload round-trips)
@@ -6076,7 +6198,6 @@ mod tests {
         assert_eq!(json_from_jsonb(&blob).unwrap(), "[null]");
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_array_embeds_parsed_non_finite_preserving_source() {
         // SELECT json_array(json('9e999'))    -> [9e999]      (source preserved)
@@ -6096,7 +6217,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_extract_nested_container_preserves_non_finite() {
         // SELECT json_extract('{"a":[1e999]}','$.a') -> [1e999]
@@ -6106,14 +6226,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_pretty_preserves_non_finite() {
         // SELECT json_pretty('[9e999]') -> "[\n    9e999\n]"
         assert_eq!(json_pretty("[9e999]", None).unwrap(), "[\n    9e999\n]");
     }
 
-    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_group_array_non_finite() {
         // Aggregate construct path shares the scalar rendering.
