@@ -3617,7 +3617,13 @@ fn format_sci_round_half_away(val: f64, prec: usize, upper: bool) -> String {
 }
 
 /// Format a float using `%g`/`%G` semantics.
-fn format_float_g(val: f64, sig: usize, upper: bool, alt_form: bool, max_sig: usize) -> String {
+pub(crate) fn format_float_g(
+    val: f64,
+    sig: usize,
+    upper: bool,
+    alt_form: bool,
+    max_sig: usize,
+) -> String {
     if !val.is_finite() {
         return format!("{val}");
     }

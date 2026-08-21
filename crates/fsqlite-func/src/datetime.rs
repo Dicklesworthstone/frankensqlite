@@ -1080,14 +1080,13 @@ fn format_strftime(
             }
             'j' => push_zero_padded_3(&mut result, doy),
             'J' => {
-                // C SQLite uses %.15g which strips trailing zeros.
-                push_format(&mut result, format_args!("{jdn:.15}"));
-                while result.as_bytes().last() == Some(&b'0') {
-                    result.pop();
-                }
-                if result.as_bytes().last() == Some(&b'.') {
-                    result.pop();
-                }
+                // Julian day number. Stock renders %J as C `%.16g`: 16
+                // significant figures, trailing zeros stripped (so an integer
+                // JDN has no ".0"). The previous fixed `{:.15}` emitted 15
+                // decimal *places* (≈22 significant digits); the general
+                // REAL->text form over-renders (17 figs) and keeps ".0".
+                // bd-565ji.
+                result.push_str(&crate::builtins::format_float_g(jdn, 16, false, false, 16));
             }
             'k' => {
                 // Space-padded 24-hour.

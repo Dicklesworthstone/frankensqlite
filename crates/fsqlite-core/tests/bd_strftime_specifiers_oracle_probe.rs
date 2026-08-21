@@ -53,9 +53,7 @@ fn strftime_specifiers_match_rusqlite_oracle() {
         // Every documented SQLite specifier + a batch stock leaves literal /
         // undefined, each isolated so one bad specifier can't mask another.
         let specs = [
-            // NOTE: %J omitted here — its trailing-precision divergence is a
-            // separate float-format issue tracked in bd-565ji.
-            "%d", "%e", "%f", "%F", "%G", "%g", "%H", "%I", "%j", "%k",
+            "%d", "%e", "%f", "%F", "%G", "%g", "%H", "%I", "%j", "%J", "%k",
             "%l", "%m", "%M", "%n", "%p", "%P", "%R", "%s", "%S", "%t", "%T",
             "%u", "%U", "%V", "%w", "%W", "%Y", "%%",
             // not defined by SQLite strftime — must behave identically on both
@@ -80,6 +78,11 @@ fn strftime_specifiers_match_rusqlite_oracle() {
             ("%p %P %I %l", "2024-03-05 12:00:00"),
             ("%H %k", "2024-03-05 07:00:00"),
             ("%e %F %T %R", "2024-03-05 07:08:09"),
+            // bd-565ji: %J (Julian day) rendered with canonical float precision
+            ("%J", "2024-03-05 09:07:05.5"),
+            ("%J", "2024-06-15 12:00:00"),
+            ("%J", "2024-01-01 00:00:00"),
+            ("%J", "1970-01-01 00:00:00.123"),
         ] {
             let sql = format!("SELECT strftime('{spec}', '{t}')");
             let fv = fval(&f, &sql).await;
