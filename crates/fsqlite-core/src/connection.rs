@@ -50593,10 +50593,11 @@ impl Connection {
         if let Some(rowid) = Self::coerce_integral_rowid_value(value) {
             Ok(Some(rowid))
         } else {
-            Err(FrankenError::TypeMismatch {
-                expected: "INTEGER PRIMARY KEY rowid".to_owned(),
-                actual: value.typeof_str().to_owned(),
-            })
+            // Stock SQLite reports a non-integral explicit rowid / INTEGER
+            // PRIMARY KEY value as the bare "datatype mismatch" (SQLITE_MISMATCH),
+            // not a verbose "type mismatch: expected ..." string. Match it, via
+            // the same FunctionError channel as limit_datatype_mismatch().
+            Err(FrankenError::FunctionError("datatype mismatch".to_owned()))
         }
     }
 
