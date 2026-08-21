@@ -120598,6 +120598,9 @@ pub(crate) fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
         }
         CodegenError::AmbiguousColumn(name) => FrankenError::AmbiguousColumn { name },
         CodegenError::Unsupported(msg) => FrankenError::NotImplemented(msg),
+        // A genuine SQL error (e.g. INSERT column/value count mismatch) is
+        // reported verbatim under SQLITE_ERROR, not "not implemented:". bd-6mj9n.
+        CodegenError::SqlError(msg) => FrankenError::FunctionError(msg),
     }
 }
 
@@ -120607,6 +120610,7 @@ fn create_index_bind_error_to_franken(error: CodegenError) -> FrankenError {
         CodegenError::ColumnNotFound { column, .. } => FrankenError::NoSuchColumn { name: column },
         CodegenError::AmbiguousColumn(name) => FrankenError::AmbiguousColumn { name },
         CodegenError::Unsupported(message) => FrankenError::FunctionError(message),
+        CodegenError::SqlError(message) => FrankenError::FunctionError(message),
     }
 }
 

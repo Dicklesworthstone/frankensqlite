@@ -2242,6 +2242,11 @@ pub enum CodegenError {
     AmbiguousColumn(String),
     /// Unsupported AST construct for this codegen pass.
     Unsupported(String),
+    /// A genuine SQL statement error (e.g. an INSERT column/value count
+    /// mismatch) that stock SQLite reports VERBATIM under SQLITE_ERROR — not an
+    /// unsupported feature. Both codegen-error mappers surface it via
+    /// `FunctionError` (no "not implemented: " prefix).
+    SqlError(String),
 }
 
 impl std::fmt::Display for CodegenError {
@@ -2253,6 +2258,7 @@ impl std::fmt::Display for CodegenError {
             }
             Self::AmbiguousColumn(name) => write!(f, "ambiguous column name: {name}"),
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            Self::SqlError(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -20166,11 +20172,10 @@ fn codegen_insert_values(
                 n_source_cols
             )
         } else {
-            format!(
-                "INSERT target list has {expected_source_cols} columns but {n_source_cols} values were supplied"
-            )
+            // An explicit target column list uses stock's shorter form.
+            format!("{n_source_cols} values for {expected_source_cols} columns")
         };
-        return Err(CodegenError::Unsupported(message));
+        return Err(CodegenError::SqlError(message));
     }
 
     let rowid_reg = b.alloc_reg();
@@ -21018,7 +21023,7 @@ fn codegen_insert_select(
     if let Some(expected) = expected_cols
         && n_cols_usize != expected
     {
-        return Err(CodegenError::Unsupported(format!(
+        return Err(CodegenError::SqlError(format!(
             "table {} has {} columns but {} values were supplied",
             target_table.name, expected, n_cols_usize
         )));
@@ -21298,7 +21303,7 @@ fn codegen_insert_select_without_from(
     if let Some(expected) = expected_cols
         && n_cols_usize != expected
     {
-        return Err(CodegenError::Unsupported(format!(
+        return Err(CodegenError::SqlError(format!(
             "table {} has {} columns but {} values were supplied",
             target_table.name, expected, n_cols_usize
         )));
