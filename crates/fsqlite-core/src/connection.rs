@@ -127813,10 +127813,9 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                 if let Some(width) = rows.first().map(Vec::len)
                     && rows.iter().any(|row| row.len() != width)
                 {
-                    return Err(FrankenError::ParseError {
-                        offset: 0,
-                        detail: "all VALUES must have the same number of terms".to_owned(),
-                    });
+                    return Err(FrankenError::FunctionError(
+                        "all VALUES must have the same number of terms".to_owned(),
+                    ));
                 }
             }
             SelectCore::Select { columns, from, .. } => {
@@ -128538,10 +128537,9 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             SelectCore::Values(rows) => {
                 let width = rows.first().map_or(0, Vec::len);
                 if rows.iter().any(|row| row.len() != width) {
-                    return Err(FrankenError::ParseError {
-                        offset: 0,
-                        detail: "all VALUES must have the same number of terms".to_owned(),
-                    });
+                    return Err(FrankenError::FunctionError(
+                        "all VALUES must have the same number of terms".to_owned(),
+                    ));
                 }
                 Ok(SelectResultColumnMetadata {
                     names: (1..=width)
@@ -129268,10 +129266,9 @@ impl<'a> SelectStructureResolver<'a> {
             && let Some(width) = rows.first().map(Vec::len)
             && rows.iter().any(|row| row.len() != width)
         {
-            return Err(FrankenError::ParseError {
-                offset: 0,
-                detail: "all VALUES must have the same number of terms".to_owned(),
-            });
+            return Err(FrankenError::FunctionError(
+                "all VALUES must have the same number of terms".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -129286,10 +129283,9 @@ impl<'a> SelectStructureResolver<'a> {
                 if let Some(width) = rows.first().map(Vec::len)
                     && rows.iter().any(|row| row.len() != width)
                 {
-                    return Err(FrankenError::ParseError {
-                        offset: 0,
-                        detail: "all VALUES must have the same number of terms".to_owned(),
-                    });
+                    return Err(FrankenError::FunctionError(
+                        "all VALUES must have the same number of terms".to_owned(),
+                    ));
                 }
                 for row in rows.iter().rev() {
                     for expr in row {

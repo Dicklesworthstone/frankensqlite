@@ -20186,8 +20186,8 @@ fn codegen_insert_values(
 
     for (row_index, row_values) in rows.iter().enumerate() {
         if row_values.len() != n_source_cols {
-            return Err(CodegenError::Unsupported(
-                "VALUES rows must have the same arity".to_owned(),
+            return Err(CodegenError::SqlError(
+                "all VALUES must have the same number of terms".to_owned(),
             ));
         }
 
@@ -25042,8 +25042,8 @@ fn codegen_insert_without_rowid(
             let mapped_regs = target_mapping.as_ref().map(|_| b.alloc_regs(n_cols as i32));
             for row_values in rows {
                 if row_values.len() != n_source_cols {
-                    return Err(CodegenError::Unsupported(
-                        "VALUES rows must have the same arity".to_owned(),
+                    return Err(CodegenError::SqlError(
+                        "all VALUES must have the same number of terms".to_owned(),
                     ));
                 }
                 for (i, val_expr) in row_values.iter().enumerate() {
