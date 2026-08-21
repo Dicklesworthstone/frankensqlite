@@ -59492,15 +59492,17 @@ impl Connection {
                     .map(std::string::ToString::to_string);
                 let strict_type = if table.strict {
                     let type_decl = type_name.as_deref().ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "STRICT table {} column {} must declare a type",
-                            table.name, col_def.name
+                        // Stock wraps the CREATE-time datatype error in "error in
+                        // table <t> after add column: ..." under SQLITE_ERROR.
+                        FrankenError::FunctionError(format!(
+                            "error in table {} after add column: missing datatype for {}.{}",
+                            table.name, table.name, col_def.name
                         ))
                     })?;
                     Some(StrictColumnType::from_type_name(type_decl).ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "STRICT table {} column {} has invalid type {}",
-                            table.name, col_def.name, type_decl
+                        FrankenError::FunctionError(format!(
+                            "error in table {} after add column: unknown datatype for {}.{}: \"{}\"",
+                            table.name, table.name, col_def.name, type_decl
                         ))
                     })?)
                 } else {
