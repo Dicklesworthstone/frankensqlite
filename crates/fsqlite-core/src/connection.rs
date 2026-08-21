@@ -448,6 +448,61 @@ std::thread_local! {
     static FSQLITE_PRAGMA_DISPATCH_ATTEMPTS: Cell<u64> = const { Cell::new(0) };
 }
 
+// bd-ttof2 (item c): SQLite appends " in <SQL> at offset N" to prepare/analysis
+// errors (no-such-column, no-such-function, ambiguous-column,
+// misuse-of-aggregate, table-already-exists, …), where N is the 0-based byte
+// offset of the offending token in the SQL text. This mirrors sqlite3's
+// per-parse `errByteOffset`: a resolution site records the offending AST node's
+// span start here immediately before returning an offset-eligible SQLITE_ERROR,
+// and the outermost query/execute boundary (which still holds the raw SQL text)
+// reads it and appends the suffix to the final wire message — leaving the
+// internal error VARIANT intact so in-engine matching (DQS retry, etc.) is
+// unaffected. Cleared at the start of each statement batch so a stale offset can
+// never attach to an unrelated error.
+std::thread_local! {
+    static ERROR_BYTE_OFFSET: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// Drop any recorded error byte offset. Called at the start of a statement
+/// batch and whenever a result is finalized successfully. bd-ttof2.
+fn clear_error_byte_offset() {
+    ERROR_BYTE_OFFSET.set(None);
+}
+
+/// Record the byte offset of the token an about-to-be-returned analysis error
+/// refers to (the offending AST node's `span.start`). Call immediately before
+/// `return Err(...)` for an offset-eligible SQLITE_ERROR. bd-ttof2.
+fn set_error_byte_offset(offset: u32) {
+    ERROR_BYTE_OFFSET.set(Some(offset));
+}
+
+fn take_error_byte_offset() -> Option<u32> {
+    ERROR_BYTE_OFFSET.replace(None)
+}
+
+/// Append SQLite's " in <SQL> at offset N" suffix to `result`'s error when a
+/// resolution site recorded a byte offset for it. Only rewrites SQLITE_ERROR-
+/// class errors (all offset-eligible analysis errors share that code), wrapping
+/// the verbatim base message in `FunctionError` (same code, `{0}` Display) so
+/// the wire message matches stock exactly. On success it just clears the
+/// channel. bd-ttof2.
+fn attach_error_byte_offset_suffix<T>(result: Result<T>, sql: &str) -> Result<T> {
+    match result {
+        Ok(value) => {
+            clear_error_byte_offset();
+            Ok(value)
+        }
+        Err(error) => match take_error_byte_offset() {
+            Some(offset) if matches!(error.error_code(), ErrorCode::Error) => {
+                Err(FrankenError::FunctionError(format!(
+                    "{error} in {sql} at offset {offset}"
+                )))
+            }
+            _ => Err(error),
+        },
+    }
+}
+
 #[cfg(test)]
 fn arm_pragma_dispatch_error_once(error: FrankenError) {
     FSQLITE_PRAGMA_DISPATCH_ATTEMPTS.set(0);
@@ -23953,32 +24008,40 @@ impl Connection {
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
         let rewritten = self.dqs_proactive_rewrite(sql);
         let sql = rewritten.as_ref();
-        let first = match self.query_impl(sql).await {
-            Ok(v) => return Ok(v),
-            Err(e) => e,
-        };
-        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
-            return Err(first);
-        }
-        let mut rewritten = HashSet::new();
-        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
-            Some(s) => s,
-            None => return Err(first),
-        };
-        loop {
-            match self.query_impl(&cur).await {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
-                        Some(s) => s,
-                        None => return Err(e),
-                    };
+        // Run the (possibly DQS-retried) query, then, at this outermost boundary
+        // where the raw SQL text is still in scope, append SQLite's
+        // " in <SQL> at offset N" suffix if a resolution site recorded a byte
+        // offset for the final error. bd-ttof2.
+        let outcome = 'dqs: {
+            let first = match self.query_impl(sql).await {
+                Ok(v) => break 'dqs Ok(v),
+                Err(e) => e,
+            };
+            if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+                break 'dqs Err(first);
+            }
+            let mut rewritten = HashSet::new();
+            let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+                Some(s) => s,
+                None => break 'dqs Err(first),
+            };
+            loop {
+                match self.query_impl(&cur).await {
+                    Ok(v) => break 'dqs Ok(v),
+                    Err(e) => {
+                        cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                            Some(s) => s,
+                            None => break 'dqs Err(e),
+                        };
+                    }
                 }
             }
-        }
+        };
+        attach_error_byte_offset_suffix(outcome, sql)
     }
 
     async fn query_impl(&self, sql: &str) -> Result<Vec<Row>> {
+        clear_error_byte_offset();
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -24210,32 +24273,38 @@ impl Connection {
     pub async fn execute(&self, sql: &str) -> Result<usize> {
         let rewritten = self.dqs_proactive_rewrite(sql);
         let sql = rewritten.as_ref();
-        let first = match self.execute_impl(sql).await {
-            Ok(v) => return Ok(v),
-            Err(e) => e,
-        };
-        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
-            return Err(first);
-        }
-        let mut rewritten = HashSet::new();
-        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
-            Some(s) => s,
-            None => return Err(first),
-        };
-        loop {
-            match self.execute_impl(&cur).await {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
-                        Some(s) => s,
-                        None => return Err(e),
-                    };
+        // See `query`: append SQLite's " in <SQL> at offset N" suffix at this
+        // outermost boundary where the raw SQL text is still in scope. bd-ttof2.
+        let outcome = 'dqs: {
+            let first = match self.execute_impl(sql).await {
+                Ok(v) => break 'dqs Ok(v),
+                Err(e) => e,
+            };
+            if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+                break 'dqs Err(first);
+            }
+            let mut rewritten = HashSet::new();
+            let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+                Some(s) => s,
+                None => break 'dqs Err(first),
+            };
+            loop {
+                match self.execute_impl(&cur).await {
+                    Ok(v) => break 'dqs Ok(v),
+                    Err(e) => {
+                        cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                            Some(s) => s,
+                            None => break 'dqs Err(e),
+                        };
+                    }
                 }
             }
-        }
+        };
+        attach_error_byte_offset_suffix(outcome, sql)
     }
 
     async fn execute_impl(&self, sql: &str) -> Result<usize> {
+        clear_error_byte_offset();
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -94708,9 +94777,21 @@ fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {
     // or window nested inside a subquery is its own scope and not flagged).
     if let Some(w) = where_clause {
         if expr_has_aggregate(w) {
-            return Err(FrankenError::FunctionError(
-                "misuse of aggregate: ".to_owned(),
-            ));
+            // Stock names the offending aggregate and carries its byte offset,
+            // with two spellings: "misuse of aggregate: NAME()" when the SELECT
+            // is itself an aggregate query, else "misuse of aggregate function
+            // NAME()". bd-ttof2.
+            let message = if let Some((name, span)) = rightmost_bare_aggregate_name_span(w) {
+                set_error_byte_offset(span.start);
+                if select_core_is_aggregate(core) {
+                    format!("misuse of aggregate: {name}()")
+                } else {
+                    format!("misuse of aggregate function {name}()")
+                }
+            } else {
+                "misuse of aggregate: ".to_owned()
+            };
+            return Err(FrankenError::FunctionError(message));
         }
         if expr_has_window_function(w) {
             return Err(FrankenError::FunctionError(
@@ -94886,18 +94967,26 @@ fn collect_aggregate_kind_names_from_args(args: &FunctionArgs, out: &mut BTreeSe
 /// when there is no bare aggregate, so the caller falls back to the bare
 /// "misuse of aggregate: " text.
 fn rightmost_bare_aggregate_name(expr: &Expr) -> Option<String> {
+    rightmost_bare_aggregate_name_span(expr).map(|(name, _)| name)
+}
+
+/// Like [`rightmost_bare_aggregate_name`] but also returns the offending call's
+/// source span, so a "misuse of aggregate" error can carry SQLite's byte offset
+/// (` in <SQL> at offset N`). bd-ttof2.
+fn rightmost_bare_aggregate_name_span(expr: &Expr) -> Option<(String, Span)> {
     let mut names = Vec::new();
     collect_bare_aggregate_names_ordered(expr, &mut names);
     names.pop()
 }
 
-fn collect_bare_aggregate_names_ordered(expr: &Expr, out: &mut Vec<String>) {
+fn collect_bare_aggregate_names_ordered(expr: &Expr, out: &mut Vec<(String, Span)>) {
     match expr {
         Expr::FunctionCall {
             name,
             args,
             filter,
             over,
+            span,
             ..
         } => {
             // Traverse arguments (and any FILTER) left-to-right first, then
@@ -94912,7 +95001,7 @@ fn collect_bare_aggregate_names_ordered(expr: &Expr, out: &mut Vec<String>) {
                 collect_bare_aggregate_names_ordered(filter, out);
             }
             if over.is_none() && is_agg_fn(name) && !is_scalar_max_min(name, args) {
-                out.push(name.to_ascii_lowercase());
+                out.push((name.to_ascii_lowercase(), *span));
             }
         }
         Expr::BinaryOp { left, right, .. } => {

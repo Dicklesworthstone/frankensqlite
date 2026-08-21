@@ -4,11 +4,12 @@
 //! expected string so a regression (e.g. an `Internal("internal error: …")`
 //! wrapping, or reworded text) is caught.
 //!
-//! Scope note (bd-ttof2): NOT asserted here — cases where stock appends
-//! " in <SQL> at offset N" (no-such-column in SELECT, no-such-function,
-//! wrong-arg-count, ambiguous-column, table-already-exists), and the open bugs
-//! (INTEGER-PK dup wording, INSERT column-count `not implemented:` prefix,
-//! aggregate-in-WHERE not rejected). Those are tracked in bd-ttof2.
+//! Scope note (bd-ttof2): the " in <SQL> at offset N" suffix feature has begun
+//! — aggregate-in-WHERE misuse is asserted verbatim below (name + two spellings
+//! + offset). Still NOT asserted (suffix not yet wired at those sites):
+//! no-such-column in SELECT, no-such-function, wrong-arg-count, ambiguous-column,
+//! table-already-exists; plus the open bugs (INTEGER-PK dup wording, INSERT
+//! column-count `not implemented:` prefix). Those are tracked in bd-ttof2.
 
 use fsqlite_core::connection::Connection;
 
@@ -20,6 +21,21 @@ async fn err_is(setup: &[&str], sql: &str, expected: &str) {
         let _ = f.execute(s).await;
     }
     match f.execute(sql).await {
+        Ok(_) => panic!("expected an error for `{sql}`, but it succeeded"),
+        Err(e) => assert_eq!(e.to_string(), expected, "sql=`{sql}`"),
+    }
+}
+
+/// Like [`err_is`] but drives `query` (the row-returning path). SELECT analysis
+/// errors are asserted through `query`, since `execute` of a SELECT currently
+/// discards rows via a fast path that can bypass some prepare-time validation
+/// (tracked separately in bd-ttof2).
+async fn query_err_is(setup: &[&str], sql: &str, expected: &str) {
+    let f = Connection::open(":memory:").await.unwrap();
+    for s in setup {
+        let _ = f.execute(s).await;
+    }
+    match f.query(sql).await {
         Ok(_) => panic!("expected an error for `{sql}`, but it succeeded"),
         Err(e) => assert_eq!(e.to_string(), expected, "sql=`{sql}`"),
     }
@@ -90,5 +106,29 @@ fn view_modify_errors() {
         err_is(setup, "INSERT INTO v VALUES (1)", "cannot modify v because it is a view").await;
         err_is(setup, "DELETE FROM v", "cannot modify v because it is a view").await;
         err_is(setup, "UPDATE v SET x = 1", "cannot modify v because it is a view").await;
+    });
+}
+
+#[test]
+fn aggregate_in_where_misuse_offset() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-ttof2 (offset-suffix feature, first slice): an aggregate in WHERE
+        // now (a) names the offending aggregate, (b) uses stock's two spellings
+        // ("misuse of aggregate: NAME()" when the SELECT is itself an aggregate
+        // query, else "misuse of aggregate function NAME()"), and (c) carries
+        // SQLite's " in <SQL> at offset N" suffix — N is the byte offset of the
+        // offending call (the rightmost aggregate, per stock). Was the bare,
+        // offsetless "misuse of aggregate: ".
+        let t: &[&str] = &["CREATE TABLE t(x INT)"];
+        query_err_is(t, "SELECT max(x) FROM t WHERE max(x) > 0",
+               "misuse of aggregate: max() in SELECT max(x) FROM t WHERE max(x) > 0 at offset 27").await;
+        query_err_is(t, "SELECT * FROM t WHERE sum(x) > 0",
+               "misuse of aggregate function sum() in SELECT * FROM t WHERE sum(x) > 0 at offset 22").await;
+        // offset points at the aggregate even when it is not the leading token
+        query_err_is(t, "SELECT * FROM t WHERE x > sum(x)",
+               "misuse of aggregate function sum() in SELECT * FROM t WHERE x > sum(x) at offset 26").await;
+        // two aggregates: stock names (and offsets) the RIGHTMOST
+        query_err_is(t, "SELECT * FROM t WHERE sum(x) + count(*) > 0",
+               "misuse of aggregate function count() in SELECT * FROM t WHERE sum(x) + count(*) > 0 at offset 31").await;
     });
 }
