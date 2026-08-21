@@ -175,7 +175,8 @@ use fsqlite_vdbe::codegen::{
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
     SelectPlannerDirective, TableSchema, bind_explicit_index, codegen_delete, codegen_insert,
     codegen_select, codegen_update, emit_backfill_column_read, emit_backfill_key_expr,
-    emit_scan_filter, without_rowid_pk_indices,
+    clear_column_error_offset, emit_scan_filter, take_column_error_offset,
+    without_rowid_pk_indices,
 };
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
@@ -467,6 +468,10 @@ std::thread_local! {
 /// batch and whenever a result is finalized successfully. bd-ttof2.
 fn clear_error_byte_offset() {
     ERROR_BYTE_OFFSET.set(None);
+    // Also drop any stale codegen column-error offset (bd-ttof2): it is set only
+    // on a resolution failure and normally consumed at codegen_error_to_franken,
+    // but a codegen path that catches+retries a ColumnNotFound could leave it set.
+    clear_column_error_offset();
 }
 
 /// Record the byte offset of the token an about-to-be-returned analysis error
@@ -33471,8 +33476,10 @@ impl Connection {
                 // (for example via trigger RAISE(ROLLBACK)). In that case,
                 // the outer rollback has already restored connection state.
                 if self.active_txn.borrow().is_none() {
+                    eprintln!("BD01QA9 wrapper: active_txn None at rollback -> early return");
                     return Err(statement_error);
                 }
+                eprintln!("BD01QA9 wrapper: ROLLBACK-to-savepoint path (purpose={purpose})");
 
                 let mut cleanup_errors = Vec::new();
                 let mut pager_rollback_succeeded = false;
@@ -34050,9 +34057,16 @@ impl Connection {
     }
 
     fn should_use_statement_savepoint(&self, was_auto: bool) -> bool {
-        self.active_txn_is_open_or_borrowed()
+        let r = self.active_txn_is_open_or_borrowed()
             && self.internal_statement_savepoint_depth.get() == 0
-            && (!was_auto || self.retained_autocommit_batch_active())
+            && (!was_auto || self.retained_autocommit_batch_active());
+        eprintln!(
+            "BD01QA9 should_use_sp: {r} (was_auto={was_auto} active_txn={} depth={} retained={})",
+            self.active_txn_is_open_or_borrowed(),
+            self.internal_statement_savepoint_depth.get(),
+            self.retained_autocommit_batch_active()
+        );
+        r
     }
 
     /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
@@ -35867,22 +35881,9 @@ impl Connection {
                     }
                 }
                 if !is_live_vtab
+                    && (has_before_insert || has_after_insert || self.fk_enforcement_enabled())
                     && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
                     && rows.len() > 1
-                    && (has_before_insert
-                        || has_after_insert
-                        || self.fk_enforcement_enabled()
-                        // bd-01qa9: a multi-row VALUES INSERT that violates a
-                        // constraint on a later row must, under ABORT (the
-                        // default) and OR ABORT, undo the rows it already
-                        // inserted — statement atomicity. The bulk VDBE program
-                        // below leaves the earlier rows behind (it behaves like
-                        // OR FAIL), so route small multi-row VALUES through the
-                        // savepoint-wrapped materialized replay, which rolls the
-                        // statement back correctly (verified equivalent to the
-                        // INSERT ... SELECT replay path). Large bulk (>= the
-                        // morsel threshold) keeps its dedicated fast path.
-                        || rows.len() < MORSEL_INSERT_THRESHOLD)
                 {
                     self.log_mem_execution_fallback(
                         "insert_values",
@@ -54813,6 +54814,10 @@ impl Connection {
         }
 
         let is_concurrent_txn = self.concurrent_txn.get();
+        eprintln!(
+            "BD01QA9 resolve: ok={ok} retained_active={} is_concurrent={is_concurrent_txn} pending_writes={txn_has_pending_writes}",
+            self.retained_autocommit_batch_active()
+        );
         // bd-m1nte / I2: On error with an active retained batch, flush immediately
         // to commit prior good writes and reset the batch. This prevents error
         // cascades from accumulating in a single oversized transaction.
@@ -54822,6 +54827,7 @@ impl Connection {
             && txn_has_pending_writes
             && self.live_vtab_transactions.borrow().is_empty()
         {
+            eprintln!("BD01QA9 resolve: HIT !ok retained-batch flush (commits partial)");
             *self.retained_autocommit_txn.borrow_mut() = Some(txn);
             self.concurrent_txn.set(false);
             self.end_concurrent_rowid_session();
@@ -57716,6 +57722,21 @@ impl Connection {
                             return Err(FrankenError::FunctionError(message));
                         }
                         let collation = column_def_declared_collation(col);
+                        // Stock rejects an unknown COLLATE name at CREATE TABLE
+                        // with "no such collation sequence: <name>"; builtins
+                        // (BINARY/NOCASE/RTRIM) and registered collations pass.
+                        if let Some(collation_name) = collation.as_deref()
+                            && self
+                                .collation_registry
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .find(collation_name)
+                                .is_none()
+                        {
+                            return Err(FrankenError::function_error(format!(
+                                "no such collation sequence: {collation_name}"
+                            )));
+                        }
                         // Per-constraint ON CONFLICT for the column. For the
                         // INTEGER PRIMARY KEY (rowid) the PRIMARY KEY clause
                         // governs the table-row insert; for other columns the
@@ -121019,9 +121040,19 @@ pub(crate) fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
             FrankenError::FunctionError(format!("no such table: {name}"))
         }
         CodegenError::ColumnNotFound { column, .. } => {
+            // bd-ttof2: carry SQLite's " in <SQL> at offset N" suffix when the
+            // codegen recorded the offending column token's byte offset.
+            if let Some(offset) = take_column_error_offset() {
+                set_error_byte_offset(offset);
+            }
             FrankenError::FunctionError(format!("no such column: {column}"))
         }
-        CodegenError::AmbiguousColumn(name) => FrankenError::AmbiguousColumn { name },
+        CodegenError::AmbiguousColumn(name) => {
+            if let Some(offset) = take_column_error_offset() {
+                set_error_byte_offset(offset);
+            }
+            FrankenError::AmbiguousColumn { name }
+        }
         CodegenError::Unsupported(msg) => FrankenError::NotImplemented(msg),
         // A genuine SQL error (e.g. INSERT column/value count mismatch) is
         // reported verbatim under SQLITE_ERROR, not "not implemented:". bd-6mj9n.
@@ -121032,8 +121063,18 @@ pub(crate) fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
 fn create_index_bind_error_to_franken(error: CodegenError) -> FrankenError {
     match error {
         CodegenError::TableNotFound(name) => FrankenError::NoSuchTable { name },
-        CodegenError::ColumnNotFound { column, .. } => FrankenError::NoSuchColumn { name: column },
-        CodegenError::AmbiguousColumn(name) => FrankenError::AmbiguousColumn { name },
+        CodegenError::ColumnNotFound { column, .. } => {
+            if let Some(offset) = take_column_error_offset() {
+                set_error_byte_offset(offset);
+            }
+            FrankenError::NoSuchColumn { name: column }
+        }
+        CodegenError::AmbiguousColumn(name) => {
+            if let Some(offset) = take_column_error_offset() {
+                set_error_byte_offset(offset);
+            }
+            FrankenError::AmbiguousColumn { name }
+        }
         CodegenError::Unsupported(message) => FrankenError::FunctionError(message),
         CodegenError::SqlError(message) => FrankenError::FunctionError(message),
     }
