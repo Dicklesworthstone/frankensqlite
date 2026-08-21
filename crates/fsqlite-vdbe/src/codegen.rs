@@ -1129,7 +1129,7 @@ fn emit_strict_type_check(b: &mut ProgramBuilder, table: &TableSchema, first_reg
 /// Returns `(index_offset, &IndexSchema)` when the target columns match a
 /// UNIQUE index on the table.  Returns `None` when the target is absent,
 /// refers to the PRIMARY KEY, or does not match any UNIQUE index.
-fn find_upsert_target_index<'a>(
+pub fn find_upsert_target_index<'a>(
     table: &'a TableSchema,
     target: Option<&UpsertTarget>,
 ) -> Option<(usize, &'a IndexSchema)> {
@@ -1213,7 +1213,7 @@ fn upsert_target_matches_index_predicate(
     expressions_match_table_locally(target_predicate, &index_predicate, table, None)
 }
 
-fn upsert_target_matches_rowid_primary_key(table: &TableSchema, target: &UpsertTarget) -> bool {
+pub fn upsert_target_matches_rowid_primary_key(table: &TableSchema, target: &UpsertTarget) -> bool {
     let [indexed_column] = target.columns.as_slice() else {
         return false;
     };

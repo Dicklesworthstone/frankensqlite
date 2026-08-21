@@ -24306,6 +24306,53 @@ impl Connection {
         attach_error_byte_offset_suffix(outcome, sql)
     }
 
+    /// Validate an INSERT's `ON CONFLICT (<target>)` arbiter at prepare time:
+    /// every named target column must exist ("no such column: <c>", checked
+    /// first), and the target must match a PRIMARY KEY or UNIQUE constraint
+    /// ("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+    /// constraint"). Neither the VDBE fast lane nor the dispatch path performs
+    /// this, so it runs at the execute() boundary. bd-prepare-time-validation-bypass.
+    fn validate_upsert_conflict_target(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Result<()> {
+        if insert.upsert.is_empty() {
+            return Ok(());
+        }
+        let schema = self.schema.borrow();
+        let Some(table) = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
+        else {
+            // A missing target table is reported elsewhere.
+            return Ok(());
+        };
+        for clause in &insert.upsert {
+            let Some(target) = clause.target.as_ref() else {
+                continue;
+            };
+            for indexed in &target.columns {
+                if let Expr::Column(column, _) = &indexed.expr
+                    && table.column_index(&column.column).is_none()
+                {
+                    return Err(FrankenError::function_error(format!(
+                        "no such column: {}",
+                        column.column
+                    )));
+                }
+            }
+            if fsqlite_vdbe::codegen::find_upsert_target_index(table, Some(target)).is_none()
+                && !fsqlite_vdbe::codegen::upsert_target_matches_rowid_primary_key(table, target)
+            {
+                return Err(FrankenError::function_error(
+                    "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn execute_impl(&self, sql: &str) -> Result<usize> {
         clear_error_byte_offset();
         self.background_status()?;
@@ -24326,6 +24373,15 @@ impl Connection {
             let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             self.cached_parse_multi(sql)?
         };
+        // INSERT ... ON CONFLICT conflict-target validation. Neither the VDBE
+        // fast lane (codegen_insert, reached only for non-deferred inserts) nor
+        // the dispatch path validates the arbiter, so run it here for every
+        // single-statement execute() INSERT. bd-prepare-time-validation-bypass.
+        if statements.len() == 1
+            && let Statement::Insert(insert) = statements[0].as_ref()
+        {
+            self.validate_upsert_conflict_target(insert)?;
+        }
         if statements.len() == 1
             && self.ad_hoc_execute_supports_prepared_reuse(statements[0].as_ref())?
         {
