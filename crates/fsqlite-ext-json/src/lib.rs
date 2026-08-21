@@ -2826,13 +2826,22 @@ impl ScalarFunction for JsonbExtractFunc {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
-        let blob = if args.len() == 2 {
+        if args.len() == 2 {
             let path = text_arg(self.name(), args, 1)?;
-            encode_jsonb_root(&jsonb_extract_single_path_value(&input, path)?)
-        } else {
-            let paths = collect_path_args(self.name(), args, 1)?;
-            jsonb_extract_value(&input, &paths)
-        }?;
+            let node = jsonb_extract_single_path_value(&input, path)?;
+            // Stock jsonb_extract returns JSONB only where json_extract would
+            // return a JSON array/object; a single path resolving to a JSON
+            // scalar (or a missing path -> NULL) returns the SQL scalar value,
+            // same as json_extract (bd-elre4).
+            return match &node {
+                Value::Array(_) | Value::Object(_) => Ok(SqliteValue::Blob(
+                    Arc::from(encode_jsonb_root(&node)?.as_slice()),
+                )),
+                _ => Ok(json_to_sqlite_scalar(&node)),
+            };
+        }
+        let paths = collect_path_args(self.name(), args, 1)?;
+        let blob = jsonb_extract_value(&input, &paths)?;
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
 
