@@ -85489,7 +85489,14 @@ impl Connection {
                         result_column_needs_fts5_aux_context(column, &fts5_source_names)
                     }) || select.order_by.iter().any(
                         |ordering| expr_needs_fts5_aux_context(&ordering.expr, &fts5_source_names),
-                    );
+                    ) || where_clause.as_deref().is_some_and(|clause| {
+                        // A `rank`/aux-function reference in the WHERE clause (e.g.
+                        // `WHERE t MATCH '...' AND rank < 0`) also needs the aux
+                        // context built from the FULL WHERE — otherwise the MATCH
+                        // query, already claimed out of the residual by the vtab
+                        // scan plan, is invisible here and `rank` fails to resolve.
+                        expr_needs_fts5_aux_context(clause, &fts5_source_names)
+                    });
                     let residual_where = live_vtab_scan_plans
                         .get(src_idx)
                         .and_then(Option::as_ref)
@@ -94489,15 +94496,26 @@ fn validate_likelihood_probability_arg(name: &str, args: &FunctionArgs) -> Resul
     }
 }
 
+/// Record the offending call's byte offset for SQLite's " ... at offset N"
+/// suffix; a zero-length span means "no location provided" and is skipped so a
+/// stale offset never attaches. bd-ttof2.
+fn mark_error_offset(span: Span) {
+    if !span.is_empty() {
+        set_error_byte_offset(span.start);
+    }
+}
+
 fn validate_function_call_resolution(
     name: &str,
     args: &FunctionArgs,
     over: Option<&WindowSpec>,
+    offending_span: Span,
 ) -> Result<()> {
     validate_likelihood_probability_arg(name, args)?;
     let num_args = aggregate_args_len_for_lookup(args);
     let application_kind = current_application_function_kind(name, num_args);
     if over.is_some() && application_kind.is_some_and(|kind| !kind.is_window_callable()) {
+        mark_error_offset(offending_span);
         return Err(FrankenError::FunctionError(format!(
             "{name}() may not be used as a window function"
         )));
@@ -94542,12 +94560,18 @@ fn validate_function_call_resolution(
     };
     match accepted {
         Some(true) => Ok(()),
-        Some(false) => Err(FrankenError::FunctionError(format!(
-            "wrong number of arguments to function {name}()"
-        ))),
-        None => Err(FrankenError::FunctionError(format!(
-            "no such function: {name}"
-        ))),
+        Some(false) => {
+            mark_error_offset(offending_span);
+            Err(FrankenError::FunctionError(format!(
+                "wrong number of arguments to function {name}()"
+            )))
+        }
+        None => {
+            mark_error_offset(offending_span);
+            Err(FrankenError::FunctionError(format!(
+                "no such function: {name}"
+            )))
+        }
     }
 }
 
@@ -94558,6 +94582,7 @@ fn validate_function_call_header(
     order_by: &[OrderingTerm],
     filter: Option<&Expr>,
     over: Option<&WindowSpec>,
+    offending_span: Span,
 ) -> Result<()> {
     let is_aggregate =
         is_current_aggregate_or_json_fn(name, args) && !is_scalar_max_min(name, args);
@@ -94574,12 +94599,15 @@ fn validate_function_call_header(
                     .window_accepts_arg_count(name, num_args)
             }) == Some(true)
         };
+        mark_error_offset(offending_span);
         return Err(FrankenError::FunctionError(if is_window_fn {
             "FILTER clause may only be used with aggregate window functions".to_owned()
         } else {
             format!("FILTER may not be used with non-aggregate {name}()")
         }));
     }
+    // Note: the two DISTINCT errors below are intentionally NOT offset-tagged —
+    // stock SQLite reports them without the " at offset N" suffix. bd-ttof2.
     if distinct && over.is_some() {
         return Err(FrankenError::FunctionError(
             "DISTINCT is not supported for window functions".to_owned(),
@@ -94591,11 +94619,12 @@ fn validate_function_call_header(
         ));
     }
     if !order_by.is_empty() && (over.is_some() || !is_aggregate) {
+        mark_error_offset(offending_span);
         return Err(FrankenError::FunctionError(format!(
             "ORDER BY may not be used with non-aggregate {name}()"
         )));
     }
-    validate_function_call_resolution(name, args, over)
+    validate_function_call_resolution(name, args, over, offending_span)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -94678,6 +94707,7 @@ fn validate_function_call_modifiers_in_expr(expr: &Expr) -> Result<()> {
             order_by,
             filter,
             over,
+            span,
             ..
         } => {
             validate_function_call_header(
@@ -94687,6 +94717,7 @@ fn validate_function_call_modifiers_in_expr(expr: &Expr) -> Result<()> {
                 order_by,
                 filter.as_deref(),
                 over.as_ref(),
+                *span,
             )?;
             if let FunctionArgs::List(args) = args {
                 for expr in args {
@@ -119193,7 +119224,9 @@ fn evaluate_having_value(
             // silently evaluate to NULL. The HAVING interpreter bypasses the
             // prepare-time resolution check, so run the same authority here
             // before the built-in scalar fallback (over = None: a scalar call).
-            validate_function_call_resolution(name, args, None)?;
+            // Span::ZERO: no offset attribution on this interpreted path (the
+            // prepare-time SELECT walk already carries the real span). bd-ttof2.
+            validate_function_call_resolution(name, args, None, Span::ZERO)?;
             Ok(eval_scalar_fn(name, &arg_values))
         }
 
@@ -129079,10 +129112,11 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                 order_by,
                 filter,
                 over,
+                span,
                 ..
             } => {
                 let resolved_aggregate_or_window =
-                    validate_function_call_resolution(name, args, over.as_ref()).is_ok()
+                    validate_function_call_resolution(name, args, over.as_ref(), Span::ZERO).is_ok()
                         && ((is_current_aggregate_or_json_fn(name, args)
                             && !is_scalar_max_min(name, args))
                             || over.is_some());
@@ -129096,6 +129130,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                     order_by,
                     filter.as_deref(),
                     over.as_ref(),
+                    *span,
                 )?;
                 if let Some(filter) = filter {
                     self.validate_expr(filter, scope, alias_use)?;
@@ -129818,6 +129853,7 @@ impl<'a> SelectStructureResolver<'a> {
                 order_by,
                 filter,
                 over,
+                span,
                 ..
             } => {
                 validate_function_call_header(
@@ -129827,6 +129863,7 @@ impl<'a> SelectStructureResolver<'a> {
                     order_by,
                     filter.as_deref(),
                     over.as_ref(),
+                    *span,
                 )?;
                 if let FunctionArgs::List(values) = args {
                     for value in values {
@@ -130195,6 +130232,7 @@ impl<'a> SelectStructureResolver<'a> {
                 order_by,
                 filter,
                 over,
+                span,
                 ..
             } => {
                 validate_function_call_header(
@@ -130204,6 +130242,7 @@ impl<'a> SelectStructureResolver<'a> {
                     order_by,
                     filter.as_deref(),
                     over.as_ref(),
+                    *span,
                 )?;
                 if let FunctionArgs::List(values) = args {
                     for value in values {
