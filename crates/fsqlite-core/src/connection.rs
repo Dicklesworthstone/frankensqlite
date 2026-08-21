@@ -84643,6 +84643,19 @@ impl Connection {
         self.reserve_clean_memdb_root_pages(ctes.len()).await?;
         for (cte_index, cte) in ctes.iter().enumerate() {
             let cte_name = &cte.name;
+            // The anchor position — the CTE's first/main SELECT core — must not
+            // reference the CTE itself: a self-reference there has no base case and
+            // is SQLite's "circular reference: NAME" (for both WITH and WITH
+            // RECURSIVE), distinct from a valid recursive CTE whose recursive term
+            // lives in a later compound (UNION) arm. Without this, a bare self-ref
+            // `c AS (SELECT * FROM c)` (no compound) would fall through to normal
+            // materialization and mis-report "no such table: c".
+            // bd-errmsg-parity-batch3-3brmm.
+            if select_core_references_table(&cte.query.body.select, cte_name) {
+                return Err(FrankenError::FunctionError(format!(
+                    "circular reference: {cte_name}"
+                )));
+            }
             let has_self_ref = is_recursive
                 && cte
                     .query
@@ -129678,13 +129691,13 @@ impl<'a> SelectStructureResolver<'a> {
                     && width != right_width
                 {
                     let (op, _) = &select.body.compounds[index];
-                    return Err(FrankenError::ParseError {
-                        offset: 0,
-                        detail: format!(
-                            "SELECTs to the left and right of {} do not have the same number of result columns",
-                            compound_op_error_name(*op)
-                        ),
-                    });
+                    // Stock SQLite reports this as a bare SQLITE_ERROR message with no
+                    // byte-offset prefix (same class as the VALUES-arity fix); ParseError's
+                    // Display would prepend "SQL error at offset 0: ". Emit verbatim.
+                    return Err(FrankenError::FunctionError(format!(
+                        "SELECTs to the left and right of {} do not have the same number of result columns",
+                        compound_op_error_name(*op)
+                    )));
                 }
                 right_width = Some(width);
             }
@@ -150674,7 +150687,7 @@ mod tests {
                 .await
                 .expect_err("mismatched UNION arm widths must fail");
             assert!(
-                matches!(query_error, FrankenError::ParseError { ref detail, .. } if detail.contains("same number of result columns")),
+                matches!(query_error, FrankenError::FunctionError(ref detail) if detail.contains("same number of result columns")),
                 "unexpected query error: {query_error}"
             );
 
@@ -150686,7 +150699,7 @@ mod tests {
                 Err(error) => error,
             };
             assert!(
-                matches!(prepare_error, FrankenError::ParseError { ref detail, .. } if detail.contains("same number of result columns")),
+                matches!(prepare_error, FrankenError::FunctionError(ref detail) if detail.contains("same number of result columns")),
                 "unexpected prepare error: {prepare_error}"
             );
 
@@ -150698,7 +150711,7 @@ mod tests {
                 Err(error) => error,
             };
             assert!(
-                matches!(explain_error, FrankenError::ParseError { ref detail, .. } if detail.contains("same number of result columns")),
+                matches!(explain_error, FrankenError::FunctionError(ref detail) if detail.contains("same number of result columns")),
                 "unexpected EXPLAIN error: {explain_error}"
             );
         });
@@ -242317,7 +242330,7 @@ mod pager_routing_tests {
                 assert!(
                     matches!(
                         &error,
-                        FrankenError::ParseError { detail, .. }
+                        FrankenError::FunctionError(detail)
                             if detail
                                 == "SELECTs to the left and right of UNION do not have the same number of result columns"
                     ),
@@ -242359,7 +242372,7 @@ mod pager_routing_tests {
                     assert!(
                         matches!(
                             &error,
-                            FrankenError::ParseError { detail, .. }
+                            FrankenError::FunctionError(detail)
                                 if detail
                                     == "SELECTs to the left and right of UNION do not have the same number of result columns"
                         ),
@@ -242379,7 +242392,7 @@ mod pager_routing_tests {
                 assert!(
                     matches!(
                         &error,
-                        FrankenError::ParseError { detail, .. }
+                        FrankenError::FunctionError(detail)
                             if detail
                                 == "SELECTs to the left and right of UNION do not have the same number of result columns"
                     ),
@@ -242457,7 +242470,7 @@ mod pager_routing_tests {
                     assert!(
                         matches!(
                             &error,
-                            FrankenError::ParseError { detail, .. }
+                            FrankenError::FunctionError(detail)
                                 if detail
                                     == &format!(
                                         "SELECTs to the left and right of {expected_op} do not have the same number of result columns"
@@ -242479,7 +242492,7 @@ mod pager_routing_tests {
                 assert!(
                     matches!(
                         &error,
-                        FrankenError::ParseError { detail, .. }
+                        FrankenError::FunctionError(detail)
                             if detail
                                 == "SELECTs to the left and right of UNION do not have the same number of result columns"
                     ),
@@ -242734,7 +242747,7 @@ mod pager_routing_tests {
                     assert!(
                         matches!(
                             &error,
-                            FrankenError::ParseError { detail, .. }
+                            FrankenError::FunctionError(detail)
                                 if detail
                                     == "SELECTs to the left and right of UNION do not have the same number of result columns"
                         ),

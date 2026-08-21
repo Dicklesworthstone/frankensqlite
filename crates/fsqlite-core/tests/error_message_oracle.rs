@@ -426,3 +426,33 @@ fn returning_aggregate_or_window_misuse() {
         );
     });
 }
+
+#[test]
+fn cte_self_reference_no_anchor_is_circular() {
+    asupersync::test_utils::run_test(|| async {
+        // A CTE whose anchor (first/main SELECT core) references itself has no base
+        // case: SQLite reports "circular reference: NAME", not "no such table". This
+        // holds for WITH RECURSIVE and plain WITH, and even when a compound (UNION)
+        // arm is present but the FIRST term is the self-reference. bd-errmsg batch3.
+        query_err_is(&[], "WITH RECURSIVE c AS (SELECT * FROM c) SELECT * FROM c",
+               "circular reference: c").await;
+        query_err_is(&[], "WITH c AS (SELECT * FROM c) SELECT * FROM c",
+               "circular reference: c").await;
+        query_err_is(&[], "WITH RECURSIVE c AS (SELECT * FROM c UNION SELECT 1) SELECT * FROM c",
+               "circular reference: c").await;
+
+        // NEGATIVE: a valid recursive CTE (anchor does NOT self-reference; the
+        // recursive term is a later UNION arm) and a plain CTE both still work.
+        let f = Connection::open(":memory:").await.unwrap();
+        assert!(
+            f.query("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<3) SELECT n FROM c")
+                .await
+                .is_ok(),
+            "valid recursive CTE (anchor is a base case) is accepted"
+        );
+        assert!(
+            f.query("WITH c AS (SELECT 1) SELECT * FROM c").await.is_ok(),
+            "plain non-self-referencing CTE is accepted"
+        );
+    });
+}
