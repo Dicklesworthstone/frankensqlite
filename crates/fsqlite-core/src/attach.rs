@@ -54,10 +54,12 @@ impl SchemaRegistry {
     pub fn attach(&mut self, schema: String, path: String) -> Result<()> {
         let lower = schema.to_ascii_lowercase();
 
-        // Cannot re-use reserved names.
+        // "main" and "temp" are always in use; stock reports re-attaching them
+        // the same as any duplicate — "database X is already in use" (name
+        // as-written) under SQLITE_ERROR, not an internal error. bd-errmsg-batch3.
         if lower == "main" || lower == "temp" {
-            return Err(FrankenError::internal(format!(
-                "cannot attach with reserved schema name: {schema}"
+            return Err(FrankenError::function_error(format!(
+                "database {schema} is already in use"
             )));
         }
 
