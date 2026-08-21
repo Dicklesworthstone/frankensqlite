@@ -65569,14 +65569,22 @@ impl Connection {
         let triggers = self.triggers.borrow();
         let temp_table_names = self.temp_table_names.borrow();
         let ddl_cache = self.original_ddl_sql.borrow();
+        // bd-y4yjq: a main table shadowed by a same-named TEMP table is parked in
+        // self.shadowed_main_tables and removed from self.schema (bd-wjrs0), yet it
+        // still belongs in main.sqlite_master. Emit those parked main tables too:
+        // the visible TEMP entry that took over the name stays excluded by the
+        // temp_table_names filter, and the parked main entry is chained back in.
+        let shadowed_main_tables = self.shadowed_main_tables.borrow();
         let mut rows = Vec::new();
 
-        for table in schema.iter() {
-            if is_sqlite_schema_name(&table.name)
-                || temp_table_names.contains(&table.name.to_ascii_lowercase())
-            {
-                continue;
-            }
+        for table in schema
+            .iter()
+            .filter(|table| {
+                !is_sqlite_schema_name(&table.name)
+                    && !temp_table_names.contains(&table.name.to_ascii_lowercase())
+            })
+            .chain(shadowed_main_tables.values())
+        {
             let is_autoincrement = self
                 .autoincrement_tables
                 .borrow()
