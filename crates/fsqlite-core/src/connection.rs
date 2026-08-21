@@ -5699,6 +5699,11 @@ type QueryRowHandler<'a> = dyn FnMut(&Row) -> Result<()> + 'a;
 /// destructive memdb reload that rebuilds state from the main `sqlite_master`.
 type CapturedTempTable = (TableSchema, Vec<(i64, Vec<SqliteValue>)>);
 
+/// A resolved FROM source during view-decltype resolution: the effective
+/// source name (alias or table name) plus its output columns as
+/// `(column name, decltype)`.
+type ResolvedViewFromSource = (Option<String>, Vec<(String, Option<String>)>);
+
 #[derive(Clone)]
 struct RecursiveCteDirectEvalPlan {
     col_map: Vec<(String, String, bool)>,
@@ -45999,7 +46004,7 @@ impl Connection {
         };
         // Each FROM source resolved to (effective name = alias or table name,
         // its output columns as (name, decltype)).
-        let mut sources: Vec<(Option<String>, Vec<(String, Option<String>)>)> = Vec::new();
+        let mut sources: Vec<ResolvedViewFromSource> = Vec::new();
         if let Some(from_clause) = from {
             for source in std::iter::once(&from_clause.source)
                 .chain(from_clause.joins.iter().map(|join| &join.table))
@@ -46054,7 +46059,7 @@ impl Connection {
         source: &TableOrSubquery,
         tables: &[TableSchema],
         depth: usize,
-    ) -> Option<(Option<String>, Vec<(String, Option<String>)>)> {
+    ) -> Option<ResolvedViewFromSource> {
         match source {
             TableOrSubquery::Table { name, alias, .. } => {
                 let effective = alias.clone().or_else(|| Some(name.name.clone()));
@@ -46106,7 +46111,7 @@ impl Connection {
 
     fn resolve_view_column_ref_decltype(
         col_ref: &ColumnRef,
-        sources: &[(Option<String>, Vec<(String, Option<String>)>)],
+        sources: &[ResolvedViewFromSource],
     ) -> Option<String> {
         let column = col_ref.column.as_ref();
         match col_ref.table.as_deref() {
@@ -59534,7 +59539,7 @@ impl Connection {
                 // literal, so the first gate clause never catches it — detect the
                 // bare NULL literal here.
                 let default_is_null_literal =
-                    default_dv.is_some_and(|dv| add_column_default_is_null_literal(dv));
+                    default_dv.is_some_and(add_column_default_is_null_literal);
                 // A STORED generated column is legal via ALTER on an EMPTY table
                 // but rejected on a non-empty one ("cannot add a STORED column"),
                 // so the row count is needed here too (bd-...-05537).
@@ -95080,7 +95085,9 @@ fn nested_inner_aggregate_name_span(expr: &Expr) -> Option<(String, Span)> {
             aggs.iter().any(|(_, outer)| {
                 outer.start <= inner.start
                     && inner.end <= outer.end
-                    && (outer.start, outer.end) != (inner.start, inner.end)
+                    // Strict containment on at least one side, i.e. the spans
+                    // differ (given the two `<=` bounds above).
+                    && (outer.start < inner.start || inner.end < outer.end)
             })
         })
         .cloned()
