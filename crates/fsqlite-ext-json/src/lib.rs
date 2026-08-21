@@ -3709,16 +3709,31 @@ impl ScalarFunction for JsonPrettyFunc {
 pub struct JsonGroupArrayFunc;
 
 impl AggregateFunction for JsonGroupArrayFunc {
-    type State = Vec<SqliteValue>;
+    /// Each accumulated element is paired with its subtype tag (0 = untagged) so
+    /// a JSON-subtyped argument (`json_object('a',1)`) is embedded as a nested
+    /// value at finalize instead of being quoted as a string (bd-76x57).
+    type State = Vec<(SqliteValue, u32)>;
     fn initial_state(&self) -> Self::State {
         Vec::new()
     }
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        state.push(args[0].clone());
+        state.push((args[0].clone(), 0));
+        Ok(())
+    }
+    fn step_with_arg_subtypes(
+        &self,
+        state: &mut Self::State,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<()> {
+        state.push((args[0].clone(), arg_subtypes.first().copied().unwrap_or(0)));
         Ok(())
     }
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
-        Ok(SqliteValue::Text(SmallText::from_string(json_array(&state)?)))
+        let (values, subtypes): (Vec<SqliteValue>, Vec<u32>) = state.into_iter().unzip();
+        Ok(SqliteValue::Text(SmallText::from_string(
+            json_array_with_subtypes(&values, &subtypes)?,
+        )))
     }
     fn num_args(&self) -> i32 {
         1
@@ -3734,17 +3749,33 @@ impl AggregateFunction for JsonGroupArrayFunc {
 pub struct JsonGroupObjectFunc;
 
 impl AggregateFunction for JsonGroupObjectFunc {
-    type State = Vec<SqliteValue>;
+    /// Flattened `[(k0,st0), (v0,stv0), (k1,st1), …]` — each key/value keeps its
+    /// subtype tag so a JSON-subtyped value is embedded rather than quoted at
+    /// finalize (bd-76x57).
+    type State = Vec<(SqliteValue, u32)>;
     fn initial_state(&self) -> Self::State {
         Vec::new()
     }
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        state.push(args[0].clone());
-        state.push(args[1].clone());
+        state.push((args[0].clone(), 0));
+        state.push((args[1].clone(), 0));
+        Ok(())
+    }
+    fn step_with_arg_subtypes(
+        &self,
+        state: &mut Self::State,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<()> {
+        state.push((args[0].clone(), arg_subtypes.first().copied().unwrap_or(0)));
+        state.push((args[1].clone(), arg_subtypes.get(1).copied().unwrap_or(0)));
         Ok(())
     }
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
-        Ok(SqliteValue::Text(SmallText::from_string(json_object(&state)?)))
+        let (values, subtypes): (Vec<SqliteValue>, Vec<u32>) = state.into_iter().unzip();
+        Ok(SqliteValue::Text(SmallText::from_string(
+            json_object_with_subtypes(&values, &subtypes)?,
+        )))
     }
     fn num_args(&self) -> i32 {
         2

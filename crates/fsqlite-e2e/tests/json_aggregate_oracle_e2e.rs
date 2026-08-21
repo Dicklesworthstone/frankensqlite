@@ -172,3 +172,36 @@ fn json_group_array_empty_group() {
         .await;
     });
 }
+
+#[test]
+fn json_group_aggregates_nested_json_subtype_embedded() {
+    // bd-76x57 keeper: the canonical use — folding `json_object(...)` /
+    // `json_array(...)` rows into a nested JSON array or object. The JSON subtype
+    // of the aggregate's argument must survive the step, so each element is
+    // EMBEDDED (`[{"k":10},…]`) rather than quoted (`["{\"k\":10}",…]`). Before
+    // the aggregate subtype channel existed, frank quoted these; this guards the
+    // regression against rusqlite (which embeds).
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // Array of nested objects: [{"k":10},{"k":20},{"k":30}]
+                "SELECT json_group_array(json_object('k', v)) FROM t",
+                // Array of nested arrays: [[10,10],[20,20],[30,30]]
+                "SELECT json_group_array(json_array(v, v)) FROM t",
+                // Grouped, nested-object elements.
+                "SELECT g, json_group_array(json_object('v', v)) FROM t GROUP BY g ORDER BY g",
+                // Object whose VALUES are nested JSON objects: {"x":{"v":10},…}
+                "SELECT json_group_object(k, json_object('v', v)) FROM t",
+                // Object whose values are nested JSON arrays.
+                "SELECT json_group_object(k, json_array(v)) FROM t",
+                // json() over a text literal also carries the subtype through.
+                "SELECT json_group_array(json('[1,2]')) FROM t",
+            ],
+            "json_group_aggregates_nested_json_subtype_embedded",
+        )
+        .await;
+    });
+}

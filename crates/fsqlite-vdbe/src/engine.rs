@@ -6650,6 +6650,10 @@ struct AggStepCall<'a> {
     agg_collation: Option<&'a str>,
     execution_cx: &'a Cx,
     args: &'a [SqliteValue],
+    /// Per-argument subtype tags (0 = untagged), parallel to `args`, so
+    /// subtype-aware aggregates (`json_group_array`/`json_group_object`) embed a
+    /// JSON-subtyped argument instead of quoting it (bd-76x57).
+    arg_subtypes: &'a [u32],
     /// DB storage encoding so collated MIN/MAX order BINARY in the DB encoding
     /// on a UTF-16 database (bd-bld9w.4).
     text_encoding: TextEncoding,
@@ -12735,6 +12739,17 @@ impl VdbeEngine {
                     let is_distinct = op.p1 != 0;
                     let arg_count = usize::from(op.p5);
                     let execution_cx = self.execution_cx.clone();
+                    // Gather per-argument subtypes (parallel to args) so
+                    // subtype-aware aggregates embed a JSON-subtyped argument
+                    // rather than quoting it (bd-76x57). Cheap: `register_subtype`
+                    // short-circuits when no register carries a subtype.
+                    let arg_subtypes: smallvec::SmallVec<[u32; 4]> = (0..arg_count)
+                        .map(|offset| {
+                            Self::reg_with_offset(op.p2, offset)
+                                .and_then(|reg| self.register_subtype(reg))
+                                .unwrap_or(0)
+                        })
+                        .collect();
                     if op.p2 >= 0
                         && (op.p2 as usize).saturating_add(arg_count) <= self.registers.len()
                     {
@@ -12756,6 +12771,7 @@ impl VdbeEngine {
                                 agg_collation,
                                 execution_cx: &execution_cx,
                                 args,
+                                arg_subtypes: &arg_subtypes,
                                 text_encoding: self.text_encoding,
                             },
                         )?;
@@ -12773,6 +12789,7 @@ impl VdbeEngine {
                                 agg_collation,
                                 execution_cx: &execution_cx,
                                 args: &args,
+                                arg_subtypes: &arg_subtypes,
                                 text_encoding,
                             },
                         )?;
@@ -15805,7 +15822,8 @@ impl VdbeEngine {
                     step.text_encoding,
                 );
             } else {
-                ctx.func.step(&mut ctx.state, step.args)?;
+                ctx.func
+                    .step_with_arg_subtypes(&mut ctx.state, step.args, step.arg_subtypes)?;
             }
         }
         observe_execution_cancellation(step.execution_cx)

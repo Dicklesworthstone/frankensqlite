@@ -42,6 +42,22 @@ pub trait AggregateFunction: Send + Sync {
     /// Process one row, updating the accumulator.
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()>;
 
+    /// Process one row with per-argument subtype tags available.
+    ///
+    /// `arg_subtypes[i]` is the subtype of `args[i]` (0 when untagged), the same
+    /// channel the scalar path exposes via `ScalarFunction::invoke_with_arg_subtypes`.
+    /// The default ignores the tags and forwards to [`Self::step`]; aggregates
+    /// that must preserve them (e.g. `json_group_array` embedding a nested
+    /// `json_object(...)` rather than quoting it) override this.
+    fn step_with_arg_subtypes(
+        &self,
+        state: &mut Self::State,
+        args: &[SqliteValue],
+        _arg_subtypes: &[u32],
+    ) -> Result<()> {
+        self.step(state, args)
+    }
+
     /// Consume the accumulator and produce the final result.
     fn finalize(&self, state: Self::State) -> Result<SqliteValue>;
 
@@ -110,6 +126,19 @@ where
             .downcast_mut::<F::State>()
             .expect("aggregate state type mismatch");
         self.inner.step(concrete, args)
+    }
+
+    fn step_with_arg_subtypes(
+        &self,
+        state: &mut Self::State,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<()> {
+        let concrete = state
+            .downcast_mut::<F::State>()
+            .expect("aggregate state type mismatch");
+        self.inner
+            .step_with_arg_subtypes(concrete, args, arg_subtypes)
     }
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
