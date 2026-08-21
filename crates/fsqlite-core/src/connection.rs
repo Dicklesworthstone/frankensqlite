@@ -74701,6 +74701,7 @@ impl Connection {
                                     name,
                                     &argument_rows,
                                     num_args,
+                                    &self.aggregate_arg_json_subtypes(args),
                                 )?
                                 .ok_or_else(|| {
                                     FrankenError::internal(format!(
@@ -79535,6 +79536,7 @@ impl Connection {
                                     name,
                                     &argument_rows,
                                     num_args,
+                                    &self.aggregate_arg_json_subtypes(args),
                                 )?
                                 .ok_or_else(|| {
                                     FrankenError::internal(format!(
@@ -83746,11 +83748,49 @@ impl Connection {
         func.finalize(state).map(Some)
     }
 
+    /// The per-argument JSON subtype an aggregate's argument expressions carry
+    /// into `step_with_arg_subtypes`, so json_group_array/json_group_object
+    /// embed a nested `json(...)`/`json_object(...)`/`json_array(...)` result
+    /// rather than quoting it. Only a top-level scalar call whose
+    /// `result_subtype()` is JSON qualifies; every other argument is subtype 0.
+    /// The subtype is a property of the argument EXPRESSION (constant across
+    /// rows), so recomputing it here is immune to GROUP BY row serialization.
+    /// bd-76x57.
+    fn aggregate_arg_json_subtypes(&self, args: &FunctionArgs) -> Vec<u32> {
+        let FunctionArgs::List(exprs) = args else {
+            return Vec::new();
+        };
+        exprs
+            .iter()
+            .map(|expr| self.expr_result_json_subtype(expr))
+            .collect()
+    }
+
+    fn expr_result_json_subtype(&self, expr: &Expr) -> u32 {
+        let Expr::FunctionCall { name, args, .. } = expr else {
+            return 0;
+        };
+        let num_args = match args {
+            FunctionArgs::List(list) => i32::try_from(list.len()).unwrap_or(-1),
+            FunctionArgs::Star => -1,
+        };
+        let registry = self.func_registry.borrow();
+        if registry
+            .find_scalar(name, num_args)
+            .is_some_and(|func| func.result_subtype() == Some(fsqlite_func::JSON_SUBTYPE))
+        {
+            fsqlite_func::JSON_SUBTYPE
+        } else {
+            0
+        }
+    }
+
     fn compute_application_aggregate_with_registry(
         &self,
         name: &str,
         argument_rows: &[Vec<SqliteValue>],
         num_args: i32,
+        arg_subtypes: &[u32],
     ) -> Result<Option<SqliteValue>> {
         // bd-cl854: registry-backed builtin aggregates (median/percentile/...)
         // are in the aggregate registry, not the `application_functions` map that
@@ -83774,7 +83814,7 @@ impl Connection {
         })?;
         let mut state = func.initial_state();
         for args in argument_rows {
-            func.step(&mut state, args)?;
+            func.step_with_arg_subtypes(&mut state, args, arg_subtypes)?;
         }
         func.finalize(state).map(Some)
     }
