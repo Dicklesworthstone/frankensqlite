@@ -2179,7 +2179,14 @@ impl<'a> ParseMachine<'a> {
             kind => {
                 return Err(ParseError {
                     kind: crate::parser::ParseErrorKind::Syntax,
-                    message: format!("unexpected token in expression: {kind:?}"),
+                    // A lexer error token (unterminated / unrecognized / malformed)
+                    // already carries its stock-matching message; propagate it
+                    // verbatim instead of Debug-wrapping it as
+                    // `unexpected token in expression: Error("...")`.
+                    message: match &kind {
+                        TokenKind::Error(msg) => msg.clone(),
+                        _ => format!("unexpected token in expression: {kind:?}"),
+                    },
                     span: token_span,
                     line,
                     col,
@@ -4087,7 +4094,12 @@ impl Parser {
 
             kind => Err(ParseError {
                 kind: crate::parser::ParseErrorKind::Syntax,
-                message: format!("unexpected token in expression: {kind:?}"),
+                // Propagate a lexer error token's message verbatim (see the other
+                // arm) rather than Debug-wrapping it.
+                message: match &kind {
+                    TokenKind::Error(msg) => msg.clone(),
+                    _ => format!("unexpected token in expression: {kind:?}"),
+                },
                 span: token_span,
                 line,
                 col,
