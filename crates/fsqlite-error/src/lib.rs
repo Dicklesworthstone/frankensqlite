@@ -171,6 +171,14 @@ pub enum FrankenError {
         actual: String,
     },
 
+    /// R-Tree bounding-box constraint violation: some dimension has min > max.
+    ///
+    /// `constraint` carries the SQLite-formatted `<table>.(<lo><=<hi>)` clause so
+    /// the full message matches stock's `rtree constraint failed: r.(x0<=x1)`
+    /// (SQLITE_CONSTRAINT / 19).
+    #[error("rtree constraint failed: {constraint}")]
+    RtreeConstraint { constraint: String },
+
     // === Transaction Errors ===
     /// Cannot start a transaction within a transaction.
     #[error("cannot start a transaction within a transaction")]
@@ -504,7 +512,8 @@ impl FrankenError {
             | Self::CheckViolation { .. }
             | Self::ForeignKeyViolation
             | Self::PrimaryKeyViolation
-            | Self::DatatypeViolation { .. } => ErrorCode::Constraint,
+            | Self::DatatypeViolation { .. }
+            | Self::RtreeConstraint { .. } => ErrorCode::Constraint,
             Self::WriteConflict { .. }
             | Self::SerializationFailure { .. }
             | Self::Busy
@@ -653,10 +662,10 @@ impl FrankenError {
     /// - `BusySnapshot` → 517 (SQLITE_BUSY_SNAPSHOT = 5 | (2 << 8))
     pub const fn extended_error_code(&self) -> i32 {
         match self {
-            Self::Busy => 5,                           // SQLITE_BUSY
-            Self::BusyRecovery => 5 | (1 << 8),        // SQLITE_BUSY_RECOVERY = 261
-            Self::BusySnapshot { .. } => 5 | (2 << 8), // SQLITE_BUSY_SNAPSHOT = 517
-            Self::DatatypeViolation { .. } => 3091,    // SQLITE_CONSTRAINT_DATATYPE
+            Self::Busy => 5,                                      // SQLITE_BUSY
+            Self::BusyRecovery => 5 | (1 << 8),                   // SQLITE_BUSY_RECOVERY = 261
+            Self::BusySnapshot { .. } => 5 | (2 << 8),            // SQLITE_BUSY_SNAPSHOT = 517
+            Self::DatatypeViolation { .. } => 3091,               // SQLITE_CONSTRAINT_DATATYPE
             Self::NewerFormat { .. } => SQLITE_OPEN_NEWER_FORMAT, // 14 | (0x7F << 8) = 32526
             _ => self.error_code() as i32,
         }

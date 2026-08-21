@@ -423,6 +423,14 @@ fn rtree_sqlite_module_args<'a>(args: &'a [&'a str]) -> Result<&'a [&'a str]> {
     })
 }
 
+/// Strip surrounding SQL identifier quoting (`"`, `'`, `` ` ``, `[`, `]`) and
+/// surrounding whitespace from a raw argv token.
+fn unquote_identifier(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'))
+        .to_owned()
+}
+
 fn parse_rtree_module_args(args: &[&str]) -> Result<ParsedRtreeModuleArgs> {
     if args.len() < 3 {
         return Err(FrankenError::function_error(
@@ -445,9 +453,7 @@ fn parse_rtree_module_args(args: &[&str]) -> Result<ParsedRtreeModuleArgs> {
     let mut seen = HashSet::new();
     let mut column_names = Vec::with_capacity(args.len());
     for arg in args {
-        let column = arg
-            .trim()
-            .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'));
+        let column = unquote_identifier(arg);
         if column.is_empty() {
             return Err(FrankenError::function_error(
                 "rtree column names must not be empty",
@@ -464,7 +470,7 @@ fn parse_rtree_module_args(args: &[&str]) -> Result<ParsedRtreeModuleArgs> {
                 "rtree column '{column}' is declared more than once",
             )));
         }
-        column_names.push(column.to_owned());
+        column_names.push(column);
     }
 
     Ok(ParsedRtreeModuleArgs {
@@ -507,6 +513,10 @@ fn parse_coordinate_value(value: &SqliteValue, coord_type: RtreeCoordType) -> Re
 #[derive(Debug, Clone)]
 pub struct RtreeVirtualTable {
     index: RtreeIndex,
+    /// Declared table name (SQLite argv[2]); used only for constraint messages.
+    table_name: String,
+    /// Declared column names `[id, min0, max0, ...]`; used for constraint messages.
+    column_names: Vec<String>,
     txn_state: TransactionalVtabState<RtreeVirtualTableSnapshot>,
 }
 
@@ -516,15 +526,38 @@ struct RtreeVirtualTableSnapshot {
 }
 
 impl RtreeVirtualTable {
+    /// Build an instance from the full SQLite argv `[module, database, table, ...module args]`.
+    ///
+    /// The table name (argv[2]) and declared column names are retained purely so
+    /// bounding-box constraint violations can report SQLite's exact
+    /// `rtree constraint failed: <table>.(<lo><=<hi>)` message.
     fn from_args(args: &[&str], coord_type: RtreeCoordType) -> Result<Self> {
-        let parsed = parse_rtree_module_args(args)?;
+        let module_args = rtree_sqlite_module_args(args)?;
+        let parsed = parse_rtree_module_args(module_args)?;
         let config = RtreeConfig::new(parsed.dimensions, coord_type).ok_or_else(|| {
             FrankenError::function_error("rtree dimensions must be between 1 and 5")
         })?;
+        let table_name = args
+            .get(2)
+            .map(|name| unquote_identifier(name))
+            .unwrap_or_default();
         Ok(Self {
             index: RtreeIndex::new(config),
+            table_name,
+            column_names: parsed.column_names,
             txn_state: TransactionalVtabState::default(),
         })
+    }
+
+    /// SQLite-style column name for a flat coordinate slot (`[min0, max0, ...]`).
+    ///
+    /// The declared column list is `[id, <coord0>, <coord1>, ...]`, so coordinate
+    /// slot `i` maps to declared column `i + 1`.
+    fn coord_column_name(&self, coord_index: usize) -> String {
+        self.column_names
+            .get(coord_index + 1)
+            .cloned()
+            .unwrap_or_else(|| format!("c{coord_index}"))
     }
 
     fn snapshot_state(&self) -> RtreeVirtualTableSnapshot {
@@ -560,6 +593,25 @@ impl RtreeVirtualTable {
             .iter()
             .map(|value| parse_coordinate_value(value, self.index.coord_type()))
             .collect::<Result<Vec<_>>>()?;
+
+        // Enforce SQLite's per-dimension `min <= max` invariant. A swapped pair
+        // produces a degenerate bounding box that corrupts spatial-query results,
+        // so stock rejects it with SQLITE_CONSTRAINT. Report the FIRST offending
+        // dimension, matching `rtree constraint failed: <table>.(<lo><=<hi>)`.
+        for dimension in 0..self.index.dimensions() {
+            let lo_index = dimension * 2;
+            if coords[lo_index] > coords[lo_index + 1] {
+                return Err(FrankenError::RtreeConstraint {
+                    constraint: format!(
+                        "{}.({}<={})",
+                        self.table_name,
+                        self.coord_column_name(lo_index),
+                        self.coord_column_name(lo_index + 1),
+                    ),
+                });
+            }
+        }
+
         MBoundingBox::new(coords).ok_or_else(|| {
             FrankenError::function_error("rtree coordinates must form complete min/max pairs")
         })
@@ -629,7 +681,7 @@ impl VirtualTable for RtreeVirtualTable {
     type Cursor = RtreeCursor;
 
     fn create(_cx: &Cx, args: &[&str]) -> Result<Self> {
-        Self::from_args(rtree_sqlite_module_args(args)?, RtreeCoordType::Float32)
+        Self::from_args(args, RtreeCoordType::Float32)
     }
 
     fn connect(cx: &Cx, args: &[&str]) -> Result<Self> {
@@ -1004,7 +1056,7 @@ impl RtreeFactory {
 
 impl VtabModuleFactory for RtreeFactory {
     fn create(&self, _cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
-        let vtab = RtreeVirtualTable::from_args(rtree_sqlite_module_args(args)?, self.coord_type)?;
+        let vtab = RtreeVirtualTable::from_args(args, self.coord_type)?;
         Ok(Box::new(vtab))
     }
 
@@ -2444,7 +2496,9 @@ mod tests {
     fn test_rtree_virtual_table_insert_and_full_scan() {
         let cx = Cx::new();
         let mut table = RtreeVirtualTable::from_args(
-            &["id", "min_x", "max_x", "min_y", "max_y"],
+            &[
+                "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+            ],
             RtreeCoordType::Float32,
         )
         .unwrap();
@@ -2501,11 +2555,146 @@ mod tests {
         assert_eq!(rows[1][0], SqliteValue::Integer(2));
     }
 
+    /// bd-hj6ly: a swapped coordinate pair (min > max) must be rejected with
+    /// SQLite's exact `rtree constraint failed: <table>.(<lo><=<hi>)`
+    /// (SQLITE_CONSTRAINT), reporting the FIRST offending dimension — not stored
+    /// as a degenerate bounding box.
+    #[test]
+    fn test_rtree_rejects_swapped_coordinates() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &[
+                "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+            ],
+            RtreeCoordType::Float32,
+        )
+        .unwrap();
+
+        // First dimension swapped (min_x=5 > max_x=2): reports min_x<=max_x.
+        let err = VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Float(5.0),
+                SqliteValue::Float(2.0),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(err, FrankenError::RtreeConstraint { .. }));
+        assert_eq!(err.error_code(), fsqlite_error::ErrorCode::Constraint);
+        assert_eq!(
+            err.to_string(),
+            "rtree constraint failed: spatial.(min_x<=max_x)"
+        );
+
+        // A valid first dimension but swapped second dimension reports min_y<=max_y.
+        let err = VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(2),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+                SqliteValue::Float(9.0),
+                SqliteValue::Float(3.0),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "rtree constraint failed: spatial.(min_y<=max_y)"
+        );
+
+        // Nothing degenerate was stored.
+        let mut cursor = table.open().unwrap();
+        cursor.filter(&cx, RTREE_SCAN_FULL, None, &[]).unwrap();
+        assert_eq!(collect_rtree_rows(&mut cursor, &cx, 5).len(), 0);
+
+        // Equal coordinates (a point) are allowed.
+        assert_eq!(
+            VirtualTable::update(
+                &mut table,
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(3),
+                    SqliteValue::Integer(3),
+                    SqliteValue::Float(4.0),
+                    SqliteValue::Float(4.0),
+                    SqliteValue::Float(4.0),
+                    SqliteValue::Float(4.0),
+                ],
+            )
+            .unwrap(),
+            Some(3)
+        );
+
+        // An UPDATE that would swap a coordinate is rejected and leaves the row
+        // untouched.
+        let err = VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(3),
+                SqliteValue::Float(10.0),
+                SqliteValue::Float(4.0),
+                SqliteValue::Float(4.0),
+                SqliteValue::Float(4.0),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "rtree constraint failed: spatial.(min_x<=max_x)"
+        );
+        assert_eq!(
+            table.index.bbox_for_id(3).unwrap().coords,
+            vec![4.0, 4.0, 4.0, 4.0]
+        );
+    }
+
+    /// bd-hj6ly: the constraint applies to integer-coordinate R-Trees too, and
+    /// reports the declared integer column names.
+    #[test]
+    fn test_rtree_i32_rejects_swapped_coordinates() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &["rtree_i32", "main", "grid", "id", "a", "b"],
+            RtreeCoordType::Int32,
+        )
+        .unwrap();
+
+        let err = VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(2),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "rtree constraint failed: grid.(a<=b)");
+    }
+
     #[test]
     fn test_rtree_cursor_past_end_returns_null_and_zero_rowid() {
         let cx = Cx::new();
         let mut table = RtreeVirtualTable::from_args(
-            &["id", "min_x", "max_x", "min_y", "max_y"],
+            &[
+                "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+            ],
             RtreeCoordType::Float32,
         )
         .unwrap();
@@ -2541,7 +2730,9 @@ mod tests {
     fn test_rtree_cursor_negative_column_returns_null() {
         let cx = Cx::new();
         let mut table = RtreeVirtualTable::from_args(
-            &["id", "min_x", "max_x", "min_y", "max_y"],
+            &[
+                "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+            ],
             RtreeCoordType::Float32,
         )
         .unwrap();
@@ -2573,7 +2764,9 @@ mod tests {
     fn test_rtree_virtual_table_bbox_filter() {
         let cx = Cx::new();
         let mut table = RtreeVirtualTable::from_args(
-            &["id", "min_x", "max_x", "min_y", "max_y"],
+            &[
+                "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+            ],
             RtreeCoordType::Float32,
         )
         .unwrap();
@@ -2657,7 +2850,9 @@ mod tests {
     #[test]
     fn test_rtree_best_index_does_not_omit_noninclusive_bbox_constraints() {
         let table = RtreeVirtualTable::from_args(
-            &["id", "min_x", "max_x", "min_y", "max_y"],
+            &[
+                "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+            ],
             RtreeCoordType::Float32,
         )
         .unwrap();
@@ -2724,7 +2919,9 @@ mod tests {
     fn test_rtree_virtual_table_update_returns_none() {
         let cx = Cx::new();
         let mut table = RtreeVirtualTable::from_args(
-            &["id", "min_x", "max_x", "min_y", "max_y"],
+            &[
+                "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+            ],
             RtreeCoordType::Float32,
         )
         .unwrap();
@@ -2779,7 +2976,9 @@ mod tests {
     fn test_rtree_virtual_table_rowid_conflict_preserves_original_entry() {
         let cx = Cx::new();
         let mut table = RtreeVirtualTable::from_args(
-            &["id", "min_x", "max_x", "min_y", "max_y"],
+            &[
+                "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+            ],
             RtreeCoordType::Float32,
         )
         .unwrap();
@@ -2845,7 +3044,9 @@ mod tests {
     fn test_rtree_virtual_table_geometry_filter() {
         let cx = Cx::new();
         let mut table = RtreeVirtualTable::from_args(
-            &["id", "min_x", "max_x", "min_y", "max_y"],
+            &[
+                "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+            ],
             RtreeCoordType::Float32,
         )
         .unwrap();
@@ -2898,7 +3099,9 @@ mod tests {
     fn test_rtree_i32_cursor_emits_integer_coordinates() {
         let cx = Cx::new();
         let mut table = RtreeVirtualTable::from_args(
-            &["id", "min_x", "max_x", "min_y", "max_y"],
+            &[
+                "rtree", "main", "spatial", "id", "min_x", "max_x", "min_y", "max_y",
+            ],
             RtreeCoordType::Int32,
         )
         .unwrap();
