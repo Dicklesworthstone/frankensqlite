@@ -3130,8 +3130,11 @@ impl<'a> ParseMachine<'a> {
                 if self.parser.eat_kind(&TokenKind::Comma) {
                     self.start_cte(recursive, ctes)?;
                 } else {
-                    self.values
-                        .push(MachineValue::With(WithClause { recursive, ctes }));
+                    // SQLite treats `RECURSIVE` as optional; a self-referencing
+                    // CTE is recursive regardless of the keyword.
+                    let mut with = WithClause { recursive, ctes };
+                    with.normalize_recursive();
+                    self.values.push(MachineValue::With(with));
                 }
                 Ok(())
             }

@@ -1193,6 +1193,62 @@ pub enum CteMaterialized {
     NotMaterialized,
 }
 
+impl WithClause {
+    /// SQLite treats the `RECURSIVE` keyword as optional: a CTE whose body
+    /// references its own name as a table source is recursive whether or not
+    /// `RECURSIVE` was written. Promote `recursive` to `true` in that case so the
+    /// recursive-CTE machinery engages for `WITH cte AS (... FROM cte ...)`.
+    pub fn normalize_recursive(&mut self) {
+        if !self.recursive && self.ctes.iter().any(Cte::is_self_referential) {
+            self.recursive = true;
+        }
+    }
+}
+
+impl Cte {
+    /// Whether this CTE's body references its own name as a top-level table
+    /// source — i.e. it is a recursive CTE. Nested subqueries are deliberately
+    /// not inspected: SQLite requires the recursive self-reference at the top
+    /// level of the recursive term's FROM clause.
+    #[must_use]
+    pub fn is_self_referential(&self) -> bool {
+        select_references_table(&self.query, &self.name)
+    }
+}
+
+fn select_references_table(select: &SelectStatement, name: &str) -> bool {
+    std::iter::once(&select.body.select)
+        .chain(select.body.compounds.iter().map(|(_, core)| core))
+        .any(|core| select_core_references_table(core, name))
+}
+
+fn select_core_references_table(core: &SelectCore, name: &str) -> bool {
+    match core {
+        SelectCore::Select {
+            from: Some(from), ..
+        } => from_references_table(from, name),
+        SelectCore::Select { from: None, .. } | SelectCore::Values(_) => false,
+    }
+}
+
+fn from_references_table(from: &FromClause, name: &str) -> bool {
+    table_source_references_table(&from.source, name)
+        || from
+            .joins
+            .iter()
+            .any(|join| table_source_references_table(&join.table, name))
+}
+
+fn table_source_references_table(source: &TableOrSubquery, name: &str) -> bool {
+    match source {
+        TableOrSubquery::Table {
+            name: qualified, ..
+        } => qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name),
+        TableOrSubquery::ParenJoin(inner) => from_references_table(inner, name),
+        TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => false,
+    }
+}
+
 /// The body of a SELECT: one or more SELECT cores connected by compound ops.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectBody {
