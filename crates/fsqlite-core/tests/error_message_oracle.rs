@@ -132,3 +132,23 @@ fn aggregate_in_where_misuse_offset() {
                "misuse of aggregate function count() in SELECT * FROM t WHERE sum(x) + count(*) > 0 at offset 31").await;
     });
 }
+
+#[test]
+fn window_misuse_offset() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-ttof2 offset-suffix (slice 2): a window function where one is not
+        // allowed (WHERE / GROUP BY / HAVING) names the offending call and
+        // carries the offset: "misuse of window function NAME() in <SQL> at
+        // offset N". Was the bare, offsetless "misuse of window function".
+        let t: &[&str] = &["CREATE TABLE t(x INT, g TEXT)"];
+        query_err_is(t, "SELECT x FROM t WHERE row_number() OVER () = 1",
+               "misuse of window function row_number() in SELECT x FROM t WHERE row_number() OVER () = 1 at offset 22").await;
+        query_err_is(t, "SELECT g FROM t GROUP BY row_number() OVER ()",
+               "misuse of window function row_number() in SELECT g FROM t GROUP BY row_number() OVER () at offset 25").await;
+        query_err_is(t, "SELECT g FROM t GROUP BY g HAVING row_number() OVER () > 0",
+               "misuse of window function row_number() in SELECT g FROM t GROUP BY g HAVING row_number() OVER () > 0 at offset 34").await;
+        // offset points at the window call even when it is not the leading token
+        query_err_is(t, "SELECT x FROM t WHERE x > sum(x) OVER ()",
+               "misuse of window function sum() in SELECT x FROM t WHERE x > sum(x) OVER () at offset 26").await;
+    });
+}

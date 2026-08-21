@@ -94764,6 +94764,19 @@ fn limit_datatype_mismatch() -> FrankenError {
     FrankenError::FunctionError("datatype mismatch".to_owned())
 }
 
+/// Build the "misuse of window function [NAME()]" error for `expr`, recording
+/// the offending call's byte offset (` in <SQL> at offset N`) when recoverable.
+/// bd-ttof2.
+fn window_misuse_error(expr: &Expr) -> FrankenError {
+    let message = if let Some((name, span)) = rightmost_window_name_span(expr) {
+        set_error_byte_offset(span.start);
+        format!("misuse of window function {name}()")
+    } else {
+        "misuse of window function".to_owned()
+    };
+    FrankenError::FunctionError(message)
+}
+
 fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {
     let SelectCore::Select {
         columns,
@@ -94796,9 +94809,7 @@ fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {
             return Err(FrankenError::FunctionError(message));
         }
         if expr_has_window_function(w) {
-            return Err(FrankenError::FunctionError(
-                "misuse of window function".to_owned(),
-            ));
+            return Err(window_misuse_error(w));
         }
     }
     // Aggregate or window function in GROUP BY is rejected.
@@ -94809,17 +94820,13 @@ fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {
             ));
         }
         if expr_has_window_function(g) {
-            return Err(FrankenError::FunctionError(
-                "misuse of window function".to_owned(),
-            ));
+            return Err(window_misuse_error(g));
         }
     }
     // Window function in HAVING is rejected (an aggregate in HAVING is allowed).
     if let Some(h) = having {
         if expr_has_window_function(h) {
-            return Err(FrankenError::FunctionError(
-                "misuse of window function".to_owned(),
-            ));
+            return Err(window_misuse_error(h));
         }
         if expr_has_nested_aggregate(h) {
             return Err(FrankenError::FunctionError(
@@ -94976,12 +94983,33 @@ fn rightmost_bare_aggregate_name(expr: &Expr) -> Option<String> {
 /// source span, so a "misuse of aggregate" error can carry SQLite's byte offset
 /// (` in <SQL> at offset N`). bd-ttof2.
 fn rightmost_bare_aggregate_name_span(expr: &Expr) -> Option<(String, Span)> {
-    let mut names = Vec::new();
-    collect_bare_aggregate_names_ordered(expr, &mut names);
-    names.pop()
+    let mut calls = Vec::new();
+    collect_agg_window_calls_ordered(expr, &mut calls);
+    calls
+        .into_iter()
+        .rev()
+        .find(|&(_, _, is_window)| !is_window)
+        .map(|(name, span, _)| (name, span))
 }
 
-fn collect_bare_aggregate_names_ordered(expr: &Expr, out: &mut Vec<(String, Span)>) {
+/// The rightmost WINDOW-function call (name + span) in `expr`, in SQLite's
+/// left-to-right walk order — fills stock's "misuse of window function NAME()"
+/// message and its byte offset when a window call appears where it may not
+/// (WHERE / GROUP BY / HAVING). bd-ttof2.
+fn rightmost_window_name_span(expr: &Expr) -> Option<(String, Span)> {
+    let mut calls = Vec::new();
+    collect_agg_window_calls_ordered(expr, &mut calls);
+    calls
+        .into_iter()
+        .rev()
+        .find(|&(_, _, is_window)| is_window)
+        .map(|(name, span, _)| (name, span))
+}
+
+/// Collect every bare-aggregate and window call in `expr` in SQLite's
+/// left-to-right walk order (arguments before the enclosing call), each as
+/// `(lowercased name, source span, is_window)`. bd-ttof2.
+fn collect_agg_window_calls_ordered(expr: &Expr, out: &mut Vec<(String, Span, bool)>) {
     match expr {
         Expr::FunctionCall {
             name,
@@ -94996,41 +95024,43 @@ fn collect_bare_aggregate_names_ordered(expr: &Expr, out: &mut Vec<(String, Span
             // aggregate is "rightmost" relative to its own argument subtree.
             if let FunctionArgs::List(items) = args {
                 for item in items {
-                    collect_bare_aggregate_names_ordered(item, out);
+                    collect_agg_window_calls_ordered(item, out);
                 }
             }
             if let Some(filter) = filter.as_deref() {
-                collect_bare_aggregate_names_ordered(filter, out);
+                collect_agg_window_calls_ordered(filter, out);
             }
-            if over.is_none() && is_agg_fn(name) && !is_scalar_max_min(name, args) {
-                out.push((name.to_ascii_lowercase(), *span));
+            if over.is_some() {
+                out.push((name.to_ascii_lowercase(), *span, true));
+            } else if is_agg_fn(name) && !is_scalar_max_min(name, args) {
+                out.push((name.to_ascii_lowercase(), *span, false));
             }
         }
         Expr::BinaryOp { left, right, .. } => {
-            collect_bare_aggregate_names_ordered(left, out);
-            collect_bare_aggregate_names_ordered(right, out);
+            collect_agg_window_calls_ordered(left, out);
+            collect_agg_window_calls_ordered(right, out);
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Cast { expr: inner, .. }
-        | Expr::Collate { expr: inner, .. } => collect_bare_aggregate_names_ordered(inner, out),
+        | Expr::Collate { expr: inner, .. } => collect_agg_window_calls_ordered(inner, out),
         Expr::Between {
             expr: inner,
             low,
             high,
             ..
         } => {
-            collect_bare_aggregate_names_ordered(inner, out);
-            collect_bare_aggregate_names_ordered(low, out);
-            collect_bare_aggregate_names_ordered(high, out);
+            collect_agg_window_calls_ordered(inner, out);
+            collect_agg_window_calls_ordered(low, out);
+            collect_agg_window_calls_ordered(high, out);
         }
         Expr::In {
             expr: inner, set, ..
         } => {
-            collect_bare_aggregate_names_ordered(inner, out);
+            collect_agg_window_calls_ordered(inner, out);
             if let InSet::List(items) = set {
                 for item in items {
-                    collect_bare_aggregate_names_ordered(item, out);
+                    collect_agg_window_calls_ordered(item, out);
                 }
             }
         }
@@ -95040,10 +95070,10 @@ fn collect_bare_aggregate_names_ordered(expr: &Expr, out: &mut Vec<(String, Span
             escape,
             ..
         } => {
-            collect_bare_aggregate_names_ordered(inner, out);
-            collect_bare_aggregate_names_ordered(pattern, out);
+            collect_agg_window_calls_ordered(inner, out);
+            collect_agg_window_calls_ordered(pattern, out);
             if let Some(escape) = escape.as_deref() {
-                collect_bare_aggregate_names_ordered(escape, out);
+                collect_agg_window_calls_ordered(escape, out);
             }
         }
         Expr::Case {
@@ -95053,25 +95083,25 @@ fn collect_bare_aggregate_names_ordered(expr: &Expr, out: &mut Vec<(String, Span
             ..
         } => {
             if let Some(operand) = operand.as_deref() {
-                collect_bare_aggregate_names_ordered(operand, out);
+                collect_agg_window_calls_ordered(operand, out);
             }
             for (when_expr, then_expr) in whens {
-                collect_bare_aggregate_names_ordered(when_expr, out);
-                collect_bare_aggregate_names_ordered(then_expr, out);
+                collect_agg_window_calls_ordered(when_expr, out);
+                collect_agg_window_calls_ordered(then_expr, out);
             }
             if let Some(else_expr) = else_expr.as_deref() {
-                collect_bare_aggregate_names_ordered(else_expr, out);
+                collect_agg_window_calls_ordered(else_expr, out);
             }
         }
         Expr::JsonAccess {
             expr: inner, path, ..
         } => {
-            collect_bare_aggregate_names_ordered(inner, out);
-            collect_bare_aggregate_names_ordered(path, out);
+            collect_agg_window_calls_ordered(inner, out);
+            collect_agg_window_calls_ordered(path, out);
         }
         Expr::RowValue(items, _) => {
             for item in items {
-                collect_bare_aggregate_names_ordered(item, out);
+                collect_agg_window_calls_ordered(item, out);
             }
         }
         _ => {}
