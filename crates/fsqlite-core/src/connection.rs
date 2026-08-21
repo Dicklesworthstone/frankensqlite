@@ -23459,6 +23459,32 @@ impl Connection {
         }
     }
 
+    /// Render a column DEFAULT for `PRAGMA table_info`'s `dflt_value`. A
+    /// parenthesized default `DEFAULT (<expr>)` reports the VERBATIM source of
+    /// the inner expression: SQLite strips the outermost paren pair and trims
+    /// surrounding whitespace but preserves the exact text (`1+1`, `1 + 1`,
+    /// `(1+1)` for `((1+1))`, `abs(-1)`), NOT an AST re-render like `(1 + 1)`.
+    /// The parser eats the outer `(` before `parse_expr`, so the inner
+    /// expression's span already excludes the outer parens; slicing
+    /// `pending_ddl_source` (the verbatim issued CREATE/ALTER text the statement
+    /// was parsed from) by that span yields exactly SQLite's output. Falls back
+    /// to the AST render when the source is unavailable (batched statements) or
+    /// the span does not resolve. bd-pragma-table-info-dflt-source-rqvvf.
+    fn format_default_value_verbatim(&self, dv: &DefaultValue) -> String {
+        if let DefaultValue::ParenExpr(expr) = dv {
+            let span = expr.span();
+            if let Some(source) = self.pending_ddl_source.borrow().as_deref()
+                && let Some(text) = source.get(span.start as usize..span.end as usize)
+            {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_owned();
+                }
+            }
+        }
+        format_default_value(dv)
+    }
+
     /// Prepare SQL into a statement.
     pub async fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         self.background_status()?;
@@ -57370,7 +57396,7 @@ impl Connection {
                             })
                             .map(|dv| -> Result<String> {
                                 self.validate_default_value_is_constant(&col.name, dv)?;
-                                Ok(format_default_value(dv))
+                                Ok(self.format_default_value_verbatim(dv))
                             })
                             .transpose()?;
                         let strict_type = if create.strict {
@@ -59080,7 +59106,7 @@ impl Connection {
                                 "Cannot add a column with non-constant default".to_owned(),
                             ));
                         }
-                        Ok(format_default_value(dv))
+                        Ok(self.format_default_value_verbatim(dv))
                     })
                     .transpose()?;
                 let (generated_expr, generated_stored) = col_def
