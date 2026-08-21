@@ -28706,8 +28706,17 @@ impl Connection {
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
         self.txn_metrics_note_write();
-        let use_statement_savepoint = !skip_statement_savepoint_in_explicit_txn
-            && self.should_use_statement_savepoint(was_auto);
+        // bd-01qa9: the skip-statement-savepoint optimization (bd-pktso) is only
+        // safe for a single-row prepared INSERT — a constraint violation fails the
+        // whole one-row statement with no earlier rows to undo. When a retained
+        // autocommit batch is active, a FAILED multi-row INSERT's partial rows
+        // would otherwise be committed by the retained-batch error-flush
+        // (resolve_autocommit_txn), so force a statement savepoint here so the
+        // failed statement is rolled back before the batch of prior good writes is
+        // flushed. FAIL still preserves via preserve_prior_changes_on_constraint_violation.
+        let use_statement_savepoint = self.should_use_statement_savepoint(was_auto)
+            && (!skip_statement_savepoint_in_explicit_txn
+                || self.retained_autocommit_batch_active());
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(
@@ -33468,10 +33477,19 @@ impl Connection {
                 // (for example via trigger RAISE(ROLLBACK)). In that case,
                 // the outer rollback has already restored connection state.
                 if self.active_txn.borrow().is_none() {
-                    eprintln!("BD01QA9 wrapper: active_txn None at rollback -> early return");
                     return Err(statement_error);
                 }
-                eprintln!("BD01QA9 wrapper: ROLLBACK-to-savepoint path (purpose={purpose})");
+
+                // bd-01qa9: match the SQL ROLLBACK TO cleanup (execute_rollback_with_cx)
+                // so a rolled-back INSERT's staged/appended rows are discarded, not
+                // just its committed pages. INSERT stages appends in the pending-
+                // direct-write buffer / append hint; without clearing them the rows
+                // survive the pager savepoint rollback. UPDATE edits pages in place
+                // and has no such buffer. Runs only on the rollback (non-FAIL) path.
+                self.stmt_microbatch_flush();
+                self.discard_cached_vdbe_engine();
+                self.clear_prepared_direct_insert_append_hint();
+                self.clear_pending_direct_write_runs();
 
                 let mut cleanup_errors = Vec::new();
                 let mut pager_rollback_succeeded = false;
@@ -34049,16 +34067,9 @@ impl Connection {
     }
 
     fn should_use_statement_savepoint(&self, was_auto: bool) -> bool {
-        let r = self.active_txn_is_open_or_borrowed()
+        self.active_txn_is_open_or_borrowed()
             && self.internal_statement_savepoint_depth.get() == 0
-            && (!was_auto || self.retained_autocommit_batch_active());
-        eprintln!(
-            "BD01QA9 should_use_sp: {r} (was_auto={was_auto} active_txn={} depth={} retained={})",
-            self.active_txn_is_open_or_borrowed(),
-            self.internal_statement_savepoint_depth.get(),
-            self.retained_autocommit_batch_active()
-        );
-        r
+            && (!was_auto || self.retained_autocommit_batch_active())
     }
 
     /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
@@ -54806,10 +54817,6 @@ impl Connection {
         }
 
         let is_concurrent_txn = self.concurrent_txn.get();
-        eprintln!(
-            "BD01QA9 resolve: ok={ok} retained_active={} is_concurrent={is_concurrent_txn} pending_writes={txn_has_pending_writes}",
-            self.retained_autocommit_batch_active()
-        );
         // bd-m1nte / I2: On error with an active retained batch, flush immediately
         // to commit prior good writes and reset the batch. This prevents error
         // cascades from accumulating in a single oversized transaction.
@@ -54819,7 +54826,6 @@ impl Connection {
             && txn_has_pending_writes
             && self.live_vtab_transactions.borrow().is_empty()
         {
-            eprintln!("BD01QA9 resolve: HIT !ok retained-batch flush (commits partial)");
             *self.retained_autocommit_txn.borrow_mut() = Some(txn);
             self.concurrent_txn.set(false);
             self.end_concurrent_rowid_session();
@@ -94571,6 +94577,24 @@ fn validate_function_call_resolution(
     }
     let is_aggregate =
         is_current_aggregate_or_json_fn(name, args) && !is_scalar_max_min(name, args);
+    // A known SCALAR used with OVER is a misuse — stock reports "NAME() may not
+    // be used as a window function", not "no such function: NAME". An unknown
+    // name still falls through to "no such function"; aggregates are valid as
+    // window functions. bd-errmsg-batch3.
+    if over.is_some() && !is_aggregate {
+        let (is_window, is_scalar) = with_current_sync_function_registry(|registry| {
+            let reg = registry.unwrap_or_else(|| shared_builtin_function_registry().as_ref());
+            (
+                reg.window_accepts_arg_count(name, num_args).is_some(),
+                reg.scalar_accepts_arg_count(name, num_args).is_some(),
+            )
+        });
+        if !is_window && is_scalar {
+            return Err(FrankenError::FunctionError(format!(
+                "{name}() may not be used as a window function"
+            )));
+        }
+    }
     let accepted = if application_kind.is_some() {
         // Resolution already selected a compatible application overload.  In
         // particular, it must take precedence over name-only JSON and FTS5
