@@ -90,6 +90,13 @@ fn datetime_deep_edges_match_rusqlite_oracle() {
             // fuller strftime specifier set
             "SELECT strftime('%j','2024-03-01')",
             "SELECT strftime('%W %U','2024-01-01')",
+            // bd-zv4ra: %U (Sunday-first week-of-year) — was passed through literal
+            "SELECT strftime('%U','2024-01-07')",
+            "SELECT strftime('%U','2024-06-15')",
+            "SELECT strftime('%U','2024-12-31')",
+            "SELECT strftime('%U','2023-01-01')",
+            "SELECT strftime('%W %U %V','2024-12-30')",
+            "SELECT strftime('%U','2024-01-06')",
             "SELECT strftime('%G-W%V-%u','2024-01-01')",
             "SELECT strftime('%G-W%V-%u','2026-12-31')",
             "SELECT strftime('%p %I','2024-06-15 13:05:00')",

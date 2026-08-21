@@ -1140,6 +1140,14 @@ fn format_strftime(fmt: &str, jdn: f64, subsec: bool, unmodified: Option<Unmodif
                 let w = (doy + 6 - ((dow + 6) % 7)) / 7;
                 push_zero_padded_2(&mut result, w);
             }
+            'U' => {
+                // Week of year (Sunday as first day of week, 00-53): the C
+                // strftime rule (0-based yday + 7 - wday)/7, with `dow`
+                // already 0=Sunday. Days before the first Sunday are week 00.
+                // bd-zv4ra.
+                let u = (doy + 6 - dow) / 7;
+                push_zero_padded_2(&mut result, u);
+            }
             'Y' => push_zero_padded_4(&mut result, y),
             'G' | 'g' | 'V' => {
                 // ISO 8601 week-based year/week.
