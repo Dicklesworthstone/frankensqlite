@@ -37833,6 +37833,10 @@ impl Connection {
 struct InsertSelectReplayEmitter<'conn> {
     connection: &'conn Connection,
     source_column_count: usize,
+    // For a stock-parity column/value count-mismatch message (bd-errmsg-parity #7).
+    target_table_name: String,
+    has_explicit_columns: bool,
+    table_column_count: usize,
     prepared: Option<PreparedStatement<'conn>>,
     returning_statement: Option<Statement>,
     statement_changes: usize,
@@ -37873,14 +37877,24 @@ impl InsertSelectReplayEmitter<'_> {
     }
 
     async fn emit_row(&mut self, row_values: &[SqliteValue]) -> Result<()> {
-        let row_idx = self.produced_rows;
         self.produced_rows = self.produced_rows.saturating_add(1);
         if row_values.len() != self.source_column_count {
-            return Err(FrankenError::Internal(format!(
-                "INSERT ... SELECT column count mismatch: source row {row_idx} has {} values, SELECT produced {}",
-                row_values.len(),
-                self.source_column_count,
-            )));
+            // Match stock SQLite's verbatim SQLITE_ERROR text (mirrors the VDBE
+            // INSERT..VALUES path). Two forms, keyed on whether an explicit
+            // target column list was given: none -> "table t has N columns but
+            // M values were supplied"; explicit -> "M values for N columns".
+            let actual = row_values.len();
+            let message = if !self.has_explicit_columns
+                && self.source_column_count == self.table_column_count
+            {
+                format!(
+                    "table {} has {} columns but {} values were supplied",
+                    self.target_table_name, self.table_column_count, actual
+                )
+            } else {
+                format!("{actual} values for {} columns", self.source_column_count)
+            };
+            return Err(FrankenError::FunctionError(message));
         }
 
         let row_result = if let Some(returning_statement) = self.returning_statement.as_ref() {
@@ -40005,6 +40019,8 @@ impl Connection {
             )));
         }
         let source_column_count = layout.targets.len();
+        let has_explicit_columns = !insert.columns.is_empty();
+        let table_column_count = layout.table_columns.len();
         let insert_sql = self.build_insert_select_replay_sql(insert, &layout);
         let collect_returning = !insert.returning.is_empty();
         let preserve_constraint_failure_rows =
@@ -40028,6 +40044,9 @@ impl Connection {
                 let mut emitter = InsertSelectReplayEmitter {
                     connection: self,
                     source_column_count,
+                    target_table_name: insert.table.name.clone(),
+                    has_explicit_columns,
+                    table_column_count,
                     prepared,
                     returning_statement,
                     statement_changes: 0,
