@@ -4,12 +4,16 @@
 //! expected string so a regression (e.g. an `Internal("internal error: …")`
 //! wrapping, or reworded text) is caught.
 //!
-//! Scope note (bd-ttof2): the " in <SQL> at offset N" suffix feature has begun
-//! — aggregate-in-WHERE misuse is asserted verbatim below (name + two spellings
-//! + offset). Still NOT asserted (suffix not yet wired at those sites):
-//! no-such-column in SELECT, no-such-function, wrong-arg-count, ambiguous-column,
-//! table-already-exists; plus the open bugs (INTEGER-PK dup wording, INSERT
-//! column-count `not implemented:` prefix). Those are tracked in bd-ttof2.
+//! Scope note (bd-ttof2, FIX-FORWARD): SQLite does NOT append a
+//! " in <SQL> at offset N" suffix to any error MESSAGE — the byte offset is
+//! exposed only via the separate sqlite3_error_offset() C API. An earlier
+//! bd-ttof2 slice misread rusqlite's Display wrapper (which formats the offset
+//! into the string on the prepare path) as stock behavior; verified against
+//! sqlite3 CLI 3.46.1 and rusqlite 3.53's bare `SqlInputError.msg` that neither
+//! the CLI nor the C API carries the suffix. The `_offset`-named tests below
+//! therefore assert the BARE stock message and guard against the suffix
+//! regressing back in. Regression tracked in
+//! bd-ttof2-offset-suffix-regression-npx41.
 
 use fsqlite_core::connection::Connection;
 
@@ -112,91 +116,87 @@ fn view_modify_errors() {
 #[test]
 fn aggregate_in_where_misuse_offset() {
     asupersync::test_utils::run_test(|| async {
-        // bd-ttof2 (offset-suffix feature, first slice): an aggregate in WHERE
-        // now (a) names the offending aggregate, (b) uses stock's two spellings
-        // ("misuse of aggregate: NAME()" when the SELECT is itself an aggregate
-        // query, else "misuse of aggregate function NAME()"), and (c) carries
-        // SQLite's " in <SQL> at offset N" suffix — N is the byte offset of the
-        // offending call (the rightmost aggregate, per stock). Was the bare,
-        // offsetless "misuse of aggregate: ".
+        // An aggregate in WHERE names the offending aggregate and uses stock's
+        // two spellings: "misuse of aggregate: NAME()" when the SELECT is itself
+        // an aggregate query, else "misuse of aggregate function NAME()"; the
+        // two-aggregate case names the RIGHTMOST. bd-ttof2 FIX-FORWARD: there is
+        // NO " in <SQL> at offset N" suffix — stock never puts the byte offset in
+        // the message (verified vs rusqlite 3.53 + sqlite3 CLI 3.46.1).
         let t: &[&str] = &["CREATE TABLE t(x INT)"];
         query_err_is(t, "SELECT max(x) FROM t WHERE max(x) > 0",
-               "misuse of aggregate: max() in SELECT max(x) FROM t WHERE max(x) > 0 at offset 27").await;
+               "misuse of aggregate: max()").await;
         query_err_is(t, "SELECT * FROM t WHERE sum(x) > 0",
-               "misuse of aggregate function sum() in SELECT * FROM t WHERE sum(x) > 0 at offset 22").await;
-        // offset points at the aggregate even when it is not the leading token
+               "misuse of aggregate function sum()").await;
         query_err_is(t, "SELECT * FROM t WHERE x > sum(x)",
-               "misuse of aggregate function sum() in SELECT * FROM t WHERE x > sum(x) at offset 26").await;
-        // two aggregates: stock names (and offsets) the RIGHTMOST
+               "misuse of aggregate function sum()").await;
         query_err_is(t, "SELECT * FROM t WHERE sum(x) + count(*) > 0",
-               "misuse of aggregate function count() in SELECT * FROM t WHERE sum(x) + count(*) > 0 at offset 31").await;
+               "misuse of aggregate function count()").await;
     });
 }
 
 #[test]
 fn window_misuse_offset() {
     asupersync::test_utils::run_test(|| async {
-        // bd-ttof2 offset-suffix (slice 2): a window function where one is not
-        // allowed (WHERE / GROUP BY / HAVING) names the offending call and
-        // carries the offset: "misuse of window function NAME() in <SQL> at
-        // offset N". Was the bare, offsetless "misuse of window function".
+        // A window function where one is not allowed (WHERE / GROUP BY / HAVING)
+        // names the offending call: "misuse of window function NAME()".
+        // bd-ttof2 FIX-FORWARD: NO " in <SQL> at offset N" suffix (stock never
+        // puts the byte offset in the message).
         let t: &[&str] = &["CREATE TABLE t(x INT, g TEXT)"];
         query_err_is(t, "SELECT x FROM t WHERE row_number() OVER () = 1",
-               "misuse of window function row_number() in SELECT x FROM t WHERE row_number() OVER () = 1 at offset 22").await;
+               "misuse of window function row_number()").await;
         query_err_is(t, "SELECT g FROM t GROUP BY row_number() OVER ()",
-               "misuse of window function row_number() in SELECT g FROM t GROUP BY row_number() OVER () at offset 25").await;
+               "misuse of window function row_number()").await;
         query_err_is(t, "SELECT g FROM t GROUP BY g HAVING row_number() OVER () > 0",
-               "misuse of window function row_number() in SELECT g FROM t GROUP BY g HAVING row_number() OVER () > 0 at offset 34").await;
-        // offset points at the window call even when it is not the leading token
+               "misuse of window function row_number()").await;
         query_err_is(t, "SELECT x FROM t WHERE x > sum(x) OVER ()",
-               "misuse of window function sum() in SELECT x FROM t WHERE x > sum(x) OVER () at offset 26").await;
+               "misuse of window function sum()").await;
     });
 }
 
 #[test]
 fn nested_aggregate_misuse_offset() {
     asupersync::test_utils::run_test(|| async {
-        // bd-ttof2 offset-suffix (slice 3): an aggregate nested inside another
-        // aggregate names the INNER call and carries its offset: "misuse of
-        // aggregate function NAME() in <SQL> at offset N". Was the bare,
-        // offsetless "misuse of aggregate function".
+        // An aggregate nested inside another aggregate names the INNER call:
+        // "misuse of aggregate function NAME()". bd-ttof2 FIX-FORWARD: NO
+        // " in <SQL> at offset N" suffix (stock never puts the byte offset in
+        // the message; verified vs sqlite3 CLI 3.46.1).
         let t: &[&str] = &["CREATE TABLE t(x INT, g TEXT)"];
         query_err_is(t, "SELECT sum(count(*)) FROM t",
-               "misuse of aggregate function count() in SELECT sum(count(*)) FROM t at offset 11").await;
+               "misuse of aggregate function count()").await;
         query_err_is(t, "SELECT max(avg(x)) FROM t GROUP BY g",
-               "misuse of aggregate function avg() in SELECT max(avg(x)) FROM t GROUP BY g at offset 11").await;
+               "misuse of aggregate function avg()").await;
         query_err_is(t, "SELECT g FROM t GROUP BY g HAVING sum(count(*)) > 0",
-               "misuse of aggregate function count() in SELECT g FROM t GROUP BY g HAVING sum(count(*)) > 0 at offset 38").await;
+               "misuse of aggregate function count()").await;
         // a non-nested aggregate precedes the nested one: still names the inner
         query_err_is(t, "SELECT avg(x) + sum(count(*)) FROM t",
-               "misuse of aggregate function count() in SELECT avg(x) + sum(count(*)) FROM t at offset 20").await;
+               "misuse of aggregate function count()").await;
         // triple nesting reports the innermost
         query_err_is(t, "SELECT sum(avg(count(*))) FROM t",
-               "misuse of aggregate function count() in SELECT sum(avg(count(*))) FROM t at offset 15").await;
+               "misuse of aggregate function count()").await;
     });
 }
 
 #[test]
 fn function_resolution_offset() {
     asupersync::test_utils::run_test(|| async {
-        // bd-ttof2 offset-suffix (slice 4): function-resolution and function-modifier
-        // errors carry stock's " in <SQL> at offset N" suffix (offset = the
-        // FunctionCall position). DISTINCT-on-window is intentionally NOT tagged
-        // (stock reports it without the suffix).
+        // Function-resolution and function-modifier errors. bd-ttof2
+        // FIX-FORWARD: NO " in <SQL> at offset N" suffix — stock reports the
+        // bare message (verified vs sqlite3 CLI 3.46.1); the byte offset is
+        // only reachable via a separate sqlite3_error_offset()-style accessor.
         let t: &[&str] = &["CREATE TABLE t(a INT, b INT)"];
         query_err_is(t, "SELECT nosuchfn(a) FROM t",
-               "no such function: nosuchfn in SELECT nosuchfn(a) FROM t at offset 7").await;
-        // offset points at the inner call when it is nested
+               "no such function: nosuchfn").await;
+        // nested inner call resolves the same bare message
         query_err_is(t, "SELECT abs(nosuchfn(a)) FROM t",
-               "no such function: nosuchfn in SELECT abs(nosuchfn(a)) FROM t at offset 11").await;
+               "no such function: nosuchfn").await;
         query_err_is(&[], "SELECT abs(1, 2)",
-               "wrong number of arguments to function abs() in SELECT abs(1, 2) at offset 7").await;
+               "wrong number of arguments to function abs()").await;
         query_err_is(t, "SELECT a + abs(1, 2) FROM t",
-               "wrong number of arguments to function abs() in SELECT a + abs(1, 2) FROM t at offset 11").await;
+               "wrong number of arguments to function abs()").await;
         query_err_is(t, "SELECT abs(a) FILTER (WHERE a > 0) FROM t",
-               "FILTER may not be used with non-aggregate abs() in SELECT abs(a) FILTER (WHERE a > 0) FROM t at offset 7").await;
+               "FILTER may not be used with non-aggregate abs()").await;
         query_err_is(t, "SELECT abs(a ORDER BY a) FROM t",
-               "ORDER BY may not be used with non-aggregate abs() in SELECT abs(a ORDER BY a) FROM t at offset 7").await;
+               "ORDER BY may not be used with non-aggregate abs()").await;
         // DISTINCT-on-window: base message only (no offset), matching stock.
         query_err_is(t, "SELECT count(DISTINCT a) OVER () FROM t",
                "DISTINCT is not supported for window functions").await;
@@ -206,20 +206,18 @@ fn function_resolution_offset() {
 #[test]
 fn offset_suffix_on_parameterized_entrypoint() {
     asupersync::test_utils::run_test(|| async {
-        // bd-ttof2: the offset suffix attaches on the parameterized entry points
-        // (query_with_params/execute_with_params), not just query/execute. A
-        // function-resolution error raised through query_with_params carries the
-        // full stock message. (The dispatch-level *misuse* validation is skipped
-        // on the parameterized fast path — a separate pre-existing gap tracked in
-        // bd-ttof2 — so this asserts a function-resolution error, which does fire.)
+        // The parameterized entry points (query_with_params/execute_with_params)
+        // surface the same bare stock error message as query/execute. A
+        // function-resolution error raised through query_with_params reports the
+        // stock message with NO offset suffix (bd-ttof2 FIX-FORWARD). (The
+        // dispatch-level *misuse* validation is skipped on the parameterized fast
+        // path — a separate pre-existing gap tracked in bd-ttof2 — so this
+        // asserts a function-resolution error, which does fire.)
         let f = Connection::open(":memory:").await.unwrap();
         let _ = f.execute("CREATE TABLE t(x INT)").await;
         match f.query_with_params("SELECT nosuchfn(x) FROM t", &[]).await {
             Ok(_) => panic!("expected an error"),
-            Err(e) => assert_eq!(
-                e.to_string(),
-                "no such function: nosuchfn in SELECT nosuchfn(x) FROM t at offset 7"
-            ),
+            Err(e) => assert_eq!(e.to_string(), "no such function: nosuchfn"),
         }
     });
 }

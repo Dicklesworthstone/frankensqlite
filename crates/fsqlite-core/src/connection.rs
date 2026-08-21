@@ -486,21 +486,18 @@ fn take_error_byte_offset() -> Option<u32> {
 /// the verbatim base message in `FunctionError` (same code, `{0}` Display) so
 /// the wire message matches stock exactly. On success it just clears the
 /// channel. bd-ttof2.
-fn attach_error_byte_offset_suffix<T>(result: Result<T>, sql: &str) -> Result<T> {
-    match result {
-        Ok(value) => {
-            clear_error_byte_offset();
-            Ok(value)
-        }
-        Err(error) => match take_error_byte_offset() {
-            Some(offset) if matches!(error.error_code(), ErrorCode::Error) => {
-                Err(FrankenError::FunctionError(format!(
-                    "{error} in {sql} at offset {offset}"
-                )))
-            }
-            _ => Err(error),
-        },
-    }
+fn attach_error_byte_offset_suffix<T>(result: Result<T>, _sql: &str) -> Result<T> {
+    // bd-ttof2 FIX-FORWARD: SQLite never appends " in <SQL> at offset N" to an
+    // error MESSAGE — the byte offset is exposed only via the separate
+    // sqlite3_error_offset() C API. Verified vs rusqlite 3.53 AND sqlite3 CLI
+    // 3.46.1: all offset-tagged error types (no-such-function, wrong-arg-count,
+    // FILTER/ORDER-BY/window misuse, misuse-of-aggregate) return the BARE
+    // message in both oracles (repro: zz_ttof2_repro.rs, 9/9). Narrowed to zero
+    // matching sites: clear any recorded offset and pass the verbatim error
+    // through unchanged. The mark_error_offset machinery is retained so a future
+    // sqlite3_error_offset()-style accessor can surface the offset out-of-band.
+    let _ = take_error_byte_offset();
+    result
 }
 
 #[cfg(test)]
