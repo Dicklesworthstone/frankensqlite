@@ -552,6 +552,24 @@ jobs:
         run: |
           cargo test -p fsqlite-core --test in_subquery_text_affinity_oracle -- --nocapture
 
+      - name: Differential stock-parity oracle keepers (2026-08 campaign)
+        run: |
+          cargo test -p fsqlite-core --test bd_json_group_aggregates_oracle -- --nocapture
+          cargo test -p fsqlite-core --test gencol_default_expr_oracle -- --nocapture
+          cargo test -p fsqlite-core --test setops_rowvalue_oracle -- --nocapture
+          cargo test -p fsqlite-core --test check_constraint_oracle -- --nocapture
+          cargo test -p fsqlite-core --test like_glob_oracle -- --nocapture
+          cargo test -p fsqlite-core --test correlated_subquery_oracle -- --nocapture
+          cargo test -p fsqlite-core --test upsert_oracle -- --nocapture
+          cargo test -p fsqlite-core --test datetime_oracle -- --nocapture
+          cargo test -p fsqlite-core --test cast_affinity_oracle -- --nocapture
+          cargo test -p fsqlite-core --test window_function_oracle -- --nocapture
+          cargo test -p fsqlite-core --test recursive_cte_oracle -- --nocapture
+          cargo test -p fsqlite-core --test foreign_key_oracle -- --nocapture
+          cargo test -p fsqlite-core --test collation_oracle -- --nocapture
+          cargo test -p fsqlite-core --test aggregate_edge_oracle -- --nocapture
+          cargo test -p fsqlite-core --test join_oracle -- --nocapture
+
   e2e-scenario-matrix:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
