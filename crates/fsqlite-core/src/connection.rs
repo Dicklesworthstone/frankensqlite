@@ -61570,7 +61570,15 @@ impl Connection {
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(table_name))
                 .ok_or_else(|| FrankenError::NoSuchTable {
-                    name: table_name.clone(),
+                    // Stock schema-qualifies the target table in CREATE INDEX
+                    // "no such table" errors (unlike SELECT/DROP/ALTER): a bare
+                    // index name defaults to the main schema, an `aux.i`
+                    // qualifier looks the table up in `aux`. bd-errmsg-batch2.
+                    name: format!(
+                        "{}.{}",
+                        stmt.name.schema.as_deref().unwrap_or("main"),
+                        table_name
+                    ),
                 })?;
             // An index cannot reuse the name of an existing table or view. C
             // SQLite rejects this unconditionally — IF NOT EXISTS only suppresses
@@ -61988,7 +61996,11 @@ impl Connection {
             }
             if !view_exists {
                 return Err(FrankenError::NoSuchTable {
-                    name: table_name.clone(),
+                    name: format!(
+                        "{}.{}",
+                        stmt.name.schema.as_deref().unwrap_or("main"),
+                        table_name
+                    ),
                 });
             }
         } else {
@@ -62005,7 +62017,11 @@ impl Connection {
             }
             if !table_exists {
                 return Err(FrankenError::NoSuchTable {
-                    name: table_name.clone(),
+                    name: format!(
+                        "{}.{}",
+                        stmt.name.schema.as_deref().unwrap_or("main"),
+                        table_name
+                    ),
                 });
             }
         }
