@@ -169,3 +169,15 @@ fn schema_and_generated_column_error_messages_6mj9n() {
         );
     });
 }
+
+#[test]
+fn unknown_attached_schema_create_messages_zh5kl() {
+    asupersync::test_utils::run_test(|| async {
+        // A CREATE-family statement qualified by an unknown attached schema
+        // reports "unknown database <schema>" (routed through
+        // execute_statement_dispatch_with_fk_scope). DML/DROP take a separate
+        // fast-path and are tracked as a follow-up on bd-...-zh5kl.
+        assert_stock(&err_of(&[], "CREATE TABLE nodb.t(a)").await, "unknown database nodb");
+        assert_stock(&err_of(&[], "CREATE VIEW nodb.v AS SELECT 1").await, "unknown database nodb");
+    });
+}

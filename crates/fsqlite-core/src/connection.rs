@@ -17466,6 +17466,54 @@ impl Connection {
         }
     }
 
+    /// Convert `attached_target_schema`'s generic Internal "no such database: X"
+    /// (raised when a statement is qualified by an UNKNOWN attached schema) into
+    /// SQLite's per-statement message: a CREATE-family statement reports
+    /// "unknown database X"; a DML/ALTER statement and a DROP of a specific
+    /// object report the qualified object as missing ("no such <kind>: X.<name>"
+    /// under SQLITE_ERROR). PRAGMA has its own remap in
+    /// `attached_pragma_target_schema`, and any non-matching error is passed
+    /// through unchanged. bd-attached-schema-qualifier-per-stmt-messages-zh5kl.
+    fn remap_unknown_attached_schema_for_statement(
+        &self,
+        error: FrankenError,
+        statement: &Statement,
+    ) -> FrankenError {
+        let schema = match &error {
+            FrankenError::Internal(detail) => match detail.strip_prefix("no such database: ") {
+                Some(schema) => schema.to_owned(),
+                None => return error,
+            },
+            _ => return error,
+        };
+        let missing = |object: &str, name: &str| {
+            FrankenError::function_error(format!("no such {object}: {schema}.{name}"))
+        };
+        match statement {
+            Statement::CreateTable(_)
+            | Statement::CreateVirtualTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::CreateView(_)
+            | Statement::CreateTrigger(_) => {
+                FrankenError::function_error(format!("unknown database {schema}"))
+            }
+            Statement::Insert(insert) => missing("table", &insert.table.name),
+            Statement::Update(update) => missing("table", &update.table.name.name),
+            Statement::Delete(delete) => missing("table", &delete.table.name.name),
+            Statement::AlterTable(alter) => missing("table", &alter.table.name),
+            Statement::Drop(drop_stmt) => {
+                let object = match drop_stmt.object_type {
+                    fsqlite_ast::DropObjectType::Index => "index",
+                    fsqlite_ast::DropObjectType::View => "view",
+                    fsqlite_ast::DropObjectType::Trigger => "trigger",
+                    fsqlite_ast::DropObjectType::Table => "table",
+                };
+                missing(object, &drop_stmt.name.name)
+            }
+            _ => error,
+        }
+    }
+
     async fn maybe_execute_attached_select(
         &self,
         select: &SelectStatement,
@@ -34693,11 +34741,13 @@ impl Connection {
     ) -> Result<Vec<Row>> {
         if let Some(rows) = self
             .maybe_execute_attached_target_statement(statement, params)
-            .await?
+            .await
+            .map_err(|error| self.remap_unknown_attached_schema_for_statement(error, statement))?
         {
             return Ok(rows);
         }
-        self.reject_unsupported_attached_target_schema(statement)?;
+        self.reject_unsupported_attached_target_schema(statement)
+            .map_err(|error| self.remap_unknown_attached_schema_for_statement(error, statement))?;
         // bd-1mcjr: stock SQLite rejects `TABLE.*` wildcards in RETURNING at
         // prepare time ("RETURNING may not use \"TABLE.*\" wildcards"), for any
         // DML target including an attached-schema-qualified one. Match it
