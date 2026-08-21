@@ -35056,6 +35056,12 @@ impl Connection {
                 detail: "RETURNING may not use \"TABLE.*\" wildcards".to_owned(),
             });
         }
+        // A bare aggregate/window function in a RETURNING projection is a misuse
+        // (RETURNING is per-row, not an aggregate context). SQLite rejects it at
+        // prepare with "misuse of aggregate/window function NAME()".
+        if let Some(error) = returning_aggregate_window_misuse(statement) {
+            return Err(error);
+        }
         // ATTACH/DETACH register or release a *separate* side connection and do
         // not write to the main database file, so a read-only / schema-only main
         // connection must still be allowed to run them — this matches SQLite,
@@ -121337,6 +121343,35 @@ fn statement_returning_uses_table_star(statement: &Statement) -> bool {
     returning
         .iter()
         .any(|column| matches!(column, ResultColumn::TableStar(_)))
+}
+
+/// Detect a bare aggregate or window function in a DML `RETURNING` projection.
+/// SQLite rejects it at prepare — `RETURNING` is a per-row projection, not an
+/// aggregate context — with "misuse of aggregate function NAME()" /
+/// "misuse of window function NAME()". An aggregate nested inside a subquery is
+/// legal and NOT reported (`collect_agg_window_calls_ordered` stops at subquery
+/// boundaries). bd-errmsg-parity-batch3-3brmm.
+fn returning_aggregate_window_misuse(statement: &Statement) -> Option<FrankenError> {
+    let returning = match statement {
+        Statement::Insert(insert) => &insert.returning,
+        Statement::Update(update) => &update.returning,
+        Statement::Delete(delete) => &delete.returning,
+        _ => return None,
+    };
+    for column in returning {
+        if let ResultColumn::Expr { expr, .. } = column {
+            let mut calls = Vec::new();
+            collect_agg_window_calls_ordered(expr, &mut calls);
+            if let Some((name, _span, is_window)) = calls.into_iter().next() {
+                return Some(FrankenError::FunctionError(if is_window {
+                    format!("misuse of window function {name}()")
+                } else {
+                    format!("misuse of aggregate function {name}()")
+                }));
+            }
+        }
+    }
+    None
 }
 
 fn statement_writes_under_query_only(statement: &Statement) -> bool {

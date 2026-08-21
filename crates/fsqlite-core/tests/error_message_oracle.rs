@@ -377,3 +377,52 @@ fn insert_select_column_count_mismatch() {
             .expect("matching-width explicit-projection INSERT..SELECT is valid");
     });
 }
+
+#[test]
+fn returning_aggregate_or_window_misuse() {
+    asupersync::test_utils::run_test(|| async {
+        // A bare aggregate/window function in a RETURNING projection is a misuse —
+        // RETURNING is a per-row projection, not an aggregate context. Verified vs
+        // sqlite3 CLI 3.46.1 (bd-errmsg-parity-batch3-3brmm).
+        err_is(
+            &["CREATE TABLE t(a)"],
+            "INSERT INTO t VALUES (1) RETURNING count(*)",
+            "misuse of aggregate function count()",
+        )
+        .await;
+        err_is(
+            &["CREATE TABLE t(a)", "INSERT INTO t VALUES(1)"],
+            "UPDATE t SET a = 2 RETURNING sum(a)",
+            "misuse of aggregate function sum()",
+        )
+        .await;
+        err_is(
+            &["CREATE TABLE t(a)", "INSERT INTO t VALUES(1)"],
+            "DELETE FROM t RETURNING count(*)",
+            "misuse of aggregate function count()",
+        )
+        .await;
+        // a window function in RETURNING is likewise a misuse
+        err_is(
+            &["CREATE TABLE t(a)"],
+            "INSERT INTO t VALUES (1) RETURNING row_number() OVER ()",
+            "misuse of window function row_number()",
+        )
+        .await;
+
+        // NEGATIVE: a plain projection, and an aggregate INSIDE a subquery, are
+        // both legal (the subquery has its own aggregate context).
+        let f = Connection::open(":memory:").await.unwrap();
+        f.execute("CREATE TABLE t(a)").await.unwrap();
+        assert!(
+            f.query("INSERT INTO t VALUES (5) RETURNING a + 1").await.is_ok(),
+            "plain RETURNING expression is valid"
+        );
+        assert!(
+            f.query("INSERT INTO t VALUES (6) RETURNING (SELECT count(*) FROM t)")
+                .await
+                .is_ok(),
+            "aggregate inside a subquery in RETURNING is legal"
+        );
+    });
+}
