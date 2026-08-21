@@ -130,12 +130,14 @@ fn attach_cross_db_queries_match_rusqlite_oracle() {
         ex(&f, &r, "INSERT INTO aux.t(id,tag) SELECT id, name FROM main.t WHERE id=1").await;
         check("after cross-db insert-select", fq(&f, "SELECT id,tag FROM aux.t ORDER BY id").await,
               rq(&r, "SELECT id,tag FROM aux.t ORDER BY id"), &mut diffs);
-        // NOTE: cross-DB UPDATE/DELETE whose subquery references the real `main`
-        // (e.g. `UPDATE aux.t SET tag=(SELECT name FROM main.t ...)` and
-        // `DELETE FROM aux.t WHERE id NOT IN (SELECT id FROM main.t)`) are a known
-        // divergence tracked in bd-s12cm (frank misresolves `main.` to the attached
-        // child's own DB and no-ops) — intentionally not asserted here.
-        // main untouched by the aux insert
+        // NOTE: a cross-DB UPDATE/DELETE whose WHERE/SET references the real `main`
+        // via a subquery (e.g. `UPDATE aux.t SET tag='UPD' WHERE id IN (SELECT id
+        // FROM main.t)`) is still a known divergence tracked in bd-s12cm: the write
+        // is delegated to the attached child where `main.t` resolves to the child's
+        // own DB, and there is no local mixed-schema WRITE path to fall back to (the
+        // fix must MATERIALIZE the main-side subquery locally before delegating, like
+        // INSERT ... SELECT does) — intentionally not asserted here.
+        // main untouched by the aux writes
         check("main untouched", fq(&f, "SELECT id,name FROM main.t ORDER BY id").await,
               rq(&r, "SELECT id,name FROM main.t ORDER BY id"), &mut diffs);
 
