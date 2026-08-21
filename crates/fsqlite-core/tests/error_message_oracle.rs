@@ -175,3 +175,30 @@ fn nested_aggregate_misuse_offset() {
                "misuse of aggregate function count() in SELECT sum(avg(count(*))) FROM t at offset 15").await;
     });
 }
+
+#[test]
+fn function_resolution_offset() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-ttof2 offset-suffix (slice 4): function-resolution and function-modifier
+        // errors carry stock's " in <SQL> at offset N" suffix (offset = the
+        // FunctionCall position). DISTINCT-on-window is intentionally NOT tagged
+        // (stock reports it without the suffix).
+        let t: &[&str] = &["CREATE TABLE t(a INT, b INT)"];
+        query_err_is(t, "SELECT nosuchfn(a) FROM t",
+               "no such function: nosuchfn in SELECT nosuchfn(a) FROM t at offset 7").await;
+        // offset points at the inner call when it is nested
+        query_err_is(t, "SELECT abs(nosuchfn(a)) FROM t",
+               "no such function: nosuchfn in SELECT abs(nosuchfn(a)) FROM t at offset 11").await;
+        query_err_is(&[], "SELECT abs(1, 2)",
+               "wrong number of arguments to function abs() in SELECT abs(1, 2) at offset 7").await;
+        query_err_is(t, "SELECT a + abs(1, 2) FROM t",
+               "wrong number of arguments to function abs() in SELECT a + abs(1, 2) FROM t at offset 11").await;
+        query_err_is(t, "SELECT abs(a) FILTER (WHERE a > 0) FROM t",
+               "FILTER may not be used with non-aggregate abs() in SELECT abs(a) FILTER (WHERE a > 0) FROM t at offset 7").await;
+        query_err_is(t, "SELECT abs(a ORDER BY a) FROM t",
+               "ORDER BY may not be used with non-aggregate abs() in SELECT abs(a ORDER BY a) FROM t at offset 7").await;
+        // DISTINCT-on-window: base message only (no offset), matching stock.
+        query_err_is(t, "SELECT count(DISTINCT a) OVER () FROM t",
+               "DISTINCT is not supported for window functions").await;
+    });
+}
