@@ -58257,7 +58257,9 @@ impl Connection {
                 requested_scope
             };
             if self.view_index_for_scope(obj_name, target_scope).is_some() {
-                return Err(FrankenError::Internal(format!(
+                // Stock reports this verbatim under SQLITE_ERROR, not "internal
+                // error:" / SQLITE_INTERNAL. bd-6mj9n.
+                return Err(FrankenError::FunctionError(format!(
                     "use DROP VIEW to delete view {obj_name}"
                 )));
             }
@@ -58308,7 +58310,7 @@ impl Connection {
                     .view_index_for_scope(obj_name, PragmaSchemaScope::Main)
                     .is_some()
                 {
-                    return Err(FrankenError::Internal(format!(
+                    return Err(FrankenError::FunctionError(format!(
                         "use DROP VIEW to delete view {obj_name}"
                     )));
                 }
@@ -58506,7 +58508,7 @@ impl Connection {
                     requested_scope
                 };
                 if self.table_exists_for_scope(obj_name, target_scope) {
-                    return Err(FrankenError::Internal(format!(
+                    return Err(FrankenError::FunctionError(format!(
                         "use DROP TABLE to delete table {obj_name}"
                     )));
                 }
@@ -61950,8 +61952,14 @@ impl Connection {
             }
         } else {
             if view_exists && !table_exists {
+                // Stock names the ACTUAL timing keyword; a trigger with no
+                // BEFORE/AFTER keyword defaults to BEFORE.
+                let timing_word = match stmt.timing {
+                    fsqlite_ast::TriggerTiming::After => "AFTER",
+                    _ => "BEFORE",
+                };
                 return Err(FrankenError::FunctionError(format!(
-                    "cannot create BEFORE/AFTER trigger on view: {table_name}"
+                    "cannot create {timing_word} trigger on view: {table_name}"
                 )));
             }
             if !table_exists {
@@ -167655,7 +167663,7 @@ mod tests {
             assert_eq!(temporary[0].values(), &[SqliteValue::Integer(2)]);
 
             let error = conn.execute("DROP VIEW base;").await.unwrap_err();
-            assert!(matches!(error, FrankenError::Internal(message)
+            assert!(matches!(error, FrankenError::FunctionError(message)
                     if message == "use DROP TABLE to delete table base"));
             assert!(conn.table_exists_for_scope("base", PragmaSchemaScope::Temp));
             assert!(conn.table_exists_for_scope("base", PragmaSchemaScope::Main));
