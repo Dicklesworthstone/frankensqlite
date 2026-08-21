@@ -94705,6 +94705,26 @@ fn validate_function_call_resolution(
             )))
         }
         None => {
+            // A window-only function (row_number, rank, dense_rank, ntile, lag,
+            // lead, first_value, ..., cume_dist) invoked WITHOUT OVER reaches here
+            // because it is neither a scalar nor an aggregate. SQLite reports
+            // "misuse of window function NAME()", not "no such function: NAME".
+            // (A scalar used WITH OVER is handled above; aggregate/window duals
+            // like sum/count are valid aggregates and never reach this arm.)
+            // bd-errmsg-parity-batch3-3brmm.
+            if over.is_none() {
+                let is_window_fn = with_current_sync_function_registry(|registry| {
+                    registry
+                        .unwrap_or_else(|| shared_builtin_function_registry().as_ref())
+                        .window_accepts_arg_count(name, num_args)
+                })
+                .is_some();
+                if is_window_fn {
+                    return Err(FrankenError::FunctionError(format!(
+                        "misuse of window function {name}()"
+                    )));
+                }
+            }
             mark_error_offset(offending_span);
             Err(FrankenError::FunctionError(format!(
                 "no such function: {name}"

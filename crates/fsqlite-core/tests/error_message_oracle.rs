@@ -302,3 +302,36 @@ fn multicolumn_subquery_comparison_operand_row_value_misused() {
         );
     });
 }
+
+#[test]
+fn bare_window_function_without_over_is_misuse() {
+    asupersync::test_utils::run_test(|| async {
+        // A window-only function (row_number, rank, lag, ...) called WITHOUT OVER
+        // is "misuse of window function NAME()", NOT "no such function: NAME".
+        // Verified vs sqlite3 CLI 3.46.1 (bd-errmsg-parity-batch3-3brmm).
+        let t: &[&str] = &["CREATE TABLE t(x INT)"];
+        query_err_is(t, "SELECT row_number() FROM t", "misuse of window function row_number()")
+            .await;
+        query_err_is(t, "SELECT rank() FROM t", "misuse of window function rank()").await;
+        query_err_is(t, "SELECT dense_rank() FROM t", "misuse of window function dense_rank()")
+            .await;
+        query_err_is(t, "SELECT lag(x) FROM t", "misuse of window function lag()").await;
+        query_err_is(t, "SELECT ntile(2) FROM t", "misuse of window function ntile()").await;
+        query_err_is(t, "SELECT cume_dist() FROM t", "misuse of window function cume_dist()").await;
+        // NEGATIVE: an unknown (non-window) function still reports "no such function".
+        query_err_is(t, "SELECT nosuchfn() FROM t", "no such function: nosuchfn").await;
+
+        // NEGATIVE: an aggregate/window dual (sum) without OVER is a valid
+        // aggregate; and a window function WITH OVER is valid.
+        let f = Connection::open(":memory:").await.unwrap();
+        f.execute("CREATE TABLE t(x INT)").await.unwrap();
+        assert!(
+            f.query("SELECT sum(x) FROM t").await.is_ok(),
+            "sum without OVER is a valid aggregate"
+        );
+        assert!(
+            f.query("SELECT row_number() OVER () FROM t").await.is_ok(),
+            "row_number() OVER () is valid"
+        );
+    });
+}
