@@ -2334,7 +2334,11 @@ fn remove_at_path(root: &mut Value, segments: &[PathSegment]) {
 
     match (parent, last_segment) {
         (Value::Object(object), PathSegment::Key(key)) => {
-            object.remove(key.as_ref());
+            // shift_remove (order-preserving), NOT remove (== swap_remove under
+            // serde_json's preserve_order IndexMap backing, which swaps the last
+            // member into the hole). SQLite's json_remove keeps the remaining
+            // object members in their original order.
+            object.shift_remove(key.as_ref());
         }
         (Value::Array(array), PathSegment::Index(index)) if *index < array.len() => {
             array.remove(*index);
@@ -2497,7 +2501,10 @@ fn merge_patch(target: Value, patch: Value) -> Value {
 
             for (key, patch_value) in patch_map {
                 if patch_value.is_null() {
-                    target_map.remove(&key);
+                    // Order-preserving removal (see remove_at_path): RFC 7396 /
+                    // SQLite json_patch drops a null-valued key while leaving the
+                    // remaining members in order.
+                    target_map.shift_remove(&key);
                     continue;
                 }
                 if let Some(prior) = target_map.get_mut(&key) {
@@ -4955,6 +4962,27 @@ mod tests {
     fn test_json_remove_array_compact() {
         let out = json_remove("[1,2,3]", &["$[1]"]).unwrap();
         assert_eq!(out, "[1,3]");
+    }
+
+    #[test]
+    fn test_json_remove_preserves_key_order() {
+        // Removing a middle key must leave the remaining members in their
+        // original order (SQLite parity). A swap_remove would move the LAST key
+        // ("d") into the hole -> {"a":1,"d":4,"c":3}. Needs 3+ keys to catch;
+        // test_json_remove_key with 2 keys cannot distinguish swap vs shift.
+        let out = json_remove(r#"{"a":1,"b":2,"c":3,"d":4}"#, &["$.b"]).unwrap();
+        assert_eq!(out, r#"{"a":1,"c":3,"d":4}"#);
+        // Removing the first key likewise preserves the tail order.
+        let out2 = json_remove(r#"{"a":1,"b":2,"c":3}"#, &["$.a"]).unwrap();
+        assert_eq!(out2, r#"{"b":2,"c":3}"#);
+    }
+
+    #[test]
+    fn test_json_patch_null_remove_preserves_order() {
+        // RFC 7396 / SQLite json_patch drops a null-valued key while keeping the
+        // remaining members in order (merge_patch must shift_remove, not remove).
+        let out = json_patch(r#"{"a":1,"b":2,"c":3,"d":4}"#, r#"{"b":null}"#).unwrap();
+        assert_eq!(out, r#"{"a":1,"c":3,"d":4}"#);
     }
 
     #[test]
