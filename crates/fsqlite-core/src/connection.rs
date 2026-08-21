@@ -17551,7 +17551,14 @@ impl Connection {
         self.attached_target_schema(name)
             .map_err(|error| match error {
                 FrankenError::Internal(detail) if detail.starts_with("no such database: ") => {
-                    FrankenError::ParseError { offset: 0, detail }
+                    // Stock reports a PRAGMA qualifier's unknown schema as
+                    // "unknown database <schema>" under SQLITE_ERROR (distinct
+                    // from the "no such database: X" used by DETACH). bd-6mj9n /
+                    // bd-...-lc80p.
+                    let schema = detail
+                        .strip_prefix("no such database: ")
+                        .unwrap_or(detail.as_str());
+                    FrankenError::function_error(format!("unknown database {schema}"))
                 }
                 other => other,
             })

@@ -136,6 +136,8 @@ fn schema_and_generated_column_error_messages_6mj9n() {
             &err_of(&["ATTACH ':memory:' AS aux"], "ATTACH ':memory:' AS aux").await,
             "database aux is already in use",
         );
+        // A PRAGMA qualified by an unknown schema (distinct wording from DETACH).
+        assert_stock(&err_of(&[], "PRAGMA nodb.user_version").await, "unknown database nodb");
         // INSERT into / UPDATE of a generated column.
         assert_stock(
             &err_of(
