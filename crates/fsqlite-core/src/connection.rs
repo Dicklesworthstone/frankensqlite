@@ -57638,14 +57638,16 @@ impl Connection {
                             .transpose()?;
                         let strict_type = if create.strict {
                             let type_decl = type_name.as_deref().ok_or_else(|| {
-                                FrankenError::Internal(format!(
-                                    "STRICT table {} column {} must declare a type",
+                                // Stock text under SQLITE_ERROR, not "internal
+                                // error:" / SQLITE_INTERNAL. bd-errmsg-batch3.
+                                FrankenError::FunctionError(format!(
+                                    "missing datatype for {}.{}",
                                     table_name, col.name
                                 ))
                             })?;
                             Some(StrictColumnType::from_type_name(type_decl).ok_or_else(|| {
-                                FrankenError::Internal(format!(
-                                    "STRICT table {} column {} has invalid type {}",
+                                FrankenError::FunctionError(format!(
+                                    "unknown datatype for {}.{}: \"{}\"",
                                     table_name, col.name, type_decl
                                 ))
                             })?)
@@ -60582,8 +60584,8 @@ impl Connection {
             if let Some(schema_name) = target.schema.as_deref()
                 && !schema_name.eq_ignore_ascii_case("main")
             {
-                return Err(FrankenError::internal(
-                    "unable to identify the object to be reindexed",
+                return Err(FrankenError::FunctionError(
+                    "unable to identify the object to be reindexed".to_owned(),
                 ));
             }
 
@@ -60643,8 +60645,8 @@ impl Connection {
                 return Ok(Vec::new());
             }
 
-            return Err(FrankenError::internal(
-                "unable to identify the object to be reindexed",
+            return Err(FrankenError::FunctionError(
+                "unable to identify the object to be reindexed".to_owned(),
             ));
         }
 
@@ -159581,7 +159583,7 @@ mod tests {
                 .await
                 .expect_err("STRICT column without declared type must fail");
             assert!(
-                matches!(missing_type, FrankenError::Internal(msg) if msg.contains("must declare a type"))
+                matches!(missing_type, FrankenError::FunctionError(msg) if msg.contains("missing datatype"))
             );
 
             let invalid_type = conn
@@ -159589,7 +159591,7 @@ mod tests {
                 .await
                 .expect_err("unsupported STRICT type must fail");
             assert!(
-                matches!(invalid_type, FrankenError::Internal(msg) if msg.contains("invalid type"))
+                matches!(invalid_type, FrankenError::FunctionError(msg) if msg.contains("unknown datatype"))
             );
         });
     }
