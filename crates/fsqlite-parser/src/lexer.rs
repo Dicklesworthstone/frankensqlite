@@ -769,7 +769,18 @@ impl<'a> Lexer<'a> {
                 }
             }
             if self.pos == hex_start {
-                return TokenKind::Error("empty hex literal".to_owned());
+                // `0x`/`0X` with no hex digits — whether bare (`0x`) or followed by
+                // non-hex identifier characters (`0xGG`) — is an unrecognized token
+                // in SQLite, reported with the FULL offending text, not an internal
+                // "empty hex literal". Consume any trailing identifier characters so
+                // the token text matches stock. bd-errmsg-parity-batch3-3brmm.
+                while self.pos < self.src.len()
+                    && (self.src[self.pos].is_ascii_alphanumeric() || self.src[self.pos] == b'_')
+                {
+                    self.advance();
+                }
+                let err_text = String::from_utf8_lossy(&self.src[start..self.pos]);
+                return TokenKind::Error(format!("unrecognized token: \"{err_text}\""));
             }
             // A hex literal cannot be immediately followed by an alphanumeric or
             // `_` (e.g. `0x1F_` or `0xFFg`) — that is an unrecognized token, the
@@ -1454,8 +1465,21 @@ mod tests {
 
     #[test]
     fn test_lex_number_hex_invalid() {
+        // `0x`/`0xGG` with no hex digits is an "unrecognized token" reporting the
+        // FULL offending text (matching SQLite), not an internal "empty hex
+        // literal". bd-errmsg-parity-batch3-3brmm.
         let tokens = kinds("0x");
-        assert!(matches!(tokens[0], TokenKind::Error(_)));
+        assert!(
+            matches!(tokens[0], TokenKind::Error(ref e) if e.contains("unrecognized token: \"0x\"")),
+            "expected 0x -> unrecognized token, got {:?}",
+            tokens[0]
+        );
+        let tokens = kinds("0xGG");
+        assert!(
+            matches!(tokens[0], TokenKind::Error(ref e) if e.contains("unrecognized token: \"0xGG\"")),
+            "expected 0xGG -> unrecognized token, got {:?}",
+            tokens[0]
+        );
     }
 
     #[test]
