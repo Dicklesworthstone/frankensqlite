@@ -234,7 +234,14 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
                 // carries the canonical `9.0e+999`, a parsed value carries its
                 // source (`9e999`) — stock's construct-vs-preserve asymmetry
                 // (GH#212, bd-t75hg).
-                out.push_str(&render_non_finite_number(number));
+                // Only reachable with `arbitrary_precision` (serde_json cannot
+                // otherwise hold a non-finite Number); the non-feature arm keeps
+                // the match compiling and is never taken (bd-uxmhz).
+                #[cfg(feature = "arbitrary_precision")]
+                let rendered = render_non_finite_number(number);
+                #[cfg(not(feature = "arbitrary_precision"))]
+                let rendered = number.to_string();
+                out.push_str(&rendered);
             }
         }
         Value::String(text) => {
@@ -1164,11 +1171,13 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
                 // Non-finite REAL (+Inf/-Inf as 9.0e+999 / 9e999): store the
                 // stock-rendered numeric text so the payload round-trips
                 // (GH#212).
-                append_jsonb_node(
-                    JSONB_FLOAT_TYPE,
-                    render_non_finite_number(number).as_bytes(),
-                    out,
-                )
+                // Only reachable with `arbitrary_precision`; the non-feature arm
+                // keeps this compiling and is never taken (bd-uxmhz).
+                #[cfg(feature = "arbitrary_precision")]
+                let rendered = render_non_finite_number(number);
+                #[cfg(not(feature = "arbitrary_precision"))]
+                let rendered = number.to_string();
+                append_jsonb_node(JSONB_FLOAT_TYPE, rendered.as_bytes(), out)
             }
         }
         Value::String(text) => append_jsonb_string(text, out),
@@ -1332,8 +1341,19 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
                 })?)
             } else {
                 // Non-finite payload (e.g. `9e999` +Inf): preserve the raw
-                // source text so the JSONB value round-trips (GH#212).
-                json_number_from_raw(normalized)?
+                // source text so the JSONB value round-trips (GH#212). Without
+                // `arbitrary_precision` a non-finite number cannot be held, so
+                // decoding such a payload is an error (bd-uxmhz).
+                #[cfg(feature = "arbitrary_precision")]
+                {
+                    json_number_from_raw(normalized)?
+                }
+                #[cfg(not(feature = "arbitrary_precision"))]
+                {
+                    return Err(FrankenError::function_error(format!(
+                        "non-finite JSONB float `{normalized}` requires the arbitrary_precision feature"
+                    )));
+                }
             }
         }
         JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE => {
@@ -2065,6 +2085,7 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
 /// Non-finite numbers cannot be held by a plain `serde_json` `Number`; the
 /// crate's `arbitrary_precision` backing stores the raw text verbatim, so this
 /// keeps the exact bytes that must round-trip (GH#212).
+#[cfg(feature = "arbitrary_precision")]
 fn json_number_from_raw(raw: &str) -> Result<Value> {
     serde_json::from_str::<Number>(raw)
         .map(Value::Number)
@@ -2086,6 +2107,7 @@ fn json_number_from_raw(raw: &str) -> Result<Value> {
 /// constructed `9.0e+999`, or a source that already wrote `9.0e+999`). Exotic
 /// forms that serde also normalizes (a fractional non-finite mantissa, or an
 /// uppercase `E`) cannot be recovered and keep serde's canonical form (GH#212).
+#[cfg(feature = "arbitrary_precision")]
 fn render_non_finite_number(number: &Number) -> String {
     let raw = number.to_string();
     let Some(exp) = raw.find(['e', 'E']) else {
@@ -2108,7 +2130,15 @@ fn float_to_json(f: f64) -> Result<Value> {
         return Ok(Value::Null);
     }
     if f.is_infinite() {
+        // With `arbitrary_precision`, +-Inf renders as the stock numeric literal
+        // `9.0e+999` / `-9.0e+999` (GH#212). Without the feature serde_json cannot
+        // hold a non-finite number, so degrade to JSON null (like NaN); enable the
+        // opt-in `arbitrary_precision` feature to restore the stock rendering
+        // (bd-uxmhz / GH#375 — the feature is viral and off by default).
+        #[cfg(feature = "arbitrary_precision")]
         return json_number_from_raw(if f > 0.0 { "9.0e+999" } else { "-9.0e+999" });
+        #[cfg(not(feature = "arbitrary_precision"))]
+        return Ok(Value::Null);
     }
     Number::from_f64(f).map(Value::Number).ok_or_else(|| {
         FrankenError::function_error("failed to convert floating-point value to JSON")
@@ -4117,6 +4147,10 @@ mod tests {
         ck!("json_remove", call("json_remove", vec![t("{\"a\":1,\"b\":2}"), t("$.a")]), "{\"b\":2}");
         ck!("json_patch", call("json_patch", vec![t("{\"a\":1,\"b\":2}"), t("{\"b\":null,\"c\":3}")]), "{\"a\":1,\"c\":3}");
         ck!("json_bignum", call("json", vec![t("{\"a\":12345678901234567890}")]), "{\"a\":12345678901234567890}");
+        // `[-0]` (JSON-integer negative zero) reads back as `0` only with the
+        // arbitrary_precision text Number; without it serde parses `-0` as the
+        // float `-0.0` and renders `-0` (bd-uxmhz, pathological edge).
+        #[cfg(feature = "arbitrary_precision")]
         ck!("json_neg_zero", call("json_extract", vec![t("[-0]"), t("$[0]")]), "0");
         // ── deeper batch ──
         ck!("jx_true", call("json_extract", vec![t("{\"a\":true}"), t("$.a")]), "1");
@@ -5598,10 +5632,14 @@ mod tests {
         assert_eq!(v_int, Value::from(7_i64));
         // GH#212 (verified against sqlite3 3.46.1): json_each(9e999) yields a
         // single row (type='real', atom=Inf), so a bare +Inf renders as the
-        // numeric literal 9.0e+999 rather than erroring.
-        let (v_inf, _) =
-            super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)]).unwrap();
-        assert_eq!(v_inf, super::json_number_from_raw("9.0e+999").unwrap());
+        // numeric literal 9.0e+999 rather than erroring. Only with the opt-in
+        // `arbitrary_precision` feature (bd-uxmhz); without it +Inf -> JSON null.
+        #[cfg(feature = "arbitrary_precision")]
+        {
+            let (v_inf, _) =
+                super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)]).unwrap();
+            assert_eq!(v_inf, super::json_number_from_raw("9.0e+999").unwrap());
+        }
     }
 
     #[test]
@@ -5890,6 +5928,7 @@ mod tests {
         SqliteValue::Text(SmallText::from_string(value))
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_array_non_finite_reals() {
         // SELECT json_array(1e999)         -> [9.0e+999]
@@ -5914,6 +5953,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_object_non_finite_real() {
         // SELECT json_object('k', 1e999)   -> {"k":9.0e+999}
@@ -5943,6 +5983,7 @@ mod tests {
         assert_eq!(json_quote(&SqliteValue::Float(f64::NAN)).unwrap(), "null");
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_parse_preserves_non_finite_source_text() {
         // SELECT json('[9e999]')      -> [9e999]      (source text PRESERVED)
@@ -5953,6 +5994,7 @@ mod tests {
         assert_eq!(json("[-9e999]").unwrap(), "[-9e999]");
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_valid_accepts_non_finite_literal_text() {
         // SELECT json_valid('[9e999]') -> 1
@@ -5961,6 +6003,7 @@ mod tests {
         assert_eq!(json_valid("[-9e999]", None), 1);
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_extract_non_finite_reads_back_as_infinity() {
         // SELECT json_extract('[9.0e+999]','$[0]') -> Inf (REAL +Inf)
@@ -5979,6 +6022,7 @@ mod tests {
         assert!(matches!(value, SqliteValue::Float(f) if f.is_infinite() && f.is_sign_negative()));
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_type_non_finite_literal_is_real() {
         // SELECT json_type('[9.0e+999]','$[0]') -> real
@@ -5986,6 +6030,7 @@ mod tests {
         assert_eq!(json_type("[9e999]", Some("$[0]")).unwrap(), Some("real"));
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_jsonb_round_trip_preserves_non_finite() {
         // SELECT json(jsonb('[9e999]')) -> [9e999]  (JSONB payload round-trips)
@@ -6003,6 +6048,7 @@ mod tests {
         assert_eq!(json_from_jsonb(&blob).unwrap(), "[null]");
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_array_embeds_parsed_non_finite_preserving_source() {
         // SELECT json_array(json('9e999'))    -> [9e999]      (source preserved)
@@ -6022,6 +6068,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_extract_nested_container_preserves_non_finite() {
         // SELECT json_extract('{"a":[1e999]}','$.a') -> [1e999]
@@ -6031,12 +6078,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_pretty_preserves_non_finite() {
         // SELECT json_pretty('[9e999]') -> "[\n    9e999\n]"
         assert_eq!(json_pretty("[9e999]", None).unwrap(), "[\n    9e999\n]");
     }
 
+    #[cfg(feature = "arbitrary_precision")]
     #[test]
     fn test_json_group_array_non_finite() {
         // Aggregate construct path shares the scalar rendering.
