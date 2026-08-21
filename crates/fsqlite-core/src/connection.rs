@@ -47832,7 +47832,7 @@ impl Connection {
             if let Expr::Column(col_ref, _) = expr
                 && col_ref.table.is_none()
             {
-                return Err(FrankenError::Internal(format!(
+                return Err(FrankenError::FunctionError(format!(
                     "no such column: {}",
                     col_ref.column
                 )));

@@ -95,6 +95,11 @@ fn query_and_vtab_error_messages_6mj9n() {
             &err_of(&["CREATE TABLE t(a)"], "SELECT x.* FROM t").await,
             "no such table: x",
         );
+        // A bad column reference in an INSERT ... VALUES list.
+        assert_stock(
+            &err_of(&["CREATE TABLE t(a)"], "INSERT INTO t(a) VALUES(nope)").await,
+            "no such column: nope",
+        );
         // Column/table DDL on a virtual table.
         assert_stock(
             &err_of(
