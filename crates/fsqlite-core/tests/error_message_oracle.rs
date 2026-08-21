@@ -50,6 +50,22 @@ fn strict_type_errors() {
 }
 
 #[test]
+fn ddl_and_ordinal_errors() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-ttof2 fix: ALTER TABLE ADD a duplicate column now reports verbatim
+        // (was Internal "internal error: duplicate column name: b").
+        err_is(&["CREATE TABLE t(a INT, b INT)"],
+               "ALTER TABLE t ADD COLUMN b INT", "duplicate column name: b").await;
+        // bd-ttof2 fix: a GROUP BY ordinal out of range now carries the 1-based
+        // term-position prefix ("1st GROUP BY term ..."), matching ORDER BY.
+        err_is(&["CREATE TABLE t(a INT)"],
+               "SELECT a FROM t GROUP BY 9", "1st GROUP BY term out of range - should be between 1 and 1").await;
+        err_is(&["CREATE TABLE t(a INT)"],
+               "SELECT a FROM t ORDER BY 5", "1st ORDER BY term out of range - should be between 1 and 1").await;
+    });
+}
+
+#[test]
 fn name_resolution_and_txn_errors() {
     asupersync::test_utils::run_test(|| async {
         err_is(&[], "SELECT * FROM nonexistent", "no such table: nonexistent").await;
