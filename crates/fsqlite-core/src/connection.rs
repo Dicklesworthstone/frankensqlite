@@ -71779,16 +71779,52 @@ impl Connection {
                                 } else {
                                     trimmed
                                 };
-                                table
+                                // Direct match: a bare (optionally quoted) column
+                                // identifier.
+                                let position = table
                                     .columns
                                     .iter()
                                     .position(|c| c.name.eq_ignore_ascii_case(unquoted))
-                                    .map(|p| {
-                                        (
-                                            i64::try_from(p).unwrap_or(-1),
-                                            table.columns[p].name.clone(),
-                                        )
-                                    })
+                                    // A COLLATE-decorated bare column (e.g.
+                                    // `b COLLATE NOCASE`) is still a column key term
+                                    // in stock: it resolves to cid>=0 + name and the
+                                    // collation is surfaced separately by
+                                    // index_xinfo's `coll`. Only a genuine expression
+                                    // (`a+1`, `lower(b)`) stays cid=-2/NULL. Such a
+                                    // term reaches here as its full SQL fragment
+                                    // (an expression-mode index stringifies every
+                                    // term, bd-ivy5h), so the direct match misses it;
+                                    // parse and peel COLLATE wrappers to the
+                                    // underlying column, mirroring
+                                    // `explicit_index_simple_column_name`.
+                                    .or_else(|| {
+                                        let expr =
+                                            fsqlite_parser::expr::parse_expr(trimmed).ok()?;
+                                        let mut cur = &expr;
+                                        loop {
+                                            match cur {
+                                                Expr::Collate { expr: inner, .. } => {
+                                                    cur = inner.as_ref();
+                                                }
+                                                Expr::Column(col_ref, _)
+                                                    if col_ref.table.is_none() =>
+                                                {
+                                                    break table.columns.iter().position(|c| {
+                                                        c.name.eq_ignore_ascii_case(
+                                                            col_ref.column.as_ref(),
+                                                        )
+                                                    });
+                                                }
+                                                _ => break None,
+                                            }
+                                        }
+                                    });
+                                position.map(|p| {
+                                    (
+                                        i64::try_from(p).unwrap_or(-1),
+                                        table.columns[p].name.clone(),
+                                    )
+                                })
                             };
                             let mut rows: Vec<Row> = (0..key_count)
                                 .map(|seq| {
