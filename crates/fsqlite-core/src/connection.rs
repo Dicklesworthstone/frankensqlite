@@ -29750,6 +29750,38 @@ impl Connection {
             || can_use_prebuilt_constant_record
     }
 
+    /// Convert a `PrimaryKeyViolation` (raised by the regular-table direct
+    /// insert path on an INTEGER PRIMARY KEY / rowid duplicate) into SQLite's
+    /// user-facing "UNIQUE constraint failed: <table>.<ipk_col>" message. Any
+    /// other error passes through unchanged. bd-s9irk #1.
+    fn direct_insert_pk_violation_as_unique(
+        &self,
+        error: FrankenError,
+        table_name: &str,
+    ) -> FrankenError {
+        if !matches!(error, FrankenError::PrimaryKeyViolation) {
+            return error;
+        }
+        let ipk_column = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            .and_then(|table| {
+                table
+                    .columns
+                    .iter()
+                    .find(|column| column.is_ipk)
+                    .map(|column| column.name.clone())
+            });
+        match ipk_column {
+            Some(column) => FrankenError::UniqueViolation {
+                columns: format!("{table_name}.{column}"),
+            },
+            None => FrankenError::PrimaryKeyViolation,
+        }
+    }
+
     async fn execute_prepared_direct_simple_insert(
         &self,
         execution_cx: &Cx,
@@ -30108,6 +30140,13 @@ impl Connection {
             cursor.swap_cell_scratch(&mut cell_scratch);
             result
         };
+        // bd-s9irk #1: an INTEGER PRIMARY KEY (rowid) duplicate reaches this
+        // regular-table direct path as PrimaryKeyViolation; SQLite reports it as
+        // a UNIQUE violation naming the IPK column ("UNIQUE constraint failed:
+        // t.a"). FTS5/virtual tables use a different path, so this never
+        // rewrites their (generic) constraint errors.
+        let result =
+            result.map_err(|error| self.direct_insert_pk_violation_as_unique(error, table_name));
         if matches!(result.as_ref(), Ok(Some(_))) {
             self.discard_cached_vdbe_engine();
             self.sync_memory_concurrent_pending_write_pages(direct.root_page)?;
@@ -40578,8 +40617,10 @@ impl Connection {
                 if is_hidden_rowid_alias_name(column) {
                     continue;
                 }
-                return Err(FrankenError::Internal(format!(
-                    "column '{column}' not found in table '{table_name}'"
+                // Stock: "table T has no column named C" under SQLITE_ERROR.
+                // bd-ttof2.
+                return Err(FrankenError::FunctionError(format!(
+                    "table {table_name} has no column named {column}"
                 )));
             };
             // Generated (VIRTUAL/STORED) columns are read-only: SQLite rejects
@@ -40677,8 +40718,11 @@ impl Connection {
                     } else if is_hidden_rowid_alias_name(col) {
                         Ok(InsertTarget::HiddenRowid)
                     } else {
-                        Err(FrankenError::Internal(format!(
-                            "column '{col}' not found in table '{table_name}'"
+                        // Stock reports an unknown INSERT column verbatim under
+                        // SQLITE_ERROR ("table T has no column named C"), not as
+                        // an internal error. bd-ttof2.
+                        Err(FrankenError::FunctionError(format!(
+                            "table {table_name} has no column named {col}"
                         )))
                     }
                 })
@@ -40964,8 +41008,10 @@ impl Connection {
             } else if is_hidden_rowid_alias_name(col) {
                 targets.push(InsertTarget::HiddenRowid);
             } else {
-                return Err(FrankenError::Internal(format!(
-                    "column '{col}' not found in table '{}'",
+                // Stock: "table T has no column named C" under SQLITE_ERROR
+                // (not an internal error). bd-ttof2.
+                return Err(FrankenError::FunctionError(format!(
+                    "table {} has no column named {col}",
                     insert.table.name
                 )));
             }
@@ -47983,8 +48029,10 @@ impl Connection {
                     targets.push(None);
                     continue;
                 }
-                return Err(FrankenError::Internal(format!(
-                    "column '{column}' not found in table '{}'",
+                // Stock: "table T has no column named C" under SQLITE_ERROR.
+                // bd-ttof2.
+                return Err(FrankenError::FunctionError(format!(
+                    "table {} has no column named {column}",
                     insert.table.name
                 )));
             }
@@ -225545,7 +225593,13 @@ mod pager_routing_tests {
                 )
                 .await
                 .expect_err("OR ROLLBACK duplicate should abort the whole explicit transaction");
-            assert!(matches!(err, FrankenError::PrimaryKeyViolation));
+            // bd-s9irk #1: an INTEGER PRIMARY KEY dup surfaces as SQLite's
+            // "UNIQUE constraint failed: <table>.<ipk_col>" (not a bare
+            // "PRIMARY KEY constraint failed").
+            assert_eq!(
+                err.to_string(),
+                "UNIQUE constraint failed: prep_direct_rollback.id",
+            );
             assert!(
                 !conn.in_transaction.get() && conn.active_txn.borrow().is_none(),
                 "OR ROLLBACK should leave the connection outside the explicit transaction"
