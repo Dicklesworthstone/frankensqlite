@@ -250,3 +250,51 @@ fn distinct_aggregate_arg_count_precedence() {
         );
     });
 }
+
+#[test]
+fn multicolumn_subquery_comparison_operand_row_value_misused() {
+    asupersync::test_utils::run_test(|| async {
+        // A multi-column subquery as the IMMEDIATE operand of a comparison operator
+        // (=, <>, <, <=, >, >=, IS, IS NOT) against a scalar is "row value misused",
+        // NOT the generic "sub-select returns N columns - expected 1". Verified vs
+        // sqlite3 CLI 3.46.1 (bd-errmsg-parity-batch4-deqcb).
+        let t: &[&str] = &["CREATE TABLE t(a INT)"];
+        query_err_is(t, "SELECT * FROM t WHERE a = (SELECT 1, 2)", "row value misused").await;
+        query_err_is(t, "SELECT * FROM t WHERE a < (SELECT 1, 2)", "row value misused").await;
+        query_err_is(t, "SELECT * FROM t WHERE a IS (SELECT 1, 2)", "row value misused").await;
+        query_err_is(t, "SELECT * FROM t WHERE a = (SELECT 1, 2, 3)", "row value misused").await;
+        // symmetric: subquery on the left
+        query_err_is(t, "SELECT * FROM t WHERE (SELECT 1, 2) = a", "row value misused").await;
+        // the row-value diagnostic precedes name validation inside the subquery
+        query_err_is(t, "SELECT * FROM t WHERE a = (SELECT nope, 2)", "row value misused").await;
+        // still fires on the `=` operand when nested inside a larger boolean
+        query_err_is(t, "SELECT * FROM t WHERE a = (SELECT 1, 2) AND a > 0", "row value misused")
+            .await;
+
+        // NEGATIVE: a multi-column subquery under a NON-comparison operator keeps
+        // the generic arity error (the subquery is an arithmetic/list/bare operand,
+        // not an immediate comparison operand).
+        query_err_is(
+            t,
+            "SELECT * FROM t WHERE a = (1 + (SELECT 1, 2))",
+            "sub-select returns 2 columns - expected 1",
+        )
+        .await;
+        query_err_is(&[], "SELECT (SELECT 1, 2)", "sub-select returns 2 columns - expected 1").await;
+        query_err_is(
+            t,
+            "SELECT * FROM t WHERE (SELECT 1, 2)",
+            "sub-select returns 2 columns - expected 1",
+        )
+        .await;
+
+        // NEGATIVE: a single-column subquery comparison is valid.
+        let f = Connection::open(":memory:").await.unwrap();
+        f.execute("CREATE TABLE t(a INT)").await.unwrap();
+        f.execute("INSERT INTO t VALUES (1)").await.unwrap();
+        assert!(
+            f.query("SELECT * FROM t WHERE a = (SELECT 1)").await.is_ok(),
+            "single-column subquery comparison is valid"
+        );
+    });
+}

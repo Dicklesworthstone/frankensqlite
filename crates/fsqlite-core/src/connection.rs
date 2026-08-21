@@ -130217,7 +130217,7 @@ impl<'a> SelectStructureResolver<'a> {
             | Expr::Column(_, _)
             | Expr::Raise { .. }
             | Expr::Placeholder(_, _) => Ok(()),
-            Expr::BinaryOp { left, right, .. } => {
+            Expr::BinaryOp { op, left, right, .. } => {
                 // A comparison operand faces a row value only when the other
                 // side is an explicit tuple or a multi-column subquery; only
                 // then may a multi-column subquery keep its width. Elsewhere
@@ -130241,6 +130241,36 @@ impl<'a> SelectStructureResolver<'a> {
                         _ => 1,
                     }
                 };
+                // SQLite reports "row value misused" when a multi-column subquery is
+                // the IMMEDIATE operand of a COMPARISON operator (=, <>, <, <=, >,
+                // >=, IS, IS NOT) against a scalar (width-1) operand — a scalar can
+                // not be compared to a row value. This precedes name validation
+                // inside the subquery (stock: `a=(SELECT badcol,2)` -> "row value
+                // misused", not "no such column"). A matching-width row-value
+                // comparison stays valid, and a multi-column subquery nested under a
+                // NON-comparison operator (e.g. arithmetic `a=(1+(SELECT x,y))`)
+                // keeps the generic "sub-select returns N columns - expected 1".
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                        | BinaryOp::Is
+                        | BinaryOp::IsNot
+                ) {
+                    let left_multicol_sub =
+                        matches!(left.as_ref(), Expr::Subquery(_, _)) && operand_width(left) > 1;
+                    let right_multicol_sub =
+                        matches!(right.as_ref(), Expr::Subquery(_, _)) && operand_width(right) > 1;
+                    if (left_multicol_sub && operand_width(right) == 1)
+                        || (right_multicol_sub && operand_width(left) == 1)
+                    {
+                        return Err(FrankenError::FunctionError("row value misused".to_owned()));
+                    }
+                }
                 let left_faces_row_value =
                     matches!(left.as_ref(), Expr::Subquery(_, _)) && operand_width(right) > 1;
                 let right_faces_row_value =
