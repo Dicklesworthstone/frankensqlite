@@ -3947,9 +3947,10 @@ impl ScalarFunction for JsonPrettyFunc {
 // json_group_array(X) / json_group_object(NAME, VALUE) — JSON aggregates
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// `json_group_array(X)` — aggregate every argument value (including SQL NULL,
-/// which becomes JSON `null`) into a JSON array, reusing `json_array` so the
-/// element encoding is identical to the scalar constructor.
+/// `json_group_array(X)` — aggregate argument values into a JSON array.
+///
+/// SQL NULL becomes JSON `null`. Reuses `json_array` so the element
+/// encoding is identical to the scalar constructor.
 pub struct JsonGroupArrayFunc;
 
 impl AggregateFunction for JsonGroupArrayFunc {
@@ -3987,9 +3988,10 @@ impl AggregateFunction for JsonGroupArrayFunc {
     }
 }
 
-/// `json_group_object(NAME, VALUE)` — aggregate (name, value) pairs into a JSON
-/// object, reusing `json_object`. The flattened `[k0, v0, k1, v1, …]` buffer
-/// feeds `json_object` directly, matching its key/value encoding and validation.
+/// `json_group_object(NAME, VALUE)` — aggregate pairs into a JSON object.
+///
+/// Reuses `json_object`: the flattened `[k0, v0, k1, v1, …]` buffer feeds
+/// `json_object` directly, matching its key/value encoding and validation.
 pub struct JsonGroupObjectFunc;
 
 impl AggregateFunction for JsonGroupObjectFunc {
