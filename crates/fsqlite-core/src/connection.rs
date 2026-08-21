@@ -45921,7 +45921,7 @@ impl Connection {
         // Only validate ordinals when the output column count is determinable;
         // ncol == 0 means it could not be resolved, so don't risk a false error.
         if ncol_i >= 1 {
-            let check_ordinal = |kind: &str, expr: &Expr| -> Result<()> {
+            let check_ordinal = |ordinal: &str, kind: &str, expr: &Expr| -> Result<()> {
                 // Reuse the execution resolver so COLLATE-wrapped and nested
                 // signed integer ordinals cannot disagree with later ORDER BY
                 // or GROUP BY handling. Arithmetic expressions such as `1+1`
@@ -45929,18 +45929,20 @@ impl Connection {
                 if let Some(n) = connection_order_by_integer_ordinal(expr)
                     && (n < 1 || n > ncol_i)
                 {
+                    // Stock prefixes the 1-based term position ("1st GROUP BY
+                    // term out of range ..."). bd-ttof2.
                     return Err(FrankenError::FunctionError(format!(
-                        "{kind} term out of range - should be between 1 and {ncol_i}"
+                        "{ordinal} {kind} term out of range - should be between 1 and {ncol_i}"
                     )));
                 }
                 Ok(())
             };
-            for term in &select.order_by {
-                check_ordinal("ORDER BY", &term.expr)?;
+            for (i, term) in select.order_by.iter().enumerate() {
+                check_ordinal(&sqlite_ordinal(i + 1), "ORDER BY", &term.expr)?;
             }
             if let SelectCore::Select { group_by, .. } = &select.body.select {
-                for expr in group_by {
-                    check_ordinal("GROUP BY", expr)?;
+                for (i, expr) in group_by.iter().enumerate() {
+                    check_ordinal(&sqlite_ordinal(i + 1), "GROUP BY", expr)?;
                 }
             }
         }
@@ -58828,7 +58830,9 @@ impl Connection {
                         .iter()
                         .any(|existing| existing.name.eq_ignore_ascii_case(&column.name)) =>
                 {
-                    return Err(FrankenError::Internal(format!(
+                    // Stock reports this verbatim under SQLITE_ERROR, not as an
+                    // internal error. bd-ttof2.
+                    return Err(FrankenError::FunctionError(format!(
                         "duplicate column name: {}",
                         column.name
                     )));
@@ -59026,7 +59030,9 @@ impl Connection {
                     .enumerate()
                     .any(|(idx, column)| idx != col_idx && column.name.eq_ignore_ascii_case(new))
                 {
-                    return Err(FrankenError::Internal(format!(
+                    // Stock: SQLITE_ERROR verbatim, not an internal error.
+                    // bd-ttof2.
+                    return Err(FrankenError::FunctionError(format!(
                         "duplicate column name: {new}"
                     )));
                 }
