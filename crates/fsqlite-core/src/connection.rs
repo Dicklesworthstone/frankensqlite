@@ -17797,7 +17797,7 @@ impl Connection {
                             if rewritten.if_not_exists {
                                 return Ok(Some(Vec::new()));
                             }
-                            return Err(FrankenError::Internal(format!(
+                            return Err(FrankenError::FunctionError(format!(
                                 "table {table_name} already exists",
                             )));
                         }
@@ -37422,7 +37422,7 @@ impl Connection {
             if create.if_not_exists {
                 return Ok(());
             }
-            return Err(FrankenError::Internal(format!(
+            return Err(FrankenError::FunctionError(format!(
                 "table {table_name} already exists",
             )));
         }
@@ -57137,7 +57137,7 @@ impl Connection {
                 if create.if_not_exists {
                     return Ok(());
                 }
-                return Err(FrankenError::Internal(format!(
+                return Err(FrankenError::FunctionError(format!(
                     "table {table_name} already exists",
                 )));
             }
@@ -57159,7 +57159,7 @@ impl Connection {
             if create.if_not_exists {
                 return Ok(());
             }
-            return Err(FrankenError::Internal(format!(
+            return Err(FrankenError::FunctionError(format!(
                 "view {table_name} already exists",
             )));
         }
@@ -57730,7 +57730,7 @@ impl Connection {
             if create.if_not_exists {
                 return Ok(());
             }
-            return Err(FrankenError::Internal(format!(
+            return Err(FrankenError::FunctionError(format!(
                 "table {table_name} already exists",
             )));
         }
@@ -58183,7 +58183,7 @@ impl Connection {
                     if drop_stmt.if_exists {
                         return Ok(Vec::new());
                     }
-                    return Err(FrankenError::Internal(format!("no such index: {obj_name}")));
+                    return Err(FrankenError::FunctionError(format!("no such index: {obj_name}")));
                 }
                 if let Some(root_page) = dropped_root_page {
                     // TEMP indexes are MemDatabase-only and must never be
@@ -58282,7 +58282,7 @@ impl Connection {
                         | PragmaSchemaScope::Main
                         | PragmaSchemaScope::Temp => obj_name.clone(),
                     };
-                    return Err(FrankenError::Internal(format!("no such view: {missing}")));
+                    return Err(FrankenError::FunctionError(format!("no such view: {missing}")));
                 }
             }
             DropObjectType::Trigger => {
@@ -58314,7 +58314,7 @@ impl Connection {
                     if drop_stmt.if_exists {
                         return Ok(Vec::new());
                     }
-                    return Err(FrankenError::Internal(format!(
+                    return Err(FrankenError::FunctionError(format!(
                         "no such trigger: {obj_name}"
                     )));
                 }
@@ -61240,7 +61240,7 @@ impl Connection {
                 if stmt.if_not_exists {
                     return Ok(());
                 }
-                return Err(FrankenError::Internal(format!(
+                return Err(FrankenError::FunctionError(format!(
                     "index {index_name} already exists"
                 )));
             }
@@ -61565,7 +61565,7 @@ impl Connection {
             if stmt.if_not_exists {
                 return Ok(());
             }
-            return Err(FrankenError::Internal(format!(
+            return Err(FrankenError::FunctionError(format!(
                 "view {view_name} already exists"
             )));
         }
@@ -61577,7 +61577,7 @@ impl Connection {
             if stmt.if_not_exists {
                 return Ok(());
             }
-            return Err(FrankenError::Internal(format!(
+            return Err(FrankenError::FunctionError(format!(
                 "table {view_name} already exists"
             )));
         }
@@ -61654,7 +61654,7 @@ impl Connection {
             if stmt.if_not_exists {
                 return Ok(());
             }
-            return Err(FrankenError::Internal(format!(
+            return Err(FrankenError::FunctionError(format!(
                 "trigger {trigger_name} already exists"
             )));
         }
