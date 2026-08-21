@@ -246,6 +246,10 @@ pub struct RtreeIndex {
     config: RtreeConfig,
     entries: Vec<RtreeEntry>,
     entry_ids: HashSet<i64>,
+    /// Auxiliary (non-indexed) column values per rowid, in declared order.
+    /// Kept alongside `entries` (not in the bbox) so spatial queries ignore them
+    /// while `column()` can still project them. Absent id ⇒ all-NULL aux.
+    aux_by_id: HashMap<i64, Vec<SqliteValue>>,
     geometry_registry: HashMap<String, Arc<dyn RtreeGeometry>>,
 }
 
@@ -255,6 +259,7 @@ impl std::fmt::Debug for RtreeIndex {
             .field("config", &self.config)
             .field("entries", &self.entries)
             .field("entry_ids", &self.entry_ids)
+            .field("aux_columns", &self.aux_by_id.len())
             .field("geometry_count", &self.geometry_registry.len())
             .finish()
     }
@@ -268,6 +273,7 @@ impl RtreeIndex {
             config,
             entries: Vec::new(),
             entry_ids: HashSet::new(),
+            aux_by_id: HashMap::new(),
             geometry_registry: HashMap::new(),
         }
     }
@@ -319,7 +325,23 @@ impl RtreeIndex {
             return false;
         }
         self.entries.retain(|e| e.id != id);
+        self.aux_by_id.remove(&id);
         true
+    }
+
+    /// Set (or clear, when empty) the auxiliary column values for a rowid.
+    pub fn set_aux(&mut self, id: i64, aux: Vec<SqliteValue>) {
+        if aux.is_empty() {
+            self.aux_by_id.remove(&id);
+        } else {
+            self.aux_by_id.insert(id, aux);
+        }
+    }
+
+    /// Auxiliary column values for a rowid, if any were stored.
+    #[must_use]
+    pub fn aux_for_id(&self, id: i64) -> Option<&Vec<SqliteValue>> {
+        self.aux_by_id.get(&id)
     }
 
     #[must_use]
@@ -411,8 +433,12 @@ const RTREE_SCAN_GEOMETRY: i32 = 2;
 
 #[derive(Debug, Clone)]
 struct ParsedRtreeModuleArgs {
+    /// All declared columns in order: `[id, min0, max0, ..., aux0, aux1, ...]`.
     column_names: Vec<String>,
+    /// Number of spatial dimensions (coordinate min/max pairs).
     dimensions: usize,
+    /// Number of trailing auxiliary (non-indexed) columns.
+    aux_count: usize,
 }
 
 fn rtree_sqlite_module_args<'a>(args: &'a [&'a str]) -> Result<&'a [&'a str]> {
@@ -432,28 +458,61 @@ fn unquote_identifier(raw: &str) -> String {
 }
 
 fn parse_rtree_module_args(args: &[&str]) -> Result<ParsedRtreeModuleArgs> {
-    if args.len() < 3 {
+    // Module args are `id, <min0 max0 pairs...>, [+aux TYPE ...]`. The id is
+    // argv[0]; every following bare column is a coordinate, and every column
+    // whose declaration begins with `+` is an auxiliary (non-indexed) column.
+    // SQLite requires all auxiliary columns to come last.
+    let Some((id_arg, rest)) = args.split_first() else {
         return Err(FrankenError::function_error(
-            "rtree requires an id column plus at least one min/max coordinate pair",
+            "Too few columns for an rtree table",
+        ));
+    };
+
+    let mut coord_names: Vec<String> = Vec::new();
+    let mut aux_names: Vec<String> = Vec::new();
+    for arg in rest {
+        if let Some(aux) = arg.trim().strip_prefix('+') {
+            // Auxiliary column: the name is the first whitespace-delimited token;
+            // any trailing declared type is accepted but does not affect the NONE
+            // affinity SQLite gives auxiliary rtree columns.
+            aux_names.push(unquote_identifier(
+                aux.split_whitespace().next().unwrap_or(""),
+            ));
+        } else if aux_names.is_empty() {
+            coord_names.push(unquote_identifier(arg));
+        } else {
+            return Err(FrankenError::function_error(
+                "Auxiliary rtree columns must be last",
+            ));
+        }
+    }
+
+    // Need the id column plus at least one complete coordinate pair.
+    if coord_names.len() < 2 {
+        return Err(FrankenError::function_error(
+            "Too few columns for an rtree table",
         ));
     }
-    if args.len().is_multiple_of(2) {
+    if !coord_names.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
-            "rtree requires an odd number of arguments: id plus min/max coordinate pairs",
+            "Wrong number of columns for an rtree table",
+        ));
+    }
+    let dimensions = coord_names.len() / 2;
+    if dimensions > MAX_DIMENSIONS {
+        return Err(FrankenError::function_error(
+            "Too many columns for an rtree table",
         ));
     }
 
-    let dimensions = (args.len() - 1) / 2;
-    if dimensions > MAX_DIMENSIONS {
-        return Err(FrankenError::function_error(format!(
-            "rtree supports at most {MAX_DIMENSIONS} dimensions",
-        )));
-    }
+    let aux_count = aux_names.len();
+    let mut column_names = Vec::with_capacity(1 + coord_names.len() + aux_count);
+    column_names.push(unquote_identifier(id_arg));
+    column_names.extend(coord_names);
+    column_names.extend(aux_names);
 
     let mut seen = HashSet::new();
-    let mut column_names = Vec::with_capacity(args.len());
-    for arg in args {
-        let column = unquote_identifier(arg);
+    for column in &column_names {
         if column.is_empty() {
             return Err(FrankenError::function_error(
                 "rtree column names must not be empty",
@@ -464,18 +523,17 @@ fn parse_rtree_module_args(args: &[&str]) -> Result<ParsedRtreeModuleArgs> {
                 "rtree does not support option assignments in module arguments",
             ));
         }
-        let key = column.to_ascii_lowercase();
-        if !seen.insert(key) {
+        if !seen.insert(column.to_ascii_lowercase()) {
             return Err(FrankenError::function_error(format!(
                 "rtree column '{column}' is declared more than once",
             )));
         }
-        column_names.push(column);
     }
 
     Ok(ParsedRtreeModuleArgs {
         column_names,
         dimensions,
+        aux_count,
     })
 }
 
@@ -515,8 +573,11 @@ pub struct RtreeVirtualTable {
     index: RtreeIndex,
     /// Declared table name (SQLite argv[2]); used only for constraint messages.
     table_name: String,
-    /// Declared column names `[id, min0, max0, ...]`; used for constraint messages.
+    /// Declared column names `[id, min0, max0, ..., aux0, ...]`; used for
+    /// constraint messages and auxiliary-column projection.
     column_names: Vec<String>,
+    /// Number of trailing auxiliary (non-indexed) columns.
+    aux_count: usize,
     txn_state: TransactionalVtabState<RtreeVirtualTableSnapshot>,
 }
 
@@ -545,6 +606,7 @@ impl RtreeVirtualTable {
             index: RtreeIndex::new(config),
             table_name,
             column_names: parsed.column_names,
+            aux_count: parsed.aux_count,
             txn_state: TransactionalVtabState::default(),
         })
     }
@@ -623,6 +685,9 @@ impl RtreeVirtualTable {
     }
 
     /// Rebuild the in-memory R-tree from persisted row values.
+    ///
+    /// Each persisted row is `[<id>?, min0, max0, ..., aux0, aux1, ...]`: the
+    /// coordinate pairs are followed by the auxiliary column values.
     pub fn rebuild_rows(&mut self, rows: &[(i64, Vec<SqliteValue>)]) -> Result<()> {
         let config = self.index.config.clone();
         let geometry_registry = self.index.geometry_registry.clone();
@@ -630,14 +695,16 @@ impl RtreeVirtualTable {
             config,
             entries: Vec::new(),
             entry_ids: HashSet::new(),
+            aux_by_id: HashMap::new(),
             geometry_registry,
         };
 
+        let coord_span = self.index.dimensions() * 2;
+        let payload_len = coord_span + self.aux_count;
         for (rowid, values) in rows {
-            let expected_coord_values = self.index.dimensions() * 2;
-            let (entry_id, coord_values) = match values.len() {
-                len if len == expected_coord_values => (*rowid, values.as_slice()),
-                len if len == expected_coord_values + 1 => {
+            let (entry_id, payload) = match values.len() {
+                len if len == payload_len => (*rowid, values.as_slice()),
+                len if len == payload_len + 1 => {
                     let id =
                         values[0]
                             .as_integer()
@@ -658,19 +725,20 @@ impl RtreeVirtualTable {
                 len => {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
-                            "rtree persisted row {rowid} has {len} values; expected {expected_coord_values} or {}",
-                            expected_coord_values + 1
+                            "rtree persisted row {rowid} has {len} values; expected {payload_len} or {}",
+                            payload_len + 1
                         ),
                     });
                 }
             };
 
-            let bbox = self.parse_bbox_values(coord_values)?;
+            let bbox = self.parse_bbox_values(&payload[..coord_span])?;
             if !self.index.insert(RtreeEntry { id: entry_id, bbox }) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!("rtree persisted row {rowid} duplicates entry id {entry_id}"),
                 });
             }
+            self.index.set_aux(entry_id, payload[coord_span..].to_vec());
         }
 
         Ok(())
@@ -807,9 +875,12 @@ impl VirtualTable for RtreeVirtualTable {
             .or(old_rowid)
             .unwrap_or_else(|| self.next_rowid());
 
-        let coordinate_values = match args.len().saturating_sub(2) {
-            count if count == self.index.dimensions() * 2 => &args[2..],
-            count if count == self.index.dimensions() * 2 + 1 => {
+        let coord_span = self.index.dimensions() * 2;
+        let expected_no_id = coord_span + self.aux_count;
+        let expected_with_id = expected_no_id + 1;
+        let payload = match args.len().saturating_sub(2) {
+            count if count == expected_no_id => &args[2..],
+            count if count == expected_with_id => {
                 if let Some(id_value) = args[2].as_integer()
                     && id_value != new_rowid
                 {
@@ -819,14 +890,15 @@ impl VirtualTable for RtreeVirtualTable {
             }
             count => {
                 return Err(FrankenError::function_error(format!(
-                    "rtree update expected {} or {} payload values, got {count}",
-                    self.index.dimensions() * 2,
-                    self.index.dimensions() * 2 + 1
+                    "rtree update expected {expected_no_id} or {expected_with_id} payload values, got {count}"
                 )));
             }
         };
 
-        let bbox = self.parse_bbox_values(coordinate_values)?;
+        // The payload is `[min0, max0, ..., aux0, aux1, ...]`: coordinates then
+        // auxiliary column values.
+        let bbox = self.parse_bbox_values(&payload[..coord_span])?;
+        let aux_values = payload[coord_span..].to_vec();
 
         if let Some(old_rowid) = old_rowid {
             if old_rowid != new_rowid {
@@ -836,6 +908,11 @@ impl VirtualTable for RtreeVirtualTable {
                 let previous_bbox = self.index.bbox_for_id(old_rowid).ok_or_else(|| {
                     FrankenError::Internal("rtree update referenced a missing rowid".to_owned())
                 })?;
+                let previous_aux = self
+                    .index
+                    .aux_for_id(old_rowid)
+                    .cloned()
+                    .unwrap_or_default();
                 let deleted = self.index.delete(old_rowid);
                 if !deleted {
                     return Err(FrankenError::Internal(
@@ -851,10 +928,12 @@ impl VirtualTable for RtreeVirtualTable {
                         bbox: previous_bbox,
                     });
                     debug_assert!(restored, "rtree rollback after failed rowid change");
+                    self.index.set_aux(old_rowid, previous_aux);
                     return Err(FrankenError::Internal(
                         "rtree update could not replace rowid".to_owned(),
                     ));
                 }
+                self.index.set_aux(new_rowid, aux_values);
                 return Ok(None);
             }
 
@@ -863,6 +942,7 @@ impl VirtualTable for RtreeVirtualTable {
                     "rtree update referenced a missing rowid".to_owned(),
                 ));
             }
+            self.index.set_aux(old_rowid, aux_values);
             return Ok(None);
         }
 
@@ -872,6 +952,7 @@ impl VirtualTable for RtreeVirtualTable {
         }) {
             return Err(FrankenError::PrimaryKeyViolation);
         }
+        self.index.set_aux(new_rowid, aux_values);
         Ok(Some(new_rowid))
     }
 
@@ -1029,7 +1110,16 @@ impl VirtualTableCursor for RtreeCursor {
         if let Some(coord) = row.bbox.coords.get(coordinate_index) {
             ctx.set_value(self.coordinate_value(*coord)?);
         } else {
-            ctx.set_value(SqliteValue::Null);
+            // Past the coordinate columns → auxiliary column region. Auxiliary
+            // values default to NULL when never stored for this row.
+            let aux_index = coordinate_index - row.bbox.coords.len();
+            let value = self
+                .index
+                .aux_for_id(row.id)
+                .and_then(|aux| aux.get(aux_index))
+                .cloned()
+                .unwrap_or(SqliteValue::Null);
+            ctx.set_value(value);
         }
         Ok(())
     }
@@ -1071,11 +1161,22 @@ impl VtabModuleFactory for RtreeFactory {
         let Ok(parsed) = parse_rtree_module_args(module_args) else {
             return Vec::new();
         };
+        // Columns are `[id, <coordinates>, <auxiliary>]`. The id and coordinate
+        // columns take their affinity from the coordinate type; auxiliary columns
+        // get NONE affinity ('A'), matching SQLite, which never coerces them.
+        let coord_end = 1 + parsed.dimensions * 2;
         parsed
             .column_names
             .into_iter()
             .enumerate()
-            .map(|(index, name)| (name, column_affinity(self.coord_type, index == 0)))
+            .map(|(index, name)| {
+                let affinity = if index >= coord_end {
+                    'A'
+                } else {
+                    column_affinity(self.coord_type, index == 0)
+                };
+                (name, affinity)
+            })
             .collect()
     }
 }
@@ -2484,12 +2585,23 @@ mod tests {
     fn test_rtree_module_args_reject_incomplete_dimension_pair() {
         let cx = Cx::new();
         let factory = rtree_module_factory();
+        // Fewer than one full coordinate pair → "Too few columns" (stock message).
         let err = match factory.create(&cx, &["rtree", "main", "spatial", "id", "min_x"]) {
             Ok(_) => panic!("incomplete rtree args should be rejected"),
             Err(err) => err,
         };
         assert!(matches!(err, FrankenError::FunctionError(_)));
-        assert!(err.to_string().contains("min/max coordinate pair"));
+        assert_eq!(err.to_string(), "Too few columns for an rtree table");
+
+        // An odd number of coordinate columns → "Wrong number of columns".
+        let err = match factory.create(&cx, &["rtree", "main", "spatial", "id", "x0", "x1", "x2"]) {
+            Ok(_) => panic!("odd coordinate count should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Wrong number of columns for an rtree table"
+        );
     }
 
     #[test]
@@ -2686,6 +2798,158 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.to_string(), "rtree constraint failed: grid.(a<=b)");
+    }
+
+    /// bd-2pibv: `+aux TYPE` auxiliary columns are parsed (not rejected as an odd
+    /// arg count), carried per row, and projected on SELECT while staying out of
+    /// the spatial index. NULL is the default for an unset auxiliary value.
+    #[test]
+    fn test_rtree_auxiliary_columns_insert_select_update() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &[
+                "rtree",
+                "main",
+                "spatial",
+                "id",
+                "x0",
+                "x1",
+                "+label TEXT",
+                "+weight INTEGER",
+            ],
+            RtreeCoordType::Float32,
+        )
+        .unwrap();
+        assert_eq!(table.aux_count, 2);
+        assert_eq!(table.index.dimensions(), 1);
+        assert_eq!(
+            table.column_names,
+            vec!["id", "x0", "x1", "label", "weight"]
+        );
+
+        // INSERT (id 1) with both auxiliary values present.
+        assert_eq!(
+            VirtualTable::update(
+                &mut table,
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Float(0.0),
+                    SqliteValue::Float(1.0),
+                    SqliteValue::Text("box".into()),
+                    SqliteValue::Integer(42),
+                ],
+            )
+            .unwrap(),
+            Some(1)
+        );
+        // INSERT (id 2) with auxiliary values left NULL (as a column-list INSERT
+        // that omits them would).
+        assert_eq!(
+            VirtualTable::update(
+                &mut table,
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(2),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Float(5.0),
+                    SqliteValue::Float(6.0),
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                ],
+            )
+            .unwrap(),
+            Some(2)
+        );
+
+        // A spatial range scan projects the auxiliary columns (cols 3 and 4)
+        // alongside id/coords, and does not use them for filtering.
+        let mut cursor = table.open().unwrap();
+        cursor
+            .filter(
+                &cx,
+                RTREE_SCAN_BBOX,
+                None,
+                &[SqliteValue::Float(0.5), SqliteValue::Float(0.5)],
+            )
+            .unwrap();
+        let rows = collect_rtree_rows(&mut cursor, &cx, 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+                SqliteValue::Text("box".into()),
+                SqliteValue::Integer(42),
+            ]
+        );
+
+        // Full scan: id 2's auxiliary columns default to NULL.
+        let mut cursor = table.open().unwrap();
+        cursor.filter(&cx, RTREE_SCAN_FULL, None, &[]).unwrap();
+        let rows = collect_rtree_rows(&mut cursor, &cx, 5);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1][3], SqliteValue::Null);
+        assert_eq!(rows[1][4], SqliteValue::Null);
+
+        // UPDATE id 1's auxiliary values (rowid unchanged).
+        VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+                SqliteValue::Text("moved".into()),
+                SqliteValue::Integer(7),
+            ],
+        )
+        .unwrap();
+        let mut cursor = table.open().unwrap();
+        cursor.filter(&cx, RTREE_SCAN_FULL, None, &[]).unwrap();
+        let rows = collect_rtree_rows(&mut cursor, &cx, 5);
+        assert_eq!(rows[0][3], SqliteValue::Text("moved".into()));
+        assert_eq!(rows[0][4], SqliteValue::Integer(7));
+
+        // DELETE id 1 also drops its auxiliary values.
+        VirtualTable::update(&mut table, &cx, &[SqliteValue::Integer(1)]).unwrap();
+        assert!(table.index.aux_for_id(1).is_none());
+    }
+
+    /// bd-2pibv: auxiliary columns must follow every coordinate column; a `+aux`
+    /// declared before a coordinate is rejected with SQLite's exact message.
+    #[test]
+    fn test_rtree_auxiliary_columns_must_be_last() {
+        let cx = Cx::new();
+        let factory = rtree_module_factory();
+        let err = match factory.create(
+            &cx,
+            &["rtree", "main", "spatial", "id", "x0", "+name TEXT", "x1"],
+        ) {
+            Ok(_) => panic!("auxiliary column before a coordinate should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "Auxiliary rtree columns must be last");
+
+        // Auxiliary columns get NONE affinity ('A'); coordinates keep 'E'.
+        let cols =
+            factory.column_info(&["rtree", "main", "spatial", "id", "x0", "x1", "+name TEXT"]);
+        assert_eq!(
+            cols,
+            vec![
+                ("id".to_owned(), 'D'),
+                ("x0".to_owned(), 'E'),
+                ("x1".to_owned(), 'E'),
+                ("name".to_owned(), 'A'),
+            ]
+        );
     }
 
     #[test]
