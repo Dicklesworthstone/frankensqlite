@@ -77,3 +77,18 @@ fn name_resolution_and_txn_errors() {
         err_is(&[], "COMMIT", "cannot commit - no transaction is active").await;
     });
 }
+
+#[test]
+fn view_modify_errors() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-ttof2 fix: DML against a plain view (no INSTEAD OF trigger) reports
+        // "cannot modify V because it is a view" verbatim, matching stock — not
+        // the "no such table: V" a table-DML fallthrough raised before, which
+        // leaked because the :memory: INSERT/UPDATE/DELETE prepared fast-path
+        // bypassed the view-DML dispatch check. Covers all three DML verbs.
+        let setup: &[&str] = &["CREATE TABLE t(x INT)", "CREATE VIEW v AS SELECT x FROM t"];
+        err_is(setup, "INSERT INTO v VALUES (1)", "cannot modify v because it is a view").await;
+        err_is(setup, "DELETE FROM v", "cannot modify v because it is a view").await;
+        err_is(setup, "UPDATE v SET x = 1", "cannot modify v because it is a view").await;
+    });
+}

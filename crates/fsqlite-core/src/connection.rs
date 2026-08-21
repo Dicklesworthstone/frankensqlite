@@ -24565,10 +24565,18 @@ impl Connection {
     }
 
     fn ad_hoc_execute_supports_prepared_reuse(&self, statement: &Statement) -> Result<bool> {
-        // DML on a view with a matching INSTEAD OF trigger must go through the
-        // normal dispatcher, which routes to the trigger body. The prepared fast
-        // lane would compile it as table DML and fail "no such table". bd-ffkpv.
-        if self.statement_targets_instead_of_view(statement) {
+        // DML on a view — with OR without a matching INSTEAD OF trigger — must go
+        // through the normal dispatcher, not the prepared fast lane which would
+        // compile it as table DML and fail "no such table". A trigger view runs
+        // the trigger; a plain view is rejected "cannot modify V because it is a
+        // view" downstream. bd-ffkpv / bd-ttof2.
+        let dml_view_target = match statement {
+            Statement::Insert(insert) => Some(insert.table.name.as_str()),
+            Statement::Update(update) => Some(update.table.name.name.as_str()),
+            Statement::Delete(delete) => Some(delete.table.name.name.as_str()),
+            _ => None,
+        };
+        if dml_view_target.is_some_and(|name| self.view_index_of(name).is_some()) {
             return Ok(false);
         }
         match statement {
@@ -34928,6 +34936,22 @@ impl Connection {
             .await?
         {
             return Ok(rows);
+        }
+        // A view targeted by DML with no matching INSTEAD OF trigger cannot be
+        // modified: stock reports "cannot modify V because it is a view", not the
+        // "no such table" a table-DML fallthrough would otherwise raise. bd-ttof2.
+        let dml_view_target = match statement {
+            Statement::Insert(insert) => Some(insert.table.name.as_str()),
+            Statement::Update(update) => Some(update.table.name.name.as_str()),
+            Statement::Delete(delete) => Some(delete.table.name.name.as_str()),
+            _ => None,
+        };
+        if let Some(name) = dml_view_target
+            && self.view_index_of(name).is_some()
+        {
+            return Err(FrankenError::FunctionError(format!(
+                "cannot modify {name} because it is a view"
+            )));
         }
         match statement {
             Statement::CreateTable(create) => {
@@ -87126,39 +87150,13 @@ impl Connection {
             if temp_roots.is_empty() && !targets_shadowed_main {
                 let schema = self.schema.borrow();
                 codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
-                    // A view (no INSTEAD OF trigger) reaching table-INSERT codegen
-                    // fails find_table as TableNotFound; stock reports "cannot
-                    // modify V because it is a view", not "no such table". bd-ttof2.
-                    .map_err(|e| {
-                        match e {
-                        CodegenError::TableNotFound(ref name)
-                            if self.view_index_of(name).is_some() =>
-                        {
-                            FrankenError::FunctionError(format!(
-                                "cannot modify {name} because it is a view"
-                            ))
-                        }
-                        other => codegen_error_to_franken(other),
-                    }})
+                    .map_err(codegen_error_to_franken)
             } else {
                 let mut schema = self.schema.borrow().clone();
                 self.apply_shadowed_main_target_substitution(&mut schema, &insert.table);
                 Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
                 codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
-                    // A view (no INSTEAD OF trigger) reaching table-INSERT codegen
-                    // fails find_table as TableNotFound; stock reports "cannot
-                    // modify V because it is a view", not "no such table". bd-ttof2.
-                    .map_err(|e| {
-                        match e {
-                        CodegenError::TableNotFound(ref name)
-                            if self.view_index_of(name).is_some() =>
-                        {
-                            FrankenError::FunctionError(format!(
-                                "cannot modify {name} because it is a view"
-                            ))
-                        }
-                        other => codegen_error_to_franken(other),
-                    }})
+                    .map_err(codegen_error_to_franken)
             }
         })?;
         let program = builder.finish()?;
