@@ -169,6 +169,35 @@ fn pragma_foreign_key_list() {
     });
 }
 
+/// A foreign key that references the parent's PRIMARY KEY implicitly (no parent
+/// column named, `REFERENCES parent`) reports the `to` column as NULL in stock
+/// SQLite, not the empty string the engine used to emit (which reads as a real
+/// column named "" to a consumer that checks `to IS NULL` for "references the
+/// PK"). Covers single-column and composite implicit references; the explicit
+/// sibling above keeps the named-column path honest.
+#[test]
+fn pragma_foreign_key_list_implicit_pk() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+            "CREATE TABLE pcomp (a INTEGER, b INTEGER, PRIMARY KEY(a, b))",
+            "CREATE TABLE child (\
+               x INTEGER PRIMARY KEY, \
+               pid INTEGER REFERENCES parent, \
+               ca INTEGER, cb INTEGER, \
+               FOREIGN KEY(ca, cb) REFERENCES pcomp)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &["PRAGMA foreign_key_list(child)"],
+            "pragma_foreign_key_list_implicit_pk",
+        )
+        .await;
+    });
+}
+
 #[test]
 fn pragma_index_info() {
     asupersync::test_utils::run_test(|| async {

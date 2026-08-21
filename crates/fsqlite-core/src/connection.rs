@@ -72426,15 +72426,24 @@ impl Connection {
                                         .columns
                                         .get(cid)
                                         .map_or_else(|| format!("col{cid}"), |c| c.name.clone());
-                                    let to_col =
-                                        fk.parent_columns.get(seq).cloned().unwrap_or_default();
+                                    // SQLite reports `to` as NULL when the FK
+                                    // references the parent's PRIMARY KEY
+                                    // implicitly (no parent columns named); a
+                                    // named parent column shows its name. An
+                                    // empty string here would read as a real
+                                    // column named "" to a consumer that checks
+                                    // `to IS NULL` for "references the PK".
+                                    let to_val = match fk.parent_columns.get(seq) {
+                                        Some(name) => SqliteValue::Text(name.clone().into()),
+                                        None => SqliteValue::Null,
+                                    };
                                     Row {
                                         values: vec![
                                             SqliteValue::Integer(i64::try_from(fk_id).unwrap_or(0)),
                                             SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
                                             SqliteValue::Text(fk.parent_table.clone().into()),
                                             SqliteValue::Text(from_col.into()),
-                                            SqliteValue::Text(to_col.into()),
+                                            to_val,
                                             SqliteValue::Text(
                                                 fk_action_sql(fk.on_update).to_owned().into(),
                                             ),
