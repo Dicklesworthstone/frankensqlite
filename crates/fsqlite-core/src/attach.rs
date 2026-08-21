@@ -96,9 +96,13 @@ impl SchemaRegistry {
     pub fn detach(&mut self, schema: &str) -> Result<()> {
         let lower = schema.to_ascii_lowercase();
 
-        if lower == "main" || lower == "temp" {
-            return Err(FrankenError::internal(format!(
-                "cannot detach reserved schema: {schema}"
+        if lower == "main" {
+            // Stock: "cannot detach database main" under SQLITE_ERROR. `temp` is
+            // NOT a reserved-detach case in stock — it is simply not in the
+            // attach list, so it falls through to the lookup below and reports
+            // "no such database: temp". bd-6mj9n.
+            return Err(FrankenError::function_error(format!(
+                "cannot detach database {schema}"
             )));
         }
 
