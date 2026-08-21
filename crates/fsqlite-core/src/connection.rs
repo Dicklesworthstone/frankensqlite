@@ -57346,6 +57346,17 @@ impl Connection {
     async fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
         let table_name = create.name.name.clone();
 
+        // Stock SQLite reserves object names beginning with "sqlite_" (case-
+        // insensitive) for internal use; a user CREATE with such a name fails
+        // before the existence check (so even IF NOT EXISTS errors). Internal
+        // tables (sqlite_sequence, sqlite_stat1) are built directly and reload
+        // uses a separate parser, so neither reaches this user-CREATE path.
+        if table_name.len() >= 7 && table_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_") {
+            return Err(FrankenError::FunctionError(format!(
+                "object name reserved for internal use: {table_name}"
+            )));
+        }
+
         // bd-wjrs0: a `TEMP`/`TEMPORARY` table (or a `temp.<name>` qualifier)
         // lives in the connection-local temp namespace and may shadow a
         // same-named `main` table; it is never persisted to the main
