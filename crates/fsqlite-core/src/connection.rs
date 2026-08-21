@@ -24329,6 +24329,15 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_execute_supports_prepared_reuse(statements[0].as_ref())?
         {
+            // The prepared/VDBE fast lane skips the interpreted-path prepare-time
+            // semantic checks that execute_statement_dispatch_impl performs, so an
+            // aggregate/window misuse (e.g. `SELECT max(x) FROM t WHERE max(x)>0`)
+            // ran without the "misuse of aggregate: max()" prepare error that stock
+            // and frank's `query()` path raise. Run the SELECT misuse validation
+            // here so `execute()` matches. bd-prepare-time-validation-bypass.
+            if let Statement::Select(select) = statements[0].as_ref() {
+                self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
+            }
             let prepared = self.prepare_after_background_status(sql).await?;
             return self
                 .execute_prepared_autocommit_with_conflict_retry(&prepared, &[])
