@@ -40552,7 +40552,7 @@ impl Connection {
         let table_schema = schema
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(table_name))
-            .ok_or_else(|| FrankenError::Internal(format!("no such table: {table_name}")))?
+            .ok_or_else(|| FrankenError::FunctionError(format!("no such table: {table_name}")))?
             .clone();
         Self::validate_insert_target_columns(&table_schema, table_name, &insert.columns)?;
         let root_page = table_schema.root_page;
@@ -42886,7 +42886,7 @@ impl Connection {
                 .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
                 .map(|table| table.root_page)
                 .ok_or_else(|| {
-                    FrankenError::Internal(format!("no such table: {}", insert.table.name))
+                    FrankenError::FunctionError(format!("no such table: {}", insert.table.name))
                 })?
         };
         let autoincrement_root_page = self
@@ -58540,17 +58540,17 @@ impl Connection {
         if self.table_name_is_virtual(table_name) {
             match &alter.action {
                 AlterTableAction::RenameColumn { .. } => {
-                    return Err(FrankenError::Internal(format!(
+                    return Err(FrankenError::FunctionError(format!(
                         "cannot rename columns of virtual table \"{table_name}\""
                     )));
                 }
                 AlterTableAction::DropColumn(_) => {
-                    return Err(FrankenError::Internal(format!(
+                    return Err(FrankenError::FunctionError(format!(
                         "cannot drop column from virtual table \"{table_name}\""
                     )));
                 }
                 AlterTableAction::AddColumn(_) => {
-                    return Err(FrankenError::Internal(
+                    return Err(FrankenError::FunctionError(
                         "virtual tables may not be altered".to_owned(),
                     ));
                 }
@@ -86802,7 +86802,7 @@ impl Connection {
                     .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
             }
             .ok_or_else(|| {
-                FrankenError::Internal(format!("no such table: {}", insert.table.name))
+                FrankenError::FunctionError(format!("no such table: {}", insert.table.name))
             })?;
             Self::validate_insert_target_columns(
                 table_schema,
@@ -120231,10 +120231,13 @@ fn empty_column_defaults_arc() -> Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>> 
 pub(crate) fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
     match e {
         CodegenError::TableNotFound(name) => {
-            FrankenError::Internal(format!("no such table: {name}"))
+            // Stock emits these verbatim under SQLITE_ERROR. Internal would add
+            // "internal error:" / SQLITE_INTERNAL; and stock's "no such column"
+            // never carries an " in table T" suffix. bd-6mj9n.
+            FrankenError::FunctionError(format!("no such table: {name}"))
         }
-        CodegenError::ColumnNotFound { table, column } => {
-            FrankenError::Internal(format!("no such column: {column} in table {table}"))
+        CodegenError::ColumnNotFound { column, .. } => {
+            FrankenError::FunctionError(format!("no such column: {column}"))
         }
         CodegenError::AmbiguousColumn(name) => FrankenError::AmbiguousColumn { name },
         CodegenError::Unsupported(msg) => FrankenError::NotImplemented(msg),
@@ -141162,7 +141165,7 @@ fn validate_join_select_column_references(
                     .iter()
                     .any(|source| source_matches_name(source, name))
                 {
-                    return Err(FrankenError::Internal(format!("no such table: {name}")));
+                    return Err(FrankenError::FunctionError(format!("no such table: {name}")));
                 }
             }
             ResultColumn::Star => {}

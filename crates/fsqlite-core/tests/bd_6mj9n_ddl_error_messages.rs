@@ -78,3 +78,43 @@ fn ddl_conflict_error_messages_6mj9n() {
         assert_stock(&err_of(&[], "DROP TRIGGER nope").await, "no such trigger: nope");
     });
 }
+
+#[test]
+fn query_and_vtab_error_messages_6mj9n() {
+    asupersync::test_utils::run_test(|| async {
+        // INSERT into a missing table (SELECT/UPDATE/DELETE already used the
+        // correct NoSuchTable path; INSERT wrapped it in Internal).
+        assert_stock(&err_of(&[], "INSERT INTO nope VALUES(1)").await, "no such table: nope");
+        // A missing column reports just the reference — never " in table T".
+        assert_stock(
+            &err_of(&["CREATE TABLE t(a)"], "SELECT nope FROM t").await,
+            "no such column: nope",
+        );
+        // `table.*` where the table is not a FROM source.
+        assert_stock(
+            &err_of(&["CREATE TABLE t(a)"], "SELECT x.* FROM t").await,
+            "no such table: x",
+        );
+        // Column/table DDL on a virtual table.
+        assert_stock(
+            &err_of(
+                &["CREATE VIRTUAL TABLE ft USING fts5(x)"],
+                "ALTER TABLE ft RENAME COLUMN x TO y",
+            )
+            .await,
+            "cannot rename columns of virtual table \"ft\"",
+        );
+        assert_stock(
+            &err_of(
+                &["CREATE VIRTUAL TABLE ft USING fts5(x, z)"],
+                "ALTER TABLE ft DROP COLUMN z",
+            )
+            .await,
+            "cannot drop column from virtual table \"ft\"",
+        );
+        assert_stock(
+            &err_of(&["CREATE VIRTUAL TABLE ft USING fts5(x)"], "ALTER TABLE ft ADD COLUMN z").await,
+            "virtual tables may not be altered",
+        );
+    });
+}
