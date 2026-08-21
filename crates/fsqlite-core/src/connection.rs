@@ -58962,15 +58962,36 @@ impl Connection {
                     ColumnConstraintKind::Default(dv) => Some(dv),
                     _ => None,
                 });
+                // An explicit `DEFAULT NULL` back-fills existing rows with NULL
+                // exactly like no default at all, so it must trip the NOT-NULL
+                // row-presence gate below (bd-...-05537).
+                // `add_column_default_is_literal_constant` counts NULL as a
+                // literal, so the first gate clause never catches it — detect the
+                // bare NULL literal here.
+                let default_is_null_literal =
+                    default_dv.is_some_and(|dv| add_column_default_is_null_literal(dv));
+                // A STORED generated column is legal via ALTER on an EMPTY table
+                // but rejected on a non-empty one ("cannot add a STORED column"),
+                // so the row count is needed here too (bd-...-05537).
+                let has_stored_generated = col_def.constraints.iter().any(|c| {
+                    matches!(
+                        &c.kind,
+                        ColumnConstraintKind::Generated {
+                            storage: Some(GeneratedStorage::Stored),
+                            ..
+                        }
+                    )
+                });
                 let add_column_table_has_rows =
                     if default_dv.is_some_and(|dv| !add_column_default_is_literal_constant(dv))
-                        // A NOT NULL column with no default back-fills existing
-                        // rows with NULL, which SQLite forbids on a non-empty
-                        // table ("Cannot add a NOT NULL column with default value
-                        // NULL"). Without this clause the row-presence gate below
-                        // (`notnull && default_value.is_none() && has_rows`) is
-                        // dead — it needs the count even when there is no default.
-                        || (notnull && default_dv.is_none())
+                        // A NOT NULL column that back-fills existing rows with NULL
+                        // — no default, or a default that is the bare NULL literal —
+                        // is forbidden by SQLite on a non-empty table ("Cannot add a
+                        // NOT NULL column with default value NULL"). Without this
+                        // clause the row-presence gate below is dead: it needs the
+                        // count even when there is no usable (non-NULL) default.
+                        || (notnull && (default_dv.is_none() || default_is_null_literal))
+                        || has_stored_generated
                     {
                         self.alter_add_column_table_has_rows(table_name).await?
                     } else {
@@ -59003,11 +59024,15 @@ impl Connection {
                         _ => None,
                     })
                     .unwrap_or((None, None));
-                if generated_stored == Some(true) {
-                    return Err(FrankenError::Internal(format!(
-                        "Cannot add a STORED generated column {}",
-                        col_def.name
-                    )));
+                if generated_stored == Some(true) && add_column_table_has_rows {
+                    // Stock allows a STORED generated column via ALTER on an EMPTY
+                    // table but rejects it on a non-empty one at step time with
+                    // this verbatim message under SQLITE_ERROR (bd-...-05537).
+                    // FunctionError renders it as-is; Internal would prefix
+                    // "internal error:" and report SQLITE_INTERNAL.
+                    return Err(FrankenError::FunctionError(
+                        "cannot add a STORED column".to_owned(),
+                    ));
                 }
                 let collation = col_def.constraints.iter().find_map(|constraint| {
                     if let ColumnConstraintKind::Collate(name) = &constraint.kind {
@@ -59030,10 +59055,15 @@ impl Connection {
                 // SQLite only forbids adding a NOT NULL column without a default
                 // when there are existing rows to back-fill with NULL; on an
                 // empty table the column may be added (bd-nmt6h).
-                if notnull && default_value.is_none() && add_column_table_has_rows {
+                if notnull
+                    && (default_value.is_none() || default_is_null_literal)
+                    && add_column_table_has_rows
+                {
                     // FunctionError renders the message verbatim (ErrorCode::Error,
                     // i.e. SQLITE_ERROR) rather than Internal's "internal error:"
-                    // prefix / SQLITE_INTERNAL code.
+                    // prefix / SQLITE_INTERNAL code. An explicit `DEFAULT NULL`
+                    // back-fills with NULL just like no default, so it is rejected
+                    // on a non-empty table too (bd-...-05537).
                     return Err(FrankenError::FunctionError(
                         "Cannot add a NOT NULL column with default value NULL".to_owned(),
                     ));
@@ -120082,6 +120112,18 @@ fn add_column_default_is_literal_constant(dv: &DefaultValue) -> bool {
         ),
         _ => false,
     }
+}
+
+/// True when a column default is the bare `NULL` literal (`DEFAULT NULL` or
+/// `DEFAULT (NULL)`). SQLite treats such a default as "no usable default" for
+/// the NOT-NULL back-fill gate: adding a NOT NULL column with a NULL default to
+/// a non-empty table is rejected exactly like adding one with no default at all.
+fn add_column_default_is_null_literal(dv: &DefaultValue) -> bool {
+    use fsqlite_ast::{Expr, Literal};
+    let expr = match dv {
+        DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr) => expr,
+    };
+    matches!(expr, Expr::Literal(Literal::Null, _))
 }
 
 fn format_default_value(dv: &DefaultValue) -> String {
