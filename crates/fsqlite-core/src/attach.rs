@@ -106,7 +106,8 @@ impl SchemaRegistry {
             .attached
             .iter()
             .position(|db| db.schema.eq_ignore_ascii_case(schema))
-            .ok_or_else(|| FrankenError::internal(format!("no such database: {schema}")))?;
+            // Stock: "no such database: X" verbatim under SQLITE_ERROR. bd-6mj9n.
+            .ok_or_else(|| FrankenError::function_error(format!("no such database: {schema}")))?;
 
         let removed = self.attached.remove(pos);
         debug!(

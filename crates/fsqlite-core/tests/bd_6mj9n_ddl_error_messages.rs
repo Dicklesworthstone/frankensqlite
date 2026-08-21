@@ -123,3 +123,31 @@ fn query_and_vtab_error_messages_6mj9n() {
         );
     });
 }
+
+#[test]
+fn schema_and_generated_column_error_messages_6mj9n() {
+    asupersync::test_utils::run_test(|| async {
+        // DETACH of a database that is not attached.
+        assert_stock(&err_of(&[], "DETACH nodb").await, "no such database: nodb");
+        // INSERT into / UPDATE of a generated column.
+        assert_stock(
+            &err_of(
+                &["CREATE TABLE t(a INTEGER, b INTEGER GENERATED ALWAYS AS (a+1) VIRTUAL)"],
+                "INSERT INTO t(a,b) VALUES(1,2)",
+            )
+            .await,
+            "cannot INSERT into generated column \"b\"",
+        );
+        assert_stock(
+            &err_of(
+                &[
+                    "CREATE TABLE t(a INTEGER, b INTEGER GENERATED ALWAYS AS (a+1) VIRTUAL)",
+                    "INSERT INTO t(a) VALUES(1)",
+                ],
+                "UPDATE t SET b=5",
+            )
+            .await,
+            "cannot UPDATE generated column \"b\"",
+        );
+    });
+}

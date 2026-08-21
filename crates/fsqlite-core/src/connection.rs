@@ -40488,7 +40488,7 @@ impl Connection {
             // ("cannot INSERT into generated column"). (bd-txni0)
             let col = &table_schema.columns[idx];
             if col.generated_expr.is_some() || col.generated_stored.is_some() {
-                return Err(FrankenError::Internal(format!(
+                return Err(FrankenError::FunctionError(format!(
                     "cannot INSERT into generated column \"{column}\""
                 )));
             }
@@ -40519,7 +40519,7 @@ impl Connection {
                 };
                 let col = &table_schema.columns[idx];
                 if col.generated_expr.is_some() || col.generated_stored.is_some() {
-                    return Err(FrankenError::Internal(format!(
+                    return Err(FrankenError::FunctionError(format!(
                         "cannot UPDATE generated column \"{column}\""
                     )));
                 }
