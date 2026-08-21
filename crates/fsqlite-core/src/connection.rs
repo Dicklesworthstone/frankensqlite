@@ -102538,14 +102538,26 @@ fn select_requires_column_reference_preflight(select: &SelectStatement, conn: &C
     fn core_has_having(core: &SelectCore) -> bool {
         matches!(core, SelectCore::Select { having: Some(_), .. })
     }
+    // A window function's inline OVER (PARTITION BY / ORDER BY <col>) column
+    // references are validated at prepare by stock (`no such column`), but the
+    // simple-query path resolves neither — only the full column-reference
+    // resolver walks window specs (validate_window_clauses). Run it whenever a
+    // window function is present so a bad partition/order column surfaces like
+    // stock instead of being silently accepted. bd-prepare-time-validation-bypass.
+    fn core_has_window_function(core: &SelectCore) -> bool {
+        matches!(core, SelectCore::Select { columns, .. }
+            if columns.iter().any(|column| matches!(column,
+                ResultColumn::Expr { expr, .. } if expr_has_window_function(expr))))
+    }
     select.with.is_some()
         || core_has_having(&select.body.select)
         || select_core_has_derived_source(&select.body.select)
-        || select
-            .body
-            .compounds
-            .iter()
-            .any(|(_, core)| core_has_having(core) || select_core_has_derived_source(core))
+        || core_has_window_function(&select.body.select)
+        || select.body.compounds.iter().any(|(_, core)| {
+            core_has_having(core)
+                || select_core_has_derived_source(core)
+                || core_has_window_function(core)
+        })
         || select_contains_subquery_matching(select, conn, |_, _| true)
 }
 
