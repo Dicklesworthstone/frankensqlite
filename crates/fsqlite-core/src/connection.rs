@@ -57699,6 +57699,7 @@ impl Connection {
                             check_defs.push(CheckConstraint {
                                 expr: self.expr_verbatim_source(expr).unwrap_or_else(|| expr.to_string()),
                                 owner_column: Some(col.name.clone()),
+                                name: c.name.clone(),
                             });
                         }
                     }
@@ -57708,6 +57709,7 @@ impl Connection {
                         check_defs.push(CheckConstraint {
                             expr: self.expr_verbatim_source(expr).unwrap_or_else(|| expr.to_string()),
                             owner_column: None,
+                            name: tc.name.clone(),
                         });
                     }
                 }
@@ -59157,6 +59159,7 @@ impl Connection {
                         ColumnConstraintKind::Check(expr) => Some(CheckConstraint {
                             expr: self.expr_verbatim_source(expr).unwrap_or_else(|| expr.to_string()),
                             owner_column: Some(col_def.name.clone()),
+                            name: constraint.name.clone(),
                         }),
                         _ => None,
                     })

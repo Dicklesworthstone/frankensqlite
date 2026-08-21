@@ -3332,6 +3332,7 @@ fn extract_check_constraints_with_owners_sql_fallback(sql: &str) -> Vec<CheckCon
             checks.push(CheckConstraint {
                 expr: definition[open_paren + 1..close_paren].trim().to_owned(),
                 owner_column: owner_column.clone(),
+                name: None,
             });
             search_from = close_paren + 1;
         }
@@ -3356,6 +3357,7 @@ pub(crate) fn check_constraints_from_create_table_statement(
                 checks.push(CheckConstraint {
                     expr: expr.to_string(),
                     owner_column: Some(column.name.clone()),
+                    name: None,
                 });
             }
         }
@@ -3365,6 +3367,7 @@ pub(crate) fn check_constraints_from_create_table_statement(
             checks.push(CheckConstraint {
                 expr: expr.to_string(),
                 owner_column: None,
+                name: None,
             });
         }
     }
@@ -5919,6 +5922,7 @@ PRAGMA integrity_check;
             check_constraints: vec![CheckConstraint {
                 expr: "length(slug) > 0".to_owned(),
                 owner_column: None,
+                name: None,
             }],
         };
 
@@ -6090,10 +6094,12 @@ PRAGMA integrity_check;
                 CheckConstraint {
                     expr: r#"length("owned col") > 0"#.to_owned(),
                     owner_column: Some("owned col".to_owned()),
+                    name: None,
                 },
                 CheckConstraint {
                     expr: "b > 0".to_owned(),
                     owner_column: None,
+                    name: None,
                 },
             ]
         );

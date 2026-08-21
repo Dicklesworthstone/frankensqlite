@@ -35,3 +35,23 @@ fn unnamed_check_violation_reports_verbatim_expr_s9irk() {
         );
     });
 }
+
+#[test]
+fn named_check_violation_reports_constraint_name_s9irk() {
+    asupersync::test_utils::run_test(|| async {
+        // A NAMED CHECK reports the constraint NAME, not the expression.
+        assert_eq!(
+            err_of(&["CREATE TABLE t(a, CONSTRAINT pos CHECK(a>0))"], "INSERT INTO t VALUES(-1)").await,
+            "CHECK constraint failed: pos",
+        );
+        // Column-level named CHECK.
+        assert_eq!(
+            err_of(
+                &["CREATE TABLE u(a INTEGER CONSTRAINT pos CHECK(a>0))"],
+                "INSERT INTO u VALUES(-1)",
+            )
+            .await,
+            "CHECK constraint failed: pos",
+        );
+    });
+}

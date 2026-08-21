@@ -633,6 +633,10 @@ pub struct CheckConstraint {
     pub expr: String,
     /// Owning column for a column-level CHECK; `None` for table-level CHECKs.
     pub owner_column: Option<String>,
+    /// The CHECK constraint's name (`CONSTRAINT <name> CHECK(...)`), if any.
+    /// SQLite reports a NAMED check violation as `CHECK constraint failed:
+    /// <name>` and an unnamed one as `CHECK constraint failed: <expr>`.
+    pub name: Option<String>,
 }
 
 /// Foreign key action type (mirrors `fsqlite_ast::ForeignKeyActionType`).
@@ -26593,7 +26597,10 @@ fn emit_check_constraints(
                 SQLITE_CONSTRAINT,
                 0,
                 0,
-                P4::Str(format!("CHECK constraint failed: {}", check.expr)),
+                P4::Str(match &check.name {
+                    Some(name) => format!("CHECK constraint failed: {name}"),
+                    None => format!("CHECK constraint failed: {}", check.expr),
+                }),
                 0,
             );
         }
@@ -54980,6 +54987,7 @@ mod tests {
         check_table.check_constraints = vec![CheckConstraint {
             expr: "random() != 0".to_owned(),
             owner_column: None,
+            name: None,
         }];
         let mut check_builder = ProgramBuilder::new();
         let check_row = check_builder.alloc_regs(
