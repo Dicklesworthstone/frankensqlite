@@ -715,9 +715,13 @@ impl<'a> Lexer<'a> {
 
             // Validate hex content
             if !hex_bytes.len().is_multiple_of(2) {
+                // SQLite reports a malformed blob literal as an "unrecognized
+                // token" with the full offending text (from `x'` through the
+                // closing quote), not an internal byte-offset diagnostic.
+                // bd-errmsg-parity-batch3-3brmm.
                 return TokenKind::Error(format!(
-                    "blob literal has odd number of hex digits at byte {}",
-                    start
+                    "unrecognized token: \"{}\"",
+                    String::from_utf8_lossy(&self.src[start..self.pos])
                 ));
             }
 
@@ -730,8 +734,11 @@ impl<'a> Lexer<'a> {
                 match (hi, lo) {
                     (Some(h), Some(l)) => bytes.push((h << 4) | l),
                     _ => {
+                        // Non-hex content in a blob literal: SQLite reports the
+                        // whole `x'...'` token as unrecognized, not a byte offset.
                         return TokenKind::Error(format!(
-                            "invalid hex in blob literal at byte {start}"
+                            "unrecognized token: \"{}\"",
+                            String::from_utf8_lossy(&self.src[start..self.pos])
                         ));
                     }
                 }
@@ -1478,6 +1485,25 @@ mod tests {
         assert!(
             matches!(tokens[0], TokenKind::Error(ref e) if e.contains("unrecognized token: \"0xGG\"")),
             "expected 0xGG -> unrecognized token, got {:?}",
+            tokens[0]
+        );
+    }
+
+    #[test]
+    fn test_lex_blob_invalid_is_unrecognized() {
+        // A malformed (terminated) blob literal reports stock's
+        // "unrecognized token: \"...\"" with the full `x'...'` text, not an
+        // internal byte-offset diagnostic. bd-errmsg-parity-batch3-3brmm.
+        let tokens = kinds("x'123'"); // odd number of hex digits
+        assert!(
+            matches!(tokens[0], TokenKind::Error(ref e) if e.contains("unrecognized token: \"x'123'\"")),
+            "expected x'123' -> unrecognized token, got {:?}",
+            tokens[0]
+        );
+        let tokens = kinds("x'1G'"); // non-hex content
+        assert!(
+            matches!(tokens[0], TokenKind::Error(ref e) if e.contains("unrecognized token: \"x'1G'\"")),
+            "expected x'1G' -> unrecognized token, got {:?}",
             tokens[0]
         );
     }
