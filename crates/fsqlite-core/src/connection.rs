@@ -35926,6 +35926,43 @@ impl Connection {
                     let is_simple_values = matches!(select_stmt.body.select, SelectCore::Values(_))
                         && select_stmt.body.compounds.is_empty();
 
+                    // A real INSERT ... SELECT bypasses the VDBE VALUES-path
+                    // column-count check (codegen.rs), so a SELECT (with `*`
+                    // expanded) whose width does not match the INSERT target would
+                    // silently mis-insert. Validate it here, matching the VDBE
+                    // path's counts and messages exactly: no target list -> "table
+                    // T has N columns but M values were supplied"; an explicit list
+                    // -> "M values for N columns". (Simple VALUES keep flowing to the
+                    // VDBE path, which checks them.) bd-errmsg-parity-batch3-3brmm.
+                    if !is_simple_values {
+                        let source_cols =
+                            self.select_result_column_count(select_stmt, &[], &mut Vec::new());
+                        let target_cols = {
+                            let schemas = self.schema.borrow();
+                            schemas
+                                .iter()
+                                .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                                .map(|t| {
+                                    if insert.columns.is_empty() {
+                                        t.columns.len()
+                                    } else {
+                                        insert.columns.len()
+                                    }
+                                })
+                        };
+                        if let Some(target_cols) = target_cols
+                            && source_cols != target_cols
+                        {
+                            return Err(FrankenError::FunctionError(if insert.columns.is_empty() {
+                                format!(
+                                    "table {table_name} has {target_cols} columns but {source_cols} values were supplied"
+                                )
+                            } else {
+                                format!("{source_cols} values for {target_cols} columns")
+                            }));
+                        }
+                    }
+
                     // Complex INSERT ... SELECT statements are replayed as
                     // per-row INSERT ... VALUES operations. Those inner
                     // statements already handle trigger firing and change

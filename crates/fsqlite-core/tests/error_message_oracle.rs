@@ -335,3 +335,45 @@ fn bare_window_function_without_over_is_misuse() {
         );
     });
 }
+
+#[test]
+fn insert_select_column_count_mismatch() {
+    asupersync::test_utils::run_test(|| async {
+        // INSERT ... SELECT whose (star-expanded) width != the target column count
+        // is rejected, matching the VALUES-path counts and messages exactly.
+        // Verified vs sqlite3 CLI 3.46.1 (bd-errmsg-parity-batch3-3brmm).
+        // no target list -> "table T has N columns but M values were supplied"
+        err_is(
+            &["CREATE TABLE s(x)", "CREATE TABLE t(a, b)"],
+            "INSERT INTO t SELECT * FROM s",
+            "table t has 2 columns but 1 values were supplied",
+        )
+        .await;
+        err_is(
+            &["CREATE TABLE s(x, y, z)", "CREATE TABLE t(a, b)"],
+            "INSERT INTO t SELECT * FROM s",
+            "table t has 2 columns but 3 values were supplied",
+        )
+        .await;
+        // explicit target list -> "M values for N columns"
+        err_is(
+            &["CREATE TABLE s(x)", "CREATE TABLE t(a, b, c)"],
+            "INSERT INTO t(a, b) SELECT * FROM s",
+            "1 values for 2 columns",
+        )
+        .await;
+
+        // NEGATIVE: matching widths are accepted (no false reject) — both the
+        // star-expanded and the explicit-projection forms.
+        let f = Connection::open(":memory:").await.unwrap();
+        for s in ["CREATE TABLE s2(x, y)", "CREATE TABLE t2(a, b)"] {
+            f.execute(s).await.unwrap();
+        }
+        f.execute("INSERT INTO t2 SELECT * FROM s2")
+            .await
+            .expect("matching-width INSERT..SELECT (* -> 2 cols) is valid");
+        f.execute("INSERT INTO t2 SELECT x, y FROM s2")
+            .await
+            .expect("matching-width explicit-projection INSERT..SELECT is valid");
+    });
+}
