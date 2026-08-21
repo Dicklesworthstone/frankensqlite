@@ -57567,6 +57567,29 @@ impl Connection {
                                 _ => None,
                             })
                             .unwrap_or((None, None));
+                        // A column cannot carry both a DEFAULT and a generated
+                        // (AS) expression. Stock SQLite's message depends on
+                        // clause order: DEFAULT written AFTER the generated
+                        // expression is "cannot use DEFAULT on a generated
+                        // column"; DEFAULT written BEFORE it surfaces as the
+                        // generic "error in generated column \"<name>\"".
+                        if generated_expr.is_some() && default_value.is_some() {
+                            let default_pos = col.constraints.iter().position(|c| {
+                                matches!(c.kind, ColumnConstraintKind::Default(_))
+                            });
+                            let generated_pos = col.constraints.iter().position(|c| {
+                                matches!(c.kind, ColumnConstraintKind::Generated { .. })
+                            });
+                            let message = if matches!(
+                                (default_pos, generated_pos),
+                                (Some(d), Some(g)) if d < g
+                            ) {
+                                format!("error in generated column \"{}\"", col.name)
+                            } else {
+                                "cannot use DEFAULT on a generated column".to_owned()
+                            };
+                            return Err(FrankenError::FunctionError(message));
+                        }
                         let collation = column_def_declared_collation(col);
                         // Per-constraint ON CONFLICT for the column. For the
                         // INTEGER PRIMARY KEY (rowid) the PRIMARY KEY clause
@@ -72125,9 +72148,10 @@ impl Connection {
                 // declared PRIMARY KEY (key=1) followed — for index_xinfo — by the
                 // remaining table columns (key=0), matching stock. Reporting only:
                 // no schema row, no root page, and no trailing rowid entry (a
-                // WITHOUT ROWID table has no rowid). Per-column PK sort order is
-                // not retained in the schema, so key terms report ASC (desc=0);
-                // collation comes from each column's declared COLLATE.
+                // WITHOUT ROWID table has no rowid). Per-column PK sort order
+                // comes from the without_rowid_pk_desc registry (bd-w9r11) so a
+                // `PRIMARY KEY(x DESC)` key term reports desc=1; collation comes
+                // from each column's declared COLLATE. bd-ttof2-adjacent.
                 for table in &tables {
                     if !table.without_rowid {
                         continue;
@@ -72164,21 +72188,35 @@ impl Connection {
                                 .position(|c| c.name.eq_ignore_ascii_case(name))
                         })
                         .collect();
+                    // Per-column PK sort order from the without_rowid_pk_desc
+                    // registry (bd-w9r11 / GH#222/#223) — the same source the
+                    // storage-metadata path honors so the b-tree compares in PK
+                    // direction. Absent/legacy snapshots fall back to all-ascending.
+                    let pk_desc_flags: Vec<bool> = self
+                        .without_rowid_pk_desc
+                        .borrow()
+                        .get(&table.name.to_ascii_lowercase())
+                        .filter(|flags| flags.len() == pk_cids.len())
+                        .cloned()
+                        .unwrap_or_else(|| vec![false; pk_cids.len()]);
                     // index_info reports only the key columns; index_xinfo appends
-                    // the remaining (covered) table columns with key=0.
-                    let mut entries: Vec<(usize, bool)> =
-                        pk_cids.iter().map(|&cid| (cid, true)).collect();
+                    // the remaining (covered) table columns with key=0 (desc=0).
+                    let mut entries: Vec<(usize, bool, bool)> = pk_cids
+                        .iter()
+                        .zip(pk_desc_flags)
+                        .map(|(&cid, desc)| (cid, true, desc))
+                        .collect();
                     if is_xinfo {
                         for cid in 0..table.columns.len() {
                             if !pk_cids.contains(&cid) {
-                                entries.push((cid, false));
+                                entries.push((cid, false, false));
                             }
                         }
                     }
                     let rows = entries
                         .into_iter()
                         .enumerate()
-                        .map(|(seq, (cid, is_key))| {
+                        .map(|(seq, (cid, is_key, desc))| {
                             let col = &table.columns[cid];
                             let seqno = SqliteValue::Integer(i64::try_from(seq).unwrap_or(0));
                             let cid_val = SqliteValue::Integer(i64::try_from(cid).unwrap_or(-1));
@@ -72190,7 +72228,7 @@ impl Connection {
                                         seqno,
                                         cid_val,
                                         name,
-                                        SqliteValue::Integer(0),
+                                        SqliteValue::Integer(i64::from(desc)),
                                         SqliteValue::Text(coll.into()),
                                         SqliteValue::Integer(i64::from(is_key)),
                                     ],

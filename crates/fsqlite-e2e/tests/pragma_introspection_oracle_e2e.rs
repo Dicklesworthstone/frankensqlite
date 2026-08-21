@@ -360,3 +360,36 @@ fn pragma_index_xinfo_without_rowid_pk_gh352() {
         .await;
     });
 }
+
+/// The WITHOUT ROWID PK auto-index synthesised for `index_xinfo` reported the
+/// PK columns' sort direction as ASC (desc=0) unconditionally, because the
+/// reporting path hard-coded desc=0 with a stale "PK sort order is not retained"
+/// comment -- even though the direction IS retained (without_rowid_pk_desc,
+/// bd-w9r11 / GH#222/#223), which the storage-cursor metadata path already
+/// honors. So `PRIMARY KEY(x DESC)` on a WITHOUT ROWID table returned desc=0
+/// where stock returns desc=1. Covers single-column DESC and a multi-column
+/// mixed-direction PK (desc flags must track PK column order, and the trailing
+/// covered columns stay desc=0).
+#[test]
+fn pragma_index_xinfo_without_rowid_desc_pk() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE w1 (x TEXT, y INTEGER, PRIMARY KEY(x DESC)) WITHOUT ROWID",
+            "CREATE TABLE w2 (a INTEGER, b TEXT, c INTEGER, PRIMARY KEY(a DESC, b, c DESC)) \
+             WITHOUT ROWID",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                "PRAGMA index_xinfo(sqlite_autoindex_w1_1)",
+                "PRAGMA index_info(sqlite_autoindex_w1_1)",
+                "PRAGMA index_xinfo(sqlite_autoindex_w2_1)",
+                "PRAGMA index_info(sqlite_autoindex_w2_1)",
+            ],
+            "pragma_index_xinfo_without_rowid_desc_pk",
+        )
+        .await;
+    });
+}
