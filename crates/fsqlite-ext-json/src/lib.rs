@@ -441,7 +441,7 @@ fn json_patch_value(root: &Value, patch: &Value) -> Value {
 ///
 /// Returns `None` when the path does not resolve.
 pub fn json_type(input: &str, path: Option<&str>) -> Result<Option<&'static str>> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     json_type_value(&root, path)
 }
 
@@ -450,7 +450,7 @@ pub fn json_type(input: &str, path: Option<&str>) -> Result<Option<&'static str>
 /// - One path: return SQL-native value (text unwrapped, number typed, JSON null -> SQL NULL)
 /// - Multiple paths: return JSON array text of extracted values (missing paths become `null`)
 pub fn json_extract(input: &str, paths: &[&str]) -> Result<SqliteValue> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     json_extract_value(&root, paths)
 }
 
@@ -827,7 +827,7 @@ pub struct JsonTableRow {
 
 /// Table-valued `json_each`: iterate immediate children at root or `path`.
 pub fn json_each(input: &str, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     json_each_value(&root, path)
 }
 
@@ -930,7 +930,7 @@ fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
 
 /// Table-valued `json_tree`: recursively iterate subtree at root or `path`.
 pub fn json_tree(input: &str, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     json_tree_value(&root, path)
 }
 
@@ -1106,6 +1106,22 @@ fn parse_json_text(input: &str) -> Result<Value> {
 fn parse_json5_text(input: &str) -> Result<Value> {
     json5::from_str::<Value>(input)
         .map_err(|error| FrankenError::function_error(format!("invalid JSON5 input: {error}")))
+}
+
+/// Parse JSON text, accepting JSON5 (unquoted keys, single quotes, trailing
+/// commas, // and /* */ comments, hex integers, leading/trailing decimal
+/// points) as a fallback when strict RFC-8259 parsing fails. The
+/// value-consuming json functions (json_extract, json_type, json_each,
+/// json_tree, …) re-serialize/extract from the parsed tree, so JSON5 input is
+/// transparently canonicalized — matching stock SQLite 3.42+ (bd-qear2). Strict
+/// JSON is unaffected (the strict parse is tried first). Non-finite
+/// +Infinity/-Infinity/NaN still error here (serde_json::Value cannot carry
+/// them) — a documented follow-up on bd-qear2.
+fn parse_json_value_lenient(input: &str) -> Result<Value> {
+    match serde_json::from_str::<Value>(input) {
+        Ok(value) => Ok(value),
+        Err(_) => parse_json5_text(input),
+    }
 }
 
 fn encode_jsonb_root(value: &Value) -> Result<Vec<u8>> {
