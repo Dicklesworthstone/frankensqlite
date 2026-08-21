@@ -240,6 +240,13 @@ pub enum FrankenError {
     #[error("type mismatch: expected {expected}, got {actual}")]
     TypeMismatch { expected: String, actual: String },
 
+    /// Stock SQLite's bare "datatype mismatch" (SQLITE_MISMATCH), e.g. a
+    /// non-integral explicit rowid / INTEGER PRIMARY KEY value or a
+    /// non-integer LIMIT/OFFSET. Wire-identical to stock in both message
+    /// and primary result code (20).
+    #[error("datatype mismatch")]
+    DatatypeMismatch,
+
     /// Integer overflow during computation.
     #[error("integer overflow")]
     IntegerOverflow,
@@ -521,7 +528,7 @@ impl FrankenError {
             | Self::BusySnapshot { .. }
             | Self::SnapshotTooOld { .. }
             | Self::LockFailed { .. } => ErrorCode::Busy,
-            Self::TypeMismatch { .. } => ErrorCode::Mismatch,
+            Self::TypeMismatch { .. } | Self::DatatypeMismatch => ErrorCode::Mismatch,
             Self::IntegerOverflow | Self::OutOfRange { .. } => ErrorCode::Range,
             Self::TooBig => ErrorCode::TooBig,
             Self::Internal(_) | Self::DatabaseImagePublicationOutcomeIndeterminate { .. } => {
@@ -555,6 +562,7 @@ impl FrankenError {
                 | Self::NoSuchTable { .. }
                 | Self::NoSuchColumn { .. }
                 | Self::TypeMismatch { .. }
+                | Self::DatatypeMismatch
                 | Self::PageBufferCapacityExhausted { .. }
                 | Self::CannotOpen { .. }
         )

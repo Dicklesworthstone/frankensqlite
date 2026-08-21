@@ -2550,7 +2550,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
         // Parse width: a literal number, or `*` to take the width from the next
         // argument (bd-jvnwt). A negative dynamic width means left-justify with
         // its absolute value, matching C printf.
-        let mut width = 0usize;
+        let width: usize;
         if i < chars.len() && chars[i] == '*' {
             i += 1;
             let w = params.get(param_idx).map_or(0, SqliteValue::to_integer);
@@ -2650,10 +2650,10 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     *p = (*p).min(PRINTF_FLOAT_PRECISION_CAP);
                 }
             }
-            'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'c' | 'p' | 'r' => {
-                if precision.is_some_and(|p| p >= PRINTF_MAX_LENGTH) {
-                    return Ok(None);
-                }
+            'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'c' | 'p' | 'r'
+                if precision.is_some_and(|p| p >= PRINTF_MAX_LENGTH) =>
+            {
+                return Ok(None);
             }
             _ => {}
         }

@@ -9351,11 +9351,9 @@ impl VdbeEngine {
                         }
                         // Stock's MustBeInt failure (e.g. a non-integer LIMIT/
                         // OFFSET such as `LIMIT 'x'`) is the bare "datatype
-                        // mismatch" (SQLITE_MISMATCH), not a verbose "type
-                        // mismatch: expected integer, got text". bd-errmsg-batch3.
-                        return Err(FrankenError::FunctionError(
-                            "datatype mismatch".to_owned(),
-                        ));
+                        // mismatch" under SQLITE_MISMATCH — message and primary
+                        // result code. bd-errmsg-batch3.
+                        return Err(FrankenError::DatatypeMismatch);
                     }
                 }
 

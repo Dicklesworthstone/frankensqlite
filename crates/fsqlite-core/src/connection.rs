@@ -50835,10 +50835,9 @@ impl Connection {
             Ok(Some(rowid))
         } else {
             // Stock SQLite reports a non-integral explicit rowid / INTEGER
-            // PRIMARY KEY value as the bare "datatype mismatch" (SQLITE_MISMATCH),
-            // not a verbose "type mismatch: expected ..." string. Match it, via
-            // the same FunctionError channel as limit_datatype_mismatch().
-            Err(FrankenError::FunctionError("datatype mismatch".to_owned()))
+            // PRIMARY KEY value as the bare "datatype mismatch" under
+            // SQLITE_MISMATCH — both the message AND the primary result code.
+            Err(FrankenError::DatatypeMismatch)
         }
     }
 
@@ -95046,7 +95045,7 @@ fn check_limit_value_lossless(expr: &Expr) -> Result<()> {
 }
 
 fn limit_datatype_mismatch() -> FrankenError {
-    FrankenError::FunctionError("datatype mismatch".to_owned())
+    FrankenError::DatatypeMismatch
 }
 
 /// Build the "misuse of window function [NAME()]" error for `expr`, recording
@@ -150038,8 +150037,7 @@ mod tests {
                 assert!(
                     matches!(
                         error,
-                        FrankenError::FunctionError(ref message)
-                            if message == "datatype mismatch"
+                        FrankenError::DatatypeMismatch
                     ),
                     "unexpected error for `{sql}` with {params:?}: {error}"
                 );
@@ -150694,7 +150692,10 @@ mod tests {
                 .query("VALUES (1), (2, 3);")
                 .await
                 .expect_err("mismatched VALUES row widths must fail");
-            assert!(matches!(error, FrankenError::ParseError { .. }));
+            assert!(
+                matches!(error, FrankenError::FunctionError(ref msg) if msg.contains("all VALUES must have the same number of terms")),
+                "unexpected ragged-VALUES error: {error}"
+            );
         });
     }
 
@@ -159992,7 +159993,7 @@ mod tests {
                 .execute("CREATE TABLE t1 (x INTEGER);")
                 .await
                 .expect_err("duplicate table should fail");
-            assert!(matches!(err, FrankenError::Internal(_)));
+            assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("already exists")));
         });
     }
 
@@ -160073,7 +160074,10 @@ mod tests {
                 .execute("ALTER TABLE strict_alter ADD COLUMN bad NUMERIC;")
                 .await
                 .expect_err("unsupported STRICT type must fail");
-            assert!(matches!(err, FrankenError::Internal(msg) if msg.contains("invalid type")));
+            assert!(
+                matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("unknown datatype")),
+                "unexpected STRICT ADD COLUMN error: {err}"
+            );
         });
     }
 
@@ -160324,7 +160328,7 @@ mod tests {
             ] {
                 let error = conn.execute(sql).await.unwrap_err();
                 assert!(
-                    matches!(&error, FrankenError::Internal(message) if message == "no such column: missing"),
+                    error.to_string() == "no such column: \"missing\"",
                     "unexpected error for {sql}: {error}"
                 );
             }
@@ -275689,8 +275693,7 @@ mod pager_routing_tests {
                 assert!(
                     matches!(
                         error,
-                        FrankenError::FunctionError(ref message)
-                            if message == "datatype mismatch"
+                        FrankenError::DatatypeMismatch
                     ),
                     "unexpected fallback LIMIT error: {error}"
                 );
@@ -275708,8 +275711,7 @@ mod pager_routing_tests {
                 assert!(
                     matches!(
                         error,
-                        FrankenError::FunctionError(ref message)
-                            if message == "datatype mismatch"
+                        FrankenError::DatatypeMismatch
                     ),
                     "unexpected compound fallback LIMIT error: {error}"
                 );
@@ -275730,8 +275732,7 @@ mod pager_routing_tests {
                 assert!(
                     matches!(
                         error,
-                        FrankenError::FunctionError(ref message)
-                            if message == "datatype mismatch"
+                        FrankenError::DatatypeMismatch
                     ),
                     "unexpected out-of-range fallback LIMIT error for `{sql}`: {error}"
                 );
@@ -275762,8 +275763,7 @@ mod pager_routing_tests {
             assert!(
                 matches!(
                     offset_error,
-                    FrankenError::FunctionError(ref message)
-                        if message == "datatype mismatch"
+                    FrankenError::DatatypeMismatch
                 ),
                 "unexpected fallback OFFSET error: {offset_error}"
             );
