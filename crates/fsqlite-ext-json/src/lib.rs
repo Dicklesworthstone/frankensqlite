@@ -78,17 +78,21 @@ pub fn json(input: &str) -> Result<String> {
     // only to validate, then lexically minify — re-serializing a parsed
     // `serde_json::Value` would normalize exponents, unescape `\/`, and drop
     // duplicate keys (bd-6b0pe / bd-p2xrc).
-    if parse_json_text(input).is_ok() {
-        return Ok(minify_json_text(input));
-    }
+    let strict_error = match parse_json_text(input) {
+        Ok(_) => return Ok(minify_json_text(input)),
+        Err(error) => error,
+    };
     // JSON5 fallback (bd-qear2): stock SQLite 3.42+ accepts JSON5 — unquoted
     // object keys, single-quoted strings, trailing commas, // and /* */
     // comments, hex integers, leading/trailing decimal points — and
     // canonicalizes it to standard JSON. Parse via the JSON5 grammar and
     // re-serialize with the canonical writer. (Non-finite +Infinity/-Infinity/
     // NaN cannot round-trip through serde_json::Value and still error here — a
-    // documented follow-up on bd-qear2.)
-    let value = parse_json5_text(input)?;
+    // documented follow-up on bd-qear2.) On total failure surface the strict
+    // error so malformed input keeps its "invalid JSON input" message.
+    let Ok(value) = parse_json5_text(input) else {
+        return Err(strict_error);
+    };
     let mut out = String::new();
     write_canonical_json_text(&value, &mut out)?;
     Ok(out)
@@ -1120,7 +1124,12 @@ fn parse_json5_text(input: &str) -> Result<Value> {
 fn parse_json_value_lenient(input: &str) -> Result<Value> {
     match serde_json::from_str::<Value>(input) {
         Ok(value) => Ok(value),
-        Err(_) => parse_json5_text(input),
+        // Fall back to JSON5; if that also fails, surface the STRICT-parse error
+        // so genuinely-malformed input keeps its existing "invalid JSON input"
+        // message rather than a JSON5-flavored one.
+        Err(strict_error) => parse_json5_text(input).map_err(|_| {
+            FrankenError::function_error(format!("invalid JSON input: {strict_error}"))
+        }),
     }
 }
 
@@ -1950,7 +1959,9 @@ fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(Value, Option<&
         ));
     };
     let input_value = match input_arg {
-        SqliteValue::Text(input_text) => parse_json_text(input_text)?,
+        // JSON5 input accepted (bd-qear2) — json_each/json_tree canonicalize
+        // via the parsed tree; strict JSON is unaffected (tried first).
+        SqliteValue::Text(input_text) => parse_json_value_lenient(input_text)?,
         SqliteValue::Blob(input_blob) => parse_json_input_blob(input_blob)?,
         // A bare SQL numeric is a JSON number (C SQLite convention), mirroring
         // the scalar `json_arg_value` path: json_each(1.5) yields a single row
@@ -2498,7 +2509,11 @@ fn text_arg<'a>(name: &str, args: &'a [SqliteValue], index: usize) -> Result<&'a
 
 fn json_arg_value(name: &str, args: &[SqliteValue], index: usize) -> Result<Value> {
     match args.get(index) {
-        Some(SqliteValue::Text(text)) => parse_json_text(text),
+        // JSON5 input is accepted (bd-qear2): the shared arg-parser for every
+        // value-consuming scalar json function (json_extract, json_type,
+        // json_set, json_remove, json_patch, …) canonicalizes it via the parsed
+        // tree. Strict JSON is unaffected (strict parse is tried first).
+        Some(SqliteValue::Text(text)) => parse_json_value_lenient(text),
         Some(SqliteValue::Blob(bytes)) => parse_json_input_blob(bytes),
         // A bare SQL numeric value is interpreted as a JSON number (C SQLite's
         // JSON-argument convention): e.g. json_type(123) -> 'integer',
@@ -4180,9 +4195,12 @@ mod tests {
                 "json({input:?}) must minify whitespace but preserve the source verbatim"
             );
         }
-        // Invalid JSON is still rejected (validation runs before minification).
+        // Genuinely-malformed input (invalid even as JSON5) is still rejected.
         assert!(json("{\"a\":}").is_err());
-        assert!(json("[1,]").is_err());
+        assert!(json("[1 2]").is_err());
+        // A trailing comma is valid JSON5, now accepted and canonicalized to
+        // standard JSON (bd-qear2): `[1,]` -> `[1]`.
+        assert_eq!(json("[1,]").unwrap(), "[1]");
     }
 
     #[test]
@@ -5144,7 +5162,7 @@ mod tests {
     ],
     tree: [
         JsonTableRowStructure {
-            key: "Null",
+            key: "Text(\"a\")",
             value: "Text(\"[10,{\\\"b\\\":20}]\")",
             type_name: "array",
             atom: "Null",

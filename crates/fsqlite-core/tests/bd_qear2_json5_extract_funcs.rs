@@ -74,6 +74,14 @@ fn json5_read_functions_bd_qear2() {
             "SELECT value FROM json_each('[10, 20, 30,]') WHERE value > 15",
             "SELECT fullkey, type FROM json_tree('{a:{b:1}}')",
             "SELECT count(*) FROM json_each('{x:0xA, y:0xB}')",
+            // transform functions share the json_arg_value choke point
+            "SELECT json_set('{a:1}','$.b',2)",
+            "SELECT json_remove('{a:1, b:2,}','$.a')",
+            "SELECT json_replace('{a:1}','$.a',9)",
+            "SELECT json_patch('{a:1,b:2}','{b:null,c:3}')",
+            "SELECT json_array_length('[1,2,3,]')",
+            "SELECT json_pretty('{a:1}') = json_pretty('{\"a\":1}')",
+            "SELECT json_valid('{a:1}'), json_valid('{a:1}', 6)",
             // standard JSON still works (regression)
             "SELECT json_extract('{\"a\":9}','$.a')",
             "SELECT json_type('[1,2,3]')",
