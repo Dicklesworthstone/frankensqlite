@@ -9201,23 +9201,76 @@ fn trigger_statement_raise_directive(
         return None;
     }
 
-    let ResultColumn::Expr {
-        expr: Expr::Raise {
-            action, message, ..
-        },
-        ..
-    } = &columns[0]
-    else {
+    let ResultColumn::Expr { expr: col_expr, .. } = &columns[0] else {
         return None;
     };
 
-    Some((
-        TriggerRaiseDirective {
-            action: *action,
-            message: message.clone(),
-        },
-        where_clause.as_deref().cloned(),
-    ))
+    // Direct form: `SELECT RAISE(...) [WHERE <predicate>]`.
+    if let Expr::Raise {
+        action, message, ..
+    } = col_expr
+    {
+        return Some((
+            TriggerRaiseDirective {
+                action: *action,
+                message: message.clone(),
+            },
+            where_clause.as_deref().cloned(),
+        ));
+    }
+
+    // CASE-wrapped form: `SELECT CASE WHEN <cond> THEN RAISE(...) END` — the other
+    // canonical conditional-RAISE trigger idiom. The WHEN condition becomes the
+    // predicate (RAISE fires only when it is true), exactly like the WHERE form.
+    // Only recognized without an additional WHERE clause (the idiom never pairs
+    // the two); any other shape falls through unrecognized.
+    if where_clause.is_none()
+        && let Some((action, message, cond)) = case_wrapped_raise_directive(col_expr)
+    {
+        return Some((
+            TriggerRaiseDirective { action, message },
+            Some(cond.clone()),
+        ));
+    }
+
+    None
+}
+
+/// Recognize `CASE WHEN <cond> THEN RAISE(<action>, <msg>) END` — a searched
+/// CASE with a single WHEN whose result is a RAISE and an absent/NULL ELSE.
+/// Returns `(action, message, when-condition)`. This is the other canonical
+/// conditional-RAISE trigger idiom alongside `SELECT RAISE(...) WHERE <cond>`;
+/// SQLite evaluates the WHEN and fires the RAISE only when it is true.
+fn case_wrapped_raise_directive(
+    expr: &Expr,
+) -> Option<(fsqlite_ast::RaiseAction, Option<String>, &Expr)> {
+    let Expr::Case {
+        operand: None,
+        whens,
+        else_expr,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    if whens.len() != 1 {
+        return None;
+    }
+    let (cond, then_result) = &whens[0];
+    let Expr::Raise {
+        action, message, ..
+    } = then_result
+    else {
+        return None;
+    };
+    let else_ok = match else_expr {
+        None => true,
+        Some(e) => matches!(e.as_ref(), Expr::Literal(Literal::Null, _)),
+    };
+    if !else_ok {
+        return None;
+    }
+    Some((*action, message.clone(), cond))
 }
 
 /// Returns true if the statement is a `SELECT RAISE(...)` (with or without a
@@ -9230,14 +9283,13 @@ fn statement_is_raise_select(statement: &Statement) -> bool {
     let SelectCore::Select { columns, .. } = &select.body.select else {
         return false;
     };
-    columns.len() == 1
-        && matches!(
-            &columns[0],
-            ResultColumn::Expr {
-                expr: Expr::Raise { .. },
-                ..
-            }
-        )
+    if columns.len() != 1 {
+        return false;
+    }
+    let ResultColumn::Expr { expr, .. } = &columns[0] else {
+        return false;
+    };
+    matches!(expr, Expr::Raise { .. }) || case_wrapped_raise_directive(expr).is_some()
 }
 
 fn select_is_plain_count_star(select: &SelectStatement) -> bool {
