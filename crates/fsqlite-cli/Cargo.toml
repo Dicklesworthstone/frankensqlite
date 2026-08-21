@@ -11,7 +11,18 @@ name = "fsqlite"
 path = "src/main.rs"
 
 [features]
-default = []
+# The workspace `fsqlite` dep is declared `default-features = false` (root
+# Cargo.toml), so the shipped shell would otherwise register ZERO SQL
+# extensions — no json1/fts5/rtree/icu/misc — a parity gap vs stock sqlite3
+# (which ships json1+fts5+rtree). Forward the facade extension features and turn
+# them on by default so `cargo build -p fsqlite-cli` ships them; a
+# `--no-default-features` build still yields a lean engine-only shell. bd-dv4xv.
+default = ["json", "fts5", "rtree", "icu", "misc"]
+json = ["fsqlite/json"]
+fts5 = ["fsqlite/fts5"]
+rtree = ["fsqlite/rtree"]
+icu = ["fsqlite/icu"]
+misc = ["fsqlite/misc"]
 
 [dependencies]
 fsqlite = { workspace = true }
