@@ -456,3 +456,26 @@ fn cte_self_reference_no_anchor_is_circular() {
         );
     });
 }
+
+#[test]
+fn parameterized_query_rejects_aggregate_misuse() {
+    asupersync::test_utils::run_test(|| async {
+        // query_with_params's prepared fast lane must run the same aggregate/window
+        // misuse validation as query()/execute(), so an aggregate-in-WHERE is
+        // rejected rather than silently accepted. bd-w39k0.
+        let f = Connection::open(":memory:").await.unwrap();
+        f.execute("CREATE TABLE t(x INT)").await.unwrap();
+        match f
+            .query_with_params("SELECT max(x) FROM t WHERE max(x) > 0", &[])
+            .await
+        {
+            Ok(_) => panic!("expected a misuse error via query_with_params"),
+            Err(e) => assert_eq!(e.to_string(), "misuse of aggregate: max()"),
+        }
+        // control: a valid query on the same parameterized entry point still works.
+        assert!(
+            f.query_with_params("SELECT x FROM t WHERE x > 0", &[]).await.is_ok(),
+            "a valid parameterized query is accepted"
+        );
+    });
+}

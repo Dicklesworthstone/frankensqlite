@@ -24129,11 +24129,20 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_query_supports_prepared_reuse(statements[0].as_ref())
         {
+            // The prepared/VDBE fast lane skips the interpreted-path prepare-time
+            // misuse checks, so an aggregate/window misuse (e.g. `SELECT max(x)
+            // FROM t WHERE max(x)>0`) would run without the "misuse of aggregate:
+            // max()" error that stock and frank's query()/execute() paths raise.
+            // Mirror execute()'s fix so query_with_params matches. bd-w39k0.
+            if let Statement::Select(select) = statements[0].as_ref() {
+                self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
+            }
             let prepared = self.prepare_after_background_status(sql).await?;
             return self
                 .query_prepared_with_params_after_background_status(&prepared, params)
                 .await;
         }
+
         let mut rows = Vec::new();
         for statement in statements {
             rows = self
