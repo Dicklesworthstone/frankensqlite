@@ -87126,13 +87126,39 @@ impl Connection {
             if temp_roots.is_empty() && !targets_shadowed_main {
                 let schema = self.schema.borrow();
                 codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
-                    .map_err(codegen_error_to_franken)
+                    // A view (no INSTEAD OF trigger) reaching table-INSERT codegen
+                    // fails find_table as TableNotFound; stock reports "cannot
+                    // modify V because it is a view", not "no such table". bd-ttof2.
+                    .map_err(|e| {
+                        match e {
+                        CodegenError::TableNotFound(ref name)
+                            if self.view_index_of(name).is_some() =>
+                        {
+                            FrankenError::FunctionError(format!(
+                                "cannot modify {name} because it is a view"
+                            ))
+                        }
+                        other => codegen_error_to_franken(other),
+                    }})
             } else {
                 let mut schema = self.schema.borrow().clone();
                 self.apply_shadowed_main_target_substitution(&mut schema, &insert.table);
                 Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
                 codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
-                    .map_err(codegen_error_to_franken)
+                    // A view (no INSTEAD OF trigger) reaching table-INSERT codegen
+                    // fails find_table as TableNotFound; stock reports "cannot
+                    // modify V because it is a view", not "no such table". bd-ttof2.
+                    .map_err(|e| {
+                        match e {
+                        CodegenError::TableNotFound(ref name)
+                            if self.view_index_of(name).is_some() =>
+                        {
+                            FrankenError::FunctionError(format!(
+                                "cannot modify {name} because it is a view"
+                            ))
+                        }
+                        other => codegen_error_to_franken(other),
+                    }})
             }
         })?;
         let program = builder.finish()?;
