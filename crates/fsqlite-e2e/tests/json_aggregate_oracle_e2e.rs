@@ -174,13 +174,13 @@ fn json_group_array_empty_group() {
 }
 
 #[test]
-#[ignore = "bd-76x57: nested-JSON subtype embedding still fails — the fix in \
-            49a8e1d64 threads subtypes through the VDBE AggStep opcode, but \
-            SELECT agg(...) FROM t executes via the INTERPRETED aggregate path \
-            in connection.rs (func.step, no subtype channel), so the VDBE fix is \
-            never reached. Real fix = subtype-aware interpreted arg eval + \
-            step_with_arg_subtypes at the connection.rs agg sites (and carry the \
-            subtype through the GROUP BY sorter). Un-ignore when that lands."]
+#[ignore = "bd-76x57: PARTIALLY fixed. e1823f046 threads the JSON subtype through \
+            the non-grouped interpreted aggregate path (SELECT agg(json_object(..)) \
+            FROM t now embeds — see fsqlite-core keeper bd_76x57_json_group_subtype). \
+            But this test also covers the GROUP BY variant, which routes through a \
+            Sorter-backed path that still drops the subtype (verified: grouped case \
+            quotes). Un-ignore once the GROUP BY / compound-source agg paths gain the \
+            same expr-derived subtype (aggregate_arg_json_subtypes is reusable)."]
 fn json_group_aggregates_nested_json_subtype_embedded() {
     // bd-76x57 keeper: the canonical use — folding `json_object(...)` /
     // `json_array(...)` rows into a nested JSON array or object. The JSON subtype
