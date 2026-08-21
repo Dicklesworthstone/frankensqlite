@@ -175,8 +175,7 @@ use fsqlite_vdbe::codegen::{
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
     SelectPlannerDirective, TableSchema, bind_explicit_index, codegen_delete, codegen_insert,
     codegen_select, codegen_update, emit_backfill_column_read, emit_backfill_key_expr,
-    clear_column_error_offset, emit_scan_filter, take_column_error_offset,
-    without_rowid_pk_indices,
+    emit_scan_filter, without_rowid_pk_indices,
 };
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
@@ -468,10 +467,6 @@ std::thread_local! {
 /// batch and whenever a result is finalized successfully. bd-ttof2.
 fn clear_error_byte_offset() {
     ERROR_BYTE_OFFSET.set(None);
-    // Also drop any stale codegen column-error offset (bd-ttof2): it is set only
-    // on a resolution failure and normally consumed at codegen_error_to_franken,
-    // but a codegen path that catches+retries a ColumnNotFound could leave it set.
-    clear_column_error_offset();
 }
 
 /// Record the byte offset of the token an about-to-be-returned analysis error
@@ -121040,19 +121035,9 @@ pub(crate) fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
             FrankenError::FunctionError(format!("no such table: {name}"))
         }
         CodegenError::ColumnNotFound { column, .. } => {
-            // bd-ttof2: carry SQLite's " in <SQL> at offset N" suffix when the
-            // codegen recorded the offending column token's byte offset.
-            if let Some(offset) = take_column_error_offset() {
-                set_error_byte_offset(offset);
-            }
             FrankenError::FunctionError(format!("no such column: {column}"))
         }
-        CodegenError::AmbiguousColumn(name) => {
-            if let Some(offset) = take_column_error_offset() {
-                set_error_byte_offset(offset);
-            }
-            FrankenError::AmbiguousColumn { name }
-        }
+        CodegenError::AmbiguousColumn(name) => FrankenError::AmbiguousColumn { name },
         CodegenError::Unsupported(msg) => FrankenError::NotImplemented(msg),
         // A genuine SQL error (e.g. INSERT column/value count mismatch) is
         // reported verbatim under SQLITE_ERROR, not "not implemented:". bd-6mj9n.
@@ -121063,18 +121048,8 @@ pub(crate) fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
 fn create_index_bind_error_to_franken(error: CodegenError) -> FrankenError {
     match error {
         CodegenError::TableNotFound(name) => FrankenError::NoSuchTable { name },
-        CodegenError::ColumnNotFound { column, .. } => {
-            if let Some(offset) = take_column_error_offset() {
-                set_error_byte_offset(offset);
-            }
-            FrankenError::NoSuchColumn { name: column }
-        }
-        CodegenError::AmbiguousColumn(name) => {
-            if let Some(offset) = take_column_error_offset() {
-                set_error_byte_offset(offset);
-            }
-            FrankenError::AmbiguousColumn { name }
-        }
+        CodegenError::ColumnNotFound { column, .. } => FrankenError::NoSuchColumn { name: column },
+        CodegenError::AmbiguousColumn(name) => FrankenError::AmbiguousColumn { name },
         CodegenError::Unsupported(message) => FrankenError::FunctionError(message),
         CodegenError::SqlError(message) => FrankenError::FunctionError(message),
     }
