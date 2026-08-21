@@ -94777,6 +94777,43 @@ fn window_misuse_error(expr: &Expr) -> FrankenError {
     FrankenError::FunctionError(message)
 }
 
+/// When `expr` has an aggregate nested inside another aggregate's arguments (a
+/// "misuse of aggregate function"), return the INNER call's name + span — the
+/// one SQLite names, e.g. `sum(count(*))` reports `count()`. Picks the innermost:
+/// the first bare aggregate (arguments-first walk order) whose span is strictly
+/// contained in another aggregate's span. bd-ttof2.
+fn nested_inner_aggregate_name_span(expr: &Expr) -> Option<(String, Span)> {
+    let mut calls = Vec::new();
+    collect_agg_window_calls_ordered(expr, &mut calls);
+    let aggs: Vec<(String, Span)> = calls
+        .into_iter()
+        .filter(|&(_, _, is_window)| !is_window)
+        .map(|(name, span, _)| (name, span))
+        .collect();
+    aggs
+        .iter()
+        .find(|(_, inner)| {
+            aggs.iter().any(|(_, outer)| {
+                outer.start <= inner.start
+                    && inner.end <= outer.end
+                    && (outer.start, outer.end) != (inner.start, inner.end)
+            })
+        })
+        .cloned()
+}
+
+/// Build the "misuse of aggregate function [NAME()]" error for a nested
+/// aggregate in `expr`, recording the inner call's byte offset. bd-ttof2.
+fn nested_aggregate_misuse_error(expr: &Expr) -> FrankenError {
+    let message = if let Some((name, span)) = nested_inner_aggregate_name_span(expr) {
+        set_error_byte_offset(span.start);
+        format!("misuse of aggregate function {name}()")
+    } else {
+        "misuse of aggregate function".to_owned()
+    };
+    FrankenError::FunctionError(message)
+}
+
 fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {
     let SelectCore::Select {
         columns,
@@ -94829,9 +94866,7 @@ fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {
             return Err(window_misuse_error(h));
         }
         if expr_has_nested_aggregate(h) {
-            return Err(FrankenError::FunctionError(
-                "misuse of aggregate function".to_owned(),
-            ));
+            return Err(nested_aggregate_misuse_error(h));
         }
     }
     // A nested aggregate anywhere in a result column is a misuse.
@@ -94839,9 +94874,7 @@ fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {
         if let ResultColumn::Expr { expr, .. } = col
             && expr_has_nested_aggregate(expr)
         {
-            return Err(FrankenError::FunctionError(
-                "misuse of aggregate function".to_owned(),
-            ));
+            return Err(nested_aggregate_misuse_error(expr));
         }
     }
     Ok(())

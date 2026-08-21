@@ -152,3 +152,26 @@ fn window_misuse_offset() {
                "misuse of window function sum() in SELECT x FROM t WHERE x > sum(x) OVER () at offset 26").await;
     });
 }
+
+#[test]
+fn nested_aggregate_misuse_offset() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-ttof2 offset-suffix (slice 3): an aggregate nested inside another
+        // aggregate names the INNER call and carries its offset: "misuse of
+        // aggregate function NAME() in <SQL> at offset N". Was the bare,
+        // offsetless "misuse of aggregate function".
+        let t: &[&str] = &["CREATE TABLE t(x INT, g TEXT)"];
+        query_err_is(t, "SELECT sum(count(*)) FROM t",
+               "misuse of aggregate function count() in SELECT sum(count(*)) FROM t at offset 11").await;
+        query_err_is(t, "SELECT max(avg(x)) FROM t GROUP BY g",
+               "misuse of aggregate function avg() in SELECT max(avg(x)) FROM t GROUP BY g at offset 11").await;
+        query_err_is(t, "SELECT g FROM t GROUP BY g HAVING sum(count(*)) > 0",
+               "misuse of aggregate function count() in SELECT g FROM t GROUP BY g HAVING sum(count(*)) > 0 at offset 38").await;
+        // a non-nested aggregate precedes the nested one: still names the inner
+        query_err_is(t, "SELECT avg(x) + sum(count(*)) FROM t",
+               "misuse of aggregate function count() in SELECT avg(x) + sum(count(*)) FROM t at offset 20").await;
+        // triple nesting reports the innermost
+        query_err_is(t, "SELECT sum(avg(count(*))) FROM t",
+               "misuse of aggregate function count() in SELECT sum(avg(count(*))) FROM t at offset 15").await;
+    });
+}
