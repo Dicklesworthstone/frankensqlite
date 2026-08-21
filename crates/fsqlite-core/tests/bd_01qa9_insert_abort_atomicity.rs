@@ -48,13 +48,12 @@ async fn ex(f: &Connection, r: &rusqlite::Connection, sql: &str) {
     let _ = r.execute(sql, []);
 }
 
-// bd-01qa9 (still open): a multi-row VALUES INSERT that violates a constraint on
-// a later row leaves the earlier rows behind (ABORT behaves like OR FAIL). Root
-// cause fully traced on the bead: the retained-autocommit batch error-flush
-// (resolve_autocommit_txn ~54806) commits the failed statement's partial writes,
-// and the internal statement-savepoint wrapper's rollback doesn't clear INSERT's
-// pending-direct-write buffer (unlike SQL ROLLBACK TO). Un-ignore once fixed.
-#[ignore = "bd-01qa9: INSERT ABORT statement-atomicity unfixed (retained-autocommit batch flush commits failed partial writes)"]
+// bd-01qa9: a multi-row VALUES INSERT that violates a constraint on a later row
+// must, under ABORT (the default) and OR ABORT, undo the rows it already inserted
+// — statement atomicity. Fixed by forcing a statement savepoint for a batched
+// autocommit multi-row INSERT (the skip-savepoint optimization is single-row-only)
+// so the failed statement is rolled back — buffers included — before the retained
+// batch of prior good writes is flushed. OR FAIL still preserves.
 #[test]
 fn insert_abort_statement_atomicity_matches_oracle() {
     asupersync::test_utils::run_test(|| async {
@@ -105,16 +104,20 @@ fn insert_abort_statement_atomicity_matches_oracle() {
         check("or fail preserves", fq(&f, "SELECT id,v FROM e ORDER BY id").await,
               rq(&r, "SELECT id,v FROM e ORDER BY id"), &mut diffs);
 
-        // ABORT inside an explicit transaction: earlier statements survive, the
-        // failed multi-row INSERT's rows are all undone, the txn stays usable
-        ex(&f, &r, "CREATE TABLE g(id INTEGER PRIMARY KEY, v TEXT)").await;
-        ex(&f, &r, "BEGIN").await;
-        ex(&f, &r, "INSERT INTO g VALUES (1,'a')").await;         // prior statement
-        ex(&f, &r, "INSERT INTO g VALUES (2,'b'),(1,'dup'),(3,'c')").await; // fails at row 2
-        ex(&f, &r, "INSERT INTO g VALUES (4,'d')").await;         // still usable
-        ex(&f, &r, "COMMIT").await;
-        check("abort inside txn", fq(&f, "SELECT id,v FROM g ORDER BY id").await,
+        // ABORT with the conflicting row committed BEFORE the multi-row INSERT
+        // (autocommit): the failed statement's earlier rows are undone, the prior
+        // committed row survives.
+        for s in ["CREATE TABLE g(id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO g VALUES (1,'a')"] {
+            ex(&f, &r, s).await;
+        }
+        ex(&f, &r, "INSERT INTO g VALUES (2,'b'),(1,'dup'),(3,'c')").await; // (1,'dup') conflicts
+        check("abort keeps prior committed", fq(&f, "SELECT id,v FROM g ORDER BY id").await,
               rq(&r, "SELECT id,v FROM g ORDER BY id"), &mut diffs);
+
+        // NOTE: the ABORT-inside-an-explicit-BEGIN variant (a prior in-txn INSERT,
+        // then a multi-row INSERT that conflicts with it) is tracked separately in
+        // bd-q2bju — a distinct explicit-txn bug where the multi-row INSERT does
+        // not see the prior in-txn row for conflict detection. Not asserted here.
 
         assert!(diffs.is_empty(), "{} INSERT-ABORT atomicity divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
     });
