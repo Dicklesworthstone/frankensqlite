@@ -94821,6 +94821,115 @@ fn collect_aggregate_kind_names_from_args(args: &FunctionArgs, out: &mut BTreeSe
     }
 }
 
+/// The lowercased name of the RIGHTMOST bare (non-windowed) aggregate function
+/// in `expr`, in SQLite's left-to-right walk order. Used to fill stock's
+/// "misuse of aggregate: <name>()" message (e.g. `sum(a)+total(b)` reports
+/// `total()`, and `count(*) OVER () + sum(a)` reports `sum()` — the windowed
+/// call is skipped though its arguments are still traversed). Returns `None`
+/// when there is no bare aggregate, so the caller falls back to the bare
+/// "misuse of aggregate: " text.
+fn rightmost_bare_aggregate_name(expr: &Expr) -> Option<String> {
+    let mut names = Vec::new();
+    collect_bare_aggregate_names_ordered(expr, &mut names);
+    names.pop()
+}
+
+fn collect_bare_aggregate_names_ordered(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::FunctionCall {
+            name,
+            args,
+            filter,
+            over,
+            ..
+        } => {
+            // Traverse arguments (and any FILTER) left-to-right first, then
+            // record this call if it is a bare aggregate, so a top-level
+            // aggregate is "rightmost" relative to its own argument subtree.
+            if let FunctionArgs::List(items) = args {
+                for item in items {
+                    collect_bare_aggregate_names_ordered(item, out);
+                }
+            }
+            if let Some(filter) = filter.as_deref() {
+                collect_bare_aggregate_names_ordered(filter, out);
+            }
+            if over.is_none() && is_agg_fn(name) && !is_scalar_max_min(name, args) {
+                out.push(name.to_ascii_lowercase());
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_bare_aggregate_names_ordered(left, out);
+            collect_bare_aggregate_names_ordered(right, out);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => collect_bare_aggregate_names_ordered(inner, out),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_bare_aggregate_names_ordered(inner, out);
+            collect_bare_aggregate_names_ordered(low, out);
+            collect_bare_aggregate_names_ordered(high, out);
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            collect_bare_aggregate_names_ordered(inner, out);
+            if let InSet::List(items) = set {
+                for item in items {
+                    collect_bare_aggregate_names_ordered(item, out);
+                }
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_bare_aggregate_names_ordered(inner, out);
+            collect_bare_aggregate_names_ordered(pattern, out);
+            if let Some(escape) = escape.as_deref() {
+                collect_bare_aggregate_names_ordered(escape, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand.as_deref() {
+                collect_bare_aggregate_names_ordered(operand, out);
+            }
+            for (when_expr, then_expr) in whens {
+                collect_bare_aggregate_names_ordered(when_expr, out);
+                collect_bare_aggregate_names_ordered(then_expr, out);
+            }
+            if let Some(else_expr) = else_expr.as_deref() {
+                collect_bare_aggregate_names_ordered(else_expr, out);
+            }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            collect_bare_aggregate_names_ordered(inner, out);
+            collect_bare_aggregate_names_ordered(path, out);
+        }
+        Expr::RowValue(items, _) => {
+            for item in items {
+                collect_bare_aggregate_names_ordered(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Check whether any result column in a SELECT contains a window function
 /// (a function call with an OVER clause).
 fn has_window_functions(select: &SelectStatement) -> bool {
@@ -129257,9 +129366,13 @@ impl<'a> SelectStructureResolver<'a> {
                     .connection
                     .expr_contains_aggregate_with_registry(&term.expr)
                 {
-                    return Err(FrankenError::FunctionError(
-                        "misuse of aggregate: ".to_owned(),
-                    ));
+                    // Stock names the offending aggregate: "misuse of aggregate:
+                    // sum()" (the rightmost bare aggregate in the term).
+                    let named = rightmost_bare_aggregate_name(&term.expr)
+                        .map_or_else(String::new, |name| format!("{name}()"));
+                    return Err(FrankenError::FunctionError(format!(
+                        "misuse of aggregate: {named}"
+                    )));
                 }
             }
         }
