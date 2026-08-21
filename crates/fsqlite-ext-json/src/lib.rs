@@ -73,13 +73,25 @@ enum EditMode {
 ///
 /// Returns a canonical minified JSON string or a `FunctionError` if invalid.
 pub fn json(input: &str) -> Result<String> {
-    // Stock json() on text minifies whitespace but preserves every token of the
+    // Strict RFC-8259 JSON: minify whitespace but preserve every token of the
     // source verbatim (number literals, string escapes, duplicate keys). Parse
     // only to validate, then lexically minify — re-serializing a parsed
     // `serde_json::Value` would normalize exponents, unescape `\/`, and drop
     // duplicate keys (bd-6b0pe / bd-p2xrc).
-    parse_json_text(input)?;
-    Ok(minify_json_text(input))
+    if parse_json_text(input).is_ok() {
+        return Ok(minify_json_text(input));
+    }
+    // JSON5 fallback (bd-qear2): stock SQLite 3.42+ accepts JSON5 — unquoted
+    // object keys, single-quoted strings, trailing commas, // and /* */
+    // comments, hex integers, leading/trailing decimal points — and
+    // canonicalizes it to standard JSON. Parse via the JSON5 grammar and
+    // re-serialize with the canonical writer. (Non-finite +Infinity/-Infinity/
+    // NaN cannot round-trip through serde_json::Value and still error here — a
+    // documented follow-up on bd-qear2.)
+    let value = parse_json5_text(input)?;
+    let mut out = String::new();
+    write_canonical_json_text(&value, &mut out)?;
+    Ok(out)
 }
 
 /// Validate JSON text under flags compatible with SQLite `json_valid`.
