@@ -58214,6 +58214,36 @@ impl Connection {
             }
         };
         let obj_name = &drop_stmt.name.name;
+
+        // Stock refuses to DROP a system table with "table <name> may not be
+        // dropped" (this beats IF EXISTS, and DROP VIEW on sqlite_master reports
+        // the same). sqlite_master is synthesized (not in `schema`) so it is
+        // special-cased; other sqlite_-prefixed internal tables (e.g.
+        // sqlite_sequence) are protected only when they actually exist. Indexes
+        // and triggers use different rules, so only guard TABLE/VIEW drops.
+        if matches!(
+            drop_stmt.object_type,
+            DropObjectType::Table | DropObjectType::View
+        ) {
+            if obj_name.eq_ignore_ascii_case("sqlite_master") {
+                return Err(FrankenError::FunctionError(
+                    "table sqlite_master may not be dropped".to_owned(),
+                ));
+            }
+            if obj_name.len() >= 7 && obj_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_") {
+                let canonical = self
+                    .schema
+                    .borrow()
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(obj_name))
+                    .map(|t| t.name.clone());
+                if let Some(canonical) = canonical {
+                    return Err(FrankenError::FunctionError(format!(
+                        "table {canonical} may not be dropped"
+                    )));
+                }
+            }
+        }
         let mut dropped_connection_local = false;
         // For DROP TABLE on a legacy stock-SQLite virtual table whose module
         // ships shadow tables (FTS5, FTS3, FTS4, R-Tree), compute the shadow
