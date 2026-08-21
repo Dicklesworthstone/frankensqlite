@@ -202,3 +202,24 @@ fn function_resolution_offset() {
                "DISTINCT is not supported for window functions").await;
     });
 }
+
+#[test]
+fn offset_suffix_on_parameterized_entrypoint() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-ttof2: the offset suffix attaches on the parameterized entry points
+        // (query_with_params/execute_with_params), not just query/execute. A
+        // function-resolution error raised through query_with_params carries the
+        // full stock message. (The dispatch-level *misuse* validation is skipped
+        // on the parameterized fast path — a separate pre-existing gap tracked in
+        // bd-ttof2 — so this asserts a function-resolution error, which does fire.)
+        let f = Connection::open(":memory:").await.unwrap();
+        let _ = f.execute("CREATE TABLE t(x INT)").await;
+        match f.query_with_params("SELECT nosuchfn(x) FROM t", &[]).await {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => assert_eq!(
+                e.to_string(),
+                "no such function: nosuchfn in SELECT nosuchfn(x) FROM t at offset 7"
+            ),
+        }
+    });
+}

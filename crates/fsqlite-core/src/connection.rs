@@ -24074,29 +24074,34 @@ impl Connection {
     pub async fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
         let rewritten = self.dqs_proactive_rewrite(sql);
         let sql = rewritten.as_ref();
-        let first = match self.query_with_params_impl(sql, params).await {
-            Ok(v) => return Ok(v),
-            Err(e) => e,
-        };
-        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
-            return Err(first);
-        }
-        let mut rewritten = HashSet::new();
-        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
-            Some(s) => s,
-            None => return Err(first),
-        };
-        loop {
-            match self.query_with_params_impl(&cur, params).await {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
-                        Some(s) => s,
-                        None => return Err(e),
-                    };
+        // See `query`: append SQLite's " in <SQL> at offset N" suffix at this
+        // outermost boundary where the raw SQL text is still in scope. bd-ttof2.
+        let outcome = 'dqs: {
+            let first = match self.query_with_params_impl(sql, params).await {
+                Ok(v) => break 'dqs Ok(v),
+                Err(e) => e,
+            };
+            if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+                break 'dqs Err(first);
+            }
+            let mut rewritten = HashSet::new();
+            let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+                Some(s) => s,
+                None => break 'dqs Err(first),
+            };
+            loop {
+                match self.query_with_params_impl(&cur, params).await {
+                    Ok(v) => break 'dqs Ok(v),
+                    Err(e) => {
+                        cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                            Some(s) => s,
+                            None => break 'dqs Err(e),
+                        };
+                    }
                 }
             }
-        }
+        };
+        attach_error_byte_offset_suffix(outcome, sql)
     }
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
@@ -24105,6 +24110,7 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>> {
+        clear_error_byte_offset();
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -24486,32 +24492,37 @@ impl Connection {
     pub async fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
         let rewritten = self.dqs_proactive_rewrite(sql);
         let sql = rewritten.as_ref();
-        let first = match self.execute_with_params_impl(sql, params).await {
-            Ok(v) => return Ok(v),
-            Err(e) => e,
-        };
-        if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
-            return Err(first);
-        }
-        let mut rewritten = HashSet::new();
-        let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
-            Some(s) => s,
-            None => return Err(first),
-        };
-        loop {
-            match self.execute_with_params_impl(&cur, params).await {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
-                        Some(s) => s,
-                        None => return Err(e),
-                    };
+        // See `query`: append SQLite's " in <SQL> at offset N" suffix here. bd-ttof2.
+        let outcome = 'dqs: {
+            let first = match self.execute_with_params_impl(sql, params).await {
+                Ok(v) => break 'dqs Ok(v),
+                Err(e) => e,
+            };
+            if !self.dqs_enabled.get() || !self.dqs_single_statement(sql) {
+                break 'dqs Err(first);
+            }
+            let mut rewritten = HashSet::new();
+            let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+                Some(s) => s,
+                None => break 'dqs Err(first),
+            };
+            loop {
+                match self.execute_with_params_impl(&cur, params).await {
+                    Ok(v) => break 'dqs Ok(v),
+                    Err(e) => {
+                        cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                            Some(s) => s,
+                            None => break 'dqs Err(e),
+                        };
+                    }
                 }
             }
-        }
+        };
+        attach_error_byte_offset_suffix(outcome, sql)
     }
 
     async fn execute_with_params_impl(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
+        clear_error_byte_offset();
         self.execute_with_params_with_statement_savepoint_policy(sql, params, false)
             .await
     }
