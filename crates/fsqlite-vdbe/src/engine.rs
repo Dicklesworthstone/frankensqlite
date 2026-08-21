@@ -9349,10 +9349,13 @@ impl VdbeEngine {
                             pc = op.p2 as usize;
                             continue;
                         }
-                        return Err(FrankenError::TypeMismatch {
-                            expected: "integer".to_owned(),
-                            actual: self.get_reg(op.p1).typeof_str().to_owned(),
-                        });
+                        // Stock's MustBeInt failure (e.g. a non-integer LIMIT/
+                        // OFFSET such as `LIMIT 'x'`) is the bare "datatype
+                        // mismatch" (SQLITE_MISMATCH), not a verbose "type
+                        // mismatch: expected integer, got text". bd-errmsg-batch3.
+                        return Err(FrankenError::FunctionError(
+                            "datatype mismatch".to_owned(),
+                        ));
                     }
                 }
 
