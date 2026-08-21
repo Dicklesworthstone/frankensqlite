@@ -67,8 +67,14 @@ fn json_each_tree_match_rusqlite_oracle() {
             "SELECT sum(value) FROM json_each('[1,2,3,4,5]')",
             "SELECT count(*) FROM json_each('{\"a\":1,\"b\":2,\"c\":3}')",
             "SELECT type, count(*) FROM json_each('[1,\"x\",null,true,2.5]') GROUP BY type ORDER BY type",
-            // json_tree — recursive traversal (id/parent/fullkey/path contract)
-            "SELECT key, value, type, atom, id, parent, fullkey, path FROM json_tree('{\"a\":1,\"b\":[2,3]}')",
+            // json_tree — recursive traversal. NOTE: the id/parent columns are
+            // documented opaque ("arbitrary and may change from one release to
+            // the next"), so they are NOT compared across implementations —
+            // frank uses a self-consistent sequential counter, stock uses
+            // internal JSONB offsets; both satisfy the parent-references-id
+            // contract. The well-defined columns (key/value/type/atom/fullkey/
+            // path) are what must match.
+            "SELECT key, value, type, atom, fullkey, path FROM json_tree('{\"a\":1,\"b\":[2,3]}')",
             "SELECT fullkey, type FROM json_tree('{\"x\":{\"y\":{\"z\":5}}}')",
             "SELECT count(*) FROM json_tree('{\"a\":[1,2,{\"b\":3}]}')",
             "SELECT value FROM json_tree('{\"a\":[1,2,{\"b\":3}]}') WHERE type='integer' ORDER BY value",
