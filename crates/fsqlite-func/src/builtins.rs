@@ -2117,7 +2117,15 @@ fn glob_match_inner(pat: &[char], txt: &[char], mut pi: usize, mut ti: usize) ->
                     if pi + 2 < pat.len() && pat[pi + 1] == '-' && pat[pi + 2] != ']' {
                         let lo = pat[pi];
                         let hi = pat[pi + 2];
-                        if txt[ti] >= lo && txt[ti] <= hi {
+                        // C SQLite's patternCompare tests the range's lower-bound
+                        // char as a LITERAL set member (`c2==c`) BEFORE it reads
+                        // the `-`, then matches the range `lo..=hi` separately
+                        // (with the upper bound NOT a literal). So a reversed /
+                        // empty range like `[5-0]` still matches its start char
+                        // `5` (`'a5c' GLOB 'a[5-0]c'` -> 1), while `[5-0]` matches
+                        // neither `0` nor `3`. A normal range `[0-9]` is
+                        // unaffected because `lo` is already inside `lo..=hi`.
+                        if txt[ti] == lo || (txt[ti] >= lo && txt[ti] <= hi) {
                             found = true;
                         }
                         pi += 3;
