@@ -20705,13 +20705,21 @@ fn codegen_insert_values(
                     make_insert_record_p4(table, &aff_str),
                     0,
                 );
+                // bd-sque1: the DO UPDATE apply is semantically an UPDATE, so its
+                // re-insert must ABORT — not REPLACE — on a uniqueness conflict.
+                // The conflict victim was already deleted above, so a same-key
+                // upsert never collides; ABORT fires only when the assignment
+                // rewrites the rowid/PK/UNIQUE key onto a DIFFERENT existing row,
+                // matching stock (a plain UPDATE that collides raises the error and
+                // leaves the table unchanged). REPLACE here silently clobbered that
+                // other row and lost it.
                 b.emit_op(
                     Opcode::Insert,
                     cursor,
                     update_rec,
                     final_rowid_reg,
                     P4::Table(table.name.clone()),
-                    OE_REPLACE | OPFLAG_ISUPDATE,
+                    OE_ABORT | OPFLAG_ISUPDATE,
                 );
                 emit_index_inserts(
                     b,
@@ -20719,7 +20727,7 @@ fn codegen_insert_values(
                     cursor,
                     existing_regs,
                     final_rowid_reg,
-                    Some(ConflictAction::Replace),
+                    Some(ConflictAction::Abort),
                 );
                 if !returning.is_empty() {
                     emit_returning(b, cursor, table, returning, table_alias, final_rowid_reg)?;
