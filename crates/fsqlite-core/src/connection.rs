@@ -23859,8 +23859,16 @@ impl Connection {
     /// supported ... Column(ColumnRef { .. column: "X" .. })` form which embeds
     /// the name in the `{expr:?}` debug. Returns None otherwise (fails safe).
     fn dqs_missing_column_name(err: &FrankenError) -> Option<String> {
+        // The VDBE/codegen column-resolution failure now reports "no such column"
+        // as a `FunctionError` (verbatim under SQLITE_ERROR, bd-6mj9n); the older
+        // fromless/interpreted path uses Internal/NotImplemented. Match all three
+        // so the DQS retry fires for FROM-table / WHERE / concat contexts too.
+        // Safe: `dqs_rewrite_once` only splices when an actual double-quoted token
+        // of that name exists, so a bare unquoted typo still errors.
         let msg = match err {
-            FrankenError::Internal(m) | FrankenError::NotImplemented(m) => m.as_str(),
+            FrankenError::Internal(m)
+            | FrankenError::NotImplemented(m)
+            | FrankenError::FunctionError(m) => m.as_str(),
             _ => return None,
         };
         if let Some(i) = msg.find("no such column: ") {
