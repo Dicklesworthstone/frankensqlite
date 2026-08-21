@@ -17,14 +17,15 @@ as a 27-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) (2026-08-19) through the 0.3.7 version bump ([`8cc00ba7cd61141605ec7c27a0ecb92aa5264e22`](https://github.com/Dicklesworthstone/frankensqlite/commit/8cc00ba7cd61141605ec7c27a0ecb92aa5264e22)). **0.3.7 is a release candidate; the `v0.3.7` tag is cut after the release gate.** The 0.3.6 row below matches the published GitHub Release. v0.3.2–v0.3.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through the 0.3.8 version bump. **0.3.8 is a release candidate; the `v0.3.8` tag is cut after the release gate.** v0.3.2–v0.3.4, v0.3.6, and v0.3.7 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...main) | HEAD | 2026-08-20 | (no post-0.3.7 changes yet) |
-| [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...main) | Release (pending tag) | 2026-08-20 | GH#345/#366/#368/#369/#370/#371/#244 + bd-xv5cm 7-facet concurrency hardening + REVIEW3 |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.8...main) | HEAD | 2026-08-21 | (no post-0.3.8 changes yet) |
+| [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.7...main) | Release (pending tag) | 2026-08-21 | UPSERT clobber P1 fix + INSERT-ABORT atomicity + stock-error-message parity campaign + JSON5 + differential oracle keeper suite |
+| [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) | Release | 2026-08-20 | GH#345/#366/#368/#369/#370/#371/#244 + bd-xv5cm 7-facet concurrency hardening + REVIEW3 |
 | [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) | Release | 2026-08-19 | FTS5 reopen/hydration + binary release |
 | [v0.3.5](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.3.5) | Tag | 2026-08-17 | crates.io snapshot; non-leading PK WITHOUT ROWID (no GitHub Release) |
 | [v0.3.4](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.4) | Release | 2026-08-16 | GH#353 WITHOUT ROWID composite-UNIQUE auto-index |
@@ -33,11 +34,45 @@ Scope window: [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.3.7
+## [Unreleased] -- development on `main` since v0.3.8
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.6...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.8...main>
 
-No post-0.3.7 changes yet; the version bump is the current tip.
+No post-0.3.8 changes yet; the version bump is the current tip.
+
+---
+
+## [0.3.8] -- 2026-08-21 (release candidate; tag `v0.3.8` is cut after the release gate)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.7...main>
+
+396 commits after the [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) tag, dominated by a stock-SQLite conformance campaign driven by differential oracle probing (frank vs bundled rusqlite / sqlite3), plus two significant data-integrity fixes.
+
+### Data integrity
+
+- **UPSERT `DO UPDATE` no longer clobbers a colliding row** (P1, bd-sque1, [`8fc5edf69`](https://github.com/Dicklesworthstone/frankensqlite/commit/8fc5edf69)): updating the conflict-target key into an existing key now aborts with `UNIQUE constraint failed` instead of silently overwriting the other row.
+- **INSERT `ABORT` statement-level rollback** (bd-01qa9, closed with un-ignored regression guard [`f8740c3ae`](https://github.com/Dicklesworthstone/frankensqlite/commit/f8740c3ae)): a mid-statement constraint failure inside an explicit transaction now rolls back exactly that statement's effects; unified follow-up for explicit-txn conflict-check visibility staged as bd-q2bju.
+- ATTACH deferred-encoding persist done correctly (bd-lzbku, [`a0706385d`](https://github.com/Dicklesworthstone/frankensqlite/commit/a0706385d)): an empty aux adopted by a UTF-16 main stays 0-byte/attachable until its first write, which stamps the header before the first row-encode.
+- Namespace-binding sidecar fds are quiesced on connection close and drop (bd-9hp58, [`725e83651`](https://github.com/Dicklesworthstone/frankensqlite/commit/725e83651)) with an lsof-clean e2e.
+
+### Stock-error-message parity campaign (bd-ttof2 + bd-errmsg-parity batches)
+
+Dozens of error paths now emit byte-identical stock SQLite messages: no-such-table/column (schema-qualified where stock does), ALTER/DROP/CREATE families, ATTACH/DETACH, VACUUM, CHECK (named + unnamed), IPK duplicates, value-count mismatches (INSERT, INSERT..SELECT, ragged VALUES), non-integer LIMIT, aggregate/window misuse (including RETURNING and the execute() fast-path, prepare-time OVER-column validation), transaction/savepoint control errors, reserved `sqlite_` names, unknown COLLATE, malformed blob/hex literals, and more. The non-stock `" in <SQL> at offset N"` suffix experiment was reverted after divergence evidence ([`42e23be3b`](https://github.com/Dicklesworthstone/frankensqlite/commit/42e23be3b)).
+
+### SQL surface & extensions
+
+- JSON5 input accepted (and canonicalized) across all scalar and table-valued JSON functions (bd-qear2, [`68a90d825`](https://github.com/Dicklesworthstone/frankensqlite/commit/68a90d825)); `json_group_array`/`json_group_object` registered with JSON-subtype preservation on both VDBE and interpreted paths; `jsonb_extract` scalar/composite return-type parity; `json_remove`/`json_patch` preserve object key order; `json_tree` path-rooted root-key parity.
+- R-Tree: auxiliary columns (`rtree(id,x0,x1,+aux TYPE)`, bd-2pibv) and per-dimension `min<=max` enforcement on INSERT/UPDATE (bd-hj6ly).
+- FTS5: `rank` usable in WHERE predicates (bd-ic9nu).
+- Recursive CTE without the `RECURSIVE` keyword parses (bd-b7g1o); bare-identifier `DEFAULT` treated as string literal; `strftime` `%U`/`%J` and NULL-on-unknown-specifier parity; `printf` dynamic width/precision i32 semantics; scalar i32-truncation parity for `substr`/`round`; `quote()` infinity round-trips as `9.0e+999`.
+- CLI ships the json/fts5/rtree/icu/misc extensions by default (bd-dv4xv).
+- Observability: Prometheus `/metrics` HTTP endpoint on a std::net daemon thread (opt-in, bd-zywqc.11), `PRAGMA write_amplification`, `PRAGMA gc_stats`, `PRAGMA schema_advisor`.
+- PRAGMA introspection parity: `table_info` on views (columns + decltypes across joins/subqueries), verbatim parenthesized `dflt_value`, `index_list` `partial=1`, COLLATE-decorated key terms in `index_info`/`index_xinfo`, table-valued `pragma_collation_list()`, TEMP-shadowed tables listed in `main.sqlite_master`.
+
+### Test infrastructure
+
+- ~100 new differential oracle keepers vs the bundled rusqlite oracle covering scalar/aggregate/window functions, datetime, printf, JSON/jsonb, collation, affinity/CAST, JOIN/set-ops/CTEs, UPSERT, RETURNING, FK actions, generated columns, STRICT tables, WITHOUT ROWID, triggers (timing, OLD/NEW, RAISE inside CASE), views, TEMP-schema resolution, and transaction atomicity — wired into CI as an explicit workflow step (takes effect when GitHub Actions is re-enabled).
+- Internal workspace dependency pins tightened to exact versions so downstream consumers cannot resolve mismatched internal crates (bd-fsqlite-loose-internal-dep-floors).
 
 ---
 

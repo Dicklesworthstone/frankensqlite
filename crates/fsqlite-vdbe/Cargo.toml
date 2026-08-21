@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-vdbe"
-version = "0.3.7"
+version = "0.3.8"
 description = "Virtual database engine bytecode interpreter"
 edition.workspace = true
 license-file.workspace = true
