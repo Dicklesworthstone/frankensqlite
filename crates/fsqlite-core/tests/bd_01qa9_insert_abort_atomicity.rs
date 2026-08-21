@@ -48,14 +48,13 @@ async fn ex(f: &Connection, r: &rusqlite::Connection, sql: &str) {
     let _ = r.execute(sql, []);
 }
 
-// bd-01qa9 is not yet fixed: a multi-row VALUES INSERT that violates a
-// constraint on a later row leaves the earlier rows behind (ABORT behaves like
-// FAIL). The root cause is in the MVCC concurrent statement-savepoint / autocommit
-// rollback path (a manual SQL SAVEPOINT/ROLLBACK TO undoes it, but the internal
-// statement-savepoint wrapper does not and corrupts concurrent conflict-detection
-// visibility). Un-ignore this once bd-01qa9 lands. See the bead for the full
-// diagnosis and the reverted first-attempt writeup.
-#[ignore = "bd-01qa9: INSERT ABORT statement-atomicity unfixed (MVCC concurrent-savepoint rollback)"]
+// bd-01qa9 (still open): a multi-row VALUES INSERT that violates a constraint on
+// a later row leaves the earlier rows behind (ABORT behaves like OR FAIL). Root
+// cause fully traced on the bead: the retained-autocommit batch error-flush
+// (resolve_autocommit_txn ~54806) commits the failed statement's partial writes,
+// and the internal statement-savepoint wrapper's rollback doesn't clear INSERT's
+// pending-direct-write buffer (unlike SQL ROLLBACK TO). Un-ignore once fixed.
+#[ignore = "bd-01qa9: INSERT ABORT statement-atomicity unfixed (retained-autocommit batch flush commits failed partial writes)"]
 #[test]
 fn insert_abort_statement_atomicity_matches_oracle() {
     asupersync::test_utils::run_test(|| async {
