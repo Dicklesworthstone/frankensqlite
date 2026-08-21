@@ -23471,18 +23471,29 @@ impl Connection {
     /// to the AST render when the source is unavailable (batched statements) or
     /// the span does not resolve. bd-pragma-table-info-dflt-source-rqvvf.
     fn format_default_value_verbatim(&self, dv: &DefaultValue) -> String {
-        if let DefaultValue::ParenExpr(expr) = dv {
-            let span = expr.span();
-            if let Some(source) = self.pending_ddl_source.borrow().as_deref()
-                && let Some(text) = source.get(span.start as usize..span.end as usize)
-            {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_owned();
-                }
-            }
+        if let DefaultValue::ParenExpr(expr) = dv
+            && let Some(verbatim) = self.expr_verbatim_source(expr)
+        {
+            return verbatim;
         }
         format_default_value(dv)
+    }
+
+    /// The VERBATIM source text of `expr` — sliced from `pending_ddl_source`
+    /// (the exact issued CREATE/ALTER SQL the statement was parsed from) by the
+    /// expression's byte span, whitespace-trimmed. Returns `None` when the
+    /// source is unavailable (batched statements) or the span does not resolve,
+    /// so callers can fall back to an AST render. Used for `dflt_value`
+    /// (bd-...-rqvvf) and for a `CHECK` constraint's reported expression
+    /// (bd-...-s9irk); SQLite reports both verbatim, not re-rendered.
+    fn expr_verbatim_source(&self, expr: &Expr) -> Option<String> {
+        let span = expr.span();
+        let source = self.pending_ddl_source.borrow();
+        let text = source
+            .as_deref()?
+            .get(span.start as usize..span.end as usize)?;
+        let trimmed = text.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
     }
 
     /// Prepare SQL into a statement.
@@ -57686,7 +57697,7 @@ impl Connection {
                     for c in &col.constraints {
                         if let ColumnConstraintKind::Check(ref expr) = c.kind {
                             check_defs.push(CheckConstraint {
-                                expr: expr.to_string(),
+                                expr: self.expr_verbatim_source(expr).unwrap_or_else(|| expr.to_string()),
                                 owner_column: Some(col.name.clone()),
                             });
                         }
@@ -57695,7 +57706,7 @@ impl Connection {
                 for tc in constraints {
                     if let TableConstraintKind::Check(ref expr) = tc.kind {
                         check_defs.push(CheckConstraint {
-                            expr: expr.to_string(),
+                            expr: self.expr_verbatim_source(expr).unwrap_or_else(|| expr.to_string()),
                             owner_column: None,
                         });
                     }
@@ -59144,7 +59155,7 @@ impl Connection {
                     .iter()
                     .filter_map(|constraint| match &constraint.kind {
                         ColumnConstraintKind::Check(expr) => Some(CheckConstraint {
-                            expr: expr.to_string(),
+                            expr: self.expr_verbatim_source(expr).unwrap_or_else(|| expr.to_string()),
                             owner_column: Some(col_def.name.clone()),
                         }),
                         _ => None,
