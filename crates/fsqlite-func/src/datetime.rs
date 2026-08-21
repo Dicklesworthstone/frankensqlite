@@ -1016,7 +1016,12 @@ fn push_zero_padded_4(result: &mut String, value: i64) {
 }
 
 /// strftime format engine.
-fn format_strftime(fmt: &str, jdn: f64, subsec: bool, unmodified: Option<UnmodifiedHms>) -> String {
+fn format_strftime(
+    fmt: &str,
+    jdn: f64,
+    subsec: bool,
+    unmodified: Option<UnmodifiedHms>,
+) -> Option<String> {
     let (y, mo, d) = jdn_to_ymd(jdn);
     let hms = hms_for_output(jdn, unmodified);
     let (h, mi, s, frac) = (hms.hour, hms.minute, hms.second, hms.fraction);
@@ -1160,10 +1165,10 @@ fn format_strftime(fmt: &str, jdn: f64, subsec: bool, unmodified: Option<Unmodif
                 }
             }
             '%' => result.push('%'),
-            other => {
-                result.push('%');
-                result.push(other);
-            }
+            // An unknown/undefined specifier makes stock strftime return NULL
+            // for the ENTIRE result (it does not pass the specifier through
+            // literally). bd-13mqo.
+            _ => return None,
         }
     }
 
@@ -1171,7 +1176,7 @@ fn format_strftime(fmt: &str, jdn: f64, subsec: bool, unmodified: Option<Unmodif
         result.push_str(&fmt[literal_start..]);
     }
 
-    result
+    Some(result)
 }
 
 /// ISO 8601 week number and year.
@@ -1682,15 +1687,18 @@ impl ScalarFunction for StrftimeFunc {
         };
         let rest = &args[1..];
         match parse_args(rest) {
-            Some(parsed) => Ok(SqliteValue::Text(
-                format_strftime(
+            Some(parsed) => Ok(
+                match format_strftime(
                     fmt.as_ref(),
                     parsed.jdn,
                     parsed.subsec,
                     parsed.unmodified_hms,
-                )
-                .into(),
-            )),
+                ) {
+                    // An unknown specifier in the format yields NULL (bd-13mqo).
+                    Some(text) => SqliteValue::Text(text.into()),
+                    None => SqliteValue::Null,
+                },
+            ),
             None => Ok(SqliteValue::Null),
         }
     }
