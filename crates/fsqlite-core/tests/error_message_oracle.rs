@@ -221,3 +221,32 @@ fn offset_suffix_on_parameterized_entrypoint() {
         }
     });
 }
+
+#[test]
+fn distinct_aggregate_arg_count_precedence() {
+    asupersync::test_utils::run_test(|| async {
+        // For a DISTINCT aggregate with more than one argument, stock reports the
+        // DISTINCT-single-argument error ONLY when the function legitimately
+        // accepts that arity (group_concat takes 1 or 2). When the arity is
+        // invalid for the function itself (count/sum/avg take 1), the arg-count
+        // error takes precedence. bd-errmsg-parity-batch4-deqcb.
+        let t: &[&str] = &["CREATE TABLE t(a INT, b INT)"];
+        query_err_is(t, "SELECT count(DISTINCT a, b) FROM t",
+               "wrong number of arguments to function count()").await;
+        query_err_is(t, "SELECT sum(DISTINCT a, b) FROM t",
+               "wrong number of arguments to function sum()").await;
+        query_err_is(t, "SELECT avg(DISTINCT a, b) FROM t",
+               "wrong number of arguments to function avg()").await;
+        // group_concat legitimately takes 2 args, so the arg count is valid and
+        // the DISTINCT-single-argument rule is what fires.
+        query_err_is(t, "SELECT group_concat(DISTINCT a, b) FROM t",
+               "DISTINCT aggregates must have exactly one argument").await;
+        // control: a valid single-argument DISTINCT aggregate is accepted.
+        let f = Connection::open(":memory:").await.unwrap();
+        let _ = f.execute("CREATE TABLE t(a INT, b INT)").await;
+        assert!(
+            f.query("SELECT count(DISTINCT a) FROM t").await.is_ok(),
+            "count(DISTINCT a) should be accepted"
+        );
+    });
+}

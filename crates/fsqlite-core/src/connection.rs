@@ -94663,9 +94663,24 @@ fn validate_function_call_header(
         ));
     }
     if distinct && is_aggregate && aggregate_args_len_for_lookup(args) != 1 {
-        return Err(FrankenError::FunctionError(
-            "DISTINCT aggregates must have exactly one argument".to_owned(),
-        ));
+        // The DISTINCT-single-argument rule only applies when the aggregate
+        // would otherwise ACCEPT this many arguments (e.g. group_concat, which
+        // takes 1 or 2 — so group_concat(DISTINCT a, b) is the DISTINCT error).
+        // When the arg count is invalid for the function itself (e.g. count,
+        // which takes 1), stock reports "wrong number of arguments" instead, so
+        // defer to validate_function_call_resolution below for that case.
+        // bd-errmsg parity (bd-errmsg-parity-batch4-deqcb).
+        let num_args = aggregate_args_len_for_lookup(args);
+        let accepts_this_arity = with_current_sync_function_registry(|registry| {
+            registry
+                .unwrap_or_else(|| shared_builtin_function_registry().as_ref())
+                .aggregate_accepts_arg_count(name, num_args)
+        });
+        if accepts_this_arity == Some(true) {
+            return Err(FrankenError::FunctionError(
+                "DISTINCT aggregates must have exactly one argument".to_owned(),
+            ));
+        }
     }
     if !order_by.is_empty() && (over.is_some() || !is_aggregate) {
         mark_error_offset(offending_span);
