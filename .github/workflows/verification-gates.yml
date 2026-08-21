@@ -569,6 +569,7 @@ jobs:
           cargo test -p fsqlite-core --test collation_oracle -- --nocapture
           cargo test -p fsqlite-core --test aggregate_edge_oracle -- --nocapture
           cargo test -p fsqlite-core --test join_oracle -- --nocapture
+          cargo test -p fsqlite-core --test string_printf_oracle -- --nocapture
 
   e2e-scenario-matrix:
     if: github.event_name == 'workflow_dispatch'
