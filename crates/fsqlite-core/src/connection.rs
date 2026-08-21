@@ -5370,6 +5370,10 @@ fn pragma_table_function_columns(name: &str) -> Option<&'static [&'static str]> 
         // No-argument pragma TVF: `SELECT * FROM pragma_function_list()` reuses
         // the `PRAGMA function_list` row generator (GH #206/#207).
         Some(&PRAGMA_FUNCTION_LIST_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("collation_list") {
+        // No-argument pragma TVF: `SELECT * FROM pragma_collation_list()` reuses
+        // the `PRAGMA collation_list` row generator (bd-5m52m).
+        Some(&PRAGMA_COLLATION_LIST_COLUMNS)
     } else {
         None
     }
@@ -5395,6 +5399,7 @@ fn pragma_table_function_is_no_arg(name: &str) -> bool {
     pragma.eq_ignore_ascii_case("database_list")
         || pragma.eq_ignore_ascii_case("compile_options")
         || pragma.eq_ignore_ascii_case("function_list")
+        || pragma.eq_ignore_ascii_case("collation_list")
 }
 
 struct HtmMetricsVtab;
