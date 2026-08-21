@@ -610,8 +610,8 @@ impl<'a> Lexer<'a> {
                 // Unterminated string
                 self.pos = self.src.len();
                 return TokenKind::Error(format!(
-                    "unterminated string literal starting at byte {}",
-                    start
+                    "unrecognized token: \"{}\"",
+                    String::from_utf8_lossy(&self.src[start..self.pos])
                 ));
             }
         }
@@ -642,8 +642,8 @@ impl<'a> Lexer<'a> {
             } else {
                 self.pos = self.src.len();
                 return TokenKind::Error(format!(
-                    "unterminated double-quoted identifier at byte {}",
-                    start
+                    "unrecognized token: \"{}\"",
+                    String::from_utf8_lossy(&self.src[start..self.pos])
                 ));
             }
         }
@@ -673,8 +673,8 @@ impl<'a> Lexer<'a> {
             } else {
                 self.pos = self.src.len();
                 return TokenKind::Error(format!(
-                    "unterminated backtick identifier at byte {}",
-                    start
+                    "unrecognized token: \"{}\"",
+                    String::from_utf8_lossy(&self.src[start..self.pos])
                 ));
             }
         }
@@ -696,7 +696,10 @@ impl<'a> Lexer<'a> {
             TokenKind::QuotedId(self.interner.intern(&value), false)
         } else {
             self.pos = self.src.len();
-            TokenKind::Error(format!("unterminated bracket identifier at byte {}", start))
+            TokenKind::Error(format!(
+                "unrecognized token: \"{}\"",
+                String::from_utf8_lossy(&self.src[start..self.pos])
+            ))
         }
     }
 
@@ -746,7 +749,10 @@ impl<'a> Lexer<'a> {
             TokenKind::Blob(bytes)
         } else {
             self.pos = self.src.len();
-            TokenKind::Error(format!("unterminated blob literal at byte {}", start))
+            TokenKind::Error(format!(
+                "unrecognized token: \"{}\"",
+                String::from_utf8_lossy(&self.src[start..self.pos])
+            ))
         }
     }
 
@@ -1384,8 +1390,19 @@ mod tests {
 
     #[test]
     fn test_lex_error_unterminated_string() {
-        let tokens = kinds("'hello");
-        assert!(matches!(tokens[0], TokenKind::Error(_)));
+        // Unterminated tokens report stock's "unrecognized token: \"<text>\"" with
+        // the full text (to end of input), not an internal "unterminated ... at
+        // byte N": string, double-quoted/backtick/bracket identifiers, and blob.
+        // bd-errmsg-parity-batch3-3brmm.
+        for input in ["'hello", "\"abc", "`abc", "[abc", "x'12"] {
+            let tokens = kinds(input);
+            let expected = format!("unrecognized token: \"{input}\"");
+            assert!(
+                matches!(tokens[0], TokenKind::Error(ref e) if e.contains(&expected)),
+                "expected {input:?} -> {expected:?}, got {:?}",
+                tokens[0]
+            );
+        }
     }
 
     #[test]
