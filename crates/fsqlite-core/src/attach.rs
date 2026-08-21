@@ -67,8 +67,9 @@ impl SchemaRegistry {
             .iter()
             .any(|db| db.schema.eq_ignore_ascii_case(&schema))
         {
-            return Err(FrankenError::internal(format!(
-                "database already attached with schema name: {schema}"
+            // Stock: "database X is already in use" under SQLITE_ERROR. bd-6mj9n.
+            return Err(FrankenError::function_error(format!(
+                "database {schema} is already in use"
             )));
         }
 

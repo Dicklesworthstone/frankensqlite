@@ -131,6 +131,11 @@ fn schema_and_generated_column_error_messages_6mj9n() {
         assert_stock(&err_of(&[], "DETACH nodb").await, "no such database: nodb");
         assert_stock(&err_of(&[], "DETACH main").await, "cannot detach database main");
         assert_stock(&err_of(&[], "DETACH temp").await, "no such database: temp");
+        // ATTACH a schema name that is already in use.
+        assert_stock(
+            &err_of(&["ATTACH ':memory:' AS aux"], "ATTACH ':memory:' AS aux").await,
+            "database aux is already in use",
+        );
         // INSERT into / UPDATE of a generated column.
         assert_stock(
             &err_of(
