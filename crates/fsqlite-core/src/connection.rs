@@ -57406,6 +57406,16 @@ impl Connection {
                         )));
                     }
                 }
+                // SQLite rejects a table whose every column is GENERATED at
+                // CREATE time ("must have at least one non-generated column"),
+                // rather than only failing later at INSERT. bd-...-lc80p.
+                if !col_infos.is_empty()
+                    && col_infos.iter().all(|column| column.generated_expr.is_some())
+                {
+                    return Err(FrankenError::FunctionError(
+                        "must have at least one non-generated column".to_owned(),
+                    ));
+                }
                 // A table may declare at most one PRIMARY KEY: count column-level
                 // PKs plus table-level PKs (a single composite table-level PK is
                 // one). More than one -> "table \"<t>\" has more than one primary

@@ -138,6 +138,15 @@ fn schema_and_generated_column_error_messages_6mj9n() {
         );
         // A PRAGMA qualified by an unknown schema (distinct wording from DETACH).
         assert_stock(&err_of(&[], "PRAGMA nodb.user_version").await, "unknown database nodb");
+        // A table whose every column is GENERATED is rejected at CREATE time.
+        assert_stock(
+            &err_of(&[], "CREATE TABLE t(a INTEGER GENERATED ALWAYS AS (1) VIRTUAL)").await,
+            "must have at least one non-generated column",
+        );
+        assert_stock(
+            &err_of(&[], "CREATE TABLE t(a AS (1), b AS (2))").await,
+            "must have at least one non-generated column",
+        );
         // INSERT into / UPDATE of a generated column.
         assert_stock(
             &err_of(
