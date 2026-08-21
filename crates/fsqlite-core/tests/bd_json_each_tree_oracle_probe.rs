@@ -79,7 +79,16 @@ fn json_each_tree_match_rusqlite_oracle() {
             "SELECT count(*) FROM json_tree('{\"a\":[1,2,{\"b\":3}]}')",
             "SELECT value FROM json_tree('{\"a\":[1,2,{\"b\":3}]}') WHERE type='integer' ORDER BY value",
             "SELECT fullkey, atom FROM json_tree('[{\"k\":1},{\"k\":2}]') WHERE atom IS NOT NULL ORDER BY fullkey",
+            // bd-kzwze: a PATH-rooted scan reports the self/root row's `key` as
+            // the last path segment (object key -> TEXT, array index -> INTEGER),
+            // NOT NULL. The `$`-rooted scans above still report root key NULL.
             "SELECT key, value FROM json_tree('{\"a\":{\"b\":1}}','$.a')",
+            "SELECT key, value, type FROM json_tree('{\"outer\":{\"a\":1,\"b\":2}}','$.outer')",
+            "SELECT key, value, type FROM json_tree('[10,[20,30]]','$[1]')",
+            "SELECT key, value FROM json_tree('{\"a\":5}','$.a')",
+            "SELECT key, value FROM json_each('{\"a\":5}','$.a')",
+            "SELECT key, value, type FROM json_each('[10,[20,30]]','$[1]')",
+            "SELECT key FROM json_tree('{\"a\":1}')",
             // atom is NULL for containers, non-NULL for leaves
             "SELECT type, atom FROM json_each('[[1],2,{\"k\":3}]') ORDER BY key",
         ];

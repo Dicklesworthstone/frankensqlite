@@ -825,6 +825,27 @@ pub fn json_each_blob(input: &[u8], path: Option<&str>) -> Result<Vec<JsonTableR
     json_each_value(&root, path)
 }
 
+/// The `key` column for the root row of a json_tree scan rooted at `path`: the
+/// last path segment — an object key (TEXT) or array index (INTEGER). NULL when
+/// scanning the document root (`$`), whose row has no parent key. Mirrors stock:
+/// `json_tree('{"a":{"b":1}}','$.a')` reports the `{"b":1}` row with key `'a'`,
+/// not NULL. (json_each's self-row key stays NULL — see its scalar branch.)
+/// bd-kzwze.
+fn path_root_key(path: Option<&str>) -> SqliteValue {
+    let Some(path) = path else {
+        return SqliteValue::Null;
+    };
+    match parse_path(path).ok().and_then(|segments| segments.last().cloned()) {
+        Some(PathSegment::Key(key)) => SqliteValue::Text(key.as_str().into()),
+        Some(PathSegment::Index(index)) => {
+            SqliteValue::Integer(i64::try_from(index).unwrap_or(0))
+        }
+        // `$` (no segment), Append, and the rare `#-n` FromEnd form have no
+        // stable literal key here — fall back to NULL.
+        _ => SqliteValue::Null,
+    }
+}
+
 fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
     let base_path = path.unwrap_or("$");
     let target = match path {
@@ -876,6 +897,10 @@ fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
         }
         scalar => {
             rows.push(JsonTableRow {
+                // json_each's self/scalar row key is ALWAYS NULL — unlike
+                // json_tree, it does not surface the rooting path's last segment
+                // (verified vs stock: json_each('{"a":5}','$.a') -> key NULL,
+                // whereas json_tree of the same -> key 'a'). bd-kzwze.
                 key: SqliteValue::Null,
                 value: json_value_column(scalar)?,
                 type_name: json_type_name(scalar),
@@ -918,7 +943,7 @@ fn json_tree_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
     append_tree_rows(
         &mut rows,
         target,
-        SqliteValue::Null,
+        path_root_key(path),
         None,
         base_path,
         base_path,
