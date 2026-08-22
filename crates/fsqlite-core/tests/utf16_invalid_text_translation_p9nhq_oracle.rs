@@ -1,3 +1,5 @@
+// Some SQL literals here ('{x:...}') look like format args to clippy.
+#![allow(clippy::literal_string_with_formatting_args)]
 //! bd-p9nhq (GH#180 residual) differential oracle — REFUTES the bead premise.
 //!
 //! GH#180's CORE bug (BLOB->TEXT->BLOB dropping raw bytes to U+FFFD) was fixed by

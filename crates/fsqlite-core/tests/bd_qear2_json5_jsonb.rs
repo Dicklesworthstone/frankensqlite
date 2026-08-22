@@ -1,4 +1,6 @@
 #![recursion_limit = "512"]
+// JSON5 SQL literals ('{a:1}') look like format args to clippy.
+#![allow(clippy::literal_string_with_formatting_args)]
 
 //! bd-qear2 (increment 3 probe): do the jsonb-producing functions accept JSON5?
 //! Tested via round-trip through json()/json_extract (JSONB bytes are opaque, so

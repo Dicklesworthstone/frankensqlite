@@ -46,6 +46,8 @@ fn rval(conn: &rusqlite::Connection, sql: &str) -> String {
 }
 
 #[test]
+// The JSON5 SQL literals ('{a:1}') look like format args to clippy.
+#[allow(clippy::literal_string_with_formatting_args)]
 fn json_edge_functions_match_rusqlite_oracle() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();

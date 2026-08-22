@@ -1,4 +1,6 @@
 #![recursion_limit = "512"]
+// JSON5 SQL literals ('{a:1}') look like format args to clippy.
+#![allow(clippy::literal_string_with_formatting_args)]
 
 //! bd-qear2 (increment 1): json() accepts JSON5 input and canonicalizes it to
 //! standard JSON, matching stock SQLite 3.42+. Covers the common JSON5 features

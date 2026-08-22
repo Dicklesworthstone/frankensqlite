@@ -1,4 +1,6 @@
 #![recursion_limit = "512"]
+// JSON5 SQL literals ('{a:1}') look like format args to clippy.
+#![allow(clippy::literal_string_with_formatting_args)]
 
 //! bd-qear2 (increment 2): the core JSON read functions — json_extract,
 //! json_type, json_each, json_tree — accept JSON5 input (unquoted keys, single

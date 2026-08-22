@@ -64,7 +64,7 @@ fn norm(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
     if rows.len() == 1 && rows[0].len() == 1 && rows[0][0].starts_with("ERR") {
         return vec![vec!["ERR".to_owned()]];
     }
-    for r in &mut rows { for c in r.iter_mut() { if c.starts_with("ERR:") { *c = "ERR".to_owned(); } } }
+    for r in &mut rows { for c in r.iter_mut() { if c.starts_with("ERR:") { "ERR".clone_into(c); } } }
     rows
 }
 
