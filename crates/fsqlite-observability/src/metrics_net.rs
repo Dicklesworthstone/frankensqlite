@@ -68,6 +68,10 @@ fn serve_one(mut stream: &TcpStream) -> std::io::Result<()> {
     // Bound the read so a slow/stuck client can never wedge the (serial) accept
     // loop, and cap total request size to avoid unbounded buffering.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    // bd-7lhxi: the accept loop is serial, so a client that sends a request but
+    // never reads the response (zero receive window) would otherwise block
+    // write_all forever and wedge the endpoint for the process lifetime.
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
     let mut head: Vec<u8> = Vec::with_capacity(1024);
     let mut buf = [0_u8; 1024];
     // Read the whole request head (through the blank line) before answering:
