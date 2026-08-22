@@ -66,7 +66,7 @@ fn temp_schema_dml_and_objects_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         let mut diffs = Vec::new();
-        let mut check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
             if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
         };
 

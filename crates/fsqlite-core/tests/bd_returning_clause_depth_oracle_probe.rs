@@ -68,7 +68,7 @@ fn returning_clause_depth_match_rusqlite_oracle() {
             exf(&f, s).await; exr(&r, s);
         }
         let mut diffs = Vec::new();
-        let mut check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
             if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
         };
 

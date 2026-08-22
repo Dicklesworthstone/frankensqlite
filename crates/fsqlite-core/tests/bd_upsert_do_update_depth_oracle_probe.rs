@@ -59,7 +59,7 @@ fn upsert_do_update_depth_match_rusqlite_oracle() {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
         let mut diffs = Vec::new();
-        let mut check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
             if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
         };
 
