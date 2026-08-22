@@ -2128,6 +2128,14 @@ fn durable_certificate_declared_version(bytes: &[u8]) -> Option<u16> {
 /// version (a genuine future format, or a corrupted version field) is
 /// deliberately NOT matched here — it falls through to strict decoding, which
 /// classifies it as corruption exactly as before.
+///
+/// Accepted trade-off (bd-kt80v): a corrupted CURRENT-version record whose
+/// version field happens to read as v2/v3 (a 1–2 bit flip) classifies as
+/// legacy and reads as absent rather than `WalCorrupt`. That mirrors stock
+/// SQLite's unverifiable-tail-ends-the-log recovery philosophy: the cost is
+/// conservative recovery for the newest batch, never accepting corrupt data;
+/// and the walk-back monotonicity means a flipped OLD record cannot mask any
+/// newer, verifiable record above it.
 fn durable_certificate_is_legacy_envelope(bytes: &[u8]) -> bool {
     durable_certificate_declared_version(bytes)
         .is_some_and(durable_certificate_record_version_is_legacy)
@@ -2873,7 +2881,18 @@ where
     /// — was written by an older release whose envelope this build cannot
     /// honor. Recovery already reads it as absent; before the first append
     /// from this build, drop it so the sidecar never mixes envelope versions.
-    fn discard_legacy_certificate_sidecar(
+    ///
+    /// Crash-ordering (bd-kt80v): this truncate-to-0 is deliberately NOT
+    /// synced before the caller writes the new record at offset 0 and then
+    /// `durable_sync`s. Under ordered metadata journaling a crash can replay
+    /// the file size only as {old, 0, new-record-len} — never new bytes under
+    /// the OLD size — so the recovery walk-back can never observe a fresh
+    /// current-version record sitting below a stale legacy tail (which the
+    /// legacy-stops-walk-back rule would mask as absent). On a filesystem
+    /// without that ordering the worst case is an absent certificate, i.e.
+    /// conservative recovery — a durability haircut on the newest batch,
+    /// never an integrity fault. This window exists only on the first append
+    /// after an upgrade over a legacy sidecar.
         file: &mut V::File,
         cx: &Cx,
         file_size: u64,
