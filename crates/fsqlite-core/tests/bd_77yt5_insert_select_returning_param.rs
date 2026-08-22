@@ -26,7 +26,7 @@ fn insert_select_returning_bind_param_77yt5() {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        let got: Vec<SqliteValue> = rows[0].values().iter().cloned().collect();
+        let got: Vec<SqliteValue> = rows[0].values().to_vec();
         assert_eq!(
             got,
             vec![
@@ -44,7 +44,7 @@ fn insert_select_returning_bind_param_77yt5() {
             )
             .await
             .unwrap();
-        let got2: Vec<SqliteValue> = rows2[0].values().iter().cloned().collect();
+        let got2: Vec<SqliteValue> = rows2[0].values().to_vec();
         assert_eq!(got2, vec![SqliteValue::Integer(8), SqliteValue::Integer(9)]);
     });
 }
