@@ -28880,6 +28880,18 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         capture_time_travel_snapshot: bool,
     ) -> Result<usize> {
+        // bd-q2bju / bd-01qa9 (explicit-txn): bd-pktso's skip-statement-savepoint
+        // optimization is only safe for a SINGLE-ROW direct insert. A multi-row
+        // VALUES INSERT that skips the savepoint neither flushes prior pending
+        // in-txn writes (its conflict check then misses a prior in-txn row ->
+        // bd-q2bju PK dup) nor rolls back its partial rows on ABORT (bd-01qa9
+        // explicit-txn facet). Keep the skip only for the single-row direct lane.
+        let is_single_row_direct = stmt
+            .precompiled_dml()
+            .and_then(|dml| dml.direct_simple_insert.as_ref())
+            .is_some();
+        let skip_statement_savepoint_in_explicit_txn =
+            skip_statement_savepoint_in_explicit_txn && is_single_row_direct;
         self.clear_table_program_error_state();
         // Issue #110: an `INSERT OR REPLACE` / upsert can delete or mutate an
         // existing row (possibly a parent of a previously cached child FK).
@@ -32804,6 +32816,13 @@ impl Connection {
                 FrankenError::ExpressionTooDeep {
                     max: usize::try_from(max).unwrap_or(usize::MAX),
                 }
+            }
+            fsqlite_parser::ParseErrorKind::Tokenizer => {
+                // A tokenizer error already carries SQLite's stock-form message
+                // (`unrecognized token: "X"`); surface it verbatim, with NO
+                // `SQL error at offset N:` prefix (the byte offset is exposed
+                // separately). bd-parser-syntax-error-format-6w6kp (Part A).
+                FrankenError::FunctionError(parse_error.message)
             }
             fsqlite_parser::ParseErrorKind::Syntax
             | fsqlite_parser::ParseErrorKind::RecursionLimit => FrankenError::ParseError {
