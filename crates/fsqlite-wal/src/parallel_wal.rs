@@ -200,10 +200,12 @@ pub const PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION: u16 = 4;
 /// store written by an older build still opens after an upgrade (GH#372).
 pub const PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION: u16 = 2;
 
-/// True when `version` names a durable-certificate envelope that an older
-/// release wrote and this build recognizes but cannot honor (every version in
-/// [`PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION`]`..`
-/// [`PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION`]).
+/// True when `version` names a legacy durable-certificate envelope.
+///
+/// Legacy = written by an older release and recognized but not honored by
+/// this build: every version in the half-open range from
+/// [`PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION`] up to (but not
+/// including) [`PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION`].
 ///
 /// Strictly newer versions and never-shipped values (0, 1) are NOT legacy:
 /// they still fail strict decoding, so a corrupted version field keeps
