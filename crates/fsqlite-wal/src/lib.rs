@@ -109,12 +109,12 @@ pub use parallel_wal::{
     ParallelWalPendingPublication, ParallelWalShadowVerdict, ParallelWalTraceRecord,
     ParallelWalVisibilitySnapshot, SegmentHeader, SegmentRecoveryOptions, SegmentRecoveryResult,
     cleanup_segments, decode_parallel_wal_durable_certificate_records,
-    default_parallel_wal_lane_count, delete_segment, list_segments, max_durable_epoch,
-    parallel_wal_coordinator_for_path, parallel_wal_fallback_reason_name,
-    parallel_wal_lookup_mode_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
-    parallel_wal_should_shadow_compare, read_segment, recover_and_apply_segments, recover_segments,
-    remove_parallel_wal_coordinator, resolve_parallel_wal_control_surface_from_env, segment_path,
-    write_segment,
+    default_parallel_wal_lane_count, delete_segment, durable_certificate_record_version_is_legacy,
+    list_segments, max_durable_epoch, parallel_wal_coordinator_for_path,
+    parallel_wal_fallback_reason_name, parallel_wal_lookup_mode_name, parallel_wal_mode_name,
+    parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare, read_segment,
+    recover_and_apply_segments, recover_segments, remove_parallel_wal_coordinator,
+    resolve_parallel_wal_control_surface_from_env, segment_path, write_segment,
 };
 pub use per_core_buffer::{
     AppendOutcome, BufferConfig, BufferState, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig,
