@@ -32878,7 +32878,11 @@ impl Connection {
         ))
     }
 
-    fn parse_error_to_franken_error(parse_error: fsqlite_parser::ParseError) -> FrankenError {
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_error_to_franken_error(
+        sql: &str,
+        parse_error: fsqlite_parser::ParseError,
+    ) -> FrankenError {
         match parse_error.kind {
             fsqlite_parser::ParseErrorKind::ExpressionTooDeep { max } => {
                 FrankenError::ExpressionTooDeep {
@@ -32892,9 +32896,21 @@ impl Connection {
                 // separately). bd-parser-syntax-error-format-6w6kp (Part A).
                 FrankenError::FunctionError(parse_error.message)
             }
+            fsqlite_parser::ParseErrorKind::UnexpectedToken => {
+                // Stock reports `near "<lexeme>": syntax error` for an unexpected
+                // token, or `incomplete input` when the offending token is
+                // end-of-input (empty span at the tail). Part B.
+                let start = parse_error.span.start as usize;
+                let end = parse_error.span.end as usize;
+                if start >= end {
+                    FrankenError::FunctionError("incomplete input".to_owned())
+                } else {
+                    let lexeme = sql.get(start..end).unwrap_or("");
+                    FrankenError::FunctionError(format!("near \"{lexeme}\": syntax error"))
+                }
+            }
             fsqlite_parser::ParseErrorKind::Syntax
             | fsqlite_parser::ParseErrorKind::RecursionLimit => FrankenError::ParseError {
-                #[allow(clippy::cast_sign_loss)]
                 offset: parse_error.span.start as usize,
                 detail: parse_error.message,
             },
@@ -32919,7 +32935,8 @@ impl Connection {
     fn parse_statements_with_statement_scratch(&self, sql: &str) -> Result<Vec<Statement>> {
         let _lookaside_growth = StatementLookasideGrowthGuard::new(self);
         let mut scratch = self.statement_parse_scratch.borrow_mut();
-        parse_statements_with_scratch(sql, &mut scratch).map_err(Self::parse_error_to_franken_error)
+        parse_statements_with_scratch(sql, &mut scratch)
+            .map_err(|error| Self::parse_error_to_franken_error(sql, error))
     }
 
     fn statement_lookaside_retained_bytes(&self) -> usize {

@@ -107,6 +107,11 @@ pub enum ParseErrorKind {
     /// and must be surfaced verbatim, with NO `SQL error at offset N:` prefix.
     /// bd-parser-syntax-error-format-6w6kp (Part A).
     Tokenizer,
+    /// A generic "unexpected token" parse error. The connection boundary renders
+    /// this as stock `near "<lexeme>": syntax error`, or `incomplete input` when
+    /// the offending token is end-of-input (empty span at the tail).
+    /// bd-parser-syntax-error-format-6w6kp (Part B).
+    UnexpectedToken,
     ExpressionTooDeep { max: u32 },
     RecursionLimit,
 }
@@ -3875,7 +3880,7 @@ mod tests {
         let error = Parser::new(Vec::new())
             .parse_expr()
             .expect_err("an empty public token stream must return an error, not panic");
-        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
         assert_eq!(error.span, Span::ZERO);
 
         let integer = Token {

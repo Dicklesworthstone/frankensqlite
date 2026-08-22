@@ -2191,7 +2191,7 @@ impl<'a> ParseMachine<'a> {
             }
             kind => {
                 return Err(ParseError {
-                    kind: crate::parser::ParseErrorKind::Syntax,
+                    kind: crate::parser::ParseErrorKind::UnexpectedToken,
                     message: format!("unexpected token in expression: {kind:?}"),
                     span: token_span,
                     line,
@@ -4108,7 +4108,7 @@ impl Parser {
                 col,
             }),
             kind => Err(ParseError {
-                kind: crate::parser::ParseErrorKind::Syntax,
+                kind: crate::parser::ParseErrorKind::UnexpectedToken,
                 message: format!("unexpected token in expression: {kind:?}"),
                 span: token_span,
                 line,
@@ -6334,7 +6334,7 @@ mod tests {
     fn test_vector_in_list_trailing_comma_syntax_error_precedes_arity() {
         let error = parse_expr("(a, b) IN (1,)")
             .expect_err("a trailing comma in an IN list must fail parsing");
-        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
         assert_eq!(error.message, "unexpected token in expression: RightParen");
     }
 
