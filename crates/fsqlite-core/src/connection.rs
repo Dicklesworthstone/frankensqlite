@@ -23985,11 +23985,79 @@ impl Connection {
 
     /// Apply the proactive INSERT-VALUES DQS rewrite when enabled. A cheap
     /// double-quote pre-check keeps the common path allocation-free (no parse).
+    /// bd-eqmqv (DQS shape 5): rewrite a double-quoted column DEFAULT value.
+    ///
+    /// `CREATE TABLE t(a TEXT DEFAULT "def")` / `ALTER TABLE t ADD COLUMN
+    /// a TEXT DEFAULT "def"` parse the DEFAULT as `Expr::Column(def)`, which the
+    /// constant-DEFAULT validator rejects ("default value ... is not constant").
+    /// Under DQS-ON it is a string literal. The validator's error names the
+    /// DEFAULT's own column, not the offending token, so the on-error retry can't
+    /// target it — splice each double-quoted top-level DEFAULT-value column
+    /// `"X"` -> `'X'` up front (only DEFAULT-value spans are touched, matching
+    /// the INSERT-VALUES splice of bd-82jdw). Returns None if nothing applies.
+    fn dqs_default_rewrite(&self, sql: &str) -> Option<String> {
+        let stmts = self.cached_parse_multi(sql).ok()?;
+        if stmts.len() != 1 {
+            return None;
+        }
+        let columns: &[fsqlite_ast::ColumnDef] = match stmts[0].as_ref() {
+            Statement::CreateTable(create) => match &create.body {
+                fsqlite_ast::CreateTableBody::Columns { columns, .. } => columns.as_slice(),
+                fsqlite_ast::CreateTableBody::AsSelect(_) => return None,
+            },
+            Statement::AlterTable(alter) => match &alter.action {
+                fsqlite_ast::AlterTableAction::AddColumn(column) => std::slice::from_ref(column),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let dq_tokens = Self::double_quoted_identifier_tokens(sql);
+        if dq_tokens.is_empty() {
+            return None;
+        }
+        let mut ranges: Vec<(u32, u32, String)> = Vec::new();
+        for column in columns {
+            for constraint in &column.constraints {
+                let fsqlite_ast::ColumnConstraintKind::Default(default_value) = &constraint.kind
+                else {
+                    continue;
+                };
+                let (DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr)) = default_value;
+                if let Expr::Column(col_ref, span) = expr
+                    && col_ref.table.is_none()
+                    && dq_tokens.iter().any(|(start, end, name)| {
+                        *start == span.start
+                            && *end == span.end
+                            && name.as_str() == col_ref.column.as_ref()
+                    })
+                {
+                    ranges.push((span.start, span.end, col_ref.column.to_string()));
+                }
+            }
+        }
+        if ranges.is_empty() {
+            return None;
+        }
+        // Splice right-to-left so earlier byte offsets stay valid.
+        ranges.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+        let mut out = sql.to_string();
+        for (start, end, name) in ranges {
+            let literal = format!("'{}'", name.replace('\'', "''"));
+            out.replace_range(start as usize..end as usize, &literal);
+        }
+        Some(out)
+    }
+
     fn dqs_proactive_rewrite<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
         if !self.dqs_enabled.get() || !sql.contains('"') {
             return std::borrow::Cow::Borrowed(sql);
         }
-        match self.dqs_insert_values_rewrite(sql) {
+        // A statement is either an INSERT or a CREATE/ALTER — try each; the
+        // non-matching rewrite returns None.
+        if let Some(rewritten) = self.dqs_insert_values_rewrite(sql) {
+            return std::borrow::Cow::Owned(rewritten);
+        }
+        match self.dqs_default_rewrite(sql) {
             Some(rewritten) => std::borrow::Cow::Owned(rewritten),
             None => std::borrow::Cow::Borrowed(sql),
         }
