@@ -40,7 +40,7 @@ fn json_group_aggregates_preserve_json_subtype_76x57() {
         // json_group_array over a json_array(...) argument -> nested arrays embedded.
         assert_eq!(
             scalar_text(&c, "SELECT json_group_array(json_array(value, value)) FROM t").await,
-            r#"[[1,1],[2,2]]"#,
+            r"[[1,1],[2,2]]",
         );
 
         // json_group_object with a json(...) value -> nested JSON embedded.
