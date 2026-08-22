@@ -17,14 +17,14 @@ as a 27-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through the 0.3.8 version bump. **0.3.8 is a release candidate; the `v0.3.8` tag is cut after the release gate.** v0.3.2–v0.3.4, v0.3.6, and v0.3.7 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.8) (2026-08-22, tag [`2cb6f69ba`](https://github.com/Dicklesworthstone/frankensqlite/commit/2cb6f69bae665bdc7f5fe66be5be2aa95e4fbc85)). v0.3.2–v0.3.4 and v0.3.6–v0.3.8 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.8...main) | HEAD | 2026-08-21 | (no post-0.3.8 changes yet) |
-| [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.7...main) | Release (pending tag) | 2026-08-21 | UPSERT clobber P1 fix + INSERT-ABORT atomicity + stock-error-message parity campaign + JSON5 + differential oracle keeper suite |
+| [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.8) | Release | 2026-08-22 | UPSERT clobber P1 fix + INSERT-ABORT atomicity + stock-error-message parity campaign + JSON5 + differential oracle keeper suite |
 | [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) | Release | 2026-08-20 | GH#345/#366/#368/#369/#370/#371/#244 + bd-xv5cm 7-facet concurrency hardening + REVIEW3 |
 | [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) | Release | 2026-08-19 | FTS5 reopen/hydration + binary release |
 | [v0.3.5](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.3.5) | Tag | 2026-08-17 | crates.io snapshot; non-leading PK WITHOUT ROWID (no GitHub Release) |
@@ -38,15 +38,15 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.8...main>
 
-No post-0.3.8 changes yet; the version bump is the current tip.
+Post-v0.3.8 development continues on `main` (see the compare link).
 
 ---
 
-## [0.3.8] -- 2026-08-21 (release candidate; tag `v0.3.8` is cut after the release gate)
+## [0.3.8] -- 2026-08-22 (GitHub Release)
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.7...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.7...v0.3.8>
 
-396 commits after the [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) tag, dominated by a stock-SQLite conformance campaign driven by differential oracle probing (frank vs bundled rusqlite / sqlite3), plus two significant data-integrity fixes.
+419 commits after the [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) tag, dominated by a stock-SQLite conformance campaign driven by differential oracle probing (frank vs bundled rusqlite / sqlite3), plus two significant data-integrity fixes.
 
 ### Data integrity
 
