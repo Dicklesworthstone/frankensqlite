@@ -188,6 +188,31 @@ pub const PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION: u16 = 2;
 /// (identity-less) record decodes to an error, which recovery treats as an
 /// absent certificate rather than a fatal failure.
 pub const PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION: u16 = 4;
+/// First durable-certificate envelope version that ever reached a `-wal-cert`
+/// sidecar. The parallel-WAL durability work shipped its on-disk record at v2;
+/// no v1 record was ever written.
+///
+/// Every version in `FIRST..RECORD_VERSION` is a *legacy* envelope: a durable
+/// proof written by an older release that this build no longer decodes (v3
+/// predates the `db_file_id` identity; v2 additionally predates the
+/// ordered-frame payload digest). Recovery treats such a record as an ABSENT
+/// certificate — conservative WAL recovery — rather than as corruption, so a
+/// store written by an older build still opens after an upgrade (GH#372).
+pub const PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION: u16 = 2;
+
+/// True when `version` names a durable-certificate envelope that an older
+/// release wrote and this build recognizes but cannot honor (every version in
+/// [`PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION`]`..`
+/// [`PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION`]).
+///
+/// Strictly newer versions and never-shipped values (0, 1) are NOT legacy:
+/// they still fail strict decoding, so a corrupted version field keeps
+/// reading as corruption rather than being silently ignored.
+#[must_use]
+pub const fn durable_certificate_record_version_is_legacy(version: u16) -> bool {
+    version >= PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION
+        && version < PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION
+}
 /// Magic prefix for one record in the `-wal-cert` sidecar.
 pub const PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC: [u8; 8] = *b"FSQLCERT";
 const PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN: &str =
@@ -4100,7 +4125,10 @@ mod tests {
         coordinator
             .start_on_runtime(&runtime.handle(), &cx)
             .expect("epoch ticker should start");
-        assert!(coordinator.is_running(), "ticker must be running before removal");
+        assert!(
+            coordinator.is_running(),
+            "ticker must be running before removal"
+        );
 
         // Extracts the coordinator under the map lock, then joins the ticker
         // OUTSIDE the lock.
@@ -5552,6 +5580,27 @@ mod tests {
     }
 
     #[test]
+    fn durable_certificate_legacy_versions_are_exactly_the_shipped_predecessors() {
+        // GH#372: v2 (the original envelope) and v3 (identity-less) both
+        // reached disk in released builds, so both must classify as legacy —
+        // an absent certificate on load, never corruption. 0 and 1 never
+        // shipped, the current version is live, and a future version is
+        // unknown: none of those is legacy.
+        assert_eq!(PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION, 2);
+        assert!(!durable_certificate_record_version_is_legacy(0));
+        assert!(!durable_certificate_record_version_is_legacy(1));
+        assert!(durable_certificate_record_version_is_legacy(2));
+        assert!(durable_certificate_record_version_is_legacy(3));
+        assert!(!durable_certificate_record_version_is_legacy(
+            PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION
+        ));
+        assert!(!durable_certificate_record_version_is_legacy(
+            PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION + 1
+        ));
+        assert!(!durable_certificate_record_version_is_legacy(u16::MAX));
+    }
+
+    #[test]
     fn durable_certificate_record_v4_preserves_identity_and_rejects_v3() {
         // bd-85x9y / GH#364: a v4 record carries the 16-byte db_file_id and
         // round-trips it losslessly; a record whose version byte is rolled back
@@ -5589,8 +5638,8 @@ mod tests {
         );
         assert_eq!(PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION, 4);
 
-        let decoded = ParallelWalDurableCertificateRecord::from_bytes(&encoded)
-            .expect("v4 record decodes");
+        let decoded =
+            ParallelWalDurableCertificateRecord::from_bytes(&encoded).expect("v4 record decodes");
         assert_eq!(decoded.db_file_id, identity);
         assert_eq!(decoded, record);
 

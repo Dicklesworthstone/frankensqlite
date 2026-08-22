@@ -36,7 +36,8 @@ use fsqlite_wal::{
     ParallelWalCommitCertificate, ParallelWalDurableCertificateRecord,
     ParallelWalFramePayloadDigestBuilder, TransactionConflictPageBaseline,
     TransactionConflictSnapshot, WAL_HEADER_SIZE, WalFile, WalGenerationIdentity, WalHeader,
-    WalSalts, execute_checkpoint, validate_wal_header_checksum,
+    WalSalts, durable_certificate_record_version_is_legacy, execute_checkpoint,
+    validate_wal_header_checksum,
 };
 use tracing::debug;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -2079,6 +2080,13 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 const MIN_DURABLE_CERTIFICATE_RECORD_SIZE: usize =
     ParallelWalDurableCertificateRecord::MIN_ENCODED_SIZE;
 const DURABLE_CERTIFICATE_RECORD_HEADER_SIZE: usize = 14;
+/// Smallest byte length a footer may declare for a record that could still be
+/// a well-formed LEGACY envelope (GH#372): the fixed header plus the length
+/// footer. Envelopes written by older releases are shorter than this build's
+/// [`MIN_DURABLE_CERTIFICATE_RECORD_SIZE`], so the legacy gates must admit
+/// footer lengths below the current minimum before classifying the bytes.
+const MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE: usize = DURABLE_CERTIFICATE_RECORD_HEADER_SIZE
+    + ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE;
 const MAX_ORPHAN_CERTIFICATE_LOOKBACK: usize = 64;
 
 fn durable_certificate_declared_len(bytes: &[u8]) -> Option<usize> {
@@ -2096,32 +2104,41 @@ fn durable_certificate_declares_len(bytes: &[u8], expected: usize) -> bool {
     durable_certificate_declared_len(bytes).is_some_and(|actual| actual.cmp(&expected).is_eq())
 }
 
-/// The durable-certificate record envelope version that immediately preceded
-/// bd-85x9y / GH#364 — the identity-less v3 record. A build written before the
-/// db-file identity was added stamps this version.
-const LEGACY_IDENTITYLESS_CERTIFICATE_RECORD_VERSION: u16 = 3;
+/// Envelope version declared by a durable-certificate record that begins with
+/// the sidecar magic, when the header is long enough to carry one.
+fn durable_certificate_declared_version(bytes: &[u8]) -> Option<u16> {
+    if !bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC) {
+        return None;
+    }
+    bytes
+        .get(8..10)
+        .map(|version_bytes| u16::from_le_bytes([version_bytes[0], version_bytes[1]]))
+}
 
 /// True when `bytes` begins with a well-formed durable-certificate envelope
-/// header (correct magic) that declares the specific LEGACY identity-less v3
-/// version written before bd-85x9y / GH#364.
+/// header (correct magic) that declares a LEGACY record version — one an
+/// older release wrote and this build recognizes but can no longer decode: v3
+/// (the identity-less envelope before bd-85x9y / GH#364) and v2 (the original
+/// envelope, which also predates the ordered-frame payload digest).
 ///
-/// Such a record is not corruption: it is a durable proof written by an older
-/// build that this build simply cannot honor (it carries no db-file identity),
-/// so the load gates treat it as an ABSENT certificate instead of failing
-/// recovery closed. Any *other* non-current version (a genuine future format, or
-/// a corrupted version byte) is deliberately NOT matched here — it falls through
-/// to strict decoding, which classifies it as corruption exactly as before.
-fn durable_certificate_is_legacy_identityless(bytes: &[u8]) -> bool {
-    if !bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC) {
-        return false;
-    }
-    match bytes.get(8..10) {
-        Some(version_bytes) => {
-            u16::from_le_bytes([version_bytes[0], version_bytes[1]])
-                == LEGACY_IDENTITYLESS_CERTIFICATE_RECORD_VERSION
-        }
-        None => false,
-    }
+/// Such a record is not corruption: it is a durable proof this build simply
+/// cannot honor, so every load gate treats it as an ABSENT certificate
+/// (conservative WAL recovery) and the append path discards it, instead of
+/// failing the open closed with `WalCorrupt` (GH#372). Any *other* non-current
+/// version (a genuine future format, or a corrupted version field) is
+/// deliberately NOT matched here — it falls through to strict decoding, which
+/// classifies it as corruption exactly as before.
+fn durable_certificate_is_legacy_envelope(bytes: &[u8]) -> bool {
+    durable_certificate_declared_version(bytes)
+        .is_some_and(durable_certificate_record_version_is_legacy)
+}
+
+/// True when `bytes` is a complete legacy envelope whose header agrees with the
+/// footer-derived `record_len` — the evidence the recovery scans require before
+/// treating footer-addressed bytes as a legacy record rather than garbage.
+fn durable_certificate_is_complete_legacy_envelope(bytes: &[u8], record_len: usize) -> bool {
+    durable_certificate_is_legacy_envelope(bytes)
+        && durable_certificate_declares_len(bytes, record_len)
 }
 
 fn decode_durable_certificate_record(
@@ -2170,6 +2187,19 @@ fn validate_incomplete_certificate_suffix(bytes: &[u8], anchored: bool) -> Resul
         return Ok(());
     }
     let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+    if durable_certificate_record_version_is_legacy(version) {
+        // GH#372: a sidecar written entirely by an older release lands here
+        // when its (shorter) records fall below this build's minimum record
+        // size, so no footer-derived candidate anchors. That is a legacy proof
+        // this build cannot honor — an absent certificate — not a torn or
+        // corrupt suffix.
+        tracing::debug!(
+            target: "fsqlite::wal::durability_combiner",
+            legacy_record_version = version,
+            "ignored durable certificate sidecar suffix from a legacy record version"
+        );
+        return Ok(());
+    }
     if version != fsqlite_wal::PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION {
         return Err(FrankenError::WalCorrupt {
             detail: format!(
@@ -2503,7 +2533,9 @@ where
     /// record identity, is never a match.
     fn db_file_identity_matches(&self, record: &ParallelWalDurableCertificateRecord) -> bool {
         match self.db_file_identity {
-            Some(id) if id != [0u8; 16] => record.db_file_id != [0u8; 16] && record.db_file_id == id,
+            Some(id) if id != [0u8; 16] => {
+                record.db_file_id != [0u8; 16] && record.db_file_id == id
+            }
             _ => false,
         }
     }
@@ -2760,7 +2792,7 @@ where
         file: &V::File,
         cx: &Cx,
         record_end: u64,
-    ) -> Result<(u64, ParallelWalDurableCertificateRecord)> {
+    ) -> Result<Option<(u64, ParallelWalDurableCertificateRecord)>> {
         let footer_size =
             u64::try_from(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE).unwrap_or(4);
         let footer_offset = record_end.checked_sub(footer_size).ok_or_else(|| {
@@ -2784,31 +2816,77 @@ where
         .map_err(|_| FrankenError::WalCorrupt {
             detail: "parallel WAL certificate footer length exceeds usize".to_owned(),
         })?;
-        if !(MIN_DURABLE_CERTIFICATE_RECORD_SIZE..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
-            .contains(&record_len)
-        {
-            return Err(FrankenError::WalCorrupt {
-                detail: format!(
-                    "parallel WAL certificate footer declares invalid record length {record_len}"
-                ),
-            });
+        let invalid_record_length = || FrankenError::WalCorrupt {
+            detail: format!(
+                "parallel WAL certificate footer declares invalid record length {record_len}"
+            ),
+        };
+        let current_length = (MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+            ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
+            .contains(&record_len);
+        // GH#372: a record written by an older release is shorter than this
+        // build's minimum, so a footer length below it is still a candidate
+        // legacy envelope — read it and classify the bytes before deciding.
+        let legacy_length_only = !current_length
+            && (MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE
+                ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
+                .contains(&record_len);
+        if !current_length && !legacy_length_only {
+            return Err(invalid_record_length());
         }
         let record_len_u64 = u64::try_from(record_len).map_err(|_| FrankenError::WalCorrupt {
             detail: "parallel WAL certificate record length exceeds u64".to_owned(),
         })?;
-        let record_start =
-            record_end
-                .checked_sub(record_len_u64)
-                .ok_or_else(|| FrankenError::WalCorrupt {
-                    detail: format!(
-                        "parallel WAL certificate record length {record_len} exceeds end offset {record_end}"
-                    ),
-                })?;
+        let Some(record_start) = record_end.checked_sub(record_len_u64) else {
+            if legacy_length_only {
+                return Err(invalid_record_length());
+            }
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "parallel WAL certificate record length {record_len} exceeds end offset {record_end}"
+                ),
+            });
+        };
         let bytes =
             Self::read_certificate_sidecar_exact(file, cx, record_start, record_len, "record")
                 .await?;
+        if durable_certificate_is_complete_legacy_envelope(&bytes, record_len) {
+            // A legacy record — and, because the sidecar is append-only and
+            // envelope versions only move forward, every record below it too.
+            // Nothing older can authorize this WAL: report it as absent.
+            tracing::debug!(
+                target: "fsqlite::wal::durability_combiner",
+                record_start,
+                legacy_record_version = durable_certificate_declared_version(&bytes),
+                "ignored durable certificate sidecar record from a legacy record version"
+            );
+            return Ok(None);
+        }
+        if legacy_length_only {
+            return Err(invalid_record_length());
+        }
         let record = decode_durable_certificate_record(&bytes, "record")?;
-        Ok((record_start, record))
+        Ok(Some((record_start, record)))
+    }
+
+    /// GH#372: the newest record — and therefore the whole append-only sidecar
+    /// — was written by an older release whose envelope this build cannot
+    /// honor. Recovery already reads it as absent; before the first append
+    /// from this build, drop it so the sidecar never mixes envelope versions.
+    fn discard_legacy_certificate_sidecar(
+        file: &mut V::File,
+        cx: &Cx,
+        file_size: u64,
+        newest_record: &[u8],
+    ) -> Result<u64> {
+        tracing::info!(
+            target: "fsqlite::wal::durability_combiner",
+            file_size,
+            legacy_record_version = durable_certificate_declared_version(newest_record),
+            "discarding durable certificate sidecar written by a legacy record version before appending"
+        );
+        file.truncate(cx, 0)?;
+        Ok(0)
     }
 
     /// Return a safe append boundary, repairing exactly one validated torn
@@ -2839,7 +2917,9 @@ where
             ]))
             .unwrap_or(usize::MAX);
             let record_len_u64 = u64::try_from(record_len).unwrap_or(u64::MAX);
-            if (MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+            // GH#372: admit legacy-length footers too, so a pre-upgrade sidecar
+            // is recognized (and discarded) instead of read as corruption.
+            if (MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE
                 ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
                 .contains(&record_len)
                 && record_len_u64 <= file_size
@@ -2853,8 +2933,12 @@ where
                     "append-boundary record",
                 )
                 .await?;
-                if bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
-                    || durable_certificate_declares_len(&bytes, record_len)
+                if durable_certificate_is_complete_legacy_envelope(&bytes, record_len) {
+                    return Self::discard_legacy_certificate_sidecar(file, cx, file_size, &bytes);
+                }
+                if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+                    && (bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
+                        || durable_certificate_declares_len(&bytes, record_len))
                 {
                     decode_durable_certificate_record(&bytes, "append-boundary record")?;
                     return Ok(file_size);
@@ -2886,6 +2970,7 @@ where
             .saturating_sub(PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
             .max(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE);
         let mut anchor_end = None;
+        let mut legacy_record_start = None;
         for candidate_end in (minimum_candidate_end..tail.len()).rev() {
             let footer_start =
                 candidate_end - ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE;
@@ -2894,7 +2979,7 @@ where
                 footer[0], footer[1], footer[2], footer[3],
             ]))
             .unwrap_or(usize::MAX);
-            if !(MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+            if !(MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE
                 ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
                 .contains(&record_len)
                 || record_len > candidate_end
@@ -2908,10 +2993,27 @@ where
             {
                 continue;
             }
-            if ParallelWalDurableCertificateRecord::from_bytes(record_bytes).is_ok() {
+            // GH#372: a legacy envelope at an exact footer boundary means the
+            // whole sidecar predates this build (envelope versions only move
+            // forward in an append-only file) — discard it below.
+            if durable_certificate_is_legacy_envelope(record_bytes) {
+                legacy_record_start = Some(record_start);
+                break;
+            }
+            if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+                && ParallelWalDurableCertificateRecord::from_bytes(record_bytes).is_ok()
+            {
                 anchor_end = Some(candidate_end);
                 break;
             }
+        }
+        if let Some(record_start) = legacy_record_start {
+            return Self::discard_legacy_certificate_sidecar(
+                file,
+                cx,
+                file_size,
+                &tail[record_start..],
+            );
         }
 
         let safe_end = if let Some(anchor_end) = anchor_end {
@@ -3089,7 +3191,7 @@ where
             let latest = if safe_end == 0 {
                 None
             } else {
-                Some(Self::read_certificate_record_ending_at(&file, cx, safe_end).await?)
+                Self::read_certificate_record_ending_at(&file, cx, safe_end).await?
             };
             let latest_is_expected = latest
                 .as_ref()
@@ -3255,14 +3357,16 @@ where
                     detail: "parallel WAL checkpoint certificate handoff was short-read".to_owned(),
                 });
             }
-            // bd-85x9y / GH#364: a handoff written by the pre-identity v3 build
-            // is an absent certificate (it carries no db-file identity), not
-            // corruption — recovery must not fail closed on it. Any other bad
-            // version still decodes strictly below and is caught as corruption.
-            if durable_certificate_is_legacy_identityless(&bytes) {
+            // bd-85x9y / GH#364 + GH#372: a handoff written by a legacy build
+            // (the pre-identity v3 envelope, or the original v2 one) is an
+            // absent certificate, not corruption — recovery must not fail
+            // closed on it. Any other bad version still decodes strictly below
+            // and is caught as corruption.
+            if durable_certificate_is_legacy_envelope(&bytes) {
                 tracing::debug!(
                     target: "fsqlite::wal::durability_combiner",
-                    "ignored checkpoint handoff certificate from a legacy identity-less build"
+                    legacy_record_version = durable_certificate_declared_version(&bytes),
+                    "ignored checkpoint handoff certificate from a legacy record version"
                 );
                 return Ok(None);
             }
@@ -3403,7 +3507,10 @@ where
                         .to_owned(),
                 })?;
                 let record_len_u64 = u64::try_from(record_len).unwrap_or(u64::MAX);
-                if (MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+                // GH#372: admit legacy-length footers too — an older release's
+                // records are shorter than this build's minimum — so the bytes
+                // are classified before the length alone rules them out.
+                if (MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE
                     ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
                     .contains(&record_len)
                     && record_len_u64 <= file_size
@@ -3417,16 +3524,17 @@ where
                         "newest record",
                     )
                     .await?;
-                    // bd-85x9y / GH#364: a well-formed record from the pre-identity
-                    // v3 build is an absent certificate (it carries no db-file
-                    // identity), not corruption. Return None so recovery does not
-                    // fail closed on a legacy sidecar left behind by a prior
-                    // release. Any other bad version decodes strictly below and is
-                    // caught as corruption.
-                    if durable_certificate_is_legacy_identityless(&bytes) {
+                    // bd-85x9y / GH#364 + GH#372: a well-formed record from a
+                    // legacy build (the pre-identity v3 envelope, or the
+                    // original v2 one) is an absent certificate, not corruption.
+                    // Return None so recovery does not fail closed on a sidecar
+                    // left behind by a prior release. Any other bad version
+                    // decodes strictly below and is caught as corruption.
+                    if durable_certificate_is_complete_legacy_envelope(&bytes, record_len) {
                         tracing::debug!(
                             target: "fsqlite::wal::durability_combiner",
-                            "ignored durable certificate sidecar from a legacy identity-less build"
+                            legacy_record_version = durable_certificate_declared_version(&bytes),
+                            "ignored durable certificate sidecar from a legacy record version"
                         );
                         return Ok(None);
                     }
@@ -3434,8 +3542,9 @@ where
                     // fully-present envelope candidate. Strict decoding is
                     // mandatory even when its magic/version/CRC/footer is
                     // corrupt; complete corruption is never a torn suffix.
-                    if bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
-                        || durable_certificate_declares_len(&bytes, record_len)
+                    if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+                        && (bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
+                            || durable_certificate_declares_len(&bytes, record_len))
                     {
                         let record =
                             decode_durable_certificate_record(&bytes, "newest record")?;
@@ -3484,7 +3593,7 @@ where
                         footer[0], footer[1], footer[2], footer[3],
                     ]))
                     .unwrap_or(usize::MAX);
-                    if !(MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+                    if !(MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE
                         ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
                         .contains(&record_len)
                         || record_len > candidate_end
@@ -3498,8 +3607,20 @@ where
                     {
                         continue;
                     }
-                    if let Ok(record) =
-                        ParallelWalDurableCertificateRecord::from_bytes(record_bytes)
+                    // GH#372: a legacy envelope at an exact footer boundary
+                    // means the whole sidecar predates this build — absent.
+                    if durable_certificate_is_legacy_envelope(record_bytes) {
+                        tracing::debug!(
+                            target: "fsqlite::wal::durability_combiner",
+                            legacy_record_version =
+                                durable_certificate_declared_version(record_bytes),
+                            "ignored durable certificate sidecar from a legacy record version"
+                        );
+                        return Ok(None);
+                    }
+                    if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+                        && let Ok(record) =
+                            ParallelWalDurableCertificateRecord::from_bytes(record_bytes)
                     {
                         anchor = Some((record_start, candidate_end, record));
                         break;
@@ -3647,8 +3768,14 @@ where
                 if record_start == 0 {
                     return Ok(None);
                 }
-                (record_start, record) =
-                    Self::read_certificate_record_ending_at(&file, cx, record_start).await?;
+                // GH#372: `None` means the record below is a legacy envelope
+                // from an older release; nothing older can authorize this WAL.
+                let Some(previous) =
+                    Self::read_certificate_record_ending_at(&file, cx, record_start).await?
+                else {
+                    return Ok(None);
+                };
+                (record_start, record) = previous;
             }
         }
         .await;
@@ -5531,7 +5658,9 @@ mod tests {
     fn write_checkpoint_handoff(vfs: &MemoryVfs, cx: &Cx, bytes: &[u8]) {
         let path = std::path::Path::new("test.db-wal-cert-head");
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
-        let (mut file, _) = vfs.open(cx, Some(path), flags).expect("open handoff sidecar");
+        let (mut file, _) = vfs
+            .open(cx, Some(path), flags)
+            .expect("open handoff sidecar");
         file.truncate(cx, 0).expect("truncate handoff sidecar");
         file.write(cx, bytes, 0).expect("write handoff sidecar");
         file.close(cx).expect("close handoff sidecar");
@@ -5621,6 +5750,202 @@ mod tests {
         assert!(
             recovered.is_none(),
             "a legacy v3 (identity-less) handoff must be absent, got {recovered:?}"
+        );
+    }
+
+    /// GH#372 helper: a synthetic legacy envelope SHORTER than this build's
+    /// minimum record size — the shape the original v2 writer produced (no
+    /// `db_file_id`, no payload digest). The legacy gates only inspect the
+    /// magic, version, and declared length, so the payload is opaque filler.
+    fn short_legacy_certificate_record(version: u16) -> Vec<u8> {
+        const OPAQUE_PAYLOAD: usize = 28;
+        let total_len = DURABLE_CERTIFICATE_RECORD_HEADER_SIZE
+            + OPAQUE_PAYLOAD
+            + 4
+            + ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE;
+        let declared = u32::try_from(total_len).expect("legacy record length fits u32");
+        let mut bytes = Vec::with_capacity(total_len);
+        bytes.extend_from_slice(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC);
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&declared.to_le_bytes());
+        bytes.extend_from_slice(&[0x5A; OPAQUE_PAYLOAD]);
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&declared.to_le_bytes());
+        assert_eq!(bytes.len(), total_len);
+        assert!(
+            total_len < MIN_DURABLE_CERTIFICATE_RECORD_SIZE,
+            "the synthetic legacy record must be shorter than the current minimum"
+        );
+        bytes
+    }
+
+    /// GH#372 helper: the authorized current-version sidecar record with its
+    /// envelope version rolled back to `version` — a full-size legacy record.
+    fn full_size_legacy_certificate_record(vfs: &MemoryVfs, cx: &Cx, version: u16) -> Vec<u8> {
+        let mut record = read_certificate_sidecar(vfs, cx);
+        record[8..10].copy_from_slice(&version.to_le_bytes());
+        record
+    }
+
+    #[test]
+    fn gh372_full_size_legacy_sidecar_record_is_absent_not_fatal() {
+        // A `-wal-cert` record written by a pre-identity release — v2 (the
+        // original envelope) or v3 (identity-less) — is a proof this build
+        // cannot honor. Loading reports an ABSENT certificate, never WalCorrupt.
+        for legacy_version in [2_u16, 3_u16] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let (mut backend, _) = make_authorized_certificate_backend(&vfs, &cx);
+            let record = full_size_legacy_certificate_record(&vfs, &cx, legacy_version);
+            replace_certificate_sidecar(&vfs, &cx, &record);
+
+            let recovered = backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .wait()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "a legacy v{legacy_version} sidecar record must be absent, never fatal: {error}"
+                    )
+                });
+            assert!(
+                recovered.is_none(),
+                "legacy v{legacy_version} record must read as absent, got {recovered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gh372_short_legacy_sidecar_record_is_absent_not_fatal() {
+        // As reported: the legacy writer's records are SHORTER than this
+        // build's minimum record size, so the EOF footer never anchored a
+        // current-version candidate and the load fell into the torn-suffix
+        // validator, failing closed with "suffix has unsupported record
+        // version 2". Three sidecar shapes: one record, two records, and two
+        // records followed by a torn third.
+        for legacy_version in [2_u16, 3_u16] {
+            let record = short_legacy_certificate_record(legacy_version);
+            let mut two = record.clone();
+            two.extend_from_slice(&record);
+            let mut torn = two.clone();
+            torn.extend_from_slice(&record[..record.len() / 2]);
+            for (label, sidecar) in [("one", record.clone()), ("two", two), ("two+torn", torn)] {
+                let cx = test_cx();
+                let vfs = MemoryVfs::new();
+                let (mut backend, _) = make_authorized_certificate_backend(&vfs, &cx);
+                replace_certificate_sidecar(&vfs, &cx, &sidecar);
+
+                let recovered = backend
+                    .latest_authorized_parallel_wal_commit_certificate(&cx)
+                    .wait()
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "short legacy v{legacy_version} sidecar ({label}) must be absent, never fatal: {error}"
+                        )
+                    });
+                assert!(
+                    recovered.is_none(),
+                    "short legacy v{legacy_version} sidecar ({label}) must read as absent, got {recovered:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gh372_append_after_legacy_sidecar_discards_it_and_succeeds() {
+        // The first append from this build discards a pre-upgrade sidecar
+        // (several legacy records, the last one torn) instead of failing
+        // closed at the append boundary, and the new record is recoverable.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, _) = make_authorized_certificate_backend(&vfs, &cx);
+        let legacy = full_size_legacy_certificate_record(&vfs, &cx, 2);
+        let mut sidecar = Vec::new();
+        for _ in 0..3 {
+            sidecar.extend_from_slice(&legacy);
+        }
+        sidecar.extend_from_slice(&legacy[..legacy.len() / 2]);
+        replace_certificate_sidecar(&vfs, &cx, &sidecar);
+        assert!(
+            backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .wait()
+                .expect("a legacy sidecar must load as absent")
+                .is_none()
+        );
+
+        let page = sample_page(0x45);
+        let mut certificate = sample_certificate(2, 2, vec![1]);
+        certificate.wal_frame_payload_digest = test_frame_payload_digest(2, &page, 2);
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 2, 2, true)
+            .expect("the first append after an upgrade must discard the legacy sidecar, not fail");
+        backend
+            .append_frame(&cx, 2, &page, 2)
+            .expect("append matching commit marker");
+        backend.sync(&cx).expect("sync matching commit marker");
+
+        let rewritten = read_certificate_sidecar(&vfs, &cx);
+        let decoded = ParallelWalDurableCertificateRecord::from_bytes(&rewritten).expect(
+            "the sidecar holds exactly one current-version record once the legacy content is discarded",
+        );
+        assert_eq!(decoded.certificate, certificate);
+        assert_eq!(
+            backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .wait()
+                .expect("recover the appended certificate"),
+            Some(certificate)
+        );
+    }
+
+    #[test]
+    fn gh372_walk_back_into_legacy_record_is_absent_not_fatal() {
+        // A current-version record that cannot authorize the WAL (here: it
+        // lies beyond the reader's frame snapshot) walks back to the record
+        // below it. When that record is a legacy envelope the walk ends as
+        // ABSENT instead of failing closed on the undecodable record.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, _) = make_authorized_certificate_backend(&vfs, &cx);
+        let mut sidecar = full_size_legacy_certificate_record(&vfs, &cx, 3);
+        let beyond_snapshot = ParallelWalDurableCertificateRecord::new(
+            backend.inner.inner().generation_identity(),
+            2,
+            2,
+            backend.db_file_id_for_written_certificate(),
+            sample_certificate(2, 2, vec![1]),
+        )
+        .expect("construct record beyond the frame snapshot")
+        .to_bytes();
+        sidecar.extend_from_slice(&beyond_snapshot);
+        replace_certificate_sidecar(&vfs, &cx, &sidecar);
+
+        let recovered = backend
+            .latest_authorized_parallel_wal_commit_certificate(&cx)
+            .wait()
+            .expect("walking back into a legacy record must be absent, never fatal");
+        assert!(recovered.is_none(), "expected absent, got {recovered:?}");
+    }
+
+    #[test]
+    fn gh372_checkpoint_handoff_with_legacy_v2_version_is_absent_not_fatal() {
+        // The v2 counterpart of the GH#364 v3 handoff case above.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        write_identity_stamped_main_db(&vfs, &cx, GH364_IDENTITY_A);
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let mut record = handoff_record_bytes(&backend, GH364_IDENTITY_A);
+        record[8..10].copy_from_slice(&2u16.to_le_bytes());
+        write_checkpoint_handoff(&vfs, &cx, &record);
+
+        let recovered = backend
+            .latest_authorized_parallel_wal_commit_certificate(&cx)
+            .wait()
+            .expect("a legacy v2 handoff must be absent, never a fatal error");
+        assert!(
+            recovered.is_none(),
+            "a legacy v2 handoff must be absent, got {recovered:?}"
         );
     }
 
