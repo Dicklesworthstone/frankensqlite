@@ -2893,6 +2893,7 @@ where
     /// conservative recovery — a durability haircut on the newest batch,
     /// never an integrity fault. This window exists only on the first append
     /// after an upgrade over a legacy sidecar.
+    fn discard_legacy_certificate_sidecar(
         file: &mut V::File,
         cx: &Cx,
         file_size: u64,
