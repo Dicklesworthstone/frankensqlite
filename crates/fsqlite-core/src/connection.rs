@@ -39386,6 +39386,31 @@ fn bounded_function_args_len(args: &FunctionArgs) -> i32 {
     }
 }
 
+/// Closed, feature-gated admission list for deterministic JSON1 scalar
+/// functions registered by `fsqlite-ext-json`.
+///
+/// `builtin_function_surface_inventory()` is owned by `fsqlite-func`, which
+/// cannot depend on the extension crate without creating a dependency cycle,
+/// so extension names are recognized here instead. Keep the list closed and
+/// pair it with the live registry check in the caller: a caller-registered
+/// function reusing one of these names cannot make an unknown name admissible,
+/// and a missing or wrong-arity extension registration still fails closed.
+#[cfg(feature = "ext-json")]
+fn bounded_json_scalar_function_declared(name: &str, arity: i32) -> bool {
+    match name.to_ascii_lowercase().as_str() {
+        "json_array" | "jsonb_array" | "json_object" | "jsonb_object" | "json_quote" => arity >= 1,
+        "json_array_length" | "json_type" | "json_valid" => matches!(arity, 1 | 2),
+        "json_extract" | "jsonb_extract" => arity >= 2,
+        _ => false,
+    }
+}
+
+/// No-extension builds admit no JSON functions: the list stays closed.
+#[cfg(not(feature = "ext-json"))]
+const fn bounded_json_scalar_function_declared(_name: &str, _arity: i32) -> bool {
+    false
+}
+
 fn is_bounded_builtin_collation(collation: &str) -> bool {
     ["binary", "nocase", "rtrim"]
         .iter()
@@ -40119,19 +40144,50 @@ fn bounded_builtin_scalar_function_supported(
     args: &FunctionArgs,
     has_aggregate_decorations: bool,
 ) -> bool {
-    if has_aggregate_decorations || matches!(args, FunctionArgs::Star) {
+    if has_aggregate_decorations {
         return false;
     }
-    let arity = bounded_function_args_len(args);
-    let declared_builtin = builtin_function_surface_inventory().iter().any(|entry| {
-        entry.family == BuiltinFunctionFamily::Scalar
+
+    // Scalar admission, unchanged for ordinary argument lists apart from the
+    // closed JSON1 extension list below. `FunctionArgs::Star` is not a scalar
+    // spelling, so the scalar path skips it and falls through to aggregates.
+    if !matches!(args, FunctionArgs::Star) {
+        let arity = bounded_function_args_len(args);
+        let declared_builtin = builtin_function_surface_inventory().iter().any(|entry| {
+            entry.family == BuiltinFunctionFamily::Scalar
+                && entry.name.eq_ignore_ascii_case(name)
+                && (entry.num_args == arity || entry.num_args == -1)
+        }) || bounded_json_scalar_function_declared(name, arity);
+        if declared_builtin
+            && registry.find_scalar(name, arity).is_some_and(|function| {
+                function.is_deterministic() && function.arity().accepts(arity)
+            })
+        {
+            return true;
+        }
+    }
+
+    // Aggregate admission for persisted trigger predicates and view bodies:
+    // the canonical mutation-guard idiom is
+    // `SELECT RAISE(ABORT, ...) WHERE (SELECT COUNT(*) ...) <> 1`, which this
+    // policy previously refused outright because `count(*)` parses as
+    // `FunctionArgs::Star`. This predicate only reaches UNEVALUATED roles —
+    // CHECK constraints and defaults validate through
+    // `bounded_check_scalar_function_supported`, which stays strict — so
+    // nothing admitted here is ever recomputed by the bounded evaluator.
+    // Admission still requires the name to be in the authoritative built-in
+    // inventory AND registered on this exact connection, so custom or
+    // caller-registered aggregates remain refused (fail closed).
+    let aggregate_arity = aggregate_args_len_for_lookup(args);
+    let declared_builtin_aggregate = builtin_function_surface_inventory().iter().any(|entry| {
+        entry.family == BuiltinFunctionFamily::Aggregate
             && entry.name.eq_ignore_ascii_case(name)
-            && (entry.num_args == arity || entry.num_args == -1)
+            && (entry.num_args == aggregate_arity || entry.num_args == -1)
     });
-    declared_builtin
+    declared_builtin_aggregate
         && registry
-            .find_scalar(name, arity)
-            .is_some_and(|function| function.is_deterministic() && function.arity().accepts(arity))
+            .find_aggregate(name, aggregate_arity)
+            .is_some_and(|function| function.arity().accepts(aggregate_arity))
 }
 
 fn bounded_check_scalar_function_supported(
@@ -246517,6 +246573,144 @@ mod pager_routing_tests {
                 !message.contains("subquery in persisted schema expression"),
                 "the refusal must come from the budget, not from the shape gate: {message}"
             );
+        });
+    }
+
+    /// An inventory aggregate such as `COUNT(*)` is ADMITTED in an
+    /// unevaluated role.
+    ///
+    /// Provenance: this admission was proven out against real client schemas
+    /// during the bounded-image-validation work in the local
+    /// fsqlite-prodtest/fsqlite-tvftest scratch clones, then landed here in
+    /// policy form. The shared function-admission predicate used to reject
+    /// `FunctionArgs::Star` outright, so any persisted trigger using the
+    /// canonical `WHERE (SELECT COUNT(*) ...) <> 1` mutation-guard idiom was
+    /// refused even though nothing ever evaluates that predicate in this
+    /// pass. Admission requires the name to be in the built-in surface
+    /// inventory AND registered on the exact connection, so unknown or
+    /// caller-registered aggregates stay refused.
+    ///
+    /// The evaluated half of the boundary does not move: CHECK constraints go
+    /// through `bounded_check_scalar_function_supported`, which still refuses
+    /// aggregates, because there the bounded evaluator really would have to
+    /// reproduce them against real rows (C SQLite rejects aggregate calls in
+    /// CHECK expressions at DDL time anyway).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn semantic_validation_admits_a_count_star_guard_in_an_unevaluated_role() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let guard = fsqlite_parser::expr::parse_expr(
+                    "(SELECT COUNT(*) FROM mutation_journal AS journal WHERE journal.intent_id = NEW.intent_id) <> 1",
+                )
+                .expect("the COUNT(*) guard parses");
+            conn.validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Expr(&guard),
+                    "WHEN clause of trigger `trg_count_guard`",
+                    BoundedSchemaExpressionRole::Unevaluated,
+                )
+                .expect(
+                    "an inventory aggregate registered on this connection must be admitted where nothing evaluates it",
+                );
+
+            // Fail-closed half: a name outside the inventory stays refused
+            // even though it would also be unregistered here.
+            let custom_aggregate = fsqlite_parser::expr::parse_expr("weighted_avg(NEW.score) > 1")
+                .expect("the custom aggregate call parses");
+            let error = conn
+                .validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Expr(&custom_aggregate),
+                    "WHEN clause of trigger `trg_custom_aggregate`",
+                    BoundedSchemaExpressionRole::Unevaluated,
+                )
+                .expect_err("a non-inventory aggregate must stay refused");
+            assert!(
+                error.to_string().contains("weighted_avg"),
+                "refusal must name the offending aggregate: {error}"
+            );
+
+            // Evaluated half: the CHECK path keeps refusing aggregates.
+            let error = conn
+                .validate_bounded_check_expression_in_sql(
+                    "COUNT(*) > 0",
+                    "CHECK constraint 1 on table `t`",
+                )
+                .expect_err("a COUNT(*) guard in an evaluated CHECK must stay refused");
+            assert!(
+                error.to_string().to_lowercase().contains("count"),
+                "expected the CHECK-path aggregate refusal naming count: {error}"
+            );
+        });
+    }
+
+    /// Deterministic JSON1 extension scalars are ADMITTED in unevaluated
+    /// roles through a CLOSED list paired with the live registry.
+    ///
+    /// Extension names are absent from `fsqlite-func`'s built-in surface
+    /// inventory by design (dependency cycle), so the admission list lives
+    /// next to the policy that consults it. A name outside every admission
+    /// list — here a plausible-looking `tenant_each` — must stay refused.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "ext-json"))]
+    #[test]
+    fn semantic_validation_admits_registered_json_scalars_and_keeps_unknown_names_fail_closed() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let json_guard = fsqlite_parser::expr::parse_expr(
+                "json_array_length(NEW.value) > 0 AND json_valid(NEW.payload)",
+            )
+            .expect("the JSON scalar guard parses");
+            conn.validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Expr(&json_guard),
+                    "WHEN clause of trigger `trg_json_guard`",
+                    BoundedSchemaExpressionRole::Unevaluated,
+                )
+                .expect(
+                    "registered deterministic JSON1 scalars must be admitted where nothing evaluates them",
+                );
+
+            let unknown_function = fsqlite_parser::expr::parse_expr("tenant_each(NEW.value)")
+                .expect("the unknown function call parses");
+            let error = conn
+                .validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Expr(&unknown_function),
+                    "WHEN clause of trigger `trg_unknown_fn`",
+                    BoundedSchemaExpressionRole::Unevaluated,
+                )
+                .expect_err("a name outside every admission list must stay refused");
+            assert!(
+                error.to_string().contains("tenant_each"),
+                "refusal must name the offending function: {error}"
+            );
+        });
+    }
+
+    /// The production-shaped JSON-array-membership trigger WHEN clause is
+    /// ADMITTED whole.
+    ///
+    /// This is the exact shape from the hfdt-0117 client schema: a
+    /// `json_each` table-valued function in FROM position (admitted by the
+    /// unevaluated role), deterministic JSON1 scalars inside a CASE (admitted
+    /// by the closed extension list plus live registry check), and a nested
+    /// `COUNT(*)` duplication guard (admitted by the aggregate path). One
+    /// refusal anywhere in the composition would fail the whole clause, so
+    /// this test is the integration pin over the two unit boundaries above.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "ext-json"))]
+    #[test]
+    fn semantic_validation_admits_the_production_json_trigger_when_clause() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let when_clause = fsqlite_parser::expr::parse_expr(
+                    "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(NEW.value) = 1 THEN NEW.value ELSE '[]' END) AS target WHERE target.type IS NOT 'object' OR (SELECT COUNT(*) FROM json_each(CASE WHEN target.type = 'object' THEN target.value ELSE '{}' END)) <> 1)",
+                )
+                .expect("the production WHEN clause parses");
+            conn.validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Expr(&when_clause),
+                    "WHEN clause of trigger `validate_json_array_members`",
+                    BoundedSchemaExpressionRole::Unevaluated,
+                )
+                .expect(
+                    "the production JSON trigger shape must validate: TVF by role, scalars by the closed extension list, COUNT(*) by the aggregate path",
+                );
         });
     }
 
