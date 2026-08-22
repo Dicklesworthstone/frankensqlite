@@ -1228,6 +1228,50 @@ pub fn upsert_target_matches_rowid_primary_key(table: &TableSchema, target: &Ups
         || table.resolves_to_hidden_rowid(&column.column)
 }
 
+/// A WITHOUT ROWID table's PRIMARY KEY is a valid `ON CONFLICT` arbiter, but it
+/// is stored as the clustering key in `primary_key_constraints` — not as an
+/// entry in `table.indexes` (so `find_upsert_target_index` misses it) and not as
+/// an `is_ipk` rowid alias (so `upsert_target_matches_rowid_primary_key` misses
+/// it). Match a plain, non-collated, non-partial target whose column set equals
+/// the PRIMARY KEY column set (order-independent, like a UNIQUE-index arbiter).
+#[must_use]
+pub fn upsert_target_matches_without_rowid_primary_key(
+    table: &TableSchema,
+    target: &UpsertTarget,
+) -> bool {
+    if !table.without_rowid || target.where_clause.is_some() {
+        return false;
+    }
+    let mut target_cols: Vec<&str> = Vec::with_capacity(target.columns.len());
+    for indexed in &target.columns {
+        // Only plain, non-collated column targets can name the PRIMARY KEY here.
+        if indexed.collation.is_some() {
+            return false;
+        }
+        let Expr::Column(column, _) = &indexed.expr else {
+            return false;
+        };
+        target_cols.push(column.column.as_ref());
+    }
+    let Some(pk_group) = table.primary_key_constraints.first() else {
+        return false;
+    };
+    if target_cols.is_empty() || pk_group.len() != target_cols.len() {
+        return false;
+    }
+    // Order-independent set match against the PRIMARY KEY columns.
+    let mut matched = vec![false; pk_group.len()];
+    target_cols.iter().all(|target_column| {
+        let Some(position) = pk_group.iter().enumerate().position(|(index, pk_column)| {
+            matched.get(index).is_some_and(|m| !m) && pk_column.eq_ignore_ascii_case(target_column)
+        }) else {
+            return false;
+        };
+        matched[position] = true;
+        true
+    })
+}
+
 /// Emit UPSERT DO UPDATE assignments into `target_regs`.
 ///
 /// For each assignment, evaluates the RHS expression using two contexts:
@@ -19857,6 +19901,7 @@ pub fn codegen_insert(
         if let Some(target) = target
             && find_upsert_target_index(table, Some(target)).is_none()
             && !upsert_target_matches_rowid_primary_key(table, target)
+            && !upsert_target_matches_without_rowid_primary_key(table, target)
         {
             return Err(CodegenError::Unsupported(
                 "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint".to_owned(),

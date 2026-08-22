@@ -24343,6 +24343,9 @@ impl Connection {
             }
             if fsqlite_vdbe::codegen::find_upsert_target_index(table, Some(target)).is_none()
                 && !fsqlite_vdbe::codegen::upsert_target_matches_rowid_primary_key(table, target)
+                && !fsqlite_vdbe::codegen::upsert_target_matches_without_rowid_primary_key(
+                    table, target,
+                )
             {
                 return Err(FrankenError::function_error(
                     "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
