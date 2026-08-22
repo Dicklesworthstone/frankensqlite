@@ -2176,17 +2176,23 @@ impl<'a> ParseMachine<'a> {
                 let name = Arc::<str>::from(kw_to_str(&kind));
                 return self.identifier_or_function(name, token_span, min_bp);
             }
+            TokenKind::Error(msg) => {
+                // A tokenizer error already carries SQLite's stock-form message
+                // (`unrecognized token: "X"`); surface it verbatim under the
+                // Tokenizer kind so no `SQL error at offset N:` prefix is added.
+                // bd-parser-syntax-error-format-6w6kp (Part A).
+                return Err(ParseError {
+                    kind: crate::parser::ParseErrorKind::Tokenizer,
+                    message: msg,
+                    span: token_span,
+                    line,
+                    col,
+                });
+            }
             kind => {
                 return Err(ParseError {
                     kind: crate::parser::ParseErrorKind::Syntax,
-                    // A lexer error token (unterminated / unrecognized / malformed)
-                    // already carries its stock-matching message; propagate it
-                    // verbatim instead of Debug-wrapping it as
-                    // `unexpected token in expression: Error("...")`.
-                    message: match &kind {
-                        TokenKind::Error(msg) => msg.clone(),
-                        _ => format!("unexpected token in expression: {kind:?}"),
-                    },
+                    message: format!("unexpected token in expression: {kind:?}"),
                     span: token_span,
                     line,
                     col,
@@ -4092,14 +4098,18 @@ impl Parser {
                 self.parse_ident_expr(name, token_span)
             }
 
+            TokenKind::Error(msg) => Err(ParseError {
+                // Surface the tokenizer error verbatim (see the other arm).
+                // bd-parser-syntax-error-format-6w6kp (Part A).
+                kind: crate::parser::ParseErrorKind::Tokenizer,
+                message: msg,
+                span: token_span,
+                line,
+                col,
+            }),
             kind => Err(ParseError {
                 kind: crate::parser::ParseErrorKind::Syntax,
-                // Propagate a lexer error token's message verbatim (see the other
-                // arm) rather than Debug-wrapping it.
-                message: match &kind {
-                    TokenKind::Error(msg) => msg.clone(),
-                    _ => format!("unexpected token in expression: {kind:?}"),
-                },
+                message: format!("unexpected token in expression: {kind:?}"),
                 span: token_span,
                 line,
                 col,

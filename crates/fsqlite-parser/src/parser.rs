@@ -102,6 +102,11 @@ enum DmlParseContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseErrorKind {
     Syntax,
+    /// A tokenizer (lexer) error — an unterminated/unrecognized/malformed token.
+    /// Its `message` is already SQLite's stock form (`unrecognized token: "X"`)
+    /// and must be surfaced verbatim, with NO `SQL error at offset N:` prefix.
+    /// bd-parser-syntax-error-format-6w6kp (Part A).
+    Tokenizer,
     ExpressionTooDeep { max: u32 },
     RecursionLimit,
 }

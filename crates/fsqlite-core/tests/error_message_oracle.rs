@@ -715,3 +715,24 @@ fn parameterized_query_rejects_aggregate_misuse() {
         );
     });
 }
+
+#[test]
+fn tokenizer_error_surfaces_verbatim_end_to_end() {
+    asupersync::test_utils::run_test(|| async {
+        // A tokenizer (lexer) error reaches the user as SQLite's bare
+        // "unrecognized token: \"X\"" — with NO "SQL error at offset N:" prefix and
+        // NO "unexpected token in expression: Error(..)" Debug-wrap. This is the
+        // end-to-end (Connection::query) contract, distinct from the TokenKind-level
+        // lexer tests. bd-parser-syntax-error-format-6w6kp (Part A).
+        for (sql, expected) in [
+            ("SELECT 0x", "unrecognized token: \"0x\""),
+            ("SELECT 0xGG", "unrecognized token: \"0xGG\""),
+            ("SELECT x'123'", "unrecognized token: \"x'123'\""),
+            ("SELECT x'1G'", "unrecognized token: \"x'1G'\""),
+            ("SELECT 'abc", "unrecognized token: \"'abc\""),
+            ("SELECT [abc", "unrecognized token: \"[abc\""),
+        ] {
+            query_err_is(&[], sql, expected).await;
+        }
+    });
+}
