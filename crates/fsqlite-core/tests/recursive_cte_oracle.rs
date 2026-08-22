@@ -17,7 +17,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -26,13 +29,19 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn fq(f: &Connection, sql: &str) -> Vec<Vec<String>> {
     match f.query_with_params(sql, &[]).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(e) => vec![vec![format!("<ERR {e:?}>")]],
     }
 }
@@ -43,7 +52,9 @@ fn rq(r: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     };
     let n = st.column_count();
     st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect())
     })
     .unwrap()
     .collect::<Result<Vec<_>, _>>()
@@ -59,7 +70,10 @@ async fn agree(setup: &[&str], sql: &str, msg: &str) {
     }
     let fr = fq(&f, sql).await;
     let rr = rq(&r, sql);
-    assert_eq!(fr, rr, "{msg}\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}");
+    assert_eq!(
+        fr, rr,
+        "{msg}\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}"
+    );
 }
 
 const T: &[&str] = &[
@@ -72,8 +86,12 @@ fn counters_and_accumulation() {
     asupersync::test_utils::run_test(|| async {
         agree(&[], "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT n FROM c ORDER BY n",
               "bounded counter 1..5").await;
-        agree(&[], "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c LIMIT 4",
-              "unbounded recursion terminated by LIMIT").await;
+        agree(
+            &[],
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c) SELECT n FROM c LIMIT 4",
+            "unbounded recursion terminated by LIMIT",
+        )
+        .await;
         agree(&[], "WITH RECURSIVE c(n, tot) AS (SELECT 1, 1 UNION ALL SELECT n+1, tot+n+1 FROM c WHERE n < 5) SELECT n, tot FROM c ORDER BY n",
               "running accumulation").await;
         agree(&[], "WITH RECURSIVE fib(a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 50) SELECT a FROM fib ORDER BY a",

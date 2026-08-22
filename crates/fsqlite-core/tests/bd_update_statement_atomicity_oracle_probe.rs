@@ -33,17 +33,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -58,9 +67,14 @@ fn update_statement_atomicity_match_rusqlite_oracle() {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // ── default (implicit ABORT): multi-row UPDATE colliding partway undoes ALL ──
         for s in [
@@ -71,8 +85,12 @@ fn update_statement_atomicity_match_rusqlite_oracle() {
         }
         // set u='Z' on ids 1 and 2: id=1 -> 'Z' ok, id=2 -> 'Z' collides -> ABORT undoes id=1 too
         ex(&f, &r, "UPDATE a SET u='Z' WHERE id IN (1,2)").await;
-        check("implicit abort undoes update", fq(&f, "SELECT id,u FROM a ORDER BY id").await,
-              rq(&r, "SELECT id,u FROM a ORDER BY id"), &mut diffs);
+        check(
+            "implicit abort undoes update",
+            fq(&f, "SELECT id,u FROM a ORDER BY id").await,
+            rq(&r, "SELECT id,u FROM a ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── explicit OR ABORT: same rollback-the-statement behavior ──
         for s in [
@@ -82,8 +100,12 @@ fn update_statement_atomicity_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "UPDATE OR ABORT b SET u='Z' WHERE id IN (1,2)").await;
-        check("or abort undoes update", fq(&f, "SELECT id,u FROM b ORDER BY id").await,
-              rq(&r, "SELECT id,u FROM b ORDER BY id"), &mut diffs);
+        check(
+            "or abort undoes update",
+            fq(&f, "SELECT id,u FROM b ORDER BY id").await,
+            rq(&r, "SELECT id,u FROM b ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── NOT NULL violation mid-statement also rolls back under ABORT ──
         for s in [
@@ -94,8 +116,12 @@ fn update_statement_atomicity_match_rusqlite_oracle() {
         }
         // set v = w for all: id=1 v=100 ok, id=2 v=NULL violates NOT NULL -> undo id=1
         ex(&f, &r, "UPDATE c SET v = w").await;
-        check("notnull abort undoes", fq(&f, "SELECT id,v FROM c ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM c ORDER BY id"), &mut diffs);
+        check(
+            "notnull abort undoes",
+            fq(&f, "SELECT id,v FROM c ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM c ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── OR FAIL: earlier rows of the UPDATE are KEPT ──
         for s in [
@@ -106,8 +132,12 @@ fn update_statement_atomicity_match_rusqlite_oracle() {
         }
         // ORDER of rowids: id=1 -> 'Z' kept, id=2 -> 'Z' fails; OR FAIL keeps id=1's change
         ex(&f, &r, "UPDATE OR FAIL d SET u='Z' WHERE id IN (1,2)").await;
-        check("or fail keeps earlier update", fq(&f, "SELECT id,u FROM d ORDER BY id").await,
-              rq(&r, "SELECT id,u FROM d ORDER BY id"), &mut diffs);
+        check(
+            "or fail keeps earlier update",
+            fq(&f, "SELECT id,u FROM d ORDER BY id").await,
+            rq(&r, "SELECT id,u FROM d ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── OR IGNORE: the offending row is skipped, others updated ──
         for s in [
@@ -119,8 +149,12 @@ fn update_statement_atomicity_match_rusqlite_oracle() {
         // set u='q' on ids 1 and 3: id=1 collides with existing 'q' (id=2) -> ignored;
         // id=3 -> 'q' also collides -> ignored; net: nothing changes
         ex(&f, &r, "UPDATE OR IGNORE e SET u='q' WHERE id IN (1,3)").await;
-        check("or ignore skips offending", fq(&f, "SELECT id,u FROM e ORDER BY id").await,
-              rq(&r, "SELECT id,u FROM e ORDER BY id"), &mut diffs);
+        check(
+            "or ignore skips offending",
+            fq(&f, "SELECT id,u FROM e ORDER BY id").await,
+            rq(&r, "SELECT id,u FROM e ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── OR REPLACE on UPDATE: the collided-with row is deleted ──
         for s in [
@@ -130,8 +164,12 @@ fn update_statement_atomicity_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "UPDATE OR REPLACE g SET u='q' WHERE id=1").await; // collides w/ id=2 -> id=2 removed
-        check("or replace update", fq(&f, "SELECT id,u FROM g ORDER BY id").await,
-              rq(&r, "SELECT id,u FROM g ORDER BY id"), &mut diffs);
+        check(
+            "or replace update",
+            fq(&f, "SELECT id,u FROM g ORDER BY id").await,
+            rq(&r, "SELECT id,u FROM g ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── successful multi-row UPDATE (no conflict) still works ──
         for s in [
@@ -141,9 +179,18 @@ fn update_statement_atomicity_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "UPDATE h SET n=n+1 WHERE id IN (1,2,3)").await;
-        check("clean multi-row update", fq(&f, "SELECT id,n FROM h ORDER BY id").await,
-              rq(&r, "SELECT id,n FROM h ORDER BY id"), &mut diffs);
+        check(
+            "clean multi-row update",
+            fq(&f, "SELECT id,n FROM h ORDER BY id").await,
+            rq(&r, "SELECT id,n FROM h ORDER BY id"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} UPDATE-atomicity divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} UPDATE-atomicity divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

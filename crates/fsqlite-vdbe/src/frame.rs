@@ -1131,7 +1131,10 @@ mod tests {
     fn trampoline_unwind_all_cleans_up_innermost_first() {
         let mut stack: TrampolineStack<FakeWork> = TrampolineStack::with_defaults();
         stack.set_recursive_triggers(true);
-        for (i, name) in ["trg_0", "trg_1", "trg_2", "trg_3", "trg_4"].iter().enumerate() {
+        for (i, name) in ["trg_0", "trg_1", "trg_2", "trg_3", "trg_4"]
+            .iter()
+            .enumerate()
+        {
             stack.try_admit(name, 4, work("t", i));
         }
         assert_eq!(stack.depth(), 5);

@@ -3419,7 +3419,10 @@ SELECT id FROM keep WHERE name = 'k3';\n"
             )
             .expect("write list rows");
             let list = String::from_utf8(list_out).expect("utf-8");
-            assert!(!list.contains('\r'), "list mode must not use CRLF: {list:?}");
+            assert!(
+                !list.contains('\r'),
+                "list mode must not use CRLF: {list:?}"
+            );
             assert!(list.ends_with('\n'), "list mode uses a bare LF terminator");
         });
     }

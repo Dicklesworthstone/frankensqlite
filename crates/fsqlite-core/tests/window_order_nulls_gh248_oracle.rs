@@ -17,7 +17,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -26,16 +29,33 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 /// Compare in emitted order (both queries carry a deterministic outer ORDER BY).
 async fn assert_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &str) {
-    let fr: Vec<Vec<String>> = fconn.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e:?}")).iter().map(|r| r.values().iter().map(tag_f).collect()).collect();
+    let fr: Vec<Vec<String>> = fconn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+        .iter()
+        .map(|r| r.values().iter().map(tag_f).collect())
+        .collect();
     let mut st = rconn.prepare(sql).unwrap();
     let n = st.column_count();
-    let rr: Vec<Vec<String>> = st.query_map([], |row| Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let rr: Vec<Vec<String>> = st
+        .query_map([], |row| {
+            Ok((0..n)
+                .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect())
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(fr, rr, "window NULLS-order mismatch on `{sql}`");
 }
 
@@ -71,10 +91,18 @@ fn window_row_number_nulls_last_gh248() {
         let r = rusqlite::Connection::open_in_memory().unwrap();
         seed(&f, &r).await;
         // row_number() over ORDER BY v NULLS LAST -> NULL rows ranked 4,5.
-        assert_agree(&f, &r,
-            "SELECT id, v, row_number() OVER (ORDER BY v NULLS LAST) FROM t ORDER BY id").await;
-        assert_agree(&f, &r,
-            "SELECT id, v, rank() OVER (ORDER BY v NULLS LAST) FROM t ORDER BY id").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT id, v, row_number() OVER (ORDER BY v NULLS LAST) FROM t ORDER BY id",
+        )
+        .await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT id, v, rank() OVER (ORDER BY v NULLS LAST) FROM t ORDER BY id",
+        )
+        .await;
     });
 }
 
@@ -85,10 +113,18 @@ fn window_order_desc_nulls_first_gh248() {
         let r = rusqlite::Connection::open_in_memory().unwrap();
         seed(&f, &r).await;
         // DESC NULLS FIRST -> NULL rows ranked first.
-        assert_agree(&f, &r,
-            "SELECT id, v, row_number() OVER (ORDER BY v DESC NULLS FIRST) FROM t ORDER BY id").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT id, v, row_number() OVER (ORDER BY v DESC NULLS FIRST) FROM t ORDER BY id",
+        )
+        .await;
         // Default DESC (NULLS LAST) as a contrast.
-        assert_agree(&f, &r,
-            "SELECT id, v, row_number() OVER (ORDER BY v DESC) FROM t ORDER BY id").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT id, v, row_number() OVER (ORDER BY v DESC) FROM t ORDER BY id",
+        )
+        .await;
     });
 }

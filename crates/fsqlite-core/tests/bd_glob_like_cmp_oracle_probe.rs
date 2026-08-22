@@ -29,7 +29,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 }
 
 async fn fval(conn: &Connection, sql: &str) -> String {
-    let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("frank `{sql}`: {e:?}"));
+    let rows = conn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("frank `{sql}`: {e:?}"));
     assert_eq!(rows.len(), 1, "frank `{sql}` returned {} rows", rows.len());
     tag_f(&rows[0].values()[0])
 }
@@ -53,7 +56,7 @@ fn glob_like_and_comparison_match_rusqlite_oracle() {
             "SELECT 'Hello' LIKE 'h%o'",
             "SELECT 'HELLO' LIKE '%ell%'",
             "SELECT 'abc' LIKE 'ABC'",
-            "SELECT 'ÄBC' LIKE 'äbc'",           // non-ASCII: LIKE folds ASCII only
+            "SELECT 'ÄBC' LIKE 'äbc'", // non-ASCII: LIKE folds ASCII only
             "SELECT '100%' LIKE '100\\%' ESCAPE '\\'",
             "SELECT 'a_b' LIKE 'a\\_b' ESCAPE '\\'",
             "SELECT 'axb' LIKE 'a\\_b' ESCAPE '\\'",

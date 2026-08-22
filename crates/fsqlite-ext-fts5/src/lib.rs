@@ -1600,9 +1600,7 @@ pub fn build_tombstone_hash(
     let pages: Vec<Fts5TombstonePage> = pages
         .into_iter()
         .enumerate()
-        .map(|(index, slots)| {
-            Fts5TombstonePage::new(key_size, index == 0 && tombstone_zero, slots)
-        })
+        .map(|(index, slots)| Fts5TombstonePage::new(key_size, index == 0 && tombstone_zero, slots))
         .collect();
     let entry_count = u32::try_from(nonzero.len() + usize::from(tombstone_zero))
         .map_err(|_| fts5_data_error("tombstone entry count exceeds u32"))?;
@@ -6183,7 +6181,10 @@ impl InvertedIndex {
                     Fts5Poslist::new(false, poslist_columns),
                 ));
             }
-            out.push((String::from_utf8_lossy(term.as_bytes()).into_owned(), entries));
+            out.push((
+                String::from_utf8_lossy(term.as_bytes()).into_owned(),
+                entries,
+            ));
         }
         out.sort_by(|left, right| left.0.cmp(&right.0));
         out
@@ -10587,9 +10588,9 @@ pub fn build_fts5vocab_rows(
                     for column in &entry.poslist.columns {
                         let slot = per_col.entry(column.column).or_insert((0, 0));
                         slot.0 = slot.0.saturating_add(1);
-                        slot.1 = slot
-                            .1
-                            .saturating_add(i64::try_from(column.offsets.len()).unwrap_or(i64::MAX));
+                        slot.1 = slot.1.saturating_add(
+                            i64::try_from(column.offsets.len()).unwrap_or(i64::MAX),
+                        );
                     }
                 }
                 for (column, (doc, cnt)) in per_col {
@@ -10607,7 +10608,8 @@ pub fn build_fts5vocab_rows(
                 ordered.sort_by_key(|entry| entry.rowid);
                 for entry in ordered {
                     let doc = i64::try_from(entry.rowid).unwrap_or(i64::MAX);
-                    let mut columns: Vec<&Fts5ColumnPositions> = entry.poslist.columns.iter().collect();
+                    let mut columns: Vec<&Fts5ColumnPositions> =
+                        entry.poslist.columns.iter().collect();
                     columns.sort_by_key(|column| column.column);
                     for column in columns {
                         let col_value = vocab_col_value(source_columns, column.column);
@@ -10743,11 +10745,19 @@ impl VirtualTableCursor for Fts5VocabCursor {
 struct Fts5VocabFactory;
 
 impl VtabModuleFactory for Fts5VocabFactory {
-    fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn fsqlite_func::vtab::ErasedVtabInstance>> {
+    fn create(
+        &self,
+        cx: &Cx,
+        args: &[&str],
+    ) -> Result<Box<dyn fsqlite_func::vtab::ErasedVtabInstance>> {
         Ok(Box::new(Fts5VocabTable::connect(cx, args)?))
     }
 
-    fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn fsqlite_func::vtab::ErasedVtabInstance>> {
+    fn connect(
+        &self,
+        cx: &Cx,
+        args: &[&str],
+    ) -> Result<Box<dyn fsqlite_func::vtab::ErasedVtabInstance>> {
         self.create(cx, args)
     }
 
@@ -12814,7 +12824,11 @@ mod tests {
             };
             // 0alpha: rowid 2 is tombstoned in seg1 (dropped); 1 (older) + 3
             // (newer) survive the recency merge.
-            assert_eq!(rowids_of(b"0alpha"), vec![1, 3], "recency merge + tombstone drop");
+            assert_eq!(
+                rowids_of(b"0alpha"),
+                vec![1, 3],
+                "recency merge + tombstone drop"
+            );
             // 0beta: only in the older segment, rowid 1 live.
             assert_eq!(rowids_of(b"0beta"), vec![1]);
             // Terms are grouped and term-sorted.
@@ -12916,13 +12930,22 @@ mod tests {
         // rowid stays findable and no absent rowid reads as tombstoned.
         let many: BTreeSet<u64> = (1_u64..=200).collect();
         let hash = build_tombstone_hash(&many, false, 4).unwrap();
-        assert!(hash.page_count > 1, "200 rowids need more than one 4-slot page");
+        assert!(
+            hash.page_count > 1,
+            "200 rowids need more than one 4-slot page"
+        );
         assert_eq!(hash.entry_count, 200);
         for r in 1_u64..=200 {
-            assert!(tombstoned(&hash, r), "grown-hash rowid {r} must be tombstoned");
+            assert!(
+                tombstoned(&hash, r),
+                "grown-hash rowid {r} must be tombstoned"
+            );
         }
         for r in [0_u64, 201, 300, 12_345] {
-            assert!(!tombstoned(&hash, r), "absent rowid {r} must NOT be tombstoned");
+            assert!(
+                !tombstoned(&hash, r),
+                "absent rowid {r} must NOT be tombstoned"
+            );
         }
 
         // A rowid past u32::MAX widens every page to an 8-byte key.
@@ -12964,7 +12987,9 @@ mod tests {
                 return false;
             }
             let hash_pgno = u32::try_from(rowid % u64::from(count)).unwrap();
-            let want = Fts5DataRowid::Tombstone { segid, hash_pgno }.encode().unwrap();
+            let want = Fts5DataRowid::Tombstone { segid, hash_pgno }
+                .encode()
+                .unwrap();
             flush
                 .tombstone_data_rows
                 .iter()
@@ -13015,10 +13040,22 @@ mod tests {
 
         assert_eq!(flush.docsize_rowids_to_delete, vec![5, 6]);
         let updated = Fts5StructureRecord::decode(&flush.structure_data_row.block).unwrap();
-        assert!(tombstoned(&flush, &updated, 1, 5), "rowid 5 tombstoned in segment 1");
-        assert!(tombstoned(&flush, &updated, 2, 6), "rowid 6 tombstoned in segment 2");
-        assert!(!tombstoned(&flush, &updated, 1, 6), "rowid 6 is not in segment 1");
-        assert!(!tombstoned(&flush, &updated, 2, 5), "rowid 5 is not in segment 2");
+        assert!(
+            tombstoned(&flush, &updated, 1, 5),
+            "rowid 5 tombstoned in segment 1"
+        );
+        assert!(
+            tombstoned(&flush, &updated, 2, 6),
+            "rowid 6 tombstoned in segment 2"
+        );
+        assert!(
+            !tombstoned(&flush, &updated, 1, 6),
+            "rowid 6 is not in segment 1"
+        );
+        assert!(
+            !tombstoned(&flush, &updated, 2, 5),
+            "rowid 5 is not in segment 2"
+        );
 
         // Averages dropped both docs: total_rows 10->8, tokens 100-7-3 = 90.
         let updated_avg = Fts5AveragesRecord::decode(&flush.averages_data_row.block, 1).unwrap();
@@ -13037,8 +13074,17 @@ mod tests {
             .tombstone_page_count;
         let mut seg1_pages = Vec::new();
         for hash_pgno in 0..count1 {
-            let id = Fts5DataRowid::Tombstone { segid: 1, hash_pgno }.encode().unwrap();
-            let row = flush.tombstone_data_rows.iter().find(|row| row.id == id).unwrap();
+            let id = Fts5DataRowid::Tombstone {
+                segid: 1,
+                hash_pgno,
+            }
+            .encode()
+            .unwrap();
+            let row = flush
+                .tombstone_data_rows
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap();
             seg1_pages.push(Fts5TombstonePage::decode(&row.block).unwrap());
         }
         let mut existing = BTreeMap::new();
@@ -13050,10 +13096,17 @@ mod tests {
             column_token_counts: vec![2],
         }];
         let flush2 =
-            encode_incremental_delete_flush(&deleted2, &updated, &updated_avg, &existing, 4).unwrap();
+            encode_incremental_delete_flush(&deleted2, &updated, &updated_avg, &existing, 4)
+                .unwrap();
         let updated2 = Fts5StructureRecord::decode(&flush2.structure_data_row.block).unwrap();
-        assert!(tombstoned(&flush2, &updated2, 1, 5), "prior tombstone 5 preserved");
-        assert!(tombstoned(&flush2, &updated2, 1, 9), "new tombstone 9 added");
+        assert!(
+            tombstoned(&flush2, &updated2, 1, 5),
+            "prior tombstone 5 preserved"
+        );
+        assert!(
+            tombstoned(&flush2, &updated2, 1, 9),
+            "new tombstone 9 added"
+        );
         let final_avg = Fts5AveragesRecord::decode(&flush2.averages_data_row.block, 1).unwrap();
         assert_eq!(final_avg.total_rows, 7);
         assert_eq!(final_avg.column_token_totals, vec![88]);
@@ -13064,7 +13117,14 @@ mod tests {
         let cx = Cx::new();
         let mut table = Fts5Table::connect(
             &cx,
-            &["fts5", "main", "t", "body", "content=''", "contentless_delete=1"],
+            &[
+                "fts5",
+                "main",
+                "t",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
         )
         .unwrap();
         table.mark_lazy_on_disk(100);
@@ -13072,11 +13132,27 @@ mod tests {
 
         table.note_lazy_deleted_rows(&[1, 2, 3]);
 
-        assert!(table.is_lazy_on_disk(), "a lazy delete must not leave lazy mode");
-        assert_eq!(table.row_count(), 97, "row count drops by the number of deletes");
-        assert!(table.documents.is_empty(), "no transient documents retained");
-        assert!(table.index.index.is_empty(), "no transient postings retained");
-        assert!(table.shadow_rows.is_none(), "reads historical state from the host");
+        assert!(
+            table.is_lazy_on_disk(),
+            "a lazy delete must not leave lazy mode"
+        );
+        assert_eq!(
+            table.row_count(),
+            97,
+            "row count drops by the number of deletes"
+        );
+        assert!(
+            table.documents.is_empty(),
+            "no transient documents retained"
+        );
+        assert!(
+            table.index.index.is_empty(),
+            "no transient postings retained"
+        );
+        assert!(
+            table.shadow_rows.is_none(),
+            "reads historical state from the host"
+        );
     }
 
     #[test]
@@ -13119,12 +13195,19 @@ mod tests {
             (1, 2),
             "merged segment spans the inputs' origins"
         );
-        assert_eq!(sm.tombstone_page_count, 0, "merged segment has no tombstones");
+        assert_eq!(
+            sm.tombstone_page_count, 0,
+            "merged segment has no tombstones"
+        );
 
         // Delete list = the two inputs' single leaves (no tombstones).
         let mut want: Vec<i64> = vec![
-            Fts5DataRowid::SegmentLeaf { segid: 1, pgno: 1 }.encode().unwrap(),
-            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 1 }.encode().unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 1, pgno: 1 }
+                .encode()
+                .unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 1 }
+                .encode()
+                .unwrap(),
         ];
         want.sort_unstable();
         let mut got = flush.deleted_data_rowids.clone();
@@ -13132,9 +13215,17 @@ mod tests {
         assert_eq!(got, want);
 
         // The merged leaf holds both terms with rowid-ascending doclists.
-        assert_eq!(flush.leaf_data_rows.len(), 1, "the small merge fits one leaf");
+        assert_eq!(
+            flush.leaf_data_rows.len(),
+            1,
+            "the small merge fits one leaf"
+        );
         let leaf = Fts5SegmentLeaf::decode(&flush.leaf_data_rows[0].block).unwrap();
-        let rust = leaf.terms.iter().find(|term| term.term == b"0rust").unwrap();
+        let rust = leaf
+            .terms
+            .iter()
+            .find(|term| term.term == b"0rust")
+            .unwrap();
         assert_eq!(
             rust.doclist
                 .entries
@@ -13144,7 +13235,11 @@ mod tests {
             vec![1, 3],
             "doclist sorted rowid-ascending"
         );
-        let search = leaf.terms.iter().find(|term| term.term == b"0search").unwrap();
+        let search = leaf
+            .terms
+            .iter()
+            .find(|term| term.term == b"0search")
+            .unwrap();
         assert_eq!(
             search
                 .doclist
@@ -13186,7 +13281,10 @@ mod tests {
         assert!(reset.levels.is_empty(), "every level dropped");
         assert_eq!(reset.cookie, 7, "cookie preserved");
         assert_eq!(reset.write_counter, 6, "write_counter bumped");
-        assert!(reset.uses_origin_tracking(), "empty structure keeps v2 mode");
+        assert!(
+            reset.uses_origin_tracking(),
+            "empty structure keeps v2 mode"
+        );
         assert_eq!(
             reset.origin_counter, 1,
             "emptied v2 index reconstructs origin_counter=1"
@@ -13202,12 +13300,30 @@ mod tests {
         // Delete list = every segment's leaves (segid1: pgno 1; segid2: pgno
         // 1..=3) plus segid2's two tombstone pages.
         let mut want: Vec<i64> = vec![
-            Fts5DataRowid::SegmentLeaf { segid: 1, pgno: 1 }.encode().unwrap(),
-            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 1 }.encode().unwrap(),
-            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 2 }.encode().unwrap(),
-            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 3 }.encode().unwrap(),
-            Fts5DataRowid::Tombstone { segid: 2, hash_pgno: 0 }.encode().unwrap(),
-            Fts5DataRowid::Tombstone { segid: 2, hash_pgno: 1 }.encode().unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 1, pgno: 1 }
+                .encode()
+                .unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 1 }
+                .encode()
+                .unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 2 }
+                .encode()
+                .unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 2, pgno: 3 }
+                .encode()
+                .unwrap(),
+            Fts5DataRowid::Tombstone {
+                segid: 2,
+                hash_pgno: 0,
+            }
+            .encode()
+            .unwrap(),
+            Fts5DataRowid::Tombstone {
+                segid: 2,
+                hash_pgno: 1,
+            }
+            .encode()
+            .unwrap(),
         ];
         want.sort_unstable();
         let mut got = flush.deleted_data_rowids.clone();
@@ -13238,7 +13354,11 @@ mod tests {
         assert_eq!(reset.write_counter, 3, "write_counter bumped");
         assert_eq!(
             flush.deleted_data_rowids,
-            vec![Fts5DataRowid::SegmentLeaf { segid: 1, pgno: 1 }.encode().unwrap()],
+            vec![
+                Fts5DataRowid::SegmentLeaf { segid: 1, pgno: 1 }
+                    .encode()
+                    .unwrap()
+            ],
             "single-leaf segment enumerated"
         );
     }
@@ -13537,7 +13657,11 @@ mod tests {
         assert_eq!(pending.term_count(), 5);
 
         let flush = pending
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
+            .flush_to_segment(
+                4,
+                Fts5StructureRecord::empty_legacy(0),
+                FTS5_SAFE_LEAF_BYTES,
+            )
             .unwrap();
         assert_eq!(flush.data_rows.len(), 2);
         assert_eq!(
@@ -13577,7 +13701,11 @@ mod tests {
         );
 
         let flush = pending
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
+            .flush_to_segment(
+                4,
+                Fts5StructureRecord::empty_legacy(0),
+                FTS5_SAFE_LEAF_BYTES,
+            )
             .unwrap();
 
         assert!(
@@ -13650,7 +13778,8 @@ mod tests {
         );
         assert_eq!(effective_leaf_budget(65_536), FTS5_SAFE_LEAF_BYTES);
         assert_eq!(
-            effective_leaf_budget(4050), 4050,
+            effective_leaf_budget(4050),
+            4050,
             "a pgsz under the ceiling is honored verbatim"
         );
 
@@ -13672,12 +13801,19 @@ mod tests {
 
         // Same corpus, two budgets: a small pgsz-derived one vs. the u16 ceiling.
         let small_budget = effective_leaf_budget(512);
-        assert_eq!(small_budget, 512, "512 is under the ceiling, honored verbatim");
+        assert_eq!(
+            small_budget, 512,
+            "512 is under the ceiling, honored verbatim"
+        );
         let small = pending
             .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), small_budget)
             .unwrap();
         let ceiling = pending
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
+            .flush_to_segment(
+                4,
+                Fts5StructureRecord::empty_legacy(0),
+                FTS5_SAFE_LEAF_BYTES,
+            )
             .unwrap();
 
         assert!(
@@ -13753,7 +13889,11 @@ mod tests {
         let flush = table
             .build_pending_hash()
             .unwrap()
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
+            .flush_to_segment(
+                4,
+                Fts5StructureRecord::empty_legacy(0),
+                FTS5_SAFE_LEAF_BYTES,
+            )
             .unwrap();
         let profile = flush.hotspot_profile().unwrap();
 
@@ -13887,7 +14027,11 @@ mod tests {
             ..Default::default()
         };
         let flush = pending
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
+            .flush_to_segment(
+                4,
+                Fts5StructureRecord::empty_legacy(0),
+                FTS5_SAFE_LEAF_BYTES,
+            )
             .unwrap();
         let scheduler = Fts5MergeScheduler {
             automerge: 4,
@@ -14027,7 +14171,11 @@ mod tests {
         let flush_profile = table
             .build_pending_hash()
             .unwrap()
-            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0), FTS5_SAFE_LEAF_BYTES)
+            .flush_to_segment(
+                4,
+                Fts5StructureRecord::empty_legacy(0),
+                FTS5_SAFE_LEAF_BYTES,
+            )
             .unwrap()
             .hotspot_profile()
             .unwrap();
@@ -14204,15 +14352,42 @@ mod tests {
                 .collect()
         }
         let leaves: &[(i64, &str)] = &[
-            (412316860417, "0000003F0730636F6D6D6F6E01812002030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030304"),
-            (412316860418, "0024004103030303030303030303030303030303030303030303030303030303030303030202020102020102020102020102020102020102020102020102020102"),
-            (412316860419, "00050040020C02020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102"),
-            (412316860420, "0005003A0220020201020201020201020201020201020201020201020201020204307731300A02030301310B02030301320C02030301330D020320080606"),
-            (412316860421, "0000003604307731340E02030301350F02030301361002030301371102030301381202030301391302030201320202030301301402030408060606060606"),
-            (412316860422, "0000003604307732311502030301321602030301331702030301341802030301351902030301361A02030301371B02030301381C02030408060606060606"),
-            (412316860423, "0000003604307732391D02030201330302030301301E02030301311F02030301322002030301332102030301342202030301352302030408060606060606"),
-            (412316860424, "0000003604307733362402030301372502030301382602030301392702030201340402030301302802030201350502030201360602030408060606060606"),
-            (412316860425, "0000001703307737070203020138080203020139090203040706"),
+            (
+                412316860417,
+                "0000003F0730636F6D6D6F6E01812002030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030304",
+            ),
+            (
+                412316860418,
+                "0024004103030303030303030303030303030303030303030303030303030303030303030202020102020102020102020102020102020102020102020102020102",
+            ),
+            (
+                412316860419,
+                "00050040020C02020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102020102",
+            ),
+            (
+                412316860420,
+                "0005003A0220020201020201020201020201020201020201020201020201020204307731300A02030301310B02030301320C02030301330D020320080606",
+            ),
+            (
+                412316860421,
+                "0000003604307731340E02030301350F02030301361002030301371102030301381202030301391302030201320202030301301402030408060606060606",
+            ),
+            (
+                412316860422,
+                "0000003604307732311502030301321602030301331702030301341802030301351902030301361A02030301371B02030301381C02030408060606060606",
+            ),
+            (
+                412316860423,
+                "0000003604307732391D02030201330302030301301E02030301311F02030301322002030301332102030301342202030301352302030408060606060606",
+            ),
+            (
+                412316860424,
+                "0000003604307733362402030301372502030301382602030301392702030201340402030301302802030201350502030201360602030408060606060606",
+            ),
+            (
+                412316860425,
+                "0000001703307737070203020138080203020139090203040706",
+            ),
         ];
         let data_rows: Vec<Fts5DataRow> = leaves
             .iter()
@@ -14236,7 +14411,11 @@ mod tests {
                 let term = term.unwrap();
                 (
                     term.term,
-                    term.doclist.entries.iter().map(|entry| entry.rowid).collect(),
+                    term.doclist
+                        .entries
+                        .iter()
+                        .map(|entry| entry.rowid)
+                        .collect(),
                 )
             })
             .collect();

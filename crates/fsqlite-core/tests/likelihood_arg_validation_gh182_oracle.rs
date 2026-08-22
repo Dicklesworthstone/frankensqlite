@@ -108,15 +108,15 @@ fn likelihood_rejects_illegal_probability_gh182() {
         let f = setup_f().await;
         let r = setup_r();
         for sql in [
-            "SELECT likelihood(1, 2)",           // integer, out of range
-            "SELECT likelihood(1, 1)",           // integer in range (still rejected)
-            "SELECT likelihood(1, 0)",           // integer in range (still rejected)
-            "SELECT likelihood(1, 1.0000001)",   // float out of range
-            "SELECT likelihood(1, -0.1)",        // unary-minus literal
-            "SELECT likelihood(1, 0.4 + 0.1)",   // constant expression, not a literal
-            "SELECT likelihood(1, abs(0.5))",    // function call, not a literal
-            "SELECT likelihood(1, NULL)",        // NULL
-            "SELECT likelihood(1, p) FROM t",    // non-constant column reference
+            "SELECT likelihood(1, 2)",         // integer, out of range
+            "SELECT likelihood(1, 1)",         // integer in range (still rejected)
+            "SELECT likelihood(1, 0)",         // integer in range (still rejected)
+            "SELECT likelihood(1, 1.0000001)", // float out of range
+            "SELECT likelihood(1, -0.1)",      // unary-minus literal
+            "SELECT likelihood(1, 0.4 + 0.1)", // constant expression, not a literal
+            "SELECT likelihood(1, abs(0.5))",  // function call, not a literal
+            "SELECT likelihood(1, NULL)",      // NULL
+            "SELECT likelihood(1, p) FROM t",  // non-constant column reference
         ] {
             assert_both_reject(&f, &r, sql).await;
         }

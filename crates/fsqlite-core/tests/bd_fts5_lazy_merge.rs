@@ -61,11 +61,17 @@ fn bd_fts5_lazy_merge_bounds_segments_and_stays_stock_readable() {
             .query("SELECT rowid FROM t WHERE t MATCH 'common' ORDER BY rowid;")
             .await
             .unwrap();
-        assert_eq!(rowids(&common), vec![1, 2, 3, 4, 5], "every row survives the merge");
+        assert_eq!(
+            rowids(&common),
+            vec![1, 2, 3, 4, 5],
+            "every row survives the merge"
+        );
 
         // DELETE after the merge must still tombstone (validates the merged
         // segment's [min, max] origin span).
-        conn.execute("DELETE FROM t WHERE rowid = 3;").await.unwrap();
+        conn.execute("DELETE FROM t WHERE rowid = 3;")
+            .await
+            .unwrap();
         let after_delete = conn
             .query("SELECT rowid FROM t WHERE t MATCH 'common' ORDER BY rowid;")
             .await
@@ -91,7 +97,11 @@ fn bd_fts5_lazy_merge_bounds_segments_and_stays_stock_readable() {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(matched, vec![1, 2, 4, 5], "stock reads the merged corpus minus the deleted row");
+        assert_eq!(
+            matched,
+            vec![1, 2, 4, 5],
+            "stock reads the merged corpus minus the deleted row"
+        );
 
         // The prefix-index doclists survived the merge: a stock prefix MATCH
         // ('ter*' -> 'term1'..'term5') still finds every live row.
@@ -102,6 +112,10 @@ fn bd_fts5_lazy_merge_bounds_segments_and_stays_stock_readable() {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(prefixed, vec![1, 2, 4, 5], "prefix-index doclists survive the merge");
+        assert_eq!(
+            prefixed,
+            vec![1, 2, 4, 5],
+            "prefix-index doclists survive the merge"
+        );
     });
 }

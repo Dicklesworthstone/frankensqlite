@@ -17,7 +17,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -26,13 +29,19 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn fq(f: &Connection, sql: &str) -> Vec<Vec<String>> {
     match f.query_with_params(sql, &[]).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(e) => vec![vec![format!("<ERR {e:?}>")]],
     }
 }
@@ -43,7 +52,9 @@ fn rq(r: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     };
     let n = st.column_count();
     st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect())
     })
     .unwrap()
     .collect::<Result<Vec<_>, _>>()
@@ -59,7 +70,10 @@ async fn agree(setup: &[&str], sql: &str, msg: &str) {
     }
     let fr = fq(&f, sql).await;
     let rr = rq(&r, sql);
-    assert_eq!(fr, rr, "{msg}\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}");
+    assert_eq!(
+        fr, rr,
+        "{msg}\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}"
+    );
 }
 
 /// cust(id,name) + ord(id,cust,amt); cust 3 has no orders, ord 13 has NULL amt.
@@ -110,11 +124,16 @@ fn correlated_where_and_in() {
 fn not_in_with_null_is_empty() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(x INT)","CREATE TABLE u(y INT)",
-              "INSERT INTO t VALUES (1),(2),(3)","INSERT INTO u VALUES (2),(NULL)"],
+            &[
+                "CREATE TABLE t(x INT)",
+                "CREATE TABLE u(y INT)",
+                "INSERT INTO t VALUES (1),(2),(3)",
+                "INSERT INTO u VALUES (2),(NULL)",
+            ],
             "SELECT x FROM t WHERE x NOT IN (SELECT y FROM u) ORDER BY x",
             "NOT IN a subquery containing NULL yields no rows",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -122,15 +141,17 @@ fn not_in_with_null_is_empty() {
 fn scalar_subquery_empty_and_multi() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(x INT)","INSERT INTO t VALUES (1)"],
+            &["CREATE TABLE t(x INT)", "INSERT INTO t VALUES (1)"],
             "SELECT (SELECT x FROM t WHERE x = 99)",
             "scalar subquery over no rows is NULL",
-        ).await;
+        )
+        .await;
         agree(
-            &["CREATE TABLE t(x INT)","INSERT INTO t VALUES (5),(6),(7)"],
+            &["CREATE TABLE t(x INT)", "INSERT INTO t VALUES (5),(6),(7)"],
             "SELECT (SELECT x FROM t ORDER BY x)",
             "scalar subquery yields its first row when several match",
-        ).await;
+        )
+        .await;
     });
 }
 

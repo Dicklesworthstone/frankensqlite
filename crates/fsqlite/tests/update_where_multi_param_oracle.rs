@@ -102,15 +102,13 @@ async fn check(
     );
 }
 
-const MR_DDL: &[&str] = &[
-    "CREATE TABLE message_recipients (
+const MR_DDL: &[&str] = &["CREATE TABLE message_recipients (
         message_id INTEGER NOT NULL,
         agent_id   INTEGER NOT NULL,
         read_ts    INTEGER,
         ack_ts     INTEGER,
         PRIMARY KEY (message_id, agent_id)
-    );",
-];
+    );"];
 const MR_SEED: &[&str] = &[
     "INSERT INTO message_recipients VALUES (1, 2, NULL, NULL);",
     "INSERT INTO message_recipients VALUES (1, 3, NULL, NULL);",
@@ -227,15 +225,13 @@ fn delete_two_where_params_composite_pk_matches_sqlite() {
 // distinct two-pass path. Pass 1 (WHERE, emitted first) and Pass 2 (SET,
 // emitted second) must still number anon placeholders in SQL-text order
 // (SET first). This is the actual regressed path in bd-q3hu3.
-const MRW_DDL: &[&str] = &[
-    "CREATE TABLE mrw (
+const MRW_DDL: &[&str] = &["CREATE TABLE mrw (
         message_id INTEGER NOT NULL,
         agent_id   INTEGER NOT NULL,
         read_ts    INTEGER,
         ack_ts     INTEGER,
         PRIMARY KEY (message_id, agent_id)
-    ) WITHOUT ROWID;",
-];
+    ) WITHOUT ROWID;"];
 const MRW_SEED: &[&str] = &[
     "INSERT INTO mrw VALUES (1, 2, NULL, NULL);",
     "INSERT INTO mrw VALUES (1, 3, NULL, NULL);",

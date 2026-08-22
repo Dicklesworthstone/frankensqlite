@@ -10,7 +10,10 @@ async fn err_of(setup: &[&str], sql: &str) -> String {
     for s in setup {
         c.execute(s).await.unwrap();
     }
-    c.execute(sql).await.expect_err("must be rejected").to_string()
+    c.execute(sql)
+        .await
+        .expect_err("must be rejected")
+        .to_string()
 }
 
 async fn ok(setup: &[&str], sql: &str) {
@@ -18,7 +21,9 @@ async fn ok(setup: &[&str], sql: &str) {
     for s in setup {
         c.execute(s).await.unwrap();
     }
-    c.execute(sql).await.expect("valid window query must succeed");
+    c.execute(sql)
+        .await
+        .expect("valid window query must succeed");
 }
 
 #[test]
@@ -38,7 +43,15 @@ fn scalar_used_as_window_reports_misuse() {
             "no such function: nonexist",
         );
         // Aggregates and window functions are valid with OVER.
-        ok(&["CREATE TABLE t(a)", "INSERT INTO t VALUES(1),(2)"], "SELECT sum(a) OVER () FROM t").await;
-        ok(&["CREATE TABLE t(a)", "INSERT INTO t VALUES(1),(2)"], "SELECT row_number() OVER () FROM t").await;
+        ok(
+            &["CREATE TABLE t(a)", "INSERT INTO t VALUES(1),(2)"],
+            "SELECT sum(a) OVER () FROM t",
+        )
+        .await;
+        ok(
+            &["CREATE TABLE t(a)", "INSERT INTO t VALUES(1),(2)"],
+            "SELECT row_number() OVER () FROM t",
+        )
+        .await;
     });
 }

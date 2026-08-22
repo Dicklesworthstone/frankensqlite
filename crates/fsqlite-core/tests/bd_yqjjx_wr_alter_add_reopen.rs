@@ -96,9 +96,7 @@ fn wr_nonleading_pk_alter_add_column_reopen_join_bd_yqjjx() {
 
         let conn = Connection::open(&db_str).await.unwrap();
         let rows = conn
-            .query(
-                "SELECT t.v, t.k, t.c, other.x FROM t JOIN other ON t.k = other.k ORDER BY t.k",
-            )
+            .query("SELECT t.v, t.k, t.c, other.x FROM t JOIN other ON t.k = other.k ORDER BY t.k")
             .await
             .unwrap();
         let got: Vec<Vec<SqliteValue>> = rows.iter().map(|r| r.values().to_vec()).collect();

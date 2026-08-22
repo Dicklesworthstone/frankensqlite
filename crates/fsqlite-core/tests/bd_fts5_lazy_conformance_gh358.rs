@@ -61,7 +61,10 @@ fn bd_fts5_lazy_conformance_matches_stock_across_query_types() {
             }
             let big = format!("{} alpha1 body1", vec!["common"; 80].join(" "));
             stock
-                .execute("UPDATE t SET x = ?1 WHERE rowid = 1", rusqlite::params![big])
+                .execute(
+                    "UPDATE t SET x = ?1 WHERE rowid = 1",
+                    rusqlite::params![big],
+                )
                 .unwrap();
             // Delete a few docs -> tombstones the lazy reader must honor.
             for id in [10_i64, 20, 33] {
@@ -69,11 +72,18 @@ fn bd_fts5_lazy_conformance_matches_stock_across_query_types() {
                     .execute("DELETE FROM t WHERE rowid = ?1", rusqlite::params![id])
                     .unwrap();
             }
-            stock.execute_batch("INSERT INTO t(t) VALUES('optimize');").unwrap();
-            let leaf_pages: i64 = stock
-                .query_row("SELECT count(*) FROM t_data WHERE id > 100", [], |r| r.get(0))
+            stock
+                .execute_batch("INSERT INTO t(t) VALUES('optimize');")
                 .unwrap();
-            assert!(leaf_pages > 1, "corpus must spill across leaves, got {leaf_pages}");
+            let leaf_pages: i64 = stock
+                .query_row("SELECT count(*) FROM t_data WHERE id > 100", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert!(
+                leaf_pages > 1,
+                "corpus must spill across leaves, got {leaf_pages}"
+            );
         }
 
         // --- FrankenSQLite lazy-reads and must match stock on every query. ---
@@ -81,18 +91,20 @@ fn bd_fts5_lazy_conformance_matches_stock_across_query_types() {
         let stock = rusqlite::Connection::open(&db_path).unwrap();
 
         let queries = [
-            "common",        // spilled doclist across many leaves
-            "alpha5",        // exact single-doc term
-            "alpha10",       // exact term of a DELETED doc (must be empty)
-            "alpha1*",       // prefix: alpha1, alpha10..alpha19 (minus deleted)
-            "body0",         // shared bucket term
+            "common",  // spilled doclist across many leaves
+            "alpha5",  // exact single-doc term
+            "alpha10", // exact term of a DELETED doc (must be empty)
+            "alpha1*", // prefix: alpha1, alpha10..alpha19 (minus deleted)
+            "body0",   // shared bucket term
             "body1",
             "common AND body2",
             "body0 OR body1",
         ];
         for q in queries {
             let frank = conn
-                .query(&format!("SELECT rowid FROM t WHERE t MATCH '{q}' ORDER BY rowid;"))
+                .query(&format!(
+                    "SELECT rowid FROM t WHERE t MATCH '{q}' ORDER BY rowid;"
+                ))
                 .await
                 .unwrap_or_else(|e| panic!("frank query {q:?} failed: {e}"));
             let expected = stock_rowids(&stock, q);

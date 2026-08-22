@@ -164,9 +164,7 @@ fn scalar_consumes_argument_collation_for_codegen(name: &str, num_args: i32) -> 
                 // (matching the no-registry branch above).
                 registry
                     .scalar_consumes_argument_collation(name, num_args)
-                    .unwrap_or_else(|| {
-                        builtin_scalar_consumes_argument_collation(name, num_args)
-                    })
+                    .unwrap_or_else(|| builtin_scalar_consumes_argument_collation(name, num_args))
             },
         )
     })
@@ -11677,7 +11675,13 @@ fn emit_join_expr(
                         let skip = b.emit_label();
                         b.emit_jump_to_label(Opcode::IfNullRow, cursor, target, skip, P4::None, 0);
                         emit_table_column_read(
-                            b, cursor, table, table_alias, None, col_idx, target,
+                            b,
+                            cursor,
+                            table,
+                            table_alias,
+                            None,
+                            col_idx,
+                            target,
                         );
                         b.resolve_label(skip);
                     } else {
@@ -17983,8 +17987,7 @@ fn rewrite_aggregates_recursive(
                 // single-aggregate arm already does this (see `needs_collation`
                 // above); mirror it so the extracted aggregate carries the same
                 // collation.
-                let needs_collation =
-                    *distinct || canon_name == "MIN" || canon_name == "MAX";
+                let needs_collation = *distinct || canon_name == "MIN" || canon_name == "MAX";
                 let agg_coll = if needs_collation {
                     expr_collation_for_agg(&exprs[0], col_idx, table)
                 } else {
@@ -20788,14 +20791,7 @@ fn codegen_insert_values(
                 let do_insert = b.emit_label();
                 // NotExists jumps to do_insert when the rowid is free (no
                 // conflict); on an existing rowid we fall through and skip.
-                b.emit_jump_to_label(
-                    Opcode::NotExists,
-                    cursor,
-                    rowid_reg,
-                    do_insert,
-                    P4::None,
-                    0,
-                );
+                b.emit_jump_to_label(Opcode::NotExists, cursor, rowid_reg, do_insert, P4::None, 0);
                 b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
                 b.resolve_label(do_insert);
             }
@@ -22665,7 +22661,13 @@ fn codegen_update_from(
             None
         };
     emit_check_constraints(b, target, col_regs, constraint_ignore_label);
-    emit_not_null_constraints(b, target, col_regs, stmt.or_conflict, constraint_ignore_label);
+    emit_not_null_constraints(
+        b,
+        target,
+        col_regs,
+        stmt.or_conflict,
+        constraint_ignore_label,
+    );
 
     // Constraints passed: NOW perform the destructive delete+insert. Old index
     // entries are read from the cursor (still positioned on the unchanged old
@@ -23493,7 +23495,12 @@ pub fn codegen_delete(
 /// declared column — map to `None`, which never dedups against a PK column.
 fn without_rowid_index_key_columns(table: &TableSchema, index: &IndexSchema) -> Vec<Option<usize>> {
     (0..index.key_term_count())
-        .map(|p| index.columns.get(p).and_then(|name| table.column_index(name)))
+        .map(|p| {
+            index
+                .columns
+                .get(p)
+                .and_then(|name| table.column_index(name))
+        })
         .collect()
 }
 
@@ -24304,10 +24311,11 @@ fn emit_without_rowid_row_insert(
     // passes `upsert: None` and `oe_flag == OE_IGNORE`).
     if let Some(
         clause @ UpsertClause {
-            action: UpsertAction::Update {
-                assignments,
-                where_clause,
-            },
+            action:
+                UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                },
             ..
         },
     ) = upsert
@@ -24747,7 +24755,13 @@ fn emit_without_rowid_upsert_row(
                 };
                 let idx_key_regs = b.alloc_regs(n_idx_cols as i32);
                 for key_pos in 0..n_idx_cols {
-                    emit_index_key_term(b, index, key_pos, idx_key_regs + key_pos as i32, &scan_ctx);
+                    emit_index_key_term(
+                        b,
+                        index,
+                        key_pos,
+                        idx_key_regs + key_pos as i32,
+                        &scan_ctx,
+                    );
                 }
                 let idx_probe_rec = b.alloc_reg();
                 b.emit_op(
@@ -28516,12 +28530,8 @@ fn validate_single_table_result_columns(
         match column {
             ResultColumn::Star => {}
             ResultColumn::TableStar(qualifier) => {
-                if !table_star_qualifier_matches_binding(
-                    qualifier,
-                    table,
-                    table_alias,
-                    from_schema,
-                ) {
+                if !table_star_qualifier_matches_binding(qualifier, table, table_alias, from_schema)
+                {
                     return Err(CodegenError::TableNotFound(qualifier.to_string()));
                 }
             }
@@ -34684,7 +34694,11 @@ fn emit_scalar_subquery(
 /// into `reg`. `reg` is left as its pre-set NULL default when the subquery
 /// yields no row at the requested offset (empty match set, `OFFSET` past the
 /// end, or `LIMIT 0`). The caller resolves `done_label`.
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn emit_scalar_subquery_ordered(
     b: &mut ProgramBuilder,
     subquery: &SelectStatement,
@@ -34766,7 +34780,14 @@ fn emit_scalar_subquery_ordered(
 
     // Sort; SorterSort jumps to `close` when the sorter is empty (NULL stays).
     let close_label = b.emit_label();
-    b.emit_jump_to_label(Opcode::SorterSort, sorter_cursor, 0, close_label, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SorterSort,
+        sorter_cursor,
+        0,
+        close_label,
+        P4::None,
+        0,
+    );
 
     // Skip OFFSET rows (default 0). IfPos decrements r_off and jumps to
     // `advance` while positive; falling through means offset exhausted -> read.
@@ -34782,7 +34803,14 @@ fn emit_scalar_subquery_ordered(
         b.resolve_label(advance);
         // SorterNext jumps to skip_check when another row exists; otherwise the
         // sorter is exhausted mid-skip and the result stays NULL.
-        b.emit_jump_to_label(Opcode::SorterNext, sorter_cursor, 0, skip_check, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SorterNext,
+            sorter_cursor,
+            0,
+            skip_check,
+            P4::None,
+            0,
+        );
         b.emit_jump_to_label(Opcode::Goto, 0, 0, close_label, P4::None, 0);
         b.resolve_label(read);
         b.free_temp(r_off);
@@ -34792,7 +34820,14 @@ fn emit_scalar_subquery_ordered(
     // final field, at index n_key) into `reg`.
     let scratch = b.alloc_reg();
     b.emit_op(Opcode::SorterData, sorter_cursor, scratch, 0, P4::None, 0);
-    b.emit_op(Opcode::Column, sorter_cursor, n_key as i32, reg, P4::None, 0);
+    b.emit_op(
+        Opcode::Column,
+        sorter_cursor,
+        n_key as i32,
+        reg,
+        P4::None,
+        0,
+    );
 
     b.resolve_label(close_label);
     b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
@@ -36280,10 +36315,18 @@ fn emit_searched_case_when_condition_with_fallback(
             ..
         } => {
             emit_searched_case_when_condition_with_fallback(
-                b, left, false_label, inner_ctx, outer_ctx,
+                b,
+                left,
+                false_label,
+                inner_ctx,
+                outer_ctx,
             );
             emit_searched_case_when_condition_with_fallback(
-                b, right, false_label, inner_ctx, outer_ctx,
+                b,
+                right,
+                false_label,
+                inner_ctx,
+                outer_ctx,
             );
         }
         Expr::BinaryOp {
@@ -36300,7 +36343,11 @@ fn emit_searched_case_when_condition_with_fallback(
             b.emit_jump_to_label(Opcode::Goto, 0, 0, pass, P4::None, 0);
             b.resolve_label(left_false);
             emit_searched_case_when_condition_with_fallback(
-                b, right, false_label, inner_ctx, outer_ctx,
+                b,
+                right,
+                false_label,
+                inner_ctx,
+                outer_ctx,
             );
             b.resolve_label(pass);
         }
@@ -36339,12 +36386,26 @@ fn emit_upsert_case_when_condition(
             ..
         } => {
             emit_upsert_case_when_condition(
-                b, left, scratch, false_label, existing_ctx, excluded_ctx, table,
-                existing_hidden_rowid_reg, excluded_hidden_rowid_reg,
+                b,
+                left,
+                scratch,
+                false_label,
+                existing_ctx,
+                excluded_ctx,
+                table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
             );
             emit_upsert_case_when_condition(
-                b, right, scratch, false_label, existing_ctx, excluded_ctx, table,
-                existing_hidden_rowid_reg, excluded_hidden_rowid_reg,
+                b,
+                right,
+                scratch,
+                false_label,
+                existing_ctx,
+                excluded_ctx,
+                table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
             );
         }
         Expr::BinaryOp {
@@ -36356,21 +36417,41 @@ fn emit_upsert_case_when_condition(
             let left_false = b.emit_label();
             let pass = b.emit_label();
             emit_upsert_case_when_condition(
-                b, left, scratch, left_false, existing_ctx, excluded_ctx, table,
-                existing_hidden_rowid_reg, excluded_hidden_rowid_reg,
+                b,
+                left,
+                scratch,
+                left_false,
+                existing_ctx,
+                excluded_ctx,
+                table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
             );
             b.emit_jump_to_label(Opcode::Goto, 0, 0, pass, P4::None, 0);
             b.resolve_label(left_false);
             emit_upsert_case_when_condition(
-                b, right, scratch, false_label, existing_ctx, excluded_ctx, table,
-                existing_hidden_rowid_reg, excluded_hidden_rowid_reg,
+                b,
+                right,
+                scratch,
+                false_label,
+                existing_ctx,
+                excluded_ctx,
+                table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
             );
             b.resolve_label(pass);
         }
         _ => {
             emit_upsert_expr(
-                b, cond, scratch, existing_ctx, excluded_ctx, table,
-                existing_hidden_rowid_reg, excluded_hidden_rowid_reg,
+                b,
+                cond,
+                scratch,
+                existing_ctx,
+                excluded_ctx,
+                table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
             );
             b.emit_jump_to_label(Opcode::IfNot, scratch, 1, false_label, P4::None, 0);
         }

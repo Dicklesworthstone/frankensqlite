@@ -404,9 +404,7 @@ mod tests {
                     match k {
                         0 => batch.push_str(&format!("CREATE INDEX ix{i}_a ON t{i}(a);")),
                         1 => batch.push_str(&format!("CREATE INDEX ix{i}_b ON t{i}(b);")),
-                        _ => batch.push_str(&format!(
-                            "CREATE INDEX ix{i}_{k} ON t{i}(c, b, a);"
-                        )),
+                        _ => batch.push_str(&format!("CREATE INDEX ix{i}_{k} ON t{i}(c, b, a);")),
                     }
                 }
                 for r in 1..=rows {
@@ -504,7 +502,11 @@ mod tests {
                  fsqlite_out: page_count={out_page_count} trunk={out_freelist_trunk} \
                  freelist={out_freelist_count} integrity={out_integrity} => \
                  {}",
-                if reproduced { "BUG REPRODUCED" } else { "compact-ok" }
+                if reproduced {
+                    "BUG REPRODUCED"
+                } else {
+                    "compact-ok"
+                }
             );
 
             assert_eq!(out_integrity, "ok", "output must stay sound");

@@ -21,15 +21,15 @@ const ROWS: &[&str] = &["a", "b", "q", "Z", "5", "-", "]"];
 // the table scan) and as `'<lit>' GLOB pattern` (function path). Both must agree
 // with C SQLite.
 const PATTERNS: &[&str] = &[
-    "[ab]",     // simple class
-    "[a-z]",    // range
-    "[^a-z]",   // negated range
-    "[a-c-]",   // trailing literal dash
-    "[]]",      // ']' as first literal member
-    "[a",       // unterminated: C SQLite -> no match
-    "[^",       // unterminated negated
-    "[a-z",     // unterminated range
-    "a[b-d]",   // class after a literal
+    "[ab]",   // simple class
+    "[a-z]",  // range
+    "[^a-z]", // negated range
+    "[a-c-]", // trailing literal dash
+    "[]]",    // ']' as first literal member
+    "[a",     // unterminated: C SQLite -> no match
+    "[^",     // unterminated negated
+    "[a-z",   // unterminated range
+    "a[b-d]", // class after a literal
 ];
 
 fn oracle_where(pattern: &str) -> Vec<String> {
@@ -57,7 +57,9 @@ fn oracle_scalar(lit: &str, pattern: &str) -> i64 {
 fn glob_bracket_classes_match_rusqlite_oracle_both_paths() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
-        conn.execute("CREATE TABLE t (x TEXT)").await.expect("create");
+        conn.execute("CREATE TABLE t (x TEXT)")
+            .await
+            .expect("create");
         for r in ROWS {
             conn.execute(&format!("INSERT INTO t VALUES ('{r}')"))
                 .await
@@ -68,7 +70,10 @@ fn glob_bracket_classes_match_rusqlite_oracle_both_paths() {
             // Interpreter path: table WHERE scan.
             let expected_where = oracle_where(pattern);
             let sql = format!("SELECT x FROM t WHERE x GLOB '{pattern}' ORDER BY x");
-            let rows = conn.query(&sql).await.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+            let rows = conn
+                .query(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
             let got_where: Vec<String> = rows
                 .iter()
                 .map(|r| match r.values()[0] {
@@ -85,7 +90,10 @@ fn glob_bracket_classes_match_rusqlite_oracle_both_paths() {
             for lit in ROWS {
                 let expected = oracle_scalar(lit, pattern);
                 let sql = format!("SELECT '{lit}' GLOB '{pattern}'");
-                let row = conn.query(&sql).await.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+                let row = conn
+                    .query(&sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
                 let got = match row[0].values()[0] {
                     SqliteValue::Integer(n) => n,
                     ref other => panic!("`{sql}` not integer: {other:?}"),

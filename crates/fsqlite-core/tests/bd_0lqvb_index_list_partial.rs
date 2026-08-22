@@ -8,11 +8,18 @@ use fsqlite_types::value::SqliteValue;
 fn pragma_index_list_partial_flag_0lqvb() {
     asupersync::test_utils::run_test(|| async {
         let c = Connection::open(":memory:").await.unwrap();
-        c.execute("CREATE TABLE t(a INTEGER, b INTEGER)").await.unwrap();
-        c.execute("CREATE INDEX idx_partial ON t(a) WHERE b>0").await.unwrap();
+        c.execute("CREATE TABLE t(a INTEGER, b INTEGER)")
+            .await
+            .unwrap();
+        c.execute("CREATE INDEX idx_partial ON t(a) WHERE b>0")
+            .await
+            .unwrap();
         c.execute("CREATE INDEX idx_full ON t(a)").await.unwrap();
 
-        let rows = c.query_with_params("PRAGMA index_list(t)", &[]).await.unwrap();
+        let rows = c
+            .query_with_params("PRAGMA index_list(t)", &[])
+            .await
+            .unwrap();
         // columns: seq, name, unique, origin, partial
         let mut partial_by_name = std::collections::HashMap::new();
         for r in &rows {

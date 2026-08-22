@@ -60,7 +60,9 @@ async fn check(ddl: &[&str], dml: &str, select_state: &str, ncols: usize) {
     let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in ddl {
-        f.execute(s).await.unwrap_or_else(|e| panic!("frank ddl `{s}`: {e}"));
+        f.execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("frank ddl `{s}`: {e}"));
         r.execute_batch(s).unwrap();
     }
     // Both engines run the same UPDATE OR IGNORE ... FROM ...; neither should
@@ -155,7 +157,10 @@ fn update_from_without_or_ignore_still_aborts_on_check() {
         let dml = "UPDATE t SET v = src.newv FROM src WHERE t.id = src.id";
         let f_err = f.execute(dml).await.is_err();
         let r_err = r.execute_batch(dml).is_err();
-        assert!(f_err, "frank must abort a plain UPDATE..FROM CHECK violation");
+        assert!(
+            f_err,
+            "frank must abort a plain UPDATE..FROM CHECK violation"
+        );
         assert_eq!(f_err, r_err, "abort parity for plain UPDATE..FROM");
         assert_eq!(
             frank_state(&f, "SELECT id, v FROM t", 2).await,

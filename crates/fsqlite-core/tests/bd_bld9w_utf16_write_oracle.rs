@@ -11,10 +11,7 @@
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
-const ASCII_ROWS: &[(i64, &str, &str)] = &[
-    (1, "Alice", "Paris"),
-    (2, "Bob", "Berlin"),
-];
+const ASCII_ROWS: &[(i64, &str, &str)] = &[(1, "Alice", "Paris"), (2, "Bob", "Berlin")];
 const UNICODE_ROWS: &[(i64, &str, &str)] = &[
     (3, "Élise", "Zürich"),
     (4, "名前", "東京"),
@@ -45,12 +42,17 @@ fn assert_stock_image_ok(db_path: &std::path::Path, expected_header: u32, encodi
     );
     let stock = rusqlite::Connection::open(db_path)
         .unwrap_or_else(|e| panic!("{encoding}: rusqlite open: {e:?}"));
-    let stock_enc: String = stock.query_row("PRAGMA encoding;", [], |r| r.get(0)).unwrap();
+    let stock_enc: String = stock
+        .query_row("PRAGMA encoding;", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(stock_enc, encoding, "{encoding}: stock reads the encoding");
     let integrity: String = stock
         .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(integrity, "ok", "{encoding}: stock integrity_check on fsqlite image");
+    assert_eq!(
+        integrity, "ok",
+        "{encoding}: stock integrity_check on fsqlite image"
+    );
 }
 
 /// Site 1 (connection.rs:29328 prepared direct UPDATE): a single-column UPDATE
@@ -88,8 +90,15 @@ fn bd_o3rz4_utf16_prepared_update_preserves_untouched_text_column() {
             )
             .await
             .unwrap();
-            let row = conn.query("SELECT a, b FROM t WHERE id = 1;").await.unwrap();
-            assert_eq!(frank_text(&row[0].values()[0]), "München", "{encoding}: updated col a");
+            let row = conn
+                .query("SELECT a, b FROM t WHERE id = 1;")
+                .await
+                .unwrap();
+            assert_eq!(
+                frank_text(&row[0].values()[0]),
+                "München",
+                "{encoding}: updated col a"
+            );
             assert_eq!(
                 frank_text(&row[0].values()[1]),
                 "Élise",
@@ -130,8 +139,12 @@ fn bd_o3rz4_utf16_or_replace_conflict_leaves_no_stale_index_entry() {
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, city TEXT UNIQUE);")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO t VALUES (1, 'Zürich');").await.unwrap();
-            conn.execute("INSERT INTO t VALUES (2, 'Berlin');").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'Zürich');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 'Berlin');")
+                .await
+                .unwrap();
             // city 'Zürich' conflicts with row 1 on the UNIQUE index → row 1 is
             // replaced; its old index entry must be removed, not orphaned.
             conn.execute("INSERT OR REPLACE INTO t VALUES (3, 'Zürich');")
@@ -142,8 +155,16 @@ fn bd_o3rz4_utf16_or_replace_conflict_leaves_no_stale_index_entry() {
                 .query("SELECT id FROM t WHERE city = 'Zürich';")
                 .await
                 .unwrap();
-            assert_eq!(hit.len(), 1, "{encoding}: exactly one 'Zürich' after replace");
-            assert_eq!(hit[0].values()[0], SqliteValue::Integer(3), "{encoding}: replacement row");
+            assert_eq!(
+                hit.len(),
+                1,
+                "{encoding}: exactly one 'Zürich' after replace"
+            );
+            assert_eq!(
+                hit[0].values()[0],
+                SqliteValue::Integer(3),
+                "{encoding}: replacement row"
+            );
             conn.close().await.unwrap();
 
             // The strongest proof: stock's own integrity_check catches a stale
@@ -157,7 +178,11 @@ fn bd_o3rz4_utf16_or_replace_conflict_leaves_no_stale_index_entry() {
                 .unwrap()
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .unwrap();
-            assert_eq!(ids, vec![3], "{encoding}: stock sees only the replacement via the index");
+            assert_eq!(
+                ids,
+                vec![3],
+                "{encoding}: stock sees only the replacement via the index"
+            );
         }
     });
 }
@@ -181,7 +206,9 @@ fn bd_o3rz4_utf16_without_rowid_replace_cleans_secondary_index() {
             conn.execute("CREATE TABLE t(city TEXT PRIMARY KEY, note TEXT) WITHOUT ROWID;")
                 .await
                 .unwrap();
-            conn.execute("CREATE INDEX idx_note ON t(note);").await.unwrap();
+            conn.execute("CREATE INDEX idx_note ON t(note);")
+                .await
+                .unwrap();
             conn.execute("INSERT INTO t VALUES ('Zürich', 'Übung');")
                 .await
                 .unwrap();
@@ -195,12 +222,19 @@ fn bd_o3rz4_utf16_without_rowid_replace_cleans_secondary_index() {
                 .query("SELECT city FROM t WHERE note = 'Übung';")
                 .await
                 .unwrap();
-            assert!(stale.is_empty(), "{encoding}: replaced note is not matchable via the index");
+            assert!(
+                stale.is_empty(),
+                "{encoding}: replaced note is not matchable via the index"
+            );
             let cur = conn
                 .query("SELECT note FROM t WHERE city = 'Zürich';")
                 .await
                 .unwrap();
-            assert_eq!(frank_text(&cur[0].values()[0]), "Neu", "{encoding}: current note");
+            assert_eq!(
+                frank_text(&cur[0].values()[0]),
+                "Neu",
+                "{encoding}: current note"
+            );
             conn.close().await.unwrap();
 
             // Stock integrity_check catches an orphaned secondary-index entry.
@@ -213,7 +247,10 @@ fn bd_o3rz4_utf16_without_rowid_replace_cleans_secondary_index() {
                 .unwrap()
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .unwrap();
-            assert!(by_note.is_empty(), "{encoding}: stock finds no stale idx_note entry");
+            assert!(
+                by_note.is_empty(),
+                "{encoding}: stock finds no stale idx_note entry"
+            );
         }
     });
 }
@@ -235,18 +272,30 @@ fn bd_o3rz4_utf16_temp_table_round_trip_into_main() {
             conn.execute("CREATE TABLE main_t(id INTEGER PRIMARY KEY, v TEXT);")
                 .await
                 .unwrap();
-            conn.execute("CREATE TEMP TABLE tmp(v TEXT);").await.unwrap();
+            conn.execute("CREATE TEMP TABLE tmp(v TEXT);")
+                .await
+                .unwrap();
             // Append-inserts into a TEMP table exercise the FusedAppendInsert
             // TEMP branch.
-            conn.execute("INSERT INTO tmp(v) VALUES ('Zürich');").await.unwrap();
-            conn.execute("INSERT INTO tmp(v) VALUES ('東京');").await.unwrap();
+            conn.execute("INSERT INTO tmp(v) VALUES ('Zürich');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO tmp(v) VALUES ('東京');")
+                .await
+                .unwrap();
 
             let temp_read = conn.query("SELECT v FROM tmp ORDER BY v;").await.unwrap();
-            let mut got: Vec<String> = temp_read.iter().map(|r| frank_text(&r.values()[0])).collect();
+            let mut got: Vec<String> = temp_read
+                .iter()
+                .map(|r| frank_text(&r.values()[0]))
+                .collect();
             got.sort();
             let mut want = vec!["Zürich".to_owned(), "東京".to_owned()];
             want.sort();
-            assert_eq!(got, want, "{encoding}: TEMP round-trip preserves non-ASCII TEXT");
+            assert_eq!(
+                got, want,
+                "{encoding}: TEMP round-trip preserves non-ASCII TEXT"
+            );
 
             // Flow TEMP → main; the copy must not lossily re-encode.
             conn.execute("INSERT INTO main_t(v) SELECT v FROM tmp;")
@@ -264,7 +313,10 @@ fn bd_o3rz4_utf16_temp_table_round_trip_into_main() {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .unwrap();
             main_vals.sort();
-            assert_eq!(main_vals, want, "{encoding}: stock reads TEMP→main copy intact");
+            assert_eq!(
+                main_vals, want,
+                "{encoding}: stock reads TEMP→main copy intact"
+            );
         }
     });
 }
@@ -294,17 +346,20 @@ fn bd_o3rz4_utf16_range_seek_matches_stock() {
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, city TEXT);")
                 .await
                 .unwrap();
-            conn.execute("CREATE INDEX idx_city ON t(city);").await.unwrap();
+            conn.execute("CREATE INDEX idx_city ON t(city);")
+                .await
+                .unwrap();
             for (i, c) in cities.iter().enumerate() {
                 conn.execute(&format!("INSERT INTO t VALUES ({}, '{c}');", i + 1))
                     .await
                     .unwrap();
             }
-            const RANGE_SQL: &str =
-                "SELECT city FROM t WHERE city > 'Berlin' ORDER BY city;";
+            const RANGE_SQL: &str = "SELECT city FROM t WHERE city > 'Berlin' ORDER BY city;";
             let frank_rows = conn.query(RANGE_SQL).await.unwrap();
-            let frank_cities: Vec<String> =
-                frank_rows.iter().map(|r| frank_text(&r.values()[0])).collect();
+            let frank_cities: Vec<String> = frank_rows
+                .iter()
+                .map(|r| frank_text(&r.values()[0]))
+                .collect();
             conn.close().await.unwrap();
 
             assert_stock_image_ok(&db_path, expected_header, encoding);
@@ -348,11 +403,9 @@ fn bd_bld9w_utf16_write_oracle_fsqlite_writes_rusqlite_validates() {
                 "{encoding}: PRAGMA encoding read-back after set"
             );
 
-            conn.execute(
-                "CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT, city TEXT);",
-            )
-            .await
-            .unwrap();
+            conn.execute("CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT, city TEXT);")
+                .await
+                .unwrap();
             conn.execute("CREATE INDEX idx_city ON people(city);")
                 .await
                 .unwrap();
@@ -371,15 +424,27 @@ fn bd_bld9w_utf16_write_oracle_fsqlite_writes_rusqlite_validates() {
                     .await
                     .unwrap();
                 assert_eq!(row.len(), 1, "{encoding}: row {id} readable");
-                assert_eq!(frank_text(&row[0].values()[0]), *name, "{encoding}: name {id}");
-                assert_eq!(frank_text(&row[0].values()[1]), *city, "{encoding}: city {id}");
+                assert_eq!(
+                    frank_text(&row[0].values()[0]),
+                    *name,
+                    "{encoding}: name {id}"
+                );
+                assert_eq!(
+                    frank_text(&row[0].values()[1]),
+                    *city,
+                    "{encoding}: city {id}"
+                );
             }
             // Index-backed lookup on freshly-written UTF-16 keys.
             let by_city = conn
                 .query("SELECT id FROM people WHERE city = 'Zürich';")
                 .await
                 .unwrap();
-            assert_eq!(by_city.len(), 1, "{encoding}: index WHERE finds the UTF-16 key");
+            assert_eq!(
+                by_city.len(),
+                1,
+                "{encoding}: index WHERE finds the UTF-16 key"
+            );
             assert_eq!(by_city[0].values()[0], SqliteValue::Integer(3));
 
             // VACUUM must preserve the encoding AND produce a stock-decodable image
@@ -428,14 +493,15 @@ fn bd_bld9w_utf16_write_oracle_fsqlite_writes_rusqlite_validates() {
             let integrity: String = stock
                 .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(integrity, "ok", "{encoding}: stock integrity_check on the fsqlite image");
+            assert_eq!(
+                integrity, "ok",
+                "{encoding}: stock integrity_check on the fsqlite image"
+            );
             for (id, name, city) in ASCII_ROWS.iter().chain(UNICODE_ROWS.iter()) {
                 let (got_name, got_city): (String, String) = stock
-                    .query_row(
-                        "SELECT name, city FROM people WHERE id = ?1;",
-                        [*id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
+                    .query_row("SELECT name, city FROM people WHERE id = ?1;", [*id], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
                     .unwrap_or_else(|e| panic!("{encoding}: stock read row {id}: {e:?}"));
                 assert_eq!(&got_name, name, "{encoding}: stock name {id}");
                 assert_eq!(&got_city, city, "{encoding}: stock city {id}");

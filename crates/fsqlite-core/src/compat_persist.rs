@@ -42,8 +42,7 @@ use fsqlite_types::StrictColumnType;
 use fsqlite_types::cx::Cx;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_types::record::{
-    RecordProfileScope, enter_record_profile_scope, parse_record,
-    serialize_record_with_encoding,
+    RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record_with_encoding,
 };
 use fsqlite_types::value::SqliteValue;
 
@@ -1310,7 +1309,10 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                     storage_order
                         .iter()
                         .map(|&declared_idx| {
-                            values.get(declared_idx).cloned().unwrap_or(SqliteValue::Null)
+                            values
+                                .get(declared_idx)
+                                .cloned()
+                                .unwrap_or(SqliteValue::Null)
                         })
                         .collect()
                 })

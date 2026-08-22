@@ -2683,8 +2683,8 @@ mod tests {
         assert_eq!(parsed.to_bytes().unwrap(), buf);
 
         // A default (never-stamped) header still reads back all-zero.
-        let legacy = DatabaseHeader::from_bytes(&make_header_for_tests().to_bytes().unwrap())
-            .unwrap();
+        let legacy =
+            DatabaseHeader::from_bytes(&make_header_for_tests().to_bytes().unwrap()).unwrap();
         assert_eq!(legacy.db_file_id, [0u8; 16]);
     }
 
@@ -2770,9 +2770,8 @@ mod tests {
             for byte in &mut buf[76..92] {
                 *byte = 0x5A;
             }
-            let parsed = DatabaseHeader::from_bytes(&buf).expect(
-                "a compatible format_version must parse despite a populated reserved tail",
-            );
+            let parsed = DatabaseHeader::from_bytes(&buf)
+                .expect("a compatible format_version must parse despite a populated reserved tail");
             assert_eq!(parsed.format_version, version);
             // The reserved tail is not surfaced through any header field; the
             // documented version fields past it still read correctly.

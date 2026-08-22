@@ -98,9 +98,16 @@ fn add_column_select_star_reprojects_matches_oracle() {
             .unwrap();
         let got = franken_rows(&stmt.query().await.expect("re-prepare after ADD COLUMN"));
 
-        assert_eq!(got, expected, "SELECT * must re-project the widened row shape");
+        assert_eq!(
+            got, expected,
+            "SELECT * must re-project the widened row shape"
+        );
         // Sanity: the new column is actually present after re-prepare.
-        assert_eq!(got[0].len(), 3, "re-prepared SELECT * must expose 3 columns");
+        assert_eq!(
+            got[0].len(),
+            3,
+            "re-prepared SELECT * must expose 3 columns"
+        );
     });
 }
 
@@ -115,7 +122,8 @@ fn add_column_explicit_list_matches_oracle() {
         .unwrap();
         let mut ostmt = ora.prepare("SELECT b FROM t ORDER BY a").unwrap();
         let _ = oracle_rows(&mut ostmt);
-        ora.execute("ALTER TABLE t ADD COLUMN c INTEGER", []).unwrap();
+        ora.execute("ALTER TABLE t ADD COLUMN c INTEGER", [])
+            .unwrap();
         let expected = oracle_rows(&mut ostmt);
 
         let conn = Connection::open(":memory:").await.unwrap();
@@ -145,7 +153,9 @@ fn create_index_keeps_prepared_select_valid_matches_oracle() {
              INSERT INTO t VALUES (1,'alpha'),(2,'beta');",
         )
         .unwrap();
-        let mut ostmt = ora.prepare("SELECT b FROM t WHERE a >= 1 ORDER BY a").unwrap();
+        let mut ostmt = ora
+            .prepare("SELECT b FROM t WHERE a >= 1 ORDER BY a")
+            .unwrap();
         let _ = oracle_rows(&mut ostmt);
         ora.execute("CREATE INDEX idx_t_b ON t(b)", []).unwrap();
         let expected = oracle_rows(&mut ostmt);
@@ -230,7 +240,8 @@ fn prepared_insert_survives_unrelated_ddl_matches_oracle() {
             .unwrap();
         let mut oins = ora.prepare("INSERT INTO t(a, b) VALUES (?1, ?2)").unwrap();
         oins.execute(rusqlite::params![1, "alpha"]).unwrap();
-        ora.execute("ALTER TABLE t ADD COLUMN c INTEGER", []).unwrap();
+        ora.execute("ALTER TABLE t ADD COLUMN c INTEGER", [])
+            .unwrap();
         let ora_affected = oins.execute(rusqlite::params![2, "beta"]).unwrap();
         let ora_count: i64 = ora
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))

@@ -21,7 +21,9 @@ use fsqlite_types::value::SqliteValue;
 /// Stock (bundled sqlite3 via rusqlite) integrity_check joined into one string.
 fn stock_integrity(path: &std::path::Path) -> String {
     let conn = rusqlite::Connection::open(path).expect("stock open");
-    let mut stmt = conn.prepare("PRAGMA integrity_check;").expect("stock prepare");
+    let mut stmt = conn
+        .prepare("PRAGMA integrity_check;")
+        .expect("stock prepare");
     let rows: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(0))
         .expect("stock query")
@@ -110,7 +112,9 @@ fn raw_trailing_slack_divergence_via_schema_only_open() {
                      DELETE FROM t WHERE id % 3 = 0;",
                 )
                 .expect("stock build");
-            let ps: i64 = stock.query_row("PRAGMA page_size;", [], |r| r.get(0)).unwrap();
+            let ps: i64 = stock
+                .query_row("PRAGMA page_size;", [], |r| r.get(0))
+                .unwrap();
             usize::try_from(ps).unwrap()
         };
 
@@ -122,7 +126,10 @@ fn raw_trailing_slack_divergence_via_schema_only_open() {
         let file_pages_after = bytes.len() / page_size;
 
         let stock = stock_integrity(&db);
-        assert_eq!(stock, "ok", "stock must ignore trailing slack, got {stock:?}");
+        assert_eq!(
+            stock, "ok",
+            "stock must ignore trailing slack, got {stock:?}"
+        );
 
         // Schema-only open bypasses the migration auto-repair.
         let conn = Connection::open_schema_only(db.to_string_lossy().into_owned())
@@ -162,7 +169,9 @@ fn churn_vacuum_into_indexed_table() {
         let src = dir.path().join("src.db");
         let tgt = dir.path().join("tgt.db");
 
-        let conn = Connection::open(src.to_string_lossy().as_ref()).await.unwrap();
+        let conn = Connection::open(src.to_string_lossy().as_ref())
+            .await
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE, a INTEGER, b TEXT);")
             .await
             .unwrap();
@@ -178,8 +187,12 @@ fn churn_vacuum_into_indexed_table() {
             .unwrap();
         }
         // Delete a large, scattered chunk to build a freelist and index churn.
-        conn.execute("DELETE FROM t WHERE id % 3 = 0;").await.unwrap();
-        conn.execute("DELETE FROM t WHERE id % 5 = 1;").await.unwrap();
+        conn.execute("DELETE FROM t WHERE id % 3 = 0;")
+            .await
+            .unwrap();
+        conn.execute("DELETE FROM t WHERE id % 5 = 1;")
+            .await
+            .unwrap();
         conn.execute_with_params(
             "VACUUM INTO ?1;",
             &[SqliteValue::Text(tgt.to_string_lossy().into_owned().into())],
@@ -200,7 +213,9 @@ fn churn_vacuum_into_overflow_rows() {
         let src = dir.path().join("src.db");
         let tgt = dir.path().join("tgt.db");
 
-        let conn = Connection::open(src.to_string_lossy().as_ref()).await.unwrap();
+        let conn = Connection::open(src.to_string_lossy().as_ref())
+            .await
+            .unwrap();
         conn.execute("CREATE TABLE big(id INTEGER PRIMARY KEY, blob TEXT, k INTEGER);")
             .await
             .unwrap();
@@ -214,7 +229,9 @@ fn churn_vacuum_into_overflow_rows() {
             .await
             .unwrap();
         }
-        conn.execute("DELETE FROM big WHERE id % 2 = 0;").await.unwrap();
+        conn.execute("DELETE FROM big WHERE id % 2 = 0;")
+            .await
+            .unwrap();
         conn.execute_with_params(
             "VACUUM INTO ?1;",
             &[SqliteValue::Text(tgt.to_string_lossy().into_owned().into())],
@@ -235,7 +252,9 @@ fn churn_vacuum_into_without_rowid() {
         let src = dir.path().join("src.db");
         let tgt = dir.path().join("tgt.db");
 
-        let conn = Connection::open(src.to_string_lossy().as_ref()).await.unwrap();
+        let conn = Connection::open(src.to_string_lossy().as_ref())
+            .await
+            .unwrap();
         conn.execute("CREATE TABLE w(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;")
             .await
             .unwrap();
@@ -249,8 +268,12 @@ fn churn_vacuum_into_without_rowid() {
             .await
             .unwrap();
         }
-        conn.execute("DELETE FROM w WHERE k LIKE 'k0000%';").await.unwrap();
-        conn.execute("DELETE FROM w WHERE k LIKE 'k001%';").await.unwrap();
+        conn.execute("DELETE FROM w WHERE k LIKE 'k0000%';")
+            .await
+            .unwrap();
+        conn.execute("DELETE FROM w WHERE k LIKE 'k001%';")
+            .await
+            .unwrap();
         conn.execute_with_params(
             "VACUUM INTO ?1;",
             &[SqliteValue::Text(tgt.to_string_lossy().into_owned().into())],
@@ -272,7 +295,9 @@ fn churn_main_db_reopen_no_vacuum() {
         let dir = tmp();
         let db = dir.path().join("main.db");
 
-        let conn = Connection::open(db.to_string_lossy().as_ref()).await.unwrap();
+        let conn = Connection::open(db.to_string_lossy().as_ref())
+            .await
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE, a INTEGER);")
             .await
             .unwrap();
@@ -281,9 +306,12 @@ fn churn_main_db_reopen_no_vacuum() {
             .await
             .unwrap();
         for i in 0..2000i64 {
-            conn.execute(&format!("INSERT INTO t(id,u,a) VALUES ({i},'u{i}',{});", i % 400))
-                .await
-                .unwrap();
+            conn.execute(&format!(
+                "INSERT INTO t(id,u,a) VALUES ({i},'u{i}',{});",
+                i % 400
+            ))
+            .await
+            .unwrap();
             conn.execute(&format!(
                 "INSERT INTO dropme(id,big) VALUES ({i}, '{}');",
                 "y".repeat(200)
@@ -293,7 +321,9 @@ fn churn_main_db_reopen_no_vacuum() {
         }
         // Free many pages into the freelist.
         conn.execute("DROP TABLE dropme;").await.unwrap();
-        conn.execute("DELETE FROM t WHERE id % 4 = 0;").await.unwrap();
+        conn.execute("DELETE FROM t WHERE id % 4 = 0;")
+            .await
+            .unwrap();
         conn.close().await.unwrap();
 
         assert_oracle_invariant(&db, "churn_main_db_reopen_no_vacuum").await;
@@ -398,9 +428,11 @@ fn stock_built_exotic_indexes_open_in_fsqlite() {
 #[test]
 fn trailing_slack_pages_beyond_page_count_oracle() {
     asupersync::test_utils::run_test(|| async {
-        for (label, extra_pages, garbage) in
-            [("one_zero_page", 1usize, false), ("three_zero_pages", 3, false), ("one_garbage_page", 1, true)]
-        {
+        for (label, extra_pages, garbage) in [
+            ("one_zero_page", 1usize, false),
+            ("three_zero_pages", 3, false),
+            ("one_garbage_page", 1, true),
+        ] {
             let dir = tmp();
             let db = dir.path().join(format!("slack_{label}.db"));
             let page_size: usize = {
@@ -431,7 +463,11 @@ fn trailing_slack_pages_beyond_page_count_oracle() {
             let header_page_count =
                 u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
             for p in 0..extra_pages {
-                let fill = if garbage { 0xABu8.wrapping_add(p as u8) } else { 0u8 };
+                let fill = if garbage {
+                    0xABu8.wrapping_add(p as u8)
+                } else {
+                    0u8
+                };
                 bytes.extend(std::iter::repeat_n(fill, page_size));
             }
             std::fs::write(&db, &bytes).expect("write image");
@@ -455,13 +491,23 @@ fn genuine_freelist_hole_flagged_by_both_engines() {
         let dir = tmp();
         let db = dir.path().join("hole.db");
         {
-            let conn = Connection::open(db.to_string_lossy().as_ref()).await.unwrap();
+            let conn = Connection::open(db.to_string_lossy().as_ref())
+                .await
+                .unwrap();
             conn.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
-            conn.execute("CREATE TABLE keep(x INTEGER PRIMARY KEY, v TEXT);").await.unwrap();
-            conn.execute("CREATE TABLE dropme(x INTEGER PRIMARY KEY, v TEXT);").await.unwrap();
+            conn.execute("CREATE TABLE keep(x INTEGER PRIMARY KEY, v TEXT);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE dropme(x INTEGER PRIMARY KEY, v TEXT);")
+                .await
+                .unwrap();
             for i in 0..64i64 {
-                conn.execute(&format!("INSERT INTO keep VALUES ({i}, 'k{i}');")).await.unwrap();
-                conn.execute(&format!("INSERT INTO dropme VALUES ({i}, 'd{i}');")).await.unwrap();
+                conn.execute(&format!("INSERT INTO keep VALUES ({i}, 'k{i}');"))
+                    .await
+                    .unwrap();
+                conn.execute(&format!("INSERT INTO dropme VALUES ({i}, 'd{i}');"))
+                    .await
+                    .unwrap();
             }
             conn.execute("DROP TABLE dropme;").await.unwrap();
             conn.close().await.unwrap();
@@ -475,13 +521,17 @@ fn genuine_freelist_hole_flagged_by_both_engines() {
         std::fs::write(&db, &bytes).unwrap();
 
         let stock = stock_integrity(&db);
-        let conn = Connection::open(db.to_string_lossy().as_ref()).await.unwrap();
+        let conn = Connection::open(db.to_string_lossy().as_ref())
+            .await
+            .unwrap();
         let frank = fsqlite_integrity(&conn).await;
         conn.close().await.unwrap();
         eprintln!("[genuine_hole] stock={stock:?} fsqlite={frank:?}");
         assert_ne!(stock, "ok", "stock must ALSO flag a genuine in-range hole");
         assert!(
-            frank.iter().any(|l| l.to_ascii_lowercase().contains("never used")),
+            frank
+                .iter()
+                .any(|l| l.to_ascii_lowercase().contains("never used")),
             "fsqlite must flag the genuine hole, got {frank:?}"
         );
     });
@@ -495,7 +545,9 @@ fn churn_vacuum_into_many_autoindexes() {
         let src = dir.path().join("src.db");
         let tgt = dir.path().join("tgt.db");
 
-        let conn = Connection::open(src.to_string_lossy().as_ref()).await.unwrap();
+        let conn = Connection::open(src.to_string_lossy().as_ref())
+            .await
+            .unwrap();
         conn.execute(
             "CREATE TABLE m(id INTEGER PRIMARY KEY, c1 TEXT UNIQUE, c2 TEXT UNIQUE, c3 INTEGER UNIQUE);",
         )
@@ -508,7 +560,9 @@ fn churn_vacuum_into_many_autoindexes() {
             .await
             .unwrap();
         }
-        conn.execute("DELETE FROM m WHERE id % 3 = 2;").await.unwrap();
+        conn.execute("DELETE FROM m WHERE id % 3 = 2;")
+            .await
+            .unwrap();
         conn.execute_with_params(
             "VACUUM INTO ?1;",
             &[SqliteValue::Text(tgt.to_string_lossy().into_owned().into())],

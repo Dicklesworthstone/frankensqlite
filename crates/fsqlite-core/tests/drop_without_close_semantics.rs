@@ -44,7 +44,11 @@ async fn scalar_i64(conn: &Connection, sql: &str) -> i64 {
 fn drop_without_close_frees_ordinary_writer_for_siblings() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
-        let db = dir.path().join("ordinary.db").to_string_lossy().into_owned();
+        let db = dir
+            .path()
+            .join("ordinary.db")
+            .to_string_lossy()
+            .into_owned();
 
         {
             let a = Connection::open(&db).await.expect("open A");
@@ -81,7 +85,10 @@ fn drop_without_close_frees_ordinary_writer_for_siblings() {
         // A's committed row survived the drop; A's uncommitted row (id=2) was
         // never made durable, so recovery left it out.
         assert_eq!(scalar_i64(&b, "SELECT v FROM t WHERE id = 1;").await, 10);
-        assert_eq!(scalar_i64(&b, "SELECT COUNT(*) FROM t WHERE id = 2;").await, 0);
+        assert_eq!(
+            scalar_i64(&b, "SELECT COUNT(*) FROM t WHERE id = 2;").await,
+            0
+        );
         assert_eq!(scalar_i64(&b, "SELECT v FROM t WHERE id = 3;").await, 30);
     });
 }
@@ -94,7 +101,11 @@ fn drop_without_close_frees_ordinary_writer_for_siblings() {
 fn drop_without_close_frees_concurrent_session_page_locks() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
-        let db = dir.path().join("concurrent.db").to_string_lossy().into_owned();
+        let db = dir
+            .path()
+            .join("concurrent.db")
+            .to_string_lossy()
+            .into_owned();
 
         {
             let a = Connection::open(&db).await.expect("open A");

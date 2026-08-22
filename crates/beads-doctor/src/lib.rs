@@ -372,11 +372,7 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
 
     match sub.as_ref() {
         "run" => Ok(Command::Run { only, config }),
-        "install" => Ok(Command::Install {
-            only,
-            config,
-            exec,
-        }),
+        "install" => Ok(Command::Install { only, config, exec }),
         "uninstall" => Ok(Command::Uninstall { only, config }),
         "--help" | "-h" | "help" => Ok(Command::Help),
         "--version" | "-V" | "version" => Ok(Command::Version),
@@ -423,11 +419,7 @@ pub async fn async_entry(cx: &Cx, args: Vec<OsString>) -> i32 {
             0
         }
         Command::Run { only, config } => run_command(cx, only, config).await,
-        Command::Install {
-            only,
-            config,
-            exec,
-        } => install_command(only, config, exec),
+        Command::Install { only, config, exec } => install_command(only, config, exec),
         Command::Uninstall { only, config } => uninstall_command(only, config),
     }
 }
@@ -470,14 +462,17 @@ async fn run_command(cx: &Cx, only: Option<String>, config_path: Option<PathBuf>
 }
 
 fn resolve_exec(exec: Option<PathBuf>) -> String {
-    exec.or_else(|| std::env::current_exe().ok())
-        .map_or_else(
-            || "beads-doctor".to_string(),
-            |p| p.to_string_lossy().into_owned(),
-        )
+    exec.or_else(|| std::env::current_exe().ok()).map_or_else(
+        || "beads-doctor".to_string(),
+        |p| p.to_string_lossy().into_owned(),
+    )
 }
 
-fn install_command(only: Option<String>, config_path: Option<PathBuf>, exec: Option<PathBuf>) -> i32 {
+fn install_command(
+    only: Option<String>,
+    config_path: Option<PathBuf>,
+    exec: Option<PathBuf>,
+) -> i32 {
     let path = config_path.unwrap_or_else(config::default_config_path);
     let config = match load_config(&path) {
         Ok(config) => config,
@@ -655,7 +650,11 @@ mod tests {
         }))
     }
 
-    fn test_cycle(runner: Arc<dyn DoctorRunner>, notifier: Arc<dyn Notifier>, dir: PathBuf) -> Cycle {
+    fn test_cycle(
+        runner: Arc<dyn DoctorRunner>,
+        notifier: Arc<dyn Notifier>,
+        dir: PathBuf,
+    ) -> Cycle {
         Cycle {
             runner,
             notifier,
@@ -795,11 +794,7 @@ mod tests {
         };
         let dir = tmp.path().to_path_buf();
         let reports = run_in_runtime(move |cx| async move {
-            let cycle = test_cycle(
-                Arc::new(FailRunner),
-                Arc::new(StubNotifier::default()),
-                dir,
-            );
+            let cycle = test_cycle(Arc::new(FailRunner), Arc::new(StubNotifier::default()), dir);
             run_cycle(&cx, &config, None, &cycle).await
         });
         assert_eq!(reports.len(), 1);
@@ -817,8 +812,14 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_args(&[os("beads-doctor"), os("run"), os("--once"), os("-w"), os("fsqlite")])
-                .unwrap(),
+            parse_args(&[
+                os("beads-doctor"),
+                os("run"),
+                os("--once"),
+                os("-w"),
+                os("fsqlite")
+            ])
+            .unwrap(),
             Command::Run {
                 only: Some("fsqlite".to_string()),
                 config: None

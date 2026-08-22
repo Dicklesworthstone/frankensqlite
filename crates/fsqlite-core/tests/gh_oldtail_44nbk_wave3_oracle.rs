@@ -16,7 +16,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
@@ -42,7 +45,10 @@ fn gh148_double_quoted_string_matches_reference() {
         }
         let q = "SELECT \"no_such\" FROM t ORDER BY x";
         let frank = match f.query(q).await {
-            Ok(rows) => Ok(rows.iter().map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>()).collect::<Vec<_>>()),
+            Ok(rows) => Ok(rows
+                .iter()
+                .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                .collect::<Vec<_>>()),
             Err(e) => Err(format!("{e:?}")),
         };
         let stock = {
@@ -52,11 +58,13 @@ fn gh148_double_quoted_string_matches_reference() {
                 Ok(mut st) => {
                     let n = st.column_count();
                     match st.query_map([], |row| {
-                        Ok((0..n).map(|i| match row.get_unwrap::<_, rusqlite::types::Value>(i) {
-                            rusqlite::types::Value::Text(s) => format!("'{s}'"),
-                            rusqlite::types::Value::Integer(v) => v.to_string(),
-                            other => format!("{other:?}"),
-                        }).collect::<Vec<_>>())
+                        Ok((0..n)
+                            .map(|i| match row.get_unwrap::<_, rusqlite::types::Value>(i) {
+                                rusqlite::types::Value::Text(s) => format!("'{s}'"),
+                                rusqlite::types::Value::Integer(v) => v.to_string(),
+                                other => format!("{other:?}"),
+                            })
+                            .collect::<Vec<_>>())
                     }) {
                         Err(e) => Err(e.to_string()),
                         Ok(rows) => Ok(rows.collect::<Result<Vec<_>, _>>().unwrap()),
@@ -67,11 +75,15 @@ fn gh148_double_quoted_string_matches_reference() {
         // Compare only whether both accept-or-reject (error identity/text differs
         // across engines); if both accept, the row sets must match.
         assert_eq!(
-            frank.is_ok(), stock.is_ok(),
+            frank.is_ok(),
+            stock.is_ok(),
             "GH#148: frank and the bundled rusqlite reference must agree on accepting/rejecting a bare double-quoted token. frank={frank:?} stock={stock:?}"
         );
         if let (Ok(fr), Ok(sr)) = (&frank, &stock) {
-            assert_eq!(fr, sr, "GH#148: both accepted the DQS token but returned different rows");
+            assert_eq!(
+                fr, sr,
+                "GH#148: both accepted the DQS token but returned different rows"
+            );
         }
     });
 }
@@ -83,7 +95,10 @@ fn snapshot_dir(dir: &std::path::Path) -> BTreeMap<String, (u64, Vec<u8>)> {
         if entry.file_type().expect("file type").is_file() {
             let path = entry.path();
             let bytes = std::fs::read(&path).unwrap_or_default();
-            m.insert(entry.file_name().to_string_lossy().into_owned(), (bytes.len() as u64, bytes));
+            m.insert(
+                entry.file_name().to_string_lossy().into_owned(),
+                (bytes.len() as u64, bytes),
+            );
         }
     }
     m
@@ -105,13 +120,20 @@ fn gh140_readonly_open_does_not_mutate_dir() {
             .unwrap();
         }
         let before = snapshot_dir(dir.path());
-        assert_eq!(before.len(), 1, "fixture should be a single main file (stock, no WAL after close)");
+        assert_eq!(
+            before.len(),
+            1,
+            "fixture should be a single main file (stock, no WAL after close)"
+        );
 
         // schema-only (read-only) open + a read query.
         let conn = Connection::open_schema_only(path.to_str().unwrap())
             .await
             .expect("schema-only open of a clean stock db");
-        let rows = conn.query("SELECT id, v FROM t ORDER BY id").await.expect("read query");
+        let rows = conn
+            .query("SELECT id, v FROM t ORDER BY id")
+            .await
+            .expect("read query");
         assert_eq!(rows.len(), 2, "read-only open must still read the two rows");
         drop(conn);
 
@@ -120,8 +142,14 @@ fn gh140_readonly_open_does_not_mutate_dir() {
             after.keys().collect::<Vec<_>>(),
             before.keys().collect::<Vec<_>>(),
             "GH#140: read-only/schema-only open must not create or delete any directory artifact (added: {:?})",
-            after.keys().filter(|k| !before.contains_key(*k)).collect::<Vec<_>>()
+            after
+                .keys()
+                .filter(|k| !before.contains_key(*k))
+                .collect::<Vec<_>>()
         );
-        assert_eq!(after, before, "GH#140: read-only/schema-only open must not mutate any existing file bytes");
+        assert_eq!(
+            after, before,
+            "GH#140: read-only/schema-only open must not mutate any existing file bytes"
+        );
     });
 }

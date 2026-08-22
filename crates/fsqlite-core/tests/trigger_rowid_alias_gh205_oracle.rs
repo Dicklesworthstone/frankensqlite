@@ -22,7 +22,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
         SqliteValue::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -34,7 +37,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
         rusqlite::types::Value::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -119,7 +125,12 @@ fn after_insert_rowid_no_ipk() {
         ] {
             exec_both(&f, &r, sql).await;
         }
-        assert_agree(&f, &r, "SELECT op, rid, oidv, ridv, aval FROM log ORDER BY rowid").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT op, rid, oidv, ridv, aval FROM log ORDER BY rowid",
+        )
+        .await;
         // Fixed oracle values: NEW.rowid == NEW.oid == NEW._rowid_ == actual rowid.
         assert_frank_eq(
             &f,
@@ -152,7 +163,12 @@ fn after_delete_rowid_no_ipk_regression() {
         ] {
             exec_both(&f, &r, sql).await;
         }
-        assert_agree(&f, &r, "SELECT op, rid, oidv, ridv, aval FROM log ORDER BY rowid").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT op, rid, oidv, ridv, aval FROM log ORDER BY rowid",
+        )
+        .await;
     });
 }
 
@@ -173,7 +189,12 @@ fn after_update_rowid_no_ipk() {
         ] {
             exec_both(&f, &r, sql).await;
         }
-        assert_agree(&f, &r, "SELECT op, oldrid, newrid, aval FROM log ORDER BY rowid").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT op, oldrid, newrid, aval FROM log ORDER BY rowid",
+        )
+        .await;
         // On an ordinary UPDATE the rowid is unchanged: OLD.rowid == NEW.rowid.
         assert_frank_eq(
             &f,
@@ -247,7 +268,12 @@ fn update_when_new_rowid_no_ipk() {
         ] {
             exec_both(&f, &r, sql).await;
         }
-        assert_agree(&f, &r, "SELECT op, oldrid, newrid, aval FROM log ORDER BY rowid").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT op, oldrid, newrid, aval FROM log ORDER BY rowid",
+        )
+        .await;
         // Only the rowid==2 (AFTER) and rowid==1 (BEFORE) rows should be logged.
         assert_frank_eq(
             &f,

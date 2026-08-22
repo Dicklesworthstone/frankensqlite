@@ -42,17 +42,27 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(e) => vec![vec![format!("ERR:{e}")]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let mut st = match conn.prepare(sql) { Ok(s) => s, Err(e) => return vec![vec![format!("ERR:{e}")]] };
+    let mut st = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => return vec![vec![format!("ERR:{e}")]],
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|e| vec![vec![format!("ERR:{e}")]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|e| vec![vec![format!("ERR:{e}")]]),
         Err(e) => vec![vec![format!("ERR:{e}")]],
     }
 }
@@ -64,7 +74,13 @@ fn norm(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
     if rows.len() == 1 && rows[0].len() == 1 && rows[0][0].starts_with("ERR") {
         return vec![vec!["ERR".to_owned()]];
     }
-    for r in &mut rows { for c in r.iter_mut() { if c.starts_with("ERR:") { "ERR".clone_into(c); } } }
+    for r in &mut rows {
+        for c in r.iter_mut() {
+            if c.starts_with("ERR:") {
+                "ERR".clone_into(c);
+            }
+        }
+    }
     rows
 }
 
@@ -89,7 +105,6 @@ fn derived_table_column_alias_match_rusqlite_oracle() {
             "SELECT sum(v) FROM (VALUES (9223372036854775807),(9223372036854775807)) AS z(v)",
             "SELECT dbl FROM (SELECT a*2 AS orig FROM base) AS t(dbl) ORDER BY dbl",
             "SELECT t1.p FROM (SELECT id, a FROM base) AS t1(p, q) JOIN base ON t1.p = base.id",
-
             // ── Forms SQLite DOES support: must produce identical rows ──
             // bare subquery alias (no column list) keeps the source column names
             "SELECT a, b FROM (SELECT a, b FROM base) AS t ORDER BY a",
@@ -113,6 +128,11 @@ fn derived_table_column_alias_match_rusqlite_oracle() {
                 diffs.push(format!("  `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"));
             }
         }
-        assert!(diffs.is_empty(), "{} derived-table alias divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} derived-table alias divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

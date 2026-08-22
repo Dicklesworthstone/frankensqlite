@@ -40,7 +40,9 @@ fn oracle_seq_rows(script: &[&str]) -> Vec<(String, i64)> {
 async fn fsqlite_seq_rows(script: &[&str]) -> Vec<(String, i64)> {
     let conn = Connection::open(":memory:").await.unwrap();
     for s in script {
-        conn.execute(s).await.unwrap_or_else(|e| panic!("`{s}`: {e:?}"));
+        conn.execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("`{s}`: {e:?}"));
     }
     let rows = conn
         .query("SELECT name, seq FROM sqlite_sequence ORDER BY name")
@@ -66,7 +68,11 @@ fn alter_rename_sqlite_sequence_matches_rusqlite_oracle() {
     asupersync::test_utils::run_test(|| async {
         // Rename: only ('t2', 4) — the sequence moved and continued.
         let expected_rename = oracle_seq_rows(RENAME_SCRIPT);
-        assert_eq!(expected_rename, vec![("t2".to_owned(), 4)], "oracle premise (rename)");
+        assert_eq!(
+            expected_rename,
+            vec![("t2".to_owned(), 4)],
+            "oracle premise (rename)"
+        );
         assert_eq!(
             fsqlite_seq_rows(RENAME_SCRIPT).await,
             expected_rename,

@@ -116,7 +116,10 @@ fn optimize_mask_materializes_stat1_matching_rusqlite() {
         r.execute_batch("PRAGMA optimize(0x10002)").unwrap();
         let sqlite = rusqlite_stat1(&r);
 
-        assert_eq!(frank, sqlite, "sqlite_stat1 must match stock after optimize");
+        assert_eq!(
+            frank, sqlite,
+            "sqlite_stat1 must match stock after optimize"
+        );
         assert!(!frank.is_empty(), "sqlite_stat1 must be non-empty");
     });
 }
@@ -136,12 +139,19 @@ fn optimize_default_mask_matches_analyze_and_rusqlite() {
         conn2.execute(POPULATE).await.unwrap();
         conn2.execute("ANALYZE").await.unwrap();
         let via_analyze = frank_stat1(&conn2).await;
-        assert_eq!(via_optimize, via_analyze, "optimize must match plain ANALYZE");
+        assert_eq!(
+            via_optimize, via_analyze,
+            "optimize must match plain ANALYZE"
+        );
 
         let r = rusqlite::Connection::open_in_memory().unwrap();
         r.execute_batch(POPULATE).unwrap();
         r.execute_batch("PRAGMA optimize").unwrap();
-        assert_eq!(via_optimize, rusqlite_stat1(&r), "default optimize vs stock");
+        assert_eq!(
+            via_optimize,
+            rusqlite_stat1(&r),
+            "default optimize vs stock"
+        );
     });
 }
 
@@ -161,7 +171,10 @@ fn optimize_zero_mask_does_not_create_stat1() {
         let r = rusqlite::Connection::open_in_memory().unwrap();
         r.execute_batch(POPULATE).unwrap();
         r.execute_batch("PRAGMA optimize(0)").unwrap();
-        assert!(!rusqlite_stat1_exists(&r), "stock optimize(0) creates nothing");
+        assert!(
+            !rusqlite_stat1_exists(&r),
+            "stock optimize(0) creates nothing"
+        );
     });
 }
 
@@ -182,10 +195,15 @@ fn optimize_on_empty_db_creates_no_stat1() {
         );
 
         let r = rusqlite::Connection::open_in_memory().unwrap();
-        r.execute_batch("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT); CREATE INDEX idx_b ON t(b);")
-            .unwrap();
+        r.execute_batch(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT); CREATE INDEX idx_b ON t(b);",
+        )
+        .unwrap();
         r.execute_batch("PRAGMA optimize").unwrap();
-        assert!(!rusqlite_stat1_exists(&r), "stock optimize on empty DB creates nothing");
+        assert!(
+            !rusqlite_stat1_exists(&r),
+            "stock optimize on empty DB creates nothing"
+        );
     });
 }
 
@@ -197,9 +215,11 @@ fn optimize_debug_mode_lists_without_executing() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
         conn.execute(POPULATE).await.unwrap();
-        conn.execute("CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT); INSERT INTO t2(b) VALUES('x');")
-            .await
-            .unwrap();
+        conn.execute(
+            "CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT); INSERT INTO t2(b) VALUES('x');",
+        )
+        .await
+        .unwrap();
 
         let mut frank: Vec<String> = frank_rows(&conn, "PRAGMA optimize(-1)")
             .await
@@ -239,7 +259,10 @@ fn optimize_debug_mode_lists_without_executing() {
             ],
             "both non-empty tables must be listed"
         );
-        assert!(!rusqlite_stat1_exists(&r), "stock debug optimize creates nothing");
+        assert!(
+            !rusqlite_stat1_exists(&r),
+            "stock debug optimize creates nothing"
+        );
     });
 }
 
@@ -252,7 +275,10 @@ fn optimize_debug_only_bit_and_plain_analyze_control() {
         conn.execute(POPULATE).await.unwrap();
 
         let debug_only = frank_rows(&conn, "PRAGMA optimize(1)").await;
-        assert!(debug_only.is_empty(), "optimize(1) lists nothing (analyze bit clear)");
+        assert!(
+            debug_only.is_empty(),
+            "optimize(1) lists nothing (analyze bit clear)"
+        );
         assert!(
             !frank_stat1_exists(&conn).await,
             "optimize(1) must not create sqlite_stat1"

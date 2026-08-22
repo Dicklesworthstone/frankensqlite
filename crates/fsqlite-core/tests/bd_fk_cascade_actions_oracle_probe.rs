@@ -32,17 +32,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -59,9 +68,14 @@ fn fk_cascade_actions_match_rusqlite_oracle() {
         ex(&f, &r, "PRAGMA foreign_keys=ON").await;
 
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // ── ON DELETE CASCADE + ON UPDATE CASCADE ──
         for s in [
@@ -74,12 +88,20 @@ fn fk_cascade_actions_match_rusqlite_oracle() {
         }
         // update parent id -> cascades to children's pid
         ex(&f, &r, "UPDATE p SET id=100 WHERE id=1").await;
-        check("on update cascade", fq(&f, "SELECT id,pid FROM c ORDER BY id").await,
-              rq(&r, "SELECT id,pid FROM c ORDER BY id"), &mut diffs);
+        check(
+            "on update cascade",
+            fq(&f, "SELECT id,pid FROM c ORDER BY id").await,
+            rq(&r, "SELECT id,pid FROM c ORDER BY id"),
+            &mut diffs,
+        );
         // delete parent -> cascades delete of children
         ex(&f, &r, "DELETE FROM p WHERE id=100").await;
-        check("on delete cascade", fq(&f, "SELECT id,pid FROM c ORDER BY id").await,
-              rq(&r, "SELECT id,pid FROM c ORDER BY id"), &mut diffs);
+        check(
+            "on delete cascade",
+            fq(&f, "SELECT id,pid FROM c ORDER BY id").await,
+            rq(&r, "SELECT id,pid FROM c ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── ON DELETE SET NULL ──
         for s in [
@@ -91,8 +113,12 @@ fn fk_cascade_actions_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "DELETE FROM p2 WHERE id=1").await;
-        check("on delete set null", fq(&f, "SELECT id,pid FROM c2 ORDER BY id").await,
-              rq(&r, "SELECT id,pid FROM c2 ORDER BY id"), &mut diffs);
+        check(
+            "on delete set null",
+            fq(&f, "SELECT id,pid FROM c2 ORDER BY id").await,
+            rq(&r, "SELECT id,pid FROM c2 ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── ON DELETE SET DEFAULT ──
         for s in [
@@ -104,8 +130,12 @@ fn fk_cascade_actions_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "DELETE FROM p3 WHERE id=1").await;
-        check("on delete set default", fq(&f, "SELECT id,pid FROM c3 ORDER BY id").await,
-              rq(&r, "SELECT id,pid FROM c3 ORDER BY id"), &mut diffs);
+        check(
+            "on delete set default",
+            fq(&f, "SELECT id,pid FROM c3 ORDER BY id").await,
+            rq(&r, "SELECT id,pid FROM c3 ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── ON DELETE RESTRICT (immediate rejection) ──
         for s in [
@@ -117,11 +147,19 @@ fn fk_cascade_actions_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "DELETE FROM p4 WHERE id=1").await; // rejected -> no-op
-        check("on delete restrict rejected", fq(&f, "SELECT id FROM p4 ORDER BY id").await,
-              rq(&r, "SELECT id FROM p4 ORDER BY id"), &mut diffs);
+        check(
+            "on delete restrict rejected",
+            fq(&f, "SELECT id FROM p4 ORDER BY id").await,
+            rq(&r, "SELECT id FROM p4 ORDER BY id"),
+            &mut diffs,
+        );
         ex(&f, &r, "DELETE FROM p4 WHERE id=2").await; // no children -> allowed
-        check("restrict allows free delete", fq(&f, "SELECT id FROM p4 ORDER BY id").await,
-              rq(&r, "SELECT id FROM p4 ORDER BY id"), &mut diffs);
+        check(
+            "restrict allows free delete",
+            fq(&f, "SELECT id FROM p4 ORDER BY id").await,
+            rq(&r, "SELECT id FROM p4 ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── multi-level cascade chain: gp -> par -> ch ──
         for s in [
@@ -135,10 +173,18 @@ fn fk_cascade_actions_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "DELETE FROM gp WHERE id=1").await; // cascades gp->par->ch
-        check("multi-level cascade par", fq(&f, "SELECT id,gpid FROM par ORDER BY id").await,
-              rq(&r, "SELECT id,gpid FROM par ORDER BY id"), &mut diffs);
-        check("multi-level cascade ch", fq(&f, "SELECT id,pid FROM ch ORDER BY id").await,
-              rq(&r, "SELECT id,pid FROM ch ORDER BY id"), &mut diffs);
+        check(
+            "multi-level cascade par",
+            fq(&f, "SELECT id,gpid FROM par ORDER BY id").await,
+            rq(&r, "SELECT id,gpid FROM par ORDER BY id"),
+            &mut diffs,
+        );
+        check(
+            "multi-level cascade ch",
+            fq(&f, "SELECT id,pid FROM ch ORDER BY id").await,
+            rq(&r, "SELECT id,pid FROM ch ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── self-referential FK cascade ──
         for s in [
@@ -148,8 +194,12 @@ fn fk_cascade_actions_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "DELETE FROM tree WHERE id=1").await; // cascades the whole subtree
-        check("self-ref cascade", fq(&f, "SELECT id,parent FROM tree ORDER BY id").await,
-              rq(&r, "SELECT id,parent FROM tree ORDER BY id"), &mut diffs);
+        check(
+            "self-ref cascade",
+            fq(&f, "SELECT id,parent FROM tree ORDER BY id").await,
+            rq(&r, "SELECT id,parent FROM tree ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── composite (two-column) FK ──
         for s in [
@@ -161,13 +211,26 @@ fn fk_cascade_actions_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "DELETE FROM pk2 WHERE a=1 AND b=1").await;
-        check("composite fk cascade", fq(&f, "SELECT id,a,b FROM fk2 ORDER BY id").await,
-              rq(&r, "SELECT id,a,b FROM fk2 ORDER BY id"), &mut diffs);
+        check(
+            "composite fk cascade",
+            fq(&f, "SELECT id,a,b FROM fk2 ORDER BY id").await,
+            rq(&r, "SELECT id,a,b FROM fk2 ORDER BY id"),
+            &mut diffs,
+        );
         // inserting a child with no matching composite parent is rejected
         ex(&f, &r, "INSERT INTO fk2 VALUES (99,9,9)").await;
-        check("composite fk insert rejected", fq(&f, "SELECT count(*) FROM fk2").await,
-              rq(&r, "SELECT count(*) FROM fk2"), &mut diffs);
+        check(
+            "composite fk insert rejected",
+            fq(&f, "SELECT count(*) FROM fk2").await,
+            rq(&r, "SELECT count(*) FROM fk2"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} FK cascade-action divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} FK cascade-action divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

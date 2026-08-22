@@ -42,7 +42,11 @@ fn insert_select_value_count_mismatch_reports_stock_text() {
         // SELECT ... FROM a source table (rows actually flow through the emitter).
         assert_eq!(
             insert_err(
-                &["CREATE TABLE t(a, b)", "CREATE TABLE s(x)", "INSERT INTO s VALUES(1)"],
+                &[
+                    "CREATE TABLE t(a, b)",
+                    "CREATE TABLE s(x)",
+                    "INSERT INTO s VALUES(1)"
+                ],
                 "INSERT INTO t SELECT x FROM s",
             )
             .await,

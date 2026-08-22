@@ -61,7 +61,9 @@ fn insert_select_then_drop_source_in_one_txn_commits_without_self_conflict() {
         conn.execute("DROP TABLE issues").await.unwrap();
 
         conn.execute("COMMIT").await.unwrap_or_else(|e| {
-            panic!("COMMIT of a single-connection INSERT..SELECT+DROP txn must not self-conflict: {e}")
+            panic!(
+                "COMMIT of a single-connection INSERT..SELECT+DROP txn must not self-conflict: {e}"
+            )
         });
 
         let rows = query_rows(&conn, "SELECT id, title FROM issues_new ORDER BY id").await;

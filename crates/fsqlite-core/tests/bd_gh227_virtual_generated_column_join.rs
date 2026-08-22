@@ -27,7 +27,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
         SqliteValue::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -39,7 +42,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
         rusqlite::types::Value::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -121,11 +127,7 @@ async fn seed(fconn: &Connection, rconn: &rusqlite::Connection) {
 fn gh227_virtual_generated_column_join_file_backed() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
-        let db = dir
-            .path()
-            .join("gh227.db")
-            .to_string_lossy()
-            .into_owned();
+        let db = dir.path().join("gh227.db").to_string_lossy().into_owned();
 
         let fconn = Connection::open(&db).await.expect("open franken file db");
         let rconn = rusqlite::Connection::open(dir.path().join("gh227_oracle.db"))

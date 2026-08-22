@@ -23,7 +23,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
         SqliteValue::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -34,7 +37,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
         rusqlite::types::Value::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -157,12 +163,7 @@ fn mixed_window_and_non_window_terms_bkc4f() {
         let r = rusqlite::Connection::open_in_memory().unwrap();
         seed_t(&f, &r).await;
         // Window + plain column. Oracle: 91 / 92 / 93.
-        assert_agree(
-            &f,
-            &r,
-            "SELECT sum(price) OVER () + id FROM t ORDER BY id",
-        )
-        .await;
+        assert_agree(&f, &r, "SELECT sum(price) OVER () + id FROM t ORDER BY id").await;
         // Unary-negated window + window. Oracle: -87.
         assert_agree(
             &f,
@@ -215,12 +216,7 @@ fn single_window_in_expression_control_bkc4f() {
         seed_t(&f, &r).await;
         // Control: a SINGLE window inside an expression must still work
         // (one window -> one placeholder). Oracle: 91.
-        assert_agree(
-            &f,
-            &r,
-            "SELECT sum(price) OVER () + 1 FROM t ORDER BY id",
-        )
-        .await;
+        assert_agree(&f, &r, "SELECT sum(price) OVER () + 1 FROM t ORDER BY id").await;
         // Control: a bare single window (the ColKind::Window fast path). Oracle: 90.
         assert_agree(&f, &r, "SELECT sum(price) OVER () FROM t ORDER BY id").await;
     });

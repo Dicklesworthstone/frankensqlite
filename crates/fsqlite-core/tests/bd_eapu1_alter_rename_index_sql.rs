@@ -7,7 +7,9 @@ use fsqlite_types::value::SqliteValue;
 
 async fn index_sql(conn: &Connection, name: &str) -> String {
     let r = conn
-        .query(&format!("SELECT sql FROM sqlite_master WHERE name = '{name}';"))
+        .query(&format!(
+            "SELECT sql FROM sqlite_master WHERE name = '{name}';"
+        ))
         .await
         .unwrap();
     match &r[0].values()[0] {
@@ -24,7 +26,9 @@ fn rename_column_keeps_index_sql_minimal_bd_eapu1() {
         let conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(a, b);").await.unwrap();
         conn.execute("CREATE INDEX ix ON t(b);").await.unwrap();
-        conn.execute("ALTER TABLE t RENAME COLUMN b TO c;").await.unwrap();
+        conn.execute("ALTER TABLE t RENAME COLUMN b TO c;")
+            .await
+            .unwrap();
         assert_eq!(index_sql(&conn, "ix").await, "CREATE INDEX ix ON t(c)");
     });
 }

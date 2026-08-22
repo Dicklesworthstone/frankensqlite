@@ -60,7 +60,10 @@ const ROWS: &[&str] = &["INSERT INTO t(id, k, j) VALUES \
 /// 2=UTF-16le, 3=UTF-16be.
 fn header_text_encoding(path: &Path) -> u32 {
     let bytes = std::fs::read(path).expect("read database file header");
-    assert!(bytes.len() >= 60, "database shorter than its 100-byte header");
+    assert!(
+        bytes.len() >= 60,
+        "database shorter than its 100-byte header"
+    );
     u32::from_be_bytes([bytes[56], bytes[57], bytes[58], bytes[59]])
 }
 

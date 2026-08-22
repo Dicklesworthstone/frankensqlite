@@ -32,17 +32,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -92,7 +101,7 @@ fn null_three_valued_logic_match_rusqlite_oracle() {
             "SELECT id FROM t WHERE v IS NULL ORDER BY id",
             "SELECT id FROM t WHERE v IN (10,30) ORDER BY id",
             "SELECT id FROM t WHERE v NOT IN (10,30) ORDER BY id",
-            "SELECT id FROM t WHERE v NOT IN (10,30,NULL) ORDER BY id",   // NULL in list -> no rows
+            "SELECT id FROM t WHERE v NOT IN (10,30,NULL) ORDER BY id", // NULL in list -> no rows
             // correlated NOT IN with a NULL-bearing subquery -> empty
             "SELECT id FROM t WHERE id NOT IN (SELECT v FROM t) ORDER BY id",
             // aggregates over NULLs
@@ -111,6 +120,11 @@ fn null_three_valued_logic_match_rusqlite_oracle() {
                 diffs.push(format!("  `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"));
             }
         }
-        assert!(diffs.is_empty(), "{} NULL/3VL divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} NULL/3VL divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

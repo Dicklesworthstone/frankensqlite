@@ -24,13 +24,13 @@ use std::simd::{
     cmp::{SimdPartialEq, SimdPartialOrd},
 };
 
+use crate::TextEncoding;
 use crate::serial_type::{
     SerialTypeClass, classify_serial_type, integer_serial_type_and_len, read_varint,
     serial_type_for_blob, serial_type_for_integer, serial_type_for_text, serial_type_len,
     varint_len, write_varint,
 };
 use crate::sync_primitives::Instant;
-use crate::TextEncoding;
 use crate::value::{SmallText, SqliteValue, pool_acquire, pool_return_reusable};
 
 static FSQLITE_RECORD_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -774,7 +774,12 @@ pub fn decode_column_from_offset_with_encoding(
     if end > data.len() {
         return None;
     }
-    decode_value_with_encoding(col.serial_type, &data[start..end], encoding, profile_enabled)
+    decode_value_with_encoding(
+        col.serial_type,
+        &data[start..end],
+        encoding,
+        profile_enabled,
+    )
 }
 
 /// Decode only the numeric aggregate-relevant shape of a projected column.
@@ -1177,8 +1182,12 @@ pub fn parse_record_prefix_with_encoding(
             return None;
         }
 
-        let value =
-            decode_value_with_encoding(serial_type, &data[body_offset..end], encoding, profile_enabled)?;
+        let value = decode_value_with_encoding(
+            serial_type,
+            &data[body_offset..end],
+            encoding,
+            profile_enabled,
+        )?;
         values.push(value);
         body_offset = end;
     }
@@ -1643,8 +1652,10 @@ pub fn serialize_record_with_encoding(values: &[SqliteValue], encoding: TextEnco
     let header_size = compute_header_size(header_content_size);
     let mut buf = Vec::with_capacity(header_size + body_size);
     buf.resize(header_size, 0);
-    let mut header_offset =
-        write_varint(buf.as_mut_slice(), u64::try_from(header_size).unwrap_or(u64::MAX));
+    let mut header_offset = write_varint(
+        buf.as_mut_slice(),
+        u64::try_from(header_size).unwrap_or(u64::MAX),
+    );
     for serial_type in &serial_types {
         header_offset += write_varint(&mut buf[header_offset..], *serial_type);
     }
@@ -1745,8 +1756,10 @@ pub fn serialize_record_iter_into_with_encoding<'a, I>(
     buf.clear();
     buf.reserve(header_size + body_size);
     buf.resize(header_size, 0);
-    let mut header_offset =
-        write_varint(buf.as_mut_slice(), u64::try_from(header_size).unwrap_or(u64::MAX));
+    let mut header_offset = write_varint(
+        buf.as_mut_slice(),
+        u64::try_from(header_size).unwrap_or(u64::MAX),
+    );
     for serial_type in &serial_types {
         header_offset += write_varint(&mut buf[header_offset..], *serial_type);
     }
@@ -3439,8 +3452,13 @@ mod tests {
         // Cover the non-fast-path overwrite of an existing Text slot.
         let mut slot = SqliteValue::Text(SmallText::new("previous value"));
         let invalid: &[u8] = &[0xFF, 0xFE, 0xFD]; // not valid UTF-8
-        let result =
-            decode_value_into(serial_type_for_text(3), invalid, &mut slot, TextEncoding::Utf8, false);
+        let result = decode_value_into(
+            serial_type_for_text(3),
+            invalid,
+            &mut slot,
+            TextEncoding::Utf8,
+            false,
+        );
         result.expect("raw SQLite TEXT must decode without substitution");
         let SqliteValue::Text(text) = slot else {
             panic!("decoded value must retain the TEXT storage class");
@@ -3455,8 +3473,13 @@ mod tests {
         // round-trip for a raw TEXT payload.
         let mut slot = SqliteValue::Integer(7);
         let invalid: &[u8] = &[0xFF, 0xFE, 0xFD];
-        let result =
-            decode_value_into(serial_type_for_text(3), invalid, &mut slot, TextEncoding::Utf8, false);
+        let result = decode_value_into(
+            serial_type_for_text(3),
+            invalid,
+            &mut slot,
+            TextEncoding::Utf8,
+            false,
+        );
         result.expect("raw SQLite TEXT must decode without substitution");
         let SqliteValue::Text(text) = &slot else {
             panic!("decoded value must retain the TEXT storage class");
@@ -3537,7 +3560,10 @@ mod tests {
         let mut serial_buf = [0u8; 9];
         let serial_len = write_varint(&mut serial_buf, serial);
         let header_size = 1 + serial_len;
-        assert!(header_size < 128, "test record header must fit one varint byte");
+        assert!(
+            header_size < 128,
+            "test record header must fit one varint byte"
+        );
         let mut record = vec![header_size as u8];
         record.extend_from_slice(&serial_buf[..serial_len]);
         record.extend_from_slice(&body);
@@ -3569,7 +3595,10 @@ mod tests {
                 row.push(SqliteValue::Integer(i64::from(i)));
             }
         }
-        assert!(row.len() > 64, "row must exceed the 64-column lazy boundary");
+        assert!(
+            row.len() > 64,
+            "row must exceed the 64-column lazy boundary"
+        );
         let record = serialize_record_with_encoding(&row, TextEncoding::Utf16le);
 
         let mut scratch = RecordDecodeScratch::default();

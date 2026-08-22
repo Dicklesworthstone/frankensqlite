@@ -32,19 +32,28 @@ const CASES: &[Case] = &[
     //    COLLATE NOCASE, bare secondary tie-breaker. Oracle: 'A','a','B','b'.
     Case {
         name: "repro/quote-derived-nocase-then-binary",
-        seed: &["CREATE TABLE q(x TEXT)", "INSERT INTO q VALUES('B'),('a'),('A'),('b')"],
+        seed: &[
+            "CREATE TABLE q(x TEXT)",
+            "INSERT INTO q VALUES('B'),('a'),('A'),('b')",
+        ],
         sql: "SELECT quote(x) FROM (SELECT x FROM q) ORDER BY x COLLATE NOCASE, x",
     },
     // ── Concat expression output variant (x || '!').
     Case {
         name: "concat-output-variant",
-        seed: &["CREATE TABLE q(x TEXT)", "INSERT INTO q VALUES('B'),('a'),('A'),('b')"],
+        seed: &[
+            "CREATE TABLE q(x TEXT)",
+            "INSERT INTO q VALUES('B'),('a'),('A'),('b')",
+        ],
         sql: "SELECT x||'!' FROM (SELECT x FROM q) ORDER BY x COLLATE NOCASE, x",
     },
     // ── DESC on the (binary) secondary tie-breaker.
     Case {
         name: "desc-secondary",
-        seed: &["CREATE TABLE q(x TEXT)", "INSERT INTO q VALUES('B'),('a'),('A'),('b')"],
+        seed: &[
+            "CREATE TABLE q(x TEXT)",
+            "INSERT INTO q VALUES('B'),('a'),('A'),('b')",
+        ],
         sql: "SELECT quote(x) FROM (SELECT x FROM q) ORDER BY x COLLATE NOCASE, x DESC",
     },
     // ── Three keys: COLLATE NOCASE primary, then two BINARY tie-breakers.
@@ -61,13 +70,19 @@ const CASES: &[Case] = &[
     //    uses the VDBE sorter and was already correct; it must stay correct.
     Case {
         name: "control/base-table-stays-correct",
-        seed: &["CREATE TABLE q(x TEXT)", "INSERT INTO q VALUES('B'),('a'),('A'),('b')"],
+        seed: &[
+            "CREATE TABLE q(x TEXT)",
+            "INSERT INTO q VALUES('B'),('a'),('A'),('b')",
+        ],
         sql: "SELECT quote(x) FROM q ORDER BY x COLLATE NOCASE, x",
     },
     // ── Control: bare-column output over the derived table (no expression).
     Case {
         name: "control/bare-column-output-over-derived",
-        seed: &["CREATE TABLE q(x TEXT)", "INSERT INTO q VALUES('B'),('a'),('A'),('b')"],
+        seed: &[
+            "CREATE TABLE q(x TEXT)",
+            "INSERT INTO q VALUES('B'),('a'),('A'),('b')",
+        ],
         sql: "SELECT x FROM (SELECT x FROM q) ORDER BY x COLLATE NOCASE, x",
     },
     // ── Control: NOCASE primary with a NOCASE secondary (both same collation,
@@ -104,7 +119,9 @@ fn order_by_collate_secondary_key_matches_rusqlite_oracle() {
 
             let conn = Connection::open(":memory:").await.unwrap();
             for s in case.seed {
-                conn.execute(s).await.unwrap_or_else(|e| panic!("[{}] seed `{s}`: {e:?}", case.name));
+                conn.execute(s)
+                    .await
+                    .unwrap_or_else(|e| panic!("[{}] seed `{s}`: {e:?}", case.name));
             }
             let rows = conn
                 .query(case.sql)

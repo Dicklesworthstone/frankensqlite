@@ -479,7 +479,11 @@ fn test_gh302_freelist_reuse_survives_crash_reopen() {
     asupersync::test_utils::run_test(|| async {
         let writer = Connection::open(&db).await.expect("reopen after crash");
         let recovered_rows = query_i64(&writer, "SELECT COUNT(*) FROM t;").await;
-        assert_eq!(recovered_rows, ROWS / 2, "recovery must keep committed state");
+        assert_eq!(
+            recovered_rows,
+            ROWS / 2,
+            "recovery must keep committed state"
+        );
         writer
             .execute("BEGIN CONCURRENT;")
             .await
@@ -508,7 +512,10 @@ fn test_gh302_freelist_reuse_survives_crash_reopen() {
     let integrity: String = oracle
         .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
         .expect("oracle integrity_check");
-    assert_eq!(integrity, "ok", "stock integrity_check must pass after crash-reopen reuse");
+    assert_eq!(
+        integrity, "ok",
+        "stock integrity_check must pass after crash-reopen reuse"
+    );
 }
 
 /// GH#302 acceptance #3: freelist reuse must be exact across a CHECKPOINT
@@ -535,7 +542,10 @@ fn test_gh302_freelist_reuse_across_checkpoint_boundary() {
             .expect("delete");
         writer.execute("COMMIT;").await.expect("commit delete");
         let freelist_before = query_i64(&writer, "PRAGMA freelist_count;").await;
-        assert!(freelist_before > 0, "delete must free pages: {freelist_before}");
+        assert!(
+            freelist_before > 0,
+            "delete must free pages: {freelist_before}"
+        );
 
         // Checkpoint the freed state into the main database file. The pragma
         // returns a result row (busy/log/checkpointed), so drive it as a

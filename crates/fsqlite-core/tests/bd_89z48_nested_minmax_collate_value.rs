@@ -24,7 +24,8 @@ async fn frank_scalar(conn: &Connection, sql: &str) -> String {
 fn stock_scalar(setup: &str, query: &str) -> String {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(setup).unwrap();
-    conn.query_row(query, [], |r| r.get::<_, String>(0)).unwrap()
+    conn.query_row(query, [], |r| r.get::<_, String>(0))
+        .unwrap()
 }
 
 /// Explicit `COLLATE NOCASE` wrapper on the nested max() argument: value and row
@@ -89,7 +90,13 @@ fn nested_max_declared_collation_value_matches_row() {
             "CREATE TABLE p2(price INTEGER, name TEXT COLLATE NOCASE); INSERT INTO p2 VALUES(3,'m'),(1,'Z'),(2,'q');",
             "SELECT max(name) || price FROM p2;",
         );
-        assert_eq!(stock, "Z1", "oracle sanity: declared-NOCASE stock returns Z1");
-        assert_eq!(got, stock, "declared-collation nested max value/row (bd-89z48)");
+        assert_eq!(
+            stock, "Z1",
+            "oracle sanity: declared-NOCASE stock returns Z1"
+        );
+        assert_eq!(
+            got, stock,
+            "declared-collation nested max value/row (bd-89z48)"
+        );
     });
 }

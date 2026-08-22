@@ -45,13 +45,19 @@ fn ddl_conflict_error_messages_6mj9n() {
             "table t already exists",
         );
         assert_stock(
-            &err_of(&["CREATE TABLE t(a)", "CREATE INDEX ix ON t(a)"], "CREATE INDEX ix ON t(a)")
-                .await,
+            &err_of(
+                &["CREATE TABLE t(a)", "CREATE INDEX ix ON t(a)"],
+                "CREATE INDEX ix ON t(a)",
+            )
+            .await,
             "index ix already exists",
         );
         assert_stock(
             &err_of(
-                &["CREATE TABLE t(a)", "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END"],
+                &[
+                    "CREATE TABLE t(a)",
+                    "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+                ],
                 "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 2; END",
             )
             .await,
@@ -75,7 +81,10 @@ fn ddl_conflict_error_messages_6mj9n() {
         // DROP <object> that does not exist.
         assert_stock(&err_of(&[], "DROP INDEX nope").await, "no such index: nope");
         assert_stock(&err_of(&[], "DROP VIEW nope").await, "no such view: nope");
-        assert_stock(&err_of(&[], "DROP TRIGGER nope").await, "no such trigger: nope");
+        assert_stock(
+            &err_of(&[], "DROP TRIGGER nope").await,
+            "no such trigger: nope",
+        );
     });
 }
 
@@ -84,7 +93,10 @@ fn query_and_vtab_error_messages_6mj9n() {
     asupersync::test_utils::run_test(|| async {
         // INSERT into a missing table (SELECT/UPDATE/DELETE already used the
         // correct NoSuchTable path; INSERT wrapped it in Internal).
-        assert_stock(&err_of(&[], "INSERT INTO nope VALUES(1)").await, "no such table: nope");
+        assert_stock(
+            &err_of(&[], "INSERT INTO nope VALUES(1)").await,
+            "no such table: nope",
+        );
         // A missing column reports just the reference — never " in table T".
         assert_stock(
             &err_of(&["CREATE TABLE t(a)"], "SELECT nope FROM t").await,
@@ -118,7 +130,11 @@ fn query_and_vtab_error_messages_6mj9n() {
             "cannot drop column from virtual table \"ft\"",
         );
         assert_stock(
-            &err_of(&["CREATE VIRTUAL TABLE ft USING fts5(x)"], "ALTER TABLE ft ADD COLUMN z").await,
+            &err_of(
+                &["CREATE VIRTUAL TABLE ft USING fts5(x)"],
+                "ALTER TABLE ft ADD COLUMN z",
+            )
+            .await,
             "virtual tables may not be altered",
         );
     });
@@ -129,7 +145,10 @@ fn schema_and_generated_column_error_messages_6mj9n() {
     asupersync::test_utils::run_test(|| async {
         // DETACH of a database that is not attached / reserved.
         assert_stock(&err_of(&[], "DETACH nodb").await, "no such database: nodb");
-        assert_stock(&err_of(&[], "DETACH main").await, "cannot detach database main");
+        assert_stock(
+            &err_of(&[], "DETACH main").await,
+            "cannot detach database main",
+        );
         assert_stock(&err_of(&[], "DETACH temp").await, "no such database: temp");
         // ATTACH a schema name that is already in use.
         assert_stock(
@@ -137,10 +156,17 @@ fn schema_and_generated_column_error_messages_6mj9n() {
             "database aux is already in use",
         );
         // A PRAGMA qualified by an unknown schema (distinct wording from DETACH).
-        assert_stock(&err_of(&[], "PRAGMA nodb.user_version").await, "unknown database nodb");
+        assert_stock(
+            &err_of(&[], "PRAGMA nodb.user_version").await,
+            "unknown database nodb",
+        );
         // A table whose every column is GENERATED is rejected at CREATE time.
         assert_stock(
-            &err_of(&[], "CREATE TABLE t(a INTEGER GENERATED ALWAYS AS (1) VIRTUAL)").await,
+            &err_of(
+                &[],
+                "CREATE TABLE t(a INTEGER GENERATED ALWAYS AS (1) VIRTUAL)",
+            )
+            .await,
             "must have at least one non-generated column",
         );
         assert_stock(
@@ -177,7 +203,13 @@ fn unknown_attached_schema_create_messages_zh5kl() {
         // reports "unknown database <schema>" (routed through
         // execute_statement_dispatch_with_fk_scope). DML/DROP take a separate
         // fast-path and are tracked as a follow-up on bd-...-zh5kl.
-        assert_stock(&err_of(&[], "CREATE TABLE nodb.t(a)").await, "unknown database nodb");
-        assert_stock(&err_of(&[], "CREATE VIEW nodb.v AS SELECT 1").await, "unknown database nodb");
+        assert_stock(
+            &err_of(&[], "CREATE TABLE nodb.t(a)").await,
+            "unknown database nodb",
+        );
+        assert_stock(
+            &err_of(&[], "CREATE VIEW nodb.v AS SELECT 1").await,
+            "unknown database nodb",
+        );
     });
 }

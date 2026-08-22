@@ -12,7 +12,10 @@ use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
 async fn frank_opt_int(conn: &Connection, sql: &str) -> Option<i64> {
-    let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("frank error on `{sql}`: {e:?}"));
+    let rows = conn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("frank error on `{sql}`: {e:?}"));
     match &rows[0].values()[0] {
         SqliteValue::Integer(n) => Some(*n),
         SqliteValue::Null => None,
@@ -57,7 +60,10 @@ fn values_columnn_in_scalar_subquery_matches_stock() {
         for sql in cases {
             let got = frank_opt_int(&conn, sql).await;
             let stock = stock_opt_int(sql);
-            assert_eq!(got, stock, "scalar subquery over VALUES diverges from stock: {sql}");
+            assert_eq!(
+                got, stock,
+                "scalar subquery over VALUES diverges from stock: {sql}"
+            );
         }
     });
 }

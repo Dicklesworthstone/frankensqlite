@@ -33,17 +33,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -66,62 +75,130 @@ fn temp_schema_dml_and_objects_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // unqualified INSERT routes to the TEMP shadow
         ex(&f, &r, "INSERT INTO t VALUES (30,'temp30')").await;
-        check("insert -> temp", fq(&f, "SELECT id,src FROM temp.t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM temp.t ORDER BY id"), &mut diffs);
-        check("insert leaves main", fq(&f, "SELECT id,src FROM main.t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM main.t ORDER BY id"), &mut diffs);
+        check(
+            "insert -> temp",
+            fq(&f, "SELECT id,src FROM temp.t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM temp.t ORDER BY id"),
+            &mut diffs,
+        );
+        check(
+            "insert leaves main",
+            fq(&f, "SELECT id,src FROM main.t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM main.t ORDER BY id"),
+            &mut diffs,
+        );
         // unqualified UPDATE routes to temp
         ex(&f, &r, "UPDATE t SET src='temp-upd' WHERE id=10").await;
-        check("update -> temp", fq(&f, "SELECT id,src FROM temp.t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM temp.t ORDER BY id"), &mut diffs);
-        check("update leaves main", fq(&f, "SELECT id,src FROM main.t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM main.t ORDER BY id"), &mut diffs);
+        check(
+            "update -> temp",
+            fq(&f, "SELECT id,src FROM temp.t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM temp.t ORDER BY id"),
+            &mut diffs,
+        );
+        check(
+            "update leaves main",
+            fq(&f, "SELECT id,src FROM main.t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM main.t ORDER BY id"),
+            &mut diffs,
+        );
         // unqualified DELETE routes to temp
         ex(&f, &r, "DELETE FROM t WHERE id=20").await;
-        check("delete -> temp", fq(&f, "SELECT id,src FROM temp.t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM temp.t ORDER BY id"), &mut diffs);
-        check("delete leaves main", fq(&f, "SELECT count(*) FROM main.t").await,
-              rq(&r, "SELECT count(*) FROM main.t"), &mut diffs);
+        check(
+            "delete -> temp",
+            fq(&f, "SELECT id,src FROM temp.t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM temp.t ORDER BY id"),
+            &mut diffs,
+        );
+        check(
+            "delete leaves main",
+            fq(&f, "SELECT count(*) FROM main.t").await,
+            rq(&r, "SELECT count(*) FROM main.t"),
+            &mut diffs,
+        );
 
         // CREATE TEMP TABLE AS SELECT from main
-        ex(&f, &r, "CREATE TEMP TABLE derived AS SELECT id, src FROM main.t WHERE id >= 2").await;
-        check("ctas from main", fq(&f, "SELECT id,src FROM derived ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM derived ORDER BY id"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "CREATE TEMP TABLE derived AS SELECT id, src FROM main.t WHERE id >= 2",
+        )
+        .await;
+        check(
+            "ctas from main",
+            fq(&f, "SELECT id,src FROM derived ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM derived ORDER BY id"),
+            &mut diffs,
+        );
 
         // temp index on a temp table, used by a range query
         ex(&f, &r, "CREATE INDEX temp.ix_derived_id ON derived(id)").await;
-        check("temp index query", fq(&f, "SELECT id FROM derived WHERE id > 2 ORDER BY id").await,
-              rq(&r, "SELECT id FROM derived WHERE id > 2 ORDER BY id"), &mut diffs);
+        check(
+            "temp index query",
+            fq(&f, "SELECT id FROM derived WHERE id > 2 ORDER BY id").await,
+            rq(&r, "SELECT id FROM derived WHERE id > 2 ORDER BY id"),
+            &mut diffs,
+        );
 
         // temp trigger firing on a temp-table write
         ex(&f, &r, "CREATE TEMP TABLE audit(msg TEXT)").await;
         ex(&f, &r, "CREATE TEMP TRIGGER trg AFTER INSERT ON derived BEGIN INSERT INTO audit VALUES ('ins-'||NEW.id); END").await;
         ex(&f, &r, "INSERT INTO derived VALUES (99,'x')").await;
-        check("temp trigger fired", fq(&f, "SELECT msg FROM audit ORDER BY msg").await,
-              rq(&r, "SELECT msg FROM audit ORDER BY msg"), &mut diffs);
+        check(
+            "temp trigger fired",
+            fq(&f, "SELECT msg FROM audit ORDER BY msg").await,
+            rq(&r, "SELECT msg FROM audit ORDER BY msg"),
+            &mut diffs,
+        );
 
         // temp table AUTOINCREMENT / rowid behavior
-        ex(&f, &r, "CREATE TEMP TABLE seq(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)").await;
+        ex(
+            &f,
+            &r,
+            "CREATE TEMP TABLE seq(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        )
+        .await;
         ex(&f, &r, "INSERT INTO seq(v) VALUES ('a'),('b'),('c')").await;
         ex(&f, &r, "DELETE FROM seq WHERE id=3").await;
-        ex(&f, &r, "INSERT INTO seq(v) VALUES ('d')").await;   // autoinc must not reuse 3
-        check("temp autoincrement", fq(&f, "SELECT id,v FROM seq ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM seq ORDER BY id"), &mut diffs);
+        ex(&f, &r, "INSERT INTO seq(v) VALUES ('d')").await; // autoinc must not reuse 3
+        check(
+            "temp autoincrement",
+            fq(&f, "SELECT id,v FROM seq ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM seq ORDER BY id"),
+            &mut diffs,
+        );
 
         // DROP the temp shadow -> bare-name DML now hits main.t
         ex(&f, &r, "DROP TABLE temp.t").await;
-        ex(&f, &r, "INSERT INTO t VALUES (4,'main4')").await;   // now targets main.t
-        check("post-drop insert -> main", fq(&f, "SELECT id,src FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM t ORDER BY id"), &mut diffs);
-        check("post-drop main direct", fq(&f, "SELECT id,src FROM main.t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM main.t ORDER BY id"), &mut diffs);
+        ex(&f, &r, "INSERT INTO t VALUES (4,'main4')").await; // now targets main.t
+        check(
+            "post-drop insert -> main",
+            fq(&f, "SELECT id,src FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM t ORDER BY id"),
+            &mut diffs,
+        );
+        check(
+            "post-drop main direct",
+            fq(&f, "SELECT id,src FROM main.t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM main.t ORDER BY id"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} TEMP-schema DML/objects divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} TEMP-schema DML/objects divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

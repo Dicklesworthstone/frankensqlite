@@ -30,7 +30,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 }
 
 async fn fval(conn: &Connection, sql: &str) -> String {
-    let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("frank `{sql}`: {e:?}"));
+    let rows = conn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("frank `{sql}`: {e:?}"));
     assert_eq!(rows.len(), 1, "frank `{sql}` returned {} rows", rows.len());
     tag_f(&rows[0].values()[0])
 }

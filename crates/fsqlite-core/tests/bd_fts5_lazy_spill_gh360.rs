@@ -49,11 +49,16 @@ fn bd_fts5_lazy_spill_gh360_reads_stock_split_doclist() {
             // (This also removes doc 1's `w1` token.)
             let big = vec!["common"; 80].join(" ");
             stock
-                .execute("UPDATE t SET x = ?1 WHERE rowid = 1", rusqlite::params![big])
+                .execute(
+                    "UPDATE t SET x = ?1 WHERE rowid = 1",
+                    rusqlite::params![big],
+                )
                 .unwrap();
             // Merge into one segment: 'common' becomes one long doclist over
             // consecutive leaf pages.
-            stock.execute_batch("INSERT INTO t(t) VALUES('optimize');").unwrap();
+            stock
+                .execute_batch("INSERT INTO t(t) VALUES('optimize');")
+                .unwrap();
 
             // Guard: the corpus must actually span multiple leaf pages, else this
             // test would not exercise the stitcher.

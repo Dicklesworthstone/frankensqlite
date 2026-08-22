@@ -62,7 +62,9 @@ fn ctas_column_affinity_matches_rusqlite_oracle() {
             let expected = oracle(script);
             let conn = Connection::open(":memory:").await.unwrap();
             for s in *script {
-                conn.execute(s).await.unwrap_or_else(|e| panic!("`{s}`: {e:?}"));
+                conn.execute(s)
+                    .await
+                    .unwrap_or_else(|e| panic!("`{s}`: {e:?}"));
             }
             let rows = conn.query(PROBE).await.expect("probe");
             let got: Vec<String> = rows
@@ -72,7 +74,10 @@ fn ctas_column_affinity_matches_rusqlite_oracle() {
                     ref other => panic!("typeof not text: {other:?}"),
                 })
                 .collect();
-            assert_eq!(got, expected, "CTAS affinity for script {script:?} diverged from oracle");
+            assert_eq!(
+                got, expected,
+                "CTAS affinity for script {script:?} diverged from oracle"
+            );
         }
     });
 }

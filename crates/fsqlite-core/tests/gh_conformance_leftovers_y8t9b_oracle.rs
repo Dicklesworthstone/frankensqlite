@@ -243,10 +243,7 @@ fn probe_typeof_where_filters_all_rows() {
     asupersync::test_utils::run_test(|| async {
         // Non-empty table but WHERE excludes every row -> same empty-group path.
         agree(
-            &[
-                "CREATE TABLE t(a INT)",
-                "INSERT INTO t VALUES(1),(2),(3)",
-            ],
+            &["CREATE TABLE t(a INT)", "INSERT INTO t VALUES(1),(2),(3)"],
             "SELECT count(*), typeof(a), coalesce(a,-1) FROM t WHERE a > 100",
             "bd-9zlcs: typeof/coalesce over WHERE-emptied group match stock",
         )
@@ -259,10 +256,7 @@ fn probe_typeof_nonempty_bare_aggregate_unchanged() {
     asupersync::test_utils::run_test(|| async {
         // Regression guard: a non-empty group keeps the captured scanned value.
         agree(
-            &[
-                "CREATE TABLE t(a INT)",
-                "INSERT INTO t VALUES(7),(8)",
-            ],
+            &["CREATE TABLE t(a INT)", "INSERT INTO t VALUES(7),(8)"],
             "SELECT count(*), typeof(a), coalesce(a,-1) FROM t",
             "bd-9zlcs: non-empty bare-aggregate value unchanged",
         )

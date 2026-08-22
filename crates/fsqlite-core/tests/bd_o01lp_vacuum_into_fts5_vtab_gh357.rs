@@ -42,9 +42,7 @@ fn bd_o01lp_vacuum_into_preserves_contentless_fts5_vtab_entry_gh357() {
         // Sanity: the SOURCE exposes the vtab entry (this is what the output
         // must round-trip).
         let src_master = conn
-            .query(
-                "SELECT name FROM sqlite_master WHERE name='search' AND type='table';",
-            )
+            .query("SELECT name FROM sqlite_master WHERE name='search' AND type='table';")
             .await
             .expect("query source sqlite_master");
         assert_eq!(

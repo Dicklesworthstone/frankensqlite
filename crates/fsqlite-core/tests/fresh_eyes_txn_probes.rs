@@ -36,12 +36,16 @@ fn fresh_eyes_lazy_delete_rollback_restores_count() {
             conn.close().await.unwrap();
         }
         // Schema-only open binds lazily (the production cass path).
-        let conn = Connection::open_existing_schema_only(&db_str).await.unwrap();
+        let conn = Connection::open_existing_schema_only(&db_str)
+            .await
+            .unwrap();
         let c0 = conn.query("SELECT count(*) FROM t;").await.unwrap();
         assert_eq!(scalar_i64(&c0), 3, "reopened count");
 
         conn.execute("BEGIN;").await.unwrap();
-        conn.execute("DELETE FROM t WHERE rowid = 2;").await.unwrap();
+        conn.execute("DELETE FROM t WHERE rowid = 2;")
+            .await
+            .unwrap();
         conn.execute("ROLLBACK;").await.unwrap();
 
         let c1 = conn.query("SELECT count(*) FROM t;").await.unwrap();
@@ -79,9 +83,11 @@ fn fresh_eyes_segid_growth_stays_stock_readable() {
             // Each statement appends one segment (plus merges); max segid grows
             // monotonically past stock's FTS5_MAX_SEGMENT=2000.
             for id in 1..=2100_i64 {
-                conn.execute(&format!("INSERT INTO t(rowid, body) VALUES ({id}, 'w{id}');"))
-                    .await
-                    .unwrap();
+                conn.execute(&format!(
+                    "INSERT INTO t(rowid, body) VALUES ({id}, 'w{id}');"
+                ))
+                .await
+                .unwrap();
             }
             conn.close().await.unwrap();
         }
@@ -91,11 +97,9 @@ fn fresh_eyes_segid_growth_stays_stock_readable() {
             .unwrap();
         assert_eq!(integrity, "ok", "stock integrity_check");
         let matched: i64 = stock
-            .query_row(
-                "SELECT count(*) FROM t WHERE t MATCH 'w2099'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT count(*) FROM t WHERE t MATCH 'w2099'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(matched, 1, "stock can query the >2000-segid image");
         let fts_check: std::result::Result<usize, _> =

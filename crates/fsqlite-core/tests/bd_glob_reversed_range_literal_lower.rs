@@ -7,7 +7,10 @@ use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
 async fn glob(c: &Connection, expr: &str) -> i64 {
-    let rows = c.query_with_params(&format!("SELECT {expr}"), &[]).await.unwrap();
+    let rows = c
+        .query_with_params(&format!("SELECT {expr}"), &[])
+        .await
+        .unwrap();
     match rows.first().map(|r| r.values()[0].clone()) {
         Some(SqliteValue::Integer(n)) => n,
         other => panic!("expected integer for `{expr}`, got {other:?}"),

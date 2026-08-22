@@ -16,7 +16,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
@@ -26,7 +29,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
@@ -39,8 +45,10 @@ async fn both(
 ) -> (Result<Vec<Vec<String>>, ()>, Result<Vec<Vec<String>>, ()>) {
     let f = match fconn.query(sql).await {
         Ok(rows) => Ok({
-            let mut v: Vec<Vec<String>> =
-                rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect();
+            let mut v: Vec<Vec<String>> = rows
+                .iter()
+                .map(|r| r.values().iter().map(tag_f).collect())
+                .collect();
             v.sort();
             v
         }),
@@ -51,7 +59,9 @@ async fn both(
         let n = stmt.column_count();
         let mut rows: Vec<Vec<String>> = stmt
             .query_map([], |row| {
-                Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())
+                Ok((0..n)
+                    .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                    .collect())
             })
             .map_err(|_| ())?
             .collect::<Result<Vec<_>, _>>()
@@ -64,7 +74,10 @@ async fn both(
 
 async fn assert_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &str) {
     let (f, r) = both(fconn, rconn, sql).await;
-    assert_eq!(f, r, "GH#158 divergence on `{sql}`\n  frank: {f:?}\n  csql:  {r:?}");
+    assert_eq!(
+        f, r,
+        "GH#158 divergence on `{sql}`\n  frank: {f:?}\n  csql:  {r:?}"
+    );
 }
 
 async fn seed(fconn: &Connection, rconn: &rusqlite::Connection) {
@@ -85,9 +98,19 @@ fn insert_or_ignore_returning_skips_conflicting_rowid_values() {
         seed(&f, &r).await;
 
         // Conflict on the INTEGER PK: RETURNING must emit NO rows on both engines.
-        assert_agree(&f, &r, "INSERT OR IGNORE INTO a VALUES (1, 99) RETURNING id, v").await;
+        assert_agree(
+            &f,
+            &r,
+            "INSERT OR IGNORE INTO a VALUES (1, 99) RETURNING id, v",
+        )
+        .await;
         // Non-conflicting: RETURNING emits the newly inserted row.
-        assert_agree(&f, &r, "INSERT OR IGNORE INTO a VALUES (2, 20) RETURNING id, v").await;
+        assert_agree(
+            &f,
+            &r,
+            "INSERT OR IGNORE INTO a VALUES (2, 20) RETURNING id, v",
+        )
+        .await;
         // Mixed multi-row: only the non-conflicting rows are returned.
         assert_agree(
             &f,

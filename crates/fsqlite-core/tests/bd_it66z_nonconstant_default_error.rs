@@ -41,10 +41,17 @@ fn nonconstant_default_error_message_it66z() {
     asupersync::test_utils::run_test(|| async {
         const EXPECTED: &str = "default value of column [b] is not constant";
         // CREATE TABLE with a non-constant default (column reference).
-        assert_stock(&err_of(&[], "CREATE TABLE t(a, b DEFAULT (a))").await, EXPECTED);
+        assert_stock(
+            &err_of(&[], "CREATE TABLE t(a, b DEFAULT (a))").await,
+            EXPECTED,
+        );
         // ALTER TABLE ADD COLUMN with a non-constant default.
         assert_stock(
-            &err_of(&["CREATE TABLE t(a)"], "ALTER TABLE t ADD COLUMN b DEFAULT (a)").await,
+            &err_of(
+                &["CREATE TABLE t(a)"],
+                "ALTER TABLE t ADD COLUMN b DEFAULT (a)",
+            )
+            .await,
             EXPECTED,
         );
     });
@@ -68,13 +75,19 @@ fn bare_identifier_default_is_string_literal_it66z() {
         let rows = c.query("SELECT quote(b), typeof(b) FROM t").await.unwrap();
         assert_eq!(rows.len(), 1);
         let v = rows[0].values();
-        assert_eq!(text_of(&v[0]), "'abc'", "b defaults to the TEXT literal 'abc'");
+        assert_eq!(
+            text_of(&v[0]),
+            "'abc'",
+            "b defaults to the TEXT literal 'abc'"
+        );
         assert_eq!(text_of(&v[1]), "text", "typeof(b) is text");
 
         // A keyword-constant DEFAULT keeps its literal (non-string) meaning — the
         // bare-id path must not swallow TRUE/FALSE/NULL/CURRENT_*.
         let c2 = Connection::open(":memory:").await.unwrap();
-        c2.execute("CREATE TABLE t2(a, b DEFAULT true)").await.unwrap();
+        c2.execute("CREATE TABLE t2(a, b DEFAULT true)")
+            .await
+            .unwrap();
         c2.execute("INSERT INTO t2(a) VALUES (1)").await.unwrap();
         let r2 = c2.query("SELECT typeof(b) FROM t2").await.unwrap();
         assert_eq!(
@@ -89,7 +102,11 @@ fn bare_identifier_default_is_string_literal_it66z() {
 fn add_primary_key_column_message_it66z() {
     asupersync::test_utils::run_test(|| async {
         assert_stock(
-            &err_of(&["CREATE TABLE t(a)"], "ALTER TABLE t ADD COLUMN b INTEGER PRIMARY KEY").await,
+            &err_of(
+                &["CREATE TABLE t(a)"],
+                "ALTER TABLE t ADD COLUMN b INTEGER PRIMARY KEY",
+            )
+            .await,
             "Cannot add a PRIMARY KEY column",
         );
     });
@@ -99,7 +116,11 @@ fn add_primary_key_column_message_it66z() {
 fn add_unique_column_message_it66z() {
     asupersync::test_utils::run_test(|| async {
         assert_stock(
-            &err_of(&["CREATE TABLE t(a)"], "ALTER TABLE t ADD COLUMN b TEXT UNIQUE").await,
+            &err_of(
+                &["CREATE TABLE t(a)"],
+                "ALTER TABLE t ADD COLUMN b TEXT UNIQUE",
+            )
+            .await,
             "Cannot add a UNIQUE column",
         );
     });
@@ -141,7 +162,11 @@ fn rename_drop_no_such_column_message_it66z() {
         // Stock quotes the missing column name in the ALTER context and reports
         // SQLITE_ERROR (not Internal): `no such column: "zzz"`.
         assert_stock(
-            &err_of(&["CREATE TABLE t(a, b)"], "ALTER TABLE t RENAME COLUMN zzz TO c").await,
+            &err_of(
+                &["CREATE TABLE t(a, b)"],
+                "ALTER TABLE t RENAME COLUMN zzz TO c",
+            )
+            .await,
             "no such column: \"zzz\"",
         );
         assert_stock(

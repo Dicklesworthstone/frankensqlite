@@ -20,7 +20,9 @@ fn gh137_sub1_unusable_partial_index_errors() {
         conn.execute("CREATE INDEX p ON t(k) WHERE k > 2;")
             .await
             .unwrap();
-        conn.execute("INSERT INTO t VALUES (1,1),(2,3);").await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1,1),(2,3);")
+            .await
+            .unwrap();
 
         // Stock: "no query solution". frank must also refuse (not return 1,2).
         let res = conn.query("SELECT id FROM t INDEXED BY p;").await;
@@ -47,12 +49,12 @@ fn gh137_sub2_aggregate_honors_indexed_by_scan_order() {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, ord INTEGER, x INTEGER);")
             .await
             .unwrap();
-        conn.execute("CREATE INDEX idx_ord ON t(ord);").await.unwrap();
-        conn.execute(
-            "INSERT INTO t VALUES (1,1,9223372036854775807),(2,3,1),(3,2,-1);",
-        )
-        .await
-        .unwrap();
+        conn.execute("CREATE INDEX idx_ord ON t(ord);")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1,1,9223372036854775807),(2,3,1),(3,2,-1);")
+            .await
+            .unwrap();
 
         let res = conn.query("SELECT sum(x) FROM t INDEXED BY idx_ord;").await;
         let got = res.expect("sum honoring INDEXED BY must not overflow");
@@ -74,7 +76,9 @@ fn gh137_sub2_covering_and_noncovering_unchanged() {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, ord INTEGER, x INTEGER);")
             .await
             .unwrap();
-        conn.execute("CREATE INDEX idx_ord ON t(ord);").await.unwrap();
+        conn.execute("CREATE INDEX idx_ord ON t(ord);")
+            .await
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1,3,10),(2,1,20),(3,2,30);")
             .await
             .unwrap();
@@ -106,7 +110,9 @@ fn gh137_sub2_where_residual() {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, ord INTEGER, x INTEGER);")
             .await
             .unwrap();
-        conn.execute("CREATE INDEX idx_ord ON t(ord);").await.unwrap();
+        conn.execute("CREATE INDEX idx_ord ON t(ord);")
+            .await
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1,3,10),(2,1,20),(3,2,30);")
             .await
             .unwrap();
@@ -131,11 +137,9 @@ fn gh137_sub2_without_rowid() {
             .await
             .unwrap();
         conn.execute("CREATE INDEX wi ON w(ord);").await.unwrap();
-        conn.execute(
-            "INSERT INTO w VALUES ('a',1,9223372036854775807),('b',3,1),('c',2,-1);",
-        )
-        .await
-        .unwrap();
+        conn.execute("INSERT INTO w VALUES ('a',1,9223372036854775807),('b',3,1),('c',2,-1);")
+            .await
+            .unwrap();
 
         let res = conn
             .query("SELECT sum(x) FROM w INDEXED BY wi;")
@@ -158,7 +162,9 @@ fn gh137_sub2_empty_table() {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, ord INTEGER, x INTEGER);")
             .await
             .unwrap();
-        conn.execute("CREATE INDEX idx_ord ON t(ord);").await.unwrap();
+        conn.execute("CREATE INDEX idx_ord ON t(ord);")
+            .await
+            .unwrap();
 
         let res = conn
             .query("SELECT sum(x), count(*) FROM t INDEXED BY idx_ord;")

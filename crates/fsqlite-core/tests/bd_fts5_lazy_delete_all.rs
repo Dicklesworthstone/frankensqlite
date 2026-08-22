@@ -295,12 +295,22 @@ fn bd_2mzkj_external_content_delete_all_preserves_content_visibility() {
             "pre count(*)"
         );
         assert_eq!(
-            count_scalar(&conn.query("SELECT count(*) FROM (SELECT body FROM t);").await.unwrap()),
+            count_scalar(
+                &conn
+                    .query("SELECT count(*) FROM (SELECT body FROM t);")
+                    .await
+                    .unwrap()
+            ),
             2,
             "pre scan"
         );
         assert_eq!(
-            count_scalar(&conn.query("SELECT count(*) FROM t WHERE t MATCH 'hello';").await.unwrap()),
+            count_scalar(
+                &conn
+                    .query("SELECT count(*) FROM t WHERE t MATCH 'hello';")
+                    .await
+                    .unwrap()
+            ),
             1,
             "pre MATCH"
         );
@@ -318,12 +328,22 @@ fn bd_2mzkj_external_content_delete_all_preserves_content_visibility() {
             "bd-2mzkj: external-content delete-all must keep count(*) reading the content source, not 0"
         );
         assert_eq!(
-            count_scalar(&conn.query("SELECT count(*) FROM (SELECT body FROM t);").await.unwrap()),
+            count_scalar(
+                &conn
+                    .query("SELECT count(*) FROM (SELECT body FROM t);")
+                    .await
+                    .unwrap()
+            ),
             2,
             "external-content scans still read the content source after delete-all"
         );
         assert_eq!(
-            count_scalar(&conn.query("SELECT count(*) FROM t WHERE t MATCH 'hello';").await.unwrap()),
+            count_scalar(
+                &conn
+                    .query("SELECT count(*) FROM t WHERE t MATCH 'hello';")
+                    .await
+                    .unwrap()
+            ),
             0,
             "delete-all cleared the index, so MATCH finds nothing"
         );
@@ -334,13 +354,21 @@ fn bd_2mzkj_external_content_delete_all_preserves_content_visibility() {
         let integ: String = stock
             .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(integ, "ok", "stock integrity_check after external-content delete-all");
+        assert_eq!(
+            integ, "ok",
+            "stock integrity_check after external-content delete-all"
+        );
         let stock_count: i64 = stock
             .query_row("SELECT count(*) FROM t;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(stock_count, 2, "stock: count(*) reads the content source after delete-all");
+        assert_eq!(
+            stock_count, 2,
+            "stock: count(*) reads the content source after delete-all"
+        );
         let stock_match: i64 = stock
-            .query_row("SELECT count(*) FROM t WHERE t MATCH 'hello';", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM t WHERE t MATCH 'hello';", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(stock_match, 0, "stock: delete-all cleared the index");
     });
@@ -388,7 +416,12 @@ fn bd_plxob_external_content_delete_all_projects_real_bodies() {
             .await
             .unwrap();
 
-        let bodies = body_values(&conn.query("SELECT body FROM t ORDER BY rowid;").await.unwrap());
+        let bodies = body_values(
+            &conn
+                .query("SELECT body FROM t ORDER BY rowid;")
+                .await
+                .unwrap(),
+        );
         assert_eq!(
             bodies,
             vec![Some("hello world".to_owned()), Some("foo bar".to_owned())],
@@ -468,6 +501,9 @@ fn bd_plxob_external_content_rebuild_reindexes_source() {
         let integ: String = stock
             .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(integ, "ok", "stock integrity_check after external-content rebuild");
+        assert_eq!(
+            integ, "ok",
+            "stock integrity_check after external-content rebuild"
+        );
     });
 }

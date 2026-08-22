@@ -34,17 +34,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -71,9 +80,14 @@ fn pragma_introspection_depth_match_rusqlite_oracle() {
             r.execute(s, []).unwrap();
         }
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // table_info: columns with type/notnull/default/pk
         check("table_info child",
@@ -96,17 +110,37 @@ fn pragma_introspection_depth_match_rusqlite_oracle() {
             rq(&r, "SELECT name,\"unique\",origin,partial FROM pragma_index_list('parent') ORDER BY name"), &mut diffs);
 
         // index_info: columns of a named index (seqno, cid, name)
-        check("index_info ix_child_name",
-            fq(&f, "SELECT seqno,cid,name FROM pragma_index_info('ix_child_name') ORDER BY seqno").await,
-            rq(&r, "SELECT seqno,cid,name FROM pragma_index_info('ix_child_name') ORDER BY seqno"), &mut diffs);
+        check(
+            "index_info ix_child_name",
+            fq(
+                &f,
+                "SELECT seqno,cid,name FROM pragma_index_info('ix_child_name') ORDER BY seqno",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT seqno,cid,name FROM pragma_index_info('ix_child_name') ORDER BY seqno",
+            ),
+            &mut diffs,
+        );
         // index_xinfo: adds desc, coll, key flag
         check("index_xinfo ux_child_ppid",
             fq(&f, "SELECT seqno,cid,name,\"desc\",coll,key FROM pragma_index_xinfo('ux_child_ppid') ORDER BY seqno").await,
             rq(&r, "SELECT seqno,cid,name,\"desc\",coll,key FROM pragma_index_xinfo('ux_child_ppid') ORDER BY seqno"), &mut diffs);
         // expression index: keyed column has cid = -2
-        check("index_xinfo expr",
-            fq(&f, "SELECT seqno,cid,key FROM pragma_index_xinfo('ix_child_expr') ORDER BY seqno").await,
-            rq(&r, "SELECT seqno,cid,key FROM pragma_index_xinfo('ix_child_expr') ORDER BY seqno"), &mut diffs);
+        check(
+            "index_xinfo expr",
+            fq(
+                &f,
+                "SELECT seqno,cid,key FROM pragma_index_xinfo('ix_child_expr') ORDER BY seqno",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT seqno,cid,key FROM pragma_index_xinfo('ix_child_expr') ORDER BY seqno",
+            ),
+            &mut diffs,
+        );
 
         // foreign_key_list: the `to` = NULL for implicit-PK reference case + named-col case
         check("foreign_key_list child",
@@ -114,10 +148,18 @@ fn pragma_introspection_depth_match_rusqlite_oracle() {
             rq(&r, "SELECT id,seq,\"table\",\"from\",\"to\",on_update,on_delete,match FROM pragma_foreign_key_list('child') ORDER BY id,seq"), &mut diffs);
 
         // counts via the introspection tables
-        check("column count",
+        check(
+            "column count",
             fq(&f, "SELECT count(*) FROM pragma_table_info('child')").await,
-            rq(&r, "SELECT count(*) FROM pragma_table_info('child')"), &mut diffs);
+            rq(&r, "SELECT count(*) FROM pragma_table_info('child')"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} PRAGMA introspection divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} PRAGMA introspection divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

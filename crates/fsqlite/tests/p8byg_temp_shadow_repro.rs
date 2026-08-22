@@ -36,7 +36,11 @@ fn p8byg_pinpoint_failing_statement() {
         ];
         for s in setup {
             let r = f.execute(s).await;
-            println!("SETUP  {:<70} => {:?}", s, r.as_ref().map(|_| "ok").map_err(|e| e.to_string()));
+            println!(
+                "SETUP  {:<70} => {:?}",
+                s,
+                r.as_ref().map(|_| "ok").map_err(|e| e.to_string())
+            );
             r.unwrap_or_else(|e| panic!("setup failed: `{s}`: {e}"));
         }
         let render = |v: &SqliteValue| match v {
@@ -58,7 +62,11 @@ fn p8byg_pinpoint_failing_statement() {
                 .map(|rs| {
                     rs.iter()
                         .map(|row| {
-                            row.values().iter().map(render).collect::<Vec<_>>().join(",")
+                            row.values()
+                                .iter()
+                                .map(render)
+                                .collect::<Vec<_>>()
+                                .join(",")
                         })
                         .collect()
                 })
@@ -72,8 +80,25 @@ fn p8byg_pinpoint_failing_statement() {
                 Err(e) => {
                     println!("MUT ERR {s}\n   => {e}");
                     // dump both tables to see routing
-                    for q in ["SELECT id, value FROM main.t ORDER BY id", "SELECT temp_id, temp_value FROM temp.t ORDER BY temp_id"] {
-                        let rows: Vec<String> = f.query(q).await.map(|rs| rs.iter().map(|row| row.values().iter().map(render).collect::<Vec<_>>().join(",")).collect()).unwrap_or_else(|e| vec![format!("<query err: {e}>")]);
+                    for q in [
+                        "SELECT id, value FROM main.t ORDER BY id",
+                        "SELECT temp_id, temp_value FROM temp.t ORDER BY temp_id",
+                    ] {
+                        let rows: Vec<String> = f
+                            .query(q)
+                            .await
+                            .map(|rs| {
+                                rs.iter()
+                                    .map(|row| {
+                                        row.values()
+                                            .iter()
+                                            .map(render)
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_else(|e| vec![format!("<query err: {e}>")]);
                         println!("   {q} => {rows:?}");
                     }
                     panic!("FIRST FAILING STATEMENT: `{s}` -> {e}");

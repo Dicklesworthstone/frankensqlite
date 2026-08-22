@@ -17,7 +17,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -26,13 +29,19 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn fq(f: &Connection, sql: &str) -> Vec<Vec<String>> {
     match f.query_with_params(sql, &[]).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(e) => vec![vec![format!("<ERR {e:?}>")]],
     }
 }
@@ -43,7 +52,9 @@ fn rq(r: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     };
     let n = st.column_count();
     st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect())
     })
     .unwrap()
     .collect::<Result<Vec<_>, _>>()
@@ -78,16 +89,27 @@ async fn agree(sql: &str, msg: &str) {
     }
     let fr = fq(&f, sql).await;
     let rr = rq(&r, sql);
-    assert_eq!(fr, rr, "{msg}\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}");
+    assert_eq!(
+        fr, rr,
+        "{msg}\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}"
+    );
 }
 
 #[test]
 fn projection_alias_filter() {
     asupersync::test_utils::run_test(|| async {
         agree("SELECT id, v FROM vsimple ORDER BY id", "simple view").await;
-        agree("SELECT k, doubled FROM valias ORDER BY k", "aliased + expression columns").await;
+        agree(
+            "SELECT k, doubled FROM valias ORDER BY k",
+            "aliased + expression columns",
+        )
+        .await;
         agree("SELECT id, v FROM vfilter ORDER BY id", "filtering view").await;
-        agree("SELECT id, bucket FROM vexpr ORDER BY id", "CASE-expression view").await;
+        agree(
+            "SELECT id, bucket FROM vexpr ORDER BY id",
+            "CASE-expression view",
+        )
+        .await;
     });
 }
 
@@ -96,25 +118,49 @@ fn aggregate_and_union_views() {
     asupersync::test_utils::run_test(|| async {
         agree("SELECT g, total, n FROM vagg ORDER BY g", "aggregate view").await;
         agree("SELECT id FROM vunion ORDER BY id", "UNION view").await;
-        agree("SELECT count(*) AS groups, sum(total) AS grand FROM vagg", "re-aggregate an aggregate view").await;
+        agree(
+            "SELECT count(*) AS groups, sum(total) AS grand FROM vagg",
+            "re-aggregate an aggregate view",
+        )
+        .await;
     });
 }
 
 #[test]
 fn outer_clauses_over_view() {
     asupersync::test_utils::run_test(|| async {
-        agree("SELECT id FROM vsimple WHERE v >= 20 ORDER BY id", "outer WHERE push-down").await;
-        agree("SELECT id, v FROM vsimple ORDER BY v DESC LIMIT 2", "outer ORDER BY + LIMIT").await;
-        agree("SELECT count(*), max(v) FROM vsimple", "aggregate over a view").await;
+        agree(
+            "SELECT id FROM vsimple WHERE v >= 20 ORDER BY id",
+            "outer WHERE push-down",
+        )
+        .await;
+        agree(
+            "SELECT id, v FROM vsimple ORDER BY v DESC LIMIT 2",
+            "outer ORDER BY + LIMIT",
+        )
+        .await;
+        agree(
+            "SELECT count(*), max(v) FROM vsimple",
+            "aggregate over a view",
+        )
+        .await;
     });
 }
 
 #[test]
 fn nested_joined_subquery_views() {
     asupersync::test_utils::run_test(|| async {
-        agree("SELECT k, doubled FROM vnested ORDER BY k", "nested view over a view").await;
+        agree(
+            "SELECT k, doubled FROM vnested ORDER BY k",
+            "nested view over a view",
+        )
+        .await;
         agree("SELECT id, v, label FROM vjoin ORDER BY id", "joined view").await;
-        agree("SELECT id, higher FROM vsub ORDER BY id", "view with a correlated-subquery column").await;
+        agree(
+            "SELECT id, higher FROM vsub ORDER BY id",
+            "view with a correlated-subquery column",
+        )
+        .await;
         agree("SELECT vsimple.id, vsimple.v, u.label FROM vsimple JOIN u ON u.id=vsimple.id ORDER BY vsimple.id", "join a view to a table").await;
     });
 }

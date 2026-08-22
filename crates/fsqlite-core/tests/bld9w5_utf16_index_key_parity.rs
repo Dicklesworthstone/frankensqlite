@@ -55,7 +55,10 @@ const ROWS: &[&str] = &["INSERT INTO t(id, k, v) VALUES \
 /// 2=UTF-16le, 3=UTF-16be.
 fn header_text_encoding(path: &std::path::Path) -> u32 {
     let bytes = std::fs::read(path).expect("read database file header");
-    assert!(bytes.len() >= 60, "database shorter than its 100-byte header");
+    assert!(
+        bytes.len() >= 60,
+        "database shorter than its 100-byte header"
+    );
     u32::from_be_bytes([bytes[56], bytes[57], bytes[58], bytes[59]])
 }
 
@@ -92,7 +95,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
         SqliteValue::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -104,7 +110,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
         rusqlite::types::Value::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -182,7 +191,11 @@ async fn run_parity(encoding: &str, expect_header: u32, label: &str) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join(format!("bld9w5_{label}.db"));
     build_stock_db(&path, encoding);
-    assert_eq!(header_text_encoding(&path), expect_header, "[{label}] wrong header encoding");
+    assert_eq!(
+        header_text_encoding(&path),
+        expect_header,
+        "[{label}] wrong header encoding"
+    );
 
     let fconn = Connection::open(path.to_str().unwrap())
         .await

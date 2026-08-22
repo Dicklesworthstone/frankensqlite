@@ -537,7 +537,8 @@ mod tests {
 
         // The WAL grows before execution — the state is now stale.
         let extra = sample_page(0xAB);
-        wal.append_frame(&cx, 4, &extra, 0).expect("append extra frame");
+        wal.append_frame(&cx, 4, &extra, 0)
+            .expect("append extra frame");
         wal.append_frame(&cx, 5, &extra, 5)
             .expect("append extra commit frame");
         assert_eq!(wal.frame_count(), 5);

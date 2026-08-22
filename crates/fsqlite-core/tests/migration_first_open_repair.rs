@@ -106,7 +106,9 @@ fn clean_database_is_stamped_at_birth_without_repair() {
             "no backup for a clean database"
         );
 
-        let conn2 = Connection::open(&db).await.expect("reopen (AlreadyMigrated)");
+        let conn2 = Connection::open(&db)
+            .await
+            .expect("reopen (AlreadyMigrated)");
         assert_eq!(integrity_lines(&conn2).await, vec!["ok".to_owned()]);
         conn2.close().await.unwrap();
     });
@@ -125,7 +127,9 @@ fn prefix_corrupt_database_is_repaired_on_first_open() {
         );
 
         // First open under current code triggers the migration/repair pass.
-        let conn = Connection::open(&db).await.expect("open triggers migration");
+        let conn = Connection::open(&db)
+            .await
+            .expect("open triggers migration");
         assert_eq!(
             integrity_lines(&conn).await,
             vec!["ok".to_owned()],
@@ -141,7 +145,10 @@ fn prefix_corrupt_database_is_repaired_on_first_open() {
         );
 
         let backup = pre_migration_backup_path(&db);
-        assert!(backup.exists(), "original preserved at the pre-migration backup");
+        assert!(
+            backup.exists(),
+            "original preserved at the pre-migration backup"
+        );
         assert_ne!(
             std::fs::read(&backup).unwrap(),
             std::fs::read(&db).unwrap(),
@@ -175,7 +182,10 @@ fn migration_runs_once_per_version() {
             "second open must not re-run the repair (no new backup)"
         );
         let marker2 = read_migration_marker(&db).expect("marker after second open");
-        assert_eq!(marker1, marker2, "marker unchanged: migration did not re-run");
+        assert_eq!(
+            marker1, marker2,
+            "marker unchanged: migration did not re-run"
+        );
     });
 }
 
@@ -217,7 +227,9 @@ fn interrupted_before_marker_completes_on_next_open() {
         // Simulate a kill that repaired the DB but lost the marker write.
         std::fs::remove_file(migration_marker_path(&db)).unwrap();
 
-        let conn = Connection::open(&db).await.expect("reopen completes the pass");
+        let conn = Connection::open(&db)
+            .await
+            .expect("reopen completes the pass");
         assert_eq!(
             integrity_lines(&conn).await,
             vec!["ok".to_owned()],
@@ -359,7 +371,9 @@ fn legacy_contentless_fts5_content_shadow_is_reclaimed_on_first_open() {
         );
 
         // First open under current code triggers the reclaim.
-        let conn = Connection::open(&db).await.expect("open triggers migration");
+        let conn = Connection::open(&db)
+            .await
+            .expect("open triggers migration");
         assert!(
             !table_exists(&conn, "t_content").await,
             "the orphaned contentless _content shadow is dropped"
@@ -401,9 +415,17 @@ fn legacy_contentless_fts5_content_shadow_is_reclaimed_on_first_open() {
         // Idempotent: a second open sees the marker (AlreadyMigrated) and does
         // not re-run the reclaim; the shadow stays dropped, survivors intact.
         std::fs::remove_file(pre_migration_backup_path(&db)).unwrap();
-        let conn2 = Connection::open(&db).await.expect("reopen (AlreadyMigrated)");
-        assert!(!table_exists(&conn2, "t_content").await, "shadow stays dropped");
-        assert!(table_exists(&conn2, "s_content").await, "stored-content shadow intact");
+        let conn2 = Connection::open(&db)
+            .await
+            .expect("reopen (AlreadyMigrated)");
+        assert!(
+            !table_exists(&conn2, "t_content").await,
+            "shadow stays dropped"
+        );
+        assert!(
+            table_exists(&conn2, "s_content").await,
+            "stored-content shadow intact"
+        );
         assert!(
             table_exists(&conn2, "unrelated_content").await,
             "unrelated table intact"
@@ -442,7 +464,9 @@ fn integrity_check_notes_orphaned_contentless_content_shadow() {
             "precondition: birth marker present (migration will not run)"
         );
 
-        let conn = Connection::open(&db).await.expect("reopen (AlreadyMigrated)");
+        let conn = Connection::open(&db)
+            .await
+            .expect("reopen (AlreadyMigrated)");
         assert!(
             table_exists(&conn, "t_content").await,
             "orphan survives when the migration does not run"

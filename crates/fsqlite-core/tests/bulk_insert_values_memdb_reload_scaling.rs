@@ -47,7 +47,11 @@ fn read_free_insert_values_streak_defers_memdb_reload_and_stays_correct() {
         // Read-after-write inside the same txn: the mirror rebuilds once here and
         // must see every inserted row.
         let mid = conn.query("SELECT COUNT(*) FROM t;").await.expect("count");
-        assert_eq!(int(mid[0].values()), N * 2, "read-after-write must see all inserted rows");
+        assert_eq!(
+            int(mid[0].values()),
+            N * 2,
+            "read-after-write must see all inserted rows"
+        );
         conn.execute("COMMIT;").await.expect("commit");
 
         assert!(
@@ -83,7 +87,10 @@ fn read_free_insert_streak_still_enforces_uniqueness() {
         let dup = conn
             .execute("INSERT INTO t (id, v) VALUES (3, 'c'), (1, 'dup');")
             .await;
-        assert!(dup.is_err(), "duplicate primary key must be rejected mid-streak");
+        assert!(
+            dup.is_err(),
+            "duplicate primary key must be rejected mid-streak"
+        );
         conn.execute("ROLLBACK;").await.expect("rollback");
     });
 }
@@ -109,8 +116,15 @@ fn insert_select_source_is_not_deferred_and_stays_correct() {
         conn.execute("INSERT INTO dst (id, v) SELECT id, v FROM src;")
             .await
             .expect("insert select");
-        let n = conn.query("SELECT COUNT(*) FROM dst;").await.expect("count");
-        assert_eq!(int(n[0].values()), 3, "INSERT...SELECT must see and copy all src rows");
+        let n = conn
+            .query("SELECT COUNT(*) FROM dst;")
+            .await
+            .expect("count");
+        assert_eq!(
+            int(n[0].values()),
+            3,
+            "INSERT...SELECT must see and copy all src rows"
+        );
         conn.execute("COMMIT;").await.expect("commit");
     });
 }

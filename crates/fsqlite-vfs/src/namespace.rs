@@ -545,9 +545,7 @@ impl DatabaseNamespaceBinding {
             .map_err(|_| FrankenError::internal("namespace lease mutex poisoned"))?;
         if matches!(
             *lease,
-            BindingLease::Shared { .. }
-                | BindingLease::ReadOnlyUnadmitted
-                | BindingLease::Quiesced
+            BindingLease::Shared { .. } | BindingLease::ReadOnlyUnadmitted | BindingLease::Quiesced
         ) {
             return Ok(());
         }
@@ -2549,7 +2547,9 @@ mod tests {
 
         // Teardown is idempotent and the eventual Arc drops are pure no-ops.
         binding.quiesce();
-        binding.finish_bootstrap().expect("quiesced bootstrap is inert");
+        binding
+            .finish_bootstrap()
+            .expect("quiesced bootstrap is inert");
         drop(binding);
         drop(lingering);
     }
@@ -2768,7 +2768,10 @@ mod tests {
         drop(reader);
 
         assert_eq!(fs::read(&database).expect("re-read main"), before_main);
-        assert_eq!(fs::read(&gate_path).expect("re-read gate record"), before_gate);
+        assert_eq!(
+            fs::read(&gate_path).expect("re-read gate record"),
+            before_gate
+        );
         assert_eq!(
             fs::read(&use_path).expect("re-read identity record"),
             before_use,
@@ -3969,7 +3972,11 @@ mod tests {
         )
         .expect("seed segment");
         assert!(matches!(
-            validate_reserved_database_artifacts(&database, WindowsLockSidecarPolicy::RejectAll, None),
+            validate_reserved_database_artifacts(
+                &database,
+                WindowsLockSidecarPolicy::RejectAll,
+                None
+            ),
             Err(FrankenError::CannotOpen { .. })
         ));
 
@@ -3978,7 +3985,11 @@ mod tests {
         let temp = sidecar_path(&second, "-wal-fec").with_extension("wal-fec.tmp");
         fs::write(temp, b"partial rewrite").expect("seed WAL-FEC rewrite temp");
         assert!(matches!(
-            validate_reserved_database_artifacts(&second, WindowsLockSidecarPolicy::RejectAll, None),
+            validate_reserved_database_artifacts(
+                &second,
+                WindowsLockSidecarPolicy::RejectAll,
+                None
+            ),
             Err(FrankenError::CannotOpen { .. })
         ));
     }

@@ -54,9 +54,9 @@
 //! ceiling and a shared phase marker, so a genuine wedge is reported as a
 //! failure naming the phase (open/select/close) rather than stalling CI.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
 use std::time::Duration;
 
 use asupersync::runtime::RuntimeBuilder;
@@ -123,9 +123,9 @@ fn gh335_checkpoint_truncate_never_fails_fresh_reader_first_select() {
             .expect("seed open");
         rt.block_on(conn.execute("PRAGMA journal_mode=WAL;"))
             .expect("seed journal_mode=WAL");
-        rt.block_on(conn.execute(
-            "CREATE TABLE gh335 (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);",
-        ))
+        rt.block_on(
+            conn.execute("CREATE TABLE gh335 (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);"),
+        )
         .expect("seed create table");
         for v in 0..8 {
             rt.block_on(conn.execute(&format!("INSERT INTO gh335 (v) VALUES ({v});")))
@@ -251,7 +251,9 @@ fn gh335_checkpoint_truncate_never_fails_fresh_reader_first_select() {
     if !hang {
         reader.join().expect("reader thread must not panic");
         writer.join().expect("writer thread must not panic");
-        checkpointer.join().expect("checkpointer thread must not panic");
+        checkpointer
+            .join()
+            .expect("checkpointer thread must not panic");
     }
 
     assert!(

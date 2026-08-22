@@ -131,7 +131,11 @@ fn insert_or_replace_with_auto_rowid_inserts_new_row_gh214() {
             .unwrap();
 
         let rows = contents(&conn).await;
-        assert_eq!(rows.len(), 2, "auto-rowid REPLACE must add a new row: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            2,
+            "auto-rowid REPLACE must add a new row: {rows:?}"
+        );
         // The pre-existing id=1 row is unchanged.
         assert_eq!(rows[0], row(1, 0.0, 1.0));
         // The new row carries the inserted bbox (its auto id is >= 2).

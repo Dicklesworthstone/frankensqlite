@@ -50,7 +50,11 @@ async fn build_clean_db(dir: &std::path::Path, name: &str) -> (String, usize) {
 /// Flip a single bit (`mask`) at `offset` of the file at `db`.
 fn flip_bit(db: &str, offset: usize, mask: u8) {
     let mut bytes = std::fs::read(db).expect("read image");
-    assert!(offset < bytes.len(), "offset {offset} beyond file len {}", bytes.len());
+    assert!(
+        offset < bytes.len(),
+        "offset {offset} beyond file len {}",
+        bytes.len()
+    );
     bytes[offset] ^= mask;
     std::fs::write(db, &bytes).expect("write corrupted image");
 }

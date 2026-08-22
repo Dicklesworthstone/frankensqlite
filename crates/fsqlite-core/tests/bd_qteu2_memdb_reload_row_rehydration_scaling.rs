@@ -83,16 +83,16 @@ async fn hydration_during_ingestion(stable_rows_each: usize) -> u64 {
     // Correctness: the trigger fired once per ingested row, and the untouched
     // stable tables still read back exactly what we stored.
     let rows = conn.query("SELECT count(*) FROM sink;").await.unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(INGEST_ROWS as i64));
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(INGEST_ROWS as i64)
+    );
     let main_rows = conn.query("SELECT count(*) FROM main;").await.unwrap();
     assert_eq!(
         main_rows[0].values()[0],
         SqliteValue::Integer(INGEST_ROWS as i64)
     );
-    let stable0 = conn
-        .query("SELECT count(*) FROM stable_0;")
-        .await
-        .unwrap();
+    let stable0 = conn.query("SELECT count(*) FROM stable_0;").await.unwrap();
     assert_eq!(
         stable0[0].values()[0],
         SqliteValue::Integer(stable_rows_each as i64),

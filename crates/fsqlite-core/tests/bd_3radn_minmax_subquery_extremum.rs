@@ -77,12 +77,7 @@ fn h2_scalar_subquery_output_sourced_from_extremum_row() {
         // min() variant — sources from the min-price row (a).
         assert_agree(&f, &r, "SELECT min(price), (SELECT name) FROM t").await;
         // A subquery nested inside a larger output expression still counts.
-        assert_agree(
-            &f,
-            &r,
-            "SELECT max(price), (SELECT name) || '!' FROM t",
-        )
-        .await;
+        assert_agree(&f, &r, "SELECT max(price), (SELECT name) || '!' FROM t").await;
     });
 }
 

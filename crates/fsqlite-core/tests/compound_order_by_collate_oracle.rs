@@ -42,7 +42,10 @@ fn compound_order_by_collate_matches_rusqlite_oracle() {
         }
         for sql in QUERIES {
             let expected = oracle(sql);
-            let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+            let rows = conn
+                .query(sql)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
             let got: Vec<String> = rows
                 .iter()
                 .map(|r| match r.values()[0] {
@@ -50,7 +53,10 @@ fn compound_order_by_collate_matches_rusqlite_oracle() {
                     ref other => panic!("`{sql}` not text: {other:?}"),
                 })
                 .collect();
-            assert_eq!(got, expected, "compound ORDER BY COLLATE `{sql}` diverged from the C SQLite oracle");
+            assert_eq!(
+                got, expected,
+                "compound ORDER BY COLLATE `{sql}` diverged from the C SQLite oracle"
+            );
         }
     });
 }

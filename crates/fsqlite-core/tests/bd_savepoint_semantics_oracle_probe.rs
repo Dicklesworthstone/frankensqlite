@@ -33,17 +33,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -64,64 +73,110 @@ fn savepoint_semantics_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // ── ROLLBACK TO leaves the savepoint active; can roll back to it twice ──
         ex(&f, &r, "SAVEPOINT sp1").await;
         ex(&f, &r, "INSERT INTO t VALUES (2,'b')").await;
-        ex(&f, &r, "ROLLBACK TO sp1").await;           // undoes id=2, sp1 still open
-        check("after first rollback-to", fq(&f, "SELECT id,v FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t ORDER BY id"), &mut diffs);
+        ex(&f, &r, "ROLLBACK TO sp1").await; // undoes id=2, sp1 still open
+        check(
+            "after first rollback-to",
+            fq(&f, "SELECT id,v FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t ORDER BY id"),
+            &mut diffs,
+        );
         ex(&f, &r, "INSERT INTO t VALUES (3,'c')").await;
-        ex(&f, &r, "ROLLBACK TO sp1").await;           // undoes id=3; sp1 still open
-        check("after second rollback-to", fq(&f, "SELECT id,v FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t ORDER BY id"), &mut diffs);
+        ex(&f, &r, "ROLLBACK TO sp1").await; // undoes id=3; sp1 still open
+        check(
+            "after second rollback-to",
+            fq(&f, "SELECT id,v FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t ORDER BY id"),
+            &mut diffs,
+        );
         ex(&f, &r, "INSERT INTO t VALUES (4,'d')").await;
-        ex(&f, &r, "RELEASE sp1").await;               // commits id=4 into the outer scope
-        check("after release keeps work", fq(&f, "SELECT id,v FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t ORDER BY id"), &mut diffs);
+        ex(&f, &r, "RELEASE sp1").await; // commits id=4 into the outer scope
+        check(
+            "after release keeps work",
+            fq(&f, "SELECT id,v FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── nested savepoints: RELEASE of the OUTER discards the inner ──
         ex(&f, &r, "SAVEPOINT outer").await;
         ex(&f, &r, "INSERT INTO t VALUES (5,'e')").await;
         ex(&f, &r, "SAVEPOINT inner").await;
         ex(&f, &r, "INSERT INTO t VALUES (6,'f')").await;
-        ex(&f, &r, "ROLLBACK TO inner").await;         // undo id=6
-        check("nested rollback inner", fq(&f, "SELECT id,v FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t ORDER BY id"), &mut diffs);
+        ex(&f, &r, "ROLLBACK TO inner").await; // undo id=6
+        check(
+            "nested rollback inner",
+            fq(&f, "SELECT id,v FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t ORDER BY id"),
+            &mut diffs,
+        );
         ex(&f, &r, "INSERT INTO t VALUES (7,'g')").await;
-        ex(&f, &r, "RELEASE outer").await;             // commits id=5 and id=7 (and closes inner)
-        check("release outer keeps all", fq(&f, "SELECT id,v FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t ORDER BY id"), &mut diffs);
+        ex(&f, &r, "RELEASE outer").await; // commits id=5 and id=7 (and closes inner)
+        check(
+            "release outer keeps all",
+            fq(&f, "SELECT id,v FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── ROLLBACK TO an outer savepoint undoes an inner savepoint's work too ──
         ex(&f, &r, "SAVEPOINT s_a").await;
         ex(&f, &r, "INSERT INTO t VALUES (8,'h')").await;
         ex(&f, &r, "SAVEPOINT s_b").await;
         ex(&f, &r, "INSERT INTO t VALUES (9,'i')").await;
-        ex(&f, &r, "ROLLBACK TO s_a").await;           // undoes id=8 AND id=9
-        check("rollback outer undoes inner", fq(&f, "SELECT id,v FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t ORDER BY id"), &mut diffs);
+        ex(&f, &r, "ROLLBACK TO s_a").await; // undoes id=8 AND id=9
+        check(
+            "rollback outer undoes inner",
+            fq(&f, "SELECT id,v FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t ORDER BY id"),
+            &mut diffs,
+        );
         ex(&f, &r, "RELEASE s_a").await;
 
         // ── a savepoint wrapping a constraint violation: the failed stmt is undone,
         //    prior savepoint work survives, and we can still ROLLBACK TO / RELEASE ──
         ex(&f, &r, "SAVEPOINT s_c").await;
         ex(&f, &r, "INSERT INTO t VALUES (10,'j')").await;
-        ex(&f, &r, "INSERT INTO t VALUES (1,'dup')").await;   // PK conflict -> statement fails
-        check("savepoint after failed stmt", fq(&f, "SELECT id,v FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t ORDER BY id"), &mut diffs);
-        ex(&f, &r, "ROLLBACK TO s_c").await;           // undoes id=10
-        check("rollback after failed stmt", fq(&f, "SELECT id,v FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t ORDER BY id"), &mut diffs);
+        ex(&f, &r, "INSERT INTO t VALUES (1,'dup')").await; // PK conflict -> statement fails
+        check(
+            "savepoint after failed stmt",
+            fq(&f, "SELECT id,v FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t ORDER BY id"),
+            &mut diffs,
+        );
+        ex(&f, &r, "ROLLBACK TO s_c").await; // undoes id=10
+        check(
+            "rollback after failed stmt",
+            fq(&f, "SELECT id,v FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t ORDER BY id"),
+            &mut diffs,
+        );
         ex(&f, &r, "RELEASE s_c").await;
 
         // final state
-        check("final state", fq(&f, "SELECT id,v FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t ORDER BY id"), &mut diffs);
+        check(
+            "final state",
+            fq(&f, "SELECT id,v FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t ORDER BY id"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} savepoint divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} savepoint divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

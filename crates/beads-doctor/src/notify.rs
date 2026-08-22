@@ -194,14 +194,22 @@ mod tests {
     fn degraded_and_warn_are_log_only_at_default_threshold() {
         // Acceptance 4: WARN/degraded (e.g. orphaned write_lock) is not notified.
         assert!(!is_notify_worthy("orphaned_write_lock", "warn", "error"));
-        assert!(!is_notify_worthy("stale_recovery_artifacts", "degraded", "error"));
+        assert!(!is_notify_worthy(
+            "stale_recovery_artifacts",
+            "degraded",
+            "error"
+        ));
     }
 
     #[test]
     fn always_notify_codes_override_severity_and_threshold() {
         // Even a mislabeled low severity notifies for corruption codes.
         assert!(is_notify_worthy("database_corrupt", "degraded", "error"));
-        assert!(is_notify_worthy("sqlite_integrity_failed", "warn", "critical"));
+        assert!(is_notify_worthy(
+            "sqlite_integrity_failed",
+            "warn",
+            "critical"
+        ));
     }
 
     #[test]

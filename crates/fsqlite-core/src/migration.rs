@@ -299,7 +299,8 @@ pub(crate) async fn run_first_open_migration(
             // taken above, so no additional backup is needed.
             match conn.reclaim_orphaned_fts5_content_shadows().await {
                 Ok(dropped) if !dropped.is_empty() => {
-                    repairs_applied.push(format!("reclaim_orphaned_fts5_content:{}", dropped.len()));
+                    repairs_applied
+                        .push(format!("reclaim_orphaned_fts5_content:{}", dropped.len()));
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -384,7 +385,10 @@ mod tests {
     fn repair_message_names_time_and_backup_path() {
         let msg = migration_repair_message(2.34, Path::new("/tmp/foo.db.pre-migration-bak"));
         assert!(msg.contains("applied migration repairs"), "got: {msg}");
-        assert!(msg.contains("2.3s"), "one-decimal elapsed seconds; got: {msg}");
+        assert!(
+            msg.contains("2.3s"),
+            "one-decimal elapsed seconds; got: {msg}"
+        );
         assert!(
             msg.contains("/tmp/foo.db.pre-migration-bak"),
             "names the backup path; got: {msg}"

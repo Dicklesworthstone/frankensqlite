@@ -1870,7 +1870,11 @@ pub mod pragma {
             && n >= 0
         {
             let hard = HARD_HEAP_LIMIT.load(Ordering::Relaxed);
-            let effective = if hard > 0 && (n > hard || n == 0) { hard } else { n };
+            let effective = if hard > 0 && (n > hard || n == 0) {
+                hard
+            } else {
+                n
+            };
             SOFT_HEAP_LIMIT.store(effective, Ordering::Relaxed);
         }
         PragmaOutput::Int(SOFT_HEAP_LIMIT.load(Ordering::Relaxed))
@@ -2171,7 +2175,10 @@ pub mod pragma {
     /// enabled flag, defaulting to `n != 0` when the argument is not a recognized
     /// boolean (so `= ON`/`= OFF` toggle without touching the threshold, while a
     /// bare number sets the threshold and enables spilling).
-    fn apply_cache_spill(state: &mut ConnectionPragmaState, stmt: &PragmaStatement) -> PragmaOutput {
+    fn apply_cache_spill(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> PragmaOutput {
         if let Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) = &stmt.value {
             let n = parse_integer_expr(expr).unwrap_or(0);
             if n > 0 {
@@ -3800,22 +3807,52 @@ mod tests {
 
         // hard=10M then soft=50M -> soft clamps down to hard (10M).
         pragma::reset_heap_limits_for_test();
-        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=10000000"), Int(10000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=50000000"), Int(10000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit"), Int(10000000));
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA hard_heap_limit=10000000"),
+            Int(10000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA soft_heap_limit=50000000"),
+            Int(10000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA soft_heap_limit"),
+            Int(10000000)
+        );
 
         // hard=50M then soft=10M -> soft stays 10M (below the hard ceiling).
         pragma::reset_heap_limits_for_test();
-        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=50000000"), Int(50000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=10000000"), Int(10000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit"), Int(10000000));
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA hard_heap_limit=50000000"),
+            Int(50000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA soft_heap_limit=10000000"),
+            Int(10000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA soft_heap_limit"),
+            Int(10000000)
+        );
 
         // soft=90M then hard=30M -> lowering hard retroactively lowers soft to 30M.
         pragma::reset_heap_limits_for_test();
-        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=90000000"), Int(90000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=30000000"), Int(30000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit"), Int(30000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit"), Int(30000000));
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA soft_heap_limit=90000000"),
+            Int(90000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA hard_heap_limit=30000000"),
+            Int(30000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA soft_heap_limit"),
+            Int(30000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA hard_heap_limit"),
+            Int(30000000)
+        );
 
         // soft=-5 is a no-op (negative), reads back 0.
         pragma::reset_heap_limits_for_test();
@@ -3824,25 +3861,49 @@ mod tests {
 
         // soft=80M then soft=0 -> 0 clears the soft limit (no hard in force).
         pragma::reset_heap_limits_for_test();
-        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=80000000"), Int(80000000));
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA soft_heap_limit=80000000"),
+            Int(80000000)
+        );
         assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=0"), Int(0));
         assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit"), Int(0));
 
         // hard=80M then hard=0 -> 0 cannot clear the hard limit; it stays 80M.
         pragma::reset_heap_limits_for_test();
-        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=80000000"), Int(80000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=0"), Int(80000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit"), Int(80000000));
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA hard_heap_limit=80000000"),
+            Int(80000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA hard_heap_limit=0"),
+            Int(80000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA hard_heap_limit"),
+            Int(80000000)
+        );
 
         // A hard limit can never be raised from SQL: hard=40M then hard=90M stays 40M.
         pragma::reset_heap_limits_for_test();
-        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=40000000"), Int(40000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA hard_heap_limit=90000000"), Int(40000000));
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA hard_heap_limit=40000000"),
+            Int(40000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA hard_heap_limit=90000000"),
+            Int(40000000)
+        );
 
         // A non-numeric argument is a no-op readback (not an error).
         pragma::reset_heap_limits_for_test();
-        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit=70000000"), Int(70000000));
-        assert_eq!(apply_sql(&mut state, "PRAGMA soft_heap_limit='junk'"), Int(70000000));
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA soft_heap_limit=70000000"),
+            Int(70000000)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA soft_heap_limit='junk'"),
+            Int(70000000)
+        );
 
         pragma::reset_heap_limits_for_test();
     }

@@ -33,17 +33,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -68,7 +77,7 @@ fn cast_expression_semantics_match_rusqlite_oracle() {
             "SELECT CAST(5 AS REAL), CAST('3.14' AS REAL), CAST('1e3' AS REAL), CAST('2.5abc' AS REAL), CAST('xyz' AS REAL)",
             // CAST AS TEXT of int/real/blob
             "SELECT CAST(42 AS TEXT), CAST(3.5 AS TEXT), CAST(-7 AS TEXT)",
-            "SELECT CAST(x'414243' AS TEXT)",              // blob bytes 'ABC' -> text
+            "SELECT CAST(x'414243' AS TEXT)", // blob bytes 'ABC' -> text
             // CAST AS BLOB (text/int/real -> their text-encoding bytes)
             "SELECT CAST('hi' AS BLOB), CAST(42 AS BLOB), CAST(3.5 AS BLOB)",
             // CAST AS NUMERIC: integral-valued text -> INTEGER, else REAL
@@ -98,6 +107,11 @@ fn cast_expression_semantics_match_rusqlite_oracle() {
                 diffs.push(format!("  `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"));
             }
         }
-        assert!(diffs.is_empty(), "{} CAST-semantics divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} CAST-semantics divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

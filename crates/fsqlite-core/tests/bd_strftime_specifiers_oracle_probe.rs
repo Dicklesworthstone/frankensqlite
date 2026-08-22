@@ -53,12 +53,11 @@ fn strftime_specifiers_match_rusqlite_oracle() {
         // Every documented SQLite specifier + a batch stock leaves literal /
         // undefined, each isolated so one bad specifier can't mask another.
         let specs = [
-            "%d", "%e", "%f", "%F", "%G", "%g", "%H", "%I", "%j", "%J", "%k",
-            "%l", "%m", "%M", "%n", "%p", "%P", "%R", "%s", "%S", "%t", "%T",
-            "%u", "%U", "%V", "%w", "%W", "%Y", "%%",
-            // not defined by SQLite strftime — must behave identically on both
-            "%a", "%A", "%b", "%B", "%c", "%C", "%D", "%h", "%r", "%x", "%X",
-            "%y", "%Z", "%z", "%q", "%1",
+            "%d", "%e", "%f", "%F", "%G", "%g", "%H", "%I", "%j", "%J", "%k", "%l", "%m", "%M",
+            "%n", "%p", "%P", "%R", "%s", "%S", "%t", "%T", "%u", "%U", "%V", "%w", "%W", "%Y",
+            "%%", // not defined by SQLite strftime — must behave identically on both
+            "%a", "%A", "%b", "%B", "%c", "%C", "%D", "%h", "%r", "%x", "%X", "%y", "%Z", "%z",
+            "%q", "%1",
         ];
 
         let ts = "2024-03-05 09:07:05.5";
@@ -88,7 +87,9 @@ fn strftime_specifiers_match_rusqlite_oracle() {
             let fv = fval(&f, &sql).await;
             let rv = rval(&r, &sql);
             if fv != rv {
-                diffs.push(format!("  `{spec}` @ {t}\n     frank= {fv}\n     stock= {rv}"));
+                diffs.push(format!(
+                    "  `{spec}` @ {t}\n     frank= {fv}\n     stock= {rv}"
+                ));
             }
         }
 

@@ -108,7 +108,11 @@ async fn stale_handoff_from_replaced_file(dir: &Path) -> (Vec<u8>, [u8; 16], i64
     {
         let conn = open(&old_db).await;
         exec(&conn, "PRAGMA journal_mode=WAL;").await;
-        exec(&conn, "CREATE TABLE big (id INTEGER PRIMARY KEY, payload TEXT);").await;
+        exec(
+            &conn,
+            "CREATE TABLE big (id INTEGER PRIMARY KEY, payload TEXT);",
+        )
+        .await;
         // Grow the old file well past a handful of pages so a re-extension to
         // its size would be unmistakable. ~400 rows of ~900-byte payload lands
         // near ~100 database pages.
@@ -163,7 +167,8 @@ fn gh364_stale_handoff_from_replaced_file_does_not_reextend_fresh_db() {
         let dir = tempfile::tempdir().unwrap();
 
         // A stale, LARGE handoff bound to a REPLACED file's identity.
-        let (stale_handoff, old_id, inflated_pages) = stale_handoff_from_replaced_file(dir.path()).await;
+        let (stale_handoff, old_id, inflated_pages) =
+            stale_handoff_from_replaced_file(dir.path()).await;
 
         // A fresh, SMALL database created at a different path (its own new id).
         let fresh_db = dir.path().join("fresh_small.db");
@@ -270,7 +275,10 @@ fn gh364_same_file_reopen_preserves_committed_growth() {
                 .await
                 .expect("close same-file db without checkpoint");
         }
-        assert!(pages_before > 10, "table should have grown ({pages_before})");
+        assert!(
+            pages_before > 10,
+            "table should have grown ({pages_before})"
+        );
 
         // Reopen the SAME file (identity matches → certificate applies).
         {
@@ -310,7 +318,11 @@ fn gh364_committed_uncheckpointed_wal_recovers_intact() {
             exec(&conn, "PRAGMA journal_mode=WAL;").await;
             exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);").await;
             for row in 0..committed_rows {
-                exec(&conn, &format!("INSERT INTO t VALUES ({row}, {});", row * 7)).await;
+                exec(
+                    &conn,
+                    &format!("INSERT INTO t VALUES ({row}, {});", row * 7),
+                )
+                .await;
             }
             // Simulate a crash before checkpoint: drop the WAL on disk, no reset.
             conn.close_without_checkpoint()
@@ -347,6 +359,9 @@ fn gh364_committed_uncheckpointed_wal_recovers_intact() {
         let count: i64 = oracle
             .query_row("SELECT COUNT(*) FROM t;", [], |r| r.get(0))
             .expect("stock count");
-        assert_eq!(count, committed_rows, "stock reader sees every committed row");
+        assert_eq!(
+            count, committed_rows,
+            "stock reader sees every committed row"
+        );
     });
 }

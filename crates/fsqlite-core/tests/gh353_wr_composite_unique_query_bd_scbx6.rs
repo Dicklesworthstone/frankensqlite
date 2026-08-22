@@ -21,7 +21,10 @@ fn render(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
@@ -45,7 +48,10 @@ fn stock_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>
                 rusqlite::types::Value::Real(f) => format!("{f}"),
                 rusqlite::types::Value::Text(s) => format!("'{s}'"),
                 rusqlite::types::Value::Blob(b) => {
-                    format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+                    format!(
+                        "X'{}'",
+                        b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                    )
                 }
             });
         }
@@ -67,8 +73,11 @@ fn wr_composite_unique_index_scan_and_constraint_bd_scbx6() {
             "INSERT INTO members VALUES ('shared', 1, 101)",
             "INSERT INTO members VALUES ('shared', 2, 102)",
         ] {
-            f.execute(s).await.unwrap_or_else(|e| panic!("frank `{s}`: {e:?}"));
-            r.execute_batch(s).unwrap_or_else(|e| panic!("stock `{s}`: {e}"));
+            f.execute(s)
+                .await
+                .unwrap_or_else(|e| panic!("frank `{s}`: {e:?}"));
+            r.execute_batch(s)
+                .unwrap_or_else(|e| panic!("stock `{s}`: {e}"));
         }
 
         // (1) Index-scan / covering reads over the composite-UNIQUE(a,c) auto-index
@@ -107,13 +116,22 @@ fn wr_composite_unique_index_scan_and_constraint_bd_scbx6() {
 
         // A non-conflicting distinct (a,c) still inserts in both.
         let ok = "INSERT INTO members VALUES ('shared', 3, 103)";
-        assert!(f.execute(ok).await.is_ok(), "frank must accept a distinct (a,c)");
-        assert!(r.execute_batch(ok).is_ok(), "stock must accept a distinct (a,c)");
+        assert!(
+            f.execute(ok).await.is_ok(),
+            "frank must accept a distinct (a,c)"
+        );
+        assert!(
+            r.execute_batch(ok).is_ok(),
+            "stock must accept a distinct (a,c)"
+        );
 
         // (3) UPDATE must maintain the composite-UNIQUE auto-index: move c 101 -> 200.
         let upd = "UPDATE members SET c = 200 WHERE a = 'shared' AND b = 1";
-        f.execute(upd).await.unwrap_or_else(|e| panic!("frank update: {e:?}"));
-        r.execute_batch(upd).unwrap_or_else(|e| panic!("stock update: {e}"));
+        f.execute(upd)
+            .await
+            .unwrap_or_else(|e| panic!("frank update: {e:?}"));
+        r.execute_batch(upd)
+            .unwrap_or_else(|e| panic!("stock update: {e}"));
         let mut upd_mismatch = Vec::new();
         for q in [
             "SELECT b FROM members WHERE a = 'shared' AND c = 200", // new value -> b=1
@@ -124,7 +142,11 @@ fn wr_composite_unique_index_scan_and_constraint_bd_scbx6() {
                 (fa, sb) => upd_mismatch.push(format!("`{q}` -> frank={fa:?} stock={sb:?}")),
             }
         }
-        assert!(upd_mismatch.is_empty(), "bd-scbx6 UPDATE auto-index divergence:\n{}", upd_mismatch.join("\n"));
+        assert!(
+            upd_mismatch.is_empty(),
+            "bd-scbx6 UPDATE auto-index divergence:\n{}",
+            upd_mismatch.join("\n")
+        );
         // phantom after UPDATE: c=200 now occupied, a fresh dup must fail in both.
         let dup2 = "INSERT INTO members VALUES ('shared', 4, 200)";
         assert_eq!(
@@ -136,8 +158,11 @@ fn wr_composite_unique_index_scan_and_constraint_bd_scbx6() {
         // (4) DELETE must remove the auto-index entry: after deleting b=1 (c=200),
         // c=200 becomes free and its index scan is empty in both.
         let del = "DELETE FROM members WHERE a = 'shared' AND b = 1";
-        f.execute(del).await.unwrap_or_else(|e| panic!("frank delete: {e:?}"));
-        r.execute_batch(del).unwrap_or_else(|e| panic!("stock delete: {e}"));
+        f.execute(del)
+            .await
+            .unwrap_or_else(|e| panic!("frank delete: {e:?}"));
+        r.execute_batch(del)
+            .unwrap_or_else(|e| panic!("stock delete: {e}"));
         let q = "SELECT b FROM members WHERE a = 'shared' AND c = 200";
         assert_eq!(
             frank_rows(&f, q).await.unwrap(),

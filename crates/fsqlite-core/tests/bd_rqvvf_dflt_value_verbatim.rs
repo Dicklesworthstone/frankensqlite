@@ -28,7 +28,10 @@ fn pragma_table_info_dflt_value_verbatim_rqvvf() {
         .await
         .unwrap();
 
-        let rows = c.query_with_params("PRAGMA table_info(t)", &[]).await.unwrap();
+        let rows = c
+            .query_with_params("PRAGMA table_info(t)", &[])
+            .await
+            .unwrap();
         // columns: cid, name, type, notnull, dflt_value, pk
         let mut got: Vec<(String, String)> = Vec::new();
         for r in &rows {

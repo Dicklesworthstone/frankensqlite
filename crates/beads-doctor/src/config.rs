@@ -92,10 +92,7 @@ pub fn state_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(xdg).join("beads-doctor");
     }
-    home_dir()
-        .join(".local")
-        .join("state")
-        .join("beads-doctor")
+    home_dir().join(".local").join("state").join("beads-doctor")
 }
 
 fn home_dir() -> PathBuf {

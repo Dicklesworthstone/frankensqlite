@@ -12,7 +12,10 @@ use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
 async fn scalar_i64(conn: &Connection, sql: &str) -> i64 {
-    let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    let rows = conn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     match &rows[0].values()[0] {
         SqliteValue::Integer(n) => *n,
         other => panic!("{sql}: expected integer, got {other:?}"),
@@ -42,7 +45,10 @@ fn multiple_now_reads_in_one_statement_are_equal() {
     asupersync::test_utils::run_test(|| async {
         let c = Connection::open(":memory:").await.unwrap();
         // Two direct reads in one (flat) statement capture the same instant.
-        assert_eq!(scalar_i64(&c, "SELECT julianday('now') = julianday('now')").await, 1);
+        assert_eq!(
+            scalar_i64(&c, "SELECT julianday('now') = julianday('now')").await,
+            1
+        );
     });
 }
 
@@ -56,7 +62,11 @@ fn now_is_stable_across_subqueries_gh175_followup() {
     asupersync::test_utils::run_test(|| async {
         let c = Connection::open(":memory:").await.unwrap();
         assert_eq!(
-            scalar_i64(&c, "SELECT (SELECT julianday('now')) = (SELECT julianday('now'))").await,
+            scalar_i64(
+                &c,
+                "SELECT (SELECT julianday('now')) = (SELECT julianday('now'))"
+            )
+            .await,
             1
         );
     });

@@ -2174,19 +2174,58 @@ fn window_and_filter_parity() {
     // Integer/text/NULL results only (float text-rendering is covered elsewhere
     // and is oracle-version sensitive), so these assert exact tagged-row parity.
     let cases: Vec<Case> = vec![
-        Case { setup: T, sql: "SELECT id, min(val) FILTER (WHERE val>0) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t ORDER BY id" },
-        Case { setup: T, sql: "SELECT id, max(val) FILTER (WHERE val>0) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t ORDER BY id" },
-        Case { setup: T, sql: "SELECT id, sum(val) FILTER (WHERE val>5) OVER (PARTITION BY grp) FROM t ORDER BY id" },
-        Case { setup: T, sql: "SELECT id, count(*) FILTER (WHERE txt IS NOT NULL) OVER (ORDER BY id) FROM t ORDER BY id" },
-        Case { setup: T, sql: "SELECT id, rank() OVER (ORDER BY val NULLS FIRST) FROM t ORDER BY id" },
-        Case { setup: T, sql: "SELECT id, rank() OVER (ORDER BY val NULLS LAST) FROM t ORDER BY id" },
-        Case { setup: T, sql: "SELECT id, sum(val) OVER (ORDER BY val RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t ORDER BY id" },
-        Case { setup: T, sql: "SELECT id, sum(val) OVER (ORDER BY val GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t ORDER BY id" },
-        Case { setup: T, sql: "SELECT id, lag(val,-1) OVER (ORDER BY id) FROM t ORDER BY id" },
-        Case { setup: T, sql: "SELECT id, nth_value(val,2) OVER (PARTITION BY grp ORDER BY id) FROM t ORDER BY id" },
-        Case { setup: T, sql: "SELECT grp, count(val) FILTER (WHERE val IS NOT NULL) FROM t GROUP BY grp ORDER BY grp" },
-        Case { setup: T, sql: "SELECT sum(DISTINCT val) FILTER (WHERE val>0) FROM t" },
-        Case { setup: T, sql: "SELECT id, group_concat(txt) FILTER (WHERE grp<>'b') OVER (ORDER BY id) FROM t ORDER BY id" },
+        Case {
+            setup: T,
+            sql: "SELECT id, min(val) FILTER (WHERE val>0) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT id, max(val) FILTER (WHERE val>0) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT id, sum(val) FILTER (WHERE val>5) OVER (PARTITION BY grp) FROM t ORDER BY id",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT id, count(*) FILTER (WHERE txt IS NOT NULL) OVER (ORDER BY id) FROM t ORDER BY id",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT id, rank() OVER (ORDER BY val NULLS FIRST) FROM t ORDER BY id",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT id, rank() OVER (ORDER BY val NULLS LAST) FROM t ORDER BY id",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT id, sum(val) OVER (ORDER BY val RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t ORDER BY id",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT id, sum(val) OVER (ORDER BY val GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t ORDER BY id",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT id, lag(val,-1) OVER (ORDER BY id) FROM t ORDER BY id",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT id, nth_value(val,2) OVER (PARTITION BY grp ORDER BY id) FROM t ORDER BY id",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT grp, count(val) FILTER (WHERE val IS NOT NULL) FROM t GROUP BY grp ORDER BY grp",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT sum(DISTINCT val) FILTER (WHERE val>0) FROM t",
+        },
+        Case {
+            setup: T,
+            sql: "SELECT id, group_concat(txt) FILTER (WHERE grp<>'b') OVER (ORDER BY id) FROM t ORDER BY id",
+        },
     ];
 
     let mut divergences = Vec::new();

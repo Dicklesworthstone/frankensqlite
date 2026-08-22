@@ -72,19 +72,31 @@ fn row_value_is_distinct_matches_rusqlite_oracle() {
 
         for sql in PROJECTIONS {
             let expected = oracle_pairs(sql);
-            let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+            let rows = conn
+                .query(sql)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
             let got: Vec<(i64, i64)> = rows
                 .iter()
                 .map(|r| (int(&r.values()[0], sql), int(&r.values()[1], sql)))
                 .collect();
-            assert_eq!(got, expected, "row-value IS-family `{sql}` diverged from the C SQLite oracle");
+            assert_eq!(
+                got, expected,
+                "row-value IS-family `{sql}` diverged from the C SQLite oracle"
+            );
         }
 
         for sql in FILTERS {
             let expected = oracle_ids(sql);
-            let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+            let rows = conn
+                .query(sql)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
             let got: Vec<i64> = rows.iter().map(|r| int(&r.values()[0], sql)).collect();
-            assert_eq!(got, expected, "row-value IS-family filter `{sql}` diverged from the C SQLite oracle");
+            assert_eq!(
+                got, expected,
+                "row-value IS-family filter `{sql}` diverged from the C SQLite oracle"
+            );
         }
     });
 }

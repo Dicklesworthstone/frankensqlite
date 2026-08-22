@@ -17,7 +17,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -26,7 +29,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
@@ -35,7 +41,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 async fn assert_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &str) {
     let f: Result<Vec<Vec<String>>, ()> = match fconn.query(sql).await {
         Ok(rows) => {
-            let mut v: Vec<Vec<String>> = rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect();
+            let mut v: Vec<Vec<String>> = rows
+                .iter()
+                .map(|r| r.values().iter().map(tag_f).collect())
+                .collect();
             v.sort();
             Ok(v)
         }
@@ -45,7 +54,11 @@ async fn assert_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &st
         let mut st = rconn.prepare(sql).map_err(|_| ())?;
         let n = st.column_count();
         let mut rows: Vec<Vec<String>> = st
-            .query_map([], |row| Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect()))
+            .query_map([], |row| {
+                Ok((0..n)
+                    .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                    .collect())
+            })
             .map_err(|_| ())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ())?;
@@ -77,7 +90,12 @@ fn having_unknown_function_errors() {
         seed(&f, &r).await;
         // The bug: an unknown function was silently NULL, dropping the group.
         assert_agree(&f, &r, "SELECT g FROM t GROUP BY g HAVING nosuchfn(g) > 0").await;
-        assert_agree(&f, &r, "SELECT g FROM t GROUP BY g HAVING totally_made_up(sum(v)) IS NOT NULL").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT g FROM t GROUP BY g HAVING totally_made_up(sum(v)) IS NOT NULL",
+        )
+        .await;
         // Wrong-arity is also a resolution error, not NULL.
         assert_agree(&f, &r, "SELECT g FROM t GROUP BY g HAVING abs() > 0").await;
     });

@@ -268,7 +268,10 @@ fn test_schema_generation_invalidates_prepared() {
             .query_with_params(&[fsqlite_types::SqliteValue::Integer(1)])
             .await
             .expect("prepared SELECT must transparently re-prepare after DDL");
-        assert!(!rows.is_empty(), "re-prepared result should still be correct");
+        assert!(
+            !rows.is_empty(),
+            "re-prepared result should still be correct"
+        );
     });
 }
 

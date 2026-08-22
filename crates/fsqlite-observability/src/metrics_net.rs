@@ -149,7 +149,10 @@ mod tests {
 
         // Only /metrics is served; other GET paths 404 (no request content echoed).
         let not_found = http_get(addr, "/../etc/passwd");
-        assert!(not_found.starts_with("HTTP/1.1 404"), "expected 404: {not_found:?}");
+        assert!(
+            not_found.starts_with("HTTP/1.1 404"),
+            "expected 404: {not_found:?}"
+        );
     }
 
     #[test]

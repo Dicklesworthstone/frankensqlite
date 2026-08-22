@@ -418,8 +418,7 @@ mod tests {
         for path in &written {
             assert!(path.exists());
         }
-        let removed =
-            remove_units(Platform::Systemd, dir.path(), &config, None).expect("remove");
+        let removed = remove_units(Platform::Systemd, dir.path(), &config, None).expect("remove");
         assert_eq!(removed.len(), 2);
         for path in &written {
             assert!(!path.exists());
@@ -433,12 +432,20 @@ mod tests {
         let plists =
             write_units(Platform::Launchd, dir.path(), &config, "/bin/bd", None).expect("plist");
         assert_eq!(plists.len(), 1);
-        assert!(plists[0].to_string_lossy().contains("com.beads.doctor.fsqlite.plist"));
+        assert!(
+            plists[0]
+                .to_string_lossy()
+                .contains("com.beads.doctor.fsqlite.plist")
+        );
 
         let tasks =
             write_units(Platform::Windows, dir.path(), &config, "bd.exe", None).expect("task");
         assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].to_string_lossy().contains("beads-doctor-fsqlite.xml"));
+        assert!(
+            tasks[0]
+                .to_string_lossy()
+                .contains("beads-doctor-fsqlite.xml")
+        );
     }
 
     #[test]

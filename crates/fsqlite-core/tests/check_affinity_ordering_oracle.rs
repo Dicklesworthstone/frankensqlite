@@ -114,10 +114,14 @@ async fn apply_checked(
         match (f, r) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
             (Ok(_), Err(e)) => {
-                diverged.push(format!("STMT_DIVERGE: {s}\n  frank: OK\n  csql:  ERROR({e})"));
+                diverged.push(format!(
+                    "STMT_DIVERGE: {s}\n  frank: OK\n  csql:  ERROR({e})"
+                ));
             }
             (Err(e), Ok(())) => {
-                diverged.push(format!("STMT_DIVERGE: {s}\n  frank: ERROR({e})\n  csql:  OK"));
+                diverged.push(format!(
+                    "STMT_DIVERGE: {s}\n  frank: ERROR({e})\n  csql:  OK"
+                ));
             }
         }
     }
@@ -148,12 +152,7 @@ fn check_sees_affinity_coerced_value_on_insert() {
             ],
         )
         .await;
-        let m = oracle_compare(
-            &fconn,
-            &rconn,
-            &["SELECT typeof(a), a FROM t ORDER BY a"],
-        )
-        .await;
+        let m = oracle_compare(&fconn, &rconn, &["SELECT typeof(a), a FROM t ORDER BY a"]).await;
         assert_no_mismatches(&m, "check_sees_affinity_coerced_value_on_insert");
     });
 }
@@ -163,7 +162,12 @@ fn check_rejects_after_affinity_coercion_on_insert() {
     asupersync::test_utils::run_test(|| async {
         let fconn = Connection::open(":memory:").await.unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
-        apply(&fconn, &rconn, &["CREATE TABLE u (b INTEGER CHECK(typeof(b) = 'text'))"]).await;
+        apply(
+            &fconn,
+            &rconn,
+            &["CREATE TABLE u (b INTEGER CHECK(typeof(b) = 'text'))"],
+        )
+        .await;
         // INTEGER column: '5' -> affinity coerces to 5 -> typeof='integer' -> CHECK fails.
         // Both engines must REJECT (before the fix fsqlite wrongly accepted it).
         let diverged = apply_checked(

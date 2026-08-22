@@ -1779,7 +1779,10 @@ mod tests {
             buf: &'a mut [u8],
             offset: u64,
         ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-            assert_eq!(offset, 0, "scripted file only serves the header at offset 0");
+            assert_eq!(
+                offset, 0,
+                "scripted file only serves the header at offset 0"
+            );
             let idx = self
                 .reads
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)

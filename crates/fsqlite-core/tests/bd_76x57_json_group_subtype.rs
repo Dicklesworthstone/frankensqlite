@@ -27,19 +27,29 @@ fn json_group_aggregates_preserve_json_subtype_76x57() {
         c.execute("CREATE TABLE t(value)").await.unwrap();
         c.execute("INSERT INTO t VALUES(1),(2)").await.unwrap();
         c.execute("CREATE TABLE kv(k, v)").await.unwrap();
-        c.execute("INSERT INTO kv VALUES('x', '{\"n\":1}')").await.unwrap();
+        c.execute("INSERT INTO kv VALUES('x', '{\"n\":1}')")
+            .await
+            .unwrap();
         c.execute("CREATE TABLE s(value)").await.unwrap();
         c.execute("INSERT INTO s VALUES('a'),('b')").await.unwrap();
 
         // json_group_array over a json_object(...) argument -> nested JSON embedded.
         assert_eq!(
-            scalar_text(&c, "SELECT json_group_array(json_object('a', value)) FROM t").await,
+            scalar_text(
+                &c,
+                "SELECT json_group_array(json_object('a', value)) FROM t"
+            )
+            .await,
             r#"[{"a":1},{"a":2}]"#,
         );
 
         // json_group_array over a json_array(...) argument -> nested arrays embedded.
         assert_eq!(
-            scalar_text(&c, "SELECT json_group_array(json_array(value, value)) FROM t").await,
+            scalar_text(
+                &c,
+                "SELECT json_group_array(json_array(value, value)) FROM t"
+            )
+            .await,
             r"[[1,1],[2,2]]",
         );
 

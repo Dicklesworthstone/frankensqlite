@@ -29,7 +29,12 @@ async fn rows(conn: &Connection, sql: &str) -> Vec<Vec<SqliteValue>> {
 async fn one_int(conn: &Connection, sql: &str) -> i64 {
     let r = rows(conn, sql).await;
     assert_eq!(r.len(), 1, "`{sql}` must emit exactly one row, got {r:?}");
-    assert_eq!(r[0].len(), 1, "`{sql}` must emit one column, got {:?}", r[0]);
+    assert_eq!(
+        r[0].len(),
+        1,
+        "`{sql}` must emit one column, got {:?}",
+        r[0]
+    );
     match &r[0][0] {
         SqliteValue::Integer(n) => *n,
         other => panic!("`{sql}` must emit an integer, got {other:?}"),
@@ -45,7 +50,10 @@ fn heap_limit_row_emission_and_process_global_gh280() {
         assert_eq!(one_int(&a, "PRAGMA soft_heap_limit").await, 0);
 
         // Assignment echoes one row = the value after mutation.
-        assert_eq!(one_int(&a, "PRAGMA soft_heap_limit=12345678").await, 12_345_678);
+        assert_eq!(
+            one_int(&a, "PRAGMA soft_heap_limit=12345678").await,
+            12_345_678
+        );
         // Bare readback echoes one row with the same value.
         assert_eq!(one_int(&a, "PRAGMA soft_heap_limit").await, 12_345_678);
 
@@ -58,7 +66,10 @@ fn heap_limit_row_emission_and_process_global_gh280() {
 
         // A hard limit assignment also surfaces as one integer row through the
         // connection layer (value-after-mutation; from 0 it takes hold).
-        assert_eq!(one_int(&b, "PRAGMA hard_heap_limit=20000000").await, 20_000_000);
+        assert_eq!(
+            one_int(&b, "PRAGMA hard_heap_limit=20000000").await,
+            20_000_000
+        );
         assert_eq!(one_int(&a, "PRAGMA hard_heap_limit").await, 20_000_000);
 
         // With a hard limit now in force, `soft = 0` clamps *up* to the hard

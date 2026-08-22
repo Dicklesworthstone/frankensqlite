@@ -60,7 +60,8 @@ fn stock_integrity() -> String {
     let c = rusqlite::Connection::open_in_memory().expect("open stock");
     c.execute_batch(SETUP).expect("stock setup");
     for stmt in INSERTS.iter().chain(UPDATES.iter()) {
-        c.execute(stmt, []).unwrap_or_else(|e| panic!("stock `{stmt}`: {e}"));
+        c.execute(stmt, [])
+            .unwrap_or_else(|e| panic!("stock `{stmt}`: {e}"));
     }
     c.query_row("PRAGMA integrity_check;", [], |r| r.get::<_, String>(0))
         .expect("stock integrity_check")
@@ -69,7 +70,11 @@ fn stock_integrity() -> String {
 #[test]
 fn integrity_check_agrees_with_stock_on_serial_type_variant_indexes() {
     // Premise: stock sqlite3 finds this actively-written shape consistent.
-    assert_eq!(stock_integrity(), "ok", "premise: stock integrity_check is ok");
+    assert_eq!(
+        stock_integrity(),
+        "ok",
+        "premise: stock integrity_check is ok"
+    );
 
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.expect("open fsqlite");

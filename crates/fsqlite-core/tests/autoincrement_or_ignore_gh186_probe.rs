@@ -14,7 +14,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -23,15 +26,32 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn assert_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &str) {
-    let fr: Vec<Vec<String>> = fconn.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e:?}")).iter().map(|r| r.values().iter().map(tag_f).collect()).collect();
+    let fr: Vec<Vec<String>> = fconn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+        .iter()
+        .map(|r| r.values().iter().map(tag_f).collect())
+        .collect();
     let mut st = rconn.prepare(sql).unwrap();
     let n = st.column_count();
-    let rr: Vec<Vec<String>> = st.query_map([], |row| Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let rr: Vec<Vec<String>> = st
+        .query_map([], |row| {
+            Ok((0..n)
+                .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect())
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(fr, rr, "autoincrement seq mismatch on `{sql}`");
 }
 
@@ -47,11 +67,16 @@ fn autoincrement_or_ignore_advances_seq_gh186() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
-        run_both(&f, &r, &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v UNIQUE)",
-            "INSERT INTO t(v) VALUES ('a')",
-            "INSERT OR IGNORE INTO t(v) VALUES ('a')", // conflict: row ignored, rowid 2 burned
-        ]).await;
+        run_both(
+            &f,
+            &r,
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v UNIQUE)",
+                "INSERT INTO t(v) VALUES ('a')",
+                "INSERT OR IGNORE INTO t(v) VALUES ('a')", // conflict: row ignored, rowid 2 burned
+            ],
+        )
+        .await;
         // sqlite3: seq advanced to 2 after the ignored insert.
         assert_agree(&f, &r, "SELECT seq FROM sqlite_sequence WHERE name='t'").await;
         run_both(&f, &r, &["INSERT INTO t(v) VALUES ('b')"]).await;
@@ -67,12 +92,17 @@ fn autoincrement_plain_sequence_control_gh186() {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
         // Control: no conflict — the sequence tracks the max inserted rowid.
-        run_both(&f, &r, &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v UNIQUE)",
-            "INSERT INTO t(v) VALUES ('a')",
-            "INSERT INTO t(v) VALUES ('b')",
-            "INSERT INTO t(id, v) VALUES (10, 'c')",
-        ]).await;
+        run_both(
+            &f,
+            &r,
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v UNIQUE)",
+                "INSERT INTO t(v) VALUES ('a')",
+                "INSERT INTO t(v) VALUES ('b')",
+                "INSERT INTO t(id, v) VALUES (10, 'c')",
+            ],
+        )
+        .await;
         assert_agree(&f, &r, "SELECT seq FROM sqlite_sequence WHERE name='t'").await;
         run_both(&f, &r, &["INSERT INTO t(v) VALUES ('d')"]).await;
         assert_agree(&f, &r, "SELECT id, v FROM t ORDER BY id").await;

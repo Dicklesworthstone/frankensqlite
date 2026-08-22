@@ -14,7 +14,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -23,16 +26,33 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 /// Agree on rows in the emitted order (NO sort — outer query has its own ORDER BY).
 async fn assert_agree_ordered(fconn: &Connection, rconn: &rusqlite::Connection, sql: &str) {
-    let fr: Vec<Vec<String>> = fconn.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e:?}")).iter().map(|r| r.values().iter().map(tag_f).collect()).collect();
+    let fr: Vec<Vec<String>> = fconn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+        .iter()
+        .map(|r| r.values().iter().map(tag_f).collect())
+        .collect();
     let mut st = rconn.prepare(sql).unwrap();
     let n = st.column_count();
-    let rr: Vec<Vec<String>> = st.query_map([], |row| Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let rr: Vec<Vec<String>> = st
+        .query_map([], |row| {
+            Ok((0..n)
+                .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect())
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(fr, rr, "scalar-subquery ORDER BY/LIMIT mismatch on `{sql}`");
 }
 
@@ -120,7 +140,12 @@ fn scalar_subquery_no_order_unaffected_gh172() {
         seed(&f, &r).await;
         // Control: uncorrelated ORDER BY DESC LIMIT 1 (different path) stays 50,
         // and an aggregate scalar subquery stays correct.
-        assert_agree_ordered(&f, &r, "SELECT (SELECT v FROM inner_t ORDER BY v DESC LIMIT 1)").await;
+        assert_agree_ordered(
+            &f,
+            &r,
+            "SELECT (SELECT v FROM inner_t ORDER BY v DESC LIMIT 1)",
+        )
+        .await;
         assert_agree_ordered(&f, &r,
             "SELECT id,(SELECT max(v) FROM inner_t WHERE inner_t.oid=outer_t.id) FROM outer_t ORDER BY id").await;
     });

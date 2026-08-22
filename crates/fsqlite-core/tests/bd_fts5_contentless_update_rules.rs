@@ -56,7 +56,12 @@ fn bd_fts5_contentless_delete_update_requires_all_columns() {
             "count intact after a rejected subset UPDATE"
         );
         assert_eq!(
-            rowids(&conn.query("SELECT rowid FROM cd WHERE cd MATCH 'alpha';").await.unwrap()),
+            rowids(
+                &conn
+                    .query("SELECT rowid FROM cd WHERE cd MATCH 'alpha';")
+                    .await
+                    .unwrap()
+            ),
             vec![1],
             "old row untouched after rejected UPDATE"
         );
@@ -71,11 +76,19 @@ fn bd_fts5_contentless_delete_update_requires_all_columns() {
             "count preserved by a full-row UPDATE"
         );
         assert!(
-            conn.query("SELECT rowid FROM cd WHERE cd MATCH 'alpha';").await.unwrap().is_empty(),
+            conn.query("SELECT rowid FROM cd WHERE cd MATCH 'alpha';")
+                .await
+                .unwrap()
+                .is_empty(),
             "old term gone after full UPDATE"
         );
         assert_eq!(
-            rowids(&conn.query("SELECT rowid FROM cd WHERE cd MATCH 'fresh';").await.unwrap()),
+            rowids(
+                &conn
+                    .query("SELECT rowid FROM cd WHERE cd MATCH 'fresh';")
+                    .await
+                    .unwrap()
+            ),
             vec![1],
             "new term indexed by full UPDATE"
         );

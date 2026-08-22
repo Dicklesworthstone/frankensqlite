@@ -88,11 +88,18 @@ fn bd_fts5_integrity_check_passes_on_stock_spilled_index() {
             }
             let big = vec!["common"; 80].join(" ");
             stock
-                .execute("UPDATE t SET x = ?1 WHERE rowid = 1", rusqlite::params![big])
+                .execute(
+                    "UPDATE t SET x = ?1 WHERE rowid = 1",
+                    rusqlite::params![big],
+                )
                 .unwrap();
-            stock.execute_batch("INSERT INTO t(t) VALUES('optimize');").unwrap();
+            stock
+                .execute_batch("INSERT INTO t(t) VALUES('optimize');")
+                .unwrap();
             let leaf_pages: i64 = stock
-                .query_row("SELECT count(*) FROM t_data WHERE id > 100", [], |r| r.get(0))
+                .query_row("SELECT count(*) FROM t_data WHERE id > 100", [], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert!(leaf_pages > 1, "fixture must spill, got {leaf_pages}");
         }

@@ -61,7 +61,9 @@ fn multitrunk_freelist_survives_commit_and_reopen() {
         );
 
         // Free them all in one committed transaction.
-        conn.execute("BEGIN CONCURRENT;").await.expect("begin delete");
+        conn.execute("BEGIN CONCURRENT;")
+            .await
+            .expect("begin delete");
         conn.execute("DELETE FROM t;").await.expect("delete all");
         conn.execute("COMMIT;").await.expect("commit delete");
 
@@ -84,7 +86,10 @@ fn multitrunk_freelist_survives_commit_and_reopen() {
 
         // Round-trip 2: reuse from the multi-trunk freelist must work and
         // shrink it consistently.
-        fresh.execute("BEGIN CONCURRENT;").await.expect("begin reuse");
+        fresh
+            .execute("BEGIN CONCURRENT;")
+            .await
+            .expect("begin reuse");
         for id in 0..50 {
             let payload = format!("reuse_{id}_{}", "q".repeat(PAYLOAD_LEN));
             fresh
@@ -109,7 +114,10 @@ fn multitrunk_freelist_survives_commit_and_reopen() {
     let integrity: String = oracle
         .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
         .expect("oracle integrity_check");
-    assert_eq!(integrity, "ok", "stock integrity_check must pass the multi-trunk freelist");
+    assert_eq!(
+        integrity, "ok",
+        "stock integrity_check must pass the multi-trunk freelist"
+    );
     let oracle_freelist: i64 = oracle
         .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
         .expect("oracle freelist_count");

@@ -51,8 +51,11 @@ fn pragma_compile_options_tvf_matches_statement_gh207() {
             "SELECT * FROM pragma_compile_options() must match PRAGMA compile_options"
         );
 
-        let mut col_rows =
-            one_col(&conn, "SELECT compile_options FROM pragma_compile_options()").await;
+        let mut col_rows = one_col(
+            &conn,
+            "SELECT compile_options FROM pragma_compile_options()",
+        )
+        .await;
         col_rows.sort();
         assert_eq!(
             col_rows, pragma_rows,

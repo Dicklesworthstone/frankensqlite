@@ -62,7 +62,10 @@ fn schema_only_open_of_large_fts5_archive_is_bounded() {
         assert!(fts_hits > 0, "lazy-bound FTS5 must return matches");
 
         let after = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        let hwm2 = after.lines().find(|l| l.starts_with("VmHWM")).unwrap_or("VmHWM: ?");
+        let hwm2 = after
+            .lines()
+            .find(|l| l.starts_with("VmHWM"))
+            .unwrap_or("VmHWM: ?");
         eprintln!("LAZYPROBE after_queries_peak_{hwm2}");
         drop(conn);
     });

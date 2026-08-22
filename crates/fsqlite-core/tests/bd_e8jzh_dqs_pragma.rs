@@ -81,7 +81,9 @@ fn dqs_pragma_off_keeps_real_column_resolution() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(c TEXT);").await.unwrap();
-        conn.execute("INSERT INTO t VALUES('realval');").await.unwrap();
+        conn.execute("INSERT INTO t VALUES('realval');")
+            .await
+            .unwrap();
 
         conn.query("PRAGMA fsqlite.dqs = OFF;").await.unwrap();
 

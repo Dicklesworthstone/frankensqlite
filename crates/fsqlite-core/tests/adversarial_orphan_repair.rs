@@ -109,7 +109,9 @@ async fn assert_orphan_hole_healed(name: &str, drop_n: usize) {
 
     // Open once: the first-open repair pass runs and heals the hole.
     {
-        let conn = Connection::open(&db).await.expect("open triggers repair pass");
+        let conn = Connection::open(&db)
+            .await
+            .expect("open triggers repair pass");
         let after = fsqlite_integrity(&conn).await;
         conn.close().await.ok();
         assert_eq!(

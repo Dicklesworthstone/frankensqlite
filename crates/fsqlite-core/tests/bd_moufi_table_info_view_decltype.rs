@@ -50,7 +50,9 @@ fn pragma_table_info_view_decltype_moufi() {
         let c = Connection::open(":memory:").await.unwrap();
 
         // (1) Direct column passthrough with aliases -> source declared types.
-        c.execute("CREATE TABLE base(a INTEGER, b TEXT)").await.unwrap();
+        c.execute("CREATE TABLE base(a INTEGER, b TEXT)")
+            .await
+            .unwrap();
         c.execute("CREATE VIEW v_alias AS SELECT a AS x, b AS y FROM base")
             .await
             .unwrap();
@@ -61,13 +63,18 @@ fn pragma_table_info_view_decltype_moufi() {
         assert_view_trailing_cols_are_zero(&c, "v_alias").await;
 
         // (2) VARCHAR(N) must be reported VERBATIM (declared type, not affinity).
-        c.execute("CREATE TABLE tv(a VARCHAR(20), b TEXT)").await.unwrap();
+        c.execute("CREATE TABLE tv(a VARCHAR(20), b TEXT)")
+            .await
+            .unwrap();
         c.execute("CREATE VIEW v_varchar AS SELECT a AS x, b FROM tv")
             .await
             .unwrap();
         assert_eq!(
             table_info_name_type(&c, "v_varchar").await,
-            vec![("x".into(), "VARCHAR(20)".into()), ("b".into(), "TEXT".into())],
+            vec![
+                ("x".into(), "VARCHAR(20)".into()),
+                ("b".into(), "TEXT".into())
+            ],
         );
 
         // (3) Expression / literal / aggregate columns report an EMPTY type.
@@ -84,11 +91,18 @@ fn pragma_table_info_view_decltype_moufi() {
         );
 
         // (4) SELECT * expands to each source column's declared type.
-        c.execute("CREATE TABLE tw(a INTEGER, b VARCHAR(9))").await.unwrap();
-        c.execute("CREATE VIEW v_star AS SELECT * FROM tw").await.unwrap();
+        c.execute("CREATE TABLE tw(a INTEGER, b VARCHAR(9))")
+            .await
+            .unwrap();
+        c.execute("CREATE VIEW v_star AS SELECT * FROM tw")
+            .await
+            .unwrap();
         assert_eq!(
             table_info_name_type(&c, "v_star").await,
-            vec![("a".into(), "INTEGER".into()), ("b".into(), "VARCHAR(9)".into())],
+            vec![
+                ("a".into(), "INTEGER".into()),
+                ("b".into(), "VARCHAR(9)".into())
+            ],
         );
 
         // (5) An explicit CREATE VIEW v(p,q) column list renames the outputs but

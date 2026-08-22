@@ -9,7 +9,10 @@ async fn attach_err(setup: &[&str], sql: &str) -> String {
     for s in setup {
         c.execute(s).await.unwrap();
     }
-    c.execute(sql).await.expect_err("ATTACH of an in-use name must be rejected").to_string()
+    c.execute(sql)
+        .await
+        .expect_err("ATTACH of an in-use name must be rejected")
+        .to_string()
 }
 
 #[test]
@@ -35,6 +38,8 @@ fn attach_in_use_schema_reports_already_in_use() {
         );
         // A fresh attached name succeeds.
         let c = Connection::open(":memory:").await.unwrap();
-        c.execute("ATTACH ':memory:' AS aux2").await.expect("fresh ATTACH must succeed");
+        c.execute("ATTACH ':memory:' AS aux2")
+            .await
+            .expect("fresh ATTACH must succeed");
     });
 }

@@ -108,8 +108,16 @@ fn h3_null_propagating_operand_and_or_cover_is_not_null_vi8lh() {
         // An OR of null-rejecting arms covers.
         allow_query(&c, "SELECT a FROM t INDEXED BY ni WHERE b = 1 OR b = 5;").await;
         // Non-propagating operands do NOT cover (stock is conservative).
-        reject_query(&c, "SELECT a FROM t INDEXED BY ni WHERE cast(b AS text) = '5';").await;
-        reject_query(&c, "SELECT a FROM t INDEXED BY ni WHERE coalesce(b, 0) = 5;").await;
+        reject_query(
+            &c,
+            "SELECT a FROM t INDEXED BY ni WHERE cast(b AS text) = '5';",
+        )
+        .await;
+        reject_query(
+            &c,
+            "SELECT a FROM t INDEXED BY ni WHERE coalesce(b, 0) = 5;",
+        )
+        .await;
         reject_query(&c, "SELECT a FROM t INDEXED BY ni WHERE abs(b) = 5;").await;
         // An OR with a non-rejecting arm does NOT cover.
         reject_query(&c, "SELECT a FROM t INDEXED BY ni WHERE b = 1 OR a = 9;").await;

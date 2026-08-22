@@ -64,15 +64,13 @@ use crate::attach::SchemaRegistry;
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, BoundCollation, ColumnConstraintKind, ColumnRef, CompoundOp,
     CreateTableBody, CteMaterialized, DefaultValue, DeleteStatement, Distinctness, DropObjectType,
-    Expr, FrameBound,
-    FrameExclude, FrameSpec, FrameType, FromClause, FunctionArgs, GeneratedStorage, InSet,
-    InsertSource,
-    InsertStatement, JoinClause, JoinConstraint, JoinKind, JsonArrow, LikeOp, LimitClause, Literal,
-    NullsOrder, OrderingTerm, PlaceholderType, PragmaValue, QualifiedName, ResultColumn,
-    SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement, TableConstraintKind,
-    TableOrSubquery, TimeTravelTarget, UnaryOp, UpdateStatement, UpsertAction, UpsertClause,
-    ValuesClause,
-    WindowReference, WindowSpec,
+    Expr, FrameBound, FrameExclude, FrameSpec, FrameType, FromClause, FunctionArgs,
+    GeneratedStorage, InSet, InsertSource, InsertStatement, JoinClause, JoinConstraint, JoinKind,
+    JsonArrow, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType,
+    PragmaValue, QualifiedName, ResultColumn, SelectBody, SelectCore, SelectStatement,
+    SortDirection, Span, Statement, TableConstraintKind, TableOrSubquery, TimeTravelTarget,
+    UnaryOp, UpdateStatement, UpsertAction, UpsertClause, ValuesClause, WindowReference,
+    WindowSpec,
 };
 use fsqlite_btree::cursor::{
     TableLeafDeleteRun, TableLeafDeleteRunDelete, TableLeafDeleteRunMissReason,
@@ -94,8 +92,8 @@ use fsqlite_ext_fts5::{
     Fts5StructureSegment, Fts5Table, Fts5TombstonePage, Fts5VocabTable, Fts5VocabType, build_expr,
     build_fts5vocab_rows, collect_merged_term_groups, decode_docsize_blob,
     encode_contentless_delete_all_flush, encode_incremental_delete_flush, encode_merged_segment,
-    fts5vocab_module_factory, highlight as fts5_highlight, main_index_term_groups, parse_fts5_query,
-    resolve_tombstone_target_segment, snippet as fts5_snippet,
+    fts5vocab_module_factory, highlight as fts5_highlight, main_index_term_groups,
+    parse_fts5_query, resolve_tombstone_target_segment, snippet as fts5_snippet,
 };
 #[cfg(feature = "ext-json")]
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
@@ -115,14 +113,15 @@ use fsqlite_func::vtab::{
 };
 use fsqlite_func::{
     ApplicationFunctionKind, BuiltinFunctionFamily, ErasedWindowFunction, FunctionArity,
-    FunctionRegistry, ResolvedScalarFunction, ScalarSchemaSafety, builtin_function_surface_inventory,
-    get_last_changes, get_last_insert_rowid, get_total_changes, sqlite_compile_options,
+    FunctionRegistry, ResolvedScalarFunction, ScalarSchemaSafety,
+    builtin_function_surface_inventory, get_last_changes, get_last_insert_rowid, get_total_changes,
+    sqlite_compile_options,
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_pager::ConnectionPagerOpenMode;
 pub use fsqlite_pager::page_cache::PageCachePeakSnapshot;
-pub use fsqlite_pager::pager::WriteSetStats;
 pub use fsqlite_pager::pager::DatabaseImageReceipt;
+pub use fsqlite_pager::pager::WriteSetStats;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
@@ -149,10 +148,8 @@ use fsqlite_types::record::{
     RecordProfileScope, decode_column_from_offset, decode_numeric_column_from_offset, encode_batch,
     enter_record_profile_scope, parse_record, parse_record_header_into,
     parse_record_into_with_encoding, parse_record_projected_column_offsets,
-    parse_record_with_encoding, record_profile_enabled,
-    record_profile_snapshot,
-    reset_record_profile, serialize_record,
-    serialize_record_iter_into_with_encoding,
+    parse_record_with_encoding, record_profile_enabled, record_profile_snapshot,
+    reset_record_profile, serialize_record, serialize_record_iter_into_with_encoding,
     serialize_record_iter_with_precomputed_header_into, serialize_record_with_encoding,
     try_build_runtime_precomputed_record_header,
 };
@@ -215,11 +212,10 @@ use fsqlite_mvcc::{
     CommitIndex, ConcurrentHandle, ConcurrentRegistry, ConcurrentRowIdAllocator,
     ConcurrentSavepoint, FcwResult, FlatCombiningMetrics, GcScheduler, GcTickResult, GcTodo,
     InProcessPageLockTable, MvccError, PreparedConcurrentCommit, RowidAllocSavepointMark,
-    SharedConcurrentHandle,
-    SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEProcessConfig,
-    SsiEProcessGate, SsiEProcessSnapshot, SsiEvidenceLedger, VersionStore, concurrent_abort,
-    concurrent_clear_page_state, concurrent_commit_read_only, concurrent_rollback_to_savepoint,
-    concurrent_savepoint, concurrent_track_write_conflict_page,
+    SharedConcurrentHandle, SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery,
+    SsiDecisionType, SsiEProcessConfig, SsiEProcessGate, SsiEProcessSnapshot, SsiEvidenceLedger,
+    VersionStore, concurrent_abort, concurrent_clear_page_state, concurrent_commit_read_only,
+    concurrent_rollback_to_savepoint, concurrent_savepoint, concurrent_track_write_conflict_page,
     finalize_prepared_concurrent_commit_with_ssi, flat_combining_metrics,
     morsel_parallel_insert::MorselScheduler, prepare_concurrent_commit_fcw_only,
     prepare_concurrent_commit_with_ssi, record_registry_commit_lock_hold,
@@ -3943,7 +3939,9 @@ impl PagerBackend {
             ..DatabaseHeader::default()
         };
         let header_bytes = header.to_bytes().map_err(|err| {
-            FrankenError::Internal(format!("failed to encode empty-reset database header: {err}"))
+            FrankenError::Internal(format!(
+                "failed to encode empty-reset database header: {err}"
+            ))
         })?;
         let mut page1 = vec![0_u8; page_len];
         page1[..DATABASE_HEADER_SIZE].copy_from_slice(&header_bytes);
@@ -4706,8 +4704,7 @@ const PRAGMA_TABLE_INFO_TVF_COLUMNS: [&str; 6] =
 /// Columns of `PRAGMA function_list` (GH#206 / bd-gh-pragma-introspection):
 /// `name|builtin|type|enc|narg|flags`, matching stock SQLite's introspection
 /// surface.
-const PRAGMA_FUNCTION_LIST_COLUMNS: [&str; 6] =
-    ["name", "builtin", "type", "enc", "narg", "flags"];
+const PRAGMA_FUNCTION_LIST_COLUMNS: [&str; 6] = ["name", "builtin", "type", "enc", "narg", "flags"];
 const PRAGMA_TABLE_XINFO_TVF_COLUMNS: [&str; 7] = [
     "cid",
     "name",
@@ -7335,7 +7332,8 @@ impl<'conn> PreparedStatement<'conn> {
             )
             .as_str(),
         );
-        conn.prepare_after_background_status(&self.original_sql).await
+        conn.prepare_after_background_status(&self.original_sql)
+            .await
     }
 
     /// Run `op`, and if it fails with `SchemaChanged` caused by a
@@ -8701,7 +8699,11 @@ impl PreparedStatement<'_> {
     }
 
     /// Execute as a query with bound SQL parameters, invoking `f` for each row.
-    pub async fn query_with_params_for_each<F>(&self, params: &[SqliteValue], mut f: F) -> Result<()>
+    pub async fn query_with_params_for_each<F>(
+        &self,
+        params: &[SqliteValue],
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(&Row) -> Result<()>,
     {
@@ -9001,7 +9003,9 @@ impl TriggerFrame {
         // rowid was captured for the event. (GH #216)
         let captured_rowid_alias =
             is_rowid_alias(column_name) && (self.new_rowid.is_some() || self.old_rowid.is_some());
-        if self.column_index(column_name).is_none() && hidden_rowid.is_none() && !captured_rowid_alias
+        if self.column_index(column_name).is_none()
+            && hidden_rowid.is_none()
+            && !captured_rowid_alias
         {
             return false;
         }
@@ -12168,9 +12172,7 @@ struct StatementExecDepthGuard<'a> {
 impl Drop for StatementExecDepthGuard<'_> {
     fn drop(&mut self) {
         let depth = self.conn.statement_exec_depth.get();
-        self.conn
-            .statement_exec_depth
-            .set(depth.saturating_sub(1));
+        self.conn.statement_exec_depth.set(depth.saturating_sub(1));
     }
 }
 
@@ -14589,17 +14591,17 @@ impl Connection {
         )
     }
 
-// ---------------------------------------------------------------------------
-// Bounded semantic walker 1 of 4: table rows
-//
-// Recomputes every ordinary ROWID table row inside the pinned snapshot and
-// checks NOT NULL and persisted CHECK constraints against the inflated values.
-// Rows are streamed one at a time against a fixed record ceiling, so residency
-// does not grow with table size — the same discipline as the structural walk.
-//
-// Converted to async: cursor positioning and payload reads are async on this
-// line. Expression evaluation stays synchronous because it performs no I/O.
-// ---------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // Bounded semantic walker 1 of 4: table rows
+    //
+    // Recomputes every ordinary ROWID table row inside the pinned snapshot and
+    // checks NOT NULL and persisted CHECK constraints against the inflated values.
+    // Rows are streamed one at a time against a fixed record ceiling, so residency
+    // does not grow with table size — the same discipline as the structural walk.
+    //
+    // Converted to async: cursor positioning and payload reads are async on this
+    // line. Expression evaluation stays synchronous because it performs no I/O.
+    // ---------------------------------------------------------------------------
 
     async fn bounded_next_table_row<T: TransactionHandle + ?Sized>(
         cx: &Cx,
@@ -14866,11 +14868,7 @@ impl Connection {
                 }
                 for (constraint_index, expression) in check_constraints.iter().enumerate() {
                     let value = self.bounded_evaluate_check_expression(
-                        table,
-                        expression,
-                        position,
-                        &inflated,
-                        None,
+                        table, expression, position, &inflated, None,
                     )?;
                     counters.check_constraint_evaluations = counters
                         .check_constraint_evaluations
@@ -14983,15 +14981,15 @@ impl Connection {
         )
     }
 
-// ---------------------------------------------------------------------------
-// Bounded semantic walker 2 of 4: index concordance
-//
-// Proves that every persisted index entry corresponds to a real table row and
-// that every table row appears in the index exactly where it should, using
-// bounded table rescans plus exact point probes rather than an O(rows)
-// reconciliation map. Ordering and uniqueness are checked on the scan; the
-// point probes catch a row that is present but filed under the wrong key.
-// ---------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // Bounded semantic walker 2 of 4: index concordance
+    //
+    // Proves that every persisted index entry corresponds to a real table row and
+    // that every table row appears in the index exactly where it should, using
+    // bounded table rescans plus exact point probes rather than an O(rows)
+    // reconciliation map. Ordering and uniqueness are checked on the scan; the
+    // point probes catch a row that is present but filed under the wrong key.
+    // ---------------------------------------------------------------------------
 
     fn bounded_index_spec(
         table: &TableSchema,
@@ -15184,14 +15182,13 @@ impl Connection {
             Self::bounded_next_table_row(cx, txn, table_root, page_size, reserved_per_page, after)
                 .await?
         {
-            let payload_values =
-                parse_record_with_encoding(&payload, self.db_text_encoding.get())
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "table `{}` rowid {rowid} payload is not a valid SQLite record",
-                            table.name
-                        ),
-                    })?;
+            let payload_values = parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                        table.name
+                    ),
+                })?;
             let row_values = Self::inflate_table_row_values_for_integrity(
                 table,
                 rowid,
@@ -15275,11 +15272,10 @@ impl Connection {
                         index.name
                     )));
                 }
-                let values =
-                    parse_record_with_encoding(&payload, self.db_text_encoding.get())
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!("index `{}` contains an invalid record", index.name),
-                        })?;
+                let values = parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("index `{}` contains an invalid record", index.name),
+                    })?;
                 if values.len() != index.key_term_count().saturating_add(1)
                     || !matches!(values.last(), Some(SqliteValue::Integer(_)))
                 {
@@ -15377,13 +15373,8 @@ impl Connection {
         // row locator for a WITHOUT ROWID table.
         let mut expected_keys: Vec<Vec<u8>> = Vec::new();
         {
-            let mut walk = Self::new_header_btree_cursor(
-                txn,
-                table_root,
-                page_size,
-                reserved_per_page,
-                false,
-            );
+            let mut walk =
+                Self::new_header_btree_cursor(txn, table_root, page_size, reserved_per_page, false);
             let mut position = 0_i64;
             if walk.first(cx).await? {
                 loop {
@@ -15499,11 +15490,10 @@ impl Connection {
                         index.name
                     )));
                 }
-                let values =
-                    parse_record_with_encoding(&payload, self.db_text_encoding.get())
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!("index `{}` contains an invalid record", index.name),
-                        })?;
+                let values = parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("index `{}` contains an invalid record", index.name),
+                    })?;
                 if values.len() != expected_entry_len {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -15636,15 +15626,15 @@ impl Connection {
             })
     }
 
-// ---------------------------------------------------------------------------
-// Bounded semantic walkers 3 and 4 of 4: foreign keys
-//
-// Declared foreign keys are resolved fail-closed and checked one child row at a
-// time inside the pinned snapshot: a non-NULL child key must find its parent by
-// direct ROWID or by a proven UNIQUE-index probe. Streaming per child row is
-// what keeps this bounded — the obvious implementation builds a parent key set
-// and is O(parent rows) resident.
-// ---------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // Bounded semantic walkers 3 and 4 of 4: foreign keys
+    //
+    // Declared foreign keys are resolved fail-closed and checked one child row at a
+    // time inside the pinned snapshot: a non-NULL child key must find its parent by
+    // direct ROWID or by a proven UNIQUE-index probe. Streaming per child row is
+    // what keeps this bounded — the obvious implementation builds a parent key set
+    // and is O(parent rows) resident.
+    // ---------------------------------------------------------------------------
 
     async fn bounded_parent_key_exists_in_txn<T: TransactionHandle + ?Sized>(
         &self,
@@ -15716,7 +15706,8 @@ impl Connection {
                 // UTF-8 `serialize_record` probe against a UTF-16 parent index lands
                 // the seek on the wrong entry, so `bounded_unique_terms_equal` fails
                 // and a CLEAN UTF-16 DB with a TEXT FK is falsely reported corrupt.
-                let probe = serialize_record_with_encoding(parent_values, self.db_text_encoding.get());
+                let probe =
+                    serialize_record_with_encoding(parent_values, self.db_text_encoding.get());
                 if probe.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
                     return Err(Self::bounded_validation_refusal(format!(
                         "FOREIGN KEY parent probe record for index `{}` exceeds the fixed {BOUNDED_VALIDATION_MAX_RECORD_BYTES}-byte bound",
@@ -15752,14 +15743,13 @@ impl Connection {
                         index.name
                     )));
                 }
-                let stored =
-                    parse_record_with_encoding(&payload, self.db_text_encoding.get())
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "FOREIGN KEY parent index `{}` yielded an invalid record",
-                                index.name
-                            ),
-                        })?;
+                let stored = parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "FOREIGN KEY parent index `{}` yielded an invalid record",
+                            index.name
+                        ),
+                    })?;
                 if stored.len() != index.key_term_count().saturating_add(1)
                     || !matches!(stored.last(), Some(SqliteValue::Integer(_)))
                 {
@@ -15817,14 +15807,13 @@ impl Connection {
             Self::bounded_next_table_row(cx, txn, child_root, page_size, reserved_per_page, after)
                 .await?
         {
-            let payload_values =
-                parse_record_with_encoding(&payload, self.db_text_encoding.get())
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "FOREIGN KEY child table `{}` rowid {rowid} has an invalid record",
-                            child.name
-                        ),
-                    })?;
+            let payload_values = parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "FOREIGN KEY child table `{}` rowid {rowid} has an invalid record",
+                        child.name
+                    ),
+                })?;
             if payload_values.len() > child.columns.len() {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -15872,17 +15861,19 @@ impl Connection {
                     ))
                 })
                 .collect::<Vec<_>>();
-            if !self.bounded_parent_key_exists_in_txn(
-                cx,
-                txn,
-                &parent,
-                check,
-                &parent_values,
-                page_size,
-                reserved_per_page,
-                counters,
-            )
-            .await? {
+            if !self
+                .bounded_parent_key_exists_in_txn(
+                    cx,
+                    txn,
+                    &parent,
+                    check,
+                    &parent_values,
+                    page_size,
+                    reserved_per_page,
+                    counters,
+                )
+                .await?
+            {
                 let child_column_names = check
                     .child_columns
                     .iter()
@@ -16315,12 +16306,7 @@ impl Connection {
         // image whose trigger bodies were never admitted is an image this proof
         // cannot speak for. TEMP objects are connection-local and never travel
         // with the image, so they are out of scope by construction.
-        for view in self
-            .views
-            .borrow()
-            .iter()
-            .filter(|view| !view.temporary)
-        {
+        for view in self.views.borrow().iter().filter(|view| !view.temporary) {
             self.validate_bounded_ast_semantics(
                 BoundedCollationAstNode::Select(&view.query),
                 &format!("view `{}`", view.name),
@@ -16690,8 +16676,9 @@ impl Connection {
                 .await?;
             if repaired_check != repaired {
                 return Err(FrankenError::DatabaseCorrupt {
-                    detail: "database candidate changed across source-derived change-counter repair"
-                        .to_owned(),
+                    detail:
+                        "database candidate changed across source-derived change-counter repair"
+                            .to_owned(),
                 });
             }
             let path = candidate_path
@@ -17860,11 +17847,7 @@ impl Connection {
     /// attached write made after the savepoint is undone in lockstep with main
     /// while the child transaction (and the savepoint) survives. No-op when there
     /// are no participants.
-    async fn rollback_to_savepoint_attached_participants(
-        &self,
-        cx: &Cx,
-        name: &str,
-    ) -> Result<()> {
+    async fn rollback_to_savepoint_attached_participants(&self, cx: &Cx, name: &str) -> Result<()> {
         for key in self.attached_transaction_participants() {
             self.with_attached_connection_async(&key, async |child| {
                 child
@@ -19318,9 +19301,9 @@ impl Connection {
         for (candidate, usage) in candidates.iter().zip(&info.constraint_usage) {
             if usage.argv_index > 0 {
                 let arg = match candidate.column_name.as_deref() {
-                    Some(col) if is_fts5 => SqliteValue::Text(
-                        format!("{col} : ({})", candidate.value.to_text()).into(),
-                    ),
+                    Some(col) if is_fts5 => {
+                        SqliteValue::Text(format!("{col} : ({})", candidate.value.to_text()).into())
+                    }
                     _ => candidate.value.clone(),
                 };
                 indexed_args.push((usage.argv_index, arg));
@@ -19583,7 +19566,10 @@ impl Connection {
         if declared_names == factory_names {
             return None;
         }
-        Some(resolve_virtual_table_column_infos(Vec::new(), factory_columns))
+        Some(resolve_virtual_table_column_infos(
+            Vec::new(),
+            factory_columns,
+        ))
     }
 
     fn try_execute_plain_live_vtab_count_star(
@@ -20363,7 +20349,8 @@ impl Connection {
             if !create_stmt.module.eq_ignore_ascii_case("fts5") {
                 return Ok(None);
             }
-            let Some(content_name) = virtual_table_option_value(&create_stmt.args, "content") else {
+            let Some(content_name) = virtual_table_option_value(&create_stmt.args, "content")
+            else {
                 return Ok(None);
             };
             if content_name.is_empty() {
@@ -23808,9 +23795,7 @@ impl Connection {
                     span
                 });
             let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
-            let prepared_result = self
-                .compile_and_wrap(&canonical_sql, sql, &statement)
-                .await;
+            let prepared_result = self.compile_and_wrap(&canonical_sql, sql, &statement).await;
 
             // User module metadata callbacks are deliberately reentrant and
             // may replace a scalar while preparation is in progress. Neither
@@ -24115,11 +24100,7 @@ impl Connection {
     }
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
-    async fn query_with_params_impl(
-        &self,
-        sql: &str,
-        params: &[SqliteValue],
-    ) -> Result<Vec<Row>> {
+    async fn query_with_params_impl(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
         clear_error_byte_offset();
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
@@ -24334,10 +24315,7 @@ impl Connection {
     /// ("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
     /// constraint"). Neither the VDBE fast lane nor the dispatch path performs
     /// this, so it runs at the execute() boundary. bd-prepare-time-validation-bypass.
-    fn validate_upsert_conflict_target(
-        &self,
-        insert: &fsqlite_ast::InsertStatement,
-    ) -> Result<()> {
+    fn validate_upsert_conflict_target(&self, insert: &fsqlite_ast::InsertStatement) -> Result<()> {
         if insert.upsert.is_empty() {
             return Ok(());
         }
@@ -30619,9 +30597,8 @@ impl Connection {
             // on a UTF-16 DB (bd-o3rz4).
             parse_record_into_with_encoding(payload_buf, new_values, self.db_text_encoding.get())
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "prepared direct update: failed to parse existing row payload"
-                        .to_owned(),
-                })?;
+                detail: "prepared direct update: failed to parse existing row payload".to_owned(),
+            })?;
             // `parse_record_into` truncates to the decoded column count; pad/trim
             // back to the schema width so IPK / missing columns are explicit.
             while new_values.len() < direct.columns.len() {
@@ -33448,10 +33425,9 @@ impl Connection {
                 let mut handle = registry.get(session_id).ok_or_else(|| {
                     FrankenError::Internal("concurrent session handle not found".to_owned())
                 })?;
-                let snapshot =
-                    concurrent_savepoint(&mut handle, &savepoint_name).map_err(|e| {
-                        FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
-                    })?;
+                let snapshot = concurrent_savepoint(&mut handle, &savepoint_name).map_err(|e| {
+                    FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
+                })?;
                 Ok(Some(snapshot))
             })();
             match concurrent_result {
@@ -35720,7 +35696,10 @@ impl Connection {
                     // short-circuits with correct polarity. CRITICAL: bind
                     // placeholders only — do NOT call rewrite_in_subqueries_select
                     // here (it would re-trigger the eager execution we are avoiding).
-                    self.log_mem_execution_fallback("select", "where_shortcircuit_subquery_fallback")?;
+                    self.log_mem_execution_fallback(
+                        "select",
+                        "where_shortcircuit_subquery_fallback",
+                    )?;
                     let mut bound = bind_placeholders_in_select_for_fallback(select, params)?;
                     let limit_clause = bound.limit.take();
                     if limit_clause
@@ -35936,9 +35915,7 @@ impl Connection {
                         insert.or_conflict,
                         Some(fsqlite_ast::ConflictAction::Replace)
                     );
-                    if !insert.upsert.is_empty()
-                        || (insert.or_conflict.is_some() && !is_replace)
-                    {
+                    if !insert.upsert.is_empty() || (insert.or_conflict.is_some() && !is_replace) {
                         return Err(FrankenError::NotImplemented(
                             "UPSERT and conflict clauses are not supported for live virtual-table INSERT"
                                 .to_owned(),
@@ -35981,13 +35958,15 @@ impl Connection {
                         if let Some(target_cols) = target_cols
                             && source_cols != target_cols
                         {
-                            return Err(FrankenError::FunctionError(if insert.columns.is_empty() {
-                                format!(
-                                    "table {table_name} has {target_cols} columns but {source_cols} values were supplied"
-                                )
-                            } else {
-                                format!("{source_cols} values for {target_cols} columns")
-                            }));
+                            return Err(FrankenError::FunctionError(
+                                if insert.columns.is_empty() {
+                                    format!(
+                                        "table {table_name} has {target_cols} columns but {source_cols} values were supplied"
+                                    )
+                                } else {
+                                    format!("{source_cols} values for {target_cols} columns")
+                                },
+                            ));
                         }
                     }
 
@@ -36156,9 +36135,7 @@ impl Connection {
                                 }
                             }
                         }
-                        for (row, rowid) in
-                            live_insert_rows.iter().zip(inserted_rowids.iter())
-                        {
+                        for (row, rowid) in live_insert_rows.iter().zip(inserted_rowids.iter()) {
                             self.fire_after_triggers(
                                 table_name,
                                 &insert_event,
@@ -36275,7 +36252,7 @@ impl Connection {
                             None,
                             Some(after_insert_rowid),
                         )
-                            .await?;
+                        .await?;
                     }
                 }
 
@@ -36331,20 +36308,19 @@ impl Connection {
                 // interpreted SELECT path and rewrite to `rowid IN (...)` so the
                 // UPDATE executes by rowid. Live virtual tables route through their
                 // module below, so they are skipped here. (bd-t7m7y)
-                let corr_in_rewrite = if self
-                    .has_live_vtab_instance(&effective_update.table.name.name)
-                {
-                    None
-                } else {
-                    self.rewrite_correlated_in_where_to_rowids(
-                        &effective_update.table,
-                        effective_update.where_clause.as_ref(),
-                        &effective_update.order_by,
-                        effective_update.limit.as_ref(),
-                        params,
-                    )
-                    .await?
-                };
+                let corr_in_rewrite =
+                    if self.has_live_vtab_instance(&effective_update.table.name.name) {
+                        None
+                    } else {
+                        self.rewrite_correlated_in_where_to_rowids(
+                            &effective_update.table,
+                            effective_update.where_clause.as_ref(),
+                            &effective_update.order_by,
+                            effective_update.limit.as_ref(),
+                            params,
+                        )
+                        .await?
+                    };
                 if let Some(rewritten) = corr_in_rewrite {
                     effective_update.order_by.clear();
                     effective_update.limit = None;
@@ -36355,8 +36331,9 @@ impl Connection {
                 // compiled or row-by-row lane (bd-gh-generated-column-update-target).
                 {
                     let schema = self.schema.borrow();
-                    if let Some(table_schema) =
-                        schema.iter().find(|t| t.name.eq_ignore_ascii_case(table_name))
+                    if let Some(table_schema) = schema
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(table_name))
                     {
                         Self::validate_update_target_columns(
                             table_schema,
@@ -36570,29 +36547,28 @@ impl Connection {
                 }
 
                 let arc_prog;
-                let program: &VdbeProgram =
-                    if let Some(p) =
-                        precompiled.filter(|_| !froze_before_update_assignments && !update_where_rewritten)
-                    {
-                        p
-                    } else {
-                        let plan_span = tracing::span!(
-                            target: "fsqlite.plan",
-                            tracing::Level::TRACE,
-                            "plan",
-                            stage = "compile_table_update"
-                        );
-                        record_trace_span_created();
-                        let _plan_guard = plan_span.enter();
-                        let sql_text = effective_update.to_string();
-                        let sql_key = Self::sql_hash(&sql_text);
-                        arc_prog = self
-                            .compile_with_cache(sql_key, &sql_text, async |conn| {
-                                conn.compile_table_update(&effective_update)
-                            })
-                            .await?;
-                        &arc_prog
-                    };
+                let program: &VdbeProgram = if let Some(p) = precompiled
+                    .filter(|_| !froze_before_update_assignments && !update_where_rewritten)
+                {
+                    p
+                } else {
+                    let plan_span = tracing::span!(
+                        target: "fsqlite.plan",
+                        tracing::Level::TRACE,
+                        "plan",
+                        stage = "compile_table_update"
+                    );
+                    record_trace_span_created();
+                    let _plan_guard = plan_span.enter();
+                    let sql_text = effective_update.to_string();
+                    let sql_key = Self::sql_hash(&sql_text);
+                    arc_prog = self
+                        .compile_with_cache(sql_key, &sql_text, async |conn| {
+                            conn.compile_table_update(&effective_update)
+                        })
+                        .await?;
+                    &arc_prog
+                };
                 let (rows, affected, _) = self
                     .execute_table_program_with_cx(
                         program,
@@ -36739,20 +36715,19 @@ impl Connection {
                 // lowered by VDBE codegen; resolve the matching rowids via the
                 // interpreted SELECT path and rewrite to `rowid IN (...)` so the
                 // DELETE executes by rowid. (bd-t7m7y)
-                let corr_in_rewrite = if self
-                    .has_live_vtab_instance(&effective_delete.table.name.name)
-                {
-                    None
-                } else {
-                    self.rewrite_correlated_in_where_to_rowids(
-                        &effective_delete.table,
-                        effective_delete.where_clause.as_ref(),
-                        &effective_delete.order_by,
-                        effective_delete.limit.as_ref(),
-                        params,
-                    )
-                    .await?
-                };
+                let corr_in_rewrite =
+                    if self.has_live_vtab_instance(&effective_delete.table.name.name) {
+                        None
+                    } else {
+                        self.rewrite_correlated_in_where_to_rowids(
+                            &effective_delete.table,
+                            effective_delete.where_clause.as_ref(),
+                            &effective_delete.order_by,
+                            effective_delete.limit.as_ref(),
+                            params,
+                        )
+                        .await?
+                    };
                 if let Some(rewritten) = corr_in_rewrite {
                     effective_delete.order_by.clear();
                     effective_delete.limit = None;
@@ -36923,28 +36898,27 @@ impl Connection {
                 }
 
                 let arc_prog;
-                let program: &VdbeProgram = if let Some(p) =
-                    precompiled.filter(|_| !delete_where_rewritten)
-                {
-                    p
-                } else {
-                    let plan_span = tracing::span!(
-                        target: "fsqlite.plan",
-                        tracing::Level::TRACE,
-                        "plan",
-                        stage = "compile_table_delete"
-                    );
-                    record_trace_span_created();
-                    let _plan_guard = plan_span.enter();
-                    let sql_text = effective_delete.to_string();
-                    let sql_key = Self::sql_hash(&sql_text);
-                    arc_prog = self
-                        .compile_with_cache(sql_key, &sql_text, async |conn| {
-                            conn.compile_table_delete(&effective_delete)
-                        })
-                        .await?;
-                    &arc_prog
-                };
+                let program: &VdbeProgram =
+                    if let Some(p) = precompiled.filter(|_| !delete_where_rewritten) {
+                        p
+                    } else {
+                        let plan_span = tracing::span!(
+                            target: "fsqlite.plan",
+                            tracing::Level::TRACE,
+                            "plan",
+                            stage = "compile_table_delete"
+                        );
+                        record_trace_span_created();
+                        let _plan_guard = plan_span.enter();
+                        let sql_text = effective_delete.to_string();
+                        let sql_key = Self::sql_hash(&sql_text);
+                        arc_prog = self
+                            .compile_with_cache(sql_key, &sql_text, async |conn| {
+                                conn.compile_table_delete(&effective_delete)
+                            })
+                            .await?;
+                        &arc_prog
+                    };
                 let (rows, affected, _) = self
                     .execute_table_program_with_cx(
                         program,
@@ -38527,9 +38501,7 @@ impl PendingDatabaseImagePublication<'_> {
             .rebind_after_committed_image_publication(&cx, self.restore_hydrated_rows)
             .await
         {
-            Ok(()) => Ok(DatabaseImagePublication::Rebound {
-                receipt: validated,
-            }),
+            Ok(()) => Ok(DatabaseImagePublication::Rebound { receipt: validated }),
             Err(error) => Ok(DatabaseImagePublication::CommittedConnectionPoisoned {
                 receipt: validated,
                 detail: error.to_string(),
@@ -39214,7 +39186,6 @@ fn bounded_identifier_lists_equal(left: &[String], right: &[String]) -> bool {
             .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
-
 /// Everything walker 2 needs to recompute one index key from a table row.
 ///
 /// `key_expressions` covers expression indexes; `predicate` covers partial
@@ -39282,7 +39253,6 @@ fn bounded_increment_validation_counter(counter: &mut u64) -> Result<()> {
     *counter = next;
     Ok(())
 }
-
 
 // ---------------------------------------------------------------------------
 // Gate-B (part 1): bounded expression-AST admission traversal
@@ -39666,9 +39636,9 @@ fn first_unsupported_bounded_ast(
                 Statement::Analyze(_) => {
                     return Ok(Some(BoundedAstUnsupported::Statement("ANALYZE")));
                 } // NOTE: this match is exhaustive over `Statement` on purpose —
-                // it fails closed by construction. A new `Statement` variant
-                // makes it non-exhaustive (a compile error) so the admission
-                // traversal cannot silently accept a construct nobody checked.
+                  // it fails closed by construction. A new `Statement` variant
+                  // makes it non-exhaustive (a compile error) so the admission
+                  // traversal cannot silently accept a construct nobody checked.
             },
             BoundedCollationAstNode::Expr(expr) => match expr {
                 Expr::Literal(literal, _) => {
@@ -40027,7 +39997,6 @@ fn first_unsupported_bounded_ast(
     Ok(None)
 }
 
-
 // ---------------------------------------------------------------------------
 // Gate-B (part 2): admission policies
 //
@@ -40053,9 +40022,9 @@ fn bounded_builtin_scalar_function_supported(
             && (entry.num_args == arity || entry.num_args == -1)
     });
     declared_builtin
-        && registry.find_scalar(name, arity).is_some_and(|function| {
-            function.is_deterministic() && function.arity().accepts(arity)
-        })
+        && registry
+            .find_scalar(name, arity)
+            .is_some_and(|function| function.is_deterministic() && function.arity().accepts(arity))
 }
 
 fn bounded_check_scalar_function_supported(
@@ -40115,7 +40084,6 @@ thread_local! {
     static CURRENT_BOUNDED_CHECK_EVALUATION_BYTES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
-
 struct BoundedCheckFunctionRegistryGuard;
 
 impl BoundedCheckFunctionRegistryGuard {
@@ -40149,7 +40117,6 @@ impl Drop for BoundedCheckEvaluationBudgetGuard {
         });
     }
 }
-
 
 /// Where a page-ownership walk records the pages it claims.
 ///
@@ -41203,7 +41170,8 @@ impl Connection {
                                 if *conflict == ConflictAction::Replace {
                                     conflicting_rowids.insert(mem_row.0);
                                 } else {
-                                    unique_violation_col = Some(idx.key_label_qualified(table_name));
+                                    unique_violation_col =
+                                        Some(idx.key_label_qualified(table_name));
                                 }
                                 break;
                             }
@@ -46077,7 +46045,8 @@ impl Connection {
                 // Nested view: recurse into its SELECT (clone out of the borrow
                 // first so the recursion can re-borrow `self.views`).
                 let (view_query, view_names) = {
-                    let idx = self.view_index_for_scope(&name.name, PragmaSchemaScope::Unqualified)?;
+                    let idx =
+                        self.view_index_for_scope(&name.name, PragmaSchemaScope::Unqualified)?;
                     let views = self.views.borrow();
                     let view = views.get(idx)?;
                     let names = if view.columns.is_empty() {
@@ -46087,7 +46056,8 @@ impl Connection {
                     };
                     (view.query.clone(), names)
                 };
-                let types = self.view_result_column_decltypes_at_depth(&view_query, tables, depth + 1);
+                let types =
+                    self.view_result_column_decltypes_at_depth(&view_query, tables, depth + 1);
                 let cols = view_names
                     .into_iter()
                     .enumerate()
@@ -46118,7 +46088,8 @@ impl Connection {
             Some(qualifier) => sources
                 .iter()
                 .find(|(name, _)| {
-                    name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(qualifier))
+                    name.as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(qualifier))
                 })
                 .and_then(|(_, cols)| {
                     cols.iter()
@@ -46846,9 +46817,11 @@ impl Connection {
         };
         let name = &table.name;
         if let Some(ti) = self.schema_index_of(&name.name) {
-            let known = self.schema.borrow().get(ti).is_some_and(|t| {
-                t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(idx))
-            });
+            let known = self
+                .schema
+                .borrow()
+                .get(ti)
+                .is_some_and(|t| t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(idx)));
             if known {
                 Ok(())
             } else {
@@ -47602,8 +47575,13 @@ impl Connection {
             ),
             alias: None,
         };
-        let select =
-            Self::build_single_table_select(table_ref, vec![rowid_col], where_clause, order_by, limit);
+        let select = Self::build_single_table_select(
+            table_ref,
+            vec![rowid_col],
+            where_clause,
+            order_by,
+            limit,
+        );
         let rows = self
             .execute_statement(&Statement::Select(select), params)
             .await?;
@@ -47657,7 +47635,9 @@ impl Connection {
         let rowids = self
             .select_matching_rowids(table_ref, where_clause, order_by, limit, params)
             .await?;
-        Ok(Some(self.rowid_in_list_where(&table_ref.name.name, &rowids)))
+        Ok(Some(
+            self.rowid_in_list_where(&table_ref.name.name, &rowids),
+        ))
     }
 
     /// Freeze stable row locators for a multi-row UPDATE before its first
@@ -48620,7 +48600,10 @@ impl Connection {
                                 column_values,
                                 tokenizer.as_ref(),
                             );
-                            let record = serialize_record_with_encoding(&persisted_values, self.db_text_encoding.get());
+                            let record = serialize_record_with_encoding(
+                                &persisted_values,
+                                self.db_text_encoding.get(),
+                            );
                             cursor.table_insert(cx, rowid, &record).await?;
                             inserted_row_count = inserted_row_count.saturating_add(1);
                             self.record_last_insert_rowid(rowid);
@@ -48664,7 +48647,10 @@ impl Connection {
                             column_values,
                             tokenizer.as_ref(),
                         );
-                        let record = serialize_record_with_encoding(&persisted_values, self.db_text_encoding.get());
+                        let record = serialize_record_with_encoding(
+                            &persisted_values,
+                            self.db_text_encoding.get(),
+                        );
                         cursor.table_insert(cx, rowid, &record).await?;
                         inserted_row_count = inserted_row_count.saturating_add(1);
                         self.record_last_insert_rowid(rowid);
@@ -48711,7 +48697,10 @@ impl Connection {
                     if cursor.table_move_to(cx, rowid).await?.is_found() {
                         cursor.delete(cx).await?;
                     }
-                    let record = serialize_record_with_encoding(&persisted_values, self.db_text_encoding.get());
+                    let record = serialize_record_with_encoding(
+                        &persisted_values,
+                        self.db_text_encoding.get(),
+                    );
                     cursor.table_insert(cx, rowid, &record).await?;
                     inserted_row_count = inserted_row_count.saturating_add(1);
                     self.record_last_insert_rowid(rowid);
@@ -48975,7 +48964,12 @@ impl Connection {
                     .filter(|fts5| {
                         fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless
                     })
-                    .map(|fts5| (fts5.config().contentless_delete_enabled(), fts5.columns().to_vec()))
+                    .map(|fts5| {
+                        (
+                            fts5.config().contentless_delete_enabled(),
+                            fts5.columns().to_vec(),
+                        )
+                    })
             };
             if let Some((delete_enabled, columns)) = contentless {
                 if !delete_enabled {
@@ -49449,7 +49443,10 @@ impl Connection {
                     if cursor.table_move_to(cx, rowid).await?.is_found() {
                         cursor.delete(cx).await?;
                     }
-                    let record = serialize_record_with_encoding(&persisted_values, self.db_text_encoding.get());
+                    let record = serialize_record_with_encoding(
+                        &persisted_values,
+                        self.db_text_encoding.get(),
+                    );
                     cursor.table_insert(cx, rowid, &record).await?;
                 }
             }
@@ -49811,7 +49808,8 @@ impl Connection {
 
         // Keep the segment count bounded (the read path walks all segments per
         // term): run the merge policy once for this append.
-        self.maybe_merge_rootpage_zero_fts5_segments(table_name).await?;
+        self.maybe_merge_rootpage_zero_fts5_segments(table_name)
+            .await?;
         Ok(true)
     }
 
@@ -49927,11 +49925,8 @@ impl Connection {
         // tombstone enumeration above misses them); otherwise a stock-written
         // dlidx orphans and the next promote's integrity_report rejects the
         // shadow (bd-x9ber).
-        self.delete_fts5_data_rows_for_segids(
-            table_name,
-            &merged_segids.iter().copied().collect(),
-        )
-        .await?;
+        self.delete_fts5_data_rows_for_segids(table_name, &merged_segids.iter().copied().collect())
+            .await?;
 
         tracing::debug!(
             table = table_name,
@@ -50012,9 +50007,10 @@ impl Connection {
                     let Some(docsize) = reader.read_docsize(rowid, column_count).await? else {
                         return Ok(None);
                     };
-                    let Some(segid) =
-                        resolve_tombstone_target_segment(&structure, u64::try_from(origin).unwrap_or(0))
-                    else {
+                    let Some(segid) = resolve_tombstone_target_segment(
+                        &structure,
+                        u64::try_from(origin).unwrap_or(0),
+                    ) else {
                         return Ok(None);
                     };
                     resolved.push(Fts5DeletedDoc {
@@ -50026,8 +50022,10 @@ impl Connection {
 
                 let touched: std::collections::BTreeSet<u32> =
                     resolved.iter().map(|doc| doc.segid).collect();
-                let mut existing_tombstones: std::collections::BTreeMap<u32, Vec<Fts5TombstonePage>> =
-                    std::collections::BTreeMap::new();
+                let mut existing_tombstones: std::collections::BTreeMap<
+                    u32,
+                    Vec<Fts5TombstonePage>,
+                > = std::collections::BTreeMap::new();
                 for &segid in &touched {
                     let count = structure
                         .levels
@@ -50216,7 +50214,11 @@ impl Connection {
                 .get_mut(&key)
                 .and_then(|instance| instance.as_any_mut().downcast_mut::<Fts5Table>())
             {
-                fts5.mark_lazy_on_disk(if is_contentless { 0 } else { preserved_row_count });
+                fts5.mark_lazy_on_disk(if is_contentless {
+                    0
+                } else {
+                    preserved_row_count
+                });
             }
         }
 
@@ -50377,7 +50379,8 @@ impl Connection {
                     cursor.delete(cx).await?;
                 }
                 for (_synthetic_rowid, values) in rows {
-                    let record = serialize_record_with_encoding(&values, self.db_text_encoding.get());
+                    let record =
+                        serialize_record_with_encoding(&values, self.db_text_encoding.get());
                     cursor.index_insert(cx, &record).await?;
                 }
                 return Ok(());
@@ -51117,7 +51120,10 @@ impl Connection {
                 };
                 (
                     rowid,
-                    values.get(1..).map(<[SqliteValue]>::to_vec).unwrap_or_default(),
+                    values
+                        .get(1..)
+                        .map(<[SqliteValue]>::to_vec)
+                        .unwrap_or_default(),
                 )
             } else {
                 (None, values.to_vec())
@@ -51310,7 +51316,13 @@ impl Connection {
                         Some(SqliteValue::Integer(n)) => Some(*n),
                         _ => None,
                     };
-                    (rowid, values.get(1..).map(<[SqliteValue]>::to_vec).unwrap_or_default())
+                    (
+                        rowid,
+                        values
+                            .get(1..)
+                            .map(<[SqliteValue]>::to_vec)
+                            .unwrap_or_default(),
+                    )
                 } else {
                     (None, values.to_vec())
                 }
@@ -57832,9 +57844,10 @@ impl Connection {
                         // column"; DEFAULT written BEFORE it surfaces as the
                         // generic "error in generated column \"<name>\"".
                         if generated_expr.is_some() && default_value.is_some() {
-                            let default_pos = col.constraints.iter().position(|c| {
-                                matches!(c.kind, ColumnConstraintKind::Default(_))
-                            });
+                            let default_pos = col
+                                .constraints
+                                .iter()
+                                .position(|c| matches!(c.kind, ColumnConstraintKind::Default(_)));
                             let generated_pos = col.constraints.iter().position(|c| {
                                 matches!(c.kind, ColumnConstraintKind::Generated { .. })
                             });
@@ -57920,7 +57933,9 @@ impl Connection {
                 // CREATE time ("must have at least one non-generated column"),
                 // rather than only failing later at INSERT. bd-...-lc80p.
                 if !col_infos.is_empty()
-                    && col_infos.iter().all(|column| column.generated_expr.is_some())
+                    && col_infos
+                        .iter()
+                        .all(|column| column.generated_expr.is_some())
                 {
                     return Err(FrankenError::FunctionError(
                         "must have at least one non-generated column".to_owned(),
@@ -58120,7 +58135,9 @@ impl Connection {
                     for c in &col.constraints {
                         if let ColumnConstraintKind::Check(ref expr) = c.kind {
                             check_defs.push(CheckConstraint {
-                                expr: self.expr_verbatim_source(expr).unwrap_or_else(|| expr.to_string()),
+                                expr: self
+                                    .expr_verbatim_source(expr)
+                                    .unwrap_or_else(|| expr.to_string()),
                                 owner_column: Some(col.name.clone()),
                                 name: c.name.clone(),
                             });
@@ -58130,7 +58147,9 @@ impl Connection {
                 for tc in constraints {
                     if let TableConstraintKind::Check(ref expr) = tc.kind {
                         check_defs.push(CheckConstraint {
-                            expr: self.expr_verbatim_source(expr).unwrap_or_else(|| expr.to_string()),
+                            expr: self
+                                .expr_verbatim_source(expr)
+                                .unwrap_or_else(|| expr.to_string()),
                             owner_column: None,
                             name: tc.name.clone(),
                         });
@@ -58749,7 +58768,9 @@ impl Connection {
                     if drop_stmt.if_exists {
                         return Ok(Vec::new());
                     }
-                    return Err(FrankenError::FunctionError(format!("no such index: {obj_name}")));
+                    return Err(FrankenError::FunctionError(format!(
+                        "no such index: {obj_name}"
+                    )));
                 }
                 if let Some(root_page) = dropped_root_page {
                     // TEMP indexes are MemDatabase-only and must never be
@@ -58848,7 +58869,9 @@ impl Connection {
                         | PragmaSchemaScope::Main
                         | PragmaSchemaScope::Temp => obj_name.clone(),
                     };
-                    return Err(FrankenError::FunctionError(format!("no such view: {missing}")));
+                    return Err(FrankenError::FunctionError(format!(
+                        "no such view: {missing}"
+                    )));
                 }
             }
             DropObjectType::Trigger => {
@@ -59175,7 +59198,9 @@ impl Connection {
                         .iter()
                         .any(|column| column.name.eq_ignore_ascii_case(old)) =>
                 {
-                    return Err(FrankenError::FunctionError(format!("no such column: \"{old}\"")));
+                    return Err(FrankenError::FunctionError(format!(
+                        "no such column: \"{old}\""
+                    )));
                 }
                 AlterTableAction::AddColumn(column)
                     if table
@@ -59376,7 +59401,9 @@ impl Connection {
                     .columns
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(old))
-                    .ok_or_else(|| FrankenError::FunctionError(format!("no such column: \"{old}\"")))?;
+                    .ok_or_else(|| {
+                        FrankenError::FunctionError(format!("no such column: \"{old}\""))
+                    })?;
                 if table
                     .columns
                     .iter()
@@ -59552,8 +59579,7 @@ impl Connection {
                         }
                     )
                 });
-                let add_column_table_has_rows =
-                    if default_dv.is_some_and(|dv| !add_column_default_is_literal_constant(dv))
+                let add_column_table_has_rows = if default_dv.is_some_and(|dv| !add_column_default_is_literal_constant(dv))
                         // A NOT NULL column that back-fills existing rows with NULL
                         // — no default, or a default that is the bare NULL literal —
                         // is forbidden by SQLite on a non-empty table ("Cannot add a
@@ -59562,18 +59588,19 @@ impl Connection {
                         // count even when there is no usable (non-NULL) default.
                         || (notnull && (default_dv.is_none() || default_is_null_literal))
                         || has_stored_generated
-                    {
-                        self.alter_add_column_table_has_rows(table_name).await?
-                    } else {
-                        false
-                    };
+                {
+                    self.alter_add_column_table_has_rows(table_name).await?
+                } else {
+                    false
+                };
                 let default_value = default_dv
                     .map(|dv| -> Result<String> {
                         self.validate_default_value_is_constant(&col_def.name, dv)?;
                         // On a non-empty table the back-filled default must be a
                         // literal constant, not an expression/function/CURRENT_*
                         // (bd-gh-alter-add-column-defaults).
-                        if add_column_table_has_rows && !add_column_default_is_literal_constant(dv) {
+                        if add_column_table_has_rows && !add_column_default_is_literal_constant(dv)
+                        {
                             return Err(FrankenError::FunctionError(
                                 "Cannot add a column with non-constant default".to_owned(),
                             ));
@@ -59616,7 +59643,9 @@ impl Connection {
                     .iter()
                     .filter_map(|constraint| match &constraint.kind {
                         ColumnConstraintKind::Check(expr) => Some(CheckConstraint {
-                            expr: self.expr_verbatim_source(expr).unwrap_or_else(|| expr.to_string()),
+                            expr: self
+                                .expr_verbatim_source(expr)
+                                .unwrap_or_else(|| expr.to_string()),
                             owner_column: Some(col_def.name.clone()),
                             name: constraint.name.clone(),
                         }),
@@ -59762,7 +59791,9 @@ impl Connection {
                     .columns
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                    .ok_or_else(|| FrankenError::FunctionError(format!("no such column: \"{col_name}\"")))?;
+                    .ok_or_else(|| {
+                        FrankenError::FunctionError(format!("no such column: \"{col_name}\""))
+                    })?;
                 if table.primary_key_constraints.iter().any(|pk| {
                     pk.iter()
                         .any(|pk_col| pk_col.eq_ignore_ascii_case(col_name))
@@ -59926,7 +59957,9 @@ impl Connection {
                     .columns
                     .iter()
                     .position(|column| column.name.eq_ignore_ascii_case(col_name))
-                    .ok_or_else(|| FrankenError::FunctionError(format!("no such column: \"{col_name}\"")))?;
+                    .ok_or_else(|| {
+                        FrankenError::FunctionError(format!("no such column: \"{col_name}\""))
+                    })?;
                 table.columns.remove(col_idx);
                 table.check_constraints.retain(|check| {
                     !check
@@ -61644,10 +61677,7 @@ impl Connection {
     /// refresh (never corrupt) `sqlite_stat1` here. The empty-database,
     /// all-fresh, mask=0, and debug cases the conformance oracle exercises all
     /// match stock.
-    async fn execute_optimize(
-        &self,
-        value: Option<&fsqlite_ast::PragmaValue>,
-    ) -> Result<Vec<Row>> {
+    async fn execute_optimize(&self, value: Option<&fsqlite_ast::PragmaValue>) -> Result<Vec<Row>> {
         const OPTIMIZE_DEBUG_BIT: i64 = 0x0001;
         const OPTIMIZE_ANALYZE_BIT: i64 = 0x0002;
         // The no-argument default mask, matching SQLite: every optimization
@@ -62478,7 +62508,8 @@ impl Connection {
         let _force_immediate_guard =
             BoolCellRestoreGuard::new(&self.fk_force_immediate_check, true);
         for (table_name, row_values) in pending_guard.pending() {
-            self.recheck_deferred_obligation(table_name, row_values).await?;
+            self.recheck_deferred_obligation(table_name, row_values)
+                .await?;
         }
         pending_guard.discharge();
         Ok(())
@@ -62527,10 +62558,7 @@ impl Connection {
             // The child row was deleted (or its identity changed) before COMMIT
             // — its deferred obligation is discharged.
             None => Ok(()),
-            Some(row) => {
-                self.check_fk_parent_exists(table_name, row.values())
-                    .await
-            }
+            Some(row) => self.check_fk_parent_exists(table_name, row.values()).await,
         }
     }
 
@@ -62730,7 +62758,8 @@ impl Connection {
         table_name: &str,
         params: Option<&[SqliteValue]>,
     ) -> Result<()> {
-        for (row_values, _explicit_rowid) in self.collect_insert_trigger_rows(insert, params).await?
+        for (row_values, _explicit_rowid) in
+            self.collect_insert_trigger_rows(insert, params).await?
         {
             self.check_fk_parent_exists(table_name, &row_values).await?;
         }
@@ -63545,7 +63574,7 @@ impl Connection {
                     victim.rowid,
                     None,
                 )
-                    .await?;
+                .await?;
                 self.fire_after_triggers(
                     table_name,
                     &delete_event,
@@ -63554,7 +63583,7 @@ impl Connection {
                     victim.rowid,
                     None,
                 )
-                    .await?;
+                .await?;
             }
         }
 
@@ -63831,18 +63860,17 @@ impl Connection {
                         // ON UPDATE NO ACTION re-checks the affected children's
                         // parent existence at COMMIT instead of erroring at the
                         // update point (bd-gh-deferred-fk-parent-dml, GH #149).
-                        if matches!(
-                            fk.on_update,
-                            fsqlite_vdbe::codegen::FkActionType::NoAction
-                        ) && self.fk_should_defer(fk)
+                        if matches!(fk.on_update, fsqlite_vdbe::codegen::FkActionType::NoAction)
+                            && self.fk_should_defer(fk)
                         {
                             let fetch_sql = format!(
                                 "SELECT * FROM {} WHERE {}",
                                 quote_identifier(child_table),
                                 where_parts.join(" AND ")
                             );
-                            let affected =
-                                self.fk_validation_query(&fetch_sql, &old_parent_vals).await?;
+                            let affected = self
+                                .fk_validation_query(&fetch_sql, &old_parent_vals)
+                                .await?;
                             let mut queue = self.deferred_fk_checks.borrow_mut();
                             for row in affected {
                                 queue.push((child_table.clone(), row.values().to_vec()));
@@ -64954,7 +64982,11 @@ impl Connection {
     /// pragma_database_list)` bodies, not only the primary query. Expression-
     /// position subqueries (e.g. `SELECT (SELECT count(*) FROM
     /// pragma_database_list)`) remain a separate gap tracked on bd-7p5z3.
-    fn statement_has_bare_pragma_tvf(&self, stmt: &SelectStatement, outer_scope: &[String]) -> bool {
+    fn statement_has_bare_pragma_tvf(
+        &self,
+        stmt: &SelectStatement,
+        outer_scope: &[String],
+    ) -> bool {
         let scope = Self::extend_cte_scope(outer_scope, stmt);
         stmt.with.as_ref().is_some_and(|with| {
             with.ctes
@@ -65004,7 +65036,9 @@ impl Connection {
                     && pragma_table_function_is_no_arg(&name.name)
                     && !self.bare_name_shadows_pragma_tvf(&name.name, cte_names)
             }
-            TableOrSubquery::ParenJoin(from) => self.from_clause_has_bare_pragma_tvf(from, cte_names),
+            TableOrSubquery::ParenJoin(from) => {
+                self.from_clause_has_bare_pragma_tvf(from, cte_names)
+            }
             TableOrSubquery::Subquery { query, .. } => {
                 self.statement_has_bare_pragma_tvf(query, cte_names)
             }
@@ -68156,9 +68190,7 @@ impl Connection {
             .with_integrity_txn(async |cx, txn| {
                 let page1 = txn.get_page(cx, PageNumber::ONE).await?;
                 let page1_bytes = page1.as_ref();
-                if page1_bytes.iter().all(|&b| b == 0)
-                    || page1_bytes.len() < DATABASE_HEADER_SIZE
-                {
+                if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < DATABASE_HEADER_SIZE {
                     return Ok(Vec::new());
                 }
                 let header = parse_database_header_checked(page1_bytes)?;
@@ -68185,9 +68217,7 @@ impl Connection {
                 // exactly the roots integrity_check walks.
                 let mut schema = self.schema.borrow().clone();
                 let temp_table_names = self.temp_table_names.borrow();
-                schema.retain(|table| {
-                    !temp_table_names.contains(&table.name.to_ascii_lowercase())
-                });
+                schema.retain(|table| !temp_table_names.contains(&table.name.to_ascii_lowercase()));
                 drop(temp_table_names);
                 schema.extend(self.shadowed_main_tables.borrow().values().cloned());
 
@@ -68294,7 +68324,9 @@ impl Connection {
             if exists
                 && ddl
                     .get(&content_shadow.to_ascii_lowercase())
-                    .is_some_and(|content_sql| ddl_matches_fts5_internal_content_shadow(content_sql))
+                    .is_some_and(|content_sql| {
+                        ddl_matches_fts5_internal_content_shadow(content_sql)
+                    })
             {
                 names.push(content_shadow);
             }
@@ -70208,8 +70240,7 @@ impl Connection {
                             // byte-preserving key. Only a key matching neither is a
                             // genuine mismatch.
                             if expected_payload.encoding_canonical.as_slice() != payload.as_slice()
-                                && expected_payload.byte_preserving.as_slice()
-                                    != payload.as_slice()
+                                && expected_payload.byte_preserving.as_slice() != payload.as_slice()
                             {
                                 return Err(FrankenError::DatabaseCorrupt {
                                     detail: format!(
@@ -70456,7 +70487,9 @@ impl Connection {
                 return Ok(Vec::new());
             }
             return Ok(vec![Row {
-                values: vec![SqliteValue::Integer(i64::from(self.defer_foreign_keys.get()))],
+                values: vec![SqliteValue::Integer(i64::from(
+                    self.defer_foreign_keys.get(),
+                ))],
             }]);
         }
 
@@ -70484,9 +70517,7 @@ impl Connection {
             };
             let requested = match expr {
                 Expr::Literal(Literal::String(text), _) => text.clone(),
-                Expr::Column(column, _) if column.table.is_none() => {
-                    column.column.to_string()
-                }
+                Expr::Column(column, _) if column.table.is_none() => column.column.to_string(),
                 // A non-string encoding argument (e.g. `PRAGMA encoding = 5`) is
                 // unsupported; stock rejects it at prepare rather than silently
                 // ignoring it (bd-ntuz0 b).
@@ -80000,8 +80031,7 @@ impl Connection {
                             // given, so present the representative row first. The
                             // lone tracked min/max is order-independent, so this
                             // reordering does not change its computed value.
-                            let refs: Vec<&Vec<SqliteValue>> = if minmax_bare_tracking
-                                .is_some()
+                            let refs: Vec<&Vec<SqliteValue>> = if minmax_bare_tracking.is_some()
                                 && let Some(repr) = repr_row
                             {
                                 let mut ordered = Vec::with_capacity(group_rows.len());
@@ -81028,8 +81058,10 @@ impl Connection {
                         });
                         slot_win_indices.push(idx);
                     }
-                    col_kinds
-                        .push(GbwColKind::WrappedWindow(slot_win_indices, outer_with_placeholder));
+                    col_kinds.push(GbwColKind::WrappedWindow(
+                        slot_win_indices,
+                        outer_with_placeholder,
+                    ));
                 }
                 other => {
                     let idx = grouped_columns.len();
@@ -82010,7 +82042,10 @@ impl Connection {
                         win_filters.push(inner_filter);
                         slot_win_indices.push(idx);
                     }
-                    col_kinds.push(ColKind::WrappedWindow(slot_win_indices, outer_with_placeholder));
+                    col_kinds.push(ColKind::WrappedWindow(
+                        slot_win_indices,
+                        outer_with_placeholder,
+                    ));
                 }
                 ResultColumn::Expr { expr, .. } => {
                     col_kinds.push(ColKind::Plain(expr.clone()));
@@ -84994,14 +85029,17 @@ impl Connection {
         // here — the sum fast paths bail on any CTE limit, and other shapes keep
         // the 1000-row recursion bound.
         let recursive_cte_row_cap: Option<usize> =
-            cte.query.limit.as_ref().and_then(|lc| match (&lc.limit, &lc.offset) {
-                (fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(n), _), None)
-                    if *n >= 0 =>
-                {
-                    usize::try_from(*n).ok()
-                }
-                _ => None,
-            });
+            cte.query
+                .limit
+                .as_ref()
+                .and_then(|lc| match (&lc.limit, &lc.offset) {
+                    (fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(n), _), None)
+                        if *n >= 0 =>
+                    {
+                        usize::try_from(*n).ok()
+                    }
+                    _ => None,
+                });
         let mut recursive_arms: Vec<(CompoundOp, RecursiveCteArmExecutionPlan)> = Vec::new();
         for (op, core) in &cte.query.body.compounds {
             if matches!(op, CompoundOp::Intersect | CompoundOp::Except) {
@@ -85690,18 +85728,19 @@ impl Connection {
                     if let Some(alias) = src.alias.as_deref() {
                         fts5_source_names.push(alias);
                     }
-                    let needs_projected_fts5_aux_context = columns.iter().any(|column| {
-                        result_column_needs_fts5_aux_context(column, &fts5_source_names)
-                    }) || select.order_by.iter().any(
-                        |ordering| expr_needs_fts5_aux_context(&ordering.expr, &fts5_source_names),
-                    ) || where_clause.as_deref().is_some_and(|clause| {
-                        // A `rank`/aux-function reference in the WHERE clause (e.g.
-                        // `WHERE t MATCH '...' AND rank < 0`) also needs the aux
-                        // context built from the FULL WHERE — otherwise the MATCH
-                        // query, already claimed out of the residual by the vtab
-                        // scan plan, is invisible here and `rank` fails to resolve.
-                        expr_needs_fts5_aux_context(clause, &fts5_source_names)
-                    });
+                    let needs_projected_fts5_aux_context =
+                        columns.iter().any(|column| {
+                            result_column_needs_fts5_aux_context(column, &fts5_source_names)
+                        }) || select.order_by.iter().any(|ordering| {
+                            expr_needs_fts5_aux_context(&ordering.expr, &fts5_source_names)
+                        }) || where_clause.as_deref().is_some_and(|clause| {
+                            // A `rank`/aux-function reference in the WHERE clause (e.g.
+                            // `WHERE t MATCH '...' AND rank < 0`) also needs the aux
+                            // context built from the FULL WHERE — otherwise the MATCH
+                            // query, already claimed out of the residual by the vtab
+                            // scan plan, is invisible here and `rank` fails to resolve.
+                            expr_needs_fts5_aux_context(clause, &fts5_source_names)
+                        });
                     let residual_where = live_vtab_scan_plans
                         .get(src_idx)
                         .and_then(Option::as_ref)
@@ -87511,8 +87550,7 @@ impl Connection {
         // GH #284: reject direct DML on the schema table with writable_schema
         // OFF (SQLITE_ERROR), rather than the generic "no such table" the
         // resolve below would raise (sqlite_master is not a user-schema table).
-        if is_sqlite_schema_name(&insert.table.name)
-            && !self.pragma_state.borrow().writable_schema
+        if is_sqlite_schema_name(&insert.table.name) && !self.pragma_state.borrow().writable_schema
         {
             return Err(FrankenError::FunctionError(format!(
                 "table {} may not be modified",
@@ -88622,10 +88660,7 @@ impl Connection {
     /// begin so the reload observes an empty schema and later writes succeed.
     /// File-backed pagers keep propagating the error rather than risk erasing a
     /// recoverable on-disk image.
-    async fn begin_reload_txn_repairing_empty_page_one(
-        &self,
-        cx: &Cx,
-    ) -> Result<TransactionKind> {
+    async fn begin_reload_txn_repairing_empty_page_one(&self, cx: &Cx) -> Result<TransactionKind> {
         match self.pager.begin(cx, TransactionMode::ReadOnly).await {
             Ok(txn) => Ok(txn),
             Err(error)
@@ -90289,9 +90324,7 @@ impl Connection {
                     let columns = match parsed_vtab {
                         Ok(Statement::CreateVirtualTable(create_stmt)) => self
                             .virtual_table_reload_column_infos(&create_stmt)
-                            .unwrap_or_else(|| {
-                                parse_virtual_table_column_infos(&create_stmt.args)
-                            }),
+                            .unwrap_or_else(|| parse_virtual_table_column_infos(&create_stmt.args)),
                         _ => {
                             crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql)
                         }
@@ -93637,8 +93670,7 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
         // aggregate to be a single builtin min()/max() with one argument.
         Expr::FunctionCall {
             name, args, filter, ..
-        } if is_agg_fn(name) && !is_scalar_max_min(name, args) =>
-        {
+        } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
             state.agg_count += 1;
             if state.agg_count > 1 {
                 state.bail = true;
@@ -93754,7 +93786,9 @@ fn walk_minmax_bare_tracking_children(
                 walk_minmax_bare_tracking(e, group_by, state);
             }
         }
-        Expr::JsonAccess { expr: inner, path, .. } => {
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
             walk_minmax_bare_tracking(inner, group_by, state);
             walk_minmax_bare_tracking(path, group_by, state);
         }
@@ -95079,8 +95113,7 @@ fn nested_inner_aggregate_name_span(expr: &Expr) -> Option<(String, Span)> {
         .filter(|&(_, _, is_window)| !is_window)
         .map(|(name, span, _)| (name, span))
         .collect();
-    aggs
-        .iter()
+    aggs.iter()
         .find(|(_, inner)| {
             aggs.iter().any(|(_, outer)| {
                 outer.start <= inner.start
@@ -95987,9 +96020,9 @@ fn replace_windows_with_placeholders_rec(
                     nulls: term.nulls,
                 })
                 .collect();
-            let new_filter = filter
-                .as_ref()
-                .map(|predicate| Box::new(replace_windows_with_placeholders_rec(predicate, extracted)));
+            let new_filter = filter.as_ref().map(|predicate| {
+                Box::new(replace_windows_with_placeholders_rec(predicate, extracted))
+            });
             Expr::FunctionCall {
                 name: name.clone(),
                 args: new_args,
@@ -96093,9 +96126,9 @@ fn replace_windows_with_placeholders_rec(
                     )
                 })
                 .collect();
-            let new_else_expr = else_expr
-                .as_ref()
-                .map(|else_expr| Box::new(replace_windows_with_placeholders_rec(else_expr, extracted)));
+            let new_else_expr = else_expr.as_ref().map(|else_expr| {
+                Box::new(replace_windows_with_placeholders_rec(else_expr, extracted))
+            });
             Expr::Case {
                 operand: new_operand,
                 whens: new_whens,
@@ -100357,7 +100390,10 @@ fn subst_cte_refs_in_nested_select(
     inlined: &mut usize,
 ) {
     if let Some(with) = &select.with
-        && with.ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(name))
+        && with
+            .ctes
+            .iter()
+            .any(|cte| cte.name.eq_ignore_ascii_case(name))
     {
         return;
     }
@@ -102623,7 +102659,13 @@ fn select_requires_column_reference_preflight(select: &SelectStatement, conn: &C
     // column-reference resolver DOES validate HAVING; run it whenever a HAVING is
     // present so the dead-branch resolution errors surface like stock.
     fn core_has_having(core: &SelectCore) -> bool {
-        matches!(core, SelectCore::Select { having: Some(_), .. })
+        matches!(
+            core,
+            SelectCore::Select {
+                having: Some(_),
+                ..
+            }
+        )
     }
     // A window function's inline OVER (PARTITION BY / ORDER BY <col>) column
     // references are validated at prepare by stock (`no such column`), but the
@@ -103841,7 +103883,10 @@ fn correlated_exists_matches_count_semijoin_shape(
 // whose eager execution diverges from stock when they sit in a short-circuitable
 // WHERE position; routing to the semantic fallback lets `eval_expr_truthiness`
 // short-circuit them per-row instead of executing them at prepare time.
-fn subquery_is_noncorrelated_nonlowerable(subquery: SubqueryExprRef<'_>, conn: &Connection) -> bool {
+fn subquery_is_noncorrelated_nonlowerable(
+    subquery: SubqueryExprRef<'_>,
+    conn: &Connection,
+) -> bool {
     match subquery {
         SubqueryExprRef::Scalar(inner) => {
             !rewrite_probe_is_correlated(conn, inner)
@@ -103852,8 +103897,7 @@ fn subquery_is_noncorrelated_nonlowerable(subquery: SubqueryExprRef<'_>, conn: &
                 && !exists_subquery_supported_by_vdbe(inner, conn)
         }
         SubqueryExprRef::In(inner) => {
-            !rewrite_probe_is_correlated(conn, inner)
-                && !in_subquery_supported_by_vdbe(inner, conn)
+            !rewrite_probe_is_correlated(conn, inner) && !in_subquery_supported_by_vdbe(inner, conn)
         }
     }
 }
@@ -121318,9 +121362,9 @@ fn insert_source_is_memdb_read_free(source: &fsqlite_ast::InsertSource) -> bool 
     match source {
         fsqlite_ast::InsertSource::DefaultValues => true,
         fsqlite_ast::InsertSource::Select(_) => false,
-        fsqlite_ast::InsertSource::Values(rows) => {
-            rows.iter().all(|row| row.iter().all(expr_is_memdb_read_free))
-        }
+        fsqlite_ast::InsertSource::Values(rows) => rows
+            .iter()
+            .all(|row| row.iter().all(expr_is_memdb_read_free)),
     }
 }
 
@@ -123646,12 +123690,7 @@ fn select_has_foldable_filter_never_true_and(select: &SelectStatement) -> bool {
                 })
             })
     };
-    core_has(&select.body.select)
-        || select
-            .body
-            .compounds
-            .iter()
-            .any(|(_, core)| core_has(core))
+    core_has(&select.body.select) || select.body.compounds.iter().any(|(_, core)| core_has(core))
 }
 
 /// Fold every never-true filter `AND` across a SELECT and its compound arms,
@@ -123788,12 +123827,7 @@ fn select_has_foldable_filter_absorbing_true_or(select: &SelectStatement) -> boo
                 })
             })
     };
-    core_has(&select.body.select)
-        || select
-            .body
-            .compounds
-            .iter()
-            .any(|(_, core)| core_has(core))
+    core_has(&select.body.select) || select.body.compounds.iter().any(|(_, core)| core_has(core))
 }
 
 /// Fold every absorbing-true filter `OR` across a SELECT and its compound arms,
@@ -129417,7 +129451,8 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                 ..
             } => {
                 let resolved_aggregate_or_window =
-                    validate_function_call_resolution(name, args, over.as_ref(), Span::ZERO).is_ok()
+                    validate_function_call_resolution(name, args, over.as_ref(), Span::ZERO)
+                        .is_ok()
                         && ((is_current_aggregate_or_json_fn(name, args)
                             && !is_scalar_max_min(name, args))
                             || over.is_some());
@@ -130365,7 +130400,9 @@ impl<'a> SelectStructureResolver<'a> {
             | Expr::Column(_, _)
             | Expr::Raise { .. }
             | Expr::Placeholder(_, _) => Ok(()),
-            Expr::BinaryOp { op, left, right, .. } => {
+            Expr::BinaryOp {
+                op, left, right, ..
+            } => {
                 // A comparison operand faces a row value only when the other
                 // side is an explicit tuple or a multi-column subquery; only
                 // then may a multi-column subquery keep its width. Elsewhere
@@ -134002,7 +134039,10 @@ impl<'a> Fts5LiveShadowReader<'a> {
         // `(id INTEGER PRIMARY KEY, sz BLOB, origin INTEGER)`: origin is the
         // integer immediately after the `sz` blob (robust to whether the
         // rowid-alias `id` surfaces as a leading record value).
-        let Some(blob_pos) = values.iter().position(|value| value.as_blob_bytes().is_some()) else {
+        let Some(blob_pos) = values
+            .iter()
+            .position(|value| value.as_blob_bytes().is_some())
+        else {
             return Ok(None);
         };
         Ok(values.get(blob_pos + 1).and_then(|value| match value {
@@ -141556,9 +141596,7 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
         }
     } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
         match val {
-            SqliteValue::Blob(bytes) => {
-                SqliteValue::Text(blob_cast_text(bytes, db_encoding))
-            }
+            SqliteValue::Blob(bytes) => SqliteValue::Text(blob_cast_text(bytes, db_encoding)),
             other => SqliteValue::Text(other.to_text().into()),
         }
     } else if upper.contains("BLOB") || upper.is_empty() {
@@ -142252,7 +142290,9 @@ fn validate_join_select_column_references(
                     .iter()
                     .any(|source| source_matches_name(source, name))
                 {
-                    return Err(FrankenError::FunctionError(format!("no such table: {name}")));
+                    return Err(FrankenError::FunctionError(format!(
+                        "no such table: {name}"
+                    )));
                 }
             }
             ResultColumn::Star => {}
@@ -142837,8 +142877,8 @@ mod tests {
         PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState,
         SimplePager, Snapshot, TriggerDepthLimitOverrideGuard, TriggerFrame, TriggerFrameGuard,
         arm_settle_rollback_error_once, arm_trigger_stack_probe, attached_schema_key,
-        bind_placeholders_in_select_for_fallback,
-        build_canonical_hash_join_key, canonical_hash_join_value, canonicalize_select_placeholders,
+        bind_placeholders_in_select_for_fallback, build_canonical_hash_join_key,
+        canonical_hash_join_value, canonicalize_select_placeholders,
         cmp_values_with_comparison_affinity, implicit_autoindex_layout, init_global_runtime,
         is_correlated_subquery, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
         join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
@@ -150042,10 +150082,7 @@ mod tests {
                     .await
                     .expect_err("invalid dynamic LIMIT must report datatype mismatch");
                 assert!(
-                    matches!(
-                        error,
-                        FrankenError::DatatypeMismatch
-                    ),
+                    matches!(error, FrankenError::DatatypeMismatch),
                     "unexpected error for `{sql}` with {params:?}: {error}"
                 );
             }
@@ -160000,7 +160037,9 @@ mod tests {
                 .execute("CREATE TABLE t1 (x INTEGER);")
                 .await
                 .expect_err("duplicate table should fail");
-            assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("already exists")));
+            assert!(
+                matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("already exists"))
+            );
         });
     }
 
@@ -160890,7 +160929,9 @@ mod tests {
             conn.execute("CREATE TABLE w (a TEXT, b INT, PRIMARY KEY(a, b)) WITHOUT ROWID;")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO w VALUES ('x', 1);").await.unwrap();
+            conn.execute("INSERT INTO w VALUES ('x', 1);")
+                .await
+                .unwrap();
             let err = conn
                 .execute("INSERT INTO w VALUES ('x', 1);")
                 .await
@@ -161374,7 +161415,9 @@ mod tests {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t(a, b);").await.unwrap();
             conn.execute("CREATE INDEX ix ON t(b);").await.unwrap();
-            conn.execute("CREATE INDEX ix2 ON t(b DESC);").await.unwrap();
+            conn.execute("CREATE INDEX ix2 ON t(b DESC);")
+                .await
+                .unwrap();
             conn.execute("ALTER TABLE t RENAME COLUMN b TO c;")
                 .await
                 .unwrap();
@@ -161403,7 +161446,9 @@ mod tests {
             assert_eq!(sql_of!("ix2"), "CREATE INDEX ix2 ON t(c DESC)");
 
             // conditional quoting: a keyword column stays quoted only because it needs it
-            conn.execute("CREATE TABLE t2(a, \"order\");").await.unwrap();
+            conn.execute("CREATE TABLE t2(a, \"order\");")
+                .await
+                .unwrap();
             conn.execute("CREATE INDEX ixk ON t2(\"order\");")
                 .await
                 .unwrap();
@@ -169878,9 +169923,7 @@ mod tests {
                             panic!("{name}: WHEN must short-circuit, got {error}")
                         });
                         let rows = conn
-                            .query(&format!(
-                                "SELECT count(*) FROM log WHERE msg = '{name}';"
-                            ))
+                            .query(&format!("SELECT count(*) FROM log WHERE msg = '{name}';"))
                             .await
                             .unwrap();
                         let fired = row_values(&rows[0])[0] == SqliteValue::Integer(1);
@@ -169894,7 +169937,9 @@ mod tests {
                         );
                     }
                 }
-                conn.execute(&format!("DROP TRIGGER trg_{name};")).await.unwrap();
+                conn.execute(&format!("DROP TRIGGER trg_{name};"))
+                    .await
+                    .unwrap();
             }
         });
     }
@@ -169937,8 +169982,7 @@ mod tests {
             for len in [2usize, 3] {
                 let mut selector = vec![0usize; len];
                 loop {
-                    let chain: Vec<char> =
-                        selector.iter().map(|&pick| alphabet[pick]).collect();
+                    let chain: Vec<char> = selector.iter().map(|&pick| alphabet[pick]).collect();
                     for op in ["AND", "OR"] {
                         let is_and = op == "AND";
                         let sql_chain = chain
@@ -170022,12 +170066,8 @@ mod tests {
                         let update = conn.execute("UPDATE t SET id = id;").await;
                         match (update, when_expected) {
                             (Ok(_), Some(expect_fire)) => {
-                                let rows = conn
-                                    .query("SELECT count(*) FROM log;")
-                                    .await
-                                    .unwrap();
-                                let fired =
-                                    row_values(&rows[0])[0] == SqliteValue::Integer(1);
+                                let rows = conn.query("SELECT count(*) FROM log;").await.unwrap();
+                                let fired = row_values(&rows[0])[0] == SqliteValue::Integer(1);
                                 assert_eq!(
                                     fired, expect_fire,
                                     "WHEN firing mismatch for {op} {label}"
@@ -170045,9 +170085,9 @@ mod tests {
                             (Err(error), Some(_)) => panic!(
                                 "WHEN {op} {label}: expected clean short-circuit, got {error}"
                             ),
-                            (Ok(_), None) => panic!(
-                                "WHEN {op} {label}: expected the error to be reached"
-                            ),
+                            (Ok(_), None) => {
+                                panic!("WHEN {op} {label}: expected the error to be reached")
+                            }
                             (Err(_), None) => {}
                         }
                         conn.execute("DELETE FROM log;").await.unwrap();
@@ -170133,15 +170173,16 @@ mod tests {
             conn.execute("INSERT INTO intents VALUES (2, 'open', '[\"bare-string\"]');")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO members VALUES (2);").await.unwrap();
+            conn.execute("INSERT INTO members VALUES (2);")
+                .await
+                .unwrap();
             let error = conn
                 .execute("UPDATE intents SET state = 'done' WHERE id = 2;")
                 .await
                 .unwrap_err();
             let message = error.to_string();
             assert!(
-                message.contains("guarded shape invalid")
-                    || message.contains("invalid JSON input"),
+                message.contains("guarded shape invalid") || message.contains("invalid JSON input"),
                 "positive control must abort, got: {message}"
             );
         });
@@ -173237,7 +173278,10 @@ mod tests {
             let row_count: i64 = sqlite
                 .query_row("SELECT COUNT(*) FROM wr;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(quick_check, "ok", "stock SQLite quick_check on vacuum output");
+            assert_eq!(
+                quick_check, "ok",
+                "stock SQLite quick_check on vacuum output"
+            );
             assert_eq!(
                 integrity_check, "ok",
                 "stock SQLite integrity_check on vacuum output"
@@ -173592,7 +173636,10 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                source_violation.to_string().to_ascii_lowercase().contains("unique"),
+                source_violation
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("unique"),
                 "source NOCASE primary key must reject the case variant, got {source_violation:?}"
             );
 
@@ -173949,7 +173996,9 @@ mod tests {
                 growth_chunk_bytes: 1,
                 max_bytes: Some(image_len),
             });
-            let imported = Connection::import_bytes_with_env(&bytes, env).await.unwrap();
+            let imported = Connection::import_bytes_with_env(&bytes, env)
+                .await
+                .unwrap();
 
             let rows = imported
                 .query("SELECT id, name FROM import_t ORDER BY id;")
@@ -174038,7 +174087,9 @@ mod tests {
                 // ORDER BY text parity vs stock sqlite3.
                 let oracle = rusqlite::Connection::open(&db_path).unwrap();
                 let expected: Vec<String> = {
-                    let mut stmt = oracle.prepare("SELECT name FROM items ORDER BY name;").unwrap();
+                    let mut stmt = oracle
+                        .prepare("SELECT name FROM items ORDER BY name;")
+                        .unwrap();
                     let mapped = stmt
                         .query_map([], |row| row.get::<_, String>(0))
                         .unwrap()
@@ -174248,7 +174299,10 @@ mod tests {
                     .await
                     .expect("prepared UTF-16 DELETE now succeeds");
                 assert_eq!(deleted, 1, "{encoding}: prepared DELETE affects one row");
-                let remaining = conn.query("SELECT id FROM items ORDER BY id;").await.unwrap();
+                let remaining = conn
+                    .query("SELECT id FROM items ORDER BY id;")
+                    .await
+                    .unwrap();
                 assert_eq!(remaining.len(), 1, "{encoding}: only id=2 remains");
                 assert_eq!(remaining[0].values()[0], SqliteValue::Integer(2));
             }
@@ -180419,7 +180473,9 @@ mod tests {
             conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, value INTEGER);")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO bench VALUES (5, 1);").await.unwrap();
+            conn.execute("INSERT INTO bench VALUES (5, 1);")
+                .await
+                .unwrap();
             let after_ddl = conn.query(sql).await.unwrap();
             assert_eq!(
                 after_ddl.iter().map(row_values).collect::<Vec<_>>(),
@@ -192298,7 +192354,9 @@ mod tests {
                     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT);")
                         .await
                         .unwrap();
-                    conn.execute("INSERT INTO t VALUES (1, 'café');").await.unwrap();
+                    conn.execute("INSERT INTO t VALUES (1, 'café');")
+                        .await
+                        .unwrap();
                     let image = conn.export_bytes().await.unwrap();
                     assert_eq!(
                         u32::from_be_bytes(image[56..60].try_into().unwrap()),
@@ -192306,7 +192364,10 @@ mod tests {
                         "empty-DB {requested} setter must persist the encoding ({sql})"
                     );
                     assert_eq!(
-                        conn.query("SELECT note FROM t WHERE id = 1;").await.unwrap()[0].values()[0],
+                        conn.query("SELECT note FROM t WHERE id = 1;")
+                            .await
+                            .unwrap()[0]
+                            .values()[0],
                         SqliteValue::Text("café".into()),
                         "UTF-16 write round-trips to canonical UTF-8 ({sql})"
                     );
@@ -202338,7 +202399,10 @@ mod autocommit_txn_tests {
         // SQLITE_BUSY_RECOVERY = 261) vs plain `Busy` (5) — instead of collapsing
         // every exhaustion to plain `Busy`. Both classify as `ErrorCode::Busy`, so
         // this is a cosmetic identity-fidelity fix.
-        assert!(matches!(busy_family_error(true), FrankenError::BusyRecovery));
+        assert!(matches!(
+            busy_family_error(true),
+            FrankenError::BusyRecovery
+        ));
         assert_eq!(busy_family_error(true).extended_error_code(), 261);
         assert!(matches!(busy_family_error(false), FrankenError::Busy));
 
@@ -205455,21 +205519,29 @@ SELECT x FROM t;
                 )
                 .await
                 .unwrap();
-                conn.execute("INSERT INTO t(rowid, body) VALUES (1, 'alpha rust'), (2, 'beta rust');")
-                    .await
-                    .unwrap();
-                conn.execute("INSERT INTO t(rowid, body) VALUES (3, 'gamma rust'), (4, 'delta search');")
-                    .await
-                    .unwrap();
-                conn.execute("INSERT INTO t(rowid, body) VALUES (5, 'epsilon rust'), (6, 'zeta search');")
-                    .await
-                    .unwrap();
+                conn.execute(
+                    "INSERT INTO t(rowid, body) VALUES (1, 'alpha rust'), (2, 'beta rust');",
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO t(rowid, body) VALUES (3, 'gamma rust'), (4, 'delta search');",
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO t(rowid, body) VALUES (5, 'epsilon rust'), (6, 'zeta search');",
+                )
+                .await
+                .unwrap();
                 conn.close().await.unwrap();
             }
 
             // Reopen lazy and DELETE a row that carries an origin (row 3, batch 2):
             // this must tombstone the owning segment WITHOUT hydrating the corpus.
-            let conn = Connection::open_existing_schema_only(&db_str).await.unwrap();
+            let conn = Connection::open_existing_schema_only(&db_str)
+                .await
+                .unwrap();
             {
                 let instances = conn.vtab_instances.borrow();
                 let fts5 = instances
@@ -205505,7 +205577,9 @@ SELECT x FROM t;
                 .await
                 .unwrap();
             assert_eq!(
-                rust.iter().map(|r| r.values()[0].clone()).collect::<Vec<_>>(),
+                rust.iter()
+                    .map(|r| r.values()[0].clone())
+                    .collect::<Vec<_>>(),
                 vec![SqliteValue::Integer(2), SqliteValue::Integer(5)],
                 "MATCH 'rust' excludes both tombstoned rows (1 and 3)"
             );
@@ -205513,7 +205587,10 @@ SELECT x FROM t;
                 .query("SELECT rowid FROM t WHERE t MATCH 'gamma';")
                 .await
                 .unwrap();
-            assert!(gamma.is_empty(), "row 3's unique term 'gamma' no longer matches");
+            assert!(
+                gamma.is_empty(),
+                "row 3's unique term 'gamma' no longer matches"
+            );
             drop(conn);
 
             // Stock C SQLite reopens the tombstoned image and agrees.
@@ -208225,11 +208302,7 @@ fts5(title, body, content=docs, content_rowid=id)'
                 .expect("WAL-visible UTF-16 is admitted read-only");
                 if !matches!(kind, OpenKind::SchemaOnly) {
                     let rows = conn.query(r#"SELECT value FROM "café";"#).await.unwrap();
-                    assert_eq!(
-                        rows.len(),
-                        1,
-                        "{stem}: WAL-visible row must be readable"
-                    );
+                    assert_eq!(rows.len(), 1, "{stem}: WAL-visible row must be readable");
                     assert_eq!(
                         rows[0].values()[0],
                         SqliteValue::Text("Καλημέρα".into()),
@@ -211460,7 +211533,8 @@ fts5(title, body, content=docs, content_rowid=id)'
             );
 
             // The PRAGMA surfaces every write-amplification row.
-            let metrics = txn_metrics_map(&conn.query("PRAGMA write_amplification;").await.unwrap());
+            let metrics =
+                txn_metrics_map(&conn.query("PRAGMA write_amplification;").await.unwrap());
             for key in [
                 "logical_page_bytes",
                 "wal_physical_bytes",
@@ -211497,9 +211571,13 @@ fts5(title, body, content=docs, content_rowid=id)'
                 .unwrap();
             conn.execute("UPDATE t SET x = x + 10;").await.unwrap();
 
-            let before = fsqlite_mvcc::ebr::GLOBAL_EBR_METRICS.snapshot().gc_freed_count;
+            let before = fsqlite_mvcc::ebr::GLOBAL_EBR_METRICS
+                .snapshot()
+                .gc_freed_count;
             let metrics = txn_metrics_map(&conn.query("PRAGMA gc_stats;").await.unwrap());
-            let after = fsqlite_mvcc::ebr::GLOBAL_EBR_METRICS.snapshot().gc_freed_count;
+            let after = fsqlite_mvcc::ebr::GLOBAL_EBR_METRICS
+                .snapshot()
+                .gc_freed_count;
 
             for key in [
                 "versions_reclaimed",
@@ -211521,8 +211599,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             }
             // The reported (process-global, monotonic) reclaim count read at PRAGMA
             // time must lie within the snapshots taken around it.
-            let reported =
-                u64::try_from(*metrics.get("versions_reclaimed").unwrap()).unwrap_or(0);
+            let reported = u64::try_from(*metrics.get("versions_reclaimed").unwrap()).unwrap_or(0);
             assert!(
                 reported >= before && reported <= after,
                 "gc_stats versions_reclaimed {reported} must be within [{before}, {after}]"
@@ -228342,7 +228419,10 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             sqlite
-                .execute("CREATE TABLE prep_schema_guard_bump (id INTEGER PRIMARY KEY);", [])
+                .execute(
+                    "CREATE TABLE prep_schema_guard_bump (id INTEGER PRIMARY KEY);",
+                    [],
+                )
                 .unwrap();
 
             // Was: `Err(SchemaChanged)`. Now both engines transparently
@@ -232487,8 +232567,7 @@ mod pager_routing_tests {
                 snap.single_writer_shared_pager_commits
             );
             assert!(
-                snap.single_writer_shared_pager_commits
-                    <= snap.single_writer_filebacked_commits,
+                snap.single_writer_shared_pager_commits <= snap.single_writer_filebacked_commits,
                 "shared-pager commits are a subset of single-writer file-backed commits"
             );
 
@@ -240539,7 +240618,10 @@ mod pager_routing_tests {
                 .query("INSERT INTO aux.t VALUES (1, 2) RETURNING aux.t.*;")
                 .await
                 .expect_err("RETURNING TABLE.* must be rejected (stock parity)");
-            assert!(matches!(err, FrankenError::ParseError { .. }), "got {err:?}");
+            assert!(
+                matches!(err, FrankenError::ParseError { .. }),
+                "got {err:?}"
+            );
         });
     }
 
@@ -240563,7 +240645,10 @@ mod pager_routing_tests {
                 )
                 .await
                 .expect_err("RETURNING TABLE.* must be rejected (stock parity)");
-            assert!(matches!(err, FrankenError::ParseError { .. }), "got {err:?}");
+            assert!(
+                matches!(err, FrankenError::ParseError { .. }),
+                "got {err:?}"
+            );
         });
     }
 
@@ -240672,7 +240757,10 @@ mod pager_routing_tests {
                 .query("UPDATE aux.t SET present = 2 WHERE id = 1 RETURNING aux.t.*;")
                 .await
                 .expect_err("RETURNING TABLE.* must be rejected (stock parity)");
-            assert!(matches!(err, FrankenError::ParseError { .. }), "got {err:?}");
+            assert!(
+                matches!(err, FrankenError::ParseError { .. }),
+                "got {err:?}"
+            );
         });
     }
 
@@ -240696,7 +240784,10 @@ mod pager_routing_tests {
                 .query("DELETE FROM aux.t WHERE id = 1 RETURNING aux.t.*;")
                 .await
                 .expect_err("RETURNING TABLE.* must be rejected (stock parity)");
-            assert!(matches!(err, FrankenError::ParseError { .. }), "got {err:?}");
+            assert!(
+                matches!(err, FrankenError::ParseError { .. }),
+                "got {err:?}"
+            );
 
             let persisted = conn
                 .query("SELECT id, present FROM aux.t ORDER BY id;")
@@ -243343,10 +243434,7 @@ mod pager_routing_tests {
             // bd-a8ygy: plain top-level shapes and the JOIN route were both
             // parsed into Agg descriptors that compute_aggregate's name table
             // does not know, silently yielding NULL. Pin all three.
-            assert_eq!(
-                one("SELECT json_group_array(x) FROM t").await,
-                "[3,1,1,2]"
-            );
+            assert_eq!(one("SELECT json_group_array(x) FROM t").await, "[3,1,1,2]");
             assert_eq!(
                 one("SELECT json_group_object(k, v) FROM kv").await,
                 r#"{"b":2,"a":1,"c":3}"#
@@ -244907,8 +244995,7 @@ mod pager_routing_tests {
             let dir = tempfile::tempdir().unwrap();
             let (source, source_receipt, source_path) =
                 seed_publication_source(dir.path(), "stale-source").await;
-            let candidate_receipt =
-                seed_publication_candidate(dir.path(), "stale-candidate").await;
+            let candidate_receipt = seed_publication_candidate(dir.path(), "stale-candidate").await;
             let candidate_path = dir.path().join("stale-candidate.db");
 
             // Naming the source as its own candidate would publish an image
@@ -244924,11 +245011,7 @@ mod pager_routing_tests {
             // CannotOpen and that is exactly when someone should look again.
             // See bd-bounded-image-api-forward-port-vcnnf.
             let self_publication = source
-                .begin_database_image_publication(
-                    &source_receipt,
-                    &source_receipt,
-                    &source_path,
-                )
+                .begin_database_image_publication(&source_receipt, &source_receipt, &source_path)
                 .await
                 .expect_err("the source is never a valid candidate for itself");
             assert!(
@@ -244967,8 +245050,7 @@ mod pager_routing_tests {
             let dir = tempfile::tempdir().unwrap();
             let (source, source_receipt, _source_path) =
                 seed_publication_source(dir.path(), "drift-source").await;
-            let candidate_receipt =
-                seed_publication_candidate(dir.path(), "drift-candidate").await;
+            let candidate_receipt = seed_publication_candidate(dir.path(), "drift-candidate").await;
             let candidate_path = dir.path().join("drift-candidate.db");
 
             corrupt_one_content_byte(
@@ -245150,7 +245232,10 @@ mod pager_routing_tests {
             // broken handle.
             let rows = validation.query("SELECT COUNT(*) FROM t;").await.unwrap();
             assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
-            validation.close().await.expect("close the validation handle");
+            validation
+                .close()
+                .await
+                .expect("close the validation handle");
 
             assert_eq!(
                 std::fs::read(&image_path).unwrap(),
@@ -245974,10 +246059,9 @@ mod pager_routing_tests {
             // Deliberately tiny: enough to bootstrap, far too small to hold the
             // table pages the loop below writes.
             env.set_schema_only_write_set_page_limit(3);
-            let reservation = Connection::reserve_schema_only_builder_target_with_env(
-                &target, &env,
-            )
-            .expect("reserve a fresh target");
+            let reservation =
+                Connection::reserve_schema_only_builder_target_with_env(&target, &env)
+                    .expect("reserve a fresh target");
             assert_eq!(reservation.write_set_page_limit(), 3);
             assert!(
                 reservation.write_set_limit_enforced(),
@@ -246032,12 +246116,9 @@ mod pager_routing_tests {
             let mut env = ConnectionEnv::default();
             // The same tiny ceiling that refuses the build above.
             env.set_schema_only_write_set_page_limit(3);
-            let conn = Connection::open_with_env(
-                db_path.to_string_lossy().into_owned(),
-                env,
-            )
-            .await
-            .expect("ordinary open must ignore the builder-only ceiling");
+            let conn = Connection::open_with_env(db_path.to_string_lossy().into_owned(), env)
+                .await
+                .expect("ordinary open must ignore the builder-only ceiling");
 
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
                 .await
@@ -246063,10 +246144,9 @@ mod pager_routing_tests {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
 
-            let missing = Connection::reserve_schema_only_builder_target(
-                dir.path().join("no-ceiling.db"),
-            )
-            .expect_err("an absent ceiling must refuse rather than default");
+            let missing =
+                Connection::reserve_schema_only_builder_target(dir.path().join("no-ceiling.db"))
+                    .expect_err("an absent ceiling must refuse rather than default");
             assert!(
                 matches!(missing, FrankenError::NotImplemented(_)),
                 "expected NotImplemented, got {missing:?}"
@@ -246099,9 +246179,8 @@ mod pager_routing_tests {
 
             let mut env = ConnectionEnv::default();
             env.set_schema_only_write_set_page_limit(64);
-            let error =
-                Connection::reserve_schema_only_builder_target_with_env(&occupied, &env)
-                    .expect_err("an occupied path must never be claimed");
+            let error = Connection::reserve_schema_only_builder_target_with_env(&occupied, &env)
+                .expect_err("an occupied path must never be claimed");
             assert!(
                 matches!(error, FrankenError::CannotOpen { .. }),
                 "expected CannotOpen, got {error:?}"
@@ -246117,7 +246196,10 @@ mod pager_routing_tests {
     /// Build a self-contained image carrying an index and a foreign key, so the
     /// semantic walkers have something real to reconcile.
     #[cfg(not(target_arch = "wasm32"))]
-    async fn build_semantic_image(dir: &Path, stem: &str) -> (std::path::PathBuf, DatabaseImageReceipt) {
+    async fn build_semantic_image(
+        dir: &Path,
+        stem: &str,
+    ) -> (std::path::PathBuf, DatabaseImageReceipt) {
         let image_path = dir.join(format!("{stem}.db"));
         let receipt = build_self_contained_image(
             &dir.join(format!("{stem}-builder.db")),
@@ -246411,7 +246493,10 @@ mod pager_routing_tests {
             let (image_path, receipt) = build_semantic_image(dir.path(), "sem-ok").await;
 
             let owner = Connection::open(
-                dir.path().join("sem-ok-owner.db").to_string_lossy().into_owned(),
+                dir.path()
+                    .join("sem-ok-owner.db")
+                    .to_string_lossy()
+                    .into_owned(),
             )
             .await
             .unwrap();
@@ -246442,7 +246527,10 @@ mod pager_routing_tests {
                 u64::from(stats.structural.database_pages),
                 "the contained structural proof must still be one byte per page"
             );
-            snapshot.finish().await.expect("unchanged image recertifies");
+            snapshot
+                .finish()
+                .await
+                .expect("unchanged image recertifies");
         });
     }
 
@@ -246466,10 +246554,7 @@ mod pager_routing_tests {
             let surgeon = Connection::open(image_path.to_string_lossy().into_owned())
                 .await
                 .expect("reopen the image to damage concordance");
-            surgeon
-                .execute("PRAGMA writable_schema=ON;")
-                .await
-                .ok();
+            surgeon.execute("PRAGMA writable_schema=ON;").await.ok();
             let dropped = surgeon.execute("DROP INDEX child_tag;").await;
             assert!(dropped.is_ok(), "precondition: index drop must succeed");
             surgeon
@@ -246479,7 +246564,10 @@ mod pager_routing_tests {
             surgeon.close().await.expect("close the surgeon");
 
             let owner = Connection::open(
-                dir.path().join("sem-bad-owner.db").to_string_lossy().into_owned(),
+                dir.path()
+                    .join("sem-bad-owner.db")
+                    .to_string_lossy()
+                    .into_owned(),
             )
             .await
             .unwrap();
@@ -246550,7 +246638,10 @@ mod pager_routing_tests {
             .await;
 
             let owner = Connection::open(
-                dir.path().join("trig-ok-owner.db").to_string_lossy().into_owned(),
+                dir.path()
+                    .join("trig-ok-owner.db")
+                    .to_string_lossy()
+                    .into_owned(),
             )
             .await
             .unwrap();
@@ -246601,7 +246692,10 @@ mod pager_routing_tests {
             .await;
 
             let owner = Connection::open(
-                dir.path().join("trig-bad-owner.db").to_string_lossy().into_owned(),
+                dir.path()
+                    .join("trig-bad-owner.db")
+                    .to_string_lossy()
+                    .into_owned(),
             )
             .await
             .unwrap();
@@ -275698,10 +275792,7 @@ mod pager_routing_tests {
                     .await
                     .expect_err("fallback LIMIT must reject a non-integer binding");
                 assert!(
-                    matches!(
-                        error,
-                        FrankenError::DatatypeMismatch
-                    ),
+                    matches!(error, FrankenError::DatatypeMismatch),
                     "unexpected fallback LIMIT error: {error}"
                 );
             }
@@ -275716,10 +275807,7 @@ mod pager_routing_tests {
                     .await
                     .expect_err("fallback LIMIT must validate the evaluated expression result");
                 assert!(
-                    matches!(
-                        error,
-                        FrankenError::DatatypeMismatch
-                    ),
+                    matches!(error, FrankenError::DatatypeMismatch),
                     "unexpected compound fallback LIMIT error: {error}"
                 );
             }
@@ -275737,10 +275825,7 @@ mod pager_routing_tests {
                     .await
                     .expect_err("fallback LIMIT must reject integer text outside i64");
                 assert!(
-                    matches!(
-                        error,
-                        FrankenError::DatatypeMismatch
-                    ),
+                    matches!(error, FrankenError::DatatypeMismatch),
                     "unexpected out-of-range fallback LIMIT error for `{sql}`: {error}"
                 );
             }
@@ -275768,10 +275853,7 @@ mod pager_routing_tests {
                 .await
                 .expect_err("positive LIMIT must validate its OFFSET binding");
             assert!(
-                matches!(
-                    offset_error,
-                    FrankenError::DatatypeMismatch
-                ),
+                matches!(offset_error, FrankenError::DatatypeMismatch),
                 "unexpected fallback OFFSET error: {offset_error}"
             );
 

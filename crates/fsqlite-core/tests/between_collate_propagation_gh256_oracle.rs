@@ -16,7 +16,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -25,15 +28,32 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn assert_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &str) {
-    let fr: Vec<Vec<String>> = fconn.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e:?}")).iter().map(|r| r.values().iter().map(tag_f).collect()).collect();
+    let fr: Vec<Vec<String>> = fconn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+        .iter()
+        .map(|r| r.values().iter().map(tag_f).collect())
+        .collect();
     let mut st = rconn.prepare(sql).unwrap();
     let n = st.column_count();
-    let rr: Vec<Vec<String>> = st.query_map([], |row| Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let rr: Vec<Vec<String>> = st
+        .query_map([], |row| {
+            Ok((0..n)
+                .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect())
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(fr, rr, "BETWEEN collate mismatch on `{sql}`");
 }
 
@@ -43,14 +63,34 @@ fn between_collate_fromless_gh256() {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
         // (1) explicit COLLATE on both bounds.
-        assert_agree(&f, &r, "SELECT 'B' BETWEEN 'a' COLLATE NOCASE AND 'c' COLLATE NOCASE").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT 'B' BETWEEN 'a' COLLATE NOCASE AND 'c' COLLATE NOCASE",
+        )
+        .await;
         // (2) explicit COLLATE on the left operand.
         assert_agree(&f, &r, "SELECT 'B' COLLATE NOCASE BETWEEN 'a' AND 'c'").await;
         // (3) explicit COLLATE on only the low bound.
-        assert_agree(&f, &r, "SELECT ('B') BETWEEN ('a' COLLATE NOCASE) AND ('c')").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT ('B') BETWEEN ('a' COLLATE NOCASE) AND ('c')",
+        )
+        .await;
         // NOT BETWEEN inverse + a genuinely-out-of-range case.
-        assert_agree(&f, &r, "SELECT 'B' NOT BETWEEN 'a' COLLATE NOCASE AND 'c' COLLATE NOCASE").await;
-        assert_agree(&f, &r, "SELECT 'Z' BETWEEN 'a' COLLATE NOCASE AND 'c' COLLATE NOCASE").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT 'B' NOT BETWEEN 'a' COLLATE NOCASE AND 'c' COLLATE NOCASE",
+        )
+        .await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT 'Z' BETWEEN 'a' COLLATE NOCASE AND 'c' COLLATE NOCASE",
+        )
+        .await;
     });
 }
 
@@ -71,9 +111,19 @@ fn between_collate_table_path_gh256() {
         // (4) implicit column collation (NOCASE) drives BETWEEN.
         assert_agree(&f, &r, "SELECT x FROM t WHERE x BETWEEN 'a' AND 'c'").await;
         // (5) bound-side explicit COLLATE on a plain-column table path.
-        assert_agree(&f, &r, "SELECT x FROM t2 WHERE x BETWEEN 'a' COLLATE NOCASE AND 'c'").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT x FROM t2 WHERE x BETWEEN 'a' COLLATE NOCASE AND 'c'",
+        )
+        .await;
         // (6) left-operand explicit COLLATE on the table path.
-        assert_agree(&f, &r, "SELECT x FROM t2 WHERE x COLLATE NOCASE BETWEEN 'a' AND 'c'").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT x FROM t2 WHERE x COLLATE NOCASE BETWEEN 'a' AND 'c'",
+        )
+        .await;
         // Control: plain BINARY BETWEEN (no collate) excludes 'B' from a..c.
         assert_agree(&f, &r, "SELECT x FROM t2 WHERE x BETWEEN 'a' AND 'c'").await;
     });

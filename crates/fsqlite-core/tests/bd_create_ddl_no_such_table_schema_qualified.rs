@@ -6,7 +6,10 @@ use fsqlite_core::connection::Connection;
 
 async fn err_of(sql: &str) -> String {
     let c = Connection::open(":memory:").await.unwrap();
-    c.execute(sql).await.expect_err("must be rejected").to_string()
+    c.execute(sql)
+        .await
+        .expect_err("must be rejected")
+        .to_string()
 }
 
 #[test]
@@ -27,6 +30,9 @@ fn create_ddl_no_such_table_is_schema_qualified() {
         // Control: SELECT / DROP / ALTER stay UNqualified.
         assert_eq!(err_of("SELECT * FROM nope").await, "no such table: nope");
         assert_eq!(err_of("DROP TABLE nope").await, "no such table: nope");
-        assert_eq!(err_of("ALTER TABLE nope RENAME TO x").await, "no such table: nope");
+        assert_eq!(
+            err_of("ALTER TABLE nope RENAME TO x").await,
+            "no such table: nope"
+        );
     });
 }

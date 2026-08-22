@@ -40,10 +40,7 @@ fn frank_order(rows: &[SqliteValue]) -> Vec<String> {
         .collect()
 }
 
-async fn frank_build(
-    dir: &std::path::Path,
-    encoding: &str,
-) -> (String, Vec<String>, Vec<String>) {
+async fn frank_build(dir: &std::path::Path, encoding: &str) -> (String, Vec<String>, Vec<String>) {
     let db = dir.join("u16.db").to_string_lossy().into_owned();
     let conn = Connection::open(&db).await.unwrap();
 
@@ -165,7 +162,10 @@ fn run_for_encoding(encoding: &str) {
                 SqliteValue::Text(s) => s.as_ref().to_owned(),
                 other => panic!("reopen integrity_check non-text {other:?}"),
             };
-            assert_eq!(ic_text, "ok", "reopen integrity_check false-flagged: {ic_text}");
+            assert_eq!(
+                ic_text, "ok",
+                "reopen integrity_check false-flagged: {ic_text}"
+            );
         }
         let bak = format!("{db}.pre-migration-bak");
         assert!(

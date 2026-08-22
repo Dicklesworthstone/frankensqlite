@@ -84,7 +84,9 @@ fn bd_lryih_join_on_short_circuit_matches_stock() {
         frank_exec(&frank, "CREATE TABLE t(id INTEGER, bad TEXT);").await;
         frank_exec(&frank, "INSERT INTO t VALUES(1,'x'),(2,'y');").await;
         oracle
-            .execute_batch("CREATE TABLE t(id INTEGER, bad TEXT); INSERT INTO t VALUES(1,'x'),(2,'y');")
+            .execute_batch(
+                "CREATE TABLE t(id INTEGER, bad TEXT); INSERT INTO t VALUES(1,'x'),(2,'y');",
+            )
             .expect("setup (rusqlite)");
 
         // `E` = an erroring uncorrelated subquery (json_each on malformed JSON).

@@ -30,17 +30,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -61,37 +70,107 @@ fn upsert_matches_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // PK conflict, DO UPDATE using excluded.* + arithmetic on existing
         ex(&f, &r, "INSERT INTO t(id,u,v) VALUES (1,'a',99) ON CONFLICT(id) DO UPDATE SET v=v+excluded.v, hits=hits+1").await;
-        check("pk do-update excluded", fq(&f, "SELECT id,u,v,hits FROM t WHERE id=1").await, rq(&r, "SELECT id,u,v,hits FROM t WHERE id=1"), &mut diffs);
+        check(
+            "pk do-update excluded",
+            fq(&f, "SELECT id,u,v,hits FROM t WHERE id=1").await,
+            rq(&r, "SELECT id,u,v,hits FROM t WHERE id=1"),
+            &mut diffs,
+        );
 
         // UNIQUE(u) conflict targeted
-        ex(&f, &r, "INSERT INTO t(id,u,v) VALUES (5,'b',7) ON CONFLICT(u) DO UPDATE SET v=excluded.v").await;
-        check("unique do-update", fq(&f, "SELECT id,u,v FROM t WHERE u='b'").await, rq(&r, "SELECT id,u,v FROM t WHERE u='b'"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT INTO t(id,u,v) VALUES (5,'b',7) ON CONFLICT(u) DO UPDATE SET v=excluded.v",
+        )
+        .await;
+        check(
+            "unique do-update",
+            fq(&f, "SELECT id,u,v FROM t WHERE u='b'").await,
+            rq(&r, "SELECT id,u,v FROM t WHERE u='b'"),
+            &mut diffs,
+        );
 
         // DO NOTHING on conflict
-        ex(&f, &r, "INSERT INTO t(id,u,v) VALUES (3,'c',999) ON CONFLICT(id) DO NOTHING").await;
-        check("do-nothing", fq(&f, "SELECT v FROM t WHERE id=3").await, rq(&r, "SELECT v FROM t WHERE id=3"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT INTO t(id,u,v) VALUES (3,'c',999) ON CONFLICT(id) DO NOTHING",
+        )
+        .await;
+        check(
+            "do-nothing",
+            fq(&f, "SELECT v FROM t WHERE id=3").await,
+            rq(&r, "SELECT v FROM t WHERE id=3"),
+            &mut diffs,
+        );
 
         // untargeted ON CONFLICT DO UPDATE
-        ex(&f, &r, "INSERT INTO t(id,u,v) VALUES (2,'b2',1) ON CONFLICT DO UPDATE SET v=v*2").await;
-        check("untargeted do-update", fq(&f, "SELECT id,v FROM t WHERE id=2").await, rq(&r, "SELECT id,v FROM t WHERE id=2"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT INTO t(id,u,v) VALUES (2,'b2',1) ON CONFLICT DO UPDATE SET v=v*2",
+        )
+        .await;
+        check(
+            "untargeted do-update",
+            fq(&f, "SELECT id,v FROM t WHERE id=2").await,
+            rq(&r, "SELECT id,v FROM t WHERE id=2"),
+            &mut diffs,
+        );
 
         // DO UPDATE with a WHERE guard that FAILS -> no update
-        ex(&f, &r, "INSERT INTO t(id,u,v) VALUES (1,'a',5) ON CONFLICT(id) DO UPDATE SET v=100 WHERE v<0").await;
-        check("do-update where-false", fq(&f, "SELECT v FROM t WHERE id=1").await, rq(&r, "SELECT v FROM t WHERE id=1"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT INTO t(id,u,v) VALUES (1,'a',5) ON CONFLICT(id) DO UPDATE SET v=100 WHERE v<0",
+        )
+        .await;
+        check(
+            "do-update where-false",
+            fq(&f, "SELECT v FROM t WHERE id=1").await,
+            rq(&r, "SELECT v FROM t WHERE id=1"),
+            &mut diffs,
+        );
 
         // insert of a brand-new non-conflicting row through an upsert stmt
-        ex(&f, &r, "INSERT INTO t(id,u,v) VALUES (7,'g',70) ON CONFLICT(id) DO UPDATE SET v=excluded.v").await;
-        check("upsert new row", fq(&f, "SELECT id,u,v FROM t WHERE id=7").await, rq(&r, "SELECT id,u,v FROM t WHERE id=7"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT INTO t(id,u,v) VALUES (7,'g',70) ON CONFLICT(id) DO UPDATE SET v=excluded.v",
+        )
+        .await;
+        check(
+            "upsert new row",
+            fq(&f, "SELECT id,u,v FROM t WHERE id=7").await,
+            rq(&r, "SELECT id,u,v FROM t WHERE id=7"),
+            &mut diffs,
+        );
 
         // full final state
-        check("final", fq(&f, "SELECT id,u,v,hits FROM t ORDER BY id").await, rq(&r, "SELECT id,u,v,hits FROM t ORDER BY id"), &mut diffs);
+        check(
+            "final",
+            fq(&f, "SELECT id,u,v,hits FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,u,v,hits FROM t ORDER BY id"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} UPSERT divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} UPSERT divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

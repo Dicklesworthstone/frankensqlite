@@ -42,7 +42,9 @@ fn names_sorted_f(rows: &[Vec<String>], name_col: usize) -> Vec<String> {
 }
 
 fn rusqlite_collation_names(rconn: &rusqlite::Connection) -> Vec<String> {
-    let mut st = rconn.prepare("SELECT name FROM pragma_collation_list").unwrap();
+    let mut st = rconn
+        .prepare("SELECT name FROM pragma_collation_list")
+        .unwrap();
     let mut v: Vec<String> = st
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()

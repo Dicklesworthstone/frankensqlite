@@ -29,17 +29,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 }
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -60,65 +69,129 @@ fn insert_abort_statement_atomicity_matches_oracle() {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // explicit OR ABORT: multi-row insert, 2nd row conflicts -> ALL undone
-        for s in ["CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO a VALUES (5,'five')"] {
+        for s in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO a VALUES (5,'five')",
+        ] {
             ex(&f, &r, s).await;
         }
-        ex(&f, &r, "INSERT OR ABORT INTO a VALUES (10,'ten'),(5,'dup'),(11,'eleven')").await;
-        check("or abort", fq(&f, "SELECT id,v FROM a ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM a ORDER BY id"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT OR ABORT INTO a VALUES (10,'ten'),(5,'dup'),(11,'eleven')",
+        )
+        .await;
+        check(
+            "or abort",
+            fq(&f, "SELECT id,v FROM a ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM a ORDER BY id"),
+            &mut diffs,
+        );
 
         // implicit ABORT (plain INSERT) — same statement rollback
-        for s in ["CREATE TABLE b(id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO b VALUES (5,'five')"] {
+        for s in [
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO b VALUES (5,'five')",
+        ] {
             ex(&f, &r, s).await;
         }
-        ex(&f, &r, "INSERT INTO b VALUES (12,'twelve'),(5,'dup'),(13,'thirteen')").await;
-        check("implicit abort", fq(&f, "SELECT id,v FROM b ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM b ORDER BY id"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT INTO b VALUES (12,'twelve'),(5,'dup'),(13,'thirteen')",
+        )
+        .await;
+        check(
+            "implicit abort",
+            fq(&f, "SELECT id,v FROM b ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM b ORDER BY id"),
+            &mut diffs,
+        );
 
         // UNIQUE (not just PK) violation partway also rolls the statement back
-        for s in ["CREATE TABLE c(id INTEGER PRIMARY KEY, u TEXT UNIQUE)", "INSERT INTO c VALUES (1,'x')"] {
+        for s in [
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, u TEXT UNIQUE)",
+            "INSERT INTO c VALUES (1,'x')",
+        ] {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "INSERT INTO c VALUES (2,'y'),(3,'x'),(4,'z')").await; // u='x' dup at row 2
-        check("unique abort", fq(&f, "SELECT id,u FROM c ORDER BY id").await,
-              rq(&r, "SELECT id,u FROM c ORDER BY id"), &mut diffs);
+        check(
+            "unique abort",
+            fq(&f, "SELECT id,u FROM c ORDER BY id").await,
+            rq(&r, "SELECT id,u FROM c ORDER BY id"),
+            &mut diffs,
+        );
 
         // NOT NULL violation partway
         for s in ["CREATE TABLE d(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)"] {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "INSERT INTO d VALUES (1,10),(2,NULL),(3,30)").await; // row 2 NOT NULL
-        check("notnull abort", fq(&f, "SELECT id,v FROM d ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM d ORDER BY id"), &mut diffs);
+        check(
+            "notnull abort",
+            fq(&f, "SELECT id,v FROM d ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM d ORDER BY id"),
+            &mut diffs,
+        );
 
         // OR FAIL must STILL preserve the earlier row (regression guard the other way)
-        for s in ["CREATE TABLE e(id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO e VALUES (5,'five')"] {
+        for s in [
+            "CREATE TABLE e(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO e VALUES (5,'five')",
+        ] {
             ex(&f, &r, s).await;
         }
-        ex(&f, &r, "INSERT OR FAIL INTO e VALUES (20,'twenty'),(5,'dup'),(21,'x')").await;
-        check("or fail preserves", fq(&f, "SELECT id,v FROM e ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM e ORDER BY id"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT OR FAIL INTO e VALUES (20,'twenty'),(5,'dup'),(21,'x')",
+        )
+        .await;
+        check(
+            "or fail preserves",
+            fq(&f, "SELECT id,v FROM e ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM e ORDER BY id"),
+            &mut diffs,
+        );
 
         // ABORT with the conflicting row committed BEFORE the multi-row INSERT
         // (autocommit): the failed statement's earlier rows are undone, the prior
         // committed row survives.
-        for s in ["CREATE TABLE g(id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO g VALUES (1,'a')"] {
+        for s in [
+            "CREATE TABLE g(id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO g VALUES (1,'a')",
+        ] {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "INSERT INTO g VALUES (2,'b'),(1,'dup'),(3,'c')").await; // (1,'dup') conflicts
-        check("abort keeps prior committed", fq(&f, "SELECT id,v FROM g ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM g ORDER BY id"), &mut diffs);
+        check(
+            "abort keeps prior committed",
+            fq(&f, "SELECT id,v FROM g ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM g ORDER BY id"),
+            &mut diffs,
+        );
 
         // NOTE: the ABORT-inside-an-explicit-BEGIN variant (a prior in-txn INSERT,
         // then a multi-row INSERT that conflicts with it) is tracked separately in
         // bd-q2bju — a distinct explicit-txn bug where the multi-row INSERT does
         // not see the prior in-txn row for conflict detection. Not asserted here.
 
-        assert!(diffs.is_empty(), "{} INSERT-ABORT atomicity divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} INSERT-ABORT atomicity divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

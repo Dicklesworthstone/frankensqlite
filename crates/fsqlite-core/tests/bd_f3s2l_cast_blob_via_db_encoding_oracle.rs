@@ -70,8 +70,10 @@ async fn run_vdbe_text_pair(encoding: &str, expect_header: u32) {
         conn.execute_batch(&format!("PRAGMA encoding = '{encoding}';"))
             .expect("stock PRAGMA");
         conn.execute_batch(create).expect("stock create");
-        conn.execute_batch(&insert_blobs).expect("stock insert blobs");
-        conn.execute_batch(insert_select).expect("stock insert-select");
+        conn.execute_batch(&insert_blobs)
+            .expect("stock insert blobs");
+        conn.execute_batch(insert_select)
+            .expect("stock insert-select");
     }
     let oracle = stock_read_col0_text(&stock_path, readback);
     assert_eq!(
@@ -89,7 +91,9 @@ async fn run_vdbe_text_pair(encoding: &str, expect_header: u32) {
             .await
             .expect("frank PRAGMA");
         conn.execute(create).await.expect("frank create");
-        conn.execute(&insert_blobs).await.expect("frank insert blobs");
+        conn.execute(&insert_blobs)
+            .await
+            .expect("frank insert blobs");
         conn.execute(insert_select)
             .await
             .expect("frank insert-select");
@@ -157,7 +161,10 @@ async fn run_numeric_pair(encoding: &str) {
     let cases = numeric_cases(encoding);
 
     // Build a table holding each numeric blob (stored verbatim).
-    let blob_values: Vec<String> = cases.iter().map(|(_, hex, _)| format!("(X'{hex}')")).collect();
+    let blob_values: Vec<String> = cases
+        .iter()
+        .map(|(_, hex, _)| format!("(X'{hex}')"))
+        .collect();
     let insert_blobs = format!("INSERT INTO b(v) VALUES {}", blob_values.join(", "));
     let create = "CREATE TABLE b(v BLOB)";
 
@@ -193,7 +200,9 @@ async fn run_numeric_pair(encoding: &str) {
         let rows = conn.query(&q).await.expect("frank numeric cast");
         assert_eq!(rows.len(), 1, "[{encoding}/{label}] one row");
         let frank_val = frank_scalar(&rows[0]);
-        eprintln!("[{encoding}] {label:<20} CAST AS {ty:<8}: stock={stock_val:<8} frank={frank_val}");
+        eprintln!(
+            "[{encoding}] {label:<20} CAST AS {ty:<8}: stock={stock_val:<8} frank={frank_val}"
+        );
         assert_eq!(
             frank_val, stock_val,
             "[{encoding}/{label}] bd-f3s2l: CAST(blob AS {ty}) must parse via DB encoding like stock"

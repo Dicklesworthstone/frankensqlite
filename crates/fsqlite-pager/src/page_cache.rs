@@ -3221,8 +3221,10 @@ impl ShardedPageCache {
         // Order matters: mark the window's exactness from the mode in force
         // before publishing the new baseline, so a concurrent reader can never
         // pair a fresh baseline with a stale exactness claim.
-        self.peak_is_exact
-            .store(self.use_fast_path.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.peak_is_exact.store(
+            self.use_fast_path.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.peak_cached_pages.store(self.len(), Ordering::Relaxed);
     }
 
@@ -6336,11 +6338,20 @@ mod tests {
 
         // Re-access the hot pages so they promote into the main (T2) queue.
         for _ in 0..8 {
-            assert!(cache.get(hot_a).is_some(), "hot page A must remain readable");
-            assert!(cache.get(hot_b).is_some(), "hot page B must remain readable");
+            assert!(
+                cache.get(hot_a).is_some(),
+                "hot page A must remain readable"
+            );
+            assert!(
+                cache.get(hot_b).is_some(),
+                "hot page B must remain readable"
+            );
         }
 
-        assert!(cache.evict_any(), "adaptive S3-FIFO should evict a cold page");
+        assert!(
+            cache.evict_any(),
+            "adaptive S3-FIFO should evict a cold page"
+        );
 
         let snapshot = cache.metrics_snapshot();
         assert!(

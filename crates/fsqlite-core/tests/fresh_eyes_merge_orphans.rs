@@ -48,11 +48,9 @@ fn fresh_eyes_merge_over_stock_segments_then_promote() {
                 .unwrap();
             eprintln!("stock wrote idx_rows={idx_rows} dlidx_rows={dlidx_rows}");
             let segs: i64 = stock
-                .query_row(
-                    "SELECT count(*) FROM t_data WHERE id = 10",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT count(*) FROM t_data WHERE id = 10", [], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             let _ = segs;
         }
@@ -60,7 +58,9 @@ fn fresh_eyes_merge_over_stock_segments_then_promote() {
         // Frank opens (lazy default), appends rows until a merge fires, then
         // forces a promote via 'optimize'.
         let db_str = db_path.to_string_lossy().into_owned();
-        let conn = Connection::open_existing_schema_only(&db_str).await.unwrap();
+        let conn = Connection::open_existing_schema_only(&db_str)
+            .await
+            .unwrap();
         for id in 1000..1006 {
             conn.execute(&format!(
                 "INSERT INTO t(rowid, body) VALUES ({id}, 'common fresh{id}');"
@@ -74,7 +74,11 @@ fn fresh_eyes_merge_over_stock_segments_then_promote() {
             .await
             .unwrap();
         eprintln!("match common -> {} rows", rows.len());
-        assert_eq!(rows.len(), 206, "all stock + frank rows match before promote");
+        assert_eq!(
+            rows.len(),
+            206,
+            "all stock + frank rows match before promote"
+        );
 
         // Promote (optimize promotes before its no-op). If the merge orphaned
         // stock rows, this errors with 'references unknown segment'.

@@ -183,7 +183,9 @@ mod macos {
 #[cfg(windows)]
 mod windows_impl {
     use super::{PAYLOAD_MASK, PID_BIRTH_FILETIME_TAG, ProcessLiveness};
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, FILETIME, GetLastError};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, FILETIME, GetLastError,
+    };
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -220,9 +222,8 @@ mod windows_impl {
         let mut user = creation;
         // SAFETY: `handle` is a live process handle; the four `FILETIME` out
         // pointers are valid, initialized locals.
-        let ok = unsafe {
-            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
-        };
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
         // SAFETY: `handle` came from `OpenProcess` above and is not used again.
         unsafe {
             CloseHandle(handle);
@@ -230,8 +231,7 @@ mod windows_impl {
         if ok == 0 {
             return Creation::Error;
         }
-        let ticks =
-            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
         Creation::Present(ticks)
     }
 
@@ -285,7 +285,10 @@ mod tests {
     #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     fn non_macos_non_windows_returns_unknown() {
-        assert_eq!(process_alive(std::process::id(), 0), ProcessLiveness::Unknown);
+        assert_eq!(
+            process_alive(std::process::id(), 0),
+            ProcessLiveness::Unknown
+        );
         assert!(current_process_birth_token().is_none());
     }
 
@@ -319,7 +322,10 @@ mod tests {
     fn almost_certainly_dead_pid_reads_dead() {
         // A very high PID that is almost certainly not running. If it happens to
         // exist, the birth mismatch still yields Dead; either way, not Alive.
-        let verdict = process_alive(0x7FFF_FFF0, PID_BIRTH_SYSCTL_TAG | PID_BIRTH_FILETIME_TAG | 0x1234);
+        let verdict = process_alive(
+            0x7FFF_FFF0,
+            PID_BIRTH_SYSCTL_TAG | PID_BIRTH_FILETIME_TAG | 0x1234,
+        );
         assert_ne!(verdict, ProcessLiveness::Alive);
     }
 }

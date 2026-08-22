@@ -56,7 +56,8 @@ fn behavioral_pragmas_match_rusqlite_oracle() {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
 
-        let like_probe = "SELECT ('ABC' LIKE 'abc') || '/' || ('abc' LIKE 'ABC') || '/' || ('AbC' LIKE 'a_c')";
+        let like_probe =
+            "SELECT ('ABC' LIKE 'abc') || '/' || ('abc' LIKE 'ABC') || '/' || ('AbC' LIKE 'a_c')";
 
         let mut diffs = Vec::new();
         let check = |label: &str, fv: String, rv: String, diffs: &mut Vec<String>| {
@@ -94,7 +95,12 @@ fn behavioral_pragmas_match_rusqlite_oracle() {
         // GLOB is always case-sensitive regardless of the pragma.
         apply_both(&f, &r, "PRAGMA case_sensitive_like = ON").await;
         let glob = "SELECT ('ABC' GLOB 'abc') || '/' || ('ABC' GLOB 'ABC')";
-        check("GLOB under CSL=ON", fval(&f, glob).await, rval(&r, glob), &mut diffs);
+        check(
+            "GLOB under CSL=ON",
+            fval(&f, glob).await,
+            rval(&r, glob),
+            &mut diffs,
+        );
         apply_both(&f, &r, "PRAGMA case_sensitive_like = OFF").await;
 
         assert!(

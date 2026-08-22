@@ -137,13 +137,19 @@ fn fts5vocab_col_matches_stock() {
 
 #[test]
 fn fts5vocab_instance_matches_stock() {
-    compare("instance", "SELECT * FROM v_inst ORDER BY term, doc, col, offset");
+    compare(
+        "instance",
+        "SELECT * FROM v_inst ORDER BY term, doc, col, offset",
+    );
 }
 
 /// Projection of a subset of columns (not `SELECT *`) still matches stock.
 #[test]
 fn fts5vocab_row_projection_matches_stock() {
-    compare("row-projection", "SELECT term, cnt FROM v_row ORDER BY term");
+    compare(
+        "row-projection",
+        "SELECT term, cnt FROM v_row ORDER BY term",
+    );
 }
 
 /// An unknown table type is rejected at CREATE, matching stock.

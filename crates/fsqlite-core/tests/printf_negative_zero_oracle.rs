@@ -45,7 +45,10 @@ fn printf_signed_zero_matches_rusqlite_oracle() {
         for expr in EXPRS {
             let expected = oracle(expr);
             let sql = format!("SELECT {expr}");
-            let rows = conn.query(&sql).await.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+            let rows = conn
+                .query(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
             let got = match rows[0].values()[0] {
                 SqliteValue::Text(ref s) => s.as_ref().to_owned(),
                 ref other => panic!("`{sql}` not text: {other:?}"),

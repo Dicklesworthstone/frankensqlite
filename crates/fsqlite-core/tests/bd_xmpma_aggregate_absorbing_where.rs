@@ -90,7 +90,11 @@ fn bd_xmpma_aggregate_absorbing_where_with_erroring_subquery_folds() {
                 ref o => panic!("expected int, got {o:?}"),
             })
             .collect();
-        assert_eq!(vals, vec![1, 2, 3], "non-aggregate scan under OR TRUE unaffected");
+        assert_eq!(
+            vals,
+            vec![1, 2, 3],
+            "non-aggregate scan under OR TRUE unaffected"
+        );
 
         // Control: a bare erroring subquery WHERE (NOT absorbed) still surfaces
         // the error rather than being silently swallowed to NULL.

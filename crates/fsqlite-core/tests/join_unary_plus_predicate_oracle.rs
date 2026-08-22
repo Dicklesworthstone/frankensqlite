@@ -39,7 +39,9 @@ fn oracle_rows(sql: &str) -> Vec<(String, String)> {
     }
     let mut stmt = conn.prepare(sql).unwrap();
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .unwrap()
         .map(Result::unwrap)
         .collect();
@@ -64,7 +66,10 @@ fn unary_plus_join_predicate_matches_rusqlite_oracle() {
                 "oracle premise: `{sql}` must return rows"
             );
 
-            let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+            let rows = conn
+                .query(sql)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
             let got: Vec<(String, String)> = rows
                 .iter()
                 .map(|r| {

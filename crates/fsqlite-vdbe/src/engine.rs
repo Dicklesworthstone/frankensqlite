@@ -1077,8 +1077,13 @@ impl MemTable {
             // UNIQUE-constraint duplicate detection is an equality test, which is
             // encoding-invariant (a == b in UTF-8 iff in UTF-16), so the DB
             // encoding is irrelevant here (bd-bld9w.4).
-            if cmp_values_collated(existing_value, new_value, collation, registry, TextEncoding::Utf8)
-                != Ordering::Equal
+            if cmp_values_collated(
+                existing_value,
+                new_value,
+                collation,
+                registry,
+                TextEncoding::Utf8,
+            ) != Ordering::Equal
             {
                 return false;
             }
@@ -7884,9 +7889,10 @@ impl VdbeEngine {
         // `self.text_encoding`, so a UTF-8-hardcoded decode on a UTF-16 DB would
         // build a probe that never matches the stored key, orphaning the old
         // index entry on INSERT OR REPLACE (bd-o3rz4).
-        let old_row = parse_record_with_encoding(&payload, self.text_encoding).ok_or_else(|| {
-            FrankenError::internal("delete_secondary_index_entries: malformed table record")
-        })?;
+        let old_row =
+            parse_record_with_encoding(&payload, self.text_encoding).ok_or_else(|| {
+                FrankenError::internal("delete_secondary_index_entries: malformed table record")
+            })?;
         let table_root_page = self.table_root_page_for_cursor(tbl_cursor_id);
         let replace_victim = table_root_page.map(|root_page| {
             self.logical_replace_victim(root_page, &old_row, Some(conflict_rowid))
@@ -8071,7 +8077,8 @@ impl VdbeEngine {
                             rowid,
                             &meta.column_indices,
                         );
-                        let key_bytes = encode_record_with_encoding(&key_values, self.text_encoding);
+                        let key_bytes =
+                            encode_record_with_encoding(&key_values, self.text_encoding);
                         if let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id)
                             && sc.writable
                         {
@@ -9417,9 +9424,13 @@ impl VdbeEngine {
                         // particular, TEXT P5 must stringify numeric values and
                         // NUMERIC P5 must attempt to coerce each TEXT value.
                         let cmp = if !builtins_overridden
-                            && let Some(cmp) =
-                                fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5, self.text_encoding)
-                        {
+                            && let Some(cmp) = fast_compare_same_storage_class(
+                                lhs,
+                                rhs,
+                                &op.p4,
+                                op.p5,
+                                self.text_encoding,
+                            ) {
                             cmp
                         } else {
                             // General path: affinity coercion + collation.
@@ -9434,7 +9445,13 @@ impl VdbeEngine {
                                     _ => "BINARY",
                                 };
                                 let coll = self.lock_collation();
-                                collate_compare(&cmp_lhs, &cmp_rhs, coll_name, &coll, self.text_encoding)
+                                collate_compare(
+                                    &cmp_lhs,
+                                    &cmp_rhs,
+                                    coll_name,
+                                    &coll,
+                                    self.text_encoding,
+                                )
                             } else {
                                 cmp_lhs.partial_cmp(&cmp_rhs)
                             }
@@ -15269,7 +15286,8 @@ impl VdbeEngine {
         }
 
         let cmp = if !builtins_overridden
-            && let Some(cmp) = fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5, self.text_encoding)
+            && let Some(cmp) =
+                fast_compare_same_storage_class(lhs, rhs, &op.p4, op.p5, self.text_encoding)
         {
             cmp
         } else {
@@ -15438,10 +15456,7 @@ impl VdbeEngine {
                 P4::PrecomputedHeader(header) if header.column_count() == n_cols => {
                     match header.slots.get(i) {
                         Some(slot)
-                            if matches!(
-                                slot.kind,
-                                PrecomputedSerialTypeKind::NullPlaceholder
-                            ) =>
+                            if matches!(slot.kind, PrecomputedSerialTypeKind::NullPlaceholder) =>
                         {
                             &null_placeholder
                         }
@@ -19716,12 +19731,12 @@ mod tests {
     use super::*;
     use crate::{Label, ProgramBuilder};
     use asupersync::runtime::{Runtime, RuntimeBuilder};
-    use fsqlite_types::record::serialize_record;
     use fsqlite_func::vtab::{IndexInfo, VirtualTable, VirtualTableCursor};
     use fsqlite_func::{FunctionRegistry, ScalarFunction, register_builtins};
     use fsqlite_mvcc::ConcurrentRegistry;
     use fsqlite_types::limits::MAX_COLUMN;
     use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4, VdbeOp};
+    use fsqlite_types::record::serialize_record;
     use fsqlite_types::record::{parse_record, parse_record_into, serialize_record_iter_into};
     use fsqlite_types::serial_type::{
         serial_type_for_blob, serial_type_for_integer, serial_type_for_text, varint_len,
@@ -32083,7 +32098,15 @@ mod tests {
             "descending index comparison should treat the larger key as earlier"
         );
         assert_eq!(
-            compare_index_prefix_keys(&lhs, &rhs, 1, &[false], &[], &coll_guard, TextEncoding::Utf8),
+            compare_index_prefix_keys(
+                &lhs,
+                &rhs,
+                1,
+                &[false],
+                &[],
+                &coll_guard,
+                TextEncoding::Utf8
+            ),
             Ordering::Greater,
             "ascending index comparison should keep natural integer ordering"
         );
@@ -33637,10 +33660,16 @@ mod tests {
         let expect_codepoint = ["Apple", "Børge", "Zoë", "apple", "Élise", "名前"];
         let mut be = fixture;
         be.sort_by(|a, b| binary_compare_bytes(a.as_bytes(), b.as_bytes(), TextEncoding::Utf16be));
-        assert_eq!(be, expect_codepoint, "UTF-16BE BINARY == code-point order for the BMP");
+        assert_eq!(
+            be, expect_codepoint,
+            "UTF-16BE BINARY == code-point order for the BMP"
+        );
         let mut u8s = fixture;
         u8s.sort_by(|a, b| binary_compare_bytes(a.as_bytes(), b.as_bytes(), TextEncoding::Utf8));
-        assert_eq!(u8s, expect_codepoint, "UTF-8 BINARY == code-point order (unchanged hot path)");
+        assert_eq!(
+            u8s, expect_codepoint,
+            "UTF-8 BINARY == code-point order (unchanged hot path)"
+        );
     }
 
     #[test]

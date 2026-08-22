@@ -73,10 +73,18 @@ fn gh173_forced_partial_index_requires_syntactic_predicate_cover() {
         // No WHERE clause at all -> reject.
         assert_rejected(&conn, "SELECT a, b FROM t INDEXED BY idx;").await;
         // Exact partial predicate present -> allow.
-        assert_allowed(&conn, "SELECT a, b FROM t INDEXED BY idx WHERE a = 1 AND b > 0;").await;
+        assert_allowed(
+            &conn,
+            "SELECT a, b FROM t INDEXED BY idx WHERE a = 1 AND b > 0;",
+        )
+        .await;
         // CRITICAL: `b > 5` logically implies `b > 0` but SQLite still REJECTS
         // (syntactic match, not implication).
-        assert_rejected(&conn, "SELECT a, b FROM t INDEXED BY idx WHERE a = 1 AND b > 5;").await;
+        assert_rejected(
+            &conn,
+            "SELECT a, b FROM t INDEXED BY idx WHERE a = 1 AND b > 5;",
+        )
+        .await;
         // Superset of conjuncts (extra `c = 2`) still contains `b > 0` -> allow.
         assert_allowed(
             &conn,
@@ -84,16 +92,32 @@ fn gh173_forced_partial_index_requires_syntactic_predicate_cover() {
         )
         .await;
         // Conjunct order does not matter -> allow.
-        assert_allowed(&conn, "SELECT a, b FROM t INDEXED BY idx WHERE b > 0 AND a = 1;").await;
+        assert_allowed(
+            &conn,
+            "SELECT a, b FROM t INDEXED BY idx WHERE b > 0 AND a = 1;",
+        )
+        .await;
         // A table-qualified predicate covers the bare stored predicate -> allow.
-        assert_allowed(&conn, "SELECT a, b FROM t INDEXED BY idx WHERE a = 1 AND t.b > 0;").await;
+        assert_allowed(
+            &conn,
+            "SELECT a, b FROM t INDEXED BY idx WHERE a = 1 AND t.b > 0;",
+        )
+        .await;
         // A commuted comparison (`0 < b`) covers `b > 0` -> allow.
-        assert_allowed(&conn, "SELECT a, b FROM t INDEXED BY idx WHERE a = 1 AND 0 < b;").await;
+        assert_allowed(
+            &conn,
+            "SELECT a, b FROM t INDEXED BY idx WHERE a = 1 AND 0 < b;",
+        )
+        .await;
 
         // ---- two-conjunct partial predicate `b > 0 AND c < 10` (index `idx2`) ----
 
         // Only one of the two conjuncts present -> reject.
-        assert_rejected(&conn, "SELECT a FROM t INDEXED BY idx2 WHERE a = 1 AND b > 0;").await;
+        assert_rejected(
+            &conn,
+            "SELECT a FROM t INDEXED BY idx2 WHERE a = 1 AND b > 0;",
+        )
+        .await;
         // Both conjuncts present (any order) -> allow.
         assert_allowed(
             &conn,
@@ -110,7 +134,11 @@ fn gh173_forced_partial_index_requires_syntactic_predicate_cover() {
 
         assert_rejected(&conn, "SELECT a FROM t INDEXED BY idx_eq WHERE a = 1;").await;
         assert_allowed(&conn, "SELECT a FROM t INDEXED BY idx_eq WHERE d = 5;").await;
-        assert_allowed(&conn, "SELECT a FROM t INDEXED BY idx_eq WHERE a = 1 AND d = 5;").await;
+        assert_allowed(
+            &conn,
+            "SELECT a FROM t INDEXED BY idx_eq WHERE a = 1 AND d = 5;",
+        )
+        .await;
 
         // ---- CONTROL: a NON-partial forced index is usable with any WHERE ----
 

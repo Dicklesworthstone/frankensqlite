@@ -115,7 +115,9 @@ fn fts5_rename_table_matches_stock_gh209() {
         }
         // No `ft`-prefixed leftovers survive the rename.
         assert!(
-            !frank_names.iter().any(|n| n == "ft" || n.starts_with("ft_")),
+            !frank_names
+                .iter()
+                .any(|n| n == "ft" || n.starts_with("ft_")),
             "no old `ft`/`ft_*` entries may remain, got {frank_names:?}"
         );
 
@@ -127,9 +129,11 @@ fn fts5_rename_table_matches_stock_gh209() {
             .unwrap();
         r.execute_batch("ALTER TABLE ft RENAME TO ft2;").unwrap();
         let stock_match: i64 = r
-            .query_row("SELECT count(*) FROM ft2 WHERE ft2 MATCH 'hello'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM ft2 WHERE ft2 MATCH 'hello'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(stock_match, 1, "stock MATCH sanity after rename");
 
@@ -236,9 +240,11 @@ fn fts5_rename_table_survives_reopen_gh209() {
             .unwrap();
         assert_eq!(integrity, "ok", "stock integrity_check on renamed image");
         let stock_match: i64 = stock
-            .query_row("SELECT count(*) FROM ft2 WHERE ft2 MATCH 'hello'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM ft2 WHERE ft2 MATCH 'hello'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(
             stock_match, 1,

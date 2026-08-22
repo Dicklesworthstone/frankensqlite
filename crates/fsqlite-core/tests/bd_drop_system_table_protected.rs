@@ -10,7 +10,10 @@ async fn err_of(setup: &[&str], failing: &str) -> String {
     for s in setup {
         c.execute(s).await.unwrap();
     }
-    c.execute(failing).await.expect_err("must be rejected").to_string()
+    c.execute(failing)
+        .await
+        .expect_err("must be rejected")
+        .to_string()
 }
 
 #[test]

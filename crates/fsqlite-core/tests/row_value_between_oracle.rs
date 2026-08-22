@@ -59,7 +59,10 @@ fn row_value_between_matches_rusqlite_oracle() {
 
         for sql in PAIR_QUERIES {
             let expected = oracle_pairs(sql);
-            let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+            let rows = conn
+                .query(sql)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
             let got: Vec<(i64, i64)> = rows
                 .iter()
                 .map(|r| {
@@ -70,17 +73,26 @@ fn row_value_between_matches_rusqlite_oracle() {
                     (int(0), int(1))
                 })
                 .collect();
-            assert_eq!(got, expected, "row-value query `{sql}` diverged from the C SQLite oracle");
+            assert_eq!(
+                got, expected,
+                "row-value query `{sql}` diverged from the C SQLite oracle"
+            );
         }
 
         for sql in SCALAR_QUERIES {
             let expected = oracle_scalar(sql);
-            let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+            let rows = conn
+                .query(sql)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
             let got = match rows[0].values()[0] {
                 SqliteValue::Integer(n) => n,
                 ref other => panic!("`{sql}` not int: {other:?}"),
             };
-            assert_eq!(got, expected, "scalar row-value `{sql}` diverged from the C SQLite oracle");
+            assert_eq!(
+                got, expected,
+                "scalar row-value `{sql}` diverged from the C SQLite oracle"
+            );
         }
     });
 }

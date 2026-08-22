@@ -999,11 +999,12 @@ fn path_root_key(path: Option<&str>) -> SqliteValue {
     let Some(path) = path else {
         return SqliteValue::Null;
     };
-    match parse_path(path).ok().and_then(|segments| segments.last().cloned()) {
+    match parse_path(path)
+        .ok()
+        .and_then(|segments| segments.last().cloned())
+    {
         Some(PathSegment::Key(key)) => SqliteValue::Text(key.as_str().into()),
-        Some(PathSegment::Index(index)) => {
-            SqliteValue::Integer(i64::try_from(index).unwrap_or(0))
-        }
+        Some(PathSegment::Index(index)) => SqliteValue::Integer(i64::try_from(index).unwrap_or(0)),
         // `$` (no segment), Append, and the rare `#-n` FromEnd form have no
         // stable literal key here — fall back to NULL.
         _ => SqliteValue::Null,
@@ -1506,9 +1507,11 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
                 FrankenError::function_error(format!("invalid JSONB float payload text: {error}"))
             })?;
             if float.is_finite() {
-                Value::Number(Number::from_f64(float).ok_or_else(|| {
-                    FrankenError::function_error("invalid JSONB float payload")
-                })?)
+                Value::Number(
+                    Number::from_f64(float).ok_or_else(|| {
+                        FrankenError::function_error("invalid JSONB float payload")
+                    })?,
+                )
             } else {
                 // Non-finite payload (e.g. `9e999` +Inf): carry the raw source
                 // text in a tagged string so the JSONB value round-trips through
@@ -2268,7 +2271,11 @@ fn float_to_json(f: f64) -> Result<Value> {
         // (GH#212). `serde_json::Number` cannot hold a non-finite value, so the
         // constructed literal is carried as a tagged string (bd-yalqc); the
         // canonical `9.0e+999` form is preserved through render.
-        return Ok(nonfinite_value(if f > 0.0 { "9.0e+999" } else { "-9.0e+999" }));
+        return Ok(nonfinite_value(if f > 0.0 {
+            "9.0e+999"
+        } else {
+            "-9.0e+999"
+        }));
     }
     Number::from_f64(f).map(Value::Number).ok_or_else(|| {
         FrankenError::function_error("failed to convert floating-point value to JSON")
@@ -3001,9 +3008,9 @@ impl ScalarFunction for JsonbExtractFunc {
             // scalar (or a missing path -> NULL) returns the SQL scalar value,
             // same as json_extract (bd-elre4).
             return match &node {
-                Value::Array(_) | Value::Object(_) => Ok(SqliteValue::Blob(
-                    Arc::from(encode_jsonb_root(&node)?.as_slice()),
-                )),
+                Value::Array(_) | Value::Object(_) => Ok(SqliteValue::Blob(Arc::from(
+                    encode_jsonb_root(&node)?.as_slice(),
+                ))),
                 _ => Ok(json_to_sqlite_scalar(&node)),
             };
         }
@@ -4086,23 +4093,59 @@ mod tests {
 
         // json_extract — single path returns the natural SQL value.
         assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":1}"#), t("$.a")]), i(1));
-        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":1}"#), t("$.b")]), nul.clone());
+        assert_eq!(
+            run(&JsonExtractFunc, &[t(r#"{"a":1}"#), t("$.b")]),
+            nul.clone()
+        );
         assert_eq!(run(&JsonExtractFunc, &[t("[10,20,30]"), t("$[0]")]), i(10));
-        assert_eq!(run(&JsonExtractFunc, &[t("[10,20,30]"), t("$[#-1]")]), i(30));
-        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":"x"}"#), t("$.a")]), t("x"));
-        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":null}"#), t("$.a")]), nul.clone());
-        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":1.5}"#), t("$.a")]), f(1.5));
+        assert_eq!(
+            run(&JsonExtractFunc, &[t("[10,20,30]"), t("$[#-1]")]),
+            i(30)
+        );
+        assert_eq!(
+            run(&JsonExtractFunc, &[t(r#"{"a":"x"}"#), t("$.a")]),
+            t("x")
+        );
+        assert_eq!(
+            run(&JsonExtractFunc, &[t(r#"{"a":null}"#), t("$.a")]),
+            nul.clone()
+        );
+        assert_eq!(
+            run(&JsonExtractFunc, &[t(r#"{"a":1.5}"#), t("$.a")]),
+            f(1.5)
+        );
         assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":true}"#), t("$.a")]), i(1));
-        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":1e3}"#), t("$.a")]), f(1000.0));
-        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":{"b":2}}"#), t("$.a")]), t(r#"{"b":2}"#));
-        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"x":[1,{"y":9}]}"#), t("$.x[1].y")]), i(9));
-        assert_eq!(run(&JsonExtractFunc, &[t(r#"{"a":1}"#), t("$")]), t(r#"{"a":1}"#));
+        assert_eq!(
+            run(&JsonExtractFunc, &[t(r#"{"a":1e3}"#), t("$.a")]),
+            f(1000.0)
+        );
+        assert_eq!(
+            run(&JsonExtractFunc, &[t(r#"{"a":{"b":2}}"#), t("$.a")]),
+            t(r#"{"b":2}"#)
+        );
+        assert_eq!(
+            run(
+                &JsonExtractFunc,
+                &[t(r#"{"x":[1,{"y":9}]}"#), t("$.x[1].y")]
+            ),
+            i(9)
+        );
+        assert_eq!(
+            run(&JsonExtractFunc, &[t(r#"{"a":1}"#), t("$")]),
+            t(r#"{"a":1}"#)
+        );
         assert_eq!(run(&JsonExtractFunc, &[t("5"), t("$")]), i(5));
         assert_eq!(run(&JsonExtractFunc, &[t(r#""hi""#), t("$")]), t("hi"));
-        assert_eq!(run(&JsonExtractFunc, &[t("[1,2,3]"), t("$[5]")]), nul.clone());
+        assert_eq!(
+            run(&JsonExtractFunc, &[t("[1,2,3]"), t("$[5]")]),
+            nul.clone()
+        );
         // multiple paths -> JSON array; a missing key becomes json `null`.
         assert_eq!(
-            run(&JsonExtractFunc, &[t(r#"{"a":1,"b":2}"#), t("$.a"), t("$.b")]),
+            run(
+                &JsonExtractFunc,
+                &[t(r#"{"a":1,"b":2}"#), t("$.a"), t("$.b")]
+            ),
             t("[1,2]")
         );
         assert_eq!(
@@ -4112,14 +4155,20 @@ mod tests {
 
         // json_type / json_valid.
         assert_eq!(run(&JsonTypeFunc, &[t("[1,2]")]), t("array"));
-        assert_eq!(run(&JsonTypeFunc, &[t(r#"{"a":1}"#), t("$.a")]), t("integer"));
+        assert_eq!(
+            run(&JsonTypeFunc, &[t(r#"{"a":1}"#), t("$.a")]),
+            t("integer")
+        );
         assert_eq!(run(&JsonTypeFunc, &[t("[1,2]"), t("$[9]")]), nul.clone());
         assert_eq!(run(&JsonValidFunc, &[t("{bad}")]), i(0));
         assert_eq!(run(&JsonValidFunc, &[t(r#"{"a":1}"#)]), i(1));
 
         // json_quote / json_array / json_array_length / json().
         assert_eq!(run(&JsonQuoteFunc, &[f(3.0)]), t("3.0"));
-        assert_eq!(run(&JsonArrayFunc, &[i(1), t("x"), nul.clone()]), t(r#"[1,"x",null]"#));
+        assert_eq!(
+            run(&JsonArrayFunc, &[i(1), t("x"), nul.clone()]),
+            t(r#"[1,"x",null]"#)
+        );
         assert_eq!(run(&JsonArrayLengthFunc, &[t("[1,2,3]")]), i(3));
         assert_eq!(run(&JsonArrayLengthFunc, &[t(r#"{"a":1}"#)]), i(0));
         assert_eq!(run(&JsonFunc, &[t("  [1,  2]  ")]), t("[1,2]"));
@@ -4252,40 +4301,200 @@ mod tests {
             }};
         }
         // JSON-string / text / integer results (exact, version-independent)
-        ck!("json_min", call("json", vec![t(" { \"a\" : 1 , \"b\" : [ 1,2 ] } ")]), "{\"a\":1,\"b\":[1,2]}");
-        ck!("json_type", call("json_type", vec![t("{\"a\":1}")]), "object");
-        ck!("json_type_path", call("json_type", vec![t("{\"a\":[1,2]}"), t("$.a")]), "array");
-        ck!("json_type_int", call("json_type", vec![t("123")]), "integer");
+        ck!(
+            "json_min",
+            call("json", vec![t(" { \"a\" : 1 , \"b\" : [ 1,2 ] } ")]),
+            "{\"a\":1,\"b\":[1,2]}"
+        );
+        ck!(
+            "json_type",
+            call("json_type", vec![t("{\"a\":1}")]),
+            "object"
+        );
+        ck!(
+            "json_type_path",
+            call("json_type", vec![t("{\"a\":[1,2]}"), t("$.a")]),
+            "array"
+        );
+        ck!(
+            "json_type_int",
+            call("json_type", vec![t("123")]),
+            "integer"
+        );
         ck!("json_type_real", call("json_type", vec![t("1.5")]), "real");
         ck!("json_type_true", call("json_type", vec![t("true")]), "true");
         ck!("json_type_null", call("json_type", vec![t("null")]), "null");
-        ck!("jx_obj", call("json_extract", vec![t("{\"a\":1,\"b\":2}"), t("$.a")]), "1");
-        ck!("jx_multi", call("json_extract", vec![t("{\"a\":1,\"b\":2}"), t("$.a"), t("$.b")]), "[1,2]");
-        ck!("jx_whole", call("json_extract", vec![t("{\"a\":1}"), t("$")]), "{\"a\":1}");
-        ck!("jx_text", call("json_extract", vec![t("{\"a\":\"x\"}"), t("$.a")]), "x");
-        ck!("jx_arr", call("json_extract", vec![t("[10,20,30]"), t("$[1]")]), "20");
-        ck!("jx_neg", call("json_extract", vec![t("[10,20,30]"), t("$[#-1]")]), "30");
-        ck!("jx_nested_obj", call("json_extract", vec![t("{\"a\":{\"b\":9}}"), t("$.a")]), "{\"b\":9}");
-        ck!("arrow", call("->", vec![t("{\"a\":{\"b\":5}}"), t("$.a")]), "{\"b\":5}");
-        ck!("arrow2", call("->>", vec![t("{\"a\":{\"b\":5}}"), t("$.a.b")]), "5");
-        ck!("arrow_str", call("->", vec![t("{\"a\":\"hi\"}"), t("$.a")]), "\"hi\"");
-        ck!("arrow2_str", call("->>", vec![t("{\"a\":\"hi\"}"), t("$.a")]), "hi");
-        ck!("json_array", call("json_array", vec![SqliteValue::Integer(1), t("x"), SqliteValue::Null, SqliteValue::Float(2.5)]), "[1,\"x\",null,2.5]");
-        ck!("json_object", call("json_object", vec![t("a"), SqliteValue::Integer(1), t("b"), t("y")]), "{\"a\":1,\"b\":\"y\"}");
-        ck!("json_object_dup", call("json_object", vec![t("a"), SqliteValue::Integer(1), t("a"), SqliteValue::Integer(2)]), "{\"a\":1,\"a\":2}");
-        ck!("json_quote_num", call("json_quote", vec![SqliteValue::Float(3.0)]), "3.0");
-        ck!("json_quote_str", call("json_quote", vec![t("a\"b")]), "\"a\\\"b\"");
-        ck!("json_valid_ok", call("json_valid", vec![t("{\"a\":1}")]), "1");
-        ck!("json_valid_bad", call("json_valid", vec![t("{\"a\":}")]), "0");
+        ck!(
+            "jx_obj",
+            call("json_extract", vec![t("{\"a\":1,\"b\":2}"), t("$.a")]),
+            "1"
+        );
+        ck!(
+            "jx_multi",
+            call(
+                "json_extract",
+                vec![t("{\"a\":1,\"b\":2}"), t("$.a"), t("$.b")]
+            ),
+            "[1,2]"
+        );
+        ck!(
+            "jx_whole",
+            call("json_extract", vec![t("{\"a\":1}"), t("$")]),
+            "{\"a\":1}"
+        );
+        ck!(
+            "jx_text",
+            call("json_extract", vec![t("{\"a\":\"x\"}"), t("$.a")]),
+            "x"
+        );
+        ck!(
+            "jx_arr",
+            call("json_extract", vec![t("[10,20,30]"), t("$[1]")]),
+            "20"
+        );
+        ck!(
+            "jx_neg",
+            call("json_extract", vec![t("[10,20,30]"), t("$[#-1]")]),
+            "30"
+        );
+        ck!(
+            "jx_nested_obj",
+            call("json_extract", vec![t("{\"a\":{\"b\":9}}"), t("$.a")]),
+            "{\"b\":9}"
+        );
+        ck!(
+            "arrow",
+            call("->", vec![t("{\"a\":{\"b\":5}}"), t("$.a")]),
+            "{\"b\":5}"
+        );
+        ck!(
+            "arrow2",
+            call("->>", vec![t("{\"a\":{\"b\":5}}"), t("$.a.b")]),
+            "5"
+        );
+        ck!(
+            "arrow_str",
+            call("->", vec![t("{\"a\":\"hi\"}"), t("$.a")]),
+            "\"hi\""
+        );
+        ck!(
+            "arrow2_str",
+            call("->>", vec![t("{\"a\":\"hi\"}"), t("$.a")]),
+            "hi"
+        );
+        ck!(
+            "json_array",
+            call(
+                "json_array",
+                vec![
+                    SqliteValue::Integer(1),
+                    t("x"),
+                    SqliteValue::Null,
+                    SqliteValue::Float(2.5)
+                ]
+            ),
+            "[1,\"x\",null,2.5]"
+        );
+        ck!(
+            "json_object",
+            call(
+                "json_object",
+                vec![t("a"), SqliteValue::Integer(1), t("b"), t("y")]
+            ),
+            "{\"a\":1,\"b\":\"y\"}"
+        );
+        ck!(
+            "json_object_dup",
+            call(
+                "json_object",
+                vec![
+                    t("a"),
+                    SqliteValue::Integer(1),
+                    t("a"),
+                    SqliteValue::Integer(2)
+                ]
+            ),
+            "{\"a\":1,\"a\":2}"
+        );
+        ck!(
+            "json_quote_num",
+            call("json_quote", vec![SqliteValue::Float(3.0)]),
+            "3.0"
+        );
+        ck!(
+            "json_quote_str",
+            call("json_quote", vec![t("a\"b")]),
+            "\"a\\\"b\""
+        );
+        ck!(
+            "json_valid_ok",
+            call("json_valid", vec![t("{\"a\":1}")]),
+            "1"
+        );
+        ck!(
+            "json_valid_bad",
+            call("json_valid", vec![t("{\"a\":}")]),
+            "0"
+        );
         ck!("json_valid_trail", call("json_valid", vec![t("{} ")]), "1");
-        ck!("json_arrlen", call("json_array_length", vec![t("[1,2,3]")]), "3");
-        ck!("json_arrlen_path", call("json_array_length", vec![t("{\"a\":[1,2,3,4]}"), t("$.a")]), "4");
-        ck!("json_set", call("json_set", vec![t("{\"a\":1}"), t("$.a"), SqliteValue::Integer(99), t("$.b"), SqliteValue::Integer(2)]), "{\"a\":99,\"b\":2}");
-        ck!("json_insert_exist", call("json_insert", vec![t("{\"a\":1}"), t("$.a"), SqliteValue::Integer(99)]), "{\"a\":1}");
-        ck!("json_replace_miss", call("json_replace", vec![t("{\"a\":1}"), t("$.b"), SqliteValue::Integer(2)]), "{\"a\":1}");
-        ck!("json_remove", call("json_remove", vec![t("{\"a\":1,\"b\":2}"), t("$.a")]), "{\"b\":2}");
-        ck!("json_patch", call("json_patch", vec![t("{\"a\":1,\"b\":2}"), t("{\"b\":null,\"c\":3}")]), "{\"a\":1,\"c\":3}");
-        ck!("json_bignum", call("json", vec![t("{\"a\":12345678901234567890}")]), "{\"a\":12345678901234567890}");
+        ck!(
+            "json_arrlen",
+            call("json_array_length", vec![t("[1,2,3]")]),
+            "3"
+        );
+        ck!(
+            "json_arrlen_path",
+            call("json_array_length", vec![t("{\"a\":[1,2,3,4]}"), t("$.a")]),
+            "4"
+        );
+        ck!(
+            "json_set",
+            call(
+                "json_set",
+                vec![
+                    t("{\"a\":1}"),
+                    t("$.a"),
+                    SqliteValue::Integer(99),
+                    t("$.b"),
+                    SqliteValue::Integer(2)
+                ]
+            ),
+            "{\"a\":99,\"b\":2}"
+        );
+        ck!(
+            "json_insert_exist",
+            call(
+                "json_insert",
+                vec![t("{\"a\":1}"), t("$.a"), SqliteValue::Integer(99)]
+            ),
+            "{\"a\":1}"
+        );
+        ck!(
+            "json_replace_miss",
+            call(
+                "json_replace",
+                vec![t("{\"a\":1}"), t("$.b"), SqliteValue::Integer(2)]
+            ),
+            "{\"a\":1}"
+        );
+        ck!(
+            "json_remove",
+            call("json_remove", vec![t("{\"a\":1,\"b\":2}"), t("$.a")]),
+            "{\"b\":2}"
+        );
+        ck!(
+            "json_patch",
+            call(
+                "json_patch",
+                vec![t("{\"a\":1,\"b\":2}"), t("{\"b\":null,\"c\":3}")]
+            ),
+            "{\"a\":1,\"c\":3}"
+        );
+        ck!(
+            "json_bignum",
+            call("json", vec![t("{\"a\":12345678901234567890}")]),
+            "{\"a\":12345678901234567890}"
+        );
         // `[-0]` (JSON-integer negative zero): stock `json_extract('[-0]','$[0]')`
         // -> `0`, but serde_json parses the literal `-0` as the float `-0.0`,
         // which renders `-0`. Preserving integer negative-zero would require an
@@ -4294,16 +4503,59 @@ mod tests {
         // the conformance entry is intentionally omitted here:
         //   ck!("json_neg_zero", call("json_extract", vec![t("[-0]"), t("$[0]")]), "0");
         // ── deeper batch ──
-        ck!("jx_true", call("json_extract", vec![t("{\"a\":true}"), t("$.a")]), "1");
-        ck!("jx_false", call("json_extract", vec![t("{\"a\":false}"), t("$.a")]), "0");
-        ck!("jx_json_null", call("json_extract", vec![t("{\"a\":null}"), t("$.a")]), "NULL");
-        ck!("jx_deep", call("json_extract", vec![t("{\"a\":{\"b\":{\"c\":7}}}"), t("$.a.b.c")]), "7");
-        ck!("jx_quoted_key", call("json_extract", vec![t("{\"a b\":1}"), t("$.\"a b\"")]), "1");
-        ck!("jx_i64max", call("json_extract", vec![t("[9223372036854775807]"), t("$[0]")]), "9223372036854775807");
-        ck!("arr_of_jsontext", call("json_array", vec![t("[1,2]")]), "[\"[1,2]\"]");
-        ck!("arr_of_real", call("json_array", vec![SqliteValue::Float(1.0)]), "[1.0]");
-        ck!("arr_of_real2", call("json_array", vec![SqliteValue::Float(2.50)]), "[2.5]");
-        ck!("obj_val_real", call("json_object", vec![t("a"), SqliteValue::Float(1.0)]), "{\"a\":1.0}");
+        ck!(
+            "jx_true",
+            call("json_extract", vec![t("{\"a\":true}"), t("$.a")]),
+            "1"
+        );
+        ck!(
+            "jx_false",
+            call("json_extract", vec![t("{\"a\":false}"), t("$.a")]),
+            "0"
+        );
+        ck!(
+            "jx_json_null",
+            call("json_extract", vec![t("{\"a\":null}"), t("$.a")]),
+            "NULL"
+        );
+        ck!(
+            "jx_deep",
+            call(
+                "json_extract",
+                vec![t("{\"a\":{\"b\":{\"c\":7}}}"), t("$.a.b.c")]
+            ),
+            "7"
+        );
+        ck!(
+            "jx_quoted_key",
+            call("json_extract", vec![t("{\"a b\":1}"), t("$.\"a b\"")]),
+            "1"
+        );
+        ck!(
+            "jx_i64max",
+            call("json_extract", vec![t("[9223372036854775807]"), t("$[0]")]),
+            "9223372036854775807"
+        );
+        ck!(
+            "arr_of_jsontext",
+            call("json_array", vec![t("[1,2]")]),
+            "[\"[1,2]\"]"
+        );
+        ck!(
+            "arr_of_real",
+            call("json_array", vec![SqliteValue::Float(1.0)]),
+            "[1.0]"
+        );
+        ck!(
+            "arr_of_real2",
+            call("json_array", vec![SqliteValue::Float(2.50)]),
+            "[2.5]"
+        );
+        ck!(
+            "obj_val_real",
+            call("json_object", vec![t("a"), SqliteValue::Float(1.0)]),
+            "{\"a\":1.0}"
+        );
         ck!("json_scalar_int", call("json", vec![t("5")]), "5");
         ck!("json_scalar_str", call("json", vec![t("\"hi\"")]), "\"hi\"");
         ck!("json_scalar_real", call("json", vec![t("1.50")]), "1.50");
@@ -4313,37 +4565,128 @@ mod tests {
         ck!("json_num_leadzero", call("json", vec![t("0.10")]), "0.10");
         ck!("json_num_neg", call("json", vec![t("-1.50")]), "-1.50");
         ck!("json_num_neg0real", call("json", vec![t("-0.0")]), "-0.0");
-        ck!("json_num_16dig", call("json", vec![t("0.3333333333333333")]), "0.3333333333333333");
-        ck!("json_num_obj", call("json", vec![t("{\"a\":1.50,\"b\":2.0}")]), "{\"a\":1.50,\"b\":2.0}");
-        ck!("json_num_arr_ws", call("json", vec![t("[1.50, 2.30]")]), "[1.50,2.30]");
-        ck!("json_pretty", call("json_pretty", vec![t("{\"a\":1,\"b\":[2,3]}")]), "{\n    \"a\": 1,\n    \"b\": [\n        2,\n        3\n    ]\n}");
-        ck!("json_err_pos_ok", call("json_error_position", vec![t("{\"a\":1}")]), "0");
-        ck!("json_err_pos_bad", call("json_error_position", vec![t("{\"a\":}")]), "6");
-        ck!("json_valid_2arg1", call("json_valid", vec![t("{\"a\":1}"), SqliteValue::Integer(1)]), "1");
-        ck!("json_valid_2arg6", call("json_valid", vec![t("{\"a\":1}"), SqliteValue::Integer(6)]), "1");
-        ck!("json_valid_5x", call("json_valid", vec![t("{\"x\":"), SqliteValue::Integer(6)]), "0");
-        ck!("arrow_int_key", call("->", vec![t("[1,2,3]"), SqliteValue::Integer(0)]), "1");
-        ck!("arrow2_int_key", call("->>", vec![t("[1,2,3]"), SqliteValue::Integer(2)]), "3");
-        ck!("json_set_create", call("json_set", vec![t("{\"a\":1}"), t("$.b.c"), SqliteValue::Integer(5)]), "{\"a\":1,\"b\":{\"c\":5}}");
-        ck!("json_set_append", call("json_set", vec![t("{\"a\":[1,2]}"), t("$.a[#]"), SqliteValue::Integer(3)]), "{\"a\":[1,2,3]}");
-        ck!("json_arrlen_obj", call("json_array_length", vec![t("{\"a\":1}")]), "0");
-        ck!("json_remove_arr_idx", call("json_remove", vec![t("[1,2,3]"), t("$[1]")]), "[1,3]");
-        ck!("json_insert_arr", call("json_insert", vec![t("[1,2]"), t("$[#]"), SqliteValue::Integer(3)]), "[1,2,3]");
-        ck!("json_quote_null", call("json_quote", vec![SqliteValue::Null]), "null");
-        ck!("json_obj_num_key", call("json_object", vec![t("1"), SqliteValue::Integer(2)]), "{\"1\":2}");
+        ck!(
+            "json_num_16dig",
+            call("json", vec![t("0.3333333333333333")]),
+            "0.3333333333333333"
+        );
+        ck!(
+            "json_num_obj",
+            call("json", vec![t("{\"a\":1.50,\"b\":2.0}")]),
+            "{\"a\":1.50,\"b\":2.0}"
+        );
+        ck!(
+            "json_num_arr_ws",
+            call("json", vec![t("[1.50, 2.30]")]),
+            "[1.50,2.30]"
+        );
+        ck!(
+            "json_pretty",
+            call("json_pretty", vec![t("{\"a\":1,\"b\":[2,3]}")]),
+            "{\n    \"a\": 1,\n    \"b\": [\n        2,\n        3\n    ]\n}"
+        );
+        ck!(
+            "json_err_pos_ok",
+            call("json_error_position", vec![t("{\"a\":1}")]),
+            "0"
+        );
+        ck!(
+            "json_err_pos_bad",
+            call("json_error_position", vec![t("{\"a\":}")]),
+            "6"
+        );
+        ck!(
+            "json_valid_2arg1",
+            call("json_valid", vec![t("{\"a\":1}"), SqliteValue::Integer(1)]),
+            "1"
+        );
+        ck!(
+            "json_valid_2arg6",
+            call("json_valid", vec![t("{\"a\":1}"), SqliteValue::Integer(6)]),
+            "1"
+        );
+        ck!(
+            "json_valid_5x",
+            call("json_valid", vec![t("{\"x\":"), SqliteValue::Integer(6)]),
+            "0"
+        );
+        ck!(
+            "arrow_int_key",
+            call("->", vec![t("[1,2,3]"), SqliteValue::Integer(0)]),
+            "1"
+        );
+        ck!(
+            "arrow2_int_key",
+            call("->>", vec![t("[1,2,3]"), SqliteValue::Integer(2)]),
+            "3"
+        );
+        ck!(
+            "json_set_create",
+            call(
+                "json_set",
+                vec![t("{\"a\":1}"), t("$.b.c"), SqliteValue::Integer(5)]
+            ),
+            "{\"a\":1,\"b\":{\"c\":5}}"
+        );
+        ck!(
+            "json_set_append",
+            call(
+                "json_set",
+                vec![t("{\"a\":[1,2]}"), t("$.a[#]"), SqliteValue::Integer(3)]
+            ),
+            "{\"a\":[1,2,3]}"
+        );
+        ck!(
+            "json_arrlen_obj",
+            call("json_array_length", vec![t("{\"a\":1}")]),
+            "0"
+        );
+        ck!(
+            "json_remove_arr_idx",
+            call("json_remove", vec![t("[1,2,3]"), t("$[1]")]),
+            "[1,3]"
+        );
+        ck!(
+            "json_insert_arr",
+            call(
+                "json_insert",
+                vec![t("[1,2]"), t("$[#]"), SqliteValue::Integer(3)]
+            ),
+            "[1,2,3]"
+        );
+        ck!(
+            "json_quote_null",
+            call("json_quote", vec![SqliteValue::Null]),
+            "null"
+        );
+        ck!(
+            "json_obj_num_key",
+            call("json_object", vec![t("1"), SqliteValue::Integer(2)]),
+            "{\"1\":2}"
+        );
 
         // Float results: compare numerically (float→text is oracle-version-sensitive)
-        let mut ck_num = |label: &str, got: SqliteValue, expect: f64| {
-            match got {
-                SqliteValue::Float(f) if (f - expect).abs() < 1e-9 => {}
-                SqliteValue::Integer(i) if (i as f64 - expect).abs() < 1e-9 => {}
-                other => fails.push(format!("{label}: got {other:?} expected ~{expect}")),
-            }
+        let mut ck_num = |label: &str, got: SqliteValue, expect: f64| match got {
+            SqliteValue::Float(f) if (f - expect).abs() < 1e-9 => {}
+            SqliteValue::Integer(i) if (i as f64 - expect).abs() < 1e-9 => {}
+            other => fails.push(format!("{label}: got {other:?} expected ~{expect}")),
         };
-        ck_num("json_deep_num", call("json_extract", vec![t("{\"a\":1.50}"), t("$.a")]), 1.5);
-        ck_num("json_e_notation", call("json_extract", vec![t("[1e3]"), t("$[0]")]), 1000.0);
+        ck_num(
+            "json_deep_num",
+            call("json_extract", vec![t("{\"a\":1.50}"), t("$.a")]),
+            1.5,
+        );
+        ck_num(
+            "json_e_notation",
+            call("json_extract", vec![t("[1e3]"), t("$[0]")]),
+            1000.0,
+        );
 
-        assert!(fails.is_empty(), "json oracle divergences:\n{}", fails.join("\n"));
+        assert!(
+            fails.is_empty(),
+            "json oracle divergences:\n{}",
+            fails.join("\n")
+        );
     }
 
     #[test]
@@ -4368,7 +4711,10 @@ mod tests {
             (r#"["a\tb"]"#, r#"["a\tb"]"#),
             // in-string whitespace kept; inter-token whitespace stripped
             (r#"[ "a  b" , 1 ]"#, r#"["a  b",1]"#),
-            (r#"{ "a" : [ 1 , 2 ] , "b" : "c" }"#, r#"{"a":[1,2],"b":"c"}"#),
+            (
+                r#"{ "a" : [ 1 , 2 ] , "b" : "c" }"#,
+                r#"{"a":[1,2],"b":"c"}"#,
+            ),
             // duplicate object keys preserved (stock does not dedup on parse)
             (r#"{"a":1,"a":2}"#, r#"{"a":1,"a":2}"#),
             (r#"{"x":1e2,"x":3e4}"#, r#"{"x":1e2,"x":3e4}"#),
@@ -5745,19 +6091,23 @@ mod tests {
         // the flags, so it is valid JSON/JSON5 (1/2) but is NOT a JSONB blob
         // (4/8 -> 0), matching C SQLite json_valid(123,4)=0 / (123,8)=0.
         assert_eq!(
-            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(1)]).unwrap(),
+            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(1)])
+                .unwrap(),
             SqliteValue::Integer(1)
         );
         assert_eq!(
-            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(2)]).unwrap(),
+            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(2)])
+                .unwrap(),
             SqliteValue::Integer(1)
         );
         assert_eq!(
-            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(4)]).unwrap(),
+            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(4)])
+                .unwrap(),
             SqliteValue::Integer(0)
         );
         assert_eq!(
-            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(8)]).unwrap(),
+            f.invoke(&[SqliteValue::Integer(123), SqliteValue::Integer(8)])
+                .unwrap(),
             SqliteValue::Integer(0)
         );
         // json_valid(NULL) -> NULL.
@@ -5789,8 +6139,7 @@ mod tests {
             super::parse_json_table_filter_args(&[SqliteValue::Float(1.5)]).unwrap();
         assert_eq!(v_float, Value::from(1.5));
         assert!(path.is_none());
-        let (v_int, _) =
-            super::parse_json_table_filter_args(&[SqliteValue::Integer(7)]).unwrap();
+        let (v_int, _) = super::parse_json_table_filter_args(&[SqliteValue::Integer(7)]).unwrap();
         assert_eq!(v_int, Value::from(7_i64));
         // GH#212 (verified against sqlite3 3.46.1): json_each(9e999) yields a
         // single row (type='real', atom=Inf), so a bare +Inf renders as the
@@ -6164,7 +6513,10 @@ mod tests {
         let value = json_extract("[9.0e+999]", &["$[0]"]).unwrap();
         match value {
             SqliteValue::Float(f) => {
-                assert!(f.is_infinite() && f.is_sign_positive(), "expected +Inf, got {f}");
+                assert!(
+                    f.is_infinite() && f.is_sign_positive(),
+                    "expected +Inf, got {f}"
+                );
             }
             other => panic!("expected REAL +Inf, got {other:?}"),
         }

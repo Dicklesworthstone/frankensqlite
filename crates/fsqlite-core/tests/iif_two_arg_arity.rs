@@ -26,7 +26,10 @@ fn iif_two_argument_form() {
         let scalar = |sql: &'static str, want: Option<&'static str>| {
             let conn = &conn;
             async move {
-                let rows = conn.query(sql).await.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+                let rows = conn
+                    .query(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
                 assert_eq!(
                     cell_text(&rows[0].values()[0]).as_deref(),
                     want,
@@ -45,7 +48,9 @@ fn iif_two_argument_form() {
 
         // Runtime (column-driven) -> IifFunc path.
         conn.execute("CREATE TABLE t(c)").await.unwrap();
-        conn.execute("INSERT INTO t VALUES (0),(1),(NULL)").await.unwrap();
+        conn.execute("INSERT INTO t VALUES (0),(1),(NULL)")
+            .await
+            .unwrap();
         let rows = conn
             .query("SELECT iif(c, 'a') FROM t ORDER BY rowid")
             .await

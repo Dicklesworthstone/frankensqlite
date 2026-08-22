@@ -170,8 +170,10 @@ impl WalMetricsSnapshot {
     /// its connection's page size).
     #[must_use]
     pub fn physical_bytes_written_total(&self, page_size: u64) -> u64 {
-        self.bytes_written_total
-            .saturating_add(self.checkpoint_frames_backfilled_total.saturating_mul(page_size))
+        self.bytes_written_total.saturating_add(
+            self.checkpoint_frames_backfilled_total
+                .saturating_mul(page_size),
+        )
     }
 
     /// bd-t6sv2.9: write-amplification factor as a percentage (physical / logical *
@@ -1020,10 +1022,7 @@ mod tests {
         let display = format!("{snap}");
         assert!(display.contains("wal_frames_written=100"));
         // bd-t6sv2.9: physical = WAL bytes + checkpoint backfill (frames * page).
-        assert_eq!(
-            snap.physical_bytes_written_total(4096),
-            409600 + 90 * 4096
-        );
+        assert_eq!(snap.physical_bytes_written_total(4096), 409600 + 90 * 4096);
         // ~190% amplification here (each logical page written to WAL, ~90% also
         // backfilled at checkpoint).
         assert!(snap.write_amplification_pct(4096) > 100);

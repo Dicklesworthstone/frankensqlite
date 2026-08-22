@@ -120,7 +120,11 @@ fn single_writer_ddl_churn_republication_is_never_snapshot_refused() {
             .query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'gen2%';")
             .await
             .expect("read sqlite_master");
-        assert_eq!(count_schema_objects(&rows), 30, "all gen2 tables must exist");
+        assert_eq!(
+            count_schema_objects(&rows),
+            30,
+            "all gen2 tables must exist"
+        );
 
         let integrity = conn
             .query("PRAGMA integrity_check;")

@@ -79,7 +79,10 @@ fn single_writer_ddl_batch_commits_without_snapshot_conflict() {
     let integrity: String = oracle
         .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
         .expect("oracle integrity_check");
-    assert_eq!(integrity, "ok", "stock integrity_check must pass after DDL churn");
+    assert_eq!(
+        integrity, "ok",
+        "stock integrity_check must pass after DDL churn"
+    );
     let tables: i64 = oracle
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 't_1_%';",

@@ -14,7 +14,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -23,13 +26,19 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn fq(f: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     match f.query(sql).await {
-        Ok(rows) => Ok(rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect()),
+        Ok(rows) => Ok(rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect()),
         Err(e) => Err(format!("{e:?}")),
     }
 }
@@ -38,7 +47,9 @@ fn rq(r: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let n = st.column_count();
     let rows = st
         .query_map([], |row| {
-            Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())
+            Ok((0..n)
+                .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect())
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
@@ -47,7 +58,10 @@ fn rq(r: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
 }
 
 async fn fexec(f: &Connection, sql: &str) -> Result<(), String> {
-    f.execute(sql).await.map(|_| ()).map_err(|e| format!("{e:?}"))
+    f.execute(sql)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// Run identical setup on both engines; then assert the final `query` agrees.
@@ -58,7 +72,9 @@ async fn setup_and_agree(setup: &[&str], query: &str) -> (Vec<Vec<String>>, Vec<
         let _ = fexec(&f, sql).await; // errors surfaced by the final query comparison
         let _ = r.execute_batch(sql);
     }
-    let fr = fq(&f, query).await.unwrap_or_else(|e| vec![vec![format!("<ERR {e}>")]]);
+    let fr = fq(&f, query)
+        .await
+        .unwrap_or_else(|e| vec![vec![format!("<ERR {e}>")]]);
     let rr = rq(&r, query).unwrap_or_else(|e| vec![vec![format!("<ERR {e}>")]]);
     (fr, rr)
 }
@@ -79,7 +95,10 @@ fn gh142_replace_parent_fires_cascade() {
             "SELECT count(*) FROM child",
         )
         .await;
-        assert_eq!(fr, rr, "GH#142: REPLACE parent must cascade-delete the child");
+        assert_eq!(
+            fr, rr,
+            "GH#142: REPLACE parent must cascade-delete the child"
+        );
     });
 }
 
@@ -185,7 +204,10 @@ fn gh164_strict_integer_accepts_exact_real() {
             "SELECT x, typeof(x) FROM t",
         )
         .await;
-        assert_eq!(fr, rr, "GH#164: STRICT INTEGER must accept exact-integer REAL 2.0 as integer 2");
+        assert_eq!(
+            fr, rr,
+            "GH#164: STRICT INTEGER must accept exact-integer REAL 2.0 as integer 2"
+        );
     });
 }
 
@@ -204,7 +226,10 @@ fn gh165_update_stored_generated_rejected() {
         }
         let frank_err = fexec(&f, "UPDATE t SET b=99").await.is_err();
         let stock_err = r.execute_batch("UPDATE t SET b=99").is_err();
-        assert_eq!(frank_err, stock_err, "GH#165: UPDATE of a STORED generated column must be rejected (stock_err={stock_err})");
+        assert_eq!(
+            frank_err, stock_err,
+            "GH#165: UPDATE of a STORED generated column must be rejected (stock_err={stock_err})"
+        );
     });
 }
 
@@ -223,7 +248,10 @@ fn gh166_update_virtual_generated_rejected() {
         }
         let frank_err = fexec(&f, "UPDATE t SET b=99").await.is_err();
         let stock_err = r.execute_batch("UPDATE t SET b=99").is_err();
-        assert_eq!(frank_err, stock_err, "GH#166: UPDATE of a VIRTUAL generated column must be rejected (stock_err={stock_err})");
+        assert_eq!(
+            frank_err, stock_err,
+            "GH#166: UPDATE of a VIRTUAL generated column must be rejected (stock_err={stock_err})"
+        );
     });
 }
 
@@ -239,7 +267,10 @@ fn gh169_check_after_affinity() {
             "SELECT x, typeof(x) FROM t",
         )
         .await;
-        assert_eq!(fr, rr, "GH#169: '5' gets INTEGER affinity (→5) before CHECK(5<10)");
+        assert_eq!(
+            fr, rr,
+            "GH#169: '5' gets INTEGER affinity (→5) before CHECK(5<10)"
+        );
     });
 }
 
@@ -258,6 +289,9 @@ fn gh172_correlated_scalar_orderby_limit1() {
             "SELECT id, (SELECT v FROM i WHERE i.oid=o.id ORDER BY v ASC LIMIT 1) FROM o ORDER BY id",
         )
         .await;
-        assert_eq!(fr, rr, "GH#172: correlated subquery must honor ORDER BY v ASC (min per group)");
+        assert_eq!(
+            fr, rr,
+            "GH#172: correlated subquery must honor ORDER BY v ASC (min per group)"
+        );
     });
 }

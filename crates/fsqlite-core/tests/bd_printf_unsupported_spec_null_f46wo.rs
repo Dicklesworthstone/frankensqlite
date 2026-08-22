@@ -87,12 +87,23 @@ fn printf_p_and_r_match_stock_across_args() {
     asupersync::test_utils::run_test(|| async {
         let mut sqls = Vec::new();
         // %p (== %X) and %r (ordinal) over varied argument types.
-        for arg in ["255", "-1", "0", "3.5", "'x'", "'0x1F'", "NULL", "4294967296"] {
+        for arg in [
+            "255",
+            "-1",
+            "0",
+            "3.5",
+            "'x'",
+            "'0x1F'",
+            "NULL",
+            "4294967296",
+        ] {
             sqls.push(format!("SELECT quote(printf('%p', {arg}))"));
             sqls.push(format!("SELECT quote(printf('%r', {arg}))"));
         }
         // %r ordinal-suffix edge coverage (11/12/13 -> th; 21/101/111 boundaries).
-        for n in [0, 1, 2, 3, 4, 11, 12, 13, 21, 22, 23, 100, 101, 111, 112, 113, -2] {
+        for n in [
+            0, 1, 2, 3, 4, 11, 12, 13, 21, 22, 23, 100, 101, 111, 112, 113, -2,
+        ] {
             sqls.push(format!("SELECT quote(printf('%r', {n}))"));
         }
         // %p width/precision/flags parity with %X.
@@ -109,9 +120,8 @@ fn printf_supported_controls_unregressed() {
         let mut sqls = Vec::new();
         // The documented supported set must still format correctly.
         for f in [
-            "%d", "%i", "%u", "%x", "%X", "%o", "%c", "%s", "%z", "%q", "%Q", "%w",
-            "%f", "%e", "%E", "%g", "%G", "%n", "%%", "%!d", "%,d", "%+d", "%05d",
-            "%-8d|", "%5.2f", "%.0f",
+            "%d", "%i", "%u", "%x", "%X", "%o", "%c", "%s", "%z", "%q", "%Q", "%w", "%f", "%e",
+            "%E", "%g", "%G", "%n", "%%", "%!d", "%,d", "%+d", "%05d", "%-8d|", "%5.2f", "%.0f",
         ] {
             sqls.push(format!("SELECT quote(printf('{f}', 1234))"));
         }

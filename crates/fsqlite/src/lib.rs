@@ -1810,7 +1810,9 @@ mod tests {
                 .execute("CREATE TABLE t1 (x INTEGER);")
                 .await
                 .expect_err("duplicate table should fail");
-            assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("already exists")));
+            assert!(
+                matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("already exists"))
+            );
         });
     }
 
@@ -2179,7 +2181,9 @@ mod tests {
                 .execute("BEGIN;")
                 .await
                 .expect_err("nested begin should fail");
-            assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("cannot start a transaction within a transaction")));
+            assert!(
+                matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("cannot start a transaction within a transaction"))
+            );
         });
     }
 
@@ -2191,7 +2195,9 @@ mod tests {
                 .execute("COMMIT;")
                 .await
                 .expect_err("commit without txn should fail");
-            assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("cannot commit - no transaction is active")));
+            assert!(
+                matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("cannot commit - no transaction is active"))
+            );
         });
     }
 
@@ -2203,7 +2209,9 @@ mod tests {
                 .execute("ROLLBACK;")
                 .await
                 .expect_err("rollback without txn should fail");
-            assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("cannot rollback - no transaction is active")));
+            assert!(
+                matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("cannot rollback - no transaction is active"))
+            );
         });
     }
 
@@ -2247,7 +2255,9 @@ mod tests {
                 .execute("RELEASE nosuch;")
                 .await
                 .expect_err("release nonexistent savepoint should fail");
-            assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("no such savepoint")));
+            assert!(
+                matches!(err, FrankenError::FunctionError(ref msg) if msg.contains("no such savepoint"))
+            );
         });
     }
 

@@ -67,7 +67,8 @@ fn readonly_connection_close_does_not_mutate_main_db_bytes() {
 
         let after = db_bytes(&db);
         assert_eq!(
-            before, after,
+            before,
+            after,
             "bd-lcuoc: a read-only connection's close must not checkpoint/mutate \
              the main-DB bytes ({} bytes before, {} after)",
             before.len(),

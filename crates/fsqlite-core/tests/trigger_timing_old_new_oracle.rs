@@ -30,7 +30,10 @@ fn tr(v: &rusqlite::types::Value) -> String {
 }
 async fn fq(f: &Connection, sql: &str) -> Vec<Vec<String>> {
     match f.query_with_params(sql, &[]).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tf).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tf).collect())
+            .collect(),
         Err(e) => vec![vec![format!("<ERR {e:?}>")]],
     }
 }
@@ -42,7 +45,9 @@ fn rqe(r: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     let n = st.column_count();
     match st
         .query_map([], |row| {
-            Ok((0..n).map(|i| tr(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+            Ok((0..n)
+                .map(|i| tr(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect::<Vec<_>>())
         })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
     {
@@ -63,9 +68,13 @@ async fn state(setup: &[&str], dml: &str, verify: &str, msg: &str) {
     let _ = r.execute_batch(dml);
     let ff = fq(&f, verify).await;
     let rr = rqe(&r, verify);
-    assert_eq!(ff, rr, "{msg}\n  dml={dml}\n  frank ={ff:?}\n  sqlite={rr:?}");
+    assert_eq!(
+        ff, rr,
+        "{msg}\n  dml={dml}\n  frank ={ff:?}\n  sqlite={rr:?}"
+    );
 }
-const AUDIT: &str = "CREATE TABLE audit(seq INTEGER PRIMARY KEY, op TEXT, oldv INTEGER, newv INTEGER)";
+const AUDIT: &str =
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, op TEXT, oldv INTEGER, newv INTEGER)";
 const AUD2: &str = "CREATE TABLE audit(seq INTEGER PRIMARY KEY, op TEXT, v INTEGER)";
 
 #[test]

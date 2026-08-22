@@ -235,7 +235,10 @@ mod tests {
         assert!(fs::metadata(&path).expect("meta").len() > MAX_LOG_BYTES);
 
         // Clock whose wall time equals the file's mtime, so age never trips.
-        let mtime = fs::metadata(&path).expect("meta").modified().expect("mtime");
+        let mtime = fs::metadata(&path)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
         let clock = ManualClock::new(Time::from_nanos(1), mtime);
 
         let reason = maybe_rotate(&path, &clock, MAX_LOG_BYTES, MAX_LOG_AGE).expect("rotate");
@@ -244,8 +247,15 @@ mod tests {
         assert!(fs::metadata(&path).is_err());
 
         // A fresh append recreates a small active file.
-        append_line(state, ws, "{\"kind\":\"tick\"}", &clock, MAX_LOG_BYTES, MAX_LOG_AGE)
-            .expect("append");
+        append_line(
+            state,
+            ws,
+            "{\"kind\":\"tick\"}",
+            &clock,
+            MAX_LOG_BYTES,
+            MAX_LOG_AGE,
+        )
+        .expect("append");
         assert!(fs::metadata(&path).expect("meta").len() <= MAX_LOG_BYTES);
     }
 
@@ -258,7 +268,10 @@ mod tests {
         let path = log_path(state, ws);
         fs::write(&path, b"{\"kind\":\"tick\"}\n").expect("seed");
 
-        let mtime = fs::metadata(&path).expect("meta").modified().expect("mtime");
+        let mtime = fs::metadata(&path)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
 
         // Clock 31 days ahead of the file: age exceeds MAX_LOG_AGE -> rotate.
         #[allow(clippy::duration_suboptimal_units)]
@@ -270,7 +283,10 @@ mod tests {
 
         // Recreate, then a near clock does not rotate.
         fs::write(&path, b"{\"kind\":\"tick\"}\n").expect("reseed");
-        let mtime2 = fs::metadata(&path).expect("meta").modified().expect("mtime");
+        let mtime2 = fs::metadata(&path)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
         let near = ManualClock::new(Time::from_nanos(10), mtime2 + Duration::from_secs(1));
         let reason = maybe_rotate(&path, &near, MAX_LOG_BYTES, MAX_LOG_AGE).expect("no rotate");
         assert_eq!(reason, None);

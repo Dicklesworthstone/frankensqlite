@@ -9,7 +9,10 @@ async fn err_of(setup: &[&str], sql: &str) -> String {
     for s in setup {
         c.execute(s).await.unwrap();
     }
-    c.execute(sql).await.expect_err("ragged VALUES must be rejected").to_string()
+    c.execute(sql)
+        .await
+        .expect_err("ragged VALUES must be rejected")
+        .to_string()
 }
 
 #[test]
@@ -27,7 +30,11 @@ fn ragged_values_reports_verbatim_terms_message() {
         );
         // Multi-row INSERT with ragged VALUES.
         assert_eq!(
-            err_of(&["CREATE TABLE t(a, b)"], "INSERT INTO t VALUES (1, 2), (3)").await,
+            err_of(
+                &["CREATE TABLE t(a, b)"],
+                "INSERT INTO t VALUES (1, 2), (3)"
+            )
+            .await,
             "all VALUES must have the same number of terms",
         );
     });

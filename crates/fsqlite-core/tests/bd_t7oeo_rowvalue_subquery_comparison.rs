@@ -20,7 +20,8 @@ async fn frank_opt_int(conn: &Connection, sql: &str) -> Option<i64> {
 
 fn stock_opt_int(sql: &str) -> Option<i64> {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.query_row(sql, [], |r| r.get::<_, Option<i64>>(0)).unwrap()
+    conn.query_row(sql, [], |r| r.get::<_, Option<i64>>(0))
+        .unwrap()
 }
 
 /// Every case is routed through the interpreted evaluator by using subquery
@@ -61,7 +62,10 @@ fn rowvalue_subquery_comparisons_match_stock() {
         for sql in cases {
             let got = frank_opt_int(&conn, sql).await;
             let stock = stock_opt_int(sql);
-            assert_eq!(got, stock, "row-value comparison diverges from stock: {sql}");
+            assert_eq!(
+                got, stock,
+                "row-value comparison diverges from stock: {sql}"
+            );
         }
     });
 }

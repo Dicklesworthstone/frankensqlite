@@ -33,17 +33,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -82,37 +91,100 @@ line2', length('café')",
         ];
 
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
         for (i, q) in exprs.iter().enumerate() {
             check(&format!("expr{i}"), fq(&f, q).await, rq(&r, q), &mut diffs);
         }
 
         // identifier quoting: all three styles reach the same keyword-named columns
-        check("dquote identifiers", fq(&f, "SELECT \"from\", [group], `order` FROM \"select\" ORDER BY \"from\"").await,
-              rq(&r, "SELECT \"from\", [group], `order` FROM \"select\" ORDER BY \"from\""), &mut diffs);
-        check("bracket table", fq(&f, "SELECT [group] FROM [select] ORDER BY [group]").await,
-              rq(&r, "SELECT [group] FROM [select] ORDER BY [group]"), &mut diffs);
-        check("backtick table", fq(&f, "SELECT `group` FROM `select` ORDER BY `group`").await,
-              rq(&r, "SELECT `group` FROM `select` ORDER BY `group`"), &mut diffs);
+        check(
+            "dquote identifiers",
+            fq(
+                &f,
+                "SELECT \"from\", [group], `order` FROM \"select\" ORDER BY \"from\"",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT \"from\", [group], `order` FROM \"select\" ORDER BY \"from\"",
+            ),
+            &mut diffs,
+        );
+        check(
+            "bracket table",
+            fq(&f, "SELECT [group] FROM [select] ORDER BY [group]").await,
+            rq(&r, "SELECT [group] FROM [select] ORDER BY [group]"),
+            &mut diffs,
+        );
+        check(
+            "backtick table",
+            fq(&f, "SELECT `group` FROM `select` ORDER BY `group`").await,
+            rq(&r, "SELECT `group` FROM `select` ORDER BY `group`"),
+            &mut diffs,
+        );
         // qualified quoted column
-        check("qualified quoted", fq(&f, "SELECT \"select\".\"from\" FROM \"select\" ORDER BY 1").await,
-              rq(&r, "SELECT \"select\".\"from\" FROM \"select\" ORDER BY 1"), &mut diffs);
+        check(
+            "qualified quoted",
+            fq(&f, "SELECT \"select\".\"from\" FROM \"select\" ORDER BY 1").await,
+            rq(&r, "SELECT \"select\".\"from\" FROM \"select\" ORDER BY 1"),
+            &mut diffs,
+        );
         // aliased with a quoted keyword alias
-        check("quoted alias", fq(&f, "SELECT \"from\" AS \"where\" FROM \"select\" ORDER BY \"where\"").await,
-              rq(&r, "SELECT \"from\" AS \"where\" FROM \"select\" ORDER BY \"where\""), &mut diffs);
+        check(
+            "quoted alias",
+            fq(
+                &f,
+                "SELECT \"from\" AS \"where\" FROM \"select\" ORDER BY \"where\"",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT \"from\" AS \"where\" FROM \"select\" ORDER BY \"where\"",
+            ),
+            &mut diffs,
+        );
         // WHERE with a string literal containing a quote
         ex(&f, &r, "CREATE TABLE s(v TEXT)").await;
         ex(&f, &r, "INSERT INTO s VALUES ('it''s'),('plain'),('a\"b')").await;
-        check("where quoted string", fq(&f, "SELECT v FROM s WHERE v = 'it''s'").await,
-              rq(&r, "SELECT v FROM s WHERE v = 'it''s'"), &mut diffs);
-        check("string with dquote char", fq(&f, "SELECT v FROM s WHERE v LIKE '%\"%'").await,
-              rq(&r, "SELECT v FROM s WHERE v LIKE '%\"%'"), &mut diffs);
+        check(
+            "where quoted string",
+            fq(&f, "SELECT v FROM s WHERE v = 'it''s'").await,
+            rq(&r, "SELECT v FROM s WHERE v = 'it''s'"),
+            &mut diffs,
+        );
+        check(
+            "string with dquote char",
+            fq(&f, "SELECT v FROM s WHERE v LIKE '%\"%'").await,
+            rq(&r, "SELECT v FROM s WHERE v LIKE '%\"%'"),
+            &mut diffs,
+        );
         // the view/table appears in sqlite_master with its quoted name unquoted
-        check("schema names", fq(&f, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").await,
-              rq(&r, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"), &mut diffs);
+        check(
+            "schema names",
+            fq(
+                &f,
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            ),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} literal/identifier-quoting divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} literal/identifier-quoting divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

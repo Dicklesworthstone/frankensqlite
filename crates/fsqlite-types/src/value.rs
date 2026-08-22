@@ -1072,9 +1072,7 @@ impl SqliteValue {
                 // BLOB is not convertible under TEXT affinity and stays a type
                 // error.
                 Self::Integer(i) => Ok(Self::Text(SmallText::from_string(i.to_string()))),
-                Self::Float(fl) => {
-                    Ok(Self::Text(SmallText::from_string(format_sqlite_float(fl))))
-                }
+                Self::Float(fl) => Ok(Self::Text(SmallText::from_string(format_sqlite_float(fl)))),
                 other => Err(StrictTypeError {
                     expected: col_type,
                     actual: other.storage_class(),
@@ -2776,8 +2774,19 @@ mod tests {
         // Mixed ASCII/Latin-1/CJK/astral samples exercise 1..=4 UTF-8 byte
         // widths and cross the surrogate boundary.
         let samples = [
-            "", "A", "Apple", "apple", "banana", "café", "cafz", "z", "Καλημέρα", "日本", "日本語",
-            "😀", "😀grin",
+            "",
+            "A",
+            "Apple",
+            "apple",
+            "banana",
+            "café",
+            "cafz",
+            "z",
+            "Καλημέρα",
+            "日本",
+            "日本語",
+            "😀",
+            "😀grin",
         ];
         for a in samples {
             for b in samples {
@@ -2816,7 +2825,11 @@ mod tests {
                 let value = SmallText::new(text);
                 let encoded = value.to_record_text_bytes(encoding);
                 let decoded = SmallText::from_record_text_bytes(&encoded, encoding);
-                assert_eq!(decoded.as_str(), text, "round-trip {text:?} via {encoding:?}");
+                assert_eq!(
+                    decoded.as_str(),
+                    text,
+                    "round-trip {text:?} via {encoding:?}"
+                );
             }
         }
         // UTF-8 encoding is zero-copy (borrows the value's exact bytes).

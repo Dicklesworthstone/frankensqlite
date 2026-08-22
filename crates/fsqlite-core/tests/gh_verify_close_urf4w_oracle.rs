@@ -21,7 +21,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
@@ -87,11 +90,15 @@ fn replace_cleans_partial_and_expression_index_gh196() {
             "GH#196: integrity_check must be ok (no stale partial/expression entries)"
         );
         assert!(
-            frank_rows(&f, "SELECT id FROM t WHERE lower(a) = 'victim'").await.is_empty(),
+            frank_rows(&f, "SELECT id FROM t WHERE lower(a) = 'victim'")
+                .await
+                .is_empty(),
             "GH#196: the victim's old expression-index key must not resolve"
         );
         assert!(
-            frank_rows(&f, "SELECT id FROM t WHERE a = 'Victim'").await.is_empty(),
+            frank_rows(&f, "SELECT id FROM t WHERE a = 'Victim'")
+                .await
+                .is_empty(),
             "GH#196: the victim's old partial-index key must not resolve"
         );
     });
@@ -122,7 +129,10 @@ fn vacuum_into_without_rowid_gh340() {
         let ic: String = stock
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ic, "ok", "GH#340: stock integrity_check on VACUUM INTO output");
+        assert_eq!(
+            ic, "ok",
+            "GH#340: stock integrity_check on VACUUM INTO output"
+        );
         let mut st = stock.prepare("SELECT k, v FROM wr ORDER BY k").unwrap();
         let rows: Vec<(String, i64)> = st
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))

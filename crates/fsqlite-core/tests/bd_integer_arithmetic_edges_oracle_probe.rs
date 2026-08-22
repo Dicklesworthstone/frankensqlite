@@ -34,17 +34,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -60,7 +69,7 @@ fn integer_arithmetic_edges_match_rusqlite_oracle() {
             "SELECT 9223372036854775807 + 1",
             "SELECT 9223372036854775807 * 2",
             "SELECT -9223372036854775808 - 1",
-            "SELECT 9223372036854775807 + 0",   // stays int at the boundary
+            "SELECT 9223372036854775807 + 0", // stays int at the boundary
             // integer division truncates toward zero
             "SELECT 7 / 2, -7 / 2, 7 / -2, -7 / -2",
             "SELECT 1 / 2, -1 / 2",
@@ -76,13 +85,13 @@ fn integer_arithmetic_edges_match_rusqlite_oracle() {
             "SELECT 3 + 0.0, 3 / 2.0, 10 * 1.0",
             // hex literals
             "SELECT 0xff, 0x10, 0xFFFFFFFF, 0x7fffffffffffffff",
-            "SELECT 0xffffffffffffffff",            // -1 as signed 64-bit
+            "SELECT 0xffffffffffffffff", // -1 as signed 64-bit
             // bitwise ops
             "SELECT 5 & 3, 5 | 2",
             "SELECT ~0, ~5, ~-1",
             "SELECT 1 << 4, 256 >> 2, 1 << 63",
             "SELECT -8 >> 1, -8 << 1",
-            "SELECT 5 & NULL, 5 | NULL, NULL << 2",  // NULL propagation
+            "SELECT 5 & NULL, 5 | NULL, NULL << 2", // NULL propagation
             // large / negative shift counts (SQLite: >=64 or negative -> 0 or sign-based)
             "SELECT 1 << 64, 1 << 100, 1 << -1, 255 >> 64",
             // comparison result typing (0/1 integers)
@@ -104,6 +113,11 @@ fn integer_arithmetic_edges_match_rusqlite_oracle() {
                 diffs.push(format!("  `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"));
             }
         }
-        assert!(diffs.is_empty(), "{} integer-arithmetic divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} integer-arithmetic divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

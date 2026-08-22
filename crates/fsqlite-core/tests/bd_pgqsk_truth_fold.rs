@@ -17,7 +17,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
@@ -41,7 +44,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
                 rusqlite::types::Value::Real(x) => format!("{x}"),
                 rusqlite::types::Value::Text(t) => format!("'{t}'"),
                 rusqlite::types::Value::Blob(b) => {
-                    format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+                    format!(
+                        "X'{}'",
+                        b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                    )
                 }
             })
             .collect())
@@ -79,9 +85,19 @@ fn bd_pgqsk_m6_where_never_true_and_short_circuits() {
         const E: &str = "(SELECT 1 FROM json_each('bare'))";
         for lhs in ["0", "0.0", "NULL", "FALSE", "+0", "'0'", "'x'", "''"] {
             // Plain scan.
-            assert_agree(&f, &r, &format!("SELECT a FROM t WHERE {lhs} AND {E} ORDER BY a")).await;
+            assert_agree(
+                &f,
+                &r,
+                &format!("SELECT a FROM t WHERE {lhs} AND {E} ORDER BY a"),
+            )
+            .await;
             // Aggregate (was excluded from the short-circuit routing).
-            assert_agree(&f, &r, &format!("SELECT count(*) FROM t WHERE {lhs} AND {E}")).await;
+            assert_agree(
+                &f,
+                &r,
+                &format!("SELECT count(*) FROM t WHERE {lhs} AND {E}"),
+            )
+            .await;
             // Nested under OR — the dead AND branch is still folded.
             assert_agree(
                 &f,
@@ -146,7 +162,12 @@ fn bd_pgqsk_m6_having_never_true_and_short_circuits() {
         let r = setup_r();
         const E: &str = "(SELECT 1 FROM json_each('bare'))";
         for lhs in ["0", "0.0", "NULL", "FALSE"] {
-            assert_agree(&f, &r, &format!("SELECT count(*) FROM t HAVING {lhs} AND {E}")).await;
+            assert_agree(
+                &f,
+                &r,
+                &format!("SELECT count(*) FROM t HAVING {lhs} AND {E}"),
+            )
+            .await;
             assert_agree(
                 &f,
                 &r,

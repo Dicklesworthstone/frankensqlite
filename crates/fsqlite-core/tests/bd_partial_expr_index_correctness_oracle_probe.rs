@@ -34,17 +34,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -70,54 +79,179 @@ fn partial_expr_index_correctness_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // partial index: query matching the partial predicate
-        check("partial idx active", fq(&f, "SELECT id,name FROM u WHERE status='active' AND name='Alice' ORDER BY id").await,
-              rq(&r, "SELECT id,name FROM u WHERE status='active' AND name='Alice' ORDER BY id"), &mut diffs);
-        check("partial idx all active", fq(&f, "SELECT id,name FROM u WHERE status='active' ORDER BY name").await,
-              rq(&r, "SELECT id,name FROM u WHERE status='active' ORDER BY name"), &mut diffs);
+        check(
+            "partial idx active",
+            fq(
+                &f,
+                "SELECT id,name FROM u WHERE status='active' AND name='Alice' ORDER BY id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id,name FROM u WHERE status='active' AND name='Alice' ORDER BY id",
+            ),
+            &mut diffs,
+        );
+        check(
+            "partial idx all active",
+            fq(
+                &f,
+                "SELECT id,name FROM u WHERE status='active' ORDER BY name",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id,name FROM u WHERE status='active' ORDER BY name",
+            ),
+            &mut diffs,
+        );
         // expression index: WHERE lower(name)=...
-        check("expr idx lower", fq(&f, "SELECT id,name FROM u WHERE lower(name)='alice' ORDER BY id").await,
-              rq(&r, "SELECT id,name FROM u WHERE lower(name)='alice' ORDER BY id"), &mut diffs);
+        check(
+            "expr idx lower",
+            fq(
+                &f,
+                "SELECT id,name FROM u WHERE lower(name)='alice' ORDER BY id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id,name FROM u WHERE lower(name)='alice' ORDER BY id",
+            ),
+            &mut diffs,
+        );
         // multi-column index equality + range
-        check("multicol idx range", fq(&f, "SELECT id,score FROM u WHERE score>=20 AND score<=40 ORDER BY score").await,
-              rq(&r, "SELECT id,score FROM u WHERE score>=20 AND score<=40 ORDER BY score"), &mut diffs);
-        check("multicol idx eq", fq(&f, "SELECT id FROM u WHERE score=30 AND status='active' ORDER BY id").await,
-              rq(&r, "SELECT id FROM u WHERE score=30 AND status='active' ORDER BY id"), &mut diffs);
+        check(
+            "multicol idx range",
+            fq(
+                &f,
+                "SELECT id,score FROM u WHERE score>=20 AND score<=40 ORDER BY score",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id,score FROM u WHERE score>=20 AND score<=40 ORDER BY score",
+            ),
+            &mut diffs,
+        );
+        check(
+            "multicol idx eq",
+            fq(
+                &f,
+                "SELECT id FROM u WHERE score=30 AND status='active' ORDER BY id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id FROM u WHERE score=30 AND status='active' ORDER BY id",
+            ),
+            &mut diffs,
+        );
 
         // ── UPDATE moving a row OUT of the partial predicate (status active->inactive) ──
         ex(&f, &r, "UPDATE u SET status='inactive' WHERE id=3").await;
-        check("partial after move-out", fq(&f, "SELECT id,name FROM u WHERE status='active' ORDER BY name").await,
-              rq(&r, "SELECT id,name FROM u WHERE status='active' ORDER BY name"), &mut diffs);
+        check(
+            "partial after move-out",
+            fq(
+                &f,
+                "SELECT id,name FROM u WHERE status='active' ORDER BY name",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id,name FROM u WHERE status='active' ORDER BY name",
+            ),
+            &mut diffs,
+        );
         // ── UPDATE moving a row INTO the partial predicate (inactive->active) ──
         ex(&f, &r, "UPDATE u SET status='active' WHERE id=2").await;
-        check("partial after move-in", fq(&f, "SELECT id,name FROM u WHERE status='active' ORDER BY name").await,
-              rq(&r, "SELECT id,name FROM u WHERE status='active' ORDER BY name"), &mut diffs);
+        check(
+            "partial after move-in",
+            fq(
+                &f,
+                "SELECT id,name FROM u WHERE status='active' ORDER BY name",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id,name FROM u WHERE status='active' ORDER BY name",
+            ),
+            &mut diffs,
+        );
         // ── UPDATE the indexed expression's base column (rename) ──
         ex(&f, &r, "UPDATE u SET name='ALICE' WHERE id=1").await;
-        check("expr idx after rename", fq(&f, "SELECT id,name FROM u WHERE lower(name)='alice' ORDER BY id").await,
-              rq(&r, "SELECT id,name FROM u WHERE lower(name)='alice' ORDER BY id"), &mut diffs);
+        check(
+            "expr idx after rename",
+            fq(
+                &f,
+                "SELECT id,name FROM u WHERE lower(name)='alice' ORDER BY id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id,name FROM u WHERE lower(name)='alice' ORDER BY id",
+            ),
+            &mut diffs,
+        );
         // ── DELETE a row and confirm no stale index entry ──
         ex(&f, &r, "DELETE FROM u WHERE id=4").await;
-        check("partial after delete", fq(&f, "SELECT id,name FROM u WHERE status='active' ORDER BY name").await,
-              rq(&r, "SELECT id,name FROM u WHERE status='active' ORDER BY name"), &mut diffs);
-        check("expr idx after delete", fq(&f, "SELECT id FROM u WHERE lower(name)='dave'").await,
-              rq(&r, "SELECT id FROM u WHERE lower(name)='dave'"), &mut diffs);
+        check(
+            "partial after delete",
+            fq(
+                &f,
+                "SELECT id,name FROM u WHERE status='active' ORDER BY name",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id,name FROM u WHERE status='active' ORDER BY name",
+            ),
+            &mut diffs,
+        );
+        check(
+            "expr idx after delete",
+            fq(&f, "SELECT id FROM u WHERE lower(name)='dave'").await,
+            rq(&r, "SELECT id FROM u WHERE lower(name)='dave'"),
+            &mut diffs,
+        );
         // ── UPDATE the score used by the multi-column index ──
         ex(&f, &r, "UPDATE u SET score=score+100 WHERE status='active'").await;
-        check("multicol after score bump", fq(&f, "SELECT id,score FROM u WHERE score>=100 ORDER BY score").await,
-              rq(&r, "SELECT id,score FROM u WHERE score>=100 ORDER BY score"), &mut diffs);
+        check(
+            "multicol after score bump",
+            fq(&f, "SELECT id,score FROM u WHERE score>=100 ORDER BY score").await,
+            rq(&r, "SELECT id,score FROM u WHERE score>=100 ORDER BY score"),
+            &mut diffs,
+        );
 
         // full-scan cross-check: the same predicates without any index-implied filter must agree too
-        check("full state", fq(&f, "SELECT id,name,status,score FROM u ORDER BY id").await,
-              rq(&r, "SELECT id,name,status,score FROM u ORDER BY id"), &mut diffs);
+        check(
+            "full state",
+            fq(&f, "SELECT id,name,status,score FROM u ORDER BY id").await,
+            rq(&r, "SELECT id,name,status,score FROM u ORDER BY id"),
+            &mut diffs,
+        );
         // count via the partial predicate
-        check("partial count", fq(&f, "SELECT count(*) FROM u WHERE status='active'").await,
-              rq(&r, "SELECT count(*) FROM u WHERE status='active'"), &mut diffs);
+        check(
+            "partial count",
+            fq(&f, "SELECT count(*) FROM u WHERE status='active'").await,
+            rq(&r, "SELECT count(*) FROM u WHERE status='active'"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} partial/expr-index divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} partial/expr-index divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

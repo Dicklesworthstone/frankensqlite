@@ -43,17 +43,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -82,37 +91,82 @@ fn temp_schema_resolution_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // unqualified `t` resolves to TEMP.t (temp shadows main)
-        check("unqualified -> temp", fq(&f, "SELECT id,src FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM t ORDER BY id"), &mut diffs);
+        check(
+            "unqualified -> temp",
+            fq(&f, "SELECT id,src FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM t ORDER BY id"),
+            &mut diffs,
+        );
         // explicit temp. and main. qualifiers reach the right table
-        check("temp. qualifier", fq(&f, "SELECT id,src FROM temp.t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM temp.t ORDER BY id"), &mut diffs);
-        check("main. qualifier", fq(&f, "SELECT id,src FROM main.t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM main.t ORDER BY id"), &mut diffs);
+        check(
+            "temp. qualifier",
+            fq(&f, "SELECT id,src FROM temp.t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM temp.t ORDER BY id"),
+            &mut diffs,
+        );
+        check(
+            "main. qualifier",
+            fq(&f, "SELECT id,src FROM main.t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM main.t ORDER BY id"),
+            &mut diffs,
+        );
         // temp-only table via bare name
-        check("temp-only bare", fq(&f, "SELECT id,note FROM scratch ORDER BY id").await,
-              rq(&r, "SELECT id,note FROM scratch ORDER BY id"), &mut diffs);
+        check(
+            "temp-only bare",
+            fq(&f, "SELECT id,note FROM scratch ORDER BY id").await,
+            rq(&r, "SELECT id,note FROM scratch ORDER BY id"),
+            &mut diffs,
+        );
         // main-only table still reachable via bare name
-        check("main-only bare", fq(&f, "SELECT id,v FROM only_main ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM only_main ORDER BY id"), &mut diffs);
+        check(
+            "main-only bare",
+            fq(&f, "SELECT id,v FROM only_main ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM only_main ORDER BY id"),
+            &mut diffs,
+        );
 
         // join temp table (shadowing) with a main-only table
-        check("temp join main", fq(&f, "SELECT t.id, t.src, o.v FROM t JOIN only_main o ON t.id/10 = o.id ORDER BY t.id").await,
-              rq(&r, "SELECT t.id, t.src, o.v FROM t JOIN only_main o ON t.id/10 = o.id ORDER BY t.id"), &mut diffs);
+        check(
+            "temp join main",
+            fq(
+                &f,
+                "SELECT t.id, t.src, o.v FROM t JOIN only_main o ON t.id/10 = o.id ORDER BY t.id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT t.id, t.src, o.v FROM t JOIN only_main o ON t.id/10 = o.id ORDER BY t.id",
+            ),
+            &mut diffs,
+        );
         // NOTE: a single statement joining BOTH main.t and temp.t (same base name,
         // different schemas) is a known divergence tracked in bd-ghiey (frank
         // mis-resolves both to one table -> 9 NULL rows vs stock's 6-row cross
         // join) -- intentionally not asserted here.
 
         // TEMP VIEW over the main table
-        ex(&f, &r, "CREATE TEMP VIEW vmain AS SELECT id, src FROM main.t WHERE id >= 2").await;
-        check("temp view over main", fq(&f, "SELECT id,src FROM vmain ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM vmain ORDER BY id"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "CREATE TEMP VIEW vmain AS SELECT id, src FROM main.t WHERE id >= 2",
+        )
+        .await;
+        check(
+            "temp view over main",
+            fq(&f, "SELECT id,src FROM vmain ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM vmain ORDER BY id"),
+            &mut diffs,
+        );
 
         // NOTE: main.sqlite_master's table listing is a known divergence tracked in
         // bd-y4yjq (frank omits the shadowed `main.t` from the listing though the
@@ -123,16 +177,33 @@ fn temp_schema_resolution_match_rusqlite_oracle() {
 
         // writes to the temp (shadowing) table don't touch main
         ex(&f, &r, "UPDATE t SET src='temp-upd' WHERE id=10").await;
-        check("temp write isolation temp", fq(&f, "SELECT id,src FROM temp.t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM temp.t ORDER BY id"), &mut diffs);
-        check("temp write isolation main", fq(&f, "SELECT id,src FROM main.t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM main.t ORDER BY id"), &mut diffs);
+        check(
+            "temp write isolation temp",
+            fq(&f, "SELECT id,src FROM temp.t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM temp.t ORDER BY id"),
+            &mut diffs,
+        );
+        check(
+            "temp write isolation main",
+            fq(&f, "SELECT id,src FROM main.t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM main.t ORDER BY id"),
+            &mut diffs,
+        );
 
         // DROP the temp shadow -> bare `t` now resolves to main.t
         ex(&f, &r, "DROP TABLE temp.t").await;
-        check("after drop temp shadow", fq(&f, "SELECT id,src FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,src FROM t ORDER BY id"), &mut diffs);
+        check(
+            "after drop temp shadow",
+            fq(&f, "SELECT id,src FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,src FROM t ORDER BY id"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} TEMP-schema divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} TEMP-schema divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

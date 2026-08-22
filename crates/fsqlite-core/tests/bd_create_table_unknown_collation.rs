@@ -6,12 +6,17 @@ use fsqlite_core::connection::Connection;
 
 async fn err_of(ddl: &str) -> String {
     let c = Connection::open(":memory:").await.unwrap();
-    c.execute(ddl).await.expect_err("unknown collation must be rejected").to_string()
+    c.execute(ddl)
+        .await
+        .expect_err("unknown collation must be rejected")
+        .to_string()
 }
 
 async fn ok(ddl: &str) {
     let c = Connection::open(":memory:").await.unwrap();
-    c.execute(ddl).await.expect("valid collation DDL must succeed");
+    c.execute(ddl)
+        .await
+        .expect("valid collation DDL must succeed");
 }
 
 #[test]

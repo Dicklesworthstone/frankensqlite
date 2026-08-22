@@ -16,7 +16,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -25,13 +28,19 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn fq(f: &Connection, sql: &str) -> Vec<Vec<String>> {
     match f.query_with_params(sql, &[]).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(e) => vec![vec![format!("<ERR {e:?}>")]],
     }
 }
@@ -42,7 +51,9 @@ fn rq(r: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     };
     let n = st.column_count();
     st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect())
     })
     .unwrap()
     .collect::<Result<Vec<_>, _>>()
@@ -59,7 +70,10 @@ async fn agree(setup: &[&str], sql: &str, msg: &str) {
     }
     let fr = fq(&f, sql).await;
     let rr = rq(&r, sql);
-    assert_eq!(fr, rr, "{msg}\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}");
+    assert_eq!(
+        fr, rr,
+        "{msg}\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}"
+    );
 }
 
 // ─────────────────────────── generated columns ───────────────────────────
@@ -68,11 +82,14 @@ async fn agree(setup: &[&str], sql: &str, msg: &str) {
 fn gencol_stored_and_virtual() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(a INT, b INT AS (a*2) STORED, c INT AS (a+b) VIRTUAL)",
-              "INSERT INTO t(a) VALUES (3),(5)"],
+            &[
+                "CREATE TABLE t(a INT, b INT AS (a*2) STORED, c INT AS (a+b) VIRTUAL)",
+                "INSERT INTO t(a) VALUES (3),(5)",
+            ],
             "SELECT a, b, c FROM t ORDER BY a",
             "STORED and VIRTUAL generated columns must compute like stock",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -80,11 +97,14 @@ fn gencol_stored_and_virtual() {
 fn gencol_text_concat() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(x TEXT, y TEXT AS (x || '!') VIRTUAL)",
-              "INSERT INTO t(x) VALUES ('hi'),('bye')"],
+            &[
+                "CREATE TABLE t(x TEXT, y TEXT AS (x || '!') VIRTUAL)",
+                "INSERT INTO t(x) VALUES ('hi'),('bye')",
+            ],
             "SELECT x, y FROM t ORDER BY x",
             "text-concat generated column",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -92,11 +112,14 @@ fn gencol_text_concat() {
 fn gencol_typeof_and_affinity() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(a INT, b TEXT AS (a) STORED, c REAL AS (a) VIRTUAL)",
-              "INSERT INTO t(a) VALUES (7)"],
+            &[
+                "CREATE TABLE t(a INT, b TEXT AS (a) STORED, c REAL AS (a) VIRTUAL)",
+                "INSERT INTO t(a) VALUES (7)",
+            ],
             "SELECT typeof(b), typeof(c), b, c FROM t",
             "generated-column declared-type affinity must coerce like stock",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -104,11 +127,14 @@ fn gencol_typeof_and_affinity() {
 fn gencol_in_where() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(a INT, doubled INT AS (a*2) VIRTUAL)",
-              "INSERT INTO t(a) VALUES (1),(2),(3),(4)"],
+            &[
+                "CREATE TABLE t(a INT, doubled INT AS (a*2) VIRTUAL)",
+                "INSERT INTO t(a) VALUES (1),(2),(3),(4)",
+            ],
             "SELECT a FROM t WHERE doubled > 4 ORDER BY a",
             "generated column usable in WHERE",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -116,11 +142,14 @@ fn gencol_in_where() {
 fn gencol_multi_column_expr() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(w INT, h INT, area INT AS (w*h) STORED)",
-              "INSERT INTO t(w,h) VALUES (2,3),(4,5)"],
+            &[
+                "CREATE TABLE t(w INT, h INT, area INT AS (w*h) STORED)",
+                "INSERT INTO t(w,h) VALUES (2,3),(4,5)",
+            ],
             "SELECT w, h, area FROM t ORDER BY w",
             "generated column over multiple columns",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -128,11 +157,14 @@ fn gencol_multi_column_expr() {
 fn gencol_feeding_aggregate() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(a INT, sq INT AS (a*a) VIRTUAL)",
-              "INSERT INTO t(a) VALUES (1),(2),(3)"],
+            &[
+                "CREATE TABLE t(a INT, sq INT AS (a*a) VIRTUAL)",
+                "INSERT INTO t(a) VALUES (1),(2),(3)",
+            ],
             "SELECT sum(sq), max(sq) FROM t",
             "generated column feeding an aggregate",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -154,11 +186,14 @@ fn gencol_case_body() {
 fn default_arithmetic_expr() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(id INT, n INT DEFAULT (1+2*3))",
-              "INSERT INTO t(id) VALUES (1)"],
+            &[
+                "CREATE TABLE t(id INT, n INT DEFAULT (1+2*3))",
+                "INSERT INTO t(id) VALUES (1)",
+            ],
             "SELECT id, n FROM t",
             "DEFAULT (arithmetic expression)",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -166,11 +201,14 @@ fn default_arithmetic_expr() {
 fn default_function_expr() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(id INT, v INT DEFAULT (abs(-9)))",
-              "INSERT INTO t(id) VALUES (1)"],
+            &[
+                "CREATE TABLE t(id INT, v INT DEFAULT (abs(-9)))",
+                "INSERT INTO t(id) VALUES (1)",
+            ],
             "SELECT id, v FROM t",
             "DEFAULT (function call)",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -178,11 +216,14 @@ fn default_function_expr() {
 fn default_literals() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(id INT, s TEXT DEFAULT 'hello', k INT DEFAULT 42)",
-              "INSERT INTO t(id) VALUES (1)"],
+            &[
+                "CREATE TABLE t(id INT, s TEXT DEFAULT 'hello', k INT DEFAULT 42)",
+                "INSERT INTO t(id) VALUES (1)",
+            ],
             "SELECT id, s, k FROM t",
             "DEFAULT literals (string + integer)",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -190,11 +231,15 @@ fn default_literals() {
 fn default_overridden_by_explicit_value() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(id INT, n INT DEFAULT (100))",
-              "INSERT INTO t(id, n) VALUES (1, 7)", "INSERT INTO t(id) VALUES (2)"],
+            &[
+                "CREATE TABLE t(id INT, n INT DEFAULT (100))",
+                "INSERT INTO t(id, n) VALUES (1, 7)",
+                "INSERT INTO t(id) VALUES (2)",
+            ],
             "SELECT id, n FROM t ORDER BY id",
             "explicit value overrides DEFAULT; omitted uses DEFAULT",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -202,11 +247,15 @@ fn default_overridden_by_explicit_value() {
 fn default_explicit_null_keeps_null() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(id INT, n INT DEFAULT (5))",
-              "INSERT INTO t(id, n) VALUES (1, NULL)", "INSERT INTO t(id) VALUES (2)"],
+            &[
+                "CREATE TABLE t(id INT, n INT DEFAULT (5))",
+                "INSERT INTO t(id, n) VALUES (1, NULL)",
+                "INSERT INTO t(id) VALUES (2)",
+            ],
             "SELECT id, n FROM t ORDER BY id",
             "explicit NULL stays NULL; omitted column uses DEFAULT",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -214,10 +263,13 @@ fn default_explicit_null_keeps_null() {
 fn default_unary_and_concat() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(id INT, a INT DEFAULT (-5), b TEXT DEFAULT ('x' || 'y'))",
-              "INSERT INTO t(id) VALUES (1)"],
+            &[
+                "CREATE TABLE t(id INT, a INT DEFAULT (-5), b TEXT DEFAULT ('x' || 'y'))",
+                "INSERT INTO t(id) VALUES (1)",
+            ],
             "SELECT id, a, b FROM t",
             "DEFAULT with unary minus and string concatenation",
-        ).await;
+        )
+        .await;
     });
 }

@@ -99,11 +99,7 @@ fn journal_mode_committed_rows_survive_reopen_bd_sw2k5() {
     asupersync::test_utils::run_test(|| async {
         for mode in ["delete", "truncate", "persist"] {
             let dir = tempfile::tempdir().unwrap();
-            let db = dir
-                .path()
-                .join("r.db")
-                .to_string_lossy()
-                .into_owned();
+            let db = dir.path().join("r.db").to_string_lossy().into_owned();
             commit_one_write(&db, mode).await;
             let conn = Connection::open(&db).await.unwrap();
             let rows = conn.query("SELECT count(*) FROM t;").await.unwrap();

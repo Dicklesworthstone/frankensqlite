@@ -85,7 +85,9 @@ fn rusqlite_seq_name(sql: &str) -> Vec<(i64, String)> {
     let r = rusqlite::Connection::open_in_memory().unwrap();
     let mut stmt = r.prepare(sql).unwrap();
     let mut out: Vec<(i64, String)> = stmt
-        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
         .unwrap()
         .map(Result::unwrap)
         .collect();
@@ -105,17 +107,30 @@ fn bare_form_matches_call_and_statement_forms() {
         let bare = frank_col0_text(&conn, "SELECT * FROM pragma_compile_options").await;
         let call = frank_col0_text(&conn, "SELECT * FROM pragma_compile_options()").await;
         let stmt = frank_col0_text(&conn, "PRAGMA compile_options").await;
-        assert!(!bare.is_empty(), "compile_options bare form must be non-empty");
+        assert!(
+            !bare.is_empty(),
+            "compile_options bare form must be non-empty"
+        );
         assert_eq!(bare, call, "compile_options: bare must match call form");
         assert_eq!(bare, stmt, "compile_options: bare must match PRAGMA form");
 
         // function_list (build-specific catalog).
         let bare = frank_col0_text(&conn, "SELECT name FROM pragma_function_list").await;
         let call = frank_col0_text(&conn, "SELECT name FROM pragma_function_list()").await;
-        let stmt = frank_col0_text(&conn, "SELECT name FROM (SELECT * FROM pragma_function_list())").await;
-        assert!(!bare.is_empty(), "function_list bare form must be non-empty");
+        let stmt = frank_col0_text(
+            &conn,
+            "SELECT name FROM (SELECT * FROM pragma_function_list())",
+        )
+        .await;
+        assert!(
+            !bare.is_empty(),
+            "function_list bare form must be non-empty"
+        );
         assert_eq!(bare, call, "function_list: bare must match call form");
-        assert_eq!(bare, stmt, "function_list: bare must match derived call form");
+        assert_eq!(
+            bare, stmt,
+            "function_list: bare must match derived call form"
+        );
 
         // database_list (portable contents).
         let bare = frank_seq_name(&conn, "SELECT seq, name FROM pragma_database_list").await;
@@ -133,7 +148,10 @@ fn bare_database_list_matches_rusqlite() {
         let conn = Connection::open(":memory:").await.unwrap();
         let frank = frank_seq_name(&conn, "SELECT seq, name FROM pragma_database_list").await;
         let sqlite = rusqlite_seq_name("SELECT seq, name FROM pragma_database_list");
-        assert_eq!(frank, sqlite, "bare pragma_database_list must match stock SQLite");
+        assert_eq!(
+            frank, sqlite,
+            "bare pragma_database_list must match stock SQLite"
+        );
     });
 }
 
@@ -156,7 +174,9 @@ fn bare_function_list_covers_core_functions_vs_rusqlite() {
                 .map(|n| n.to_ascii_lowercase())
                 .collect();
 
-        for f in ["abs", "coalesce", "length", "lower", "upper", "count", "sum", "min", "max"] {
+        for f in [
+            "abs", "coalesce", "length", "lower", "upper", "count", "sum", "min", "max",
+        ] {
             assert!(sqlite.contains(f), "oracle drift: stock SQLite lacks `{f}`");
             assert!(
                 frank.contains(f),
@@ -175,7 +195,10 @@ fn bare_form_where_filter_matches_rusqlite() {
             frank_col0_text(&conn, "SELECT name FROM pragma_database_list WHERE seq = 0").await;
         let sqlite = rusqlite_col0_text("SELECT name FROM pragma_database_list WHERE seq = 0");
         assert_eq!(frank, vec!["main".to_owned()]);
-        assert_eq!(frank, sqlite, "bare-form WHERE filter must match stock SQLite");
+        assert_eq!(
+            frank, sqlite,
+            "bare-form WHERE filter must match stock SQLite"
+        );
     });
 }
 
@@ -207,11 +230,16 @@ fn bare_form_join_of_two_pragma_tvfs() {
             )
             .unwrap();
         let sqlite: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(frank, sqlite, "bare self-join of pragma_database_list must match stock");
+        assert_eq!(
+            frank, sqlite,
+            "bare self-join of pragma_database_list must match stock"
+        );
         assert_eq!(frank, vec![("main".to_owned(), "main".to_owned())]);
 
         // A join of two *different* bare pragma TVFs must execute (no NoSuchTable)
@@ -228,7 +256,10 @@ fn bare_form_join_of_two_pragma_tvfs() {
              JOIN pragma_compile_options() b",
         )
         .await;
-        assert!(!bare.is_empty(), "cross join with compile_options must be non-empty");
+        assert!(
+            !bare.is_empty(),
+            "cross join with compile_options must be non-empty"
+        );
         assert_eq!(
             bare.len(),
             call.len(),
@@ -251,7 +282,10 @@ fn controls_call_form_unknown_name_and_arg_pragma() {
         assert!(!call.is_empty(), "call form must still work");
 
         // A genuinely unknown bare name still errors (not over-routed).
-        match conn.query("SELECT * FROM definitely_not_a_real_table_xyz").await {
+        match conn
+            .query("SELECT * FROM definitely_not_a_real_table_xyz")
+            .await
+        {
             Ok(rows) => panic!("unknown bare name unexpectedly succeeded: {rows:?}"),
             Err(e) => assert!(
                 e.to_string().to_ascii_lowercase().contains("no such table"),
@@ -266,12 +300,18 @@ fn controls_call_form_unknown_name_and_arg_pragma() {
             .iter()
             .map(|row| text(&row.values()[0]))
             .collect();
-        assert_eq!(info, vec!["a".to_owned(), "b".to_owned()], "arg call form must be unaffected");
+        assert_eq!(
+            info,
+            vec!["a".to_owned(), "b".to_owned()],
+            "arg call form must be unaffected"
+        );
 
         // ... and its bare, argument-less form still behaves as before (errors);
         // this bead deliberately does NOT route arg-requiring pragma TVFs.
         match conn.query("SELECT * FROM pragma_table_info").await {
-            Ok(rows) => panic!("bare arg-requiring pragma_table_info unexpectedly succeeded: {rows:?}"),
+            Ok(rows) => {
+                panic!("bare arg-requiring pragma_table_info unexpectedly succeeded: {rows:?}")
+            }
             Err(e) => assert!(
                 e.to_string().to_ascii_lowercase().contains("no such table"),
                 "bare pragma_table_info must still error, got: {e}"

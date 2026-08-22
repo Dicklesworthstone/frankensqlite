@@ -8,7 +8,10 @@ use fsqlite_core::connection::Connection;
 async fn err_of(sql: &str) -> String {
     let c = Connection::open(":memory:").await.unwrap();
     c.execute("CREATE TABLE t(a, b)").await.unwrap();
-    c.execute(sql).await.expect_err("bad window column must be rejected").to_string()
+    c.execute(sql)
+        .await
+        .expect_err("bad window column must be rejected")
+        .to_string()
 }
 
 async fn ok(setup: &[&str], sql: &str) {
@@ -16,7 +19,9 @@ async fn ok(setup: &[&str], sql: &str) {
     for s in setup {
         c.execute(s).await.unwrap();
     }
-    c.execute(sql).await.expect("valid window query must succeed");
+    c.execute(sql)
+        .await
+        .expect("valid window query must succeed");
 }
 
 #[test]
@@ -36,6 +41,10 @@ fn window_spec_bad_column_rejected() {
         ok(t, "SELECT sum(a) OVER (PARTITION BY b) FROM t").await;
         ok(t, "SELECT sum(a) OVER () FROM t").await;
         ok(t, "SELECT row_number() OVER (ORDER BY a) FROM t").await;
-        ok(t, "SELECT a, sum(b) OVER (PARTITION BY a ORDER BY b) FROM t").await;
+        ok(
+            t,
+            "SELECT a, sum(b) OVER (PARTITION BY a ORDER BY b) FROM t",
+        )
+        .await;
     });
 }

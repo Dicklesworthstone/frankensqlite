@@ -6,7 +6,10 @@ use fsqlite_core::connection::Connection;
 
 async fn err_of(sql: &str) -> String {
     let c = Connection::open(":memory:").await.unwrap();
-    c.execute(sql).await.expect_err("must be rejected").to_string()
+    c.execute(sql)
+        .await
+        .expect_err("must be rejected")
+        .to_string()
 }
 
 #[test]
@@ -22,7 +25,9 @@ fn strict_and_reindex_error_text_matches_stock() {
         );
         // A recognised STRICT type is fine.
         let c = Connection::open(":memory:").await.unwrap();
-        c.execute("CREATE TABLE ok(a INTEGER, b TEXT, c ANY) STRICT").await.expect("valid STRICT");
+        c.execute("CREATE TABLE ok(a INTEGER, b TEXT, c ANY) STRICT")
+            .await
+            .expect("valid STRICT");
 
         assert_eq!(
             err_of("REINDEX no_such_object").await,

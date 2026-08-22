@@ -9,16 +9,34 @@ use fsqlite_core::connection::Connection;
 // (ddl, must_be_rejected)
 const CASES: &[(&str, bool)] = &[
     // Column-level PRIMARY KEY on a generated column.
-    ("CREATE TABLE t1(a INT, b INT GENERATED ALWAYS AS (a) STORED PRIMARY KEY)", true),
+    (
+        "CREATE TABLE t1(a INT, b INT GENERATED ALWAYS AS (a) STORED PRIMARY KEY)",
+        true,
+    ),
     // Table-level PRIMARY KEY naming a generated column.
-    ("CREATE TABLE t2(a INT, b INT GENERATED ALWAYS AS (a) STORED, PRIMARY KEY(b))", true),
+    (
+        "CREATE TABLE t2(a INT, b INT GENERATED ALWAYS AS (a) STORED, PRIMARY KEY(b))",
+        true,
+    ),
     // Composite PRIMARY KEY including a generated column.
-    ("CREATE TABLE t3(a INT, b INT GENERATED ALWAYS AS (a) STORED, PRIMARY KEY(a,b))", true),
+    (
+        "CREATE TABLE t3(a INT, b INT GENERATED ALWAYS AS (a) STORED, PRIMARY KEY(a,b))",
+        true,
+    ),
     // VIRTUAL generated column PK is also rejected.
-    ("CREATE TABLE t4(a INT, b INT GENERATED ALWAYS AS (a) VIRTUAL PRIMARY KEY)", true),
+    (
+        "CREATE TABLE t4(a INT, b INT GENERATED ALWAYS AS (a) VIRTUAL PRIMARY KEY)",
+        true,
+    ),
     // Controls that must be ACCEPTED:
-    ("CREATE TABLE u1(a INT, b INT GENERATED ALWAYS AS (a) STORED UNIQUE)", false),
-    ("CREATE TABLE u2(a INT PRIMARY KEY, b INT GENERATED ALWAYS AS (a) STORED)", false),
+    (
+        "CREATE TABLE u1(a INT, b INT GENERATED ALWAYS AS (a) STORED UNIQUE)",
+        false,
+    ),
+    (
+        "CREATE TABLE u2(a INT PRIMARY KEY, b INT GENERATED ALWAYS AS (a) STORED)",
+        false,
+    ),
 ];
 
 fn oracle_rejects(ddl: &str) -> bool {

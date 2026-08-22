@@ -19,7 +19,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
         SqliteValue::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -30,7 +33,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
         rusqlite::types::Value::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }

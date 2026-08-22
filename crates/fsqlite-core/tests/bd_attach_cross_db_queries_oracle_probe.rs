@@ -42,17 +42,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -79,24 +88,52 @@ fn attach_cross_db_queries_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // unqualified `t` resolves to main.t (first matching schema)
-        check("unqualified t -> main", fq(&f, "SELECT id,name FROM t ORDER BY id").await,
-              rq(&r, "SELECT id,name FROM t ORDER BY id"), &mut diffs);
+        check(
+            "unqualified t -> main",
+            fq(&f, "SELECT id,name FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,name FROM t ORDER BY id"),
+            &mut diffs,
+        );
         // explicit main. and aux. qualifiers
-        check("main.t qualified", fq(&f, "SELECT id,name FROM main.t ORDER BY id").await,
-              rq(&r, "SELECT id,name FROM main.t ORDER BY id"), &mut diffs);
-        check("aux.t qualified", fq(&f, "SELECT id,tag FROM aux.t ORDER BY id").await,
-              rq(&r, "SELECT id,tag FROM aux.t ORDER BY id"), &mut diffs);
+        check(
+            "main.t qualified",
+            fq(&f, "SELECT id,name FROM main.t ORDER BY id").await,
+            rq(&r, "SELECT id,name FROM main.t ORDER BY id"),
+            &mut diffs,
+        );
+        check(
+            "aux.t qualified",
+            fq(&f, "SELECT id,tag FROM aux.t ORDER BY id").await,
+            rq(&r, "SELECT id,tag FROM aux.t ORDER BY id"),
+            &mut diffs,
+        );
         // NOTE: bare unqualified `SELECT ... FROM only` (aux-only table) is a known
         // divergence tracked in bd-pqauo (frank does not resolve unqualified names
         // against attached schemas) — intentionally not asserted here.
         // cross-DB inner join on id
-        check("cross-db inner join", fq(&f, "SELECT m.id, m.name, a.tag FROM main.t m JOIN aux.t a ON m.id=a.id ORDER BY m.id").await,
-              rq(&r, "SELECT m.id, m.name, a.tag FROM main.t m JOIN aux.t a ON m.id=a.id ORDER BY m.id"), &mut diffs);
+        check(
+            "cross-db inner join",
+            fq(
+                &f,
+                "SELECT m.id, m.name, a.tag FROM main.t m JOIN aux.t a ON m.id=a.id ORDER BY m.id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT m.id, m.name, a.tag FROM main.t m JOIN aux.t a ON m.id=a.id ORDER BY m.id",
+            ),
+            &mut diffs,
+        );
         // cross-DB left join (main rows without an aux match)
         check("cross-db left join", fq(&f, "SELECT m.id, m.name, a.tag FROM main.t m LEFT JOIN aux.t a ON m.id=a.id ORDER BY m.id").await,
               rq(&r, "SELECT m.id, m.name, a.tag FROM main.t m LEFT JOIN aux.t a ON m.id=a.id ORDER BY m.id"), &mut diffs);
@@ -104,32 +141,118 @@ fn attach_cross_db_queries_match_rusqlite_oracle() {
         check("three-way cross-db", fq(&f, "SELECT m.id, a.tag, o.note FROM main.t m JOIN aux.t a ON m.id=a.id JOIN aux.only o ON o.id=m.id ORDER BY m.id").await,
               rq(&r, "SELECT m.id, a.tag, o.note FROM main.t m JOIN aux.t a ON m.id=a.id JOIN aux.only o ON o.id=m.id ORDER BY m.id"), &mut diffs);
         // cross-DB IN subquery
-        check("cross-db IN subquery", fq(&f, "SELECT id,name FROM main.t WHERE id IN (SELECT id FROM aux.t) ORDER BY id").await,
-              rq(&r, "SELECT id,name FROM main.t WHERE id IN (SELECT id FROM aux.t) ORDER BY id"), &mut diffs);
+        check(
+            "cross-db IN subquery",
+            fq(
+                &f,
+                "SELECT id,name FROM main.t WHERE id IN (SELECT id FROM aux.t) ORDER BY id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id,name FROM main.t WHERE id IN (SELECT id FROM aux.t) ORDER BY id",
+            ),
+            &mut diffs,
+        );
         // cross-DB correlated scalar subquery
-        check("cross-db correlated scalar", fq(&f, "SELECT id, (SELECT tag FROM aux.t a WHERE a.id=m.id) FROM main.t m ORDER BY id").await,
-              rq(&r, "SELECT id, (SELECT tag FROM aux.t a WHERE a.id=m.id) FROM main.t m ORDER BY id"), &mut diffs);
+        check(
+            "cross-db correlated scalar",
+            fq(
+                &f,
+                "SELECT id, (SELECT tag FROM aux.t a WHERE a.id=m.id) FROM main.t m ORDER BY id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id, (SELECT tag FROM aux.t a WHERE a.id=m.id) FROM main.t m ORDER BY id",
+            ),
+            &mut diffs,
+        );
         // cross-DB EXISTS
         check("cross-db not exists", fq(&f, "SELECT id,name FROM main.t m WHERE NOT EXISTS (SELECT 1 FROM aux.t a WHERE a.id=m.id) ORDER BY id").await,
               rq(&r, "SELECT id,name FROM main.t m WHERE NOT EXISTS (SELECT 1 FROM aux.t a WHERE a.id=m.id) ORDER BY id"), &mut diffs);
         // UNION across databases (compatible column shapes)
-        check("cross-db union all", fq(&f, "SELECT id FROM main.t UNION ALL SELECT id FROM aux.t ORDER BY id").await,
-              rq(&r, "SELECT id FROM main.t UNION ALL SELECT id FROM aux.t ORDER BY id"), &mut diffs);
-        check("cross-db union dedup", fq(&f, "SELECT id FROM main.t UNION SELECT id FROM aux.t ORDER BY id").await,
-              rq(&r, "SELECT id FROM main.t UNION SELECT id FROM aux.t ORDER BY id"), &mut diffs);
+        check(
+            "cross-db union all",
+            fq(
+                &f,
+                "SELECT id FROM main.t UNION ALL SELECT id FROM aux.t ORDER BY id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id FROM main.t UNION ALL SELECT id FROM aux.t ORDER BY id",
+            ),
+            &mut diffs,
+        );
+        check(
+            "cross-db union dedup",
+            fq(
+                &f,
+                "SELECT id FROM main.t UNION SELECT id FROM aux.t ORDER BY id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id FROM main.t UNION SELECT id FROM aux.t ORDER BY id",
+            ),
+            &mut diffs,
+        );
         // aggregate over a cross-db join
-        check("cross-db aggregate", fq(&f, "SELECT count(*), sum(m.id) FROM main.t m JOIN aux.t a ON m.id=a.id").await,
-              rq(&r, "SELECT count(*), sum(m.id) FROM main.t m JOIN aux.t a ON m.id=a.id"), &mut diffs);
+        check(
+            "cross-db aggregate",
+            fq(
+                &f,
+                "SELECT count(*), sum(m.id) FROM main.t m JOIN aux.t a ON m.id=a.id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT count(*), sum(m.id) FROM main.t m JOIN aux.t a ON m.id=a.id",
+            ),
+            &mut diffs,
+        );
         // per-schema sqlite_master: aux sees aux.t + aux.only, not main.t
-        check("aux sqlite_master", fq(&f, "SELECT name FROM aux.sqlite_master WHERE type='table' ORDER BY name").await,
-              rq(&r, "SELECT name FROM aux.sqlite_master WHERE type='table' ORDER BY name"), &mut diffs);
-        check("main sqlite_master", fq(&f, "SELECT name FROM main.sqlite_master WHERE type='table' ORDER BY name").await,
-              rq(&r, "SELECT name FROM main.sqlite_master WHERE type='table' ORDER BY name"), &mut diffs);
+        check(
+            "aux sqlite_master",
+            fq(
+                &f,
+                "SELECT name FROM aux.sqlite_master WHERE type='table' ORDER BY name",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT name FROM aux.sqlite_master WHERE type='table' ORDER BY name",
+            ),
+            &mut diffs,
+        );
+        check(
+            "main sqlite_master",
+            fq(
+                &f,
+                "SELECT name FROM main.sqlite_master WHERE type='table' ORDER BY name",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT name FROM main.sqlite_master WHERE type='table' ORDER BY name",
+            ),
+            &mut diffs,
+        );
 
         // cross-DB write: INSERT INTO aux.t SELECT FROM main.t (ids not already present)
-        ex(&f, &r, "INSERT INTO aux.t(id,tag) SELECT id, name FROM main.t WHERE id=1").await;
-        check("after cross-db insert-select", fq(&f, "SELECT id,tag FROM aux.t ORDER BY id").await,
-              rq(&r, "SELECT id,tag FROM aux.t ORDER BY id"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT INTO aux.t(id,tag) SELECT id, name FROM main.t WHERE id=1",
+        )
+        .await;
+        check(
+            "after cross-db insert-select",
+            fq(&f, "SELECT id,tag FROM aux.t ORDER BY id").await,
+            rq(&r, "SELECT id,tag FROM aux.t ORDER BY id"),
+            &mut diffs,
+        );
         // NOTE: a cross-DB UPDATE/DELETE whose WHERE/SET references the real `main`
         // via a subquery (e.g. `UPDATE aux.t SET tag='UPD' WHERE id IN (SELECT id
         // FROM main.t)`) is still a known divergence tracked in bd-s12cm: the write
@@ -138,9 +261,18 @@ fn attach_cross_db_queries_match_rusqlite_oracle() {
         // fix must MATERIALIZE the main-side subquery locally before delegating, like
         // INSERT ... SELECT does) — intentionally not asserted here.
         // main untouched by the aux writes
-        check("main untouched", fq(&f, "SELECT id,name FROM main.t ORDER BY id").await,
-              rq(&r, "SELECT id,name FROM main.t ORDER BY id"), &mut diffs);
+        check(
+            "main untouched",
+            fq(&f, "SELECT id,name FROM main.t ORDER BY id").await,
+            rq(&r, "SELECT id,name FROM main.t ORDER BY id"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} ATTACH cross-db divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} ATTACH cross-db divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

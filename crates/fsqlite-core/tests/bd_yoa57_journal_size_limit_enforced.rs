@@ -73,12 +73,8 @@ fn bd_yoa57_journal_size_limit_caps_the_wal() {
         const LIMIT: i64 = 16 * 1024;
 
         let capped_db = dir.path().join("capped.db");
-        let capped_wal = wal_bytes_after_writes(
-            capped_db.to_string_lossy().as_ref(),
-            LIMIT,
-            ROWS,
-        )
-        .await;
+        let capped_wal =
+            wal_bytes_after_writes(capped_db.to_string_lossy().as_ref(), LIMIT, ROWS).await;
 
         // ENFORCEMENT: the WAL must not stay grown far past the limit. Allow a
         // generous window (one checkpoint interval of frames can be in flight),
@@ -92,12 +88,8 @@ fn bd_yoa57_journal_size_limit_caps_the_wal() {
         // CONTROL: with no limit (-1), the same workload is permitted to leave
         // the WAL substantially larger — proving the cap is what bounded it.
         let uncapped_db = dir.path().join("uncapped.db");
-        let uncapped_wal = wal_bytes_after_writes(
-            uncapped_db.to_string_lossy().as_ref(),
-            -1,
-            ROWS,
-        )
-        .await;
+        let uncapped_wal =
+            wal_bytes_after_writes(uncapped_db.to_string_lossy().as_ref(), -1, ROWS).await;
 
         eprintln!(
             "bd-yoa57: capped_wal={capped_wal} bytes (limit={LIMIT}), uncapped_wal={uncapped_wal} bytes"

@@ -14,7 +14,10 @@ use fsqlite_core::connection::Connection;
 fn stock_integrity_check(path: &str) -> Vec<String> {
     let r = rusqlite::Connection::open(path).expect("stock sqlite3 opens the fsqlite file");
     let mut st = r.prepare("PRAGMA integrity_check").unwrap();
-    st.query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    st.query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 /// The issue's exact schema.
@@ -36,13 +39,21 @@ const SCHEMA: &str = "CREATE TABLE members(
 fn wr_composite_unique_autoindex_exact_reproducer_gh353() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("shape.sqlite").to_string_lossy().to_string();
+        let db = dir
+            .path()
+            .join("shape.sqlite")
+            .to_string_lossy()
+            .to_string();
         {
             let f = Connection::open(&db).await.unwrap();
             f.execute("PRAGMA journal_mode = DELETE").await.unwrap();
             f.execute(SCHEMA).await.unwrap();
-            f.execute("CREATE INDEX idx_members_capture ON members(capture_ordinal)").await.unwrap();
-            f.execute("CREATE INDEX idx_members_fact ON members(xbrl_fact_id)").await.unwrap();
+            f.execute("CREATE INDEX idx_members_capture ON members(capture_ordinal)")
+                .await
+                .unwrap();
+            f.execute("CREATE INDEX idx_members_fact ON members(xbrl_fact_id)")
+                .await
+                .unwrap();
             // 5 rows sharing ONE intent_id — composite UNIQUE leading column is
             // shared; only the trailing column varies (0..4).
             f.execute("BEGIN IMMEDIATE").await.unwrap();
@@ -55,7 +66,9 @@ fn wr_composite_unique_autoindex_exact_reproducer_gh353() {
                 .unwrap_or_else(|e| panic!("insert row {i}: {e:?}"));
             }
             f.execute("COMMIT").await.unwrap();
-            f.close().await.expect("close so stock sqlite3 sees a consistent file");
+            f.close()
+                .await
+                .expect("close so stock sqlite3 sees a consistent file");
         }
         let report = stock_integrity_check(&db);
         assert_eq!(
@@ -77,11 +90,17 @@ fn iso_shared_leading_autocommit_wal_gh353() {
             let f = Connection::open(&db).await.unwrap();
             f.execute("CREATE TABLE m (a TEXT, b INTEGER, c INTEGER, PRIMARY KEY (a, b), UNIQUE (a, c)) WITHOUT ROWID").await.unwrap();
             for i in 0..5 {
-                f.execute(&format!("INSERT INTO m VALUES ('shared', {i}, {i})")).await.unwrap();
+                f.execute(&format!("INSERT INTO m VALUES ('shared', {i}, {i})"))
+                    .await
+                    .unwrap();
             }
             f.close().await.expect("close");
         }
-        assert_eq!(stock_integrity_check(&db), vec!["ok".to_string()], "iso: shared-leading autocommit WAL");
+        assert_eq!(
+            stock_integrity_check(&db),
+            vec!["ok".to_string()],
+            "iso: shared-leading autocommit WAL"
+        );
     });
 }
 
@@ -96,12 +115,18 @@ fn iso_shared_leading_begin_immediate_wal_gh353() {
             f.execute("CREATE TABLE m (a TEXT, b INTEGER, c INTEGER, PRIMARY KEY (a, b), UNIQUE (a, c)) WITHOUT ROWID").await.unwrap();
             f.execute("BEGIN IMMEDIATE").await.unwrap();
             for i in 0..5 {
-                f.execute(&format!("INSERT INTO m VALUES ('shared', {i}, {i})")).await.unwrap();
+                f.execute(&format!("INSERT INTO m VALUES ('shared', {i}, {i})"))
+                    .await
+                    .unwrap();
             }
             f.execute("COMMIT").await.unwrap();
             f.close().await.expect("close");
         }
-        assert_eq!(stock_integrity_check(&db), vec!["ok".to_string()], "iso: shared-leading BEGIN IMMEDIATE WAL");
+        assert_eq!(
+            stock_integrity_check(&db),
+            vec!["ok".to_string()],
+            "iso: shared-leading BEGIN IMMEDIATE WAL"
+        );
     });
 }
 
@@ -117,12 +142,18 @@ fn iso_distinct_leading_begin_immediate_delete_gh353() {
             f.execute("CREATE TABLE m (a TEXT, b INTEGER, c INTEGER, PRIMARY KEY (a, b), UNIQUE (a, c)) WITHOUT ROWID").await.unwrap();
             f.execute("BEGIN IMMEDIATE").await.unwrap();
             for i in 0..5 {
-                f.execute(&format!("INSERT INTO m VALUES ('k{i}', {i}, {i})")).await.unwrap();
+                f.execute(&format!("INSERT INTO m VALUES ('k{i}', {i}, {i})"))
+                    .await
+                    .unwrap();
             }
             f.execute("COMMIT").await.unwrap();
             f.close().await.expect("close");
         }
-        assert_eq!(stock_integrity_check(&db), vec!["ok".to_string()], "iso: distinct-leading BEGIN IMMEDIATE DELETE");
+        assert_eq!(
+            stock_integrity_check(&db),
+            vec!["ok".to_string()],
+            "iso: distinct-leading BEGIN IMMEDIATE DELETE"
+        );
     });
 }
 
@@ -130,7 +161,11 @@ fn iso_distinct_leading_begin_immediate_delete_gh353() {
 fn wr_single_col_unique_autoindex_control_gh353() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("single.sqlite").to_string_lossy().to_string();
+        let db = dir
+            .path()
+            .join("single.sqlite")
+            .to_string_lossy()
+            .to_string();
         {
             let f = Connection::open(&db).await.unwrap();
             f.execute("PRAGMA journal_mode = DELETE").await.unwrap();
@@ -142,7 +177,9 @@ fn wr_single_col_unique_autoindex_control_gh353() {
             .unwrap();
             f.execute("BEGIN IMMEDIATE").await.unwrap();
             for i in 0..5 {
-                f.execute(&format!("INSERT INTO m VALUES ('shared', {i}, 'u-{i}')")).await.unwrap();
+                f.execute(&format!("INSERT INTO m VALUES ('shared', {i}, 'u-{i}')"))
+                    .await
+                    .unwrap();
             }
             f.execute("COMMIT").await.unwrap();
             f.close().await.expect("close");

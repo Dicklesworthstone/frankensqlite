@@ -67,13 +67,13 @@ use fsqlite_core::connection::Connection;
 /// four `invalid_*` rows mirror `cast_from_blob_oracle_e2e`; the `ascii_*` and
 /// `valid_*` rows prove the UTF-16 divergence is not specific to invalid UTF-8.
 const CASES: &[(&str, &str)] = &[
-    ("ascii_A_41", "41"),                 // "A"      valid 1-byte
-    ("ascii_AB_4142", "4142"),            // "AB"     valid 2-byte
-    ("valid_u2002_e28082", "E28082"),     // U+2002   VALID 3-byte UTF-8
-    ("valid_u0080_c280", "C280"),         // U+0080   valid 2-byte UTF-8
-    ("invalid_bare_cont_80", "80"),       // bare continuation
-    ("invalid_overlong_c0af", "C0AF"),    // overlong '/'
-    ("invalid_surrogate_eda080", "EDA080"), // lone high surrogate
+    ("ascii_A_41", "41"),                       // "A"      valid 1-byte
+    ("ascii_AB_4142", "4142"),                  // "AB"     valid 2-byte
+    ("valid_u2002_e28082", "E28082"),           // U+2002   VALID 3-byte UTF-8
+    ("valid_u0080_c280", "C280"),               // U+0080   valid 2-byte UTF-8
+    ("invalid_bare_cont_80", "80"),             // bare continuation
+    ("invalid_overlong_c0af", "C0AF"),          // overlong '/'
+    ("invalid_surrogate_eda080", "EDA080"),     // lone high surrogate
     ("invalid_overlong4_f08080af", "F08080AF"), // overlong 4-byte
 ];
 
@@ -176,12 +176,18 @@ fn utf8_control_byte_preservation() {
         );
         // Concrete anchors: raw invalid bytes survive intact, not as EFBFBD.
         assert_eq!(oracle[4], "80", "stock UTF-8 keeps X'80'");
-        assert_eq!(frank_via_stock[4], "80", "frank UTF-8 keeps X'80' (no U+FFFD)");
+        assert_eq!(
+            frank_via_stock[4], "80",
+            "frank UTF-8 keeps X'80' (no U+FFFD)"
+        );
     });
 }
 
 fn cases_index(name: &str) -> usize {
-    CASES.iter().position(|(n, _)| *n == name).expect("known case")
+    CASES
+        .iter()
+        .position(|(n, _)| *n == name)
+        .expect("known case")
 }
 
 /// ACTIVE parity guard (bd-f3s2l): UTF-16LE `CAST(blob AS TEXT)` byte-relabel.
@@ -203,7 +209,8 @@ fn utf16le_cast_relabel_parity() {
         ];
         for (name, want) in expected_stock {
             assert_eq!(
-                oracle[cases_index(name)], want,
+                oracle[cases_index(name)],
+                want,
                 "stock UTF-16le byte-relabel for {name}"
             );
         }
@@ -235,7 +242,8 @@ fn utf16be_cast_relabel_parity() {
         ];
         for (name, want) in expected_stock {
             assert_eq!(
-                oracle[cases_index(name)], want,
+                oracle[cases_index(name)],
+                want,
                 "stock UTF-16be byte-relabel for {name}"
             );
         }

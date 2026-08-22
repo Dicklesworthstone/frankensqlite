@@ -28,6 +28,8 @@ fn alter_strict_add_column_datatype_error() {
         // A valid STRICT type succeeds.
         let c = Connection::open(":memory:").await.unwrap();
         c.execute("CREATE TABLE t(a INTEGER) STRICT").await.unwrap();
-        c.execute("ALTER TABLE t ADD COLUMN c TEXT").await.expect("valid STRICT ADD COLUMN");
+        c.execute("ALTER TABLE t ADD COLUMN c TEXT")
+            .await
+            .expect("valid STRICT ADD COLUMN");
     });
 }

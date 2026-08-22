@@ -31,17 +31,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -56,9 +65,14 @@ fn generated_columns_match_rusqlite_oracle() {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         for s in [
             "CREATE TABLE t(\
@@ -69,25 +83,79 @@ fn generated_columns_match_rusqlite_oracle() {
                sgn TEXT AS (CASE WHEN a < 0 THEN 'neg' WHEN a = 0 THEN 'zero' ELSE 'pos' END) VIRTUAL)",
             "CREATE INDEX iv ON t(v)",
             "INSERT INTO t(a,b) VALUES (2,3),(5,1),(-4,10),(0,7)",
-        ] { ex(&f, &r, s).await; }
+        ] {
+            ex(&f, &r, s).await;
+        }
 
-        check("computed values", fq(&f, "SELECT a,b,s,v,lbl,sgn FROM t ORDER BY a").await, rq(&r, "SELECT a,b,s,v,lbl,sgn FROM t ORDER BY a"), &mut diffs);
-        check("typeof gen", fq(&f, "SELECT typeof(s), typeof(v), typeof(lbl) FROM t WHERE a=2").await, rq(&r, "SELECT typeof(s), typeof(v), typeof(lbl) FROM t WHERE a=2"), &mut diffs);
+        check(
+            "computed values",
+            fq(&f, "SELECT a,b,s,v,lbl,sgn FROM t ORDER BY a").await,
+            rq(&r, "SELECT a,b,s,v,lbl,sgn FROM t ORDER BY a"),
+            &mut diffs,
+        );
+        check(
+            "typeof gen",
+            fq(
+                &f,
+                "SELECT typeof(s), typeof(v), typeof(lbl) FROM t WHERE a=2",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT typeof(s), typeof(v), typeof(lbl) FROM t WHERE a=2",
+            ),
+            &mut diffs,
+        );
 
         // recompute on UPDATE of a base column
         ex(&f, &r, "UPDATE t SET a = a + 100 WHERE b = 3").await;
-        check("recompute on update", fq(&f, "SELECT a,b,s,v,lbl FROM t WHERE b=3").await, rq(&r, "SELECT a,b,s,v,lbl FROM t WHERE b=3"), &mut diffs);
+        check(
+            "recompute on update",
+            fq(&f, "SELECT a,b,s,v,lbl FROM t WHERE b=3").await,
+            rq(&r, "SELECT a,b,s,v,lbl FROM t WHERE b=3"),
+            &mut diffs,
+        );
 
         // use generated columns in WHERE / ORDER BY / aggregates / index
-        check("where on stored", fq(&f, "SELECT a FROM t WHERE s > 6 ORDER BY a").await, rq(&r, "SELECT a FROM t WHERE s > 6 ORDER BY a"), &mut diffs);
-        check("order by virtual", fq(&f, "SELECT a,v FROM t ORDER BY v, a").await, rq(&r, "SELECT a,v FROM t ORDER BY v, a"), &mut diffs);
-        check("agg over generated", fq(&f, "SELECT sum(s), max(v), group_concat(lbl,'|') FROM t").await, rq(&r, "SELECT sum(s), max(v), group_concat(lbl,'|') FROM t"), &mut diffs);
-        check("index lookup on virtual", fq(&f, "SELECT a FROM t WHERE v = 5").await, rq(&r, "SELECT a FROM t WHERE v = 5"), &mut diffs);
+        check(
+            "where on stored",
+            fq(&f, "SELECT a FROM t WHERE s > 6 ORDER BY a").await,
+            rq(&r, "SELECT a FROM t WHERE s > 6 ORDER BY a"),
+            &mut diffs,
+        );
+        check(
+            "order by virtual",
+            fq(&f, "SELECT a,v FROM t ORDER BY v, a").await,
+            rq(&r, "SELECT a,v FROM t ORDER BY v, a"),
+            &mut diffs,
+        );
+        check(
+            "agg over generated",
+            fq(&f, "SELECT sum(s), max(v), group_concat(lbl,'|') FROM t").await,
+            rq(&r, "SELECT sum(s), max(v), group_concat(lbl,'|') FROM t"),
+            &mut diffs,
+        );
+        check(
+            "index lookup on virtual",
+            fq(&f, "SELECT a FROM t WHERE v = 5").await,
+            rq(&r, "SELECT a FROM t WHERE v = 5"),
+            &mut diffs,
+        );
 
         // explicit value for a generated column must be rejected -> no row added
         ex(&f, &r, "INSERT INTO t(a,b,s) VALUES (1,1,999)").await;
-        check("reject explicit gen value", fq(&f, "SELECT count(*) FROM t").await, rq(&r, "SELECT count(*) FROM t"), &mut diffs);
+        check(
+            "reject explicit gen value",
+            fq(&f, "SELECT count(*) FROM t").await,
+            rq(&r, "SELECT count(*) FROM t"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} generated-column divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} generated-column divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

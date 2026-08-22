@@ -45,9 +45,7 @@ fn stock_row_text(conn: &rusqlite::Connection, sql: &str) -> String {
                     rusqlite::types::ValueRef::Null => "NULL".to_owned(),
                     rusqlite::types::ValueRef::Integer(n) => n.to_string(),
                     rusqlite::types::ValueRef::Real(f) => format!("{f}"),
-                    rusqlite::types::ValueRef::Text(t) => {
-                        String::from_utf8_lossy(t).into_owned()
-                    }
+                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
                     rusqlite::types::ValueRef::Blob(b) => format!("blob:{}", b.len()),
                 })
                 .collect();

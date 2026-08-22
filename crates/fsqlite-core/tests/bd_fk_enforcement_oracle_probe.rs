@@ -31,17 +31,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -73,34 +82,72 @@ fn fk_enforcement_matches_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
 
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr {
-                d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"));
-            }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // insert-time violation: child with no parent must be rejected on both.
         ex(&f, &r, "INSERT INTO c_cascade VALUES (13, 500)").await;
-        check("insert-violation rejected", fq(&f, "SELECT count(*) FROM c_cascade").await, rq(&r, "SELECT count(*) FROM c_cascade"), &mut diffs);
+        check(
+            "insert-violation rejected",
+            fq(&f, "SELECT count(*) FROM c_cascade").await,
+            rq(&r, "SELECT count(*) FROM c_cascade"),
+            &mut diffs,
+        );
 
         // ON UPDATE CASCADE: change p.id 2 -> 200, cascades to c_cascade.
         ex(&f, &r, "UPDATE p SET id=200 WHERE id=2").await;
-        check("update cascade", fq(&f, "SELECT cid,pid FROM c_cascade ORDER BY cid").await, rq(&r, "SELECT cid,pid FROM c_cascade ORDER BY cid"), &mut diffs);
+        check(
+            "update cascade",
+            fq(&f, "SELECT cid,pid FROM c_cascade ORDER BY cid").await,
+            rq(&r, "SELECT cid,pid FROM c_cascade ORDER BY cid"),
+            &mut diffs,
+        );
 
         // ON DELETE CASCADE: delete p 1 -> c_cascade rows 10,11 gone.
         ex(&f, &r, "DELETE FROM p WHERE id=1").await;
-        check("delete cascade child", fq(&f, "SELECT cid,pid FROM c_cascade ORDER BY cid").await, rq(&r, "SELECT cid,pid FROM c_cascade ORDER BY cid"), &mut diffs);
+        check(
+            "delete cascade child",
+            fq(&f, "SELECT cid,pid FROM c_cascade ORDER BY cid").await,
+            rq(&r, "SELECT cid,pid FROM c_cascade ORDER BY cid"),
+            &mut diffs,
+        );
         // but SET NULL child 20 -> pid NULL (its parent 1 deleted)
-        check("delete set null", fq(&f, "SELECT cid,pid FROM c_setnull ORDER BY cid").await, rq(&r, "SELECT cid,pid FROM c_setnull ORDER BY cid"), &mut diffs);
+        check(
+            "delete set null",
+            fq(&f, "SELECT cid,pid FROM c_setnull ORDER BY cid").await,
+            rq(&r, "SELECT cid,pid FROM c_setnull ORDER BY cid"),
+            &mut diffs,
+        );
         // SET DEFAULT child 30 -> pid 99
-        check("delete set default", fq(&f, "SELECT cid,pid FROM c_setdef ORDER BY cid").await, rq(&r, "SELECT cid,pid FROM c_setdef ORDER BY cid"), &mut diffs);
+        check(
+            "delete set default",
+            fq(&f, "SELECT cid,pid FROM c_setdef ORDER BY cid").await,
+            rq(&r, "SELECT cid,pid FROM c_setdef ORDER BY cid"),
+            &mut diffs,
+        );
 
         // RESTRICT: deleting p 3 (referenced by c_restrict 40) must be rejected -> p 3 stays.
         ex(&f, &r, "DELETE FROM p WHERE id=3").await;
-        check("delete restrict rejected", fq(&f, "SELECT count(*) FROM p WHERE id=3").await, rq(&r, "SELECT count(*) FROM p WHERE id=3"), &mut diffs);
+        check(
+            "delete restrict rejected",
+            fq(&f, "SELECT count(*) FROM p WHERE id=3").await,
+            rq(&r, "SELECT count(*) FROM p WHERE id=3"),
+            &mut diffs,
+        );
 
         // parent state after all
-        check("parent final", fq(&f, "SELECT id FROM p ORDER BY id").await, rq(&r, "SELECT id FROM p ORDER BY id"), &mut diffs);
+        check(
+            "parent final",
+            fq(&f, "SELECT id FROM p ORDER BY id").await,
+            rq(&r, "SELECT id FROM p ORDER BY id"),
+            &mut diffs,
+        );
 
         assert!(
             diffs.is_empty(),

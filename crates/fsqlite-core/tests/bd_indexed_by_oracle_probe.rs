@@ -31,17 +31,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -63,34 +72,75 @@ fn indexed_by_matches_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // forced index — same results as without the hint
-        check("indexed by", fq(&f, "SELECT id,v FROM t INDEXED BY ik WHERE k=20 ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t INDEXED BY ik WHERE k=20 ORDER BY id"), &mut diffs);
+        check(
+            "indexed by",
+            fq(
+                &f,
+                "SELECT id,v FROM t INDEXED BY ik WHERE k=20 ORDER BY id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT id,v FROM t INDEXED BY ik WHERE k=20 ORDER BY id",
+            ),
+            &mut diffs,
+        );
         // NOT INDEXED — full scan, same results
-        check("not indexed", fq(&f, "SELECT id,v FROM t NOT INDEXED WHERE k=10 ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t NOT INDEXED WHERE k=10 ORDER BY id"), &mut diffs);
+        check(
+            "not indexed",
+            fq(&f, "SELECT id,v FROM t NOT INDEXED WHERE k=10 ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t NOT INDEXED WHERE k=10 ORDER BY id"),
+            &mut diffs,
+        );
         // hint with a join
         check("indexed by in join", fq(&f, "SELECT a.id,b.id FROM t a INDEXED BY ik JOIN t b ON a.k=b.k WHERE a.id<b.id ORDER BY a.id,b.id").await,
               rq(&r, "SELECT a.id,b.id FROM t a INDEXED BY ik JOIN t b ON a.k=b.k WHERE a.id<b.id ORDER BY a.id,b.id"), &mut diffs);
         // non-existent index -> error on both
-        check("no such index", fq(&f, "SELECT id FROM t INDEXED BY nope WHERE k=10").await,
-              rq(&r, "SELECT id FROM t INDEXED BY nope WHERE k=10"), &mut diffs);
+        check(
+            "no such index",
+            fq(&f, "SELECT id FROM t INDEXED BY nope WHERE k=10").await,
+            rq(&r, "SELECT id FROM t INDEXED BY nope WHERE k=10"),
+            &mut diffs,
+        );
         // an index the WHERE cannot use -> error on both (INDEXED BY forces it)
-        check("index not usable", fq(&f, "SELECT id FROM t INDEXED BY ik WHERE v='a'").await,
-              rq(&r, "SELECT id FROM t INDEXED BY ik WHERE v='a'"), &mut diffs);
+        check(
+            "index not usable",
+            fq(&f, "SELECT id FROM t INDEXED BY ik WHERE v='a'").await,
+            rq(&r, "SELECT id FROM t INDEXED BY ik WHERE v='a'"),
+            &mut diffs,
+        );
 
         // DELETE / UPDATE with INDEXED BY
         ex(&f, &r, "UPDATE t INDEXED BY ik SET v='X' WHERE k=30").await;
-        check("update indexed by", fq(&f, "SELECT id,v FROM t WHERE k=30 ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM t WHERE k=30 ORDER BY id"), &mut diffs);
+        check(
+            "update indexed by",
+            fq(&f, "SELECT id,v FROM t WHERE k=30 ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM t WHERE k=30 ORDER BY id"),
+            &mut diffs,
+        );
         ex(&f, &r, "DELETE FROM t NOT INDEXED WHERE k=10").await;
-        check("delete not indexed", fq(&f, "SELECT count(*) FROM t").await,
-              rq(&r, "SELECT count(*) FROM t"), &mut diffs);
+        check(
+            "delete not indexed",
+            fq(&f, "SELECT count(*) FROM t").await,
+            rq(&r, "SELECT count(*) FROM t"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} INDEXED BY divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} INDEXED BY divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

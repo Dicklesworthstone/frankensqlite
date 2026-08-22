@@ -42,17 +42,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -67,9 +76,14 @@ fn or_conflict_clause_match_rusqlite_oracle() {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // ── OR REPLACE across multiple unique constraints ──
         for s in [
@@ -79,9 +93,18 @@ fn or_conflict_clause_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         // this new row collides with row 1 (a='a1') AND row 2 (b='b2') -> REPLACE removes BOTH
-        ex(&f, &r, "INSERT OR REPLACE INTO u VALUES (9,'a1','b2','merged')").await;
-        check("replace multi-unique", fq(&f, "SELECT id,a,b,tag FROM u ORDER BY id").await,
-              rq(&r, "SELECT id,a,b,tag FROM u ORDER BY id"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT OR REPLACE INTO u VALUES (9,'a1','b2','merged')",
+        )
+        .await;
+        check(
+            "replace multi-unique",
+            fq(&f, "SELECT id,a,b,tag FROM u ORDER BY id").await,
+            rq(&r, "SELECT id,a,b,tag FROM u ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── OR IGNORE skips a conflicting row, continues with others ──
         for s in [
@@ -90,9 +113,18 @@ fn or_conflict_clause_match_rusqlite_oracle() {
         ] {
             ex(&f, &r, s).await;
         }
-        ex(&f, &r, "INSERT OR IGNORE INTO k VALUES (1,'dup'),(3,'three'),(2,'dup2'),(4,'four')").await;
-        check("or ignore multi", fq(&f, "SELECT id,v FROM k ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM k ORDER BY id"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT OR IGNORE INTO k VALUES (1,'dup'),(3,'three'),(2,'dup2'),(4,'four')",
+        )
+        .await;
+        check(
+            "or ignore multi",
+            fq(&f, "SELECT id,v FROM k ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM k ORDER BY id"),
+            &mut diffs,
+        );
 
         // NOTE: INSERT OR ABORT and the default/implicit ABORT of a plain multi-row
         // INSERT are a known divergence tracked in bd-01qa9 (frank retains rows
@@ -107,9 +139,18 @@ fn or_conflict_clause_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         // id=10 inserted, then id=5 fails -> id=10 SURVIVES (OR FAIL), id=11 not reached
-        ex(&f, &r, "INSERT OR FAIL INTO fl VALUES (10,'ten'),(5,'dup'),(11,'eleven')").await;
-        check("or fail keeps earlier", fq(&f, "SELECT id,v FROM fl ORDER BY id").await,
-              rq(&r, "SELECT id,v FROM fl ORDER BY id"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT OR FAIL INTO fl VALUES (10,'ten'),(5,'dup'),(11,'eleven')",
+        )
+        .await;
+        check(
+            "or fail keeps earlier",
+            fq(&f, "SELECT id,v FROM fl ORDER BY id").await,
+            rq(&r, "SELECT id,v FROM fl ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── OR REPLACE via UPDATE that would violate a unique constraint ──
         for s in [
@@ -120,12 +161,20 @@ fn or_conflict_clause_match_rusqlite_oracle() {
         }
         // UPDATE OR REPLACE: setting id=2's u to 'x' collides with id=1 -> id=1 removed
         ex(&f, &r, "UPDATE OR REPLACE up SET u='x' WHERE id=2").await;
-        check("update or replace", fq(&f, "SELECT id,u FROM up ORDER BY id").await,
-              rq(&r, "SELECT id,u FROM up ORDER BY id"), &mut diffs);
+        check(
+            "update or replace",
+            fq(&f, "SELECT id,u FROM up ORDER BY id").await,
+            rq(&r, "SELECT id,u FROM up ORDER BY id"),
+            &mut diffs,
+        );
         // UPDATE OR IGNORE: a colliding update is skipped (row unchanged)
         ex(&f, &r, "UPDATE OR IGNORE up SET u='z' WHERE id=2").await; // 'z' belongs to id=3 -> ignored
-        check("update or ignore", fq(&f, "SELECT id,u FROM up ORDER BY id").await,
-              rq(&r, "SELECT id,u FROM up ORDER BY id"), &mut diffs);
+        check(
+            "update or ignore",
+            fq(&f, "SELECT id,u FROM up ORDER BY id").await,
+            rq(&r, "SELECT id,u FROM up ORDER BY id"),
+            &mut diffs,
+        );
 
         // ── OR REPLACE resetting rowid/autoincrement interaction ──
         for s in [
@@ -135,9 +184,18 @@ fn or_conflict_clause_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         ex(&f, &r, "INSERT OR REPLACE INTO ai(v) VALUES ('q')").await; // replaces the 'q' row with a new id
-        check("replace autoinc", fq(&f, "SELECT v FROM ai ORDER BY v").await,
-              rq(&r, "SELECT v FROM ai ORDER BY v"), &mut diffs);
+        check(
+            "replace autoinc",
+            fq(&f, "SELECT v FROM ai ORDER BY v").await,
+            rq(&r, "SELECT v FROM ai ORDER BY v"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} OR-conflict divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} OR-conflict divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

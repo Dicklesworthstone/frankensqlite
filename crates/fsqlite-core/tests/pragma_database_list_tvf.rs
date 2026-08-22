@@ -70,7 +70,13 @@ fn pragma_database_list_table_valued_function() {
                 ref o => panic!("name not text: {o:?}"),
             })
             .collect();
-        assert!(attached.contains(&"main".to_owned()), "main missing: {attached:?}");
-        assert!(attached.contains(&"aux2".to_owned()), "attached db missing: {attached:?}");
+        assert!(
+            attached.contains(&"main".to_owned()),
+            "main missing: {attached:?}"
+        );
+        assert!(
+            attached.contains(&"aux2".to_owned()),
+            "attached db missing: {attached:?}"
+        );
     });
 }

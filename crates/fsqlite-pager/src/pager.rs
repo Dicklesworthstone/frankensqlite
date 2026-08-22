@@ -8834,9 +8834,7 @@ impl<F: VfsFile> PagerInner<F> {
             let mut reparked = 0_usize;
             for page in std::mem::take(&mut self.freelist) {
                 let raw = page.get();
-                if raw > 1
-                    && raw <= effective_db_size
-                    && !self.durable_freelist_view.contains(&raw)
+                if raw > 1 && raw <= effective_db_size && !self.durable_freelist_view.contains(&raw)
                 {
                     self.abandoned_eof_reservations.push(page);
                     reparked += 1;
@@ -13821,10 +13819,7 @@ where
     /// changes from this connection, so a plain shared read yields a consistent
     /// image — no reader-count gate is needed either, since concurrent readers
     /// cannot mutate a read-only file.
-    async fn capture_vacuum_source_image_readonly(
-        &self,
-        cx: &Cx,
-    ) -> Result<DatabaseImageReceipt> {
+    async fn capture_vacuum_source_image_readonly(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
         self.validate_namespace_binding()?;
         let (db_file, page_size) = {
@@ -15070,7 +15065,10 @@ where
             });
         }
         let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-            map_database_header_error(&error, "invalid database header during recovery-mode detection")
+            map_database_header_error(
+                &error,
+                "invalid database header during recovery-mode detection",
+            )
         })?;
         Self::journal_mode_from_database_header(&header)
     }
@@ -15879,7 +15877,11 @@ where
         };
         #[cfg(all(feature = "native", any(unix, windows)))]
         if disposition == ReadWriteOpenDisposition::ReservedEmpty && pending_namespace.is_some() {
-            validate_reserved_database_artifacts(&db_path, WindowsLockSidecarPolicy::RejectAll, None)?;
+            validate_reserved_database_artifacts(
+                &db_path,
+                WindowsLockSidecarPolicy::RejectAll,
+                None,
+            )?;
         }
         #[cfg(all(feature = "native", any(unix, windows)))]
         let namespace_expected_identity = pending_namespace
@@ -16076,73 +16078,72 @@ where
         // reserved file falls through to the same coherent-header read every other
         // disposition uses (its reserved identity was validated when the file was
         // opened; re-check it here before treating it as open-existing).
-        let reserved_empty_existing_size = if disposition
-            == ReadWriteOpenDisposition::ReservedEmpty
+        let reserved_empty_existing_size = if disposition == ReadWriteOpenDisposition::ReservedEmpty
         {
             Some(shared_db_file_read(&db_file, cx).await?.file_size(cx)?)
         } else {
             None
         };
-        let (mut file_size, coherent_header_bytes, accept_proven_non_hot_leftover) = if reserved_empty_existing_size
-            == Some(0)
-        {
-            (0, None, false)
-        } else {
-            if reserved_empty_existing_size.is_some() && database_identity != expected_identity {
-                // A reserved slot holding a populated DB with a DIFFERENT identity
-                // than reserved is a genuine mismatch — reject.
-                return Err(FrankenError::CannotOpen { path: db_path });
-            }
-            let mut accept_proven_non_hot_leftover = false;
-            loop {
-                // Never wait for the recovery fence while holding main
-                // SHARED: another opener may own the fence while trying to
-                // upgrade to EXCLUSIVE. An unlocked existence probe is only
-                // a routing hint; every decision is rechecked under a lock.
-                if vfs.access(cx, &journal_path, AccessFlags::EXISTS)?
-                    && !accept_proven_non_hot_leftover
+        let (mut file_size, coherent_header_bytes, accept_proven_non_hot_leftover) =
+            if reserved_empty_existing_size == Some(0) {
+                (0, None, false)
+            } else {
+                if reserved_empty_existing_size.is_some() && database_identity != expected_identity
                 {
-                    let _recovery_guard = recovery_fence.acquire_for_recovery()?;
-                    let prior_kind = maintenance_open_lease.upgrade_to_exclusive(None)?;
-                    let recovery_result = Self::recover_rollback_journal_for_open(
-                        cx,
-                        &*vfs,
-                        RollbackJournalOpenRecoveryContext {
-                            group_commit_queue: &group_commit_queue,
-                            db_file: &db_file,
-                            current_db_path: &db_path,
-                            current_db_identity: database_identity,
-                            journal_path: &journal_path,
-                        },
-                        None,
-                    )
-                    .await;
-                    let cleanup_cx = cleanup_child_cx(cx);
-                    let _cleanup_mask = cleanup_cx.masked();
-                    let downgrade_result =
-                        maintenance_open_lease.downgrade_from_exclusive(prior_kind);
-                    match (recovery_result, downgrade_result) {
-                        (Ok(outcome), Ok(())) => {
-                            accept_proven_non_hot_leftover = outcome.is_some();
-                        }
-                        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
-                        (Err(recovery_error), Err(downgrade_error)) => {
-                            return Err(FrankenError::internal(format!(
-                                "open-time rollback recovery failed and could not restore its maintenance lease: recovery={recovery_error}; downgrade={downgrade_error}"
-                            )));
-                        }
-                    }
-                    continue;
+                    // A reserved slot holding a populated DB with a DIFFERENT identity
+                    // than reserved is a genuine mismatch — reject.
+                    return Err(FrankenError::CannotOpen { path: db_path });
                 }
+                let mut accept_proven_non_hot_leftover = false;
+                loop {
+                    // Never wait for the recovery fence while holding main
+                    // SHARED: another opener may own the fence while trying to
+                    // upgrade to EXCLUSIVE. An unlocked existence probe is only
+                    // a routing hint; every decision is rechecked under a lock.
+                    if vfs.access(cx, &journal_path, AccessFlags::EXISTS)?
+                        && !accept_proven_non_hot_leftover
+                    {
+                        let _recovery_guard = recovery_fence.acquire_for_recovery()?;
+                        let prior_kind = maintenance_open_lease.upgrade_to_exclusive(None)?;
+                        let recovery_result = Self::recover_rollback_journal_for_open(
+                            cx,
+                            &*vfs,
+                            RollbackJournalOpenRecoveryContext {
+                                group_commit_queue: &group_commit_queue,
+                                db_file: &db_file,
+                                current_db_path: &db_path,
+                                current_db_identity: database_identity,
+                                journal_path: &journal_path,
+                            },
+                            None,
+                        )
+                        .await;
+                        let cleanup_cx = cleanup_child_cx(cx);
+                        let _cleanup_mask = cleanup_cx.masked();
+                        let downgrade_result =
+                            maintenance_open_lease.downgrade_from_exclusive(prior_kind);
+                        match (recovery_result, downgrade_result) {
+                            (Ok(outcome), Ok(())) => {
+                                accept_proven_non_hot_leftover = outcome.is_some();
+                            }
+                            (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+                            (Err(recovery_error), Err(downgrade_error)) => {
+                                return Err(FrankenError::internal(format!(
+                                    "open-time rollback recovery failed and could not restore its maintenance lease: recovery={recovery_error}; downgrade={downgrade_error}"
+                                )));
+                            }
+                        }
+                        continue;
+                    }
 
-                let mut snapshot_state = (
-                    Arc::clone(&vfs),
-                    journal_path.clone(),
-                    accept_proven_non_hot_leftover,
-                    disposition,
-                    db_path.clone(),
-                );
-                let snapshot = with_main_shared_lock(
+                    let mut snapshot_state = (
+                        Arc::clone(&vfs),
+                        journal_path.clone(),
+                        accept_proven_non_hot_leftover,
+                        disposition,
+                        db_path.clone(),
+                    );
+                    let snapshot = with_main_shared_lock(
                     cx,
                     &group_commit_queue,
                     &db_file,
@@ -16189,12 +16190,12 @@ where
                     })
                 })
                 .await?;
-                if let Some((file_size, header_bytes)) = snapshot {
-                    break (file_size, header_bytes, accept_proven_non_hot_leftover);
+                    if let Some((file_size, header_bytes)) = snapshot {
+                        break (file_size, header_bytes, accept_proven_non_hot_leftover);
+                    }
+                    accept_proven_non_hot_leftover = false;
                 }
-                accept_proven_non_hot_leftover = false;
-            }
-        };
+            };
 
         let page_size = if let Some(header_bytes) = coherent_header_bytes.as_ref() {
             match DatabaseHeader::from_bytes(header_bytes) {
@@ -23232,8 +23233,7 @@ where
                                     .copied()
                                     .map(PageNumber::get)
                                     .filter(|page| {
-                                        *page <= committed_db_size
-                                            && !published_set.contains(page)
+                                        *page <= committed_db_size && !published_set.contains(page)
                                     })
                                     .collect();
                                 if !dropped.is_empty() {
@@ -24049,8 +24049,7 @@ where
                                     .copied()
                                     .map(PageNumber::get)
                                     .filter(|page| {
-                                        *page <= committed_db_size
-                                            && !published_set.contains(page)
+                                        *page <= committed_db_size && !published_set.contains(page)
                                     })
                                     .collect();
                                 if !dropped.is_empty() {
@@ -29382,7 +29381,10 @@ mod tests {
                 .await
                 .expect("bead_id=bd-gzyk1 case=post_cancel_refresh_must_converge");
             {
-                let after = pager.begin(&fresh, TransactionMode::ReadOnly).await.unwrap();
+                let after = pager
+                    .begin(&fresh, TransactionMode::ReadOnly)
+                    .await
+                    .unwrap();
                 drop(after);
             }
             assert_eq!(

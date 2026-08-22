@@ -2102,13 +2102,19 @@ mod tests {
         let s = |x: &str| Some(x.to_owned());
 
         // Month/year overflow normalizes forward (ceiling is the default).
-        assert_eq!(date(&[text("2020-01-31"), text("+1 month")]), s("2020-03-02"));
+        assert_eq!(
+            date(&[text("2020-01-31"), text("+1 month")]),
+            s("2020-03-02")
+        );
         assert_eq!(
             date(&[text("2020-01-31"), text("+1 month"), text("+1 month")]),
             s("2020-04-02")
         );
         assert_eq!(date(&[text("2021-02-28"), text("+1 day")]), s("2021-03-01"));
-        assert_eq!(date(&[text("2020-02-29"), text("+1 year")]), s("2021-03-01"));
+        assert_eq!(
+            date(&[text("2020-02-29"), text("+1 year")]),
+            s("2021-03-01")
+        );
         // A literal date validates day<=31 (NOT days-in-month), then JDN math
         // normalizes: Feb 30 -> Mar 1.
         assert_eq!(date(&[text("2020-02-30")]), s("2020-03-01"));
@@ -2122,26 +2128,68 @@ mod tests {
             s("2021-02-28")
         );
         // start-of / weekday (0..=6; 7 is out of range -> NULL).
-        assert_eq!(date(&[text("2020-01-31"), text("start of month")]), s("2020-01-01"));
-        assert_eq!(date(&[text("2020-06-15"), text("weekday 0")]), s("2020-06-21"));
-        assert_eq!(date(&[text("2020-06-15"), text("weekday 6")]), s("2020-06-20"));
+        assert_eq!(
+            date(&[text("2020-01-31"), text("start of month")]),
+            s("2020-01-01")
+        );
+        assert_eq!(
+            date(&[text("2020-06-15"), text("weekday 0")]),
+            s("2020-06-21")
+        );
+        assert_eq!(
+            date(&[text("2020-06-15"), text("weekday 6")]),
+            s("2020-06-20")
+        );
         assert_eq!(date(&[text("2020-06-15"), text("weekday 7")]), None);
         // Fractional month/year (bd-datetime-fractional-month-year-ag5fo): the integer part recomposes the
         // calendar; the remainder adds FLAT days (30/month, 365/year) AFTER,
         // signed like the modifier — NOT `value * average-month-length`.
-        assert_eq!(date(&[text("2020-01-15"), text("+1.5 months")]), s("2020-03-01"));
-        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+0.5 months")]), s("2020-01-30 00:00:00"));
-        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+1.5 months")]), s("2020-03-01 00:00:00"));
-        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+2.5 months")]), s("2020-03-30 00:00:00"));
-        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+1.25 months")]), s("2020-02-22 12:00:00"));
-        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+1.75 months")]), s("2020-03-08 12:00:00"));
-        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("-0.5 months")]), s("2019-12-31 00:00:00"));
-        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("-1.5 months")]), s("2019-11-30 00:00:00"));
+        assert_eq!(
+            date(&[text("2020-01-15"), text("+1.5 months")]),
+            s("2020-03-01")
+        );
+        assert_eq!(
+            dtime(&[text("2020-01-15 00:00:00"), text("+0.5 months")]),
+            s("2020-01-30 00:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2020-01-15 00:00:00"), text("+1.5 months")]),
+            s("2020-03-01 00:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2020-01-15 00:00:00"), text("+2.5 months")]),
+            s("2020-03-30 00:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2020-01-15 00:00:00"), text("+1.25 months")]),
+            s("2020-02-22 12:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2020-01-15 00:00:00"), text("+1.75 months")]),
+            s("2020-03-08 12:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2020-01-15 00:00:00"), text("-0.5 months")]),
+            s("2019-12-31 00:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2020-01-15 00:00:00"), text("-1.5 months")]),
+            s("2019-11-30 00:00:00")
+        );
         // Integer recomposition (ceiling) happens BEFORE the fractional days.
-        assert_eq!(dtime(&[text("2020-01-31 00:00:00"), text("+1.5 months")]), s("2020-03-17 00:00:00"));
+        assert_eq!(
+            dtime(&[text("2020-01-31 00:00:00"), text("+1.5 months")]),
+            s("2020-03-17 00:00:00")
+        );
         // Fractional years use 365 flat days for the remainder.
-        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+1.5 years")]), s("2021-07-16 12:00:00"));
-        assert_eq!(dtime(&[text("2020-01-15 00:00:00"), text("+0.5 years")]), s("2020-07-15 12:00:00"));
+        assert_eq!(
+            dtime(&[text("2020-01-15 00:00:00"), text("+1.5 years")]),
+            s("2021-07-16 12:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2020-01-15 00:00:00"), text("+0.5 years")]),
+            s("2020-07-15 12:00:00")
+        );
         // Invalid month / unparseable -> NULL.
         assert_eq!(date(&[text("2020-13-01")]), None);
         assert_eq!(date(&[text("2020-00-10")]), None);
@@ -2152,22 +2200,40 @@ mod tests {
             dtime(&[text("2020-06-15 12:34:56"), text("start of day")]),
             s("2020-06-15 00:00:00")
         );
-        assert_eq!(dtime(&[text("2020-01-01"), text("+90 minutes")]), s("2020-01-01 01:30:00"));
-        assert_eq!(dtime(&[text("2020-01-01"), text("+1.5 days")]), s("2020-01-02 12:00:00"));
-        assert_eq!(dtime(&[int(0), text("unixepoch")]), s("1970-01-01 00:00:00"));
+        assert_eq!(
+            dtime(&[text("2020-01-01"), text("+90 minutes")]),
+            s("2020-01-01 01:30:00")
+        );
+        assert_eq!(
+            dtime(&[text("2020-01-01"), text("+1.5 days")]),
+            s("2020-01-02 12:00:00")
+        );
+        assert_eq!(
+            dtime(&[int(0), text("unixepoch")]),
+            s("1970-01-01 00:00:00")
+        );
 
         // strftime format codes.
-        assert_eq!(strf(&[text("%f"), text("2020-01-01 00:00:01.25")]), s("01.250"));
+        assert_eq!(
+            strf(&[text("%f"), text("2020-01-01 00:00:01.25")]),
+            s("01.250")
+        );
         assert_eq!(strf(&[text("%j"), text("2020-03-01")]), s("061"));
         assert_eq!(strf(&[text("%w"), text("2020-06-15")]), s("1"));
         assert_eq!(strf(&[text("%W"), text("2020-01-01")]), s("00"));
-        assert_eq!(strf(&[text("%s"), text("2020-01-01 00:00:00")]), s("1577836800"));
+        assert_eq!(
+            strf(&[text("%s"), text("2020-01-01 00:00:00")]),
+            s("1577836800")
+        );
         assert_eq!(strf(&[text("%e"), text("2020-06-05")]), s(" 5"));
         assert_eq!(strf(&[text("%I"), text("2020-06-15 13:00:00")]), s("01"));
         assert_eq!(strf(&[text("%p"), text("2020-06-15 13:00:00")]), s("PM"));
         assert_eq!(strf(&[text("%P"), text("2020-06-15 13:00:00")]), s("pm"));
         assert_eq!(strf(&[text("%R"), text("2020-06-15 13:05:00")]), s("13:05"));
-        assert_eq!(strf(&[text("%T"), text("2020-06-15 13:05:07")]), s("13:05:07"));
+        assert_eq!(
+            strf(&[text("%T"), text("2020-06-15 13:05:07")]),
+            s("13:05:07")
+        );
         // ISO 8601 week/year boundaries (the trickiest: a January date whose ISO
         // year is the PRIOR calendar year, and week 53).
         assert_eq!(strf(&[text("%G"), text("2020-12-31")]), s("2020"));
@@ -2175,13 +2241,18 @@ mod tests {
         assert_eq!(strf(&[text("%u"), text("2020-06-15")]), s("1"));
         assert_eq!(strf(&[text("%g"), text("2021-01-01")]), s("20"));
         assert_eq!(strf(&[text("%V"), text("2021-01-01")]), s("53"));
-        assert_eq!(strf(&[text("%G-%V-%u"), text("2021-01-01")]), s("2020-53-5"));
+        assert_eq!(
+            strf(&[text("%G-%V-%u"), text("2021-01-01")]),
+            s("2020-53-5")
+        );
         assert_eq!(strf(&[text("%V"), text("2016-01-01")]), s("53"));
         assert_eq!(strf(&[text("%V"), text("2018-12-31")]), s("01"));
 
         // julianday is exact for a round value.
         assert_eq!(
-            JuliandayFunc.invoke(&[text("2000-01-01 12:00:00")]).unwrap(),
+            JuliandayFunc
+                .invoke(&[text("2000-01-01 12:00:00")])
+                .unwrap(),
             SqliteValue::Float(2451545.0)
         );
     }
@@ -2208,7 +2279,9 @@ mod tests {
 
         // timediff(A, B) = A - B, formatted +YYYY-MM-DD HH:MM:SS.SSS.
         assert_eq!(
-            TimediffFunc.invoke(&[text("2020-03-01"), text("2020-01-15")]).unwrap(),
+            TimediffFunc
+                .invoke(&[text("2020-03-01"), text("2020-01-15")])
+                .unwrap(),
             txt("+0000-01-15 00:00:00.000")
         );
         assert_eq!(
@@ -2219,21 +2292,41 @@ mod tests {
         );
 
         // strftime codes: %J full julian day, %k/%l space-padded hours, %f, %s.
-        assert_eq!(strf(&[text("%J"), text("2000-01-01 18:00:00")]), "2451545.25");
+        assert_eq!(
+            strf(&[text("%J"), text("2000-01-01 18:00:00")]),
+            "2451545.25"
+        );
         assert_eq!(strf(&[text("%k"), text("2020-06-15 09:00:00")]), " 9");
         assert_eq!(strf(&[text("%l"), text("2020-06-15 13:00:00")]), " 1");
-        assert_eq!(strf(&[text("%f"), text("2020-01-01 00:00:00.999")]), "00.999");
-        assert_eq!(strf(&[text("%s"), text("2020-01-01 00:00:00.5")]), "1577836800");
+        assert_eq!(
+            strf(&[text("%f"), text("2020-01-01 00:00:00.999")]),
+            "00.999"
+        );
+        assert_eq!(
+            strf(&[text("%s"), text("2020-01-01 00:00:00.5")]),
+            "1577836800"
+        );
 
         // subsec / unixepoch-of-float / out-of-range.
-        assert_eq!(dtime(&[text("2020-01-01 00:00:00"), text("subsec")]), s("2020-01-01 00:00:00.000"));
-        assert_eq!(dtime(&[float(1_577_836_800.5), text("unixepoch")]), s("2020-01-01 00:00:00"));
+        assert_eq!(
+            dtime(&[text("2020-01-01 00:00:00"), text("subsec")]),
+            s("2020-01-01 00:00:00.000")
+        );
+        assert_eq!(
+            dtime(&[float(1_577_836_800.5), text("unixepoch")]),
+            s("2020-01-01 00:00:00")
+        );
         assert_eq!(dtime(&[text("2020-01-01"), text("+100000000 days")]), None);
 
         // julianday / unixepoch subsec (exact float).
-        assert_eq!(JuliandayFunc.invoke(&[text("1970-01-01")]).unwrap(), SqliteValue::Float(2440587.5));
         assert_eq!(
-            UnixepochFunc.invoke(&[text("2020-01-01"), text("subsec")]).unwrap(),
+            JuliandayFunc.invoke(&[text("1970-01-01")]).unwrap(),
+            SqliteValue::Float(2440587.5)
+        );
+        assert_eq!(
+            UnixepochFunc
+                .invoke(&[text("2020-01-01"), text("subsec")])
+                .unwrap(),
             SqliteValue::Float(1_577_836_800.0)
         );
     }
@@ -2336,21 +2429,38 @@ mod tests {
         // unixepoch() number. Verified against SQLite 3.53. Guards the
         // post-modifier range check in `parse_args`.
         let over_datetime = &[text("9999-12-31 23:59:59"), text("+1 second")];
-        assert_eq!(DateTimeFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
-        assert_eq!(TimeFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
-        assert_eq!(JuliandayFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
-        assert_eq!(UnixepochFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
         assert_eq!(
-            DateFunc.invoke(&[text("9999-12-31"), text("+1 day")]).unwrap(),
+            DateTimeFunc.invoke(over_datetime).unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(TimeFunc.invoke(over_datetime).unwrap(), SqliteValue::Null);
+        assert_eq!(
+            JuliandayFunc.invoke(over_datetime).unwrap(),
             SqliteValue::Null
         );
         assert_eq!(
-            DateTimeFunc.invoke(&[text("9999-12-31"), text("+1 month")]).unwrap(),
+            UnixepochFunc.invoke(over_datetime).unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            DateFunc
+                .invoke(&[text("9999-12-31"), text("+1 day")])
+                .unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            DateTimeFunc
+                .invoke(&[text("9999-12-31"), text("+1 month")])
+                .unwrap(),
             SqliteValue::Null
         );
         assert_eq!(
             StrftimeFunc
-                .invoke(&[text("%Y-%m-%d"), text("9999-12-31 23:59:59"), text("+1 second")])
+                .invoke(&[
+                    text("%Y-%m-%d"),
+                    text("9999-12-31 23:59:59"),
+                    text("+1 second")
+                ])
                 .unwrap(),
             SqliteValue::Null
         );
@@ -2390,7 +2500,9 @@ mod tests {
             "-0001-12-31 23:59:59",
         );
         assert_text(
-            &DateFunc.invoke(&[text("0000-01-01"), text("-1 day")]).unwrap(),
+            &DateFunc
+                .invoke(&[text("0000-01-01"), text("-1 day")])
+                .unwrap(),
             "-0001-12-31",
         );
         assert_text(
@@ -2410,7 +2522,10 @@ mod tests {
             &DateTimeFunc.invoke(&[text("2024-03-15 14:30:00")]).unwrap(),
             "2024-03-15 14:30:00",
         );
-        assert_text(&DateFunc.invoke(&[text("0000-01-01")]).unwrap(), "0000-01-01");
+        assert_text(
+            &DateFunc.invoke(&[text("0000-01-01")]).unwrap(),
+            "0000-01-01",
+        );
         // strftime('%Y') keeps the sign INSIDE a 4-wide field ("-001"), matching
         // SQLite's separate strftime path — this fix must not touch it.
         assert_text(

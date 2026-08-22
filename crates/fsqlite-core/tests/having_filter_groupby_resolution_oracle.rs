@@ -19,7 +19,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -28,14 +31,20 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn assert_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &str) {
     let f: Result<Vec<Vec<String>>, ()> = match fconn.query(sql).await {
         Ok(rows) => {
-            let mut v: Vec<Vec<String>> = rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect();
+            let mut v: Vec<Vec<String>> = rows
+                .iter()
+                .map(|r| r.values().iter().map(tag_f).collect())
+                .collect();
             v.sort();
             Ok(v)
         }
@@ -45,7 +54,11 @@ async fn assert_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &st
         let mut st = rconn.prepare(sql).map_err(|_| ())?;
         let n = st.column_count();
         let mut rows: Vec<Vec<String>> = st
-            .query_map([], |row| Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect()))
+            .query_map([], |row| {
+                Ok((0..n)
+                    .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                    .collect())
+            })
             .map_err(|_| ())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ())?;
@@ -76,7 +89,12 @@ fn having_aggregate_filter_grouped_gh234() {
         let r = rusqlite::Connection::open_in_memory().unwrap();
         seed(&f, &r).await;
         // FILTER restricts the aggregate inside the HAVING term (per group).
-        assert_agree(&f, &r, "SELECT g FROM t GROUP BY g HAVING sum(x) FILTER (WHERE x > 0) > 6 ORDER BY g").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT g FROM t GROUP BY g HAVING sum(x) FILTER (WHERE x > 0) > 6 ORDER BY g",
+        )
+        .await;
         assert_agree(&f, &r, "SELECT g, count(*) FILTER (WHERE x > 0) AS pos FROM t GROUP BY g HAVING count(*) FILTER (WHERE x > 0) = 1 ORDER BY g").await;
     });
 }
@@ -88,8 +106,18 @@ fn having_aggregate_filter_no_group_by_gh235() {
         let r = rusqlite::Connection::open_in_memory().unwrap();
         seed(&f, &r).await;
         // Implicit single group: FILTER applies inside the HAVING aggregate.
-        assert_agree(&f, &r, "SELECT sum(x) FROM t HAVING count(*) FILTER (WHERE x > 0) = 3").await;
-        assert_agree(&f, &r, "SELECT sum(x) FROM t HAVING sum(x) FILTER (WHERE x > 0) > 100").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT sum(x) FROM t HAVING count(*) FILTER (WHERE x > 0) = 3",
+        )
+        .await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT sum(x) FROM t HAVING sum(x) FILTER (WHERE x > 0) > 100",
+        )
+        .await;
     });
 }
 

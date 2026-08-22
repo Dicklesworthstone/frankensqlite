@@ -79,14 +79,14 @@ fn dml_conflict_and_returning_match_rusqlite_oracle() {
 
         // Conflict resolution + RETURNING, applied to both engines.
         for sql in [
-            "INSERT OR IGNORE INTO t VALUES (1,'x',999)",              // PK conflict -> ignored
-            "INSERT OR REPLACE INTO t VALUES (2,'b2',222)",            // PK conflict -> replace
-            "INSERT OR REPLACE INTO t(id,u,v) VALUES (99,'a',111)",    // UNIQUE(u) conflict -> replace row 1
-            "INSERT INTO t VALUES (5,'e',50) RETURNING id, v, v*2",    // RETURNING
-            "UPDATE t SET v = v + 1 WHERE v >= 20 RETURNING id, v",    // multi-row UPDATE RETURNING
+            "INSERT OR IGNORE INTO t VALUES (1,'x',999)", // PK conflict -> ignored
+            "INSERT OR REPLACE INTO t VALUES (2,'b2',222)", // PK conflict -> replace
+            "INSERT OR REPLACE INTO t(id,u,v) VALUES (99,'a',111)", // UNIQUE(u) conflict -> replace row 1
+            "INSERT INTO t VALUES (5,'e',50) RETURNING id, v, v*2", // RETURNING
+            "UPDATE t SET v = v + 1 WHERE v >= 20 RETURNING id, v", // multi-row UPDATE RETURNING
             "DELETE FROM t WHERE id IN (SELECT id FROM t WHERE v > 100) RETURNING id",
             "INSERT INTO t(id,u,v) SELECT id+100, u||'_c', v FROM t WHERE v < 60 RETURNING id",
-            "UPDATE OR IGNORE t SET u='b2' WHERE id=5",               // would violate UNIQUE -> ignore
+            "UPDATE OR IGNORE t SET u='b2' WHERE id=5", // would violate UNIQUE -> ignore
         ] {
             if let Some(d) = both(&f, &r, sql).await {
                 diffs.push(d);

@@ -43,14 +43,18 @@ fn bd_fts5_lazy_docsize_origin_populated_and_stock_readable() {
                 .expect("batch 1 insert");
             // Batch 2 (rows 3,4): incremental append -> a new segment with its
             // own origin; docsize origin is populated for these rows.
-            conn.execute("INSERT INTO t(rowid, body) VALUES (3, 'gamma rust'), (4, 'delta search');")
-                .await
-                .expect("batch 2 insert");
+            conn.execute(
+                "INSERT INTO t(rowid, body) VALUES (3, 'gamma rust'), (4, 'delta search');",
+            )
+            .await
+            .expect("batch 2 insert");
             // Batch 3 (rows 5,6): another incremental append -> a later, larger
             // origin than batch 2.
-            conn.execute("INSERT INTO t(rowid, body) VALUES (5, 'epsilon rust'), (6, 'zeta search');")
-                .await
-                .expect("batch 3 insert");
+            conn.execute(
+                "INSERT INTO t(rowid, body) VALUES (5, 'epsilon rust'), (6, 'zeta search');",
+            )
+            .await
+            .expect("batch 3 insert");
 
             conn.close().await.expect("flush + close");
         }
@@ -61,7 +65,10 @@ fn bd_fts5_lazy_docsize_origin_populated_and_stock_readable() {
         let integrity: String = stock
             .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(integrity, "ok", "stock integrity_check on the fsqlite image");
+        assert_eq!(
+            integrity, "ok",
+            "stock integrity_check on the fsqlite image"
+        );
 
         // Corpus intact + matchable (5 rows contain 'rust': 1,2,3,5).
         let matched: Vec<i64> = stock
@@ -71,7 +78,11 @@ fn bd_fts5_lazy_docsize_origin_populated_and_stock_readable() {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(matched, vec![1, 2, 3, 5], "stock MATCH over the full corpus");
+        assert_eq!(
+            matched,
+            vec![1, 2, 3, 5],
+            "stock MATCH over the full corpus"
+        );
 
         // ── The `_docsize.origin` column: read every row's origin. ────────
         let origins: Vec<(i64, Option<i64>)> = stock
@@ -88,16 +99,31 @@ fn bd_fts5_lazy_docsize_origin_populated_and_stock_readable() {
         // Batch 1 (full re-encode): both rows share the single re-encoded
         // segment's origin — now populated too (Stage 1b).
         let o1 = origin_of(1).expect("batch-1 row 1 origin populated (full-encode)");
-        assert_eq!(origin_of(2), Some(o1), "batch-1 rows share one segment origin");
+        assert_eq!(
+            origin_of(2),
+            Some(o1),
+            "batch-1 rows share one segment origin"
+        );
 
         // Batch 2 (incremental): both rows share a later segment origin.
         let o2 = origin_of(3).expect("batch-2 row 3 origin populated");
-        assert_eq!(origin_of(4), Some(o2), "batch-2 rows share one segment origin");
+        assert_eq!(
+            origin_of(4),
+            Some(o2),
+            "batch-2 rows share one segment origin"
+        );
 
         // Batch 3 (incremental): both rows share a later, larger origin.
         let o3 = origin_of(5).expect("batch-3 row 5 origin populated");
-        assert_eq!(origin_of(6), Some(o3), "batch-3 rows share one segment origin");
+        assert_eq!(
+            origin_of(6),
+            Some(o3),
+            "batch-3 rows share one segment origin"
+        );
         assert!(o2 > o1, "batch 2 origin exceeds batch 1: {o2} > {o1}");
-        assert!(o3 > o2, "later batch has a larger origin (monotonic): {o3} > {o2}");
+        assert!(
+            o3 > o2,
+            "later batch has a larger origin (monotonic): {o3} > {o2}"
+        );
     });
 }

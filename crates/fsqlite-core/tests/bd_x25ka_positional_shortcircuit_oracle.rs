@@ -77,11 +77,7 @@ async fn assert_matches_stock(schema: &[&str], rows: &[&str], queries: &[&str]) 
 
         match (&frank_res, &stock_res) {
             (Ok(fr), Ok(sr)) => {
-                assert_eq!(
-                    frank_rows_text(fr),
-                    *sr,
-                    "bd-x25ka: rows diverged on `{q}`"
-                );
+                assert_eq!(frank_rows_text(fr), *sr, "bd-x25ka: rows diverged on `{q}`");
             }
             (Err(_), Err(_)) => { /* both error: agree */ }
             (Ok(fr), Err(se)) => panic!(
@@ -89,9 +85,9 @@ async fn assert_matches_stock(schema: &[&str], rows: &[&str], queries: &[&str]) 
                  a dead-branch error was silently swallowed",
                 frank_rows_text(fr)
             ),
-            (Err(fe), Ok(sr)) => panic!(
-                "bd-x25ka: frank ERRORED ({fe}) but stock SUCCEEDED (rows={sr:?}) on `{q}`"
-            ),
+            (Err(fe), Ok(sr)) => {
+                panic!("bd-x25ka: frank ERRORED ({fe}) but stock SUCCEEDED (rows={sr:?}) on `{q}`")
+            }
         }
     }
 }
@@ -100,10 +96,7 @@ async fn assert_matches_stock(schema: &[&str], rows: &[&str], queries: &[&str]) 
 fn bd_x25ka_positional_shortcircuit_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         assert_matches_stock(
-            &[
-                "CREATE TABLE t(a INTEGER);",
-                "CREATE TABLE u(x INTEGER);",
-            ],
+            &["CREATE TABLE t(a INTEGER);", "CREATE TABLE u(x INTEGER);"],
             &[
                 "INSERT INTO t(a) VALUES (1), (2);",
                 "INSERT INTO u(x) VALUES (10);",

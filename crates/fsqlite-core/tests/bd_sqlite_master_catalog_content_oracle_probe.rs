@@ -34,17 +34,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -69,46 +78,134 @@ fn sqlite_master_catalog_content_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // all objects by (type, name)
-        check("all objects", fq(&f, "SELECT type,name FROM sqlite_master ORDER BY type,name").await,
-              rq(&r, "SELECT type,name FROM sqlite_master ORDER BY type,name"), &mut diffs);
+        check(
+            "all objects",
+            fq(&f, "SELECT type,name FROM sqlite_master ORDER BY type,name").await,
+            rq(&r, "SELECT type,name FROM sqlite_master ORDER BY type,name"),
+            &mut diffs,
+        );
         // tables only
-        check("tables", fq(&f, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").await,
-              rq(&r, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"), &mut diffs);
+        check(
+            "tables",
+            fq(
+                &f,
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            ),
+            &mut diffs,
+        );
         // indexes with their tbl_name (includes the UNIQUE auto-index sqlite_autoindex_users_1)
-        check("indexes + tbl_name", fq(&f, "SELECT type,name,tbl_name FROM sqlite_master WHERE type='index' ORDER BY name").await,
-              rq(&r, "SELECT type,name,tbl_name FROM sqlite_master WHERE type='index' ORDER BY name"), &mut diffs);
+        check(
+            "indexes + tbl_name",
+            fq(
+                &f,
+                "SELECT type,name,tbl_name FROM sqlite_master WHERE type='index' ORDER BY name",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT type,name,tbl_name FROM sqlite_master WHERE type='index' ORDER BY name",
+            ),
+            &mut diffs,
+        );
         // the UNIQUE-constraint auto-index exists (by name prefix)
         check("autoindex present", fq(&f, "SELECT count(*) FROM sqlite_master WHERE type='index' AND name LIKE 'sqlite_autoindex_%'").await,
               rq(&r, "SELECT count(*) FROM sqlite_master WHERE type='index' AND name LIKE 'sqlite_autoindex_%'"), &mut diffs);
         // view + trigger with tbl_name
-        check("view row", fq(&f, "SELECT type,name,tbl_name FROM sqlite_master WHERE type='view'").await,
-              rq(&r, "SELECT type,name,tbl_name FROM sqlite_master WHERE type='view'"), &mut diffs);
-        check("trigger row", fq(&f, "SELECT type,name,tbl_name FROM sqlite_master WHERE type='trigger'").await,
-              rq(&r, "SELECT type,name,tbl_name FROM sqlite_master WHERE type='trigger'"), &mut diffs);
+        check(
+            "view row",
+            fq(
+                &f,
+                "SELECT type,name,tbl_name FROM sqlite_master WHERE type='view'",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT type,name,tbl_name FROM sqlite_master WHERE type='view'",
+            ),
+            &mut diffs,
+        );
+        check(
+            "trigger row",
+            fq(
+                &f,
+                "SELECT type,name,tbl_name FROM sqlite_master WHERE type='trigger'",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT type,name,tbl_name FROM sqlite_master WHERE type='trigger'",
+            ),
+            &mut diffs,
+        );
         // an index's tbl_name points at its owning table
         check("index tbl_name mapping", fq(&f, "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='posts' ORDER BY name").await,
               rq(&r, "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='posts' ORDER BY name"), &mut diffs);
 
         // ── AUTOINCREMENT -> sqlite_sequence appears ──
-        ex(&f, &r, "CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)").await;
+        ex(
+            &f,
+            &r,
+            "CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+        )
+        .await;
         ex(&f, &r, "INSERT INTO ai(v) VALUES ('a'),('b')").await;
-        check("sqlite_sequence present", fq(&f, "SELECT name FROM sqlite_master WHERE name='sqlite_sequence'").await,
-              rq(&r, "SELECT name FROM sqlite_master WHERE name='sqlite_sequence'"), &mut diffs);
-        check("sqlite_sequence row", fq(&f, "SELECT name,seq FROM sqlite_sequence WHERE name='ai'").await,
-              rq(&r, "SELECT name,seq FROM sqlite_sequence WHERE name='ai'"), &mut diffs);
+        check(
+            "sqlite_sequence present",
+            fq(
+                &f,
+                "SELECT name FROM sqlite_master WHERE name='sqlite_sequence'",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT name FROM sqlite_master WHERE name='sqlite_sequence'",
+            ),
+            &mut diffs,
+        );
+        check(
+            "sqlite_sequence row",
+            fq(&f, "SELECT name,seq FROM sqlite_sequence WHERE name='ai'").await,
+            rq(&r, "SELECT name,seq FROM sqlite_sequence WHERE name='ai'"),
+            &mut diffs,
+        );
 
         // ── DROP removes catalog rows (table + its indexes) ──
         ex(&f, &r, "DROP INDEX ix_posts_uid").await;
-        check("after drop index", fq(&f, "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name").await,
-              rq(&r, "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"), &mut diffs);
+        check(
+            "after drop index",
+            fq(
+                &f,
+                "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name",
+            ),
+            &mut diffs,
+        );
         ex(&f, &r, "DROP TABLE posts").await;
-        check("after drop table", fq(&f, "SELECT type,name FROM sqlite_master ORDER BY type,name").await,
-              rq(&r, "SELECT type,name FROM sqlite_master ORDER BY type,name"), &mut diffs);
+        check(
+            "after drop table",
+            fq(&f, "SELECT type,name FROM sqlite_master ORDER BY type,name").await,
+            rq(&r, "SELECT type,name FROM sqlite_master ORDER BY type,name"),
+            &mut diffs,
+        );
 
         // ── ALTER RENAME updates name (and tbl_name of dependents) ──
         ex(&f, &r, "ALTER TABLE users RENAME TO members").await;
@@ -116,9 +213,18 @@ fn sqlite_master_catalog_content_match_rusqlite_oracle() {
               rq(&r, "SELECT type,name,tbl_name FROM sqlite_master WHERE type IN('table','index','view') ORDER BY type,name"), &mut diffs);
 
         // total object count
-        check("total count", fq(&f, "SELECT count(*) FROM sqlite_master").await,
-              rq(&r, "SELECT count(*) FROM sqlite_master"), &mut diffs);
+        check(
+            "total count",
+            fq(&f, "SELECT count(*) FROM sqlite_master").await,
+            rq(&r, "SELECT count(*) FROM sqlite_master"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} sqlite_master catalog divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} sqlite_master catalog divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

@@ -121,9 +121,30 @@ fn function_list_covers_core_sqlite_functions_gh206() {
         let sqlite = sqlite_function_names();
 
         let core = [
-            "abs", "coalesce", "hex", "ifnull", "instr", "length", "lower", "ltrim", "max", "min",
-            "nullif", "quote", "replace", "round", "rtrim", "substr", "trim", "typeof", "upper",
-            "count", "sum", "total", "avg", "group_concat",
+            "abs",
+            "coalesce",
+            "hex",
+            "ifnull",
+            "instr",
+            "length",
+            "lower",
+            "ltrim",
+            "max",
+            "min",
+            "nullif",
+            "quote",
+            "replace",
+            "round",
+            "rtrim",
+            "substr",
+            "trim",
+            "typeof",
+            "upper",
+            "count",
+            "sum",
+            "total",
+            "avg",
+            "group_concat",
         ];
         for f in core {
             assert!(

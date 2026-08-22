@@ -9,7 +9,9 @@ use fsqlite_types::value::SqliteValue;
 
 async fn insert_err(value_sql: &str) -> String {
     let c = Connection::open(":memory:").await.unwrap();
-    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)").await.unwrap();
+    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
+        .await
+        .unwrap();
     c.execute(&format!("INSERT INTO t VALUES({value_sql}, 'y')"))
         .await
         .expect_err("non-integral rowid must be rejected")
@@ -18,8 +20,12 @@ async fn insert_err(value_sql: &str) -> String {
 
 async fn insert_rowid(value_sql: &str) -> i64 {
     let c = Connection::open(":memory:").await.unwrap();
-    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)").await.unwrap();
-    c.execute(&format!("INSERT INTO t VALUES({value_sql}, 'y')")).await.unwrap();
+    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
+        .await
+        .unwrap();
+    c.execute(&format!("INSERT INTO t VALUES({value_sql}, 'y')"))
+        .await
+        .unwrap();
     let rows = c.query_with_params("SELECT a FROM t", &[]).await.unwrap();
     match rows.first().map(|r| r.values()[0].clone()) {
         Some(SqliteValue::Integer(n)) => n,

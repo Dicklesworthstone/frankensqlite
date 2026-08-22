@@ -45,7 +45,9 @@ async fn craft_freelist_hole_db(dir: &std::path::Path) -> (String, u32) {
                 .expect("insert dropme");
         }
         // Free dropme's pages into the durable freelist.
-        conn.execute("DROP TABLE dropme;").await.expect("drop dropme");
+        conn.execute("DROP TABLE dropme;")
+            .await
+            .expect("drop dropme");
         conn.close().await.expect("close");
     }
 
@@ -77,7 +79,10 @@ fn bd_84rh4_freelist_hole_is_deterministically_reproducible() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
         let (db, freed) = craft_freelist_hole_db(dir.path()).await;
-        assert!(freed > 0, "reproducer requires durably-freed pages to erase");
+        assert!(
+            freed > 0,
+            "reproducer requires durably-freed pages to erase"
+        );
 
         let conn = Connection::open(&db).await.expect("reopen crafted image");
         let integrity = conn

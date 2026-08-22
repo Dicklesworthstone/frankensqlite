@@ -122,7 +122,11 @@ fn not_materialized_random_reevaluates_gh204() {
                  SELECT (SELECT r FROM c)=(SELECT r FROM c)",
             )
             .await;
-            assert_eq!(eq, vec![vec!["0".to_owned()]], "NOT MATERIALIZED `=` must be 0");
+            assert_eq!(
+                eq,
+                vec![vec!["0".to_owned()]],
+                "NOT MATERIALIZED `=` must be 0"
+            );
         }
     });
 }

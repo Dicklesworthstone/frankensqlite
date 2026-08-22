@@ -33,17 +33,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -58,9 +67,14 @@ fn without_rowid_semantics_match_rusqlite_oracle() {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
         let mut diffs = Vec::new();
-        let check = |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
-            if fr != rr { d.push(format!("  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}")); }
-        };
+        let check =
+            |label: &str, fr: Vec<Vec<String>>, rr: Vec<Vec<String>>, d: &mut Vec<String>| {
+                if fr != rr {
+                    d.push(format!(
+                        "  [{label}]\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            };
 
         // ── TEXT single-column PK ──
         for s in [
@@ -70,36 +84,77 @@ fn without_rowid_semantics_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         // natural scan is PK (text) order
-        check("wr text pk order", fq(&f, "SELECT k,v FROM kv").await,
-              rq(&r, "SELECT k,v FROM kv"), &mut diffs);
-        check("wr text pk explicit order", fq(&f, "SELECT k FROM kv ORDER BY k").await,
-              rq(&r, "SELECT k FROM kv ORDER BY k"), &mut diffs);
+        check(
+            "wr text pk order",
+            fq(&f, "SELECT k,v FROM kv").await,
+            rq(&r, "SELECT k,v FROM kv"),
+            &mut diffs,
+        );
+        check(
+            "wr text pk explicit order",
+            fq(&f, "SELECT k FROM kv ORDER BY k").await,
+            rq(&r, "SELECT k FROM kv ORDER BY k"),
+            &mut diffs,
+        );
         // rowid is NOT a column on WITHOUT ROWID -> both error
-        check("wr no rowid column", fq(&f, "SELECT rowid FROM kv").await,
-              rq(&r, "SELECT rowid FROM kv"), &mut diffs);
+        check(
+            "wr no rowid column",
+            fq(&f, "SELECT rowid FROM kv").await,
+            rq(&r, "SELECT rowid FROM kv"),
+            &mut diffs,
+        );
         // PK uniqueness enforced: duplicate insert rejected
         ex(&f, &r, "INSERT INTO kv VALUES ('apple',99)").await;
-        check("wr pk unique", fq(&f, "SELECT k,v FROM kv ORDER BY k").await,
-              rq(&r, "SELECT k,v FROM kv ORDER BY k"), &mut diffs);
+        check(
+            "wr pk unique",
+            fq(&f, "SELECT k,v FROM kv ORDER BY k").await,
+            rq(&r, "SELECT k,v FROM kv ORDER BY k"),
+            &mut diffs,
+        );
         // point lookup by PK
-        check("wr pk lookup", fq(&f, "SELECT v FROM kv WHERE k='cherry'").await,
-              rq(&r, "SELECT v FROM kv WHERE k='cherry'"), &mut diffs);
+        check(
+            "wr pk lookup",
+            fq(&f, "SELECT v FROM kv WHERE k='cherry'").await,
+            rq(&r, "SELECT v FROM kv WHERE k='cherry'"),
+            &mut diffs,
+        );
         // UPDATE a non-PK column
         ex(&f, &r, "UPDATE kv SET v=v+10 WHERE k='apple'").await;
-        check("wr update nonpk", fq(&f, "SELECT k,v FROM kv ORDER BY k").await,
-              rq(&r, "SELECT k,v FROM kv ORDER BY k"), &mut diffs);
+        check(
+            "wr update nonpk",
+            fq(&f, "SELECT k,v FROM kv ORDER BY k").await,
+            rq(&r, "SELECT k,v FROM kv ORDER BY k"),
+            &mut diffs,
+        );
         // UPDATE the PK column (moves the row in the tree)
         ex(&f, &r, "UPDATE kv SET k='avocado' WHERE k='apple'").await;
-        check("wr update pk", fq(&f, "SELECT k,v FROM kv ORDER BY k").await,
-              rq(&r, "SELECT k,v FROM kv ORDER BY k"), &mut diffs);
+        check(
+            "wr update pk",
+            fq(&f, "SELECT k,v FROM kv ORDER BY k").await,
+            rq(&r, "SELECT k,v FROM kv ORDER BY k"),
+            &mut diffs,
+        );
         // UPSERT on the PK
-        ex(&f, &r, "INSERT INTO kv VALUES ('banana',100) ON CONFLICT(k) DO UPDATE SET v=v+1").await;
-        check("wr upsert", fq(&f, "SELECT k,v FROM kv ORDER BY k").await,
-              rq(&r, "SELECT k,v FROM kv ORDER BY k"), &mut diffs);
+        ex(
+            &f,
+            &r,
+            "INSERT INTO kv VALUES ('banana',100) ON CONFLICT(k) DO UPDATE SET v=v+1",
+        )
+        .await;
+        check(
+            "wr upsert",
+            fq(&f, "SELECT k,v FROM kv ORDER BY k").await,
+            rq(&r, "SELECT k,v FROM kv ORDER BY k"),
+            &mut diffs,
+        );
         // DELETE by PK
         ex(&f, &r, "DELETE FROM kv WHERE k='cherry'").await;
-        check("wr delete", fq(&f, "SELECT k FROM kv ORDER BY k").await,
-              rq(&r, "SELECT k FROM kv ORDER BY k"), &mut diffs);
+        check(
+            "wr delete",
+            fq(&f, "SELECT k FROM kv ORDER BY k").await,
+            rq(&r, "SELECT k FROM kv ORDER BY k"),
+            &mut diffs,
+        );
 
         // ── composite PK ──
         for s in [
@@ -109,22 +164,42 @@ fn without_rowid_semantics_match_rusqlite_oracle() {
             ex(&f, &r, s).await;
         }
         // scan is composite-PK order (x, then y)
-        check("wr composite pk order", fq(&f, "SELECT x,y,label FROM grid").await,
-              rq(&r, "SELECT x,y,label FROM grid"), &mut diffs);
+        check(
+            "wr composite pk order",
+            fq(&f, "SELECT x,y,label FROM grid").await,
+            rq(&r, "SELECT x,y,label FROM grid"),
+            &mut diffs,
+        );
         // range scan over the leading PK column
-        check("wr composite range", fq(&f, "SELECT x,y FROM grid WHERE x=1 AND y>=2 ORDER BY x,y").await,
-              rq(&r, "SELECT x,y FROM grid WHERE x=1 AND y>=2 ORDER BY x,y"), &mut diffs);
+        check(
+            "wr composite range",
+            fq(&f, "SELECT x,y FROM grid WHERE x=1 AND y>=2 ORDER BY x,y").await,
+            rq(&r, "SELECT x,y FROM grid WHERE x=1 AND y>=2 ORDER BY x,y"),
+            &mut diffs,
+        );
         // composite PK uniqueness
         ex(&f, &r, "INSERT INTO grid VALUES (1,1,'dup')").await;
-        check("wr composite unique", fq(&f, "SELECT count(*) FROM grid").await,
-              rq(&r, "SELECT count(*) FROM grid"), &mut diffs);
+        check(
+            "wr composite unique",
+            fq(&f, "SELECT count(*) FROM grid").await,
+            rq(&r, "SELECT count(*) FROM grid"),
+            &mut diffs,
+        );
 
         // ── secondary index on a WITHOUT ROWID table ──
         ex(&f, &r, "CREATE INDEX ix_grid_label ON grid(label)").await;
-        check("wr secondary index", fq(&f, "SELECT x,y FROM grid WHERE label='e'").await,
-              rq(&r, "SELECT x,y FROM grid WHERE label='e'"), &mut diffs);
-        check("wr secondary index scan", fq(&f, "SELECT label FROM grid ORDER BY label").await,
-              rq(&r, "SELECT label FROM grid ORDER BY label"), &mut diffs);
+        check(
+            "wr secondary index",
+            fq(&f, "SELECT x,y FROM grid WHERE label='e'").await,
+            rq(&r, "SELECT x,y FROM grid WHERE label='e'"),
+            &mut diffs,
+        );
+        check(
+            "wr secondary index scan",
+            fq(&f, "SELECT label FROM grid ORDER BY label").await,
+            rq(&r, "SELECT label FROM grid ORDER BY label"),
+            &mut diffs,
+        );
 
         // ── INTEGER PK WITHOUT ROWID (still index-btree, not a rowid alias) ──
         for s in [
@@ -133,9 +208,18 @@ fn without_rowid_semantics_match_rusqlite_oracle() {
         ] {
             ex(&f, &r, s).await;
         }
-        check("wr int pk order", fq(&f, "SELECT id,w FROM n").await,
-              rq(&r, "SELECT id,w FROM n"), &mut diffs);
+        check(
+            "wr int pk order",
+            fq(&f, "SELECT id,w FROM n").await,
+            rq(&r, "SELECT id,w FROM n"),
+            &mut diffs,
+        );
 
-        assert!(diffs.is_empty(), "{} WITHOUT ROWID divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} WITHOUT ROWID divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

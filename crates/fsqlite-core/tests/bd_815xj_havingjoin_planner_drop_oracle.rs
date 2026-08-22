@@ -73,7 +73,9 @@ async fn assert_matches_stock(schema: &[&str], rows: &[&str], queries: &[(&str, 
         let stock_res = stock_rows(&stock, q);
         let frank_res = conn.query(q).await;
         match (&frank_res, &stock_res) {
-            (Ok(fr), Ok(sr)) => assert_eq!(frank_rows_text(fr), *sr, "[{label}] rows diverged on `{q}`"),
+            (Ok(fr), Ok(sr)) => {
+                assert_eq!(frank_rows_text(fr), *sr, "[{label}] rows diverged on `{q}`")
+            }
             (Err(_), Err(_)) => {}
             (Ok(fr), Err(se)) => panic!(
                 "[{label}] frank SUCCEEDED ({:?}) but stock ERRORED ({se}) on `{q}`",
@@ -97,24 +99,48 @@ fn bd_815xj_scan_backed_never_true_filter_planner_drop() {
             &[
                 // Whole never-true HAVING / JOIN-ON over a scan -> the sub is
                 // dropped, no error (rusqlite short-circuits it).
-                ("having-drop", q("SELECT 1 FROM u GROUP BY x HAVING SUB AND NULL")),
-                ("join-on-drop", q("SELECT u1.x FROM u u1 JOIN u u2 ON SUB AND NULL")),
-                ("having-nogroup", q("SELECT count(*) FROM u HAVING SUB AND NULL")),
+                (
+                    "having-drop",
+                    q("SELECT 1 FROM u GROUP BY x HAVING SUB AND NULL"),
+                ),
+                (
+                    "join-on-drop",
+                    q("SELECT u1.x FROM u u1 JOIN u u2 ON SUB AND NULL"),
+                ),
+                (
+                    "having-nogroup",
+                    q("SELECT count(*) FROM u HAVING SUB AND NULL"),
+                ),
                 // `(sub) AND never-true` under an OR with a LIVE term is ALSO
                 // dropped by rusqlite's planner (the AND-branch is never-true), so
                 // the sub is never materialized — frank must match, not error.
-                ("having-or-live", q("SELECT 1 FROM u GROUP BY x HAVING (SUB AND NULL) OR x>0")),
-                ("table-where-or", q("SELECT x FROM u WHERE (SUB AND NULL) OR x=10")),
-                ("join-on-or", q("SELECT u1.x FROM u u1 JOIN u u2 ON (SUB AND NULL) OR u1.x=u2.x")),
+                (
+                    "having-or-live",
+                    q("SELECT 1 FROM u GROUP BY x HAVING (SUB AND NULL) OR x>0"),
+                ),
+                (
+                    "table-where-or",
+                    q("SELECT x FROM u WHERE (SUB AND NULL) OR x=10"),
+                ),
+                (
+                    "join-on-or",
+                    q("SELECT u1.x FROM u u1 JOIN u u2 ON (SUB AND NULL) OR u1.x=u2.x"),
+                ),
                 // Control — table WHERE whole never-true is likewise dropped.
                 ("table-where", q("SELECT x FROM u WHERE SUB AND NULL")),
                 // Control — FROM-less: NO scan, so it stays left-to-right; whatever
                 // rusqlite does (error vs value), frank must match.
                 ("fromless-where", q("SELECT 1 WHERE SUB AND NULL")),
                 // Control — left const short-circuits -> no error, sub not run.
-                ("left-const-having", q("SELECT 1 FROM u GROUP BY x HAVING NULL AND SUB")),
+                (
+                    "left-const-having",
+                    q("SELECT 1 FROM u GROUP BY x HAVING NULL AND SUB"),
+                ),
                 // Guard against over-drop: a valid HAVING is unaffected.
-                ("valid-having", "SELECT x FROM u GROUP BY x HAVING count(*) > 0 ORDER BY x".to_owned()),
+                (
+                    "valid-having",
+                    "SELECT x FROM u GROUP BY x HAVING count(*) > 0 ORDER BY x".to_owned(),
+                ),
             ],
         )
         .await;

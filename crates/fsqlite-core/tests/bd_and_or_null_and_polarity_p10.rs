@@ -25,13 +25,19 @@ fn render(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
-    Ok(rows.iter().map(|r| r.values().iter().map(render).collect()).collect())
+    Ok(rows
+        .iter()
+        .map(|r| r.values().iter().map(render).collect())
+        .collect())
 }
 
 fn stock_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
@@ -48,7 +54,10 @@ fn stock_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>
                     rusqlite::types::Value::Real(f) => format!("{f}"),
                     rusqlite::types::Value::Text(s) => format!("'{s}'"),
                     rusqlite::types::Value::Blob(b) => {
-                        format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+                        format!(
+                            "X'{}'",
+                            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                        )
                     }
                 });
             }
@@ -61,9 +70,17 @@ fn stock_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>
 }
 
 async fn setup(frank: &Connection, stock: &rusqlite::Connection) {
-    frank.execute("CREATE TABLE t(id INTEGER PRIMARY KEY);").await.expect("frank create");
-    frank.execute("INSERT INTO t(id) VALUES (1),(2);").await.expect("frank insert");
-    stock.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t(id) VALUES (1),(2);").expect("stock setup");
+    frank
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY);")
+        .await
+        .expect("frank create");
+    frank
+        .execute("INSERT INTO t(id) VALUES (1),(2);")
+        .await
+        .expect("frank insert");
+    stock
+        .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t(id) VALUES (1),(2);")
+        .expect("stock setup");
 }
 
 // The seeking-true polarity fold landed in rewrite_in_expr (bd-lryih P10/P12,
@@ -81,11 +98,20 @@ fn bd_and_or_null_and_polarity_matches_stock() {
         // (sql, must_error) — stock-verified expectation; both engines must agree.
         let probes: &[(&str, bool)] = &[
             // P10: seeking-true WHERE — NULL AND E is never TRUE → E skipped → no rows, no error.
-            ("SELECT id FROM t WHERE NULL AND (SELECT count(*) FROM json_each('bare')) ORDER BY id;", false),
+            (
+                "SELECT id FROM t WHERE NULL AND (SELECT count(*) FROM json_each('bare')) ORDER BY id;",
+                false,
+            ),
             // P12: under NOT — inner is seeking-false → E MUST be evaluated → both error.
-            ("SELECT id FROM t WHERE NOT (NULL AND (SELECT count(*) FROM json_each('bare'))) ORDER BY id;", true),
+            (
+                "SELECT id FROM t WHERE NOT (NULL AND (SELECT count(*) FROM json_each('bare'))) ORDER BY id;",
+                true,
+            ),
             // Guard: a plain WHERE over the erroring subquery still evaluates it → both error.
-            ("SELECT id FROM t WHERE (SELECT count(*) FROM json_each('bare')) ORDER BY id;", true),
+            (
+                "SELECT id FROM t WHERE (SELECT count(*) FROM json_each('bare')) ORDER BY id;",
+                true,
+            ),
             // Sanity: NULL AND <true> also yields no rows (no error either way).
             ("SELECT id FROM t WHERE NULL AND 1 ORDER BY id;", false),
         ];
@@ -93,13 +119,22 @@ fn bd_and_or_null_and_polarity_matches_stock() {
         for (sql, must_error) in probes {
             let f = frank_rows(&frank, sql).await;
             let s = stock_rows(&stock, sql);
-            assert_eq!(s.is_err(), *must_error, "stock expectation wrong for `{sql}`: {s:?}");
             assert_eq!(
-                f.is_err(), *must_error,
+                s.is_err(),
+                *must_error,
+                "stock expectation wrong for `{sql}`: {s:?}"
+            );
+            assert_eq!(
+                f.is_err(),
+                *must_error,
                 "fsqlite error-state mismatch vs stock for `{sql}`: got {f:?}"
             );
             if !*must_error {
-                assert_eq!(f.as_ref().ok(), s.as_ref().ok(), "fsqlite vs stock row divergence for `{sql}`");
+                assert_eq!(
+                    f.as_ref().ok(),
+                    s.as_ref().ok(),
+                    "fsqlite vs stock row divergence for `{sql}`"
+                );
             }
         }
 

@@ -141,7 +141,11 @@ fn bd_zqc1b_full_column_update_on_reopened_lazy() {
             .query("SELECT rowid FROM t WHERE t MATCH 'beta' ORDER BY rowid;")
             .await
             .unwrap();
-        assert_eq!(rowids(&beta), vec![1], "new term beta is indexed for rowid 1");
+        assert_eq!(
+            rowids(&beta),
+            vec![1],
+            "new term beta is indexed for rowid 1"
+        );
         let alpha = conn
             .query("SELECT rowid FROM t WHERE t MATCH 'alpha';")
             .await

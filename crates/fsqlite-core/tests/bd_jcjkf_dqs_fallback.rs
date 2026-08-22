@@ -33,7 +33,9 @@ fn dqs_shape2_fromhaving_unresolvable_is_string() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(c TEXT);").await.unwrap();
-        conn.execute("INSERT INTO t VALUES('r1'),('r2');").await.unwrap();
+        conn.execute("INSERT INTO t VALUES('r1'),('r2');")
+            .await
+            .unwrap();
 
         let r = conn.query("SELECT \"nope\" FROM t;").await.unwrap();
         assert_eq!(r.len(), 2);
@@ -49,14 +51,19 @@ fn dqs_real_column_still_wins() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(c TEXT);").await.unwrap();
-        conn.execute("INSERT INTO t VALUES('realval');").await.unwrap();
+        conn.execute("INSERT INTO t VALUES('realval');")
+            .await
+            .unwrap();
 
         // "c" resolves -> the column value, NOT the string 'c'.
         let r = conn.query("SELECT \"c\" FROM t;").await.unwrap();
         assert_eq!(r[0].values()[0], SqliteValue::Text("realval".into()));
 
         // WHERE "c"="c" -> column compared to itself -> true -> the row.
-        let r = conn.query("SELECT c FROM t WHERE \"c\"=\"c\";").await.unwrap();
+        let r = conn
+            .query("SELECT c FROM t WHERE \"c\"=\"c\";")
+            .await
+            .unwrap();
         assert_eq!(r.len(), 1);
     });
 }
@@ -112,13 +119,21 @@ fn dqs_single_quote_in_name_is_escaped() {
 fn dqs_shape3_insert_values_double_quoted_is_string() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
-        conn.execute("CREATE TABLE t(a TEXT, b TEXT);").await.unwrap();
+        conn.execute("CREATE TABLE t(a TEXT, b TEXT);")
+            .await
+            .unwrap();
 
-        conn.execute("INSERT INTO t(a) VALUES(\"litstr\");").await.unwrap();
+        conn.execute("INSERT INTO t(a) VALUES(\"litstr\");")
+            .await
+            .unwrap();
         // Two double-quoted values in one row; the second escapes a single quote.
-        conn.execute("INSERT INTO t(a, b) VALUES(\"x\", \"a'b\");").await.unwrap();
+        conn.execute("INSERT INTO t(a, b) VALUES(\"x\", \"a'b\");")
+            .await
+            .unwrap();
         // Multi-row.
-        conn.execute("INSERT INTO t(a) VALUES(\"r1\"), (\"r2\");").await.unwrap();
+        conn.execute("INSERT INTO t(a) VALUES(\"r1\"), (\"r2\");")
+            .await
+            .unwrap();
 
         let a: Vec<SqliteValue> = conn
             .query("SELECT a FROM t;")
@@ -148,7 +163,9 @@ fn dqs_shape3_insert_values_splice_spares_table_name() {
         conn.execute("CREATE TABLE t(c TEXT);").await.unwrap();
 
         // "t" stays the table; only the value "lit" becomes the string 'lit'.
-        conn.execute("INSERT INTO \"t\" VALUES(\"lit\");").await.unwrap();
+        conn.execute("INSERT INTO \"t\" VALUES(\"lit\");")
+            .await
+            .unwrap();
         let r = conn.query("SELECT c FROM t;").await.unwrap();
         assert_eq!(r[0].values()[0], SqliteValue::Text("lit".into()));
     });

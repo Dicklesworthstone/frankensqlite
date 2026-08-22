@@ -8,7 +8,11 @@ use fsqlite_core::connection::Connection;
 fn vacuum_unknown_database_reports_unknown_database() {
     asupersync::test_utils::run_test(|| async {
         let c = Connection::open(":memory:").await.unwrap();
-        let err = c.execute("VACUUM nope").await.expect_err("unknown VACUUM target").to_string();
+        let err = c
+            .execute("VACUUM nope")
+            .await
+            .expect_err("unknown VACUUM target")
+            .to_string();
         assert_eq!(err, "unknown database nope");
 
         let err2 = c
@@ -20,6 +24,8 @@ fn vacuum_unknown_database_reports_unknown_database() {
 
         // VACUUM main / no-arg succeed.
         c.execute("VACUUM").await.expect("bare VACUUM must succeed");
-        c.execute("VACUUM main").await.expect("VACUUM main must succeed");
+        c.execute("VACUUM main")
+            .await
+            .expect("VACUUM main must succeed");
     });
 }

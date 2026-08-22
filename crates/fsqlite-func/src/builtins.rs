@@ -3772,7 +3772,9 @@ mod tests {
         // and replace have empty-needle quirks. All char-based (not byte-based).
         let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
         let int = SqliteValue::Integer;
-        let run = |f: &dyn ScalarFunction, args: &[SqliteValue]| -> SqliteValue { f.invoke(args).unwrap() };
+        let run = |f: &dyn ScalarFunction, args: &[SqliteValue]| -> SqliteValue {
+            f.invoke(args).unwrap()
+        };
 
         // substr: position 0 means "before char 1", so a length spanning it loses one.
         assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(0)]), t("abcdef"));
@@ -3787,7 +3789,10 @@ mod tests {
         // A start before the string with a length that never reaches it -> empty.
         assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(-10), int(3)]), t(""));
         assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(10)]), t(""));
-        assert_eq!(run(&SubstrFunc, &[t("abcdef"), int(3), int(100)]), t("cdef"));
+        assert_eq!(
+            run(&SubstrFunc, &[t("abcdef"), int(3), int(100)]),
+            t("cdef")
+        );
         // Char-based (not byte-based) on multi-byte UTF-8.
         assert_eq!(run(&SubstrFunc, &[t("héllo"), int(2), int(2)]), t("él"));
 
@@ -3861,13 +3866,30 @@ mod tests {
         let flt = SqliteValue::Float;
         let blob = |b: &[u8]| SqliteValue::Blob(std::sync::Arc::from(b));
 
-        assert_eq!(ScalarMaxFunc.invoke(&[int(1), t("a"), flt(2.5)]).unwrap(), t("a"));
-        assert_eq!(ScalarMinFunc.invoke(&[int(1), t("a"), flt(2.5)]).unwrap(), int(1));
+        assert_eq!(
+            ScalarMaxFunc.invoke(&[int(1), t("a"), flt(2.5)]).unwrap(),
+            t("a")
+        );
+        assert_eq!(
+            ScalarMinFunc.invoke(&[int(1), t("a"), flt(2.5)]).unwrap(),
+            int(1)
+        );
         // blob sorts after text/number, so it is the max.
-        assert_eq!(ScalarMaxFunc.invoke(&[blob(&[1]), t("z"), int(99)]).unwrap(), blob(&[1]));
+        assert_eq!(
+            ScalarMaxFunc
+                .invoke(&[blob(&[1]), t("z"), int(99)])
+                .unwrap(),
+            blob(&[1])
+        );
         // Any NULL arg -> NULL (scalar-only behavior).
-        assert_eq!(ScalarMaxFunc.invoke(&[SqliteValue::Null, int(5)]).unwrap(), SqliteValue::Null);
-        assert_eq!(ScalarMinFunc.invoke(&[SqliteValue::Null, int(5)]).unwrap(), SqliteValue::Null);
+        assert_eq!(
+            ScalarMaxFunc.invoke(&[SqliteValue::Null, int(5)]).unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            ScalarMinFunc.invoke(&[SqliteValue::Null, int(5)]).unwrap(),
+            SqliteValue::Null
+        );
 
         // printf infinity: "Inf"/"+Inf"/"-Inf", with the sign flag and width.
         let f = FormatFunc;
@@ -3891,7 +3913,9 @@ mod tests {
         let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
         let int = SqliteValue::Integer;
         let blob = |b: &[u8]| SqliteValue::Blob(std::sync::Arc::from(b));
-        let run = |f: &dyn ScalarFunction, args: &[SqliteValue]| -> SqliteValue { f.invoke(args).unwrap() };
+        let run = |f: &dyn ScalarFunction, args: &[SqliteValue]| -> SqliteValue {
+            f.invoke(args).unwrap()
+        };
 
         // hex.
         assert_eq!(run(&HexFunc, &[t("abc")]), t("616263"));
@@ -3920,7 +3944,9 @@ mod tests {
         let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
         let int = SqliteValue::Integer;
         let blob = |b: &[u8]| SqliteValue::Blob(std::sync::Arc::from(b));
-        let run = |f: &dyn ScalarFunction, args: &[SqliteValue]| -> SqliteValue { f.invoke(args).unwrap() };
+        let run = |f: &dyn ScalarFunction, args: &[SqliteValue]| -> SqliteValue {
+            f.invoke(args).unwrap()
+        };
 
         // upper()/lower() are ASCII-ONLY (SQLite's built-in): non-ASCII unchanged.
         assert_eq!(run(&UpperFunc, &[t("héllo")]), t("HéLLO"));
@@ -3932,9 +3958,18 @@ mod tests {
         assert_eq!(run(&LengthFunc, &[int(12345)]), int(5));
         assert_eq!(run(&LengthFunc, &[SqliteValue::Null]), SqliteValue::Null);
         // trig (exact f64 wrappers).
-        assert_eq!(run(&SinFunc, &[SqliteValue::Float(0.0)]), SqliteValue::Float(0.0));
-        assert_eq!(run(&CosFunc, &[SqliteValue::Float(0.0)]), SqliteValue::Float(1.0));
-        assert_eq!(run(&Atan2Func, &[int(1), int(1)]), SqliteValue::Float((1.0_f64).atan2(1.0)));
+        assert_eq!(
+            run(&SinFunc, &[SqliteValue::Float(0.0)]),
+            SqliteValue::Float(0.0)
+        );
+        assert_eq!(
+            run(&CosFunc, &[SqliteValue::Float(0.0)]),
+            SqliteValue::Float(1.0)
+        );
+        assert_eq!(
+            run(&Atan2Func, &[int(1), int(1)]),
+            SqliteValue::Float((1.0_f64).atan2(1.0))
+        );
     }
 
     fn assert_wrong_arg_count(registry: &FunctionRegistry, name: &str, arity: i32) {
@@ -6835,7 +6870,10 @@ mod tests {
         // i32 cast: 2147483648 -> INT_MIN -> 0 pad; 4294967296 -> 0; 4294967301 -> 5.
         assert_eq!(run(&[txt("%*d"), int(2_147_483_648), int(7)]), some("7"));
         assert_eq!(run(&[txt("%*d"), int(4_294_967_296), int(7)]), some("7"));
-        assert_eq!(run(&[txt("%*d"), int(4_294_967_301), int(7)]), some("    7"));
+        assert_eq!(
+            run(&[txt("%*d"), int(4_294_967_301), int(7)]),
+            some("    7")
+        );
         assert_eq!(run(&[txt("%*d"), int(-2_147_483_648), int(7)]), some("7"));
         // width reaching 1e9 -> NULL (not a giant string).
         assert_eq!(run(&[txt("%*d"), int(1_000_000_000), int(7)]), None);
@@ -6844,10 +6882,16 @@ mod tests {
         // INT_MIN -> default precision, and >= 1e9 -> NULL for %d.
         assert_eq!(run(&[txt("%.*f"), int(2), flt(3.14159)]), some("3.14"));
         assert_eq!(run(&[txt("%.*d"), int(-3), int(42)]), some("042"));
-        assert_eq!(run(&[txt("%.*f"), int(2_147_483_648), flt(5.5)]), some("5.500000"));
+        assert_eq!(
+            run(&[txt("%.*f"), int(2_147_483_648), flt(5.5)]),
+            some("5.500000")
+        );
         assert_eq!(run(&[txt("%.*d"), int(1_000_000_000), int(7)]), None);
         // combined dynamic width + precision.
-        assert_eq!(run(&[txt("%*.*f"), int(10), int(2), flt(3.14159)]), some("      3.14"));
+        assert_eq!(
+            run(&[txt("%*.*f"), int(10), int(2), flt(3.14159)]),
+            some("      3.14")
+        );
     }
 
     #[test]

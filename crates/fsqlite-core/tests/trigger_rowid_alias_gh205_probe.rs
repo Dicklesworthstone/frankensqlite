@@ -15,7 +15,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -24,22 +27,44 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn assert_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &str) {
-    let fr: Vec<Vec<String>> = fconn.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e:?}")).iter().map(|r| r.values().iter().map(tag_f).collect()).collect();
+    let fr: Vec<Vec<String>> = fconn
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+        .iter()
+        .map(|r| r.values().iter().map(tag_f).collect())
+        .collect();
     let mut st = rconn.prepare(sql).unwrap();
     let n = st.column_count();
-    let rr: Vec<Vec<String>> = st.query_map([], |row| Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let rr: Vec<Vec<String>> = st
+        .query_map([], |row| {
+            Ok((0..n)
+                .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect())
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(fr, rr, "trigger rowid-alias log mismatch on `{sql}`");
 }
 
 async fn run_both(fconn: &Connection, rconn: &rusqlite::Connection, stmts: &[&str]) {
     for s in stmts {
-        fconn.execute(s).await.unwrap_or_else(|e| panic!("frank exec `{s}`: {e:?}"));
-        rconn.execute_batch(s).unwrap_or_else(|e| panic!("csql exec `{s}`: {e}"));
+        fconn
+            .execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("frank exec `{s}`: {e:?}"));
+        rconn
+            .execute_batch(s)
+            .unwrap_or_else(|e| panic!("csql exec `{s}`: {e}"));
     }
 }
 

@@ -391,7 +391,9 @@ impl TransactionController {
         }
         // Stock: "no such savepoint: X" verbatim under SQLITE_ERROR (not the
         // Internal "internal error:" prefix / SQLITE_INTERNAL). bd-3nppp.
-        Err(FrankenError::function_error(format!("no such savepoint: {name}")))
+        Err(FrankenError::function_error(format!(
+            "no such savepoint: {name}"
+        )))
     }
 
     /// Reset all transaction state back to idle.

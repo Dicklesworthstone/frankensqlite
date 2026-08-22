@@ -29,7 +29,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
         SqliteValue::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -40,7 +43,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
         rusqlite::types::Value::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -95,7 +101,12 @@ fn minmax_bare_nested_ungrouped_bd0174u() {
         assert_agree(&f, &r, "SELECT max(price) || ':' || name FROM t").await;
         assert_agree(&f, &r, "SELECT min(price) || ':' || name FROM t").await;
         // Bare column appears BEFORE the aggregate in the expression.
-        assert_agree(&f, &r, "SELECT 'winner=' || name || '@' || max(price) FROM t").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT 'winner=' || name || '@' || max(price) FROM t",
+        )
+        .await;
         // Casty / different scalar shapes around the aggregate.
         assert_agree(&f, &r, "SELECT 'p' || min(price) || name FROM t").await;
     });
@@ -184,9 +195,19 @@ fn minmax_bare_nested_with_where_bd0174u() {
             ],
         )
         .await;
-        assert_agree(&f, &r, "SELECT max(price) || ':' || name FROM t WHERE price < 40").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT max(price) || ':' || name FROM t WHERE price < 40",
+        )
+        .await;
         // Empty scan: implicit aggregation yields one all-NULL row.
-        assert_agree(&f, &r, "SELECT max(price) || ':' || name FROM t WHERE price > 1000").await;
+        assert_agree(
+            &f,
+            &r,
+            "SELECT max(price) || ':' || name FROM t WHERE price > 1000",
+        )
+        .await;
     });
 }
 

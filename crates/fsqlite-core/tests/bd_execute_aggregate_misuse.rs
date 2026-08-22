@@ -10,7 +10,10 @@ async fn exec_err(setup: &[&str], sql: &str) -> String {
     for s in setup {
         c.execute(s).await.unwrap();
     }
-    c.execute(sql).await.expect_err("aggregate-in-WHERE misuse must error").to_string()
+    c.execute(sql)
+        .await
+        .expect_err("aggregate-in-WHERE misuse must error")
+        .to_string()
 }
 
 async fn exec_ok(setup: &[&str], sql: &str) {
@@ -18,7 +21,9 @@ async fn exec_ok(setup: &[&str], sql: &str) {
     for s in setup {
         c.execute(s).await.unwrap();
     }
-    c.execute(sql).await.expect("valid query must succeed via execute()");
+    c.execute(sql)
+        .await
+        .expect("valid query must succeed via execute()");
 }
 
 #[test]
@@ -38,6 +43,10 @@ fn execute_aggregate_in_where_reports_misuse() {
         // Valid queries via execute() are unaffected.
         exec_ok(t, "SELECT * FROM t WHERE x > 0").await;
         exec_ok(t, "SELECT sum(x) FROM t").await;
-        exec_ok(&["CREATE TABLE t2(x)", "INSERT INTO t2 VALUES(1),(2)"], "SELECT count(*) FROM t2").await;
+        exec_ok(
+            &["CREATE TABLE t2(x)", "INSERT INTO t2 VALUES(1),(2)"],
+            "SELECT count(*) FROM t2",
+        )
+        .await;
     });
 }

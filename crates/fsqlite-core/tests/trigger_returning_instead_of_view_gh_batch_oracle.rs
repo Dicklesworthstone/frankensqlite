@@ -27,7 +27,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
         SqliteValue::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -39,7 +42,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
         rusqlite::types::Value::Blob(b) => {
-            format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+            format!(
+                "X'{}'",
+                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+            )
         }
     }
 }
@@ -184,8 +190,12 @@ fn instead_of_view_returning_star_and_expr() {
             exec_both(&f, &r, sql).await;
         }
         // `*` plus a computed expression referencing a bare view column.
-        assert_returning_agree(&f, &r, "INSERT INTO v VALUES(7,'hi') RETURNING *, id+1, upper(v)")
-            .await;
+        assert_returning_agree(
+            &f,
+            &r,
+            "INSERT INTO v VALUES(7,'hi') RETURNING *, id+1, upper(v)",
+        )
+        .await;
         assert_agree(&f, &r, "SELECT id,v FROM base ORDER BY id").await;
     });
 }

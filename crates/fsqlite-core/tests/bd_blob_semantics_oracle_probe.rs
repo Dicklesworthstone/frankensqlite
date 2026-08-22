@@ -91,6 +91,11 @@ fn blob_semantics_match_rusqlite_oracle() {
                 diffs.push(format!("  `{e}`\n     frank= {fv}\n     stock= {rv}"));
             }
         }
-        assert!(diffs.is_empty(), "{} blob-semantics divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} blob-semantics divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

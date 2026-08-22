@@ -63,11 +63,7 @@ fn journal_mode_rollback_modes_round_trip_bd_sw2k5() {
 fn journal_mode_rollback_mode_resets_on_reopen_bd_sw2k5() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
-        let db_str = dir
-            .path()
-            .join("sw2k5.db")
-            .to_string_lossy()
-            .into_owned();
+        let db_str = dir.path().join("sw2k5.db").to_string_lossy().into_owned();
 
         {
             let conn = Connection::open(&db_str).await.unwrap();

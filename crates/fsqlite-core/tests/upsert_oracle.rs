@@ -18,7 +18,10 @@ fn tag_f(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 fn tag_r(v: &rusqlite::types::Value) -> String {
@@ -27,13 +30,19 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Integer(n) => n.to_string(),
         rusqlite::types::Value::Real(f) => format!("{f}"),
         rusqlite::types::Value::Text(s) => format!("'{s}'"),
-        rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        rusqlite::types::Value::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
 async fn fq(f: &Connection, sql: &str) -> Vec<Vec<String>> {
     match f.query_with_params(sql, &[]).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(e) => vec![vec![format!("<ERR {e:?}>")]],
     }
 }
@@ -44,7 +53,9 @@ fn rq(r: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     };
     let n = st.column_count();
     st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect())
     })
     .unwrap()
     .collect::<Result<Vec<_>, _>>()
@@ -60,27 +71,36 @@ async fn agree(setup: &[&str], sql: &str, msg: &str) {
     }
     let fr = fq(&f, sql).await;
     let rr = rq(&r, sql);
-    assert_eq!(fr, rr, "{msg}\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}");
+    assert_eq!(
+        fr, rr,
+        "{msg}\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}"
+    );
 }
 
 #[test]
 fn do_nothing() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(k INT UNIQUE, v INT)",
-              "INSERT INTO t VALUES (1,10)",
-              "INSERT INTO t VALUES (1,99) ON CONFLICT(k) DO NOTHING",
-              "INSERT INTO t VALUES (2,20) ON CONFLICT(k) DO NOTHING"],
+            &[
+                "CREATE TABLE t(k INT UNIQUE, v INT)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT INTO t VALUES (1,99) ON CONFLICT(k) DO NOTHING",
+                "INSERT INTO t VALUES (2,20) ON CONFLICT(k) DO NOTHING",
+            ],
             "SELECT k,v FROM t ORDER BY k",
             "DO NOTHING skips a conflict, keeps a non-conflict",
-        ).await;
+        )
+        .await;
         agree(
-            &["CREATE TABLE t(k INT UNIQUE, v INT)",
-              "INSERT INTO t VALUES (1,10)",
-              "INSERT INTO t VALUES (2,20) ON CONFLICT(k) DO NOTHING"],
+            &[
+                "CREATE TABLE t(k INT UNIQUE, v INT)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT INTO t VALUES (2,20) ON CONFLICT(k) DO NOTHING",
+            ],
             "SELECT k,v FROM t ORDER BY k",
             "DO NOTHING with no conflict is a normal insert",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -88,26 +108,35 @@ fn do_nothing() {
 fn do_update_from_excluded() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(k INT PRIMARY KEY, v INT)",
-              "INSERT INTO t VALUES (1,10)",
-              "INSERT INTO t VALUES (1,99) ON CONFLICT(k) DO UPDATE SET v = excluded.v"],
+            &[
+                "CREATE TABLE t(k INT PRIMARY KEY, v INT)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT INTO t VALUES (1,99) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            ],
             "SELECT k,v FROM t ORDER BY k",
             "DO UPDATE SET v = excluded.v",
-        ).await;
+        )
+        .await;
         agree(
-            &["CREATE TABLE t(k INT PRIMARY KEY, v INT)",
-              "INSERT INTO t VALUES (1,10)",
-              "INSERT INTO t VALUES (1,5) ON CONFLICT(k) DO UPDATE SET v = v + excluded.v"],
+            &[
+                "CREATE TABLE t(k INT PRIMARY KEY, v INT)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT INTO t VALUES (1,5) ON CONFLICT(k) DO UPDATE SET v = v + excluded.v",
+            ],
             "SELECT k,v FROM t ORDER BY k",
             "DO UPDATE reading both existing v and excluded.v",
-        ).await;
+        )
+        .await;
         agree(
-            &["CREATE TABLE t(k INT PRIMARY KEY, v INT)",
-              "INSERT INTO t VALUES (1,10)",
-              "INSERT INTO t VALUES (1,99) ON CONFLICT DO UPDATE SET v = excluded.v"],
+            &[
+                "CREATE TABLE t(k INT PRIMARY KEY, v INT)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT INTO t VALUES (1,99) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
             "SELECT k,v FROM t ORDER BY k",
             "DO UPDATE with no explicit conflict target",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -142,12 +171,15 @@ fn do_update_multirow() {
             "multi-row upsert: conflicts update, new rows insert",
         ).await;
         agree(
-            &["CREATE TABLE t(k INT PRIMARY KEY, v INT)",
-              "INSERT INTO t VALUES (1,1),(2,2),(3,3)",
-              "INSERT INTO t VALUES (2,20) ON CONFLICT(k) DO UPDATE SET v = excluded.v"],
+            &[
+                "CREATE TABLE t(k INT PRIMARY KEY, v INT)",
+                "INSERT INTO t VALUES (1,1),(2,2),(3,3)",
+                "INSERT INTO t VALUES (2,20) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            ],
             "SELECT count(*), sum(v) FROM t",
             "upsert row count/aggregate unchanged in size",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -155,19 +187,25 @@ fn do_update_multirow() {
 fn insert_or_ignore_or_replace() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(k INT UNIQUE, v INT)",
-              "INSERT INTO t VALUES (1,10)",
-              "INSERT OR IGNORE INTO t VALUES (1,99),(2,20)"],
+            &[
+                "CREATE TABLE t(k INT UNIQUE, v INT)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT OR IGNORE INTO t VALUES (1,99),(2,20)",
+            ],
             "SELECT k,v FROM t ORDER BY k",
             "INSERT OR IGNORE skips the conflict",
-        ).await;
+        )
+        .await;
         agree(
-            &["CREATE TABLE t(k INT PRIMARY KEY, v INT)",
-              "INSERT INTO t VALUES (1,10)",
-              "INSERT OR REPLACE INTO t VALUES (1,99),(2,20)"],
+            &[
+                "CREATE TABLE t(k INT PRIMARY KEY, v INT)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT OR REPLACE INTO t VALUES (1,99),(2,20)",
+            ],
             "SELECT k,v FROM t ORDER BY k",
             "INSERT OR REPLACE delete-then-inserts",
-        ).await;
+        )
+        .await;
     });
 }
 
@@ -175,11 +213,14 @@ fn insert_or_ignore_or_replace() {
 fn upsert_on_second_unique() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &["CREATE TABLE t(id INT PRIMARY KEY, email TEXT UNIQUE, hits INT)",
-              "INSERT INTO t VALUES (1,'a@x',1)",
-              "INSERT INTO t VALUES (2,'a@x',1) ON CONFLICT(email) DO UPDATE SET hits = hits + 1"],
+            &[
+                "CREATE TABLE t(id INT PRIMARY KEY, email TEXT UNIQUE, hits INT)",
+                "INSERT INTO t VALUES (1,'a@x',1)",
+                "INSERT INTO t VALUES (2,'a@x',1) ON CONFLICT(email) DO UPDATE SET hits = hits + 1",
+            ],
             "SELECT id,email,hits FROM t ORDER BY id",
             "upsert targeting a secondary UNIQUE constraint",
-        ).await;
+        )
+        .await;
     });
 }
