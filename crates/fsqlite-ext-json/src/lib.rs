@@ -228,18 +228,18 @@ pub fn json(input: &str) -> Result<String> {
     };
     // JSON5 fallback (bd-qear2): stock SQLite 3.42+ accepts JSON5 — unquoted
     // object keys, single-quoted strings, trailing commas, // and /* */
-    // comments, hex integers, leading/trailing decimal points — and
-    // canonicalizes it to standard JSON. Parse via the JSON5 grammar and
-    // re-serialize with the canonical writer. (Non-finite +Infinity/-Infinity/
-    // NaN cannot round-trip through serde_json::Value and still error here — a
-    // documented follow-up on bd-qear2.) On total failure surface the strict
-    // error so malformed input keeps its "invalid JSON input" message.
-    let Ok(value) = parse_json5_text(input) else {
+    // comments, hex integers, leading/trailing decimal points, Infinity/NaN —
+    // and canonicalizes it to standard JSON. Parse ONLY to validate, then
+    // translate LEXICALLY (bd-4gqeu): stock's translator is token-level, so a
+    // value-tree round-trip would drop duplicate object keys and normalize
+    // exponent literals (`{a:1,a:2}` and `{a:1e2,}` must stay `{"a":1,"a":2}`
+    // and `{"a":1e2}`), exactly the fidelity rule the strict path above
+    // follows. On total failure surface the strict error so malformed input
+    // keeps its "invalid JSON input" message.
+    if parse_json5_text(input).is_err() {
         return Err(strict_error);
-    };
-    let mut out = String::new();
-    write_canonical_json_text(&value, &mut out)?;
-    Ok(out)
+    }
+    Ok(translate_json5_to_json(input))
 }
 
 /// Validate JSON text under flags compatible with SQLite `json_valid`.
@@ -315,6 +315,248 @@ fn encode_json_text(context: &str, value: &Value) -> Result<String> {
 /// `1.50` keeps its trailing zero), string escapes are preserved (`"a\/b"`
 /// stays `\/`, not `/`), and duplicate object keys are kept. Round-tripping
 /// through `serde_json::Value` loses all of that (exponents are normalised to
+/// Lexically translate KNOWN-VALID JSON5 text to stock-canonical JSON text
+/// (bd-4gqeu). Token-level like stock's `jsonTranslateTextToBlob`, so it
+/// preserves what a value-tree round-trip destroys: duplicate object keys,
+/// key order, exponent literals (`1e2`, `1E+3`), and string-escape spellings.
+///
+/// Oracle-pinned transformations (sqlite3 3.46.1):
+/// - comments, trailing commas, and JSON5 whitespace stripped; structure
+///   minified
+/// - single-quoted strings/keys -> double-quoted; a bare `"` inside becomes
+///   `\"`; `\'` becomes a bare `'`
+/// - bare identifier keys quoted; `Infinity`/`+Infinity` -> `9e999`,
+///   `-Infinity` -> `-9e999`, `NaN` (any sign) -> `null`
+/// - `\xHH` -> `\u00HH` (hex digits verbatim), `\0` -> the `0000` escape
+///   spelling, and `\v` -> the `0009` escape spelling — reproducing stock's
+///   quirk (the VALUE is U+000B but its text translator spells `0009`);
+///   JSON-legal escapes
+///   (`\" \\ \/ \b \f \n \r \t \uXXXX`) pass through verbatim; escaped line
+///   continuations are removed
+/// - hex integers -> decimal (`0xFFFFFFFFFFFFFFFF` -> full u64 magnitude);
+///   a leading `+` is dropped; `.5`/`-.5` gain a leading `0`; `5.`/`1.e3`
+///   gain a `0` after the dot; all other number tokens pass verbatim
+///
+/// The caller MUST have validated `input` as well-formed JSON5 first; this
+/// function never rejects, it only transforms.
+#[allow(clippy::too_many_lines)]
+fn translate_json5_to_json(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    // A structural comma is held back until the next value/key token proves it
+    // was not a trailing comma.
+    let mut pending_comma = false;
+    let flush_comma = |out: &mut String, pending: &mut bool| {
+        if *pending {
+            out.push(',');
+            *pending = false;
+        }
+    };
+
+    fn is_json5_ws(ch: char) -> bool {
+        ch.is_whitespace() || ch == '\u{FEFF}'
+    }
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            c if is_json5_ws(c) => {}
+            '/' => match chars.peek() {
+                Some('/') => {
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    for c in chars.by_ref() {
+                        if prev == '*' && c == '/' {
+                            break;
+                        }
+                        prev = c;
+                    }
+                }
+                // Unreachable in valid JSON5; pass through.
+                _ => out.push('/'),
+            },
+            ',' => pending_comma = true,
+            '}' | ']' => {
+                // A comma directly before a closer was trailing: drop it.
+                pending_comma = false;
+                out.push(ch);
+            }
+            '{' | '[' => {
+                flush_comma(&mut out, &mut pending_comma);
+                out.push(ch);
+            }
+            ':' => out.push(':'),
+            '"' | '\'' => {
+                flush_comma(&mut out, &mut pending_comma);
+                translate_json5_string(ch, &mut chars, &mut out);
+            }
+            c if c.is_alphabetic() || c == '_' || c == '$' || c == '\\' => {
+                flush_comma(&mut out, &mut pending_comma);
+                let mut ident = String::new();
+                ident.push(c);
+                while let Some(&n) = chars.peek() {
+                    if n.is_alphanumeric() || n == '_' || n == '$' || n == '\\' {
+                        ident.push(n);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match ident.as_str() {
+                    "true" | "false" | "null" => out.push_str(&ident),
+                    "Infinity" => out.push_str("9e999"),
+                    "NaN" => out.push_str("null"),
+                    // Any other bare identifier in valid JSON5 is an object key.
+                    _ => {
+                        out.push('"');
+                        out.push_str(&ident);
+                        out.push('"');
+                    }
+                }
+            }
+            '+' | '-' | '.' | '0'..='9' => {
+                flush_comma(&mut out, &mut pending_comma);
+                let mut sign_negative = false;
+                let mut first = ch;
+                if first == '+' || first == '-' {
+                    sign_negative = first == '-';
+                    match chars.next() {
+                        Some(next) => first = next,
+                        None => break,
+                    }
+                }
+                if first == 'I' || first == 'N' {
+                    // Signed Infinity / NaN: consume the identifier tail.
+                    while let Some(&n) = chars.peek() {
+                        if n.is_alphabetic() {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if first == 'I' {
+                        if sign_negative {
+                            out.push('-');
+                        }
+                        out.push_str("9e999");
+                    } else {
+                        out.push_str("null");
+                    }
+                    continue;
+                }
+                let mut token = String::new();
+                token.push(first);
+                while let Some(&n) = chars.peek() {
+                    // In valid JSON5 a number token is delimited by
+                    // whitespace, a comment, `,`, `]`, or `}` — none of which
+                    // are number chars — so a greedy read is safe.
+                    if n.is_ascii_hexdigit() || matches!(n, 'x' | 'X' | '.' | '+' | '-') {
+                        token.push(n);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if sign_negative {
+                    out.push('-');
+                }
+                out.push_str(&translate_json5_number(&token));
+            }
+            // Unreachable in valid JSON5; pass through.
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Translate the body of one JSON5 string (opened with `delim`, which has
+/// already been consumed) into a canonical double-quoted JSON string.
+fn translate_json5_string(
+    delim: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+) {
+    out.push('"');
+    while let Some(ch) = chars.next() {
+        if ch == delim {
+            break;
+        }
+        match ch {
+            '\\' => match chars.next() {
+                Some('\'') => out.push('\''),
+                Some('v') => out.push_str("\\u0009"),
+                Some('0') => out.push_str("\\u0000"),
+                Some('x') => {
+                    out.push_str("\\u00");
+                    for _ in 0..2 {
+                        if let Some(h) = chars.next() {
+                            out.push(h);
+                        }
+                    }
+                }
+                Some('u') => {
+                    out.push_str("\\u");
+                    for _ in 0..4 {
+                        if let Some(h) = chars.next() {
+                            out.push(h);
+                        }
+                    }
+                }
+                // Escaped line continuations disappear ('\r' swallows a
+                // following '\n' so CRLF drops as one).
+                Some('\r') => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                }
+                Some('\n' | '\u{2028}' | '\u{2029}') => {}
+                Some(c @ ('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't')) => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                // Unreachable in stock-valid JSON5; keep the char.
+                Some(other) => out.push(other),
+                None => break,
+            },
+            // A bare `"` inside a single-quoted string must be escaped.
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
+/// Canonicalize one unsigned JSON5 number token (sign already emitted).
+fn translate_json5_number(token: &str) -> String {
+    if let Some(hex) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
+        if let Ok(value) = u128::from_str_radix(hex, 16) {
+            return value.to_string();
+        }
+        return token.to_owned();
+    }
+    let mut out = String::with_capacity(token.len() + 2);
+    let mut chars = token.chars().peekable();
+    if chars.peek() == Some(&'.') {
+        out.push('0');
+    }
+    while let Some(ch) = chars.next() {
+        out.push(ch);
+        if ch == '.' && !chars.peek().is_some_and(char::is_ascii_digit) {
+            out.push('0');
+        }
+    }
+    out
+}
+
 /// `e+NN`, `\/` is unescaped, duplicate keys are dropped), so the text-input
 /// path lexically minifies the source instead of re-serialising a parsed tree.
 /// The caller MUST have validated `input` as well-formed JSON first.
@@ -4076,6 +4318,64 @@ pub fn register_json_scalars(registry: &mut FunctionRegistry) {
 mod tests {
     use super::*;
     use fsqlite_func::FunctionRegistry;
+
+    #[test]
+    // The JSON5 literals ('{a:...}') look like format args to clippy.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn json5_lexical_translation_matches_stock_oracle() {
+        // bd-4gqeu: every expectation below is pinned against sqlite3 3.46.1
+        // `SELECT json('<input>')` unless noted. The translator must be
+        // token-faithful: duplicate keys, key order, and exponent literals
+        // survive.
+        let cases: &[(&str, &str)] = &[
+            // Fidelity the old serde round-trip destroyed:
+            ("{a:1,a:2}", r#"{"a":1,"a":2}"#),
+            ("{b:1,a:2}", r#"{"b":1,"a":2}"#),
+            ("{a:1e2,}", r#"{"a":1e2}"#),
+            ("[1E+3]", "[1E+3]"),
+            // Structure: comments, trailing commas, whitespace.
+            ("[1,/*c*/2,]", "[1,2]"),
+            ("{a:1//c\n,b:2}", r#"{"a":1,"b":2}"#),
+            ("{ a : 1 }", r#"{"a":1}"#),
+            // Strings and escapes (escape SPELLINGS are preserved/translated,
+            // never decoded to their characters).
+            ("{a:'hi'}", r#"{"a":"hi"}"#),
+            (r"{a:'it\'s'}", r#"{"a":"it's"}"#),
+            ("{'k':1}", r#"{"k":1}"#),
+            ("['q\"d']", r#"["q\"d"]"#),
+            (r"['\x41']", r#"["\u0041"]"#),
+            (r"['s\u0041']", r#"["s\u0041"]"#),
+            (r"['a\tb']", r#"["a\tb"]"#),
+            (r"['\/']", r#"["\/"]"#),
+            // Stock spells \v with the 0009 escape even though the value is U+000B.
+            (r"['\v']", r#"["\u0009"]"#),
+            (r"['\x0b']", r#"["\u000b"]"#),
+            ("['line\\\ncont']", r#"["linecont"]"#),
+            // Numbers.
+            ("[0x1A]", "[26]"),
+            ("[-0x10]", "[-16]"),
+            ("[0xFFFFFFFFFFFFFFFF]", "[18446744073709551615]"),
+            ("[.5e2]", "[0.5e2]"),
+            ("[1.e3]", "[1.0e3]"),
+            ("[-.5]", "[-0.5]"),
+            ("[+.5]", "[0.5]"),
+            ("{a:+3}", r#"{"a":3}"#),
+            // Non-finite.
+            ("{a:Infinity}", r#"{"a":9e999}"#),
+            ("[+Infinity]", "[9e999]"),
+            ("[-Infinity]", "[-9e999]"),
+            ("{a:NaN}", r#"{"a":null}"#),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                json(input).unwrap_or_else(|e| panic!("json({input:?}) errored: {e}")),
+                *expected,
+                "json5 translation mismatch for {input:?}"
+            );
+        }
+        // Strict-JSON inputs must still take the token-preserving minify path.
+        assert_eq!(json(r#"{"a": 1e2}"#).unwrap(), r#"{"a":1e2}"#);
+    }
 
     #[test]
     fn test_json_fn_oracle_edges_2026_08() {
