@@ -44,7 +44,8 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
     RUNTIME.with(|runtime| runtime.block_on(future))
 }
-use fsqlite_parser::{Parser, parse_first_statement_with_tail};
+use fsqlite_parser::{Lexer, Parser, TokenKind, parse_first_statement_with_tail};
+use fsqlite_types::SmallText;
 use fsqlite_types::value::SqliteValue;
 
 // ── SQLite result codes ─────────────────────────────────────────────
@@ -311,6 +312,14 @@ pub struct Sqlite3Stmt {
     /// alive until next step or finalize to satisfy C lifetime expectations,
     /// including values that contain embedded NUL bytes).
     text_cache: Vec<Option<Vec<u8>>>,
+    /// Bound parameter values (0-based; SQL parameter index `i` maps to
+    /// `bindings[i - 1]`). Sized to the statement's parameter count at prepare
+    /// time; slots left unbound stay NULL, matching SQLite. bd-w2i2w.
+    bindings: Vec<SqliteValue>,
+    /// Full parameter name including its sigil (e.g. `":id"`, `"@x"`, `"$y"`)
+    /// for each 1-based index, or `None` for nameless `?` / `?NNN`. Parallel to
+    /// `bindings`; drives `sqlite3_bind_parameter_name` / `_index`. bd-w2i2w.
+    param_names: Vec<Option<CString>>,
 }
 
 type ExecCallback = unsafe extern "C" fn(
@@ -406,6 +415,103 @@ fn validate_and_classify_prepared_sql(
         step_mode,
         column_count,
     }))
+}
+
+/// Parameter binding layout computed once at prepare time. bd-w2i2w.
+struct PreparedParamInfo {
+    /// One NULL slot per bindable parameter (index `i` → `bindings[i - 1]`).
+    bindings: Vec<SqliteValue>,
+    /// Full name (with sigil) per 1-based index, `None` for `?` / `?NNN`.
+    param_names: Vec<Option<CString>>,
+}
+
+/// Assign (or reuse) a 1-based index for a named parameter, mirroring SQLite's
+/// numbering: a repeated name reuses its first-assigned index. bd-w2i2w.
+fn assign_named_param_index(
+    full: String,
+    next: &mut u32,
+    named: &mut std::collections::HashMap<String, u32>,
+    names_by_index: &mut Vec<(u32, String)>,
+) -> u32 {
+    if let Some(&index) = named.get(&full) {
+        return index;
+    }
+    let index = *next;
+    *next = next.saturating_add(1);
+    named.insert(full.clone(), index);
+    names_by_index.push((index, full));
+    index
+}
+
+/// Enumerate a statement's bind parameters and their SQLite-canonical indices.
+///
+/// Mirrors `sqlite3_bind_parameter_count`/`_index`/`_name` semantics:
+///   - `?`            → the next sequential index.
+///   - `?NNN`         → index NNN; the running counter jumps past it.
+///   - `:x`/`@x`/`$x` → next sequential index, deduplicated by full name.
+///
+/// Reuses the engine lexer so string/comment/blob contexts never yield false
+/// placeholders. The returned `bindings` is sized to the largest index seen
+/// (all NULL); `param_names[i - 1]` is the sigil-prefixed name of index `i`, or
+/// `None` for the nameless `?` / `?NNN` forms. bd-w2i2w.
+fn compute_prepared_param_info(sql: &str) -> PreparedParamInfo {
+    use std::collections::HashMap;
+
+    let tokens = Lexer::tokenize(sql);
+    let mut next: u32 = 1;
+    let mut max_index: u32 = 0;
+    let mut named: HashMap<String, u32> = HashMap::new();
+    let mut names_by_index: Vec<(u32, String)> = Vec::new();
+
+    for token in &tokens {
+        let index = match &token.kind {
+            TokenKind::Question => {
+                let index = next;
+                next = next.saturating_add(1);
+                index
+            }
+            TokenKind::QuestionNum(n) => {
+                if *n >= next {
+                    next = n.saturating_add(1);
+                }
+                *n
+            }
+            TokenKind::ColonParam(name) => assign_named_param_index(
+                format!(":{name}"),
+                &mut next,
+                &mut named,
+                &mut names_by_index,
+            ),
+            TokenKind::AtParam(name) => assign_named_param_index(
+                format!("@{name}"),
+                &mut next,
+                &mut named,
+                &mut names_by_index,
+            ),
+            TokenKind::DollarParam(name) => assign_named_param_index(
+                format!("${name}"),
+                &mut next,
+                &mut named,
+                &mut names_by_index,
+            ),
+            _ => continue,
+        };
+        max_index = max_index.max(index);
+    }
+
+    let count = max_index as usize;
+    let mut param_names: Vec<Option<CString>> = vec![None; count];
+    for (index, full) in names_by_index {
+        let slot = index as usize;
+        if slot >= 1 && slot <= count {
+            param_names[slot - 1] = CString::new(full).ok();
+        }
+    }
+
+    PreparedParamInfo {
+        bindings: vec![SqliteValue::Null; count],
+        param_names,
+    }
 }
 
 fn first_statement_tail_offset(sql: &str) -> Result<Option<usize>, FrankenError> {
@@ -949,6 +1055,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
                 "sqlite3_prepare_v2"
             );
             handle.clear_error();
+            let param_info = compute_prepared_param_info(&info.consumed_sql);
             let stmt = Box::new(Sqlite3Stmt {
                 db,
                 sql: info.consumed_sql,
@@ -959,6 +1066,8 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
                 last_step_code: SQLITE_OK,
                 column_count: info.column_count,
                 text_cache: Vec::new(),
+                bindings: param_info.bindings,
+                param_names: param_info.param_names,
             });
             handle.register_statement();
             *pp_stmt = Box::into_raw(stmt);
@@ -1013,10 +1122,26 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
     if s.rows.is_none() {
         tracing::info!(target: "fsqlite.compat", sql = %s.sql, "sqlite3_step (first call)");
 
+        // Route through the parameterized entry points only when the statement
+        // actually has bind parameters, so unparameterized SQL keeps its exact
+        // prior behavior. Unbound slots default to NULL (SQLite semantics).
+        let has_params = !s.bindings.is_empty();
         let execute_result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match s.step_mode {
-                PreparedStepMode::Query => block_on(db.conn.query(&s.sql)).map(Some),
-                PreparedStepMode::Execute => block_on(db.conn.execute(&s.sql)).map(|_| None),
+                PreparedStepMode::Query => {
+                    if has_params {
+                        block_on(db.conn.query_with_params(&s.sql, &s.bindings)).map(Some)
+                    } else {
+                        block_on(db.conn.query(&s.sql)).map(Some)
+                    }
+                }
+                PreparedStepMode::Execute => {
+                    if has_params {
+                        block_on(db.conn.execute_with_params(&s.sql, &s.bindings)).map(|_| None)
+                    } else {
+                        block_on(db.conn.execute(&s.sql)).map(|_| None)
+                    }
+                }
             }));
 
         match execute_result {
@@ -1156,6 +1281,282 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut Sqlite3Stmt) -> c_int {
     s.last_step_code = SQLITE_OK;
     s.text_cache.clear();
     rc
+}
+
+// ── Parameter binding (bd-w2i2w) ────────────────────────────────────
+
+/// C `void(*)(void*)` destructor sentinel: do not free the caller's buffer.
+pub const SQLITE_STATIC: isize = 0;
+/// C `void(*)(void*)` destructor sentinel: SQLite must copy the caller's buffer.
+pub const SQLITE_TRANSIENT: isize = -1;
+
+/// The 5th argument of `sqlite3_bind_text`/`_blob`: an optional destructor for
+/// the caller's buffer, or the `SQLITE_STATIC` / `SQLITE_TRANSIENT` sentinels.
+type SqliteDestructor = Option<unsafe extern "C" fn(*mut c_void)>;
+
+/// Invoke a caller-supplied destructor, but never the `SQLITE_STATIC` (null) or
+/// `SQLITE_TRANSIENT` (-1) sentinels. Every bind copies the bytes immediately,
+/// so a real destructor is safe to call right after the copy. bd-w2i2w.
+unsafe fn run_bind_destructor(xdel: SqliteDestructor, ptr: *const c_void) {
+    let Some(func) = xdel else {
+        return; // SQLITE_STATIC (null): nothing to free.
+    };
+    let addr = func as usize as isize;
+    if addr == SQLITE_TRANSIENT {
+        return; // SQLITE_TRANSIENT sentinel is not a callable pointer.
+    }
+    func(ptr as *mut c_void);
+}
+
+/// Resolve a 1-based parameter index to its 0-based binding slot, or `None`
+/// (which callers map to `SQLITE_RANGE`) when out of range. bd-w2i2w.
+unsafe fn binding_slot_index(stmt: *const Sqlite3Stmt, index: c_int) -> Option<usize> {
+    if index < 1 {
+        return None;
+    }
+    let s = &*stmt;
+    let slot = (index as usize).checked_sub(1)?;
+    (slot < s.bindings.len()).then_some(slot)
+}
+
+/// Store a resolved value into parameter `index`, mapping out-of-range to
+/// `SQLITE_RANGE`. bd-w2i2w.
+unsafe fn store_binding(stmt: *mut Sqlite3Stmt, index: c_int, value: SqliteValue) -> c_int {
+    match binding_slot_index(stmt, index) {
+        Some(slot) => {
+            let s = &mut *stmt;
+            s.bindings[slot] = value;
+            SQLITE_OK
+        }
+        None => SQLITE_RANGE,
+    }
+}
+
+/// Bind a 64-bit integer to parameter `index` (1-based).
+///
+/// # Safety
+/// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_int64(
+    stmt: *mut Sqlite3Stmt,
+    index: c_int,
+    value: i64,
+) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    store_binding(stmt, index, SqliteValue::Integer(value))
+}
+
+/// Bind a 32-bit integer to parameter `index` (1-based).
+///
+/// # Safety
+/// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_int(
+    stmt: *mut Sqlite3Stmt,
+    index: c_int,
+    value: c_int,
+) -> c_int {
+    sqlite3_bind_int64(stmt, index, i64::from(value))
+}
+
+/// Bind a floating-point value to parameter `index` (1-based).
+///
+/// # Safety
+/// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_double(
+    stmt: *mut Sqlite3Stmt,
+    index: c_int,
+    value: c_double,
+) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    store_binding(stmt, index, SqliteValue::Float(value))
+}
+
+/// Bind SQL NULL to parameter `index` (1-based).
+///
+/// # Safety
+/// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut Sqlite3Stmt, index: c_int) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    store_binding(stmt, index, SqliteValue::Null)
+}
+
+/// Bind UTF-8 text to parameter `index` (1-based).
+///
+/// `n < 0` treats `text` as NUL-terminated; otherwise exactly `n` bytes are
+/// copied (embedded NULs preserved). A NULL `text` pointer binds SQL NULL. The
+/// bytes are always copied, so `SQLITE_STATIC` and `SQLITE_TRANSIENT` behave
+/// identically; a real destructor is invoked once the copy completes.
+///
+/// # Safety
+/// `stmt` must be a valid handle; when non-null, `text` must point to at least
+/// `n` readable bytes (or be NUL-terminated when `n < 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_text(
+    stmt: *mut Sqlite3Stmt,
+    index: c_int,
+    text: *const c_char,
+    n: c_int,
+    xdel: SqliteDestructor,
+) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    // Validate the index before touching the caller's buffer, matching SQLite.
+    if binding_slot_index(stmt, index).is_none() {
+        return SQLITE_RANGE;
+    }
+    let value = if text.is_null() {
+        SqliteValue::Null
+    } else {
+        let bytes: &[u8] = if n < 0 {
+            CStr::from_ptr(text).to_bytes()
+        } else {
+            std::slice::from_raw_parts(text.cast::<u8>(), n as usize)
+        };
+        let value = SqliteValue::Text(SmallText::from_bytes(bytes));
+        run_bind_destructor(xdel, text.cast());
+        value
+    };
+    store_binding(stmt, index, value)
+}
+
+/// Bind a BLOB to parameter `index` (1-based).
+///
+/// `n` must be non-negative; a NULL `data` pointer binds SQL NULL. The bytes are
+/// always copied, so `SQLITE_STATIC` and `SQLITE_TRANSIENT` behave identically;
+/// a real destructor is invoked once the copy completes.
+///
+/// # Safety
+/// `stmt` must be a valid handle; when non-null, `data` must point to at least
+/// `n` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_blob(
+    stmt: *mut Sqlite3Stmt,
+    index: c_int,
+    data: *const c_void,
+    n: c_int,
+    xdel: SqliteDestructor,
+) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    if binding_slot_index(stmt, index).is_none() {
+        return SQLITE_RANGE;
+    }
+    let value = if data.is_null() {
+        SqliteValue::Null
+    } else {
+        if n < 0 {
+            return SQLITE_MISUSE;
+        }
+        let bytes = std::slice::from_raw_parts(data.cast::<u8>(), n as usize);
+        let value = SqliteValue::Blob(std::sync::Arc::from(bytes));
+        run_bind_destructor(xdel, data);
+        value
+    };
+    store_binding(stmt, index, value)
+}
+
+/// Bind a BLOB of `n` zero bytes to parameter `index` (1-based).
+///
+/// # Safety
+/// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_zeroblob(
+    stmt: *mut Sqlite3Stmt,
+    index: c_int,
+    n: c_int,
+) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let len = n.max(0) as usize;
+    let value = SqliteValue::Blob(std::sync::Arc::from(vec![0u8; len].as_slice()));
+    store_binding(stmt, index, value)
+}
+
+/// Number of bindable parameters in the prepared statement (the largest index).
+///
+/// # Safety
+/// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_parameter_count(stmt: *mut Sqlite3Stmt) -> c_int {
+    if stmt.is_null() {
+        return 0;
+    }
+    let s = &*stmt;
+    c_int::try_from(s.bindings.len()).unwrap_or(c_int::MAX)
+}
+
+/// 1-based index of the parameter named `name` (with its sigil, e.g. `":id"`),
+/// or 0 if no such parameter exists.
+///
+/// # Safety
+/// `stmt` must be a valid handle; `name`, when non-null, must be NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_parameter_index(
+    stmt: *mut Sqlite3Stmt,
+    name: *const c_char,
+) -> c_int {
+    if stmt.is_null() || name.is_null() {
+        return 0;
+    }
+    let needle = CStr::from_ptr(name).to_bytes();
+    let s = &*stmt;
+    for (offset, entry) in s.param_names.iter().enumerate() {
+        if let Some(candidate) = entry
+            && candidate.as_bytes() == needle
+        {
+            return (offset + 1) as c_int;
+        }
+    }
+    0
+}
+
+/// Name (with sigil) of the parameter at 1-based `index`, or NULL for the
+/// nameless `?` / `?NNN` forms or an out-of-range index. The returned pointer is
+/// owned by the statement and valid until it is finalized.
+///
+/// # Safety
+/// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_parameter_name(
+    stmt: *mut Sqlite3Stmt,
+    index: c_int,
+) -> *const c_char {
+    if stmt.is_null() || index < 1 {
+        return std::ptr::null();
+    }
+    let s = &*stmt;
+    match s.param_names.get((index - 1) as usize) {
+        Some(Some(name)) => name.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
+/// Reset every bound parameter back to NULL. bd-w2i2w.
+///
+/// # Safety
+/// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_clear_bindings(stmt: *mut Sqlite3Stmt) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let s = &mut *stmt;
+    for value in &mut s.bindings {
+        *value = SqliteValue::Null;
+    }
+    SQLITE_OK
 }
 
 // ── Column accessors ────────────────────────────────────────────────
@@ -2617,6 +3018,290 @@ mod tests {
             );
             assert_eq!(sqlite3_changes(db), 0);
 
+            sqlite3_close(db);
+        }
+    }
+
+    // ── Parameter binding (bd-w2i2w) ────────────────────────────────
+
+    unsafe fn prepare(db: *mut Sqlite3, sql: &str) -> *mut Sqlite3Stmt {
+        let c = CString::new(sql).unwrap();
+        let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, c.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            SQLITE_OK,
+            "prepare failed for: {sql}"
+        );
+        assert!(!stmt.is_null());
+        stmt
+    }
+
+    #[test]
+    fn test_bind_positional_roundtrip() {
+        unsafe {
+            let db = open_memory();
+            let setup = CString::new("CREATE TABLE t(id INTEGER, name TEXT, score REAL);").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let ins = prepare(db, "INSERT INTO t VALUES(?, ?, ?);");
+            assert_eq!(sqlite3_bind_parameter_count(ins), 3);
+            assert_eq!(sqlite3_bind_int(ins, 1, 42), SQLITE_OK);
+            let name = CString::new("hello").unwrap();
+            assert_eq!(sqlite3_bind_text(ins, 2, name.as_ptr(), -1, None), SQLITE_OK);
+            assert_eq!(sqlite3_bind_double(ins, 3, 3.5), SQLITE_OK);
+            assert_eq!(sqlite3_step(ins), SQLITE_DONE);
+            sqlite3_finalize(ins);
+
+            // Bound parameter in a SELECT WHERE clause round-trips.
+            let sel = prepare(db, "SELECT id, name, score FROM t WHERE id = ?;");
+            assert_eq!(sqlite3_bind_int(sel, 1, 42), SQLITE_OK);
+            assert_eq!(sqlite3_step(sel), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(sel, 0), 42);
+            let text = sqlite3_column_text(sel, 1);
+            assert_eq!(CStr::from_ptr(text.cast::<c_char>()).to_bytes(), b"hello");
+            assert!((sqlite3_column_double(sel, 2) - 3.5).abs() < 1e-9);
+            assert_eq!(sqlite3_step(sel), SQLITE_DONE);
+            sqlite3_finalize(sel);
+
+            // A non-matching bind yields no rows (proves the value reaches the engine).
+            let sel2 = prepare(db, "SELECT id FROM t WHERE id = ?;");
+            assert_eq!(sqlite3_bind_int(sel2, 1, 999), SQLITE_OK);
+            assert_eq!(sqlite3_step(sel2), SQLITE_DONE);
+            sqlite3_finalize(sel2);
+
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_bind_parameter_count_variants() {
+        unsafe {
+            let db = open_memory();
+            let cases: &[(&str, c_int)] = &[
+                ("SELECT 1;", 0),
+                ("SELECT ?, ?, ?;", 3),
+                ("SELECT ?1, ?2;", 2),
+                // ?1 reused collapses to one slot; ?3 pushes the count to 3.
+                ("SELECT ?1, ?1, ?3;", 3),
+                ("SELECT :a, @b, $c;", 3),
+                // A '?' inside a string literal is not a parameter.
+                ("SELECT ?, 'literal ? mark';", 1),
+            ];
+            for (sql, expected) in cases {
+                let stmt = prepare(db, sql);
+                assert_eq!(
+                    sqlite3_bind_parameter_count(stmt),
+                    *expected,
+                    "count mismatch for {sql}"
+                );
+                sqlite3_finalize(stmt);
+            }
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_bind_named_parameters() {
+        unsafe {
+            let db = open_memory();
+            let setup = CString::new("CREATE TABLE t(a INTEGER, b INTEGER);").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let ins = prepare(db, "INSERT INTO t VALUES(:first, @second);");
+            assert_eq!(sqlite3_bind_parameter_count(ins), 2);
+
+            let n1 = CString::new(":first").unwrap();
+            let n2 = CString::new("@second").unwrap();
+            assert_eq!(sqlite3_bind_parameter_index(ins, n1.as_ptr()), 1);
+            assert_eq!(sqlite3_bind_parameter_index(ins, n2.as_ptr()), 2);
+            let missing = CString::new(":nope").unwrap();
+            assert_eq!(sqlite3_bind_parameter_index(ins, missing.as_ptr()), 0);
+
+            assert_eq!(
+                CStr::from_ptr(sqlite3_bind_parameter_name(ins, 1)).to_bytes(),
+                b":first"
+            );
+            assert_eq!(
+                CStr::from_ptr(sqlite3_bind_parameter_name(ins, 2)).to_bytes(),
+                b"@second"
+            );
+
+            // Bind by resolved index and confirm the row lands.
+            assert_eq!(sqlite3_bind_int(ins, 1, 10), SQLITE_OK);
+            assert_eq!(sqlite3_bind_int(ins, 2, 20), SQLITE_OK);
+            assert_eq!(sqlite3_step(ins), SQLITE_DONE);
+            sqlite3_finalize(ins);
+
+            let sel = prepare(db, "SELECT a + b FROM t;");
+            assert_eq!(sqlite3_step(sel), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(sel, 0), 30);
+            sqlite3_finalize(sel);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_bind_range_and_nameless() {
+        unsafe {
+            let db = open_memory();
+            let stmt = prepare(db, "SELECT ?, ?2;");
+            assert_eq!(sqlite3_bind_parameter_count(stmt), 2);
+            // Out-of-range indices report SQLITE_RANGE without corrupting state.
+            assert_eq!(sqlite3_bind_int(stmt, 0, 1), SQLITE_RANGE);
+            assert_eq!(sqlite3_bind_int(stmt, 3, 1), SQLITE_RANGE);
+            // '?' and '?2' are nameless → no parameter name.
+            assert!(sqlite3_bind_parameter_name(stmt, 1).is_null());
+            assert!(sqlite3_bind_parameter_name(stmt, 2).is_null());
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_bind_null_and_clear_bindings() {
+        unsafe {
+            let db = open_memory();
+            let setup = CString::new("CREATE TABLE t(v);").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let ins = prepare(db, "INSERT INTO t VALUES(?);");
+            assert_eq!(sqlite3_bind_int(ins, 1, 7), SQLITE_OK);
+            // clear_bindings resets the slot to NULL before stepping.
+            assert_eq!(sqlite3_clear_bindings(ins), SQLITE_OK);
+            assert_eq!(sqlite3_step(ins), SQLITE_DONE);
+            sqlite3_finalize(ins);
+
+            let sel = prepare(db, "SELECT v, v IS NULL FROM t;");
+            assert_eq!(sqlite3_step(sel), SQLITE_ROW);
+            assert_eq!(sqlite3_column_type(sel, 0), SQLITE_NULL);
+            assert_eq!(sqlite3_column_int64(sel, 1), 1);
+            sqlite3_finalize(sel);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_bind_blob_and_zeroblob() {
+        unsafe {
+            let db = open_memory();
+            let setup = CString::new("CREATE TABLE t(id INTEGER, data BLOB);").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let ins = prepare(db, "INSERT INTO t VALUES(?, ?);");
+            let blob: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+            assert_eq!(sqlite3_bind_int(ins, 1, 1), SQLITE_OK);
+            assert_eq!(
+                sqlite3_bind_blob(ins, 2, blob.as_ptr().cast(), 4, None),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(ins), SQLITE_DONE);
+            sqlite3_finalize(ins);
+
+            let ins2 = prepare(db, "INSERT INTO t VALUES(?, ?);");
+            assert_eq!(sqlite3_bind_int(ins2, 1, 2), SQLITE_OK);
+            assert_eq!(sqlite3_bind_zeroblob(ins2, 2, 3), SQLITE_OK);
+            assert_eq!(sqlite3_step(ins2), SQLITE_DONE);
+            sqlite3_finalize(ins2);
+
+            let sel = prepare(db, "SELECT length(data) FROM t ORDER BY id;");
+            assert_eq!(sqlite3_step(sel), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(sel, 0), 4);
+            assert_eq!(sqlite3_step(sel), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(sel, 0), 3);
+            sqlite3_finalize(sel);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_bind_text_preserves_embedded_nul() {
+        unsafe {
+            let db = open_memory();
+            let setup = CString::new("CREATE TABLE t(v TEXT);").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let ins = prepare(db, "INSERT INTO t VALUES(?);");
+            // Explicit length keeps the embedded NUL, unlike the -1 strlen form.
+            let raw = b"a\0b";
+            assert_eq!(
+                sqlite3_bind_text(ins, 1, raw.as_ptr().cast(), 3, None),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(ins), SQLITE_DONE);
+            sqlite3_finalize(ins);
+
+            // The stored value keeps all three bytes (verified by the byte count
+            // accessor; SQL `length()` would stop at the NUL by C-string rule).
+            let sel = prepare(db, "SELECT v FROM t;");
+            assert_eq!(sqlite3_step(sel), SQLITE_ROW);
+            assert_eq!(sqlite3_column_bytes(sel, 0), 3);
+            let text = sqlite3_column_text(sel, 0);
+            assert!(!text.is_null());
+            let bytes = std::slice::from_raw_parts(text.cast::<u8>(), 3);
+            assert_eq!(bytes, b"a\0b");
+            sqlite3_finalize(sel);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_bind_destructor_is_invoked_for_custom() {
+        unsafe {
+            static CALLS: AtomicUsize = AtomicUsize::new(0);
+            unsafe extern "C" fn dtor(_ptr: *mut c_void) {
+                CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let db = open_memory();
+            let stmt = prepare(db, "SELECT ?;");
+            let text = CString::new("x").unwrap();
+            // A real destructor is called once the bytes are copied; STATIC/None
+            // and the TRANSIENT sentinel are not.
+            assert_eq!(
+                sqlite3_bind_text(stmt, 1, text.as_ptr(), -1, Some(dtor)),
+                SQLITE_OK
+            );
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+
+            let transient: SqliteDestructor =
+                std::mem::transmute::<isize, SqliteDestructor>(SQLITE_TRANSIENT);
+            assert_eq!(
+                sqlite3_bind_text(stmt, 1, text.as_ptr(), -1, transient),
+                SQLITE_OK
+            );
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1, "TRANSIENT must not call");
+
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_bind_on_unparameterized_is_range() {
+        unsafe {
+            let db = open_memory();
+            let stmt = prepare(db, "SELECT 1;");
+            assert_eq!(sqlite3_bind_parameter_count(stmt), 0);
+            assert_eq!(sqlite3_bind_int(stmt, 1, 5), SQLITE_RANGE);
+            // Unparameterized statements still execute normally.
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 1);
+            sqlite3_finalize(stmt);
             sqlite3_close(db);
         }
     }
