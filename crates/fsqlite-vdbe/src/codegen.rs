@@ -40683,8 +40683,10 @@ mod tests {
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
         let err = codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        // a0e51891e switched ragged VALUES to the verbatim stock message under
+        // SQLITE_ERROR (CodegenError::SqlError, no "unsupported:" prefix).
         assert!(
-            matches!(err, CodegenError::Unsupported(ref msg) if msg.contains("same arity")),
+            matches!(err, CodegenError::SqlError(ref msg) if msg.contains("same number of terms")),
             "unexpected error: {err:?}"
         );
     }
@@ -54843,8 +54845,10 @@ mod tests {
         };
         let mut b = ProgramBuilder::new();
         let err = codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        // a0e51891e switched explicit-column arity mismatch to stock's shorter
+        // verbatim form ("<n> values for <m> columns") under SQLITE_ERROR.
         assert!(
-            matches!(err, CodegenError::Unsupported(ref message) if message.contains("INSERT target list has 1 columns but 2 values were supplied")),
+            matches!(err, CodegenError::SqlError(ref message) if message.contains("2 values for 1 columns")),
             "unexpected error: {err:?}"
         );
     }
