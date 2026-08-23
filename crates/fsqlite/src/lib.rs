@@ -53,6 +53,18 @@ pub mod session {
     };
 }
 
+// Guard for fsqlite#379: `async-api` must always bring the full `native`
+// stack. The feature table enforces this implication; this compile_error is a
+// tripwire so that if the implication is ever dropped from Cargo.toml again,
+// `default-features = false, features = ["async-api"]` fails loudly instead of
+// silently building an engine whose native context wiring is absent.
+#[cfg(all(feature = "async-api", not(feature = "native")))]
+compile_error!(
+    "the `async-api` feature requires `native`; enable `native` (it is implied \
+     by `async-api` in fsqlite's feature table — seeing this error means that \
+     implication was removed)"
+);
+
 #[cfg(feature = "async-api")]
 pub mod async_api;
 #[cfg(feature = "async-api")]
