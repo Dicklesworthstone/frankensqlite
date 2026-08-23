@@ -218,3 +218,111 @@ fn upsert_multi_row_mixed_insert_and_update() {
         .await;
     });
 }
+
+// bd-xjfrt — a correlated subquery in a DO UPDATE SET expression must resolve
+// its outer references against the *target* row, not evaluate to NULL. Before
+// the fix, the DO-UPDATE apply built its expression-eval ScanCtx with
+// `schema: None`, so any subquery fell straight through to the "no schema
+// context — emit NULL" arm of `emit_expr`.
+#[test]
+fn upsert_do_update_correlated_subquery_target_row() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER)",
+                "CREATE TABLE s (k INTEGER PRIMARY KEY, add_v INTEGER)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT INTO s VALUES (1,1000)",
+                // v = existing v (10) + (SELECT add_v FROM s WHERE s.k = t.k) = 1010.
+                "INSERT INTO t (k,v) VALUES (1,5) ON CONFLICT(k) DO UPDATE SET v = v + (SELECT add_v FROM s WHERE s.k = t.k)",
+            ],
+            &["SELECT k, v FROM t ORDER BY k"], // (1,1010)
+            "upsert_do_update_correlated_subquery_target_row",
+        )
+        .await;
+    });
+}
+
+// bd-xjfrt — the same correlated subquery, but keyed off `excluded.k` (the
+// attempted-insert pseudo-row) rather than the target `t.k`. Both must reach
+// the same existing row and yield 1010.
+#[test]
+fn upsert_do_update_correlated_subquery_excluded_key() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER)",
+                "CREATE TABLE s (k INTEGER PRIMARY KEY, add_v INTEGER)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT INTO s VALUES (1,1000)",
+                "INSERT INTO t (k,v) VALUES (1,5) ON CONFLICT(k) DO UPDATE SET v = v + (SELECT add_v FROM s WHERE s.k = excluded.k)",
+            ],
+            &["SELECT k, v FROM t ORDER BY k"], // (1,1010)
+            "upsert_do_update_correlated_subquery_excluded_key",
+        )
+        .await;
+    });
+}
+
+// bd-xjfrt — a correlated EXISTS inside the DO UPDATE SET expression must also
+// resolve against the target row.
+#[test]
+fn upsert_do_update_correlated_exists() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER)",
+                "CREATE TABLE s (k INTEGER PRIMARY KEY)",
+                "INSERT INTO t VALUES (1,10),(2,20)",
+                "INSERT INTO s VALUES (1)",
+                // Row 1 has a matching s row -> +100; row 2 does not -> +1.
+                "INSERT INTO t (k,v) VALUES (1,0) ON CONFLICT(k) DO UPDATE SET v = v + (CASE WHEN EXISTS (SELECT 1 FROM s WHERE s.k = t.k) THEN 100 ELSE 1 END)",
+                "INSERT INTO t (k,v) VALUES (2,0) ON CONFLICT(k) DO UPDATE SET v = v + (CASE WHEN EXISTS (SELECT 1 FROM s WHERE s.k = t.k) THEN 100 ELSE 1 END)",
+            ],
+            &["SELECT k, v FROM t ORDER BY k"], // (1,110),(2,21)
+            "upsert_do_update_correlated_exists",
+        )
+        .await;
+    });
+}
+
+// bd-xjfrt — a searched-CASE DO UPDATE SET expression must not clobber the
+// existing column register while evaluating the WHEN condition. The assignment
+// destination is the same register that holds the existing column value, and
+// the condition scratch used to alias it: `CASE WHEN 1>2 THEN excluded.v ELSE v
+// END` returned 0 (the clobbered comparison result) instead of the existing 10.
+#[test]
+fn upsert_do_update_case_bare_column_not_clobbered() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t VALUES (1,10)",
+                // WHEN false -> ELSE picks the existing v (10), unchanged.
+                "INSERT INTO t (id,v) VALUES (1,99) ON CONFLICT(id) DO UPDATE SET v = CASE WHEN 1>2 THEN excluded.v ELSE v END",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,10)
+            "upsert_do_update_case_bare_column_not_clobbered",
+        )
+        .await;
+    });
+}
+
+// bd-xjfrt — the true-branch mirror: `CASE WHEN 2>1 THEN v ELSE excluded.v END`
+// must yield the existing v (10), proving the taken THEN branch reads the
+// un-clobbered existing register too.
+#[test]
+fn upsert_do_update_case_true_branch_bare_column() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT INTO t (id,v) VALUES (1,99) ON CONFLICT(id) DO UPDATE SET v = CASE WHEN 2>1 THEN v ELSE excluded.v END",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,10)
+            "upsert_do_update_case_true_branch_bare_column",
+        )
+        .await;
+    });
+}

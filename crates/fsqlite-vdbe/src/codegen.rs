@@ -1864,10 +1864,20 @@ fn emit_upsert_expr(
                     // left-to-right so a would-be-skipped erroring operand is never
                     // evaluated (bd-and-or-short-circuit GAP-2, ON CONFLICT DO
                     // UPDATE path). Non-AND/OR conditions emit byte-identically.
+                    //
+                    // bd-xjfrt: the condition MUST evaluate into its own scratch
+                    // register, never `reg`. `reg` is the assignment destination,
+                    // which for an unqualified target column aliases the existing
+                    // row's value register (`existing_regs + col_idx`). Using `reg`
+                    // as the comparison scratch clobbered that existing value, so a
+                    // later bare-column reference in the THEN/ELSE (e.g.
+                    // `CASE WHEN 1>2 THEN excluded.v ELSE v END`) read the clobbered
+                    // 0 instead of the real column value.
+                    let cond_scratch = b.alloc_temp();
                     emit_upsert_case_when_condition(
                         b,
                         when_expr,
-                        reg,
+                        cond_scratch,
                         next_when,
                         existing_ctx,
                         excluded_ctx,
@@ -1875,6 +1885,7 @@ fn emit_upsert_expr(
                         existing_hidden_rowid_reg,
                         excluded_hidden_rowid_reg,
                     );
+                    b.free_temp(cond_scratch);
                 }
                 emit_upsert_expr(
                     b,
@@ -19957,6 +19968,7 @@ pub fn codegen_insert(
                     Some(&mapping.col_mapping),
                     table_cursor,
                     table,
+                    schema,
                     &stmt.returning,
                     target_alias,
                     ctx,
@@ -19973,6 +19985,7 @@ pub fn codegen_insert(
                     None,
                     table_cursor,
                     table,
+                    schema,
                     &stmt.returning,
                     target_alias,
                     ctx,
@@ -20215,6 +20228,7 @@ fn codegen_insert_values(
     col_mapping: Option<&[Option<usize>]>,
     cursor: i32,
     table: &TableSchema,
+    schema: &[TableSchema],
     returning: &[ResultColumn],
     table_alias: Option<&str>,
     ctx: &CodegenContext,
@@ -20665,11 +20679,24 @@ fn codegen_insert_values(
                 // Build ScanCtx for evaluating DO UPDATE expressions.
                 // "excluded" maps to val_regs (the attempted insert values).
                 // Unqualified column refs resolve from existing_regs (the current row).
+                //
+                // bd-xjfrt: a subquery/EXISTS in a DO UPDATE SET expression is
+                // emitted through the generic `emit_expr` path with `existing_ctx`
+                // as its outer correlation context, so `existing_ctx` must carry
+                // the real `schema` (else the subquery falls into the "no schema"
+                // NULL arm) and expose `excluded.*` as a register-backed secondary
+                // (so `... WHERE s.k = excluded.k` correlates against val_regs).
+                let excluded_secondary = [SecondaryScan {
+                    cursor,
+                    table,
+                    table_alias: Some("excluded"),
+                    register_base: Some(val_regs),
+                }];
                 let excluded_ctx = ScanCtx {
                     cursor,
                     table,
                     table_alias: Some("excluded"),
-                    schema: None,
+                    schema: Some(schema),
                     register_base: Some(val_regs),
                     secondaries: &[],
                 };
@@ -20677,9 +20704,9 @@ fn codegen_insert_values(
                     cursor,
                     table,
                     table_alias,
-                    schema: None,
+                    schema: Some(schema),
                     register_base: Some(existing_regs),
-                    secondaries: &[],
+                    secondaries: &excluded_secondary,
                 };
                 let existing_hidden_rowid_reg = ctx
                     .rowid_alias_col_idx
@@ -22441,6 +22468,25 @@ fn emit_column_from_cursor(
     }
 }
 
+/// Emit a column read against a [`SecondaryScan`], honoring a register-backed
+/// source when present. A cursor-backed secondary (UPDATE ... FROM) reads the
+/// B-tree; a register-backed secondary (the UPSERT `excluded.*` pseudo-row,
+/// bd-xjfrt) copies the attempted-insert value from `register_base + col_idx`.
+/// The IPK column register is kept in sync with the rowid at INSERT codegen, so
+/// a plain copy is correct for it too.
+fn emit_secondary_column(b: &mut ProgramBuilder, col_name: &str, sec: &SecondaryScan<'_>, reg: i32) {
+    if let Some(base) = sec.register_base {
+        if let Some(col_idx) = sec.table.column_index(col_name) {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::Copy, base + col_idx as i32, reg, 0, P4::None, 0);
+        } else {
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        }
+    } else {
+        emit_column_from_cursor(b, col_name, sec.cursor, sec.table, reg);
+    }
+}
+
 /// Generate VDBE bytecode for `UPDATE target SET ... FROM source WHERE ...`.
 ///
 /// Uses a nested-loop join: outer loop scans the FROM table, inner loop scans
@@ -22528,6 +22574,7 @@ fn codegen_update_from(
             cursor,
             table: src_table,
             table_alias: *src_alias,
+            register_base: None,
         });
     }
 
@@ -24892,11 +24939,22 @@ fn emit_without_rowid_upsert_row(
 
     // `excluded.*` resolves to the attempted-insert values (val_regs); unqualified
     // column refs resolve to the existing row (existing_regs).
+    //
+    // bd-xjfrt: as in the rowid path, `existing_ctx` carries the real `schema` and
+    // a register-backed `excluded.*` secondary so correlated subqueries/EXISTS in
+    // a DO UPDATE SET expression resolve against the target row and val_regs
+    // instead of collapsing to NULL.
+    let excluded_secondary = [SecondaryScan {
+        cursor: table_cursor,
+        table,
+        table_alias: Some("excluded"),
+        register_base: Some(val_regs),
+    }];
     let excluded_ctx = ScanCtx {
         cursor: table_cursor,
         table,
         table_alias: Some("excluded"),
-        schema: None,
+        schema: Some(schema),
         register_base: Some(val_regs),
         secondaries: &[],
     };
@@ -24904,9 +24962,9 @@ fn emit_without_rowid_upsert_row(
         cursor: table_cursor,
         table,
         table_alias: target_alias,
-        schema: None,
+        schema: Some(schema),
         register_base: Some(existing_regs),
-        secondaries: &[],
+        secondaries: &excluded_secondary,
     };
     // WITHOUT ROWID tables have no hidden rowid, so no column ever resolves to a
     // hidden rowid; the excluded-side helper still needs a register value, so
@@ -26024,6 +26082,7 @@ fn codegen_update_from_without_rowid(
             cursor,
             table: src_table,
             table_alias: *src_alias,
+            register_base: None,
         });
     }
     let sorter_cursor = (1 + n_indexes + from_specs.len()) as i32;
@@ -31086,11 +31145,18 @@ struct ScanCtx<'a> {
     secondaries: &'a [SecondaryScan<'a>],
 }
 
-/// Secondary table scan context for UPDATE ... FROM.
+/// Secondary table scan context for UPDATE ... FROM (and the register-backed
+/// `excluded.*` pseudo-table threaded into UPSERT DO UPDATE subquery
+/// correlation).
 struct SecondaryScan<'a> {
     cursor: i32,
     table: &'a TableSchema,
     table_alias: Option<&'a str>,
+    /// When set, a qualified reference to this secondary resolves by copying
+    /// from `register_base + col_index` instead of reading the B-tree cursor.
+    /// Used for the UPSERT `excluded.*` pseudo-row, whose attempted-insert
+    /// values live in registers (`val_regs`), not on a cursor (bd-xjfrt).
+    register_base: Option<i32>,
 }
 
 fn literal_integer_value(expr: &Expr) -> Option<i64> {
@@ -33316,7 +33382,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                     .iter()
                     .find(|sec| matches_table_or_alias(qualifier, sec.table, sec.table_alias))
                 {
-                    emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
+                    emit_secondary_column(b, &col_ref.column, sec, reg);
                     return;
                 }
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
@@ -33377,7 +33443,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             {
                 // Unqualified column not found in primary — resolve against the
                 // first secondary FROM source that has it.
-                emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
+                emit_secondary_column(b, &col_ref.column, sec, reg);
             } else {
                 // Unknown column — emit Null.
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
@@ -37219,6 +37285,7 @@ mod tests {
             cursor: 7,
             table: &secondary_table,
             table_alias: Some("u"),
+            register_base: None,
         }];
         let outer = ScanCtx {
             cursor: 3,
@@ -51309,6 +51376,7 @@ mod tests {
             cursor: 1,
             table: &secondary_table,
             table_alias: Some("u"),
+            register_base: None,
         }];
         let scan_ctx = ScanCtx {
             cursor: 0,
