@@ -24778,6 +24778,13 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_query_supports_prepared_reuse(statements[0].as_ref())
         {
+            // The prepared/VDBE fast lane skips the interpreted-path aggregate/
+            // window misuse check; mirror query_with_params/execute() so this
+            // entry point also rejects e.g. `SELECT max(x) FROM t WHERE max(x)>0`
+            // instead of silently accepting it. bd-w39k0.
+            if let Statement::Select(select) = statements[0].as_ref() {
+                self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
+            }
             let prepared = self.prepare_after_background_status(sql).await?;
             return self
                 .query_prepared_with_params_for_each_after_background_status(&prepared, params, f)
@@ -24816,6 +24823,13 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_query_supports_prepared_reuse(statements[0].as_ref())
         {
+            // The prepared/VDBE fast lane skips the interpreted-path aggregate/
+            // window misuse check; mirror query_with_params/execute() so this
+            // entry point also rejects e.g. `SELECT max(x) FROM t WHERE max(x)>0`
+            // instead of silently accepting it. bd-w39k0.
+            if let Statement::Select(select) = statements[0].as_ref() {
+                self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
+            }
             let prepared = self.prepare_after_background_status(sql).await?;
             return self
                 .query_prepared_row_after_background_status(&prepared, None)
@@ -24855,6 +24869,13 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_query_supports_prepared_reuse(statements[0].as_ref())
         {
+            // The prepared/VDBE fast lane skips the interpreted-path aggregate/
+            // window misuse check; mirror query_with_params/execute() so this
+            // entry point also rejects e.g. `SELECT max(x) FROM t WHERE max(x)>0`
+            // instead of silently accepting it. bd-w39k0.
+            if let Statement::Select(select) = statements[0].as_ref() {
+                self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
+            }
             let prepared = self.prepare_after_background_status(sql).await?;
             return self
                 .query_prepared_row_after_background_status(&prepared, Some(params))
@@ -25275,6 +25296,13 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_execute_supports_prepared_reuse(statements[0].as_ref())?
         {
+            // The prepared/VDBE fast lane skips the interpreted-path aggregate/
+            // window misuse check; mirror query_with_params/execute() so the
+            // row-discarding parameterized path also rejects e.g. `SELECT max(x)
+            // FROM t WHERE max(x)>0` instead of silently accepting it. bd-w39k0.
+            if let Statement::Select(select) = statements[0].as_ref() {
+                self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
+            }
             let prepared = self.prepare_after_background_status(sql).await?;
             return self
                 .execute_prepared_with_params_after_background_status(

@@ -694,24 +694,67 @@ fn cte_self_reference_no_anchor_is_circular() {
 #[test]
 fn parameterized_query_rejects_aggregate_misuse() {
     asupersync::test_utils::run_test(|| async {
-        // query_with_params's prepared fast lane must run the same aggregate/window
-        // misuse validation as query()/execute(), so an aggregate-in-WHERE is
-        // rejected rather than silently accepted. bd-w39k0.
+        // EVERY prepared/VDBE fast-lane entry point must run the same
+        // aggregate/window misuse validation as the interpreted query()/execute()
+        // paths, so an aggregate-in-WHERE is rejected rather than silently
+        // accepted. The fast lane is taken by the parameterized and single-row
+        // entry points (query_with_params / query_with_params_for_each /
+        // query_row / query_row_with_params / execute_with_params); the plain
+        // query() path is fully interpreted and already rejects it. bd-w39k0.
+        const MISUSE: &str = "SELECT max(x) FROM t WHERE max(x) > 0";
+        const EXPECTED: &str = "misuse of aggregate: max()";
+
         let f = Connection::open(":memory:").await.unwrap();
         f.execute("CREATE TABLE t(x INT)").await.unwrap();
+        f.execute("INSERT INTO t VALUES (1)").await.unwrap();
+
+        // query_with_params fast lane.
+        match f.query_with_params(MISUSE, &[]).await {
+            Ok(_) => panic!("expected a misuse error via query_with_params"),
+            Err(e) => assert_eq!(e.to_string(), EXPECTED),
+        }
+        // query_with_params_for_each fast lane.
         match f
-            .query_with_params("SELECT max(x) FROM t WHERE max(x) > 0", &[])
+            .query_with_params_for_each(MISUSE, &[], |_row| Ok(()))
             .await
         {
-            Ok(_) => panic!("expected a misuse error via query_with_params"),
-            Err(e) => assert_eq!(e.to_string(), "misuse of aggregate: max()"),
+            Ok(()) => panic!("expected a misuse error via query_with_params_for_each"),
+            Err(e) => assert_eq!(e.to_string(), EXPECTED),
         }
-        // control: a valid query on the same parameterized entry point still works.
+        // query_row fast lane.
+        match f.query_row(MISUSE).await {
+            Ok(_) => panic!("expected a misuse error via query_row"),
+            Err(e) => assert_eq!(e.to_string(), EXPECTED),
+        }
+        // query_row_with_params fast lane.
+        match f.query_row_with_params(MISUSE, &[]).await {
+            Ok(_) => panic!("expected a misuse error via query_row_with_params"),
+            Err(e) => assert_eq!(e.to_string(), EXPECTED),
+        }
+        // execute_with_params fast lane (the row-discarding parameterized path).
+        match f.execute_with_params(MISUSE, &[]).await {
+            Ok(_) => panic!("expected a misuse error via execute_with_params"),
+            Err(e) => assert_eq!(e.to_string(), EXPECTED),
+        }
+
+        // controls: valid queries on the same entry points still work.
         assert!(
             f.query_with_params("SELECT x FROM t WHERE x > 0", &[])
                 .await
                 .is_ok(),
-            "a valid parameterized query is accepted"
+            "a valid query_with_params is accepted"
+        );
+        assert!(
+            f.query_row_with_params("SELECT x FROM t WHERE x > 0", &[])
+                .await
+                .is_ok(),
+            "a valid query_row_with_params is accepted"
+        );
+        assert!(
+            f.execute_with_params("SELECT x FROM t WHERE x > 0", &[])
+                .await
+                .is_ok(),
+            "a valid execute_with_params is accepted"
         );
     });
 }
