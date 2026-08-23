@@ -19892,50 +19892,23 @@ pub fn codegen_insert(
     // entries when a conflicting row is deleted.
     register_table_index_meta(b, table, table_cursor);
 
-    // Conflict behavior: ON CONFLICT clause from upsert takes precedence.
-    let (oe_flag, upsert_clause) = if !stmt.upsert.is_empty() {
-        // Use the first upsert clause (multiple ON CONFLICT clauses
-        // are parsed but we process the first one).
-        let clause = &stmt.upsert[0];
-        match &clause.action {
-            UpsertAction::Nothing => (OE_IGNORE, None),
-            UpsertAction::Update { .. } => (OE_IGNORE, Some(clause)),
-        }
-    } else {
-        (conflict_action_to_oe(stmt.or_conflict.as_ref()), None)
-    };
-    // Statement-level conflict algorithm: an explicit `INSERT OR <algo>`
-    // overrides per-constraint `ON CONFLICT` clauses.
-    //
-    // For an upsert, the *target* conflict is resolved by the check-before-insert
-    // probe in `codegen_insert_values` (the DO UPDATE branch does its own REPLACE
-    // handling). The `stmt_level` here governs the no-conflict INSERT path's
-    // remaining constraints (non-target UNIQUE/PK indexes via `emit_index_inserts`,
-    // plus NOT NULL on the update path):
-    //   * DO NOTHING legitimately ignores the conflicting row, so keep IGNORE.
-    //   * DO UPDATE must NOT blanket-IGNORE a violation on a *different* index:
-    //     stock SQLite aborts (or applies an explicit `INSERT OR <algo>`) when the
-    //     inserted row collides on a non-target UNIQUE/PK constraint. Forcing
-    //     IGNORE here silently swallowed those writes as Ok(0)
-    //     (hfdt-fsqlite-upsert-conflict-target-a756a), so carry the genuine
-    //     statement conflict action instead (`None` => default ABORT).
-    let stmt_level: Option<ConflictAction> = if stmt.upsert.is_empty() {
-        stmt.or_conflict
-    } else {
-        match &stmt.upsert[0].action {
-            UpsertAction::Nothing => Some(ConflictAction::Ignore),
-            UpsertAction::Update { .. } => stmt.or_conflict,
-        }
-    };
-    if let Some(UpsertClause {
-        action: UpsertAction::Update {
-            assignments,
-            where_clause,
-        },
-        target,
-    }) = upsert_clause
-    {
-        if let Some(target) = target
+    // Conflict behavior. A statement-level `INSERT OR <algo>` (or the default
+    // ABORT) governs BOTH the pre-insert NOT NULL/CHECK checks on the candidate
+    // row and the no-conflict INSERT path's remaining (non-target) UNIQUE/PK
+    // constraints. The per-constraint `ON CONFLICT` chain is routed row-by-row
+    // in `codegen_insert_values`: each clause probes its own target in written
+    // order and the first whose target conflicts is applied (DO UPDATE rewrites
+    // the conflicting row; DO NOTHING skips the insert). A conflict on a
+    // constraint that no clause targets falls through to `stmt_level`
+    // (default ABORT), matching stock (multiple ON CONFLICT clauses, SQLite
+    // 3.35+). Stock enforces candidate NOT NULL/CHECK even for a row that will
+    // conflict, so these are NOT blanket-IGNORE'd (bd-aap9u).
+    let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    let stmt_level: Option<ConflictAction> = stmt.or_conflict;
+    // Validate every clause's conflict target + DO UPDATE assignment/WHERE
+    // columns up front for error parity.
+    for clause in &stmt.upsert {
+        if let Some(target) = clause.target.as_ref()
             && find_upsert_target_index(table, Some(target)).is_none()
             && !upsert_target_matches_rowid_primary_key(table, target)
             && !upsert_target_matches_without_rowid_primary_key(table, target)
@@ -19944,12 +19917,18 @@ pub fn codegen_insert(
                 "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint".to_owned(),
             ));
         }
-        for assign in assignments {
-            validate_assignment_target(table, &assign.target)?;
-            validate_upsert_expr_columns(&assign.value, table, target_alias)?;
-        }
-        if let Some(where_expr) = where_clause {
-            validate_upsert_expr_columns(where_expr, table, target_alias)?;
+        if let UpsertAction::Update {
+            assignments,
+            where_clause,
+        } = &clause.action
+        {
+            for assign in assignments {
+                validate_assignment_target(table, &assign.target)?;
+                validate_upsert_expr_columns(&assign.value, table, target_alias)?;
+            }
+            if let Some(where_expr) = where_clause {
+                validate_upsert_expr_columns(where_expr, table, target_alias)?;
+            }
         }
     }
 
@@ -19974,7 +19953,7 @@ pub fn codegen_insert(
                     ctx,
                     oe_flag,
                     stmt_level,
-                    upsert_clause,
+                    &stmt.upsert,
                 )?;
             } else {
                 codegen_insert_values(
@@ -19991,7 +19970,7 @@ pub fn codegen_insert(
                     ctx,
                     oe_flag,
                     stmt_level,
-                    upsert_clause,
+                    &stmt.upsert,
                 )?;
             }
         }
@@ -20220,6 +20199,353 @@ fn build_insert_target_mapping(
     clippy::cast_possible_wrap,
     clippy::too_many_arguments
 )]
+/// Emit the check-before-insert conflict probe for one UPSERT `ON CONFLICT`
+/// clause (rowid table). `target` is the clause's conflict target (`None` for a
+/// bare `ON CONFLICT`). On NO conflict, control jumps to `no_conflict_label`
+/// (the next clause in the chain, or the normal-insert path for the last
+/// clause). On conflict, control falls through with the table cursor positioned
+/// on the conflicting row; the returned register holds that row's rowid.
+fn emit_upsert_probe(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    cursor: i32,
+    val_regs: i32,
+    rowid_reg: i32,
+    table_alias: Option<&str>,
+    target: Option<&UpsertTarget>,
+    no_conflict_label: Label,
+) -> i32 {
+    if let Some((idx_offset, index)) = find_upsert_target_index(table, target) {
+        let attempted_row_ctx = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema: None,
+            register_base: Some(val_regs),
+            secondaries: &[],
+        };
+        emit_index_predicate_guard(b, index, &attempted_row_ctx, no_conflict_label);
+
+        // UNIQUE index conflict check.
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let idx_cursor = cursor + 1 + idx_offset as i32;
+        let n_key_cols = index.columns.len() as i32;
+
+        // Build probe key from attempted insert values.
+        let key_val_regs = b.alloc_regs(n_key_cols);
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        for (key_pos, col_name) in index.columns.iter().enumerate() {
+            if let Some(col_idx) = table.column_index(col_name) {
+                b.emit_op(
+                    Opcode::Copy,
+                    val_regs + col_idx as i32,
+                    key_val_regs + key_pos as i32,
+                    0,
+                    P4::None,
+                    0,
+                );
+            }
+        }
+        let key_rec_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            key_val_regs,
+            n_key_cols,
+            key_rec_reg,
+            P4::None,
+            0,
+        );
+
+        // NoConflict: jump to no_conflict_label if no match found.
+        b.emit_jump_to_label(
+            Opcode::NoConflict,
+            idx_cursor,
+            key_rec_reg,
+            no_conflict_label,
+            P4::None,
+            0,
+        );
+
+        // Conflict: extract existing row's rowid from index.
+        let existing_rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, existing_rowid_reg, 0, P4::None, 0);
+
+        // Seek table cursor to the existing row.
+        b.emit_jump_to_label(
+            Opcode::NotExists,
+            cursor,
+            existing_rowid_reg,
+            no_conflict_label,
+            P4::None,
+            0,
+        );
+
+        existing_rowid_reg
+    } else if target.is_none()
+        && table
+            .indexes
+            .iter()
+            .any(|index| index.is_unique && index.supports_direct_column_lookup())
+    {
+        // Omitted conflict target (SQLite 3.35+): DO UPDATE fires on whichever
+        // uniqueness constraint the new row violates first. Probe the rowid/IPK
+        // PRIMARY KEY, then every UNIQUE index in schema order; the first hit
+        // supplies the existing row and leaves the table cursor positioned on it.
+        let conflict_label = b.emit_label();
+        let found_rowid_reg = b.alloc_reg();
+        let pk_miss = b.emit_label();
+        b.emit_jump_to_label(Opcode::NotExists, cursor, rowid_reg, pk_miss, P4::None, 0);
+        b.emit_op(Opcode::Copy, rowid_reg, found_rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
+        b.resolve_label(pk_miss);
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        for (idx_offset, index) in table.indexes.iter().enumerate() {
+            if !index.is_unique || !index.supports_direct_column_lookup() {
+                continue;
+            }
+            let idx_miss = b.emit_label();
+            let idx_cursor = cursor + 1 + idx_offset as i32;
+            let n_key_cols = index.columns.len() as i32;
+            let key_val_regs = b.alloc_regs(n_key_cols);
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            for (key_pos, col_name) in index.columns.iter().enumerate() {
+                if let Some(col_idx) = table.column_index(col_name) {
+                    b.emit_op(
+                        Opcode::Copy,
+                        val_regs + col_idx as i32,
+                        key_val_regs + key_pos as i32,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                }
+            }
+            let key_rec_reg = b.alloc_reg();
+            b.emit_op(
+                Opcode::MakeRecord,
+                key_val_regs,
+                n_key_cols,
+                key_rec_reg,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::NoConflict,
+                idx_cursor,
+                key_rec_reg,
+                idx_miss,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::IdxRowid, idx_cursor, found_rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::NotExists,
+                cursor,
+                found_rowid_reg,
+                idx_miss,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
+            b.resolve_label(idx_miss);
+        }
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, no_conflict_label, P4::None, 0);
+        b.resolve_label(conflict_label);
+        found_rowid_reg
+    } else {
+        // PK conflict check (explicit PK/rowid target, or omitted target on a
+        // table with no UNIQUE indexes).
+        b.emit_jump_to_label(Opcode::NotExists, cursor, rowid_reg, no_conflict_label, P4::None, 0);
+        rowid_reg
+    }
+}
+
+/// Emit the DO UPDATE apply body for one UPSERT clause (rowid table): read the
+/// conflicting row, evaluate the optional `WHERE`, apply the SET assignments
+/// (with `excluded.*` bound to the attempted-insert registers), re-validate
+/// constraints, delete the old row, and re-insert the rewritten image. The
+/// table cursor must already be positioned on the conflicting row (rowid in
+/// `update_rowid_reg`, from [`emit_upsert_probe`]). Does not emit the trailing
+/// jump to the done label — the caller does.
+#[allow(clippy::too_many_arguments)]
+fn emit_upsert_do_update_apply(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    cursor: i32,
+    schema: &[TableSchema],
+    val_regs: i32,
+    rowid_reg: i32,
+    update_rowid_reg: i32,
+    assignments: &[fsqlite_ast::Assignment],
+    where_clause: Option<&Expr>,
+    n_cols: usize,
+    n_cols_i32: i32,
+    aff_str: &str,
+    stmt_level: Option<ConflictAction>,
+    returning: &[ResultColumn],
+    table_alias: Option<&str>,
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    // Allocate registers for existing row columns and read them from the cursor.
+    let existing_regs = b.alloc_regs(n_cols_i32);
+    for col_idx in 0..n_cols {
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let col_i = col_idx as i32;
+        if table.columns.get(col_idx).is_some_and(|c| c.is_ipk) {
+            b.emit_op(Opcode::Rowid, cursor, existing_regs + col_i, 0, P4::None, 0);
+        } else {
+            b.emit_op(Opcode::Column, cursor, col_i, existing_regs + col_i, P4::None, 0);
+        }
+    }
+
+    // Build ScanCtx for evaluating DO UPDATE expressions. "excluded" maps to
+    // val_regs (the attempted insert values); unqualified column refs resolve
+    // from existing_regs (the current row). bd-xjfrt: both ctxs carry the real
+    // `schema` (so subqueries resolve, not the "no schema → NULL" arm) and
+    // existing_ctx exposes `excluded.*` as a register-backed secondary so
+    // `... WHERE s.k = excluded.k` correlates against val_regs.
+    let excluded_secondary = [SecondaryScan {
+        cursor,
+        table,
+        table_alias: Some("excluded"),
+        register_base: Some(val_regs),
+    }];
+    let excluded_ctx = ScanCtx {
+        cursor,
+        table,
+        table_alias: Some("excluded"),
+        schema: Some(schema),
+        register_base: Some(val_regs),
+        secondaries: &[],
+    };
+    let existing_ctx = ScanCtx {
+        cursor,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: Some(existing_regs),
+        secondaries: &excluded_secondary,
+    };
+    let existing_hidden_rowid_reg = ctx
+        .rowid_alias_col_idx
+        .map(|ipk_idx| existing_regs + ipk_idx as i32);
+    let excluded_hidden_rowid_reg = rowid_reg;
+
+    // Optional WHERE clause on the DO UPDATE action.
+    let skip_update_label = if let Some(where_expr) = where_clause {
+        let label = b.emit_label();
+        let where_reg = b.alloc_reg();
+        emit_upsert_expr(
+            b,
+            where_expr,
+            where_reg,
+            &existing_ctx,
+            &excluded_ctx,
+            table,
+            existing_hidden_rowid_reg,
+            excluded_hidden_rowid_reg,
+        );
+        // If WHERE is false/NULL, skip the update (jump to done).
+        b.emit_jump_to_label(Opcode::IfNot, where_reg, 1, label, P4::None, 0);
+        Some(label)
+    } else {
+        None
+    };
+
+    emit_upsert_assignments(
+        b,
+        assignments,
+        table,
+        existing_regs,
+        &existing_ctx,
+        &excluded_ctx,
+        existing_hidden_rowid_reg,
+        excluded_hidden_rowid_reg,
+    )?;
+    // Validate the rewritten image before removing the old row.
+    emit_strict_type_check(b, table, existing_regs);
+    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
+    // constraints see the affinity-coerced value.
+    b.emit_op(
+        Opcode::Affinity,
+        existing_regs,
+        table.columns.len() as i32,
+        0,
+        P4::Affinity(table.affinity_string()),
+        0,
+    );
+    emit_check_constraints(b, table, existing_regs, None);
+    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
+    emit_index_deletes(b, table, cursor);
+    b.emit_op(Opcode::Delete, cursor, 0, 0, P4::None, OPFLAG_ISUPDATE);
+
+    // An UPSERT assignment may rewrite the INTEGER PRIMARY KEY. Reinsert at the
+    // new rowid, not the conflict victim's old id.
+    let mut final_rowid_reg = update_rowid_reg;
+    if let Some(ipk_idx) = ctx
+        .rowid_alias_col_idx
+        .or_else(|| table.columns.iter().position(|column| column.is_ipk))
+    {
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let ipk_reg = existing_regs + ipk_idx as i32;
+        let auto_label = b.emit_label();
+        let rowid_done_label = b.emit_label();
+        final_rowid_reg = b.alloc_reg();
+        b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
+        b.emit_op(Opcode::Copy, ipk_reg, final_rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, rowid_done_label, P4::None, 0);
+        b.resolve_label(auto_label);
+        b.emit_op(
+            Opcode::NewRowid,
+            cursor,
+            final_rowid_reg,
+            i32::from(ctx.concurrent_mode),
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::Copy, final_rowid_reg, ipk_reg, 0, P4::None, 0);
+        b.resolve_label(rowid_done_label);
+    }
+
+    let update_rec = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        existing_regs,
+        n_cols_i32,
+        update_rec,
+        make_insert_record_p4(table, aff_str),
+        0,
+    );
+    // bd-sque1: the DO UPDATE apply is semantically an UPDATE, so its re-insert
+    // must ABORT — not REPLACE — on a uniqueness conflict. The conflict victim
+    // was already deleted above, so a same-key upsert never collides; ABORT
+    // fires only when the assignment rewrites the rowid/PK/UNIQUE key onto a
+    // DIFFERENT existing row, matching stock.
+    b.emit_op(
+        Opcode::Insert,
+        cursor,
+        update_rec,
+        final_rowid_reg,
+        P4::Table(table.name.clone()),
+        OE_ABORT | OPFLAG_ISUPDATE,
+    );
+    emit_index_inserts(
+        b,
+        table,
+        cursor,
+        existing_regs,
+        final_rowid_reg,
+        Some(ConflictAction::Abort),
+    );
+    if !returning.is_empty() {
+        emit_returning(b, cursor, table, returning, table_alias, final_rowid_reg)?;
+    }
+    if let Some(label) = skip_update_label {
+        b.resolve_label(label);
+    }
+    Ok(())
+}
+
 fn codegen_insert_values(
     b: &mut ProgramBuilder,
     rows: &[Vec<Expr>],
@@ -20234,7 +20560,7 @@ fn codegen_insert_values(
     ctx: &CodegenContext,
     oe_flag: u16,
     stmt_level: Option<ConflictAction>,
-    upsert: Option<&UpsertClause>,
+    upserts: &[UpsertClause],
 ) -> Result<(), CodegenError> {
     // Conflict action for the table (rowid/INTEGER PRIMARY KEY) row: a
     // statement-level `INSERT OR <algo>` overrides the IPK column's declared
@@ -20467,414 +20793,88 @@ fn codegen_insert_values(
             );
         }
 
-        // UPSERT DO UPDATE: check-before-insert pattern.
-        if let Some(upsert_clause) = upsert {
-            if let UpsertAction::Update {
-                assignments,
-                where_clause,
-            } = &upsert_clause.action
-            {
-                let insert_label = b.emit_label();
-                let done_label = b.emit_label();
-
-                // Determine conflict check method: UNIQUE index or PK.
-                let update_rowid_reg = if let Some((idx_offset, index)) =
-                    find_upsert_target_index(table, upsert_clause.target.as_ref())
-                {
-                    let attempted_row_ctx = ScanCtx {
-                        cursor,
-                        table,
-                        table_alias,
-                        schema: None,
-                        register_base: Some(val_regs),
-                        secondaries: &[],
-                    };
-                    emit_index_predicate_guard(b, index, &attempted_row_ctx, insert_label);
-
-                    // UNIQUE index conflict check.
-                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-                    let idx_cursor = cursor + 1 + idx_offset as i32;
-                    let n_key_cols = index.columns.len() as i32;
-
-                    // Build probe key from attempted insert values.
-                    let key_val_regs = b.alloc_regs(n_key_cols);
-                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-                    for (key_pos, col_name) in index.columns.iter().enumerate() {
-                        if let Some(col_idx) = table.column_index(col_name) {
-                            b.emit_op(
-                                Opcode::Copy,
-                                val_regs + col_idx as i32,
-                                key_val_regs + key_pos as i32,
-                                0,
-                                P4::None,
-                                0,
-                            );
-                        }
-                    }
-                    let key_rec_reg = b.alloc_reg();
-                    b.emit_op(
-                        Opcode::MakeRecord,
-                        key_val_regs,
-                        n_key_cols,
-                        key_rec_reg,
-                        P4::None,
-                        0,
-                    );
-
-                    // NoConflict: jump to insert_label if no match found.
-                    b.emit_jump_to_label(
-                        Opcode::NoConflict,
-                        idx_cursor,
-                        key_rec_reg,
-                        insert_label,
-                        P4::None,
-                        0,
-                    );
-
-                    // Conflict: extract existing row's rowid from index.
-                    let existing_rowid_reg = b.alloc_reg();
-                    b.emit_op(
-                        Opcode::IdxRowid,
-                        idx_cursor,
-                        existing_rowid_reg,
-                        0,
-                        P4::None,
-                        0,
-                    );
-
-                    // Seek table cursor to the existing row.
-                    b.emit_jump_to_label(
-                        Opcode::NotExists,
-                        cursor,
-                        existing_rowid_reg,
-                        insert_label,
-                        P4::None,
-                        0,
-                    );
-
-                    existing_rowid_reg
-                } else if upsert_clause.target.is_none()
-                    && table
-                        .indexes
-                        .iter()
-                        .any(|index| index.is_unique && index.supports_direct_column_lookup())
-                {
-                    // Omitted conflict target (SQLite 3.35+): DO UPDATE fires on
-                    // whichever uniqueness constraint the new row violates first.
-                    // Probe the rowid/IPK PRIMARY KEY, then every UNIQUE index in
-                    // schema order; the first hit supplies the existing row and
-                    // leaves the table cursor positioned on it.
-                    let conflict_label = b.emit_label();
-                    let found_rowid_reg = b.alloc_reg();
-                    let pk_miss = b.emit_label();
-                    b.emit_jump_to_label(
-                        Opcode::NotExists,
-                        cursor,
-                        rowid_reg,
-                        pk_miss,
-                        P4::None,
-                        0,
-                    );
-                    b.emit_op(Opcode::Copy, rowid_reg, found_rowid_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
-                    b.resolve_label(pk_miss);
-                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-                    for (idx_offset, index) in table.indexes.iter().enumerate() {
-                        if !index.is_unique || !index.supports_direct_column_lookup() {
-                            continue;
-                        }
-                        let idx_miss = b.emit_label();
-                        let idx_cursor = cursor + 1 + idx_offset as i32;
-                        let n_key_cols = index.columns.len() as i32;
-                        let key_val_regs = b.alloc_regs(n_key_cols);
-                        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-                        for (key_pos, col_name) in index.columns.iter().enumerate() {
-                            if let Some(col_idx) = table.column_index(col_name) {
-                                b.emit_op(
-                                    Opcode::Copy,
-                                    val_regs + col_idx as i32,
-                                    key_val_regs + key_pos as i32,
-                                    0,
-                                    P4::None,
-                                    0,
-                                );
-                            }
-                        }
-                        let key_rec_reg = b.alloc_reg();
-                        b.emit_op(
-                            Opcode::MakeRecord,
-                            key_val_regs,
-                            n_key_cols,
-                            key_rec_reg,
-                            P4::None,
-                            0,
-                        );
-                        b.emit_jump_to_label(
-                            Opcode::NoConflict,
-                            idx_cursor,
-                            key_rec_reg,
-                            idx_miss,
-                            P4::None,
-                            0,
-                        );
-                        b.emit_op(
-                            Opcode::IdxRowid,
-                            idx_cursor,
-                            found_rowid_reg,
-                            0,
-                            P4::None,
-                            0,
-                        );
-                        b.emit_jump_to_label(
-                            Opcode::NotExists,
-                            cursor,
-                            found_rowid_reg,
-                            idx_miss,
-                            P4::None,
-                            0,
-                        );
-                        b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
-                        b.resolve_label(idx_miss);
-                    }
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, insert_label, P4::None, 0);
-                    b.resolve_label(conflict_label);
-                    found_rowid_reg
+        // UPSERT: a chain of ON CONFLICT clauses (SQLite 3.35+). Each clause
+        // probes its own conflict target in written order; the first clause
+        // whose target is violated is applied (DO UPDATE rewrites the specific
+        // conflicting row; DO NOTHING skips the insert). A conflict on a
+        // constraint that no clause targets falls through to the normal insert,
+        // where `stmt_level` (default ABORT) raises it — matching stock.
+        if !upserts.is_empty() {
+            let done_label = b.emit_label();
+            let insert_label = b.emit_label();
+            for (clause_idx, clause) in upserts.iter().enumerate() {
+                // NO conflict on this clause's target routes to the next clause;
+                // the last clause routes to the normal-insert path.
+                let no_conflict_label = if clause_idx + 1 == upserts.len() {
+                    insert_label
                 } else {
-                    // PK conflict check (explicit PK/rowid target, or omitted
-                    // target on a table with no UNIQUE indexes).
-                    b.emit_jump_to_label(
-                        Opcode::NotExists,
-                        cursor,
-                        rowid_reg,
-                        insert_label,
-                        P4::None,
-                        0,
-                    );
-                    rowid_reg
+                    b.emit_label()
                 };
-
-                // --- Conflict path: row exists, do UPDATE ---
-
-                // Allocate registers for existing row columns.
-                let existing_regs = b.alloc_regs(n_cols_i32);
-
-                // Read existing column values from cursor.
-                for col_idx in 0..n_cols {
-                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-                    let col_i = col_idx as i32;
-                    if table.columns.get(col_idx).is_some_and(|c| c.is_ipk) {
-                        b.emit_op(Opcode::Rowid, cursor, existing_regs + col_i, 0, P4::None, 0);
-                    } else {
-                        b.emit_op(
-                            Opcode::Column,
-                            cursor,
-                            col_i,
-                            existing_regs + col_i,
-                            P4::None,
-                            0,
-                        );
-                    }
-                }
-
-                // Build ScanCtx for evaluating DO UPDATE expressions.
-                // "excluded" maps to val_regs (the attempted insert values).
-                // Unqualified column refs resolve from existing_regs (the current row).
-                //
-                // bd-xjfrt: a subquery/EXISTS in a DO UPDATE SET expression is
-                // emitted through the generic `emit_expr` path with `existing_ctx`
-                // as its outer correlation context, so `existing_ctx` must carry
-                // the real `schema` (else the subquery falls into the "no schema"
-                // NULL arm) and expose `excluded.*` as a register-backed secondary
-                // (so `... WHERE s.k = excluded.k` correlates against val_regs).
-                let excluded_secondary = [SecondaryScan {
-                    cursor,
+                let existing_rowid_reg = emit_upsert_probe(
+                    b,
                     table,
-                    table_alias: Some("excluded"),
-                    register_base: Some(val_regs),
-                }];
-                let excluded_ctx = ScanCtx {
                     cursor,
-                    table,
-                    table_alias: Some("excluded"),
-                    schema: Some(schema),
-                    register_base: Some(val_regs),
-                    secondaries: &[],
-                };
-                let existing_ctx = ScanCtx {
-                    cursor,
-                    table,
+                    val_regs,
+                    rowid_reg,
                     table_alias,
-                    schema: Some(schema),
-                    register_base: Some(existing_regs),
-                    secondaries: &excluded_secondary,
-                };
-                let existing_hidden_rowid_reg = ctx
-                    .rowid_alias_col_idx
-                    .map(|ipk_idx| existing_regs + ipk_idx as i32);
-                let excluded_hidden_rowid_reg = rowid_reg;
-
-                // Optional WHERE clause on the DO UPDATE action.
-                let skip_update_label = if let Some(where_expr) = where_clause {
-                    let label = b.emit_label();
-                    let where_reg = b.alloc_reg();
-                    emit_upsert_expr(
-                        b,
-                        where_expr,
-                        where_reg,
-                        &existing_ctx,
-                        &excluded_ctx,
-                        table,
-                        existing_hidden_rowid_reg,
-                        excluded_hidden_rowid_reg,
-                    );
-                    // If WHERE is false/NULL, skip the update (jump to done).
-                    b.emit_jump_to_label(
-                        Opcode::IfNot,
-                        where_reg,
-                        1, // p3=1: jump on NULL (treat NULL as false)
-                        label,
-                        P4::None,
-                        0,
-                    );
-                    Some(label)
-                } else {
-                    None
-                };
-
-                emit_upsert_assignments(
-                    b,
-                    assignments,
-                    table,
-                    existing_regs,
-                    &existing_ctx,
-                    &excluded_ctx,
-                    existing_hidden_rowid_reg,
-                    excluded_hidden_rowid_reg,
-                )?;
-                // Validate the rewritten image before removing the old row.
-                emit_strict_type_check(b, table, existing_regs);
-                // GH #169: coerce to column affinity before CHECK/NOT NULL so
-                // the constraints see the affinity-coerced value (SQLite applies
-                // affinity, then evaluates constraints).
-                b.emit_op(
-                    Opcode::Affinity,
-                    existing_regs,
-                    table.columns.len() as i32,
-                    0,
-                    P4::Affinity(table.affinity_string()),
-                    0,
+                    clause.target.as_ref(),
+                    no_conflict_label,
                 );
-                emit_check_constraints(b, table, existing_regs, None);
-                emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
-                emit_index_deletes(b, table, cursor);
-                b.emit_op(Opcode::Delete, cursor, 0, 0, P4::None, OPFLAG_ISUPDATE);
-
-                // An UPSERT assignment may rewrite the INTEGER PRIMARY KEY.
-                // Reinsert at the new rowid, not the conflict victim's old id.
-                let mut final_rowid_reg = update_rowid_reg;
-                if let Some(ipk_idx) = ctx
-                    .rowid_alias_col_idx
-                    .or_else(|| table.columns.iter().position(|column| column.is_ipk))
-                {
-                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-                    let ipk_reg = existing_regs + ipk_idx as i32;
-                    let auto_label = b.emit_label();
-                    let rowid_done_label = b.emit_label();
-                    final_rowid_reg = b.alloc_reg();
-                    b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
-                    b.emit_op(Opcode::Copy, ipk_reg, final_rowid_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, rowid_done_label, P4::None, 0);
-                    b.resolve_label(auto_label);
-                    b.emit_op(
-                        Opcode::NewRowid,
-                        cursor,
-                        final_rowid_reg,
-                        i32::from(ctx.concurrent_mode),
-                        P4::None,
-                        0,
-                    );
-                    b.emit_op(Opcode::Copy, final_rowid_reg, ipk_reg, 0, P4::None, 0);
-                    b.resolve_label(rowid_done_label);
+                match &clause.action {
+                    UpsertAction::Nothing => {
+                        // Conflict on this target -> skip the insert entirely.
+                        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    }
+                    UpsertAction::Update {
+                        assignments,
+                        where_clause,
+                    } => {
+                        emit_upsert_do_update_apply(
+                            b,
+                            table,
+                            cursor,
+                            schema,
+                            val_regs,
+                            rowid_reg,
+                            existing_rowid_reg,
+                            assignments,
+                            where_clause.as_deref(),
+                            n_cols,
+                            n_cols_i32,
+                            &aff_str,
+                            stmt_level,
+                            returning,
+                            table_alias,
+                            ctx,
+                        )?;
+                        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    }
                 }
-
-                let update_rec = b.alloc_reg();
-                b.emit_op(
-                    Opcode::MakeRecord,
-                    existing_regs,
-                    n_cols_i32,
-                    update_rec,
-                    make_insert_record_p4(table, &aff_str),
-                    0,
-                );
-                // bd-sque1: the DO UPDATE apply is semantically an UPDATE, so its
-                // re-insert must ABORT — not REPLACE — on a uniqueness conflict.
-                // The conflict victim was already deleted above, so a same-key
-                // upsert never collides; ABORT fires only when the assignment
-                // rewrites the rowid/PK/UNIQUE key onto a DIFFERENT existing row,
-                // matching stock (a plain UPDATE that collides raises the error and
-                // leaves the table unchanged). REPLACE here silently clobbered that
-                // other row and lost it.
-                b.emit_op(
-                    Opcode::Insert,
-                    cursor,
-                    update_rec,
-                    final_rowid_reg,
-                    P4::Table(table.name.clone()),
-                    OE_ABORT | OPFLAG_ISUPDATE,
-                );
-                emit_index_inserts(
-                    b,
-                    table,
-                    cursor,
-                    existing_regs,
-                    final_rowid_reg,
-                    Some(ConflictAction::Abort),
-                );
-                if !returning.is_empty() {
-                    emit_returning(b, cursor, table, returning, table_alias, final_rowid_reg)?;
-                }
-                if let Some(label) = skip_update_label {
-                    b.resolve_label(label);
-                }
-
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-
-                // --- No conflict path: normal insert ---
-                b.resolve_label(insert_label);
-                let insert_p4 = emit_table_insert_record(
-                    b,
-                    val_regs,
-                    n_cols_i32,
-                    rec_reg,
-                    table,
-                    &aff_str,
-                    preformatted_record.as_deref(),
-                );
-                b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
-                emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
-
-                if !returning.is_empty() {
-                    emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
-                }
-
-                b.resolve_label(done_label);
-            } else {
-                // DO NOTHING — oe_flag is already OE_IGNORE, just do normal insert.
-                let insert_p4 = emit_table_insert_record(
-                    b,
-                    val_regs,
-                    n_cols_i32,
-                    rec_reg,
-                    table,
-                    &aff_str,
-                    preformatted_record.as_deref(),
-                );
-                b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
-                emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
-                if !returning.is_empty() {
-                    emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
+                if clause_idx + 1 != upserts.len() {
+                    b.resolve_label(no_conflict_label);
                 }
             }
+
+            // --- No clause matched: normal insert. Non-target UNIQUE/PK
+            // constraints are enforced by emit_index_inserts under stmt_level
+            // (default ABORT), so a conflict on a constraint no clause targets
+            // raises the error, matching stock. ---
+            b.resolve_label(insert_label);
+            let insert_p4 = emit_table_insert_record(
+                b,
+                val_regs,
+                n_cols_i32,
+                rec_reg,
+                table,
+                &aff_str,
+                preformatted_record.as_deref(),
+            );
+            b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
+            emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
+            if !returning.is_empty() {
+                emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
+            }
+            b.resolve_label(done_label);
         } else {
             // No upsert — normal insert path.
             // GH #158: INSERT OR IGNORE on a rowid / INTEGER-PRIMARY-KEY conflict
