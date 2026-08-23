@@ -110480,6 +110480,74 @@ fn expand_row_value_order(
     }
 }
 
+/// bd-47svm: Statically-known result-column arity of a subquery used as an
+/// operand of a row-value comparison `(a, b) OP (SELECT x, y ...)`. Returns
+/// `None` for shapes whose arity is not knowable here (compound / `VALUES`
+/// bodies, or `*` / `table.*` result columns), so the caller leaves the node
+/// intact rather than mis-projecting it.
+fn row_value_comparison_subquery_arity(select: &SelectStatement) -> Option<usize> {
+    if !select.body.compounds.is_empty() {
+        return None;
+    }
+    let SelectCore::Select { columns, .. } = &select.body.select else {
+        return None;
+    };
+    if columns
+        .iter()
+        .any(|c| !matches!(c, ResultColumn::Expr { .. }))
+    {
+        return None;
+    }
+    Some(columns.len())
+}
+
+/// bd-47svm: Project a row-value subquery down to its `col_idx`-th result column,
+/// preserving FROM/WHERE/ORDER BY/LIMIT so every projected column is drawn from
+/// the same (first) row and any outer correlation survives — mirroring the
+/// UPDATE `SET (a, b) = (SELECT ...)` projection (bd-6utze). `None` for the same
+/// unsupported shapes as [`row_value_comparison_subquery_arity`].
+fn project_row_value_comparison_subquery_column(
+    select: &SelectStatement,
+    col_idx: usize,
+) -> Option<SelectStatement> {
+    if !select.body.compounds.is_empty() {
+        return None;
+    }
+    let SelectCore::Select { columns, .. } = &select.body.select else {
+        return None;
+    };
+    let target = columns.get(col_idx)?;
+    if !matches!(target, ResultColumn::Expr { .. }) {
+        return None;
+    }
+    let target = target.clone();
+    let mut projected = select.clone();
+    if let SelectCore::Select { columns, .. } = &mut projected.body.select {
+        *columns = vec![target];
+    }
+    Some(projected)
+}
+
+/// bd-47svm: Materialize a single-row multi-column subquery into a vector of
+/// per-column scalar subqueries `[(SELECT x ...), (SELECT y ...)]`, so a
+/// row-value comparison whose operand is a subquery can reuse
+/// [`expand_row_value_comparison`]'s element-wise / lexicographic lowering. Each
+/// projected scalar subquery reads the same (first) row, matching SQLite's
+/// row-value subquery semantics. `None` when the subquery arity is not
+/// statically known.
+fn row_value_comparison_subquery_columns(
+    select: &SelectStatement,
+    span: Span,
+) -> Option<Vec<Expr>> {
+    let arity = row_value_comparison_subquery_arity(select)?;
+    let mut cols = Vec::with_capacity(arity);
+    for i in 0..arity {
+        let projected = project_row_value_comparison_subquery_column(select, i)?;
+        cols.push(Expr::Subquery(Box::new(projected), span));
+    }
+    Some(cols)
+}
+
 /// bd-l2si0: Recursively expand every `RowValue OP RowValue` comparison in an
 /// expression tree. `IN (list)` / `IN (SELECT ...)` row values are handled by
 /// `rewrite_in_expr` and are only descended into here, not transformed.
@@ -110497,6 +110565,28 @@ fn rewrite_row_value_comparisons(expr: &Expr) -> Expr {
                 && !la.is_empty()
                 && la.len() == ra.len()
                 && let Some(expanded) = expand_row_value_comparison(la, ra, *op, *span)
+            {
+                return expanded;
+            }
+            // bd-47svm: `(a, b) OP (SELECT x, y ...)` — the RHS is a single-row
+            // multi-column subquery, not a literal tuple, so the `RowValue`
+            // guard above misses it and the VDBE codegen collapses the subquery
+            // to its first column (0 rows). Materialize the subquery into
+            // per-column scalar subqueries and reuse the same element-wise /
+            // lexicographic lowering. Symmetric for a subquery LHS.
+            if let (Expr::RowValue(la, _), Expr::Subquery(sub, sub_span)) = (&l, &r)
+                && !la.is_empty()
+                && row_value_comparison_subquery_arity(sub) == Some(la.len())
+                && let Some(rb) = row_value_comparison_subquery_columns(sub, *sub_span)
+                && let Some(expanded) = expand_row_value_comparison(la, &rb, *op, *span)
+            {
+                return expanded;
+            }
+            if let (Expr::Subquery(sub, sub_span), Expr::RowValue(ra, _)) = (&l, &r)
+                && !ra.is_empty()
+                && row_value_comparison_subquery_arity(sub) == Some(ra.len())
+                && let Some(lb) = row_value_comparison_subquery_columns(sub, *sub_span)
+                && let Some(expanded) = expand_row_value_comparison(&lb, ra, *op, *span)
             {
                 return expanded;
             }

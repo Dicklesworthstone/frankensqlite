@@ -81,8 +81,22 @@ fn row_values_match_rusqlite_oracle() {
             "SELECT a,b FROM t WHERE (a,b) NOT IN (VALUES (1,2),(2,2)) ORDER BY a,b",
             // row-value IN (SELECT ...)
             "SELECT a,b FROM t WHERE (a,b) IN (SELECT x,y FROM u) ORDER BY a,b",
-            // NOTE: (a,b) = (SELECT x,y ...) row-value vs scalar-subquery-row is
-            // a separate open leaf (frank returns no rows) — tracked, excluded.
+            // bd-47svm: (a,b) = / <> / < (SELECT x,y ...) — row-value vs a
+            // single-row multi-column subquery. The subquery is compared as a
+            // row-value tuple, not collapsed to its first column.
+            "SELECT c FROM t WHERE (a,b) = (SELECT x,y FROM u WHERE x=1) ORDER BY c",
+            "SELECT c FROM t WHERE (a,b) = (SELECT x,y FROM u WHERE x=2) ORDER BY c",
+            "SELECT c FROM t WHERE (a,b) <> (SELECT x,y FROM u WHERE x=1) ORDER BY c",
+            "SELECT c FROM t WHERE (a,b) < (SELECT x,y FROM u WHERE x=2) ORDER BY c",
+            "SELECT c FROM t WHERE (a,b) >= (SELECT x,y FROM u WHERE x=1) ORDER BY c",
+            // multi-row subquery RHS: SQLite takes the first row.
+            "SELECT c FROM t WHERE (a,b) = (SELECT x,y FROM u ORDER BY x) ORDER BY c",
+            // subquery on the LEFT, row-value on the right.
+            "SELECT c FROM t WHERE (SELECT x,y FROM u WHERE x=2) = (a,b) ORDER BY c",
+            // empty subquery RHS → no match.
+            "SELECT c FROM t WHERE (a,b) = (SELECT x,y FROM u WHERE x=99) ORDER BY c",
+            // row-value vs subquery in a bare projection.
+            "SELECT (1,2) = (SELECT x,y FROM u WHERE x=1), (1,2) < (SELECT x,y FROM u WHERE x=2)",
             // row-value with mixed affinity
             "SELECT (1,'2') = (1,2), ('a',1) < ('b',0)",
             // row-value in a CASE / projection
