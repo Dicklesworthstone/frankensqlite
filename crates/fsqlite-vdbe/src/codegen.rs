@@ -11697,7 +11697,20 @@ fn emit_join_expr(
                 }
                 JoinColumnResolution::Column(cursor, col_idx) => {
                     let (table, table_alias) = tables[cursor as usize];
-                    if virtual_generated_column_expr(&table.columns[col_idx]).is_some() {
+                    if table.columns[col_idx].is_ipk {
+                        // bd-ghiey: an INTEGER PRIMARY KEY is stored as the
+                        // b-tree rowid, not in the record, so read it via Rowid
+                        // (mirroring single-table `emit_table_column_read`). The
+                        // join path's plain `Column` read relies on the engine's
+                        // `rowid_alias_col_by_root_page` map to substitute the
+                        // rowid, but that map is keyed by pre-routing root pages
+                        // built from `self.schema` — it misses TEMP tables (whose
+                        // roots are routed to the temp database) and shadowed main
+                        // tables (parked out of `self.schema`), so their IPK
+                        // projected as NULL through a join. Emitting `Rowid`
+                        // directly is what stock does and needs no runtime map.
+                        b.emit_op(Opcode::Rowid, cursor, target, 0, P4::None, 0);
+                    } else if virtual_generated_column_expr(&table.columns[col_idx]).is_some() {
                         // GH#227 (bd-gh-virtual-generated-columns-5e0u1): a
                         // VIRTUAL generated column is not materialized in the
                         // record — the slot holds a NULL placeholder. Reading it
@@ -12032,14 +12045,23 @@ fn emit_join_result_columns(
                 for (cursor_idx, (table, _)) in tables.iter().enumerate() {
                     for col_idx in 0..table.columns.len() {
                         let dst = out_regs + reg_offset;
-                        b.emit_op(
-                            Opcode::Column,
-                            cursor_idx as i32,
-                            col_idx as i32,
-                            dst,
-                            P4::None,
-                            0,
-                        );
+                        // bd-ghiey: an INTEGER PRIMARY KEY lives in the b-tree
+                        // rowid, not the record — read it via Rowid (see the
+                        // Expr-path note in `emit_join_expr`), so a `SELECT *`
+                        // over a TEMP/shadowed table in a join projects the id
+                        // instead of NULL.
+                        if table.columns[col_idx].is_ipk {
+                            b.emit_op(Opcode::Rowid, cursor_idx as i32, dst, 0, P4::None, 0);
+                        } else {
+                            b.emit_op(
+                                Opcode::Column,
+                                cursor_idx as i32,
+                                col_idx as i32,
+                                dst,
+                                P4::None,
+                                0,
+                            );
+                        }
                         reg_offset += 1;
                     }
                 }
@@ -12051,14 +12073,18 @@ fn emit_join_result_columns(
                         matched = true;
                         for col_idx in 0..table.columns.len() {
                             let dst = out_regs + reg_offset;
-                            b.emit_op(
-                                Opcode::Column,
-                                cursor_idx as i32,
-                                col_idx as i32,
-                                dst,
-                                P4::None,
-                                0,
-                            );
+                            if table.columns[col_idx].is_ipk {
+                                b.emit_op(Opcode::Rowid, cursor_idx as i32, dst, 0, P4::None, 0);
+                            } else {
+                                b.emit_op(
+                                    Opcode::Column,
+                                    cursor_idx as i32,
+                                    col_idx as i32,
+                                    dst,
+                                    P4::None,
+                                    0,
+                                );
+                            }
                             reg_offset += 1;
                         }
                         break;
