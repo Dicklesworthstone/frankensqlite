@@ -1,16 +1,19 @@
 //! bd-ota5x / GH#341: `validate_database_integrity_bounded` must accept a
-//! simple WITHOUT ROWID table (leading PK, no secondary index, no foreign key)
-//! by walking its index b-tree directly, instead of refusing every WR table.
+//! WITHOUT ROWID table across its full structural family — the row walk, the
+//! secondary-index concordance, and (part-3) foreign keys — instead of refusing
+//! every WR table.
 //!
 //! Parts 1+2 (landed): the WR table-row walk AND secondary-index concordance
-//! (entries keyed by the PK locator, not a rowid). Foreign keys on WR tables
-//! (parent/child probes by rowid) are still refused pending part-3, so this
-//! keeper also pins that a WR table in a foreign-key-declaring schema remains
-//! refused rather than mis-validated.
+//! (entries keyed by the PK locator, not a rowid). Part-3 (this file's foreign
+//! key cases): a WR table may be a foreign-key PARENT (probed by seeking its own
+//! PRIMARY KEY b-tree on the PK-tuple prefix) or a foreign-key CHILD (walked as
+//! an index b-tree). The three failing-direction cases pin that the WR parent
+//! probe and the WR child walk actually reject a dangling reference rather than
+//! pass corruption as ok.
 //!
 //! Bounded validation only admits a self-contained rollback/DELETE-mode image,
-//! so the accept case builds one (PRAGMA journal_mode=DELETE + VACUUM INTO)
-//! exactly as the in-crate bounded tests do.
+//! so every case builds one (PRAGMA journal_mode=DELETE + VACUUM INTO) exactly
+//! as the in-crate bounded tests do.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_error::FrankenError;
@@ -114,32 +117,300 @@ fn bounded_integrity_accepts_simple_without_rowid_tables() {
     });
 }
 
+/// Part-3 positive: WITHOUT ROWID tables that participate in FOREIGN KEYs as
+/// both parents and children, with every reference satisfied, must pass bounded
+/// integrity. Exercises: a rowid child -> WR parent (single-column PK probe), a
+/// rowid child -> WR parent (composite PK probe), a WR child -> rowid parent
+/// (WR child walk + IPK probe), and a WR child -> WR parent (WR child walk + WR
+/// parent probe). A wrong PK-tuple key/seek would miss a present parent and
+/// wrongly report DatabaseCorrupt here.
 #[test]
-fn bounded_integrity_still_refuses_without_rowid_in_fk_schema() {
+fn bounded_integrity_accepts_without_rowid_foreign_keys() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("wrfk.db").to_string_lossy().into_owned();
-        let conn = Connection::open(&db).await.unwrap();
+        let image = dir.path().join("wrfk-ok.db");
 
-        // A WR table plus a rowid table that declares a FOREIGN KEY. WR foreign
-        // key parent/child probes (part-3) are not implemented, so the
-        // schema-support gate refuses the whole image before any structural walk.
-        conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;")
+        let builder = Connection::open(
+            dir.path()
+                .join("wrfk-ok-builder.db")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        builder
+            .execute("PRAGMA journal_mode=DELETE;")
             .await
             .unwrap();
-        conn.execute("CREATE TABLE child(id INTEGER PRIMARY KEY, ref TEXT REFERENCES t(k));")
+        // Parents.
+        builder
+            .execute("CREATE TABLE rp(id INTEGER PRIMARY KEY, name TEXT);")
             .await
             .unwrap();
+        builder
+            .execute("INSERT INTO rp(id, name) VALUES (1,'one'),(2,'two');")
+            .await
+            .unwrap();
+        builder
+            .execute("CREATE TABLE wp(k TEXT PRIMARY KEY, d TEXT) WITHOUT ROWID;")
+            .await
+            .unwrap();
+        builder
+            .execute("INSERT INTO wp(k, d) VALUES ('a','A'),('b','B');")
+            .await
+            .unwrap();
+        builder
+            .execute(
+                "CREATE TABLE wpc(x INTEGER, y INTEGER, note TEXT, PRIMARY KEY(x, y)) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+        builder
+            .execute("INSERT INTO wpc(x, y, note) VALUES (1,10,'p'),(2,20,'q');")
+            .await
+            .unwrap();
+        // Children.
+        builder
+            .execute("CREATE TABLE rc(id INTEGER PRIMARY KEY, ref TEXT REFERENCES wp(k));")
+            .await
+            .unwrap();
+        // A NULL child key is skipped by the FK check, so it must not trip it.
+        builder
+            .execute("INSERT INTO rc(id, ref) VALUES (1,'a'),(2,'b'),(3,NULL);")
+            .await
+            .unwrap();
+        builder
+            .execute(
+                "CREATE TABLE crc(id INTEGER PRIMARY KEY, fx INTEGER, fy INTEGER, FOREIGN KEY(fx, fy) REFERENCES wpc(x, y));",
+            )
+            .await
+            .unwrap();
+        builder
+            .execute("INSERT INTO crc(id, fx, fy) VALUES (1,1,10),(2,2,20);")
+            .await
+            .unwrap();
+        builder
+            .execute(
+                "CREATE TABLE wc(k TEXT PRIMARY KEY, pid INTEGER REFERENCES rp(id)) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+        builder
+            .execute("INSERT INTO wc(k, pid) VALUES ('m',1),('n',2);")
+            .await
+            .unwrap();
+        builder
+            .execute(
+                "CREATE TABLE wc2(k TEXT PRIMARY KEY, wref TEXT REFERENCES wp(k)) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+        builder
+            .execute("INSERT INTO wc2(k, wref) VALUES ('p','a'),('q','b');")
+            .await
+            .unwrap();
+        builder
+            .execute(&format!(
+                "VACUUM INTO '{}';",
+                image.to_string_lossy().replace('\'', "''")
+            ))
+            .await
+            .unwrap();
+        let receipt = builder
+            .inspect_self_contained_image_receipt(&image)
+            .await
+            .expect("receipt the built image");
+        builder.close().await.expect("close builder");
 
-        let err = conn
+        let owner = Connection::open(
+            dir.path()
+                .join("wrfk-ok-owner.db")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        let snapshot = owner
+            .begin_bounded_structural_snapshot(&receipt, &image, 256)
+            .await
+            .expect("image opens a bounded snapshot");
+        snapshot
+            .connection()
             .validate_database_integrity_bounded(dir.path())
             .await
-            .expect_err(
-                "WITHOUT ROWID in a schema with foreign keys is not yet bounded-validatable",
-            );
+            .expect("bounded integrity must accept satisfied WITHOUT ROWID foreign keys");
+    });
+}
+
+/// Part-3 negative (WR parent probe): a rowid child holding a dangling reference
+/// to a WITHOUT ROWID parent's PRIMARY KEY must be rejected. Seeded with
+/// foreign_keys=OFF so the orphan reaches disk, then VACUUM INTO. If the WR
+/// parent probe silently skipped validation (or the PK-tuple seek were wrong),
+/// this corruption would pass as ok.
+#[test]
+fn bounded_integrity_rejects_orphan_rowid_child_of_without_rowid_parent() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("wrfk-orphan-parent.db");
+
+        let builder = Connection::open(
+            dir.path()
+                .join("wrfk-orphan-parent-builder.db")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        builder
+            .execute("PRAGMA journal_mode=DELETE;")
+            .await
+            .unwrap();
+        builder
+            .execute("PRAGMA foreign_keys=OFF;")
+            .await
+            .unwrap();
+        builder
+            .execute("CREATE TABLE wp(k TEXT PRIMARY KEY, d TEXT) WITHOUT ROWID;")
+            .await
+            .unwrap();
+        builder
+            .execute("INSERT INTO wp(k, d) VALUES ('a','A'),('b','B');")
+            .await
+            .unwrap();
+        builder
+            .execute("CREATE TABLE rc(id INTEGER PRIMARY KEY, ref TEXT REFERENCES wp(k));")
+            .await
+            .unwrap();
+        // 'zzz' has no parent row in wp — a dangling reference.
+        builder
+            .execute("INSERT INTO rc(id, ref) VALUES (1,'a'),(2,'zzz');")
+            .await
+            .unwrap();
+        builder
+            .execute(&format!(
+                "VACUUM INTO '{}';",
+                image.to_string_lossy().replace('\'', "''")
+            ))
+            .await
+            .unwrap();
+        let receipt = builder
+            .inspect_self_contained_image_receipt(&image)
+            .await
+            .expect("receipt the built image");
+        builder.close().await.expect("close builder");
+
+        let owner = Connection::open(
+            dir.path()
+                .join("wrfk-orphan-parent-owner.db")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        let snapshot = owner
+            .begin_bounded_structural_snapshot(&receipt, &image, 256)
+            .await
+            .expect("image opens a bounded snapshot");
+        let err = snapshot
+            .connection()
+            .validate_database_integrity_bounded(dir.path())
+            .await
+            .expect_err("a dangling reference to a WITHOUT ROWID parent must be rejected");
         assert!(
-            matches!(&err, FrankenError::NotImplemented(msg) if msg.contains("foreign keys")),
-            "expected a WR-in-FK-schema refusal, got: {err:?}"
+            matches!(&err, FrankenError::DatabaseCorrupt { .. }),
+            "expected DatabaseCorrupt from the WR parent FK probe, got: {err:?}"
+        );
+        let detail = format!("{err:?}");
+        assert!(
+            detail.contains("FOREIGN KEY"),
+            "expected a FOREIGN KEY violation detail, got: {detail}"
+        );
+    });
+}
+
+/// Part-3 negative (WR child walk): a WITHOUT ROWID child holding a dangling
+/// reference must be rejected. Proves the WR child index-cursor walk actually
+/// reaches each WR child row and feeds it to the parent probe (a rowid parent
+/// here, so the failure isolates the WR child walk from the WR parent probe).
+#[test]
+fn bounded_integrity_rejects_orphan_without_rowid_child() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("wrfk-orphan-child.db");
+
+        let builder = Connection::open(
+            dir.path()
+                .join("wrfk-orphan-child-builder.db")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        builder
+            .execute("PRAGMA journal_mode=DELETE;")
+            .await
+            .unwrap();
+        builder
+            .execute("PRAGMA foreign_keys=OFF;")
+            .await
+            .unwrap();
+        builder
+            .execute("CREATE TABLE rp(id INTEGER PRIMARY KEY, name TEXT);")
+            .await
+            .unwrap();
+        builder
+            .execute("INSERT INTO rp(id, name) VALUES (1,'one'),(2,'two');")
+            .await
+            .unwrap();
+        builder
+            .execute(
+                "CREATE TABLE wc(k TEXT PRIMARY KEY, pid INTEGER REFERENCES rp(id)) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+        // pid=99 has no parent row in rp — a dangling reference in a WR child.
+        builder
+            .execute("INSERT INTO wc(k, pid) VALUES ('m',1),('n',99);")
+            .await
+            .unwrap();
+        builder
+            .execute(&format!(
+                "VACUUM INTO '{}';",
+                image.to_string_lossy().replace('\'', "''")
+            ))
+            .await
+            .unwrap();
+        let receipt = builder
+            .inspect_self_contained_image_receipt(&image)
+            .await
+            .expect("receipt the built image");
+        builder.close().await.expect("close builder");
+
+        let owner = Connection::open(
+            dir.path()
+                .join("wrfk-orphan-child-owner.db")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        let snapshot = owner
+            .begin_bounded_structural_snapshot(&receipt, &image, 256)
+            .await
+            .expect("image opens a bounded snapshot");
+        let err = snapshot
+            .connection()
+            .validate_database_integrity_bounded(dir.path())
+            .await
+            .expect_err("a dangling reference from a WITHOUT ROWID child must be rejected");
+        assert!(
+            matches!(&err, FrankenError::DatabaseCorrupt { .. }),
+            "expected DatabaseCorrupt from the WR child FK walk, got: {err:?}"
+        );
+        let detail = format!("{err:?}");
+        assert!(
+            detail.contains("FOREIGN KEY"),
+            "expected a FOREIGN KEY violation detail, got: {detail}"
         );
     });
 }

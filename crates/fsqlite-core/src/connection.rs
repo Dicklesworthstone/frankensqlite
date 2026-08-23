@@ -14781,9 +14781,9 @@ impl Connection {
     /// leading declared columns, so the stored record is already in declared
     /// (== schema) order and needs no reordering. There is no rowid: a 1-based
     /// position identifies rows in diagnostics, and inflation runs with
-    /// `rowid_alias_col_idx = None`. Callers gate secondary-index and
-    /// foreign-key WR shapes out in `validate_bounded_schema_support`, so this
-    /// walk only ever validates NOT NULL and CHECK on the row image itself.
+    /// `rowid_alias_col_idx = None`. This walk validates NOT NULL and CHECK on
+    /// the row image itself; secondary-index concordance and foreign keys for
+    /// WITHOUT ROWID tables are handled by their own bounded walkers.
     #[allow(clippy::too_many_arguments)]
     async fn bounded_validate_without_rowid_table_rows<T: TransactionHandle + ?Sized>(
         &self,
@@ -15763,7 +15763,160 @@ impl Connection {
                 }
                 Ok(self.bounded_unique_terms_equal(index, &stored, parent_values))
             }
+            BoundedForeignKeyParentProbe::WithoutRowidPrimaryKey => {
+                // The foreign key references the parent's full PRIMARY KEY in PK
+                // order (bounded_resolve_foreign_key_check only chooses this arm
+                // then), so `parent_values` is the PK tuple in PK order and the
+                // WITHOUT ROWID parent table's own b-tree — an index b-tree keyed
+                // by that PK — is what we probe.
+                let pk_column_indices =
+                    without_rowid_pk_indices(parent).map_err(codegen_error_to_franken)?;
+                let pk_count = pk_column_indices.len();
+                if parent_values.len() != pk_count {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "bounded FOREIGN KEY WITHOUT ROWID probe for parent `{}` has {} values but the primary key has {pk_count} column(s)",
+                            parent.name,
+                            parent_values.len()
+                        ),
+                    });
+                }
+                let value_bytes = parent_values.iter().try_fold(0_usize, |total, value| {
+                    total
+                        .checked_add(bounded_sqlite_value_bytes(value))
+                        .ok_or(FrankenError::TooBig)
+                })?;
+                if value_bytes > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "FOREIGN KEY parent probe values for WITHOUT ROWID table `{}` exceed the fixed {BOUNDED_VALIDATION_MAX_RECORD_BYTES}-byte bound",
+                        parent.name
+                    )));
+                }
+                // Serialize the PK-tuple probe in the DB text encoding so it
+                // matches the stored (DB-encoded) records byte-for-byte, exactly
+                // as the UniqueIndex arm does for its probe.
+                let probe =
+                    serialize_record_with_encoding(parent_values, self.db_text_encoding.get());
+                if probe.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "FOREIGN KEY parent probe record for WITHOUT ROWID table `{}` exceeds the fixed {BOUNDED_VALIDATION_MAX_RECORD_BYTES}-byte bound",
+                        parent.name
+                    )));
+                }
+                let parent_root =
+                    page_number_from_schema_root(parent.root_page, &parent.name, "table")?;
+                // The seek must compare the PK prefix exactly the way the engine's
+                // own WITHOUT ROWID table cursor does. Reuse the identical per-root
+                // direction/collation metadata the engine builds for that cursor
+                // (the WITHOUT ROWID branch of table_execution_metadata), so the
+                // probe cannot diverge from the stored on-disk ordering.
+                let metadata = self.table_execution_metadata();
+                let descending = metadata
+                    .index_desc_flags_by_root_page
+                    .get(&parent.root_page)
+                    .cloned()
+                    .unwrap_or_else(|| vec![false; pk_count]);
+                let collations = metadata
+                    .index_collations_by_root_page
+                    .get(&parent.root_page)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        pk_column_indices
+                            .iter()
+                            .map(|&idx| {
+                                parent
+                                    .columns
+                                    .get(idx)
+                                    .and_then(|column| column.collation.clone())
+                            })
+                            .collect()
+                    });
+                let mut cursor = Self::new_header_btree_index_cursor(
+                    txn,
+                    parent_root,
+                    page_size,
+                    reserved_per_page,
+                    descending,
+                    collations.clone(),
+                    Arc::clone(&self.collation_registry),
+                );
+                bounded_increment_validation_counter(&mut counters.foreign_key_parent_probes)?;
+                // A LowerBound index seek treats a PK-only probe as a strict
+                // prefix of the full-row records (the stored record is longer), so
+                // it never returns Found; it positions the cursor at the first row
+                // whose PK is >= the probe. Re-check that landed row's leading PK
+                // terms for equality, exactly as the UniqueIndex arm does.
+                let _seek_result = cursor.index_move_to(cx, &probe).await?;
+                if cursor.eof() {
+                    return Ok(false);
+                }
+                let payload = cursor.payload(cx).await?;
+                if payload.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "FOREIGN KEY parent WITHOUT ROWID table `{}` yielded a record above the fixed {BOUNDED_VALIDATION_MAX_RECORD_BYTES}-byte bound",
+                        parent.name
+                    )));
+                }
+                let stored = parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "FOREIGN KEY parent WITHOUT ROWID table `{}` yielded an invalid record",
+                            parent.name
+                        ),
+                    })?;
+                if stored.len() < pk_count {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "FOREIGN KEY parent WITHOUT ROWID table `{}` row stores {} column(s), fewer than its {pk_count} primary-key column(s)",
+                            parent.name,
+                            stored.len()
+                        ),
+                    });
+                }
+                Ok(self.bounded_leading_terms_equal(&collations, &stored[..pk_count], parent_values))
+            }
         }
+    }
+
+    /// Whether two equal-length term slices compare equal under the given
+    /// per-term collations, using the same collation-aware comparison as the
+    /// b-tree cursor comparator and the index-concordance check. A NULL on
+    /// either side is never equal (NULL child keys are skipped before the probe;
+    /// this is a defensive guard).
+    fn bounded_leading_terms_equal(
+        &self,
+        collations: &[Option<String>],
+        lhs: &[SqliteValue],
+        rhs: &[SqliteValue],
+    ) -> bool {
+        if lhs.len() != rhs.len() {
+            return false;
+        }
+        if lhs.iter().chain(rhs.iter()).any(SqliteValue::is_null) {
+            return false;
+        }
+        let registry = self
+            .collation_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for idx in 0..lhs.len() {
+            let ord = match (collations.get(idx).and_then(Option::as_deref), &lhs[idx], &rhs[idx]) {
+                (Some(coll_name), SqliteValue::Text(left), SqliteValue::Text(right)) => {
+                    match registry.find(coll_name) {
+                        Some(collation) => collation.compare(left.as_bytes(), right.as_bytes()),
+                        None => left.as_bytes().cmp(right.as_bytes()),
+                    }
+                }
+                _ => match lhs[idx].partial_cmp(&rhs[idx]) {
+                    Some(ordering) => ordering,
+                    None => return false,
+                },
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return false;
+            }
+        }
+        true
     }
 
     async fn bounded_validate_foreign_key_in_txn<T: TransactionHandle + ?Sized>(
@@ -15802,57 +15955,184 @@ impl Connection {
         let child_root = page_number_from_schema_root(child.root_page, &child.name, "table")?;
         let child_rowid_alias = rowid_aliases.get(&child.root_page).copied();
         let child_defaults = column_defaults.get(&child.root_page).map(Vec::as_slice);
-        let mut after = None;
-        while let Some((rowid, payload)) =
-            Self::bounded_next_table_row(cx, txn, child_root, page_size, reserved_per_page, after)
-                .await?
-        {
-            let payload_values = parse_record_with_encoding(&payload, self.db_text_encoding.get())
+        if child.without_rowid {
+            // A WITHOUT ROWID child's rows live in an index b-tree keyed by the
+            // PRIMARY KEY, not a rowid table b-tree. The walk cursor borrows
+            // `txn` for its whole lifetime, so the parent-probe cursor (also over
+            // `txn`) cannot be opened while it is live. Collect each non-NULL
+            // child row's parent-probe tuple in phase 1, then probe in phase 2
+            // once the walk cursor is dropped — mirrors the WR secondary-index
+            // concordance's collect-then-probe structure. A WITHOUT ROWID row has
+            // no rowid, so a 1-based position identifies it in diagnostics (stock
+            // reports a NULL rowid for foreign_key_check on such rows).
+            let mut pending: Vec<(String, Vec<SqliteValue>)> = Vec::new();
+            {
+                let mut walk = Self::new_header_btree_cursor(
+                    txn,
+                    child_root,
+                    page_size,
+                    reserved_per_page,
+                    false,
+                );
+                let mut position = 0_i64;
+                if walk.first(cx).await? {
+                    loop {
+                        position = position.checked_add(1).ok_or(FrankenError::TooBig)?;
+                        let payload = walk.payload(cx).await?;
+                        let payload_values =
+                            parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "FOREIGN KEY child WITHOUT ROWID table `{}` row {position} has an invalid record",
+                                        child.name
+                                    ),
+                                })?;
+                        if payload_values.len() > child.columns.len() {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "FOREIGN KEY child WITHOUT ROWID table `{}` row {position} stores {} columns but schema allows {}",
+                                    child.name,
+                                    payload_values.len(),
+                                    child.columns.len()
+                                ),
+                            });
+                        }
+                        let inflated = Self::inflate_table_row_values_for_integrity(
+                            &child,
+                            position,
+                            &payload_values,
+                            None,
+                            child_defaults,
+                        )?;
+                        bounded_increment_validation_counter(
+                            &mut counters.foreign_key_child_rows_checked,
+                        )?;
+                        if let Some(parent_values) =
+                            self.bounded_foreign_key_parent_values(&child, &parent, check, &inflated)?
+                        {
+                            pending.push((format!("row {position}"), parent_values));
+                        }
+                        if !walk.next(cx).await? {
+                            break;
+                        }
+                    }
+                }
+            }
+            for (row_identity, parent_values) in &pending {
+                self.bounded_probe_foreign_key_parent(
+                    cx,
+                    txn,
+                    &child,
+                    &parent,
+                    check,
+                    parent_values,
+                    row_identity,
+                    page_size,
+                    reserved_per_page,
+                    counters,
+                )
+                .await?;
+            }
+        } else {
+            let mut after = None;
+            while let Some((rowid, payload)) = Self::bounded_next_table_row(
+                cx,
+                txn,
+                child_root,
+                page_size,
+                reserved_per_page,
+                after,
+            )
+            .await?
+            {
+                let payload_values = parse_record_with_encoding(
+                    &payload,
+                    self.db_text_encoding.get(),
+                )
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: format!(
                         "FOREIGN KEY child table `{}` rowid {rowid} has an invalid record",
                         child.name
                     ),
                 })?;
-            if payload_values.len() > child.columns.len() {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "FOREIGN KEY child table `{}` rowid {rowid} stores {} columns but schema allows {}",
-                        child.name,
-                        payload_values.len(),
-                        child.columns.len()
-                    ),
-                });
-            }
-            let inflated = Self::inflate_table_row_values_for_integrity(
-                &child,
-                rowid,
-                &payload_values,
-                child_rowid_alias,
-                child_defaults,
-            )?;
-            bounded_increment_validation_counter(&mut counters.foreign_key_child_rows_checked)?;
-            let child_values = check
-                .child_columns
-                .iter()
-                .map(|position| {
-                    inflated
-                        .get(*position)
-                        .cloned()
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "FOREIGN KEY constraint {} on table `{}` references missing inflated child column {position}",
-                                check.constraint_index + 1,
-                                child.name
-                            ),
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if child_values.iter().any(SqliteValue::is_null) {
+                if payload_values.len() > child.columns.len() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "FOREIGN KEY child table `{}` rowid {rowid} stores {} columns but schema allows {}",
+                            child.name,
+                            payload_values.len(),
+                            child.columns.len()
+                        ),
+                    });
+                }
+                let inflated = Self::inflate_table_row_values_for_integrity(
+                    &child,
+                    rowid,
+                    &payload_values,
+                    child_rowid_alias,
+                    child_defaults,
+                )?;
+                bounded_increment_validation_counter(&mut counters.foreign_key_child_rows_checked)?;
+                // A rowid child cursor is opened and dropped per row by
+                // `bounded_next_table_row`, so no walk cursor is live here and the
+                // parent probe can run inline.
+                if let Some(parent_values) =
+                    self.bounded_foreign_key_parent_values(&child, &parent, check, &inflated)?
+                {
+                    self.bounded_probe_foreign_key_parent(
+                        cx,
+                        txn,
+                        &child,
+                        &parent,
+                        check,
+                        &parent_values,
+                        &format!("rowid {rowid}"),
+                        page_size,
+                        reserved_per_page,
+                        counters,
+                    )
+                    .await?;
+                }
                 after = Some(rowid);
-                continue;
             }
-            let parent_values = child_values
+        }
+        bounded_increment_validation_counter(&mut counters.foreign_key_constraints_checked)?;
+        Ok(())
+    }
+
+    /// Extract an inflated child row's foreign-key parent-probe tuple, or `None`
+    /// when the row has any NULL child key (SQLite MATCH semantics skip such
+    /// rows). The returned values carry the parent columns' affinity, ready for
+    /// the parent probe. Pure (no cursor), so it composes with both the inline
+    /// rowid walk and the two-phase WITHOUT ROWID walk.
+    fn bounded_foreign_key_parent_values(
+        &self,
+        child: &TableSchema,
+        parent: &TableSchema,
+        check: &BoundedForeignKeyCheck,
+        inflated: &[SqliteValue],
+    ) -> Result<Option<Vec<SqliteValue>>> {
+        let child_values = check
+            .child_columns
+            .iter()
+            .map(|position| {
+                inflated
+                    .get(*position)
+                    .cloned()
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "FOREIGN KEY constraint {} on table `{}` references missing inflated child column {position}",
+                            check.constraint_index + 1,
+                            child.name
+                        ),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if child_values.iter().any(SqliteValue::is_null) {
+            return Ok(None);
+        }
+        Ok(Some(
+            child_values
                 .into_iter()
                 .zip(&check.parent_columns)
                 .map(|(value, parent_column)| {
@@ -15860,46 +16140,63 @@ impl Connection {
                         parent.columns[*parent_column].affinity,
                     ))
                 })
-                .collect::<Vec<_>>();
-            if !self
-                .bounded_parent_key_exists_in_txn(
-                    cx,
-                    txn,
-                    &parent,
-                    check,
-                    &parent_values,
-                    page_size,
-                    reserved_per_page,
-                    counters,
-                )
-                .await?
-            {
-                let child_column_names = check
-                    .child_columns
-                    .iter()
-                    .map(|position| child.columns[*position].name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let parent_column_names = check
-                    .parent_columns
-                    .iter()
-                    .map(|position| parent.columns[*position].name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "FOREIGN KEY constraint {} on table `{}` rowid {rowid} violates `{}({child_column_names}) REFERENCES {}({parent_column_names})`",
-                        check.constraint_index + 1,
-                        child.name,
-                        child.name,
-                        parent.name
-                    ),
-                });
-            }
-            after = Some(rowid);
+                .collect(),
+        ))
+    }
+
+    /// Probe a child row's foreign-key parent, erroring
+    /// [`FrankenError::DatabaseCorrupt`] on a dangling reference. `row_identity`
+    /// names the child row in the violation message (`rowid N` or `row N`).
+    #[allow(clippy::too_many_arguments)]
+    async fn bounded_probe_foreign_key_parent<T: TransactionHandle + ?Sized>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        child: &TableSchema,
+        parent: &TableSchema,
+        check: &BoundedForeignKeyCheck,
+        parent_values: &[SqliteValue],
+        row_identity: &str,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        counters: &mut BoundedValidationCounters,
+    ) -> Result<()> {
+        if self
+            .bounded_parent_key_exists_in_txn(
+                cx,
+                txn,
+                parent,
+                check,
+                parent_values,
+                page_size,
+                reserved_per_page,
+                counters,
+            )
+            .await?
+        {
+            return Ok(());
         }
-        bounded_increment_validation_counter(&mut counters.foreign_key_constraints_checked)?;
-        Ok(())
+        let child_column_names = check
+            .child_columns
+            .iter()
+            .map(|position| child.columns[*position].name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let parent_column_names = check
+            .parent_columns
+            .iter()
+            .map(|position| parent.columns[*position].name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "FOREIGN KEY constraint {} on table `{}` {row_identity} violates `{}({child_column_names}) REFERENCES {}({parent_column_names})`",
+                check.constraint_index + 1,
+                child.name,
+                child.name,
+                parent.name
+            ),
+        })
     }
 
     async fn bounded_validate_foreign_keys_in_txn<T: TransactionHandle + ?Sized>(
@@ -16046,8 +16343,28 @@ impl Connection {
             )));
         }
 
-        let parent_probe = if parent_columns.len() == 1 && parent.columns[parent_columns[0]].is_ipk
-        {
+        let parent_probe = if parent.without_rowid {
+            // A WITHOUT ROWID parent's own b-tree IS its PRIMARY KEY index. The
+            // bounded probe can seek it only when the foreign key references
+            // exactly the PK columns in PRIMARY KEY order, so `parent_values`
+            // forms the PK-tuple prefix directly. A WITHOUT ROWID parent
+            // referenced by any other column set would require probing a WITHOUT
+            // ROWID *secondary* index (keyed by [cols, PK], not [cols, rowid]),
+            // which the UniqueIndex arm does not model — refuse rather than
+            // mis-probe.
+            let pk_indices = without_rowid_pk_indices(parent).map_err(codegen_error_to_franken)?;
+            if parent_columns == pk_indices {
+                BoundedForeignKeyParentProbe::WithoutRowidPrimaryKey
+            } else {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "FOREIGN KEY constraint {} on table `{}` references WITHOUT ROWID parent `{}({})` by columns other than its full PRIMARY KEY in key order; the bounded proof does not probe a WITHOUT ROWID secondary index",
+                    constraint_index + 1,
+                    child.name,
+                    parent.name,
+                    foreign_key.parent_columns.join(", ")
+                )));
+            }
+        } else if parent_columns.len() == 1 && parent.columns[parent_columns[0]].is_ipk {
             BoundedForeignKeyParentProbe::IntegerPrimaryKey {
                 column_index: parent_columns[0],
             }
@@ -16213,28 +16530,14 @@ impl Connection {
         }
         let original_ddl = self.original_ddl_sql.borrow().clone();
         for table in &schema {
-            if table.without_rowid {
-                // bd-ota5x/bd-r7ytr: bounded validation walks a WITHOUT ROWID
-                // table's index b-tree directly — both its rows
-                // (bounded_validate_table_rows WR branch) and its secondary-index
-                // concordance (bounded_validate_without_rowid_index_concordance,
-                // whose entries are keyed by the PK locator). fsqlite only admits
-                // a WR table whose PRIMARY KEY is exactly the leading declared
-                // columns, so the stored record is in declared == schema order —
-                // no reorder needed. What is NOT yet handled: FOREIGN KEYS, whose
-                // bounded parent/child probes resolve rows by rowid. Refuse a WR
-                // table in any schema that declares a foreign key rather than
-                // mis-validate it.
-                if schema
-                    .iter()
-                    .any(|candidate| !candidate.foreign_keys.is_empty())
-                {
-                    return Err(Self::bounded_validation_refusal(format!(
-                        "WITHOUT ROWID table `{}` in a schema that declares foreign keys",
-                        table.name
-                    )));
-                }
-            }
+            // WITHOUT ROWID tables are fully bounded-validatable: their rows
+            // (bounded_validate_table_rows WR branch), secondary-index
+            // concordance (bounded_validate_without_rowid_index_concordance,
+            // keyed by the PK locator), and foreign keys (WR parent probes seek
+            // the PK b-tree; WR child rows are walked as an index b-tree) are all
+            // handled. A foreign key that references a WR parent by columns other
+            // than its full PRIMARY KEY is refused per-constraint in
+            // bounded_resolve_foreign_key_check, not here.
             // A rootless table has no btree to walk, and a virtual table's rows
             // do not live in this image at all.
             if table.root_page <= 0
@@ -39505,6 +39808,13 @@ const BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH: usize = 512;
 enum BoundedForeignKeyParentProbe {
     IntegerPrimaryKey { column_index: usize },
     UniqueIndex { index_index: usize },
+    /// The parent is a WITHOUT ROWID table and the foreign key references its
+    /// full PRIMARY KEY in PRIMARY KEY order. The parent row is resolved by
+    /// seeking the table's own b-tree (an index b-tree keyed by the PK) on the
+    /// PK-tuple prefix — there is no separate index and no trailing rowid. The
+    /// PK column indices are recomputed from the parent schema at probe time so
+    /// this stays a `Copy` unit variant.
+    WithoutRowidPrimaryKey,
 }
 
 #[derive(Debug)]
