@@ -222,8 +222,15 @@ mod windows_impl {
         let mut user = creation;
         // SAFETY: `handle` is a live process handle; the four `FILETIME` out
         // pointers are valid, initialized locals.
-        let ok =
-            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        let ok = unsafe {
+            GetProcessTimes(
+                handle,
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
         // SAFETY: `handle` came from `OpenProcess` above and is not used again.
         unsafe {
             CloseHandle(handle);
