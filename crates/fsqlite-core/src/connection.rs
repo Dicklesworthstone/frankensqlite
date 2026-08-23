@@ -78264,6 +78264,13 @@ impl Connection {
         ExistsProbeMemoGuard { conn: self }
     }
 
+    /// bd-kwaam (frankensqlite#377): maximum child-table size for the
+    /// unamortized linear `EXISTS` direct probe at memo depth 0. Above this,
+    /// evaluation falls through to the nested-statement path, which scales
+    /// sub-linearly on indexed shapes; below it, the allocation-free scan is
+    /// cheaper than one statement execution.
+    const EXISTS_DIRECT_PROBE_MAX_LINEAR_ROWS: usize = 64;
+
     fn try_direct_exists_probe(
         &self,
         subquery: &SelectStatement,
@@ -78459,6 +78466,22 @@ impl Connection {
             drop(memo);
             Some(key)
         } else {
+            // bd-kwaam (frankensqlite#377): outside an armed `execute_join_select`
+            // WHERE loop the value-set memo can never be used, so the path below
+            // degrades to a full linear MemDB scan. In write contexts — the common
+            // depth-0 caller is trigger-WHEN evaluation — that scan runs once per
+            // mutated row against the same table being written, which makes bulk
+            // ingestion guarded by `WHEN EXISTS` validators quadratic (measured:
+            // 3000 guarded inserts 36s vs 3s baseline; stock SQLite seeks). The
+            // nested-statement fallback evaluates the same predicate through the
+            // join executor with no caching and no staleness exposure, so hand
+            // children larger than the threshold to it. Small tables keep the
+            // allocation-free early-exit scan, where it beats statement overhead.
+            if table.row_count() > Self::EXISTS_DIRECT_PROBE_MAX_LINEAR_ROWS {
+                drop(memo);
+                return None;
+            }
+
             drop(memo);
             None
         };
@@ -220872,6 +220895,62 @@ mod pager_routing_tests {
                 "the first-match child row must remain on the linear early-exit path"
             );
             assert_eq!(FSQLITE_EXISTS_PROBE_MEMO_HITS.with(Cell::get), 0);
+        });
+    }
+
+    #[test]
+    fn test_trigger_when_exists_guard_bulk_insert_stays_linear_after_threshold() {
+        // bd-kwaam (frankensqlite#377): a single-term correlated `WHEN EXISTS`
+        // guard used to take the unamortized linear MemDB probe at memo depth 0,
+        // making bulk ingestion quadratic. Above the threshold the probe must
+        // fall through to the nested-statement path; behavior is unchanged
+        // (guards still fire, duplicates still abort), only the complexity is.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE guarded_facts (\
+                     id TEXT PRIMARY KEY NOT NULL,\
+                     cap TEXT NOT NULL,\
+                     ord INTEGER NOT NULL\
+                 ) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TRIGGER trg_guarded_facts_no_replace_id \
+                 BEFORE INSERT ON guarded_facts \
+                 WHEN EXISTS (\
+                     SELECT 1 FROM guarded_facts AS e WHERE e.id = NEW.id\
+                 ) \
+                 BEGIN SELECT RAISE(ABORT, 'id cannot be replaced'); END;",
+            )
+            .await
+            .unwrap();
+
+            let inserted = conn.execute("BEGIN IMMEDIATE;").await.unwrap();
+            assert_eq!(inserted, 0);
+            for i in 0..300_i64 {
+                let sql = format!(
+                    "INSERT INTO guarded_facts (id, cap, ord) VALUES ('fact_{i:06}', 'cap_{}', {});",
+                    i / 4,
+                    i % 4
+                );
+                conn.execute(&sql).await.unwrap_or_else(|error| {
+                    panic!("guarded bulk insert {i} must not refuse: {error:?}")
+                });
+            }
+            conn.execute("COMMIT;").await.unwrap();
+
+            // Negative control: the guard must still fire on a duplicate id —
+            // falling through to the statement path may not weaken it.
+            let duplicate = conn
+                .execute("INSERT INTO guarded_facts (id, cap, ord) VALUES ('fact_000000', 'other', 9);")
+                .await;
+            let error = duplicate.expect_err("duplicate id must RAISE(ABORT)");
+            assert!(
+                error.to_string().contains("id cannot be replaced"),
+                "unexpected error shape: {error:?}"
+            );
         });
     }
 
