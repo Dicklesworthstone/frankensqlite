@@ -10,7 +10,12 @@ repository.workspace = true
 [dependencies]
 asupersync.workspace = true
 blake3.workspace = true
-fsqlite = { workspace = true, features = ["async-api"] }
+# The workspace `fsqlite` spec is `default-features = false` (bd-slgya): the
+# facade's native/uring/extension defaults must be re-enabled here or the
+# file-backed pager compiles out and every file-DB open fails at runtime with
+# NotImplemented (workspace-wide builds mask this via feature unification;
+# solo `-p fsqlite-harness` builds expose it).
+fsqlite = { workspace = true, features = ["async-api", "linux-asupersync-uring", "json", "fts5", "rtree", "icu", "misc"] }
 fsqlite-ast = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-parser = { workspace = true }

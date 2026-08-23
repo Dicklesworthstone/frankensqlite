@@ -1460,6 +1460,30 @@ mod tests {
     }
 
     #[test]
+    fn test_open_named_file_database_roundtrip() {
+        // bd-slgya regression guard: solo `-p fsqlite-c-api` builds get only
+        // the facade features listed in this crate's manifest; if the native
+        // pager is dropped there, file-backed opens fail at runtime with
+        // NotImplemented while workspace-unified builds stay green.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("roundtrip.db");
+        let c_path = CString::new(path.to_str().unwrap()).unwrap();
+        unsafe {
+            let mut db: *mut Sqlite3 = ptr::null_mut();
+            let rc = sqlite3_open(c_path.as_ptr(), &mut db);
+            assert_eq!(rc, SQLITE_OK, "file-backed open failed");
+            assert!(!db.is_null());
+
+            let sql =
+                CString::new("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(42);").unwrap();
+            let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
+            assert_eq!(rc, SQLITE_OK, "exec on file-backed database failed");
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+        assert!(path.exists(), "database file was not created on disk");
+    }
+
+    #[test]
     fn test_cleanup_temporary_database_artifacts_removes_sidecars() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("temp.db");

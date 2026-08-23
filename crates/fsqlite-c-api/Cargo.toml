@@ -10,7 +10,12 @@ repository.workspace = true
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-fsqlite = { workspace = true }
+# The workspace `fsqlite` spec is `default-features = false` (bd-slgya), so the
+# facade's default capability set (native engine + file-backed pager via
+# `linux-asupersync-uring`, plus the stock-parity extensions) must be restored
+# explicitly — a drop-in sqlite3 replacement that cannot open file databases
+# or run json1/fts5 is broken for every C consumer.
+fsqlite = { workspace = true, features = ["linux-asupersync-uring", "json", "fts5", "rtree", "icu", "misc"] }
 fsqlite-ast = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-parser = { workspace = true }

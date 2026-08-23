@@ -25,7 +25,14 @@ icu = ["fsqlite/icu"]
 misc = ["fsqlite/misc"]
 
 [dependencies]
-fsqlite = { workspace = true }
+# `linux-asupersync-uring` (which implies the facade's `native`) must be
+# enabled here explicitly: the workspace `fsqlite` spec is
+# `default-features = false`, so without it the file-backed pager compiles out
+# and the shipped shell cannot open real database files — the v0.3.8 release
+# binaries shipped exactly that defect (bd-slgya). Workspace-wide builds mask
+# the gap via feature unification; the dsr release build (`-p fsqlite-cli`)
+# does not.
+fsqlite = { workspace = true, features = ["linux-asupersync-uring"] }
 fsqlite-error = { workspace = true }
 fsqlite-core = { workspace = true }
 fsqlite-types = { workspace = true }
@@ -41,6 +48,7 @@ asupersync = { workspace = true }
 # entry points through `asupersync::test_utils::run_test`, which lives behind
 # `test-internals`. The runtime the binary itself builds in `main` is unchanged.
 asupersync = { workspace = true, features = ["test-internals"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

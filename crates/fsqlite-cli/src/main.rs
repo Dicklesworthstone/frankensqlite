@@ -2710,6 +2710,44 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
     }
 
     #[test]
+    fn test_file_backed_database_roundtrip() {
+        // bd-slgya regression guard: the workspace `fsqlite` dep is
+        // `default-features = false`, so a dropped facade feature silently
+        // compiles out the file-backed pager and every file-DB open fails at
+        // runtime — :memory: coverage cannot catch it, and the v0.3.8 release
+        // binaries shipped exactly that defect. Solo `-p fsqlite-cli` builds
+        // (= the dsr release build) exercise the file path only through this
+        // test.
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join("roundtrip.db");
+            let db_arg = db_path.to_string_lossy().into_owned();
+
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![
+                OsString::from("fsqlite"),
+                OsString::from(&db_arg),
+                OsString::from("-c"),
+                OsString::from(
+                    "CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(42); SELECT x FROM t;",
+                ),
+            ];
+            let exit_code =
+                run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch())
+                    .await;
+            let stderr = String::from_utf8_lossy(&err).into_owned();
+            assert_eq!(exit_code, 0, "file-backed open failed: {stderr}");
+            assert!(err.is_empty(), "unexpected stderr: {stderr}");
+
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(stdout.contains("42"), "expected query result, got: {stdout}");
+            assert!(db_path.exists(), "database file was not created on disk");
+        });
+    }
+
+    #[test]
     fn test_repl_quit_command_exits_cleanly() {
         asupersync::test_utils::run_test(|| async {
             let mut input = Cursor::new(b".quit\n".to_vec());
