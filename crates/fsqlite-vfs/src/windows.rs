@@ -1916,7 +1916,16 @@ impl WindowsFile {
             .stock_main_locks
             .as_ref()
             .map_or(level == LockLevel::None, |locks| locks.is_exactly_at(level));
-        Ok(stock_exact && self.os_locks_ref()?.is_exactly_at(level))
+        // A sidecar-less binding (bd-ypl7b read-only open) never opened the
+        // cooperative sidecars, so its cooperative state is vacuously NONE —
+        // mirror the stock-handle treatment above instead of erroring with
+        // "windows lock files are closed" (beads_rust GH#438: that error
+        // fired on every read-only open+close cycle).
+        let cooperative_exact = self
+            .os_locks
+            .as_ref()
+            .map_or(level == LockLevel::None, |locks| locks.is_exactly_at(level));
+        Ok(stock_exact && cooperative_exact)
     }
 
     fn rollback_ordinary_locks_to(&mut self, level: LockLevel) -> Result<()> {
@@ -1935,7 +1944,16 @@ impl WindowsFile {
             // structurally incomplete lock ladder.
             drop(self.stock_main_locks.take());
         }
-        let cooperative_result = self.os_locks_mut()?.restore_to_exact(level);
+        let cooperative_result = if self.os_locks.is_none() && level == LockLevel::None {
+            // Sidecar-less binding (bd-ypl7b): no cooperative sidecars were
+            // ever opened, so restoring to NONE is vacuously complete. The
+            // unlock/close path must never materialize sidecars — a read-only
+            // open on read-only media has to close cleanly.
+            Ok(())
+        } else {
+            self.os_locks_mut()
+                .and_then(|locks| locks.restore_to_exact(level))
+        };
         match (stock_result, cooperative_result) {
             (Ok(()), Ok(())) => {
                 if !self.ordinary_locks_are_exactly_at(level)? {
@@ -2465,6 +2483,10 @@ impl VfsFile for WindowsFile {
             return Ok(());
         }
 
+        // A sidecar-less read-only binding (bd-ypl7b) materializes the
+        // cooperative sidecars on demand the moment something actually
+        // acquires a lock through it; plain reads never reach this point.
+        self.ensure_os_locks()?;
         // Materialize the stock-visible handle before acquiring any
         // cooperative sidecar lock. If duplicating the main handle fails,
         // no partial lock acquisition is left hidden behind the unchanged
@@ -2678,8 +2700,36 @@ impl VfsFile for WindowsFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        if self.os_locks_ref()?.reserved_locked_by_other()? {
-            return Ok(true);
+        match self.os_locks.as_ref() {
+            Some(os_locks) => {
+                if os_locks.reserved_locked_by_other()? {
+                    return Ok(true);
+                }
+            }
+            None => {
+                // Sidecar-less read-only binding (bd-ypl7b): this binding
+                // retains no sidecar handles, but another process may still
+                // hold the cooperative RESERVED lock through the on-disk
+                // sidecar. Probe it transiently without creating anything —
+                // an absent sidecar means no cooperative holder exists
+                // (holders create the sidecars when they lock), and
+                // LockFileEx works on a read-only handle, so this stays
+                // usable on read-only media.
+                self.ensure_open()?;
+                let reserved_path = sqlite_reserved_lock_path(&self.path);
+                let mut open_options = windows_open_options();
+                match open_options.read(true).open(&reserved_path) {
+                    Ok(reserved_file) => {
+                        match AdvisoryFileLock::try_lock(&reserved_file, FileLockMode::Exclusive) {
+                            Ok(()) => WindowsOsLockFiles::unlock_file(&reserved_file)?,
+                            Err(FileLockError::AlreadyLocked) => return Ok(true),
+                            Err(FileLockError::Io(err)) => return Err(FrankenError::Io(err)),
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(FrankenError::Io(err)),
+                }
+            }
         }
         if self.lock_level >= LockLevel::Reserved {
             return Ok(false);
