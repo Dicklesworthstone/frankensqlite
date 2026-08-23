@@ -3337,6 +3337,26 @@ mod tests {
             "read-only open must stay sidecar-less (bd-ypl7b)"
         );
 
+        // The GH#438 killer: with no sidecar handles, the reserved probe and
+        // a plain open+close cycle must both work instead of erroring with
+        // "windows lock files are closed".
+        assert!(
+            !file
+                .check_reserved_lock(&cx)
+                .expect("reserved probe on a sidecar-less binding"),
+            "no cooperative sidecars on disk means no reserved holder"
+        );
+        {
+            let (mut ro2, _) = vfs
+                .open(&cx, Some(&path), VfsOpenFlags::MAIN_DB)
+                .expect("second read-only open");
+            ro2.close(&cx).expect("sidecar-less read-only close");
+        }
+        assert!(
+            !sqlite_shared_lock_path(&path).exists(),
+            "a read-only open+close cycle must not materialize sidecars"
+        );
+
         file.lock_external_shared_snapshot(&cx)
             .expect("external snapshot fence on a read-only binding");
         assert!(
