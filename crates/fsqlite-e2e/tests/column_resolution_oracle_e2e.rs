@@ -171,6 +171,36 @@ fn output_alias_resolves_in_order_by_and_group_by() {
     });
 }
 
+/// bd-7mymt: three-part `schema.table.column` references (e.g. `main.a.id`)
+/// must parse and resolve exactly like SQLite. Before the fix the parser
+/// rejected the second dot ("expected RightParen, got Dot") and skipped the
+/// whole statement. For the `main` database the schema qualifier resolves to
+/// the same table as the two-part form, in the SELECT list, FROM clause,
+/// JOIN/ON, WHERE, and ORDER BY.
+#[test]
+fn three_part_schema_qualified_column_resolves() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = ab().await;
+        check(
+            &f,
+            &r,
+            &[
+                // Three-part column in SELECT list + FROM + ORDER BY.
+                "SELECT main.a.id, main.a.x FROM main.a ORDER BY main.a.id",
+                // Three-part column against an unqualified FROM table.
+                "SELECT main.a.id, main.a.x FROM a ORDER BY main.a.id",
+                // Three-part columns across a JOIN, in ON and WHERE.
+                "SELECT main.a.id, main.b.y FROM main.a JOIN main.b \
+                 ON main.a.id = main.b.id WHERE main.a.x > 5 ORDER BY main.a.id",
+                // Round-trips as a plain projection.
+                "SELECT main.a.x FROM main.a WHERE main.a.id = 1",
+            ],
+            "three_part_schema_qualified_column_resolves",
+        )
+        .await;
+    });
+}
+
 /// bd-ujuzr: SQLite resolves a result-column alias in WHERE (leniency); frank
 /// rejects it with "no such column". The ORDER BY/GROUP BY alias cases above
 /// work, so frank is stricter than SQLite only in the WHERE clause.

@@ -44,13 +44,7 @@ fn dummy_expr() -> Expr {
 /// stored `.expr` must be the whole comparison (not a bare literal).
 fn cmp_expr(table: &str, column: &str, op: BinaryOp) -> Expr {
     Expr::BinaryOp {
-        left: Box::new(Expr::Column(
-            ColumnRef {
-                table: Some(table.into()),
-                column: column.into(),
-            },
-            ds(),
-        )),
+        left: Box::new(Expr::Column(ColumnRef::qualified(table, column), ds())),
         op,
         right: Box::new(dummy_expr()),
         span: ds(),

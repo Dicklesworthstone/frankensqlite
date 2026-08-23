@@ -216,9 +216,14 @@ pub enum Literal {
 // Column references
 // ---------------------------------------------------------------------------
 
-/// A reference to a column, possibly qualified with a table name.
+/// A reference to a column, possibly qualified with a table name and, for a
+/// three-part `schema.table.column` reference, a leading database/schema name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnRef {
+    /// Optional database/schema qualifier — the leading segment of a
+    /// three-part `schema.table.column` reference. `None` for bare and
+    /// table-qualified references.
+    pub schema: Option<Arc<str>>,
     /// Optional table (or alias) qualifier.
     pub table: Option<Arc<str>>,
     /// Column name.
@@ -226,19 +231,38 @@ pub struct ColumnRef {
 }
 
 impl ColumnRef {
-    /// Create an unqualified column reference.
+    /// Create an unqualified column reference (`column`).
     #[must_use]
     pub fn bare(column: impl Into<Arc<str>>) -> Self {
         Self {
+            schema: None,
             table: None,
             column: column.into(),
         }
     }
 
-    /// Create a table-qualified column reference.
+    /// Create a table-qualified column reference (`table.column`).
     #[must_use]
     pub fn qualified(table: impl Into<Arc<str>>, column: impl Into<Arc<str>>) -> Self {
         Self {
+            schema: None,
+            table: Some(table.into()),
+            column: column.into(),
+        }
+    }
+
+    /// Create a schema-qualified column reference (`schema.table.column`).
+    ///
+    /// The leading segment names the database/schema (e.g. `main`, `temp`, or
+    /// an attached database alias), matching SQLite's three-part column syntax.
+    #[must_use]
+    pub fn schema_qualified(
+        schema: impl Into<Arc<str>>,
+        table: impl Into<Arc<str>>,
+        column: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            schema: Some(schema.into()),
             table: Some(table.into()),
             column: column.into(),
         }

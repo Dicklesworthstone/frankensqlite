@@ -117,9 +117,23 @@ fn attach_cross_db_queries_match_rusqlite_oracle() {
             rq(&r, "SELECT id,tag FROM aux.t ORDER BY id"),
             &mut diffs,
         );
-        // NOTE: bare unqualified `SELECT ... FROM only` (aux-only table) is a known
-        // divergence tracked in bd-pqauo (frank does not resolve unqualified names
-        // against attached schemas) — intentionally not asserted here.
+        // bd-pqauo (FIXED): a bare unqualified `SELECT ... FROM only` resolves to
+        // the aux-only table via SQLite's temp->main->attached-in-order search.
+        check(
+            "bd-pqauo unqualified attached-only table",
+            fq(&f, "SELECT id,note FROM only ORDER BY id").await,
+            rq(&r, "SELECT id,note FROM only ORDER BY id"),
+            &mut diffs,
+        );
+        // A same-named MAIN table still shadows the attached one for an
+        // unqualified reference (main.t wins over aux.t) — already covered by the
+        // "unqualified t -> main" check above; re-assert after the pqauo fix.
+        check(
+            "bd-pqauo unqualified shadow (main wins)",
+            fq(&f, "SELECT id,name FROM t ORDER BY id").await,
+            rq(&r, "SELECT id,name FROM t ORDER BY id"),
+            &mut diffs,
+        );
         // cross-DB inner join on id
         check(
             "cross-db inner join",
@@ -253,13 +267,36 @@ fn attach_cross_db_queries_match_rusqlite_oracle() {
             rq(&r, "SELECT id,tag FROM aux.t ORDER BY id"),
             &mut diffs,
         );
-        // NOTE: a cross-DB UPDATE/DELETE whose WHERE/SET references the real `main`
-        // via a subquery (e.g. `UPDATE aux.t SET tag='UPD' WHERE id IN (SELECT id
-        // FROM main.t)`) is still a known divergence tracked in bd-s12cm: the write
-        // is delegated to the attached child where `main.t` resolves to the child's
-        // own DB, and there is no local mixed-schema WRITE path to fall back to (the
-        // fix must MATERIALIZE the main-side subquery locally before delegating, like
-        // INSERT ... SELECT does) — intentionally not asserted here.
+        // bd-s12cm (FIXED): a cross-DB UPDATE whose WHERE references the real
+        // `main` via a subquery. The mixed statement previously errored
+        // ("statements mixing attached schemas..."); frank now materializes the
+        // uncorrelated main-side subquery locally before delegating.
+        ex(
+            &f,
+            &r,
+            "UPDATE aux.t SET tag='X'||id WHERE id IN (SELECT id FROM main.t)",
+        )
+        .await;
+        check(
+            "after cross-db update (mixed subquery)",
+            fq(&f, "SELECT id,tag FROM aux.t ORDER BY id").await,
+            rq(&r, "SELECT id,tag FROM aux.t ORDER BY id"),
+            &mut diffs,
+        );
+        // bd-s12cm (FIXED): a cross-DB DELETE anti-join against the real `main`
+        // (id=4 lives only in aux, so it is deleted).
+        ex(
+            &f,
+            &r,
+            "DELETE FROM aux.t WHERE id NOT IN (SELECT id FROM main.t)",
+        )
+        .await;
+        check(
+            "after cross-db delete (anti-join)",
+            fq(&f, "SELECT id,tag FROM aux.t ORDER BY id").await,
+            rq(&r, "SELECT id,tag FROM aux.t ORDER BY id"),
+            &mut diffs,
+        );
         // main untouched by the aux writes
         check(
             "main untouched",
