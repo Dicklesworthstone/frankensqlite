@@ -55286,10 +55286,7 @@ mod tests {
             from: None,
             where_clause: Some(Expr::BinaryOp {
                 left: Box::new(Expr::Column(
-                    fsqlite_ast::ColumnRef {
-                        table: None,
-                        column: "b".into(),
-                    },
+                    fsqlite_ast::ColumnRef::bare("b"),
                     Span::ZERO,
                 )),
                 op: fsqlite_ast::BinaryOp::Eq,

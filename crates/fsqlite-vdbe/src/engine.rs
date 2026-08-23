@@ -24675,10 +24675,7 @@ mod tests {
                 from: None,
                 where_clause: Some(Expr::BinaryOp {
                     left: Box::new(Expr::Column(
-                        ColumnRef {
-                            table: None,
-                            column: "rowid".into(),
-                        },
+                        ColumnRef::bare("rowid"),
                         span(),
                     )),
                     op: AstBinaryOp::Eq,
@@ -24719,10 +24716,7 @@ mod tests {
                 },
                 where_clause: Some(Expr::BinaryOp {
                     left: Box::new(Expr::Column(
-                        ColumnRef {
-                            table: None,
-                            column: "rowid".into(),
-                        },
+                        ColumnRef::bare("rowid"),
                         span(),
                     )),
                     op: AstBinaryOp::Eq,

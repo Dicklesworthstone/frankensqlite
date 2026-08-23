@@ -1394,6 +1394,10 @@ impl fmt::Display for Literal {
 
 impl fmt::Display for ColumnRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(ref s) = self.schema {
+            write_ident(f, s)?;
+            f.write_str(".")?;
+        }
         if let Some(ref t) = self.table {
             write_ident(f, t)?;
             f.write_str(".")?;

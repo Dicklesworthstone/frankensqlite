@@ -17610,6 +17610,86 @@ impl Connection {
         }
     }
 
+    /// bd-pqauo: SQLite resolves an unqualified table name in the search order
+    /// temp → main → each ATTACHed database in attach order (first match wins).
+    /// frank's resolver only searched main/temp, so a table living solely in an
+    /// attached schema (`SELECT ... FROM only` where `only` is `aux.only`) was
+    /// reported "no such table". Qualify such a bare FROM/JOIN table reference
+    /// with its owning attached schema BEFORE routing, so the existing
+    /// attached-schema delegation resolves it. A local table/view of the same
+    /// name keeps the bare reference (main/temp shadow attached). Scoped to the
+    /// primary and compound-arm FROM table sources; an unqualified attached
+    /// table nested inside a subquery source is a narrower follow-up (bd-ghiey).
+    fn qualify_unqualified_attached_from_tables(
+        &self,
+        select: &SelectStatement,
+    ) -> Option<SelectStatement> {
+        let attached_order: Vec<String> = {
+            let registry = self.attached_schemas.borrow();
+            registry
+                .all_schemas()
+                .into_iter()
+                .filter(|schema| !is_builtin_schema(schema))
+                .map(str::to_owned)
+                .collect()
+        };
+        if attached_order.is_empty() {
+            return None;
+        }
+        let mut candidates: Vec<String> = Vec::new();
+        collect_bare_from_table_names(&select.body.select, &mut candidates);
+        for (_op, core) in &select.body.compounds {
+            collect_bare_from_table_names(core, &mut candidates);
+        }
+        // A statement-level CTE shadows an attached table for an unqualified
+        // reference in the primary/compound FROM (it is in scope there), so it
+        // must never be re-pointed at an attached schema.
+        if let Some(with) = &select.with {
+            candidates.retain(|candidate| {
+                !with
+                    .ctes
+                    .iter()
+                    .any(|cte| cte.name.eq_ignore_ascii_case(candidate))
+            });
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let mut resolved: Vec<(String, String)> = Vec::new();
+        for name in &candidates {
+            if resolved.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            // main/temp shadow an attached table for an unqualified reference.
+            if self.schema_index_of(name).is_some() || self.view_index_of(name).is_some() {
+                continue;
+            }
+            for schema in &attached_order {
+                // A probe failure (e.g. a not-yet-materialized child) just means
+                // "not resolvable here" — never fail an unrelated SELECT over it.
+                let found = self
+                    .with_attached_connection(schema, |conn| {
+                        Ok(conn.schema_index_of(name).is_some()
+                            || conn.view_index_of(name).is_some())
+                    })
+                    .unwrap_or(false);
+                if found {
+                    resolved.push((name.clone(), schema.clone()));
+                    break;
+                }
+            }
+        }
+        if resolved.is_empty() {
+            return None;
+        }
+        let mut rewritten = select.clone();
+        qualify_bare_from_table_names(&mut rewritten.body.select, &resolved);
+        for (_op, core) in &mut rewritten.body.compounds {
+            qualify_bare_from_table_names(core, &resolved);
+        }
+        Some(rewritten)
+    }
+
     async fn maybe_execute_attached_select(
         &self,
         select: &SelectStatement,
@@ -35410,6 +35490,19 @@ impl Connection {
                 } else {
                     select
                 };
+                // bd-pqauo: qualify an unqualified FROM/JOIN table that lives
+                // ONLY in an attached schema (`FROM only` -> `FROM aux.only`)
+                // BEFORE the routing cascade, so every downstream path — direct
+                // attached delegation and the mixed-schema local fallback alike —
+                // resolves it the way SQLite's temp->main->attached search would.
+                let qualified_select_owner;
+                let select = match self.qualify_unqualified_attached_from_tables(select) {
+                    Some(qualified) => {
+                        qualified_select_owner = qualified;
+                        &qualified_select_owner
+                    }
+                    None => select,
+                };
                 // bd-c9v0f + bd-pw68x: reject out-of-range ORDER BY/GROUP BY
                 // ordinals and unknown INDEXED BY hints, matching SQLite.
                 self.validate_select_ordinals_and_hints(select)?;
@@ -48415,6 +48508,7 @@ impl Connection {
     ) -> Expr {
         Expr::Column(
             ColumnRef {
+                schema: None,
                 table: table_ref.alias.clone().map(Into::into),
                 column: key_column.into(),
             },
@@ -48433,6 +48527,7 @@ impl Connection {
 
         let key_ref = Expr::Column(
             ColumnRef {
+                schema: None,
                 table: table_ref.alias.clone().map(Into::into),
                 column: key_column.into(),
             },
@@ -97315,6 +97410,69 @@ fn strip_attached_schema_from_select(select: &mut SelectStatement, target_schema
             name.schema = None;
         }
     });
+}
+
+/// bd-pqauo: gather the bare (schema-less) table names used directly as a FROM
+/// or JOIN source in a select core, including through parenthesized joins.
+fn collect_bare_from_table_names(core: &SelectCore, out: &mut Vec<String>) {
+    if let SelectCore::Select {
+        from: Some(from), ..
+    } = core
+    {
+        collect_bare_from_source_names(&from.source, out);
+        for join in &from.joins {
+            collect_bare_from_source_names(&join.table, out);
+        }
+    }
+}
+
+fn collect_bare_from_source_names(source: &TableOrSubquery, out: &mut Vec<String>) {
+    match source {
+        TableOrSubquery::Table { name, .. } if name.schema.is_none() => {
+            out.push(name.name.clone());
+        }
+        TableOrSubquery::ParenJoin(inner) => {
+            collect_bare_from_source_names(&inner.source, out);
+            for join in &inner.joins {
+                collect_bare_from_source_names(&join.table, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// bd-pqauo: qualify each bare FROM/JOIN table source named in `resolved` with
+/// its owning attached schema.
+fn qualify_bare_from_table_names(core: &mut SelectCore, resolved: &[(String, String)]) {
+    if let SelectCore::Select {
+        from: Some(from), ..
+    } = core
+    {
+        qualify_bare_from_source_names(&mut from.source, resolved);
+        for join in &mut from.joins {
+            qualify_bare_from_source_names(&mut join.table, resolved);
+        }
+    }
+}
+
+fn qualify_bare_from_source_names(source: &mut TableOrSubquery, resolved: &[(String, String)]) {
+    match source {
+        TableOrSubquery::Table { name, .. } if name.schema.is_none() => {
+            if let Some((_, schema)) = resolved
+                .iter()
+                .find(|(bare, _)| bare.eq_ignore_ascii_case(&name.name))
+            {
+                name.schema = Some(schema.clone());
+            }
+        }
+        TableOrSubquery::ParenJoin(inner) => {
+            qualify_bare_from_source_names(&mut inner.source, resolved);
+            for join in &mut inner.joins {
+                qualify_bare_from_source_names(&mut join.table, resolved);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Persistent views belong to exactly one database schema. SQLite defers

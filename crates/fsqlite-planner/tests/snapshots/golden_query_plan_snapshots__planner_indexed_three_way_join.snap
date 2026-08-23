@@ -10,7 +10,7 @@ total_cost: 151978.441
 access_paths:
   table=users kind=IndexScanEquality index=idx_users_email rows=1.000 cost=13.927 probe=Some(Equality { column: "email", target: Placeholder(Numbered(1), 89..91) })
   table=products kind=FullTableScan index=(none) rows=8000.000 cost=260.000 probe=None
-  table=orders kind=IndexScanEquality index=idx_orders_product rows=22000.000 cost=18.963 probe=Some(Equality { column: "product_id", target: Column(ColumnRef { table: Some("products"), column: "id" }, 146..157) })
+  table=orders kind=IndexScanEquality index=idx_orders_product rows=22000.000 cost=18.963 probe=Some(Equality { column: "product_id", target: Column(ColumnRef { schema: None, table: Some("products"), column: "id" }, 146..157) })
 display:
 QUERY PLAN (est. cost 151978.4):
   0: SCAN users USING INDEX idx_users_email (~1 rows, cost 13.9)

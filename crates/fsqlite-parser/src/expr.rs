@@ -2213,33 +2213,70 @@ impl<'a> ParseMachine<'a> {
             return self.start_function(name.to_string(), start, min_bp);
         }
         let parsed = if self.parser.at_kind(&TokenKind::Dot) {
-            let Some(column_token) = self.parser.tokens.get(self.parser.pos + 1).cloned() else {
+            let Some(mid_token) = self.parser.tokens.get(self.parser.pos + 1).cloned() else {
                 return Err(self.parser.err_here("expected column name after '.'"));
             };
-            let column = match &column_token.kind {
-                TokenKind::Id(column) | TokenKind::QuotedId(column, _) => Arc::clone(column),
-                TokenKind::String(column) => Arc::<str>::from(column.as_str()),
+            let mid = match &mid_token.kind {
+                TokenKind::Id(mid) | TokenKind::QuotedId(mid, _) => Arc::clone(mid),
+                TokenKind::String(mid) => Arc::<str>::from(mid.as_str()),
                 kind if starts_post_dot_identifier(kind) => Arc::<str>::from(kw_to_str(kind)),
                 _ => {
                     return Err(ParseError::at(
-                        format!(
-                            "expected column name after '.', got {:?}",
-                            column_token.kind
-                        ),
-                        Some(&column_token),
+                        format!("expected column name after '.', got {:?}", mid_token.kind),
+                        Some(&mid_token),
                     ));
                 }
             };
-            self.parser.pos = self.parser.pos.saturating_add(2);
-            self.parser.finish_expr(
-                Expr::Column(
-                    ColumnRef::qualified(name, column),
-                    start.merge(column_token.span),
-                ),
-                2,
-                false,
-                false,
-            )?
+            // Three-part reference `schema.table.column` (e.g. `main.t.id`):
+            // a second dot after the middle segment promotes `name` to the
+            // schema/database qualifier and `mid` to the table qualifier.
+            if matches!(
+                self.parser.tokens.get(self.parser.pos + 2).map(|t| &t.kind),
+                Some(TokenKind::Dot)
+            ) {
+                let Some(column_token) = self.parser.tokens.get(self.parser.pos + 3).cloned()
+                else {
+                    return Err(ParseError::at(
+                        "expected column name after '.'".to_owned(),
+                        self.parser.tokens.get(self.parser.pos + 2),
+                    ));
+                };
+                let column = match &column_token.kind {
+                    TokenKind::Id(column) | TokenKind::QuotedId(column, _) => Arc::clone(column),
+                    TokenKind::String(column) => Arc::<str>::from(column.as_str()),
+                    kind if starts_post_dot_identifier(kind) => Arc::<str>::from(kw_to_str(kind)),
+                    _ => {
+                        return Err(ParseError::at(
+                            format!(
+                                "expected column name after '.', got {:?}",
+                                column_token.kind
+                            ),
+                            Some(&column_token),
+                        ));
+                    }
+                };
+                self.parser.pos = self.parser.pos.saturating_add(4);
+                self.parser.finish_expr(
+                    Expr::Column(
+                        ColumnRef::schema_qualified(name, mid, column),
+                        start.merge(column_token.span),
+                    ),
+                    2,
+                    false,
+                    false,
+                )?
+            } else {
+                self.parser.pos = self.parser.pos.saturating_add(2);
+                self.parser.finish_expr(
+                    Expr::Column(
+                        ColumnRef::qualified(name, mid),
+                        start.merge(mid_token.span),
+                    ),
+                    2,
+                    false,
+                    false,
+                )?
+            }
         } else {
             ParsedExpr::leaf(Expr::Column(ColumnRef::bare(name), start))
         };
@@ -4128,26 +4165,52 @@ impl Parser {
             return self.parse_function_call(name.as_ref().to_owned(), start);
         }
         let name = name.into();
-        // Table-qualified column: name.column
+        // Table-qualified column (`name.column`) or three-part
+        // schema-qualified column (`name.mid.column`).
         if matches!(self.peek_kind(), TokenKind::Dot) {
-            let Some(col_tok) = self.peek_nth_token(1) else {
+            let Some(mid_tok) = self.peek_nth_token(1).cloned() else {
                 return Err(self.err_here("expected column name after '.'"));
             };
-            let col_name = match &col_tok.kind {
+            let mid_name = match &mid_tok.kind {
                 TokenKind::Id(c) | TokenKind::QuotedId(c, _) => Arc::clone(c),
                 TokenKind::String(c) => Arc::<str>::from(c.as_str()),
                 k if starts_post_dot_identifier(k) => Arc::<str>::from(kw_to_str(k)),
                 _ => {
                     return Err(ParseError::at(
-                        format!("expected column name after '.', got {:?}", col_tok.kind),
-                        Some(col_tok),
+                        format!("expected column name after '.', got {:?}", mid_tok.kind),
+                        Some(&mid_tok),
                     ));
                 }
             };
-            let span = start.merge(col_tok.span);
+            // Three-part reference `schema.table.column` (e.g. `main.t.id`).
+            if matches!(self.peek_nth_token(2).map(|t| &t.kind), Some(TokenKind::Dot)) {
+                let Some(col_tok) = self.peek_nth_token(3).cloned() else {
+                    return Err(self.err_here("expected column name after '.'"));
+                };
+                let col_name = match &col_tok.kind {
+                    TokenKind::Id(c) | TokenKind::QuotedId(c, _) => Arc::clone(c),
+                    TokenKind::String(c) => Arc::<str>::from(c.as_str()),
+                    k if starts_post_dot_identifier(k) => Arc::<str>::from(kw_to_str(k)),
+                    _ => {
+                        return Err(ParseError::at(
+                            format!("expected column name after '.', got {:?}", col_tok.kind),
+                            Some(&col_tok),
+                        ));
+                    }
+                };
+                let span = start.merge(col_tok.span);
+                self.pos = self.pos.saturating_add(4);
+                return self.finish_expr(
+                    Expr::Column(ColumnRef::schema_qualified(name, mid_name, col_name), span),
+                    2,
+                    false,
+                    false,
+                );
+            }
+            let span = start.merge(mid_tok.span);
             self.pos = self.pos.saturating_add(2);
             return self.finish_expr(
-                Expr::Column(ColumnRef::qualified(name, col_name), span),
+                Expr::Column(ColumnRef::qualified(name, mid_name), span),
                 2,
                 false,
                 false,
@@ -6758,6 +6821,7 @@ mod tests {
         match &parse("x") {
             Expr::Column(
                 ColumnRef {
+                    schema: None,
                     table: None,
                     column,
                 },
@@ -6772,6 +6836,7 @@ mod tests {
         match &parse("t.x") {
             Expr::Column(
                 ColumnRef {
+                    schema: None,
                     table: Some(t),
                     column,
                 },
@@ -6782,6 +6847,28 @@ mod tests {
             }
             other => unreachable!("expected qualified column, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_column_schema_qualified() {
+        // Three-part `schema.table.column` reference (e.g. `main.t.id`).
+        match &parse("main.t.id") {
+            Expr::Column(
+                ColumnRef {
+                    schema: Some(s),
+                    table: Some(t),
+                    column,
+                },
+                _,
+            ) => {
+                assert_eq!(s.as_ref(), "main");
+                assert_eq!(t.as_ref(), "t");
+                assert_eq!(column.as_ref(), "id");
+            }
+            other => unreachable!("expected schema-qualified column, got {other:?}"),
+        }
+        // Round-trips through Display as `main.t.id`.
+        assert_eq!(parse("main.t.id").to_string(), "main.t.id");
     }
 
     #[test]
