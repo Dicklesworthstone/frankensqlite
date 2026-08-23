@@ -2,10 +2,10 @@
 //! and deep-path scalars vs rusqlite (bundled SQLite 3.53). A probe sweep found
 //! the standalone/literal forms stock-correct across 12 cases (asserted here).
 //!
-//! KNOWN GAP (bd-tfwym): the *lateral* form `FROM t, json_each(t.col)` — a TVF
-//! whose argument references a sibling FROM table — is unimplemented (frank
-//! errors "column not found"). The two `#[ignore]`d tests below assert the stock
-//! result and should be un-ignored once bd-tfwym lands.
+//! LATERAL form (bd-tfwym, FIXED): `FROM t, json_each(t.col)` — a TVF whose
+//! argument references a sibling FROM table — is evaluated per-row of the
+//! referenced table inside the join loop. The two lateral tests below assert the
+//! stock cross-product result.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -153,7 +153,6 @@ fn deep_paths_and_types() {
 // ── Lateral TVF: KNOWN GAP bd-tfwym. Un-ignore when the lateral join lands. ──
 
 #[test]
-#[ignore = "bd-tfwym: lateral json_each(t.col) referencing a sibling FROM table is unimplemented"]
 fn lateral_json_each_join() {
     asupersync::test_utils::run_test(|| async {
         agree(
@@ -169,7 +168,6 @@ fn lateral_json_each_join() {
 }
 
 #[test]
-#[ignore = "bd-tfwym: lateral json_each(t.col) referencing a sibling FROM table is unimplemented"]
 fn lateral_json_each_aggregate() {
     asupersync::test_utils::run_test(|| async {
         agree(
