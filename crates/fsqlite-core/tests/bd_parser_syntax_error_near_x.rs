@@ -78,3 +78,82 @@ fn parser_expected_family_and_generic_match_stock_near_x() {
         );
     });
 }
+
+/// Run `setup` then attempt `sql`; return the error text (DDL path).
+async fn ddl_err(setup: &[&str], sql: &str) -> String {
+    let c = Connection::open(":memory:").await.unwrap();
+    for s in setup {
+        let _ = c.execute(s).await;
+    }
+    c.execute(sql)
+        .await
+        .expect_err("malformed statement must be rejected")
+        .to_string()
+}
+
+#[test]
+fn parser_trigger_body_restrictions_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        // Part B-ext + C: trigger-body DML restrictions. Stock (bundled SQLite
+        // 3.53.2) reports most of these as near-X grammar errors, and a few as
+        // fixed verbatim messages. bd-parser-syntax-error-format-6w6kp.
+        let setup = &["CREATE TABLE t(a, b)", "CREATE INDEX ix ON t(a)"];
+        let tr = |body: &str| format!("CREATE TRIGGER tr AFTER INSERT ON t BEGIN {body} END");
+
+        // ── near-X (UnexpectedToken) ──
+        assert_eq!(
+            ddl_err(setup, &tr("INSERT INTO t DEFAULT VALUES;")).await,
+            "near \"DEFAULT\": syntax error",
+        );
+        assert_eq!(
+            ddl_err(setup, &tr("UPDATE t SET a = 1 ORDER BY a;")).await,
+            "near \"ORDER\": syntax error",
+        );
+        assert_eq!(
+            ddl_err(setup, &tr("UPDATE t SET a = 1 LIMIT 1;")).await,
+            "near \"LIMIT\": syntax error",
+        );
+        assert_eq!(
+            ddl_err(setup, &tr("DELETE FROM t ORDER BY a;")).await,
+            "near \"ORDER\": syntax error",
+        );
+        assert_eq!(
+            ddl_err(setup, &tr("CREATE TABLE z(a);")).await,
+            "near \"CREATE\": syntax error",
+        );
+        assert_eq!(ddl_err(setup, &tr("")).await, "near \"END\": syntax error");
+        assert_eq!(
+            ddl_err(setup, "EXPLAIN EXPLAIN SELECT 1").await,
+            "near \"EXPLAIN\": syntax error",
+        );
+        // UPDATE/DELETE RETURNING have no grammar slot in a trigger → near-X.
+        assert_eq!(
+            ddl_err(setup, &tr("UPDATE t SET a = 1 RETURNING a;")).await,
+            "near \"RETURNING\": syntax error",
+        );
+        assert_eq!(
+            ddl_err(setup, &tr("DELETE FROM t RETURNING a;")).await,
+            "near \"RETURNING\": syntax error",
+        );
+
+        // ── verbatim (Semantic) ──
+        assert_eq!(
+            ddl_err(setup, &tr("UPDATE main.t SET a = 1;")).await,
+            "qualified table names are not allowed on INSERT, UPDATE, and DELETE \
+             statements within triggers",
+        );
+        assert_eq!(
+            ddl_err(setup, &tr("UPDATE t INDEXED BY ix SET a = 1;")).await,
+            "the INDEXED BY clause is not allowed on UPDATE or DELETE statements within triggers",
+        );
+        assert_eq!(
+            ddl_err(setup, &tr("UPDATE t NOT INDEXED SET a = 1;")).await,
+            "the NOT INDEXED clause is not allowed on UPDATE or DELETE statements within triggers",
+        );
+        // A trigger-body INSERT parses RETURNING then rejects it verbatim.
+        assert_eq!(
+            ddl_err(setup, &tr("INSERT INTO t VALUES (1, 2) RETURNING a;")).await,
+            "cannot use RETURNING in a trigger",
+        );
+    });
+}

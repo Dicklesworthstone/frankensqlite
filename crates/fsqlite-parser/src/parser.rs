@@ -714,8 +714,10 @@ impl Parser {
         let first = self.parse_identifier()?;
         if self.check(&TokenKind::Dot) {
             if context == DmlParseContext::TriggerBody {
-                return Err(self
-                    .err_msg("qualified table names are not allowed in trigger body statements"));
+                return Err(self.err_semantic(
+                    "qualified table names are not allowed on INSERT, UPDATE, and DELETE \
+                     statements within triggers",
+                ));
             }
             self.advance();
             let second = self.parse_identifier()?;
@@ -742,8 +744,16 @@ impl Parser {
             && (self.check_kw(&TokenKind::KwIndexed)
                 || (self.check_kw(&TokenKind::KwNot) && self.peek_nth(1) == &TokenKind::KwIndexed))
         {
-            return Err(self
-                .err_msg("INDEXED BY and NOT INDEXED are not allowed in trigger body statements"));
+            // Stock emits a distinct verbatim message per clause.
+            // bd-parser-syntax-error-format-6w6kp (Part C).
+            let clause = if self.check_kw(&TokenKind::KwIndexed) {
+                "INDEXED BY"
+            } else {
+                "NOT INDEXED"
+            };
+            return Err(self.err_semantic(format!(
+                "the {clause} clause is not allowed on UPDATE or DELETE statements within triggers"
+            )));
         }
         let index_hint = self.parse_index_hint()?;
         let time_travel = self.parse_time_travel_clause()?;
@@ -1475,9 +1485,19 @@ impl Parser {
     fn parse_returning(
         &mut self,
         context: DmlParseContext,
+        dml_is_insert: bool,
     ) -> Result<Vec<ResultColumn>, ParseError> {
         if self.check_kw(&TokenKind::KwReturning) && context == DmlParseContext::TriggerBody {
-            return Err(self.err_msg("RETURNING is not allowed in trigger body statements"));
+            // Stock diverges by statement: a trigger-body INSERT parses RETURNING
+            // grammatically and then rejects it with a fixed semantic message,
+            // while the trigger UPDATE/DELETE grammar has no RETURNING slot at
+            // all, so RETURNING is just an unexpected token there.
+            // bd-parser-syntax-error-format-6w6kp (Part C).
+            return Err(if dml_is_insert {
+                self.err_semantic("cannot use RETURNING in a trigger")
+            } else {
+                self.err_unexpected("RETURNING is not allowed in trigger body statements")
+            });
         }
         if self.eat_kw(&TokenKind::KwReturning) {
             self.parse_comma_sep(Self::parse_result_column)
@@ -1530,7 +1550,9 @@ impl Parser {
         let source = if self.check_kw(&TokenKind::KwDefault)
             && context == DmlParseContext::TriggerBody
         {
-            return Err(self.err_msg("DEFAULT VALUES is not allowed in trigger body statements"));
+            return Err(
+                self.err_unexpected("DEFAULT VALUES is not allowed in trigger body statements"),
+            );
         } else if self.eat_kw(&TokenKind::KwDefault) {
             self.expect_kw(&TokenKind::KwValues)?;
             InsertSource::DefaultValues
@@ -1548,7 +1570,7 @@ impl Parser {
             InsertSource::Select(Box::new(self.parse_select_stmt(inner_with)?))
         };
         let upsert = self.parse_upsert_clauses()?;
-        let returning = self.parse_returning(context)?;
+        let returning = self.parse_returning(context, true)?;
         Ok(Statement::Insert(InsertStatement {
             with,
             or_conflict,
@@ -1658,9 +1680,11 @@ impl Parser {
         } else {
             None
         };
-        let returning = self.parse_returning(context)?;
+        let returning = self.parse_returning(context, false)?;
         if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwOrder) {
-            return Err(self.err_msg("ORDER BY is not allowed in trigger body UPDATE statements"));
+            return Err(
+                self.err_unexpected("ORDER BY is not allowed in trigger body UPDATE statements"),
+            );
         }
         let order_by = if self.eat_kw(&TokenKind::KwOrder) {
             self.expect_kw(&TokenKind::KwBy)?;
@@ -1669,7 +1693,9 @@ impl Parser {
             vec![]
         };
         if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwLimit) {
-            return Err(self.err_msg("LIMIT is not allowed in trigger body UPDATE statements"));
+            return Err(
+                self.err_unexpected("LIMIT is not allowed in trigger body UPDATE statements"),
+            );
         }
         let limit = self.parse_limit()?;
         Ok(Statement::Update(UpdateStatement {
@@ -1716,9 +1742,11 @@ impl Parser {
         } else {
             None
         };
-        let returning = self.parse_returning(context)?;
+        let returning = self.parse_returning(context, false)?;
         if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwOrder) {
-            return Err(self.err_msg("ORDER BY is not allowed in trigger body DELETE statements"));
+            return Err(
+                self.err_unexpected("ORDER BY is not allowed in trigger body DELETE statements"),
+            );
         }
         let order_by = if self.eat_kw(&TokenKind::KwOrder) {
             self.expect_kw(&TokenKind::KwBy)?;
@@ -1727,7 +1755,9 @@ impl Parser {
             vec![]
         };
         if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwLimit) {
-            return Err(self.err_msg("LIMIT is not allowed in trigger body DELETE statements"));
+            return Err(
+                self.err_unexpected("LIMIT is not allowed in trigger body DELETE statements"),
+            );
         }
         let limit = self.parse_limit()?;
         Ok(Statement::Delete(DeleteStatement {
@@ -2287,7 +2317,7 @@ impl Parser {
             TokenKind::KwDelete => self.parse_delete_stmt(None, DmlParseContext::TriggerBody),
             _ => {
                 Err(self
-                    .err_msg("trigger body statement must be SELECT, INSERT, UPDATE, or DELETE"))
+                    .err_unexpected("trigger body statement must be SELECT, INSERT, UPDATE, or DELETE"))
             }
         }
     }
@@ -2339,7 +2369,7 @@ impl Parser {
         self.expect_kw(&TokenKind::KwBegin)?;
         let mut body = Vec::new();
         if self.check_kw(&TokenKind::KwEnd) {
-            let error = self.err_msg("trigger body must contain at least one statement");
+            let error = self.err_unexpected("trigger body must contain at least one statement");
             self.recover_trigger_body_after_error(self.pos);
             return Err(error);
         }
@@ -2629,7 +2659,7 @@ impl Parser {
             false
         };
         if self.check_kw(&TokenKind::KwExplain) {
-            return Err(self.err_msg("nested EXPLAIN is not allowed"));
+            return Err(self.err_unexpected("nested EXPLAIN is not allowed"));
         }
         let stmt = self.parse_statement_inner()?;
         Ok(Statement::Explain {
@@ -3795,7 +3825,8 @@ mod tests {
         ] {
             let error = parse_first_statement_with_tail(sql)
                 .expect_err("SQLite does not permit nested EXPLAIN statements");
-            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            // Stock: `near "EXPLAIN": syntax error`. bd-parser-syntax-error-format-6w6kp.
+            assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
             assert!(
                 error.message.contains("nested EXPLAIN"),
                 "unexpected diagnostic for `{sql}`: {error:?}"
@@ -4140,7 +4171,9 @@ mod tests {
         ] {
             let error = parse_first_statement_with_tail(sql)
                 .expect_err("invalid trigger-body grammar must fail closed");
-            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            // Empty body and non-DML statements are reported as stock near-X
+            // syntax errors at the offending token. bd-parser-syntax-error-format-6w6kp.
+            assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
             assert_eq!(
                 &sql[error.span.start as usize..error.span.end as usize],
                 rejected,
@@ -4297,16 +4330,21 @@ mod tests {
         ] {
             let error = parse_first_statement_with_tail(sql)
                 .expect_err("stock-forbidden trigger DML must fail closed");
-            // Every case is rejected as a parse error whose span points at the
-            // exact forbidden token. `WITH ... INSERT` is a grammar-position
-            // UnexpectedToken (stock: `near "INSERT"`); the remaining
-            // frank-specific trigger-body restrictions are still tagged Syntax
-            // pending their near-X / verbatim reclassification (Part C follow-up).
-            // bd-parser-syntax-error-format-6w6kp.
+            // This test guards the exact-token SPAN. The kind varies by stock's
+            // own behavior: near-X grammar errors (UnexpectedToken: DEFAULT
+            // VALUES, ORDER BY/LIMIT, WITH..INSERT, UPDATE/DELETE RETURNING),
+            // fixed verbatim messages (Semantic: qualified names, INDEXED BY /
+            // NOT INDEXED, INSERT RETURNING), or frank's still-too-strict
+            // table-alias rejection (Syntax: `AS`, a separate validation-gap bug
+            // — stock 3.53 actually accepts a trigger-body table alias). The
+            // exact user-facing messages are pinned in the end-to-end keeper
+            // (bd_parser_syntax_error_near_x). bd-parser-syntax-error-format-6w6kp.
             assert!(
                 matches!(
                     error.kind,
-                    ParseErrorKind::Syntax | ParseErrorKind::UnexpectedToken
+                    ParseErrorKind::Syntax
+                        | ParseErrorKind::UnexpectedToken
+                        | ParseErrorKind::Semantic
                 ),
                 "unexpected kind for `{sql}`: {error:?}"
             );
