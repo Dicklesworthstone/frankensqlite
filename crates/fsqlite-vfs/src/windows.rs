@@ -1612,12 +1612,6 @@ impl WindowsFile {
             .ok_or_else(|| FrankenError::internal("windows file is closed"))
     }
 
-    fn os_locks_ref(&self) -> Result<&WindowsOsLockFiles> {
-        self.os_locks
-            .as_ref()
-            .ok_or_else(|| FrankenError::internal("windows lock files are closed"))
-    }
-
     fn os_locks_mut(&mut self) -> Result<&mut WindowsOsLockFiles> {
         self.os_locks
             .as_mut()
@@ -1911,7 +1905,7 @@ impl WindowsFile {
         Ok(())
     }
 
-    fn ordinary_locks_are_exactly_at(&self, level: LockLevel) -> Result<bool> {
+    fn ordinary_locks_are_exactly_at(&self, level: LockLevel) -> bool {
         let stock_exact = self
             .stock_main_locks
             .as_ref()
@@ -1925,7 +1919,7 @@ impl WindowsFile {
             .os_locks
             .as_ref()
             .map_or(level == LockLevel::None, |locks| locks.is_exactly_at(level));
-        Ok(stock_exact && cooperative_exact)
+        stock_exact && cooperative_exact
     }
 
     fn rollback_ordinary_locks_to(&mut self, level: LockLevel) -> Result<()> {
@@ -1956,7 +1950,7 @@ impl WindowsFile {
         };
         match (stock_result, cooperative_result) {
             (Ok(()), Ok(())) => {
-                if !self.ordinary_locks_are_exactly_at(level)? {
+                if !self.ordinary_locks_are_exactly_at(level) {
                     return Err(FrankenError::internal(format!(
                         "Windows ordinary lock restoration reported success without exact {level:?} ownership on both surfaces"
                     )));
@@ -2476,7 +2470,7 @@ impl VfsFile for WindowsFile {
     }
 
     fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
-        if !self.ordinary_locks_are_exactly_at(self.lock_level)? {
+        if !self.ordinary_locks_are_exactly_at(self.lock_level) {
             self.restore_ordinary_lock_level(cx, self.lock_level)?;
         }
         if level <= self.lock_level {
@@ -2521,7 +2515,7 @@ impl VfsFile for WindowsFile {
 
     fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
         if level >= self.lock_level {
-            if self.ordinary_locks_are_exactly_at(self.lock_level)? {
+            if self.ordinary_locks_are_exactly_at(self.lock_level) {
                 return Ok(());
             }
             return self.restore_ordinary_lock_level(cx, self.lock_level);
@@ -2700,35 +2694,32 @@ impl VfsFile for WindowsFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        match self.os_locks.as_ref() {
-            Some(os_locks) => {
-                if os_locks.reserved_locked_by_other()? {
-                    return Ok(true);
-                }
+        if let Some(os_locks) = self.os_locks.as_ref() {
+            if os_locks.reserved_locked_by_other()? {
+                return Ok(true);
             }
-            None => {
-                // Sidecar-less read-only binding (bd-ypl7b): this binding
-                // retains no sidecar handles, but another process may still
-                // hold the cooperative RESERVED lock through the on-disk
-                // sidecar. Probe it transiently without creating anything —
-                // an absent sidecar means no cooperative holder exists
-                // (holders create the sidecars when they lock), and
-                // LockFileEx works on a read-only handle, so this stays
-                // usable on read-only media.
-                self.ensure_open()?;
-                let reserved_path = sqlite_reserved_lock_path(&self.path);
-                let mut open_options = windows_open_options();
-                match open_options.read(true).open(&reserved_path) {
-                    Ok(reserved_file) => {
-                        match AdvisoryFileLock::try_lock(&reserved_file, FileLockMode::Exclusive) {
-                            Ok(()) => WindowsOsLockFiles::unlock_file(&reserved_file)?,
-                            Err(FileLockError::AlreadyLocked) => return Ok(true),
-                            Err(FileLockError::Io(err)) => return Err(FrankenError::Io(err)),
-                        }
+        } else {
+            // Sidecar-less read-only binding (bd-ypl7b): this binding
+            // retains no sidecar handles, but another process may still
+            // hold the cooperative RESERVED lock through the on-disk
+            // sidecar. Probe it transiently without creating anything —
+            // an absent sidecar means no cooperative holder exists
+            // (holders create the sidecars when they lock), and
+            // LockFileEx works on a read-only handle, so this stays
+            // usable on read-only media.
+            self.ensure_open()?;
+            let reserved_path = sqlite_reserved_lock_path(&self.path);
+            let mut open_options = windows_open_options();
+            match open_options.read(true).open(&reserved_path) {
+                Ok(reserved_file) => {
+                    match AdvisoryFileLock::try_lock(&reserved_file, FileLockMode::Exclusive) {
+                        Ok(()) => WindowsOsLockFiles::unlock_file(&reserved_file)?,
+                        Err(FileLockError::AlreadyLocked) => return Ok(true),
+                        Err(FileLockError::Io(err)) => return Err(FrankenError::Io(err)),
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(FrankenError::Io(err)),
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(FrankenError::Io(err)),
             }
         }
         if self.lock_level >= LockLevel::Reserved {
@@ -4110,11 +4101,7 @@ mod tests {
             .restore_external_maintenance_attempt(&cx)
             .expect("retry exact restoration after the dropped future");
         assert!(attempted.external_maintenance_locks.is_none());
-        assert!(
-            attempted
-                .ordinary_locks_are_exactly_at(LockLevel::None)
-                .expect("inspect exact restored surfaces")
-        );
+        assert!(attempted.ordinary_locks_are_exactly_at(LockLevel::None));
         assert_eq!(attempted.lock_level, LockLevel::None);
 
         let (mut probe, _) = vfs
