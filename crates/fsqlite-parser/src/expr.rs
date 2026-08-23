@@ -2655,7 +2655,9 @@ impl<'a> ParseMachine<'a> {
         span: Span,
     ) -> Result<(), ParseError> {
         if let Some(message) = vector_in_list_arity_error(&lhs.expr, &items) {
-            return Err(self.parser.err_here(message));
+            // Stock emits this row-value arity message VERBATIM (no offset
+            // prefix, not a near-X form). bd-parser-syntax-error-format-6w6kp.
+            return Err(self.parser.err_semantic(message));
         }
         let item_height = items.iter().map(|item| item.height).max().unwrap_or(0);
         let items_are_constant = items.iter().all(|item| item.is_constant);
@@ -3444,9 +3446,11 @@ impl<'a> ParseMachine<'a> {
         constraint: Option<JoinConstraint>,
     ) -> Result<(), ParseError> {
         if join_type.natural && constraint.is_some() {
+            // Stock SQLite emits this fixed message verbatim (Part C), not the
+            // generic near-X form. bd-parser-syntax-error-format-6w6kp.
             return Err(self
                 .parser
-                .err_here("a NATURAL join may not have an ON or USING clause"));
+                .err_semantic("a NATURAL join may not have an ON or USING clause"));
         }
         build.joins.push(JoinClause {
             join_type,
@@ -3847,7 +3851,14 @@ impl Parser {
     }
 
     fn err_here(&self, message: impl Into<String>) -> ParseError {
-        ParseError::at(message, self.peek_token())
+        // Every expression-grammar "expected/unexpected" failure is reported by
+        // stock SQLite as `near "<offending-token>": syntax error` (or
+        // `incomplete input` at EOF). Tag UnexpectedToken so the connection
+        // boundary renders it that way, keyed on the offending token's span.
+        // bd-parser-syntax-error-format-6w6kp (Part B).
+        let mut error = ParseError::at(message, self.peek_token());
+        error.kind = crate::parser::ParseErrorKind::UnexpectedToken;
+        error
     }
 
     // ── Prefix (nud) ────────────────────────────────────────────────────
@@ -4709,7 +4720,9 @@ impl Parser {
         }
         let end = self.expect_kind(&TokenKind::RightParen)?;
         if let Some(message) = vector_in_list_arity_error(&lhs.expr, &parsed_items) {
-            return Err(self.err_here(message));
+            // Stock emits this row-value arity message VERBATIM (no offset
+            // prefix, not a near-X form). bd-parser-syntax-error-format-6w6kp.
+            return Err(self.err_semantic(message));
         }
         let span = start.merge(end);
         let item_height = parsed_items
@@ -5383,7 +5396,9 @@ mod tests {
         for (sql, unexpected) in [("1; 2", "2"), ("1; SELECT 2", "SELECT"), ("1;;", ";")] {
             let error = parse_expr(sql)
                 .expect_err("tokens after the optional expression terminator must be rejected");
-            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            // Stock renders a stray token after an expression as a near-X syntax
+            // error. bd-parser-syntax-error-format-6w6kp (Part B).
+            assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
             assert!(
                 error.message.contains("unexpected token after expression"),
                 "unexpected diagnostic for `{sql}`: {error:?}"
@@ -6329,7 +6344,7 @@ mod tests {
             let error = parse_expr(sql).expect_err("mismatched vector IN arity must fail parsing");
             assert_eq!(
                 error.kind,
-                ParseErrorKind::Syntax,
+                ParseErrorKind::Semantic,
                 "unexpected kind for `{sql}`"
             );
             assert_eq!(
@@ -6422,7 +6437,7 @@ mod tests {
                 .expect_err("statement parser must reject mismatched vector IN arity");
             assert_eq!(
                 error.kind,
-                ParseErrorKind::Syntax,
+                ParseErrorKind::Semantic,
                 "unexpected kind for `{sql}`"
             );
             assert_eq!(

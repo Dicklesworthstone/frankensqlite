@@ -4001,8 +4001,11 @@ mod wasm_tests {
             .expect("message field should exist")
             .as_string()
             .expect("message should be a string");
-        assert!(message.contains("SQL error at offset"));
-        assert!(message.contains("unexpected token"));
+        // Parser syntax errors now match stock SQLite's bare
+        // `near "<token>": syntax error` form, with NO `SQL error at offset N:`
+        // prefix. bd-parser-syntax-error-format-6w6kp (Part B).
+        assert!(message.contains("near \"NOT\""));
+        assert!(message.contains("syntax error"));
     }
 
     #[wasm_bindgen_test]

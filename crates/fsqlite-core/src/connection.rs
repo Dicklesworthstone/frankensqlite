@@ -33468,6 +33468,13 @@ impl Connection {
                     FrankenError::FunctionError(format!("near \"{lexeme}\": syntax error"))
                 }
             }
+            fsqlite_parser::ParseErrorKind::Semantic => {
+                // A semantic parse-error carries a fixed message that already
+                // matches stock SQLite verbatim (e.g. "a NATURAL join may not
+                // have an ON or USING clause"); surface it with NO
+                // `SQL error at offset N:` prefix. Part C.
+                FrankenError::FunctionError(parse_error.message)
+            }
             fsqlite_parser::ParseErrorKind::Syntax
             | fsqlite_parser::ParseErrorKind::RecursionLimit => FrankenError::ParseError {
                 offset: parse_error.span.start as usize,

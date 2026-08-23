@@ -112,6 +112,11 @@ pub enum ParseErrorKind {
     /// the offending token is end-of-input (empty span at the tail).
     /// bd-parser-syntax-error-format-6w6kp (Part B).
     UnexpectedToken,
+    /// A semantic parse-error with a fixed, stock-matching message (e.g.
+    /// `a NATURAL join may not have an ON or USING clause`). The connection
+    /// boundary surfaces `message` VERBATIM, with NO `SQL error at offset N:`
+    /// prefix. bd-parser-syntax-error-format-6w6kp (Part C).
+    Semantic,
     ExpressionTooDeep { max: u32 },
     RecursionLimit,
 }
@@ -377,8 +382,9 @@ impl Parser {
                         continue;
                     }
 
-                    let error = self
-                        .err_msg("unexpected token after end of statement; expected ';' separator");
+                    let error = self.err_unexpected(
+                        "unexpected token after end of statement; expected ';' separator",
+                    );
                     if collect_parse_metrics {
                         FSQLITE_PARSE_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     }
@@ -508,11 +514,36 @@ impl Parser {
     }
 
     pub(crate) fn err_expected(&self, what: &str) -> ParseError {
-        ParseError::at(format!("expected {what}"), self.current())
+        // Stock's grammar reports every "expected X" grammar failure as
+        // `near "<offending-token>": syntax error` (or `incomplete input` at
+        // EOF). Tag UnexpectedToken so the connection boundary renders it that
+        // way. bd-parser-syntax-error-format-6w6kp (Part B).
+        let mut error = ParseError::at(format!("expected {what}"), self.current());
+        error.kind = ParseErrorKind::UnexpectedToken;
+        error
     }
 
     pub(crate) fn err_msg(&self, msg: impl Into<String>) -> ParseError {
         ParseError::at(msg, self.current())
+    }
+
+    /// A generic unexpected-token parse error anchored at the current token.
+    /// The connection boundary renders it as stock `near "<lexeme>": syntax
+    /// error` (or `incomplete input` at EOF), keyed on the tagged kind.
+    /// bd-parser-syntax-error-format-6w6kp (Part B).
+    pub(crate) fn err_unexpected(&self, msg: impl Into<String>) -> ParseError {
+        let mut error = ParseError::at(msg, self.current());
+        error.kind = ParseErrorKind::UnexpectedToken;
+        error
+    }
+
+    /// A semantic parse-error whose fixed message matches stock SQLite verbatim.
+    /// The connection boundary surfaces it with NO offset prefix.
+    /// bd-parser-syntax-error-format-6w6kp (Part C).
+    pub(crate) fn err_semantic(&self, msg: impl Into<String>) -> ParseError {
+        let mut error = ParseError::at(msg, self.current());
+        error.kind = ParseErrorKind::Semantic;
+        error
     }
 
     fn synchronize(&mut self) {
@@ -912,7 +943,7 @@ impl Parser {
                 Ok(Statement::Analyze(name))
             }
             TokenKind::KwExplain => parser.parse_explain(),
-            _ => Err(parser.err_msg("unexpected token at start of statement")),
+            _ => Err(parser.err_unexpected("unexpected token at start of statement")),
         })
     }
 
@@ -973,7 +1004,9 @@ impl Parser {
         if matches!(final_core, SelectCore::Values(_))
             && matches!(self.peek(), TokenKind::KwOrder | TokenKind::KwLimit)
         {
-            return Err(self.err_msg("ORDER BY / LIMIT clause is not allowed after a VALUES term"));
+            return Err(
+                self.err_unexpected("ORDER BY / LIMIT clause is not allowed after a VALUES term"),
+            );
         }
         let order_by = if self.eat_kw(&TokenKind::KwOrder) {
             self.expect_kw(&TokenKind::KwBy)?;
@@ -996,7 +1029,9 @@ impl Parser {
         if matches!(final_core, SelectCore::Values(_))
             && (!order_by.is_empty() || limit.value.is_some())
         {
-            return Err(self.err_msg("ORDER BY / LIMIT clause is not allowed after a VALUES term"));
+            return Err(
+                self.err_unexpected("ORDER BY / LIMIT clause is not allowed after a VALUES term"),
+            );
         }
         Ok(HeightTracked {
             value: SelectStatement {
@@ -2803,10 +2838,9 @@ pub fn parse_first_statement_with_tail(
     } else if parser.at_eof() {
         sql.len()
     } else {
-        return Err(ParseError::at(
-            "unexpected token after end of statement; expected ';' separator",
-            parser.current(),
-        ));
+        return Err(
+            parser.err_unexpected("unexpected token after end of statement; expected ';' separator")
+        );
     };
 
     Ok(Some((statement, tail_offset)))
@@ -3800,7 +3834,10 @@ mod tests {
         ] {
             let error = parse_first_statement_with_tail(sql)
                 .expect_err("a trailing clause on a final VALUES term must be rejected");
-            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            // Stock reports a trailing ORDER BY / LIMIT on a final VALUES term as
+            // `near "ORDER"/"LIMIT": syntax error` (there is no such grammar slot),
+            // so this is an UnexpectedToken. bd-parser-syntax-error-format-6w6kp.
+            assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
             assert!(
                 error.message.contains("not allowed after a VALUES term"),
                 "unexpected diagnostic for `{sql}`: {error:?}"
@@ -3819,7 +3856,7 @@ mod tests {
         );
         let error = parse_first_statement_with_tail(&deeply_nested)
             .expect_err("the forbidden final-VALUES clause must win over expression depth");
-        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
         assert_eq!(
             &deeply_nested[error.span.start as usize..error.span.end as usize],
             "ORDER"
@@ -3841,7 +3878,9 @@ mod tests {
     fn test_count_star_rejects_aggregate_order_by() {
         let error = parse_first_statement_with_tail("SELECT count(* ORDER BY x) FROM t")
             .expect_err("aggregate ORDER BY after count(*) must be rejected");
-        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        // Stock: `near "ORDER": syntax error` (the aggregate arg list has no
+        // ORDER BY slot). bd-parser-syntax-error-format-6w6kp.
+        assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
         assert!(
             error.message.contains("RightParen"),
             "unexpected diagnostic: {error:?}"
@@ -4098,7 +4137,10 @@ mod tests {
         let missing_separator = "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1 END";
         let error = parse_first_statement_with_tail(missing_separator)
             .expect_err("a trigger body statement still requires a semicolon");
-        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        // An UnexpectedToken with an empty (EOF) span; the connection boundary
+        // renders it as stock's `incomplete input`.
+        // bd-parser-syntax-error-format-6w6kp (Part B).
+        assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
         assert!(
             error
                 .message
@@ -4241,7 +4283,19 @@ mod tests {
         ] {
             let error = parse_first_statement_with_tail(sql)
                 .expect_err("stock-forbidden trigger DML must fail closed");
-            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            // Every case is rejected as a parse error whose span points at the
+            // exact forbidden token. `WITH ... INSERT` is a grammar-position
+            // UnexpectedToken (stock: `near "INSERT"`); the remaining
+            // frank-specific trigger-body restrictions are still tagged Syntax
+            // pending their near-X / verbatim reclassification (Part C follow-up).
+            // bd-parser-syntax-error-format-6w6kp.
+            assert!(
+                matches!(
+                    error.kind,
+                    ParseErrorKind::Syntax | ParseErrorKind::UnexpectedToken
+                ),
+                "unexpected kind for `{sql}`: {error:?}"
+            );
             assert_eq!(
                 &sql[error.span.start as usize..error.span.end as usize],
                 rejected,
@@ -4789,7 +4843,8 @@ mod tests {
 
         let error = parse_first_statement_with_tail("SELECT sum(1) OVER WINDOW w AS ()")
             .expect_err("WINDOW after OVER is a window name, not an implicit OVER alias");
-        assert_eq!(error.kind, ParseErrorKind::Syntax);
+        // Stock: `near "WINDOW": syntax error`. bd-parser-syntax-error-format-6w6kp.
+        assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
     }
 
     #[test]
