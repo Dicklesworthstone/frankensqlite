@@ -21064,6 +21064,7 @@ impl Connection {
         &self,
         src: &JoinTableSource,
         queries: &[String],
+        rank_weights: Option<Vec<f64>>,
     ) -> Result<Option<Fts5AuxTableContext>> {
         if queries.is_empty() {
             return Ok(None);
@@ -21100,6 +21101,7 @@ impl Connection {
             query_terms,
             column_count: fts5.columns().len(),
             row_table_label: src.alias.clone().unwrap_or_else(|| src.table_name.clone()),
+            rank_weights,
         }))
     }
 
@@ -86940,6 +86942,42 @@ impl Connection {
             .as_ref()
             .map(Option::as_ref)
             .unwrap_or(where_clause.as_deref());
+        // bd-pulz6: `rank MATCH '<rankfn>'` / `rank = '<rankfn>'` is a per-query
+        // ranking DIRECTIVE (its bm25 weights feed the FTS5 aux context built
+        // below), not a row filter. `rank` is a computed column, so the term
+        // never maps to a vtab constraint and falls straight to the residual
+        // WHERE — where evaluating `<float> MATCH '<text>'` is falsy for every
+        // row and silently empties the result. Strip the directive from the
+        // WHERE that is actually evaluated per row.
+        #[cfg(feature = "ext-fts5")]
+        let rank_directive_stripped_where: Option<Option<Expr>> = {
+            let fts5_names: Vec<&str> = table_sources
+                .iter()
+                .filter(|src| {
+                    src.local_table_binding().is_some()
+                        && self.is_live_fts5_instance(&src.table_name)
+                })
+                .flat_map(|src| {
+                    std::iter::once(src.table_name.as_str()).chain(src.alias.as_deref())
+                })
+                .collect();
+            match effective_where_clause {
+                Some(expr)
+                    if !fts5_names.is_empty()
+                        && where_has_fts5_rank_directive(expr, &fts5_names) =>
+                {
+                    Some(strip_fts5_rank_directive_terms(expr, &fts5_names))
+                }
+                _ => None,
+            }
+        };
+        #[cfg(feature = "ext-fts5")]
+        let effective_where_clause_for_eval: Option<&Expr> =
+            match &rank_directive_stripped_where {
+                Some(stripped) => stripped.as_ref(),
+                None => effective_where_clause,
+            };
+        #[cfg(not(feature = "ext-fts5"))]
         let effective_where_clause_for_eval = effective_where_clause;
         let fts5_aux_context = {
             #[cfg(feature = "ext-fts5")]
@@ -86984,8 +87022,18 @@ impl Connection {
                     };
                     let queries =
                         collect_fts5_match_queries_for_source(match_query_source, &src.table_name);
+                    // bd-pulz6: capture any `rank MATCH '<bm25(...)>'` directive's
+                    // column weights so `rank` (in SELECT / ORDER BY) re-ranks with
+                    // them instead of the default all-ones weighting.
+                    let rank_weights = where_clause.as_deref().and_then(|clause| {
+                        let mut terms: Vec<&Expr> = Vec::new();
+                        flatten_and_terms(clause, &mut terms);
+                        terms
+                            .iter()
+                            .find_map(|term| fts5_rank_directive_weights(term, &fts5_source_names))
+                    });
                     if let Some(aux_table) = self
-                        .build_fts5_aux_context_for_source(src, &queries)
+                        .build_fts5_aux_context_for_source(src, &queries, rank_weights)
                         .await?
                     {
                         context.insert(src.table_name.clone(), aux_table);
@@ -139016,6 +139064,11 @@ struct Fts5AuxTableContext {
     query_terms: Vec<String>,
     column_count: usize,
     row_table_label: String,
+    /// Per-column bm25 weights from a `rank MATCH '<bm25(...)>'` directive, if
+    /// the query supplied one. `None` means default all-ones weighting. Fewer
+    /// weights than columns leaves the trailing columns at weight 1.0 (matching
+    /// stock FTS5, since `bm25_score` defaults missing entries). bd-pulz6.
+    rank_weights: Option<Vec<f64>>,
 }
 
 #[cfg(feature = "ext-fts5")]
@@ -140881,7 +140934,12 @@ fn try_eval_fts5_rank_column(
             return Ok(None);
         };
 
-        let weights = vec![1.0; table_ctx.column_count];
+        // bd-pulz6: honor a `rank MATCH '<bm25(...)>'` directive's weights when
+        // present; otherwise fall back to the default all-ones weighting.
+        let weights = table_ctx
+            .rank_weights
+            .clone()
+            .unwrap_or_else(|| vec![1.0; table_ctx.column_count]);
         Ok(Some(SqliteValue::Float(fts5_aux_bm25_score(
             table_ctx, rowid, &weights,
         )?)))
@@ -144365,6 +144423,101 @@ fn is_fts5_rank_column_reference(col_ref: &ColumnRef, table_names: &[&str]) -> b
                 .iter()
                 .any(|table_name| prefix.eq_ignore_ascii_case(table_name))
         })
+}
+
+/// Parse a `rank` ranking-function spec of the form `bm25(w0, w1, ...)` into its
+/// per-column weight list. Returns `None` for any other ranking function (only
+/// bm25 is supported) or a malformed spec. An empty argument list (`bm25()`)
+/// yields an empty weight vector, which `bm25_score` treats as all-ones.
+/// bd-pulz6.
+#[cfg(feature = "ext-fts5")]
+fn parse_bm25_rank_weights(spec: &str) -> Option<Vec<f64>> {
+    let spec = spec.trim();
+    let open = spec.find('(')?;
+    if !spec[..open].trim().eq_ignore_ascii_case("bm25") {
+        return None;
+    }
+    let close = spec.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let inner = spec[open + 1..close].trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut weights = Vec::with_capacity(4);
+    for part in inner.split(',') {
+        weights.push(part.trim().parse::<f64>().ok()?);
+    }
+    Some(weights)
+}
+
+/// True when `expr` is a reference to the FTS5 `rank` column of one of
+/// `fts5_names`. bd-pulz6.
+#[cfg(feature = "ext-fts5")]
+fn expr_is_fts5_rank_reference(expr: &Expr, fts5_names: &[&str]) -> bool {
+    matches!(expr, Expr::Column(col_ref, _) if is_fts5_rank_column_reference(col_ref, fts5_names))
+}
+
+/// If `term` is an FTS5 rank-assignment directive — `rank MATCH '<bm25(...)>'`
+/// or `rank = '<bm25(...)>'` against one of `fts5_names` — return the parsed
+/// bm25 column weights. Both idioms bind a custom ranking function for the
+/// query rather than filtering rows. bd-pulz6.
+#[cfg(feature = "ext-fts5")]
+fn fts5_rank_directive_weights(term: &Expr, fts5_names: &[&str]) -> Option<Vec<f64>> {
+    let spec_expr = match term {
+        Expr::Like {
+            expr,
+            pattern,
+            op: LikeOp::Match,
+            not: false,
+            ..
+        } if expr_is_fts5_rank_reference(expr, fts5_names) => pattern.as_ref(),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } => {
+            if expr_is_fts5_rank_reference(left, fts5_names) {
+                right.as_ref()
+            } else if expr_is_fts5_rank_reference(right, fts5_names) {
+                left.as_ref()
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    match eval_live_vtab_constant_expr(spec_expr)? {
+        SqliteValue::Text(spec) => parse_bm25_rank_weights(&spec),
+        _ => None,
+    }
+}
+
+/// Whether any AND-term of `expr` is an FTS5 rank-assignment directive. bd-pulz6.
+#[cfg(feature = "ext-fts5")]
+fn where_has_fts5_rank_directive(expr: &Expr, fts5_names: &[&str]) -> bool {
+    let mut terms: Vec<&Expr> = Vec::new();
+    flatten_and_terms(expr, &mut terms);
+    terms
+        .iter()
+        .any(|term| fts5_rank_directive_weights(term, fts5_names).is_some())
+}
+
+/// Rebuild `expr` with every FTS5 rank-assignment directive AND-term removed.
+/// Returns `None` when nothing remains (the directive was the sole predicate).
+/// bd-pulz6.
+#[cfg(feature = "ext-fts5")]
+fn strip_fts5_rank_directive_terms(expr: &Expr, fts5_names: &[&str]) -> Option<Expr> {
+    let mut terms: Vec<&Expr> = Vec::new();
+    flatten_and_terms(expr, &mut terms);
+    let kept: Vec<Expr> = terms
+        .into_iter()
+        .filter(|term| fts5_rank_directive_weights(term, fts5_names).is_none())
+        .cloned()
+        .collect();
+    rebuild_and_terms(kept)
 }
 
 // ── Time-travel query helper functions (#23) ──────────────────────────────
