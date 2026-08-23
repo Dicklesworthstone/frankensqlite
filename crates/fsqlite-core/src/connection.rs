@@ -62585,6 +62585,14 @@ impl Connection {
     async fn execute_create_index(&self, stmt: &fsqlite_ast::CreateIndexStatement) -> Result<()> {
         let table_name = &stmt.table;
         let index_name = stmt.name.name.clone();
+        // Stock reserves "sqlite_"-prefixed object names for internal use; a user
+        // CREATE INDEX with such a name fails before any other check.
+        // bd-errmsg-parity-batch2-g8v6e.
+        if index_name.len() >= 7 && index_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_") {
+            return Err(FrankenError::FunctionError(format!(
+                "object name reserved for internal use: {index_name}"
+            )));
+        }
         let target_is_temp = self
             .temp_table_names
             .borrow()
@@ -62949,6 +62957,13 @@ impl Connection {
     /// Execute a CREATE VIEW statement (store definition in memory).
     async fn execute_create_view(&self, stmt: &fsqlite_ast::CreateViewStatement) -> Result<()> {
         let view_name = &stmt.name.name;
+        // Stock reserves "sqlite_"-prefixed object names for internal use.
+        // bd-errmsg-parity-batch2-g8v6e.
+        if view_name.len() >= 7 && view_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_") {
+            return Err(FrankenError::FunctionError(format!(
+                "object name reserved for internal use: {view_name}"
+            )));
+        }
         let qualifier = stmt.name.schema.as_deref();
         if stmt.temporary && qualifier.is_some_and(|schema| !schema.eq_ignore_ascii_case("temp")) {
             return Err(FrankenError::FunctionError(
@@ -63018,6 +63033,13 @@ impl Connection {
         stmt: &fsqlite_ast::CreateTriggerStatement,
     ) -> Result<()> {
         let trigger_name = &stmt.name.name;
+        // Stock reserves "sqlite_"-prefixed object names for internal use.
+        // bd-errmsg-parity-batch2-g8v6e.
+        if trigger_name.len() >= 7 && trigger_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_") {
+            return Err(FrankenError::FunctionError(format!(
+                "object name reserved for internal use: {trigger_name}"
+            )));
+        }
         let table_name = &stmt.table;
 
         let table_exists = self.schema_index_of(table_name).is_some();
