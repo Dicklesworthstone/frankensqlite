@@ -2221,7 +2221,7 @@ impl<'a> ParseMachine<'a> {
                 TokenKind::String(mid) => Arc::<str>::from(mid.as_str()),
                 kind if starts_post_dot_identifier(kind) => Arc::<str>::from(kw_to_str(kind)),
                 _ => {
-                    return Err(ParseError::at(
+                    return Err(ParseError::unexpected_at(
                         format!("expected column name after '.', got {:?}", mid_token.kind),
                         Some(&mid_token),
                     ));
@@ -2236,7 +2236,7 @@ impl<'a> ParseMachine<'a> {
             ) {
                 let Some(column_token) = self.parser.tokens.get(self.parser.pos + 3).cloned()
                 else {
-                    return Err(ParseError::at(
+                    return Err(ParseError::unexpected_at(
                         "expected column name after '.'".to_owned(),
                         self.parser.tokens.get(self.parser.pos + 2),
                     ));
@@ -2246,7 +2246,7 @@ impl<'a> ParseMachine<'a> {
                     TokenKind::String(column) => Arc::<str>::from(column.as_str()),
                     kind if starts_post_dot_identifier(kind) => Arc::<str>::from(kw_to_str(kind)),
                     _ => {
-                        return Err(ParseError::at(
+                        return Err(ParseError::unexpected_at(
                             format!(
                                 "expected column name after '.', got {:?}",
                                 column_token.kind
@@ -2494,7 +2494,7 @@ impl<'a> ParseMachine<'a> {
                     }
                     TokenKind::KwIn => self.start_in(lhs, true, min_bp)?,
                     _ => {
-                        return Err(ParseError::at(
+                        return Err(ParseError::unexpected_at(
                             format!(
                                 "expected LIKE/GLOB/MATCH/REGEXP/BETWEEN/IN after NOT, got {:?}",
                                 next.kind
@@ -2505,7 +2505,7 @@ impl<'a> ParseMachine<'a> {
                 }
             }
             other => {
-                return Err(ParseError::at(
+                return Err(ParseError::unexpected_at(
                     format!("unexpected infix token: {other:?}"),
                     Some(&token),
                 ));
@@ -4187,7 +4187,7 @@ impl Parser {
                 TokenKind::String(c) => Arc::<str>::from(c.as_str()),
                 k if starts_post_dot_identifier(k) => Arc::<str>::from(kw_to_str(k)),
                 _ => {
-                    return Err(ParseError::at(
+                    return Err(ParseError::unexpected_at(
                         format!("expected column name after '.', got {:?}", mid_tok.kind),
                         Some(&mid_tok),
                     ));
@@ -4203,7 +4203,7 @@ impl Parser {
                     TokenKind::String(c) => Arc::<str>::from(c.as_str()),
                     k if starts_post_dot_identifier(k) => Arc::<str>::from(kw_to_str(k)),
                     _ => {
-                        return Err(ParseError::at(
+                        return Err(ParseError::unexpected_at(
                             format!("expected column name after '.', got {:?}", col_tok.kind),
                             Some(&col_tok),
                         ));
@@ -4323,7 +4323,7 @@ impl Parser {
                     has_function,
                 )
             }
-            other => Err(ParseError::at(
+            other => Err(ParseError::unexpected_at(
                 format!("unexpected postfix token: {other:?}"),
                 Some(&tok),
             )),
@@ -4532,7 +4532,7 @@ impl Parser {
                     TokenKind::KwRegexp => self.parse_like(lhs, LikeOp::Regexp, true),
                     TokenKind::KwBetween => self.parse_between(lhs, true),
                     TokenKind::KwIn => self.parse_in(lhs, true),
-                    _ => Err(ParseError::at(
+                    _ => Err(ParseError::unexpected_at(
                         format!(
                             "expected LIKE/GLOB/MATCH/REGEXP/BETWEEN/IN \
                              after NOT, got {:?}",
@@ -4543,7 +4543,7 @@ impl Parser {
                 }
             }
 
-            other => Err(ParseError::at(
+            other => Err(ParseError::unexpected_at(
                 format!("unexpected infix token: {other:?}"),
                 Some(&tok),
             )),
@@ -4949,7 +4949,7 @@ impl Parser {
             TokenKind::KwAbort => RaiseAction::Abort,
             TokenKind::KwFail => RaiseAction::Fail,
             _ => {
-                return Err(ParseError::at(
+                return Err(ParseError::unexpected_at(
                     "expected IGNORE, ROLLBACK, ABORT, or FAIL in RAISE",
                     Some(&action_tok),
                 ));
@@ -4963,7 +4963,7 @@ impl Parser {
         let message = match &msg_tok.kind {
             TokenKind::String(s) => s.clone(),
             _ => {
-                return Err(ParseError::at(
+                return Err(ParseError::unexpected_at(
                     "expected string message in RAISE",
                     Some(&msg_tok),
                 ));
@@ -5023,7 +5023,7 @@ impl Parser {
                     TokenKind::Integer(i) => Ok(format!("-{i}")),
                     TokenKind::OversizedInt(s) => Ok(format!("-{s}")),
                     TokenKind::Float(f) => Ok(format!("-{f}")),
-                    _ => Err(ParseError::at(
+                    _ => Err(ParseError::unexpected_at(
                         "expected number in type argument",
                         Some(&next),
                     )),
@@ -5035,7 +5035,7 @@ impl Parser {
                     TokenKind::Integer(i) => Ok(format!("+{i}")),
                     TokenKind::OversizedInt(s) => Ok(format!("+{s}")),
                     TokenKind::Float(f) => Ok(format!("+{f}")),
-                    _ => Err(ParseError::at(
+                    _ => Err(ParseError::unexpected_at(
                         "expected number in type argument",
                         Some(&next),
                     )),
@@ -5043,7 +5043,7 @@ impl Parser {
             }
             TokenKind::OversizedInt(s) => Ok(s.clone()),
             TokenKind::Id(s) | TokenKind::QuotedId(s, _) => Ok(s.to_string()),
-            _ => Err(ParseError::at("expected type argument", Some(&tok))),
+            _ => Err(ParseError::unexpected_at("expected type argument", Some(&tok))),
         }
     }
 

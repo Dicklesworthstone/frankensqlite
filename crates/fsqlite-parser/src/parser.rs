@@ -152,6 +152,18 @@ impl ParseError {
         }
     }
 
+    /// A grammar "expected/unexpected" parse error anchored at a SPECIFIC
+    /// token (not the parser's current token). Tagged UnexpectedToken so the
+    /// connection boundary renders it as stock `near "<lexeme>": syntax error`
+    /// (or `incomplete input` when that token is end-of-input / has an empty
+    /// span). bd-parser-syntax-error-format-6w6kp (Part B).
+    #[must_use]
+    pub(crate) fn unexpected_at(message: impl Into<String>, token: Option<&Token>) -> Self {
+        let mut error = Self::at(message, token);
+        error.kind = ParseErrorKind::UnexpectedToken;
+        error
+    }
+
     #[must_use]
     pub(crate) fn expression_too_deep(max: u32, token: Option<&Token>) -> Self {
         let mut error = Self::at(
@@ -3450,7 +3462,9 @@ mod tests {
         for sql in ["SELECT 1 WHERE t.*", "SELECT abs(t.*) FROM t"] {
             let error = parse_first_statement_with_tail(sql)
                 .expect_err("qualified star must not become an ordinary column expression");
-            assert_eq!(error.kind, ParseErrorKind::Syntax);
+            // Stock reports the illegal `table.*` outside result columns as
+            // `near "*": syntax error`. bd-parser-syntax-error-format-6w6kp.
+            assert_eq!(error.kind, ParseErrorKind::UnexpectedToken);
             assert_eq!(
                 &sql[error.span.start as usize..error.span.end as usize],
                 "*",
