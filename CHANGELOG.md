@@ -17,13 +17,14 @@ as a 27-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.8) (2026-08-22, tag [`2cb6f69ba`](https://github.com/Dicklesworthstone/frankensqlite/commit/2cb6f69bae665bdc7f5fe66be5be2aa95e4fbc85)). v0.3.2–v0.3.4 and v0.3.6–v0.3.8 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.9](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.9) (2026-08-23). v0.3.2–v0.3.4 and v0.3.6–v0.3.9 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.8...main) | HEAD | 2026-08-21 | (no post-0.3.8 changes yet) |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.9...main) | HEAD | 2026-08-23 | (no post-0.3.9 changes yet) |
+| [v0.3.9](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.9) | Release | 2026-08-23 | Windows read-only open regression fix (GH#438: `br` unusable on Windows at 0.3.7/0.3.8) + harness `native` feature repair (GH#378) + UPSERT `DO UPDATE` expression fixes + error-message parity continuation |
 | [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.8) | Release | 2026-08-22 | UPSERT clobber P1 fix + INSERT-ABORT atomicity + stock-error-message parity campaign + JSON5 + differential oracle keeper suite |
 | [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) | Release | 2026-08-20 | GH#345/#366/#368/#369/#370/#371/#244 + bd-xv5cm 7-facet concurrency hardening + REVIEW3 |
 | [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) | Release | 2026-08-19 | FTS5 reopen/hydration + binary release |
@@ -34,11 +35,49 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.3.8
+## [Unreleased] -- development on `main` since v0.3.9
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.8...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.9...main>
 
-Post-v0.3.8 development continues on `main` (see the compare link).
+Post-v0.3.9 development continues on `main` (see the compare link).
+
+---
+
+## [0.3.9] -- 2026-08-23 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.8...v0.3.9>
+
+49 non-merge commits in roughly one day after the [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.8) tag. A fast-follow patch release whose reason for existing is the Windows read-only-open regression: fsqlite 0.3.7/0.3.8 error on **every read-only open+close on Windows**, which made downstream `beads_rust` (`br`) v0.4.0 fail on all Windows machines before its first command completed ([beads_rust#438](https://github.com/Dicklesworthstone/beads_rust/issues/438)).
+
+### Windows read-only open regression (GH#438 downstream)
+
+Delivered capability: read-only opens work on Windows again; advisory-lock sidecars are created only when a lock is actually taken.
+
+The 0.3.7 change that made Windows read-only opens sidecar-less (`os_locks: None`) missed four `os_locks` consumers, so the close-path lock assertion `ordinary_locks_are_exactly_at` errored on every RO open+close cycle — reproduced on a real Windows host as `internal error: windows lock files are closed` from even `br init`. Fixes, verified on real Windows hardware by rebuilding `br` against the patched tree and re-running the failing commands:
+
+- Sidecar-less (`None`) lock surfaces are treated as vacuously at-NONE by the exactly-at check and the restore-to-NONE path; `close` never materializes sidecars just to assert about them. ([`7ed48fee1`](https://github.com/Dicklesworthstone/frankensqlite/commit/7ed48fee1), [`2fda33ab0`](https://github.com/Dicklesworthstone/frankensqlite/commit/2fda33ab0))
+- `lock()` and both external fences materialize the advisory-lock sidecars on demand; `check_reserved_lock` uses a transient read-only probe. ([`7ed48fee1`](https://github.com/Dicklesworthstone/frankensqlite/commit/7ed48fee1))
+- Regression keeper: reserved-probe and open+close-cycle tests for sidecar-less RO bindings — the behavioral test the original change deferred. ([`ed5fbb343`](https://github.com/Dicklesworthstone/frankensqlite/commit/ed5fbb343))
+- Windows-target clippy is green again (`&raw mut` for `GetProcessTimes` out-pointers). ([`a9fac172c`](https://github.com/Dicklesworthstone/frankensqlite/commit/a9fac172c))
+
+### Downstream build repairs
+
+- `fsqlite-harness` compiles again: it lost `fsqlite_vfs::host_fs` when those helpers moved behind the `native` feature; the harness now enables the feature on its own dependency edge (GH#378). ([`2fa816433`](https://github.com/Dicklesworthstone/frankensqlite/commit/2fa816433))
+- `json()` JSON5 canonicalization no longer round-trips through serde: a lexical JSON5→JSON translator preserves numeric text verbatim. ([`bda321183`](https://github.com/Dicklesworthstone/frankensqlite/commit/bda321183))
+- Broken-HEAD window repaired: a docs-only edit had swallowed a function signature in `fsqlite-core`. ([`ba35bb558`](https://github.com/Dicklesworthstone/frankensqlite/commit/ba35bb558), [`ff4c51cde`](https://github.com/Dicklesworthstone/frankensqlite/commit/ff4c51cde) for the earlier same-day WAL re-export miss)
+
+### SQL correctness & stock-parity continuation
+
+- UPSERT `DO UPDATE SET` evaluates correlated subqueries, `excluded.*` references, and CASE bare columns correctly. ([`bcaad2502`](https://github.com/Dicklesworthstone/frankensqlite/commit/bcaad2502))
+- Three-part `schema.table.column` references resolve end to end. ([`b00c66feb`](https://github.com/Dicklesworthstone/frankensqlite/commit/b00c66feb))
+- Bounded integrity validation covers WITHOUT ROWID foreign keys (GH#341 part 3). ([`257da1f12`](https://github.com/Dicklesworthstone/frankensqlite/commit/257da1f12))
+- JOIN projections emit `Rowid` for integer-primary-key columns; shadowed-`main` resolution splits correctly when a `temp` table shares the name; attached-target UPDATEs materialize cross-schema subqueries; lateral `json_each` oracle tests activated. ([`0bbe20448`](https://github.com/Dicklesworthstone/frankensqlite/commit/0bbe20448), [`06d4f90c2`](https://github.com/Dicklesworthstone/frankensqlite/commit/06d4f90c2), [`194989b25`](https://github.com/Dicklesworthstone/frankensqlite/commit/194989b25), [`1cf28a433`](https://github.com/Dicklesworthstone/frankensqlite/commit/1cf28a433))
+- Error-message parity: parser expected/unexpected and row-value arity errors match stock `near "X"` / verbatim text; unexpected characters and bare parameter prefixes report `unrecognized token`; aggregate/window misuse validation runs on all prepared SELECT fast lanes. ([`901a30eaa`](https://github.com/Dicklesworthstone/frankensqlite/commit/901a30eaa), [`f99897c55`](https://github.com/Dicklesworthstone/frankensqlite/commit/f99897c55), [`555bb131c`](https://github.com/Dicklesworthstone/frankensqlite/commit/555bb131c), [`3b6e1fb31`](https://github.com/Dicklesworthstone/frankensqlite/commit/3b6e1fb31))
+
+### Performance & observability
+
+- Trigger `WHEN` correlated-subquery guards no longer pay an unamortized linear `EXISTS` probe on large children (gated to small children; the planner index-seek remainder of GH#377 stays tracked). ([`778d96e24`](https://github.com/Dicklesworthstone/frankensqlite/commit/778d96e24))
+- The `/metrics` serve loop has a write timeout, so a stalled scraper cannot wedge the exporter. ([`2b6ead826`](https://github.com/Dicklesworthstone/frankensqlite/commit/2b6ead826))
 
 ---
 
