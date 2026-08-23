@@ -10,13 +10,16 @@
 //! (where real bugs were found), so it is a targeted leaf hunt. Ordered result
 //! sets / schema listings compared.
 //!
-//! This probe SURFACED two genuine frank divergences, extracted to beads and
-//! removed from the asserted set (probe stays green on the passing subset):
-//!   - bd-y4yjq: after `CREATE TEMP TABLE t` shadows `main.t`, main.sqlite_master
-//!     omits `main.t` from its table listing (the table is still queryable).
-//!   - bd-ghiey: a single statement joining BOTH `main.t` and `temp.t` (same base
-//!     name, different schemas) mis-resolves both to one table -> wrong
-//!     cardinality (9 vs 6) and NULL column projection.
+//! This probe SURFACED two genuine frank divergences; one is now FIXED and
+//! asserted here, the other remains extracted to a bead:
+//!   - bd-y4yjq (OPEN): after `CREATE TEMP TABLE t` shadows `main.t`,
+//!     main.sqlite_master omits `main.t` from its table listing (the table is
+//!     still queryable). Intentionally not asserted here.
+//!   - bd-ghiey (FIXED): a single statement joining BOTH `main.t` and `temp.t`
+//!     (same base name, different schemas) used to mis-resolve both to one table
+//!     -> wrong cardinality (9 vs 6) and NULL column projection. Now asserted
+//!     below: the `main.`-qualified source gets a distinct synthetic codegen
+//!     schema entry so the two sources land on different root pages.
 //! Each same-named table resolved ALONE (temp. and main. qualifiers) is correct.
 
 use fsqlite_core::connection::Connection;
@@ -149,10 +152,53 @@ fn temp_schema_resolution_match_rusqlite_oracle() {
             ),
             &mut diffs,
         );
-        // NOTE: a single statement joining BOTH main.t and temp.t (same base name,
-        // different schemas) is a known divergence tracked in bd-ghiey (frank
-        // mis-resolves both to one table -> 9 NULL rows vs stock's 6-row cross
-        // join) -- intentionally not asserted here.
+        // bd-ghiey (FIXED): a single statement joining BOTH main.t and temp.t
+        // (same base name, different schemas) must resolve each source to its own
+        // table -> stock's 6-row cross join, NOT frank's former 9 all-NULL rows
+        // (both mis-resolved to main.t). The `main.`-qualified source now gets a
+        // distinct synthetic codegen-schema entry so it lands on a different root
+        // page than the temp/unqualified source.
+        check(
+            "join BOTH main.t and temp.t (id projection)",
+            fq(
+                &f,
+                "SELECT m.id, tm.id FROM main.t m JOIN temp.t tm ON 1=1 ORDER BY m.id, tm.id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT m.id, tm.id FROM main.t m JOIN temp.t tm ON 1=1 ORDER BY m.id, tm.id",
+            ),
+            &mut diffs,
+        );
+        check(
+            "join BOTH main.t and temp.t (star projection)",
+            fq(
+                &f,
+                "SELECT * FROM main.t m JOIN temp.t tm ON 1=1 ORDER BY m.id, tm.id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT * FROM main.t m JOIN temp.t tm ON 1=1 ORDER BY m.id, tm.id",
+            ),
+            &mut diffs,
+        );
+        // Symmetric: temp source listed first, and an unqualified sibling that
+        // must still resolve temp-first while main.t reaches the shadowed main.
+        check(
+            "join temp.t then main.t",
+            fq(
+                &f,
+                "SELECT tm.id, m.src FROM temp.t tm JOIN main.t m ON 1=1 ORDER BY tm.id, m.id",
+            )
+            .await,
+            rq(
+                &r,
+                "SELECT tm.id, m.src FROM temp.t tm JOIN main.t m ON 1=1 ORDER BY tm.id, m.id",
+            ),
+            &mut diffs,
+        );
 
         // TEMP VIEW over the main table
         ex(

@@ -74984,8 +74984,8 @@ impl Connection {
     /// when nothing is shadowed.
     fn apply_shadowed_main_substitution(
         &self,
-        schema: &mut [TableSchema],
-        select: &SelectStatement,
+        schema: &mut Vec<TableSchema>,
+        select: &mut SelectStatement,
     ) {
         if self.shadowed_main_tables.borrow().is_empty() {
             return;
@@ -74995,12 +74995,42 @@ impl Connection {
         if main_refs.is_empty() {
             return;
         }
+        // bd-ghiey: a shadowed name referenced as `main.<name>` while ALSO
+        // appearing as a non-main FROM source (unqualified or `temp.<name>`) in
+        // the same statement cannot use the flat single-slot swap: the schema
+        // Vec holds one entry per name, so replacing it would collapse BOTH
+        // references onto the main table (observed: `main.t m JOIN temp.t tm`
+        // scanned main × main, 9 all-NULL rows vs stock's 6). For such
+        // conflicts, add the shadowed main table under a distinct synthetic name
+        // (NUL-delimited so it cannot collide with a real identifier) and
+        // retarget the `main.`-qualified sources to it, so `main.<name>` and the
+        // temp/unqualified `<name>` resolve to different root pages. The
+        // codegen resolves a FROM source to a `TableSchema`/root_page by bare
+        // name (it ignores the schema qualifier), so distinct names are what
+        // makes the two sources land on distinct roots. Non-conflicting lone
+        // `main.<name>` refs keep the simpler in-place slot swap.
+        let mut from_refs: Vec<(Option<String>, String)> = Vec::new();
+        collect_from_source_schema_refs(select, &mut from_refs);
         let shadowed = self.shadowed_main_tables.borrow();
         for name_lc in &main_refs {
-            if let Some(main_table) = shadowed.get(name_lc)
-                && let Some(slot) = schema
-                    .iter_mut()
-                    .find(|t| t.name.eq_ignore_ascii_case(name_lc))
+            let Some(main_table) = shadowed.get(name_lc) else {
+                continue;
+            };
+            let has_nonmain_from_ref = from_refs.iter().any(|(schema_q, name)| {
+                name.eq_ignore_ascii_case(name_lc)
+                    && !schema_q
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("main"))
+            });
+            if has_nonmain_from_ref {
+                let synthetic = format!("\u{0}main\u{0}{name_lc}");
+                let mut main_entry = main_table.clone();
+                main_entry.name = synthetic.clone();
+                schema.push(main_entry);
+                retarget_main_qualified_from_sources(select, name_lc, &synthetic);
+            } else if let Some(slot) = schema
+                .iter_mut()
+                .find(|t| t.name.eq_ignore_ascii_case(name_lc))
             {
                 *slot = main_table.clone();
             }
@@ -75124,7 +75154,7 @@ impl Connection {
             // bd-wjrs0: when a TEMP table shadows a same-named main table, the visible `schema`
             // entry is the TEMP one. An explicit `main.<name>` reference must still reach the
             // shadowed main table, so swap it back into this per-statement snapshot.
-            self.apply_shadowed_main_substitution(&mut schema, &canonical_select);
+            self.apply_shadowed_main_substitution(&mut schema, &mut canonical_select);
             Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
             record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
             self.compile_canonical_select_with_schema(&canonical_select, &schema)
@@ -97783,6 +97813,78 @@ fn qualify_bare_from_source_names(source: &mut TableOrSubquery, resolved: &[(Str
         }
         _ => {}
     }
+}
+
+/// bd-ghiey: collect `(schema-qualifier, bare-name)` for every FROM/JOIN table
+/// source across the select body (primary core + compound arms). Used to detect
+/// a main-vs-temp shadow conflict — the same base name referenced both as
+/// `main.<name>` and as an unqualified/`temp.` FROM source in one statement.
+fn collect_from_source_schema_refs(
+    select: &SelectStatement,
+    out: &mut Vec<(Option<String>, String)>,
+) {
+    collect_from_source_schema_refs_core(&select.body.select, out);
+    for (_, core) in &select.body.compounds {
+        collect_from_source_schema_refs_core(core, out);
+    }
+}
+
+fn collect_from_source_schema_refs_core(
+    core: &SelectCore,
+    out: &mut Vec<(Option<String>, String)>,
+) {
+    if let SelectCore::Select {
+        from: Some(from), ..
+    } = core
+    {
+        collect_from_source_schema_ref(&from.source, out);
+        for join in &from.joins {
+            collect_from_source_schema_ref(&join.table, out);
+        }
+    }
+}
+
+fn collect_from_source_schema_ref(
+    source: &TableOrSubquery,
+    out: &mut Vec<(Option<String>, String)>,
+) {
+    match source {
+        TableOrSubquery::Table { name, .. } => {
+            out.push((name.schema.clone(), name.name.clone()));
+        }
+        TableOrSubquery::ParenJoin(inner) => {
+            collect_from_source_schema_ref(&inner.source, out);
+            for join in &inner.joins {
+                collect_from_source_schema_ref(&join.table, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// bd-ghiey: rewrite every `main.<name_lc>` qualified name in the statement
+/// (FROM/JOIN sources and `main.<name>.*` table-stars) to the unqualified
+/// synthetic name so codegen's bare-name table resolution lands it on the
+/// distinct shadowed-main schema entry. Column references are left to bind
+/// through their FROM-source alias (the common `main.t m` form); an explicit
+/// three-part `main.t.col` reference in this rare conflict shape is not yet
+/// retargeted.
+fn retarget_main_qualified_from_sources(
+    select: &mut SelectStatement,
+    name_lc: &str,
+    synthetic: &str,
+) {
+    visit_select_qualified_names_mut(select, &mut |qn: &mut QualifiedName| {
+        if qn.name.eq_ignore_ascii_case(name_lc)
+            && qn
+                .schema
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("main"))
+        {
+            qn.schema = None;
+            qn.name = synthetic.to_owned();
+        }
+    });
 }
 
 /// Persistent views belong to exactly one database schema. SQLite defers
