@@ -41,6 +41,16 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.9...ma
 
 Post-v0.3.9 development continues on `main` (see the compare link).
 
+### Feature graph
+
+- `async-api` now implies fsqlite's own `native` feature (GH#379). Previously
+  `default-features = false, features = ["async-api"]` compiled silently while
+  dropping the entire `fsqlite-core`/`fsqlite-vfs` native stack; only
+  `fsqlite-types/native` was enabled. A `compile_error!` tripwire in
+  `fsqlite/src/lib.rs` now rejects any future `async-api`-without-`native`
+  combination. The previously documented workaround
+  (`features = ["native", "async-api"]`) keeps working unchanged.
+
 ---
 
 ## [0.3.9] -- 2026-08-23 (GitHub Release)
