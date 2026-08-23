@@ -17881,6 +17881,79 @@ impl Connection {
         self.record_statement_changes(changes);
     }
 
+    /// bd-s12cm: materialize the uncorrelated subqueries in a mixed
+    /// attached-target UPDATE's SET/WHERE so the statement can be delegated.
+    ///
+    /// An `UPDATE aux.t SET x = (SELECT ... FROM main.t) WHERE id IN (SELECT id
+    /// FROM main.t)` references both the attached target (`aux.t`) and `main`.
+    /// The attached-schema resolver rejects that mix because the attached child
+    /// connection cannot see the real `main` (its own `main` *is* `aux`). Every
+    /// uncorrelated subquery is evaluated here on the OUTER connection — where
+    /// `main.`/`aux.` resolve correctly — and inlined as literals, exactly as
+    /// `INSERT ... SELECT` materializes its main-side source rows before
+    /// dispatch. The result references only the attached target and delegates
+    /// cleanly.
+    ///
+    /// Returns `Ok(None)` when there is no subquery to inline (the caller keeps
+    /// the original rejection). A *correlated* subquery cannot be pre-evaluated
+    /// (its value depends on the row being written); inlining it against an
+    /// empty outer row surfaces a "no such column" error which propagates out,
+    /// and the caller then preserves the original rejection unchanged.
+    async fn materialize_attached_update_cross_schema_subqueries(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+    ) -> Result<Option<fsqlite_ast::UpdateStatement>> {
+        let set_has_subquery = update
+            .assignments
+            .iter()
+            .any(|assignment| expr_has_any_subquery(&assignment.value));
+        let where_has_subquery = update
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_has_any_subquery);
+        if !set_has_subquery && !where_has_subquery {
+            return Ok(None);
+        }
+        let mut materialized = update.clone();
+        for assignment in &mut materialized.assignments {
+            if expr_has_any_subquery(&assignment.value) {
+                let inlined = self
+                    .inline_subqueries_in_expr(&assignment.value, &[], &[])
+                    .await?;
+                assignment.value = inlined;
+            }
+        }
+        if let Some(where_clause) = materialized.where_clause.as_mut()
+            && expr_has_any_subquery(where_clause)
+        {
+            let inlined = self.inline_subqueries_in_expr(where_clause, &[], &[]).await?;
+            *where_clause = inlined;
+        }
+        Ok(Some(materialized))
+    }
+
+    /// bd-s12cm: DELETE counterpart of
+    /// [`Self::materialize_attached_update_cross_schema_subqueries`]. A
+    /// `DELETE FROM aux.t WHERE id NOT IN (SELECT id FROM main.t)` mixes the
+    /// attached target with a `main`-referencing anti-join; the subquery is
+    /// evaluated locally and inlined so the delegated DELETE targets only the
+    /// attached child. Same correlated-subquery caveat as the UPDATE variant.
+    async fn materialize_attached_delete_cross_schema_subqueries(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+    ) -> Result<Option<fsqlite_ast::DeleteStatement>> {
+        let Some(where_clause) = delete.where_clause.as_ref() else {
+            return Ok(None);
+        };
+        if !expr_has_any_subquery(where_clause) {
+            return Ok(None);
+        }
+        let inlined = self.inline_subqueries_in_expr(where_clause, &[], &[]).await?;
+        let mut materialized = delete.clone();
+        materialized.where_clause = Some(inlined);
+        Ok(Some(materialized))
+    }
+
     // Delegates to the attached connection's own statement execution, which can
     // route back here, so the future is boxed to break the recursive type.
     #[allow(clippy::type_complexity)]
@@ -18171,13 +18244,51 @@ impl Connection {
                     }
                 }
                 Statement::Update(update) => {
-                    let target_schema = {
+                    let resolved = {
                         let registry = self.attached_schemas.borrow();
-                        determine_attached_update_schema(update, &registry)?
+                        determine_attached_update_schema(update, &registry)
                     };
-                    let Some(target_schema) = target_schema else {
-                        return Ok(None);
+                    // bd-s12cm: an attached-target UPDATE whose SET/WHERE embeds a
+                    // subquery over `main`/another schema is rejected by the
+                    // resolver (the attached child's own `main` *is* the attached
+                    // DB, so it cannot see the real `main`). Materialize the
+                    // uncorrelated subqueries here on the outer connection and
+                    // retry, so the now single-schema write reaches the child.
+                    let (target_schema, effective_update): (
+                        String,
+                        Cow<'_, fsqlite_ast::UpdateStatement>,
+                    ) = match resolved {
+                        Ok(None) => return Ok(None),
+                        Ok(Some(schema)) => (schema, Cow::Borrowed(update)),
+                        Err(mixed_error) => {
+                            let Some(target_schema) =
+                                self.attached_target_schema(&update.table.name)?
+                            else {
+                                return Err(mixed_error);
+                            };
+                            let Some(materialized) = self
+                                .materialize_attached_update_cross_schema_subqueries(update)
+                                .await
+                                .ok()
+                                .flatten()
+                            else {
+                                return Err(mixed_error);
+                            };
+                            let reresolved = {
+                                let registry = self.attached_schemas.borrow();
+                                determine_attached_update_schema(&materialized, &registry)
+                            };
+                            match reresolved {
+                                Ok(Some(schema))
+                                    if schema.eq_ignore_ascii_case(&target_schema) =>
+                                {
+                                    (schema, Cow::Owned(materialized))
+                                }
+                                _ => return Err(mixed_error),
+                            }
+                        }
                     };
+                    let update = effective_update.as_ref();
                     self.prepare_attached_target_write_in_explicit_transaction(
                         "UPDATE",
                         update
@@ -18236,13 +18347,50 @@ impl Connection {
                     }
                 }
                 Statement::Delete(delete) => {
-                    let target_schema = {
+                    let resolved = {
                         let registry = self.attached_schemas.borrow();
-                        determine_attached_delete_schema(delete, &registry)?
+                        determine_attached_delete_schema(delete, &registry)
                     };
-                    let Some(target_schema) = target_schema else {
-                        return Ok(None);
+                    // bd-s12cm: a mixed attached-target DELETE (e.g. anti-join
+                    // `WHERE id NOT IN (SELECT id FROM main.t)`) is rejected by
+                    // the resolver. Materialize the uncorrelated subqueries here
+                    // and retry so the now single-schema delete reaches the
+                    // attached child.
+                    let (target_schema, effective_delete): (
+                        String,
+                        Cow<'_, fsqlite_ast::DeleteStatement>,
+                    ) = match resolved {
+                        Ok(None) => return Ok(None),
+                        Ok(Some(schema)) => (schema, Cow::Borrowed(delete)),
+                        Err(mixed_error) => {
+                            let Some(target_schema) =
+                                self.attached_target_schema(&delete.table.name)?
+                            else {
+                                return Err(mixed_error);
+                            };
+                            let Some(materialized) = self
+                                .materialize_attached_delete_cross_schema_subqueries(delete)
+                                .await
+                                .ok()
+                                .flatten()
+                            else {
+                                return Err(mixed_error);
+                            };
+                            let reresolved = {
+                                let registry = self.attached_schemas.borrow();
+                                determine_attached_delete_schema(&materialized, &registry)
+                            };
+                            match reresolved {
+                                Ok(Some(schema))
+                                    if schema.eq_ignore_ascii_case(&target_schema) =>
+                                {
+                                    (schema, Cow::Owned(materialized))
+                                }
+                                _ => return Err(mixed_error),
+                            }
+                        }
                     };
+                    let delete = effective_delete.as_ref();
                     self.prepare_attached_target_write_in_explicit_transaction(
                         "DELETE",
                         delete
@@ -85758,6 +85906,22 @@ impl Connection {
         let all_sources: Vec<&TableOrSubquery> = std::iter::once(&from.source)
             .chain(from.joins.iter().map(|j| &j.table))
             .collect();
+        // bd-tfwym: a table-valued function whose argument references a column
+        // is a LATERAL dependency on a sibling FROM source (e.g.
+        // `FROM t, json_each(t.tags)`). It cannot be pre-materialized once
+        // against `params` alone — it produces a different relation per row of
+        // the referenced table. Outer-query correlations were already
+        // substituted to literals upstream (bd-l3tce `substitute_outer_refs`),
+        // so any surviving `Expr::Column` in a TVF argument is a same-level
+        // lateral reference. Such sources skip pre-materialization here and are
+        // evaluated per-row inside the join loop instead.
+        let lateral_tvf: Vec<bool> = all_sources
+            .iter()
+            .map(|src| {
+                matches!(src, TableOrSubquery::TableFunction { args, .. }
+                    if args.iter().any(expr_references_any_column))
+            })
+            .collect();
         for (i, pre) in preloaded.iter_mut().enumerate() {
             if pre.is_some() {
                 match all_sources[i] {
@@ -85780,6 +85944,13 @@ impl Connection {
                         *pre = Some(row_data);
                     }
                     TableOrSubquery::TableFunction { name, args, .. } => {
+                        // bd-tfwym: a lateral TVF is evaluated per-row inside the
+                        // join loop, not pre-materialized here. Leave the empty
+                        // placeholder in `preloaded[i]`; `table_rows[i]` is unused
+                        // for such sources (the join loop overrides it).
+                        if lateral_tvf[i] {
+                            continue;
+                        }
                         let include_hidden_rowid =
                             table_sources[i].hidden_rowid_projection.is_some();
                         *pre = Some(
@@ -86107,6 +86278,36 @@ impl Connection {
             } else {
                 join.constraint.as_ref()
             };
+
+            // bd-tfwym: a lateral table-valued function (its argument reads a
+            // sibling column) produces a distinct relation per left row. Bind
+            // each left row into the TVF arguments, run the TVF, and cross the
+            // rows here instead of joining against the (unused) pre-materialized
+            // placeholder.
+            if lateral_tvf[join_idx + 1] {
+                let (tvf_name, tvf_args) = match all_sources[join_idx + 1] {
+                    TableOrSubquery::TableFunction { name, args, .. } => {
+                        (name.as_str(), args.as_slice())
+                    }
+                    _ => unreachable!("lateral_tvf flag implies a TableFunction source"),
+                };
+                let include_hidden_rowid =
+                    table_sources[join_idx + 1].hidden_rowid_projection.is_some();
+                combined = self
+                    .execute_lateral_table_function_join(
+                        &combined,
+                        tvf_name,
+                        tvf_args,
+                        right_width,
+                        current_width,
+                        include_hidden_rowid,
+                        join.join_type.kind,
+                        effective_constraint,
+                        &col_map,
+                    )
+                    .await?;
+                continue;
+            }
 
             // B3 (s83k): if the resolved ON still contains a subquery, it's
             // correlated and needs per-pair `inline_subqueries_in_expr`
@@ -86485,6 +86686,89 @@ impl Connection {
                     combined.extend_from_slice(&right_row[..right_width]);
                     result.push(combined);
                 }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// bd-tfwym: LATERAL join of a table-valued function whose arguments read
+    /// columns of a sibling FROM source (e.g. `FROM t, json_each(t.tags)`).
+    ///
+    /// An ordinary join crosses the left rows with a single pre-materialized
+    /// right relation, but a lateral TVF yields a *different* relation for each
+    /// left row: its argument (`t.tags`) reads that row's columns. So for every
+    /// left row we bind its values into the TVF arguments, run the TVF, and
+    /// cross the left row with the resulting rows — honoring the join constraint
+    /// and null-extending for LEFT/FULL when the TVF produces nothing (matching
+    /// stock SQLite's `LEFT JOIN` over an empty lateral).
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_lateral_table_function_join(
+        &self,
+        left: &[Vec<SqliteValue>],
+        name: &str,
+        args: &[Expr],
+        right_width: usize,
+        left_width: usize,
+        include_hidden_rowid: bool,
+        kind: fsqlite_ast::JoinKind,
+        constraint: Option<&JoinConstraint>,
+        col_map: &[(String, String, bool)],
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        use fsqlite_ast::JoinKind;
+
+        let combined_width = left_width + right_width;
+        // The TVF arguments resolve only against the left (sibling) columns;
+        // the TVF's own output columns occupy col_map indices >= left_width and
+        // are not yet materialized when the arguments are evaluated.
+        let left_col_map = &col_map[..left_width];
+        let mut result = Vec::new();
+        let mut scratch: Vec<SqliteValue> = Vec::with_capacity(combined_width);
+
+        for left_row in left {
+            // Bind this left row's columns into the TVF arguments (constant
+            // arguments evaluate identically each iteration), then run the TVF.
+            let mut bound_args = Vec::with_capacity(args.len());
+            for arg in args {
+                let value = self
+                    .eval_expr_with_subqueries(arg, left_row, left_col_map, None)
+                    .await?;
+                bound_args.push(Expr::BoundOuterValue {
+                    value,
+                    collation: BoundCollation::Unspecified,
+                    affinity: None,
+                    span: Span::ZERO,
+                });
+            }
+            let right_rows = self
+                .execute_table_function_rows(name, &bound_args, None, include_hidden_rowid)
+                .await?;
+
+            let mut matched = false;
+            for right_row in &right_rows {
+                scratch.clear();
+                scratch.extend_from_slice(left_row);
+                scratch.extend_from_slice(&right_row[..right_width]);
+                let passes = match constraint {
+                    None => true,
+                    Some(JoinConstraint::On(expr)) => {
+                        eval_join_predicate(expr, &scratch, col_map)?
+                    }
+                    Some(JoinConstraint::Using(cols)) => {
+                        eval_using_constraint(cols, &scratch, col_map, left_width)
+                    }
+                };
+                if passes {
+                    matched = true;
+                    result.push(scratch.clone());
+                }
+            }
+
+            if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
+                let mut combined = Vec::with_capacity(combined_width);
+                combined.extend_from_slice(left_row);
+                combined.extend(std::iter::repeat_n(SqliteValue::Null, right_width));
+                result.push(combined);
             }
         }
 
@@ -122046,6 +122330,90 @@ fn expr_contains_function_call(expr: &Expr) -> bool {
         Expr::BoundOuterValue { .. }
         | Expr::Literal(_, _)
         | Expr::Column(_, _)
+        | Expr::Placeholder(_, _)
+        | Expr::Raise { .. } => false,
+    }
+}
+
+/// bd-tfwym: does `expr` reference any column? Used to detect a LATERAL
+/// table-valued-function argument — a TVF whose argument reads a column from a
+/// sibling FROM source (e.g. `FROM t, json_each(t.tags)`). Outer-query
+/// correlations are substituted to literals before the join executor runs
+/// (bd-l3tce `substitute_outer_refs`), so any surviving `Expr::Column` in a TVF
+/// argument is a same-level lateral dependency that must be evaluated per-row of
+/// the referenced sibling rather than once against `params` alone. A subquery
+/// argument is treated conservatively as lateral (per-row evaluation stays
+/// correct for a non-correlated subquery too).
+fn expr_references_any_column(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_, _) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_any_column(left) || expr_references_any_column(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => expr_references_any_column(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_references_any_column(expr)
+                || expr_references_any_column(low)
+                || expr_references_any_column(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_references_any_column(expr)
+                || match set {
+                    InSet::List(values) => values.iter().any(expr_references_any_column),
+                    InSet::Subquery(_) => true,
+                    InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_references_any_column(expr)
+                || expr_references_any_column(pattern)
+                || escape.as_deref().is_some_and(expr_references_any_column)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_references_any_column)
+                || whens.iter().any(|(when, then)| {
+                    expr_references_any_column(when) || expr_references_any_column(then)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_references_any_column)
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_references_any_column(expr) || expr_references_any_column(path)
+        }
+        Expr::FunctionCall {
+            args,
+            filter,
+            order_by,
+            ..
+        } => {
+            (match args {
+                FunctionArgs::List(list) => list.iter().any(expr_references_any_column),
+                FunctionArgs::Star => false,
+            }) || filter.as_deref().is_some_and(expr_references_any_column)
+                || order_by
+                    .iter()
+                    .any(|term| expr_references_any_column(&term.expr))
+        }
+        Expr::RowValue(values, _) => values.iter().any(expr_references_any_column),
+        Expr::Exists { .. } | Expr::Subquery(..) => true,
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
         | Expr::Placeholder(_, _)
         | Expr::Raise { .. } => false,
     }
