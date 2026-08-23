@@ -36586,6 +36586,49 @@ impl Connection {
                     fsqlite_ast::TriggerTiming::After,
                     &insert_event,
                 );
+                // bd-y7old: a conflicting ON CONFLICT DO UPDATE resolves to the
+                // UPDATE path, so it must fire BEFORE/AFTER UPDATE triggers (and
+                // NOT AFTER INSERT). Compute their presence for the DO-UPDATE case.
+                let is_do_update_upsert = insert
+                    .upsert
+                    .iter()
+                    .any(|clause| matches!(clause.action, fsqlite_ast::UpsertAction::Update { .. }));
+                // `UPDATE OF <cols>` triggers match on the SET-assigned columns, so
+                // build the event from the first DO-UPDATE clause's assignments
+                // (mirroring the plain-UPDATE arm). Empty when not a DO-UPDATE
+                // upsert; then it is never consulted.
+                let update_event = fsqlite_ast::TriggerEvent::Update(
+                    insert
+                        .upsert
+                        .iter()
+                        .find_map(|clause| match &clause.action {
+                            fsqlite_ast::UpsertAction::Update { assignments, .. } => {
+                                Some(Self::assignment_target_column_names(assignments))
+                            }
+                            fsqlite_ast::UpsertAction::Nothing => None,
+                        })
+                        .unwrap_or_default(),
+                );
+                let has_before_update = is_do_update_upsert
+                    && self.has_matching_triggers(
+                        table_name,
+                        fsqlite_ast::TriggerTiming::Before,
+                        &update_event,
+                    );
+                let has_after_update = is_do_update_upsert
+                    && self.has_matching_triggers(
+                        table_name,
+                        fsqlite_ast::TriggerTiming::After,
+                        &update_event,
+                    );
+                let has_upsert_update_triggers = has_before_update || has_after_update;
+                // The conflict/OLD-NEW plan is needed whenever a conflicting row
+                // would change which triggers fire: BEFORE/AFTER UPDATE must fire
+                // for the update, and AFTER INSERT must be SUPPRESSED because no
+                // insert happened — the latter matters even with no UPDATE triggers
+                // (stock fires only BEFORE INSERT on a conflict/update path).
+                let upsert_needs_conflict_plan =
+                    is_do_update_upsert && (has_after_insert || has_upsert_update_triggers);
                 if is_live_vtab {
                     if !insert.returning.is_empty() {
                         return Err(FrankenError::NotImplemented(
@@ -36660,8 +36703,10 @@ impl Connection {
                     // per-row INSERT ... VALUES operations. Those inner
                     // statements already handle trigger firing and change
                     // tracking, so route around the outer trigger path here.
-                    let needs_row_by_row_replay =
-                        has_before_insert || has_after_insert || self.fk_enforcement_enabled();
+                    let needs_row_by_row_replay = has_before_insert
+                        || has_after_insert
+                        || upsert_needs_conflict_plan
+                        || self.fk_enforcement_enabled();
                     if !is_simple_values || needs_row_by_row_replay {
                         self.log_mem_execution_fallback(
                             "insert_select",
@@ -36679,7 +36724,10 @@ impl Connection {
                     }
                 }
                 if !is_live_vtab
-                    && (has_before_insert || has_after_insert || self.fk_enforcement_enabled())
+                    && (has_before_insert
+                        || has_after_insert
+                        || upsert_needs_conflict_plan
+                        || self.fk_enforcement_enabled())
                     && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
                     && rows.len() > 1
                 {
@@ -36740,7 +36788,7 @@ impl Connection {
                 let (mut trigger_new_rows, trigger_new_explicit_rowids): (
                     Vec<Vec<SqliteValue>>,
                     Vec<Option<i64>>,
-                ) = if has_before_insert || has_after_insert {
+                ) = if has_before_insert || has_after_insert || upsert_needs_conflict_plan {
                     if let Some(rows) = live_insert_rows.as_ref() {
                         // Live virtual-table rows are inserted through the module's
                         // xUpdate; the rowid is chosen there, not known pre-insert.
@@ -36838,6 +36886,66 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
+                // bd-y7old: a DO UPDATE upsert whose single attempted row conflicts
+                // resolves to the UPDATE path. Determine the conflict + OLD/NEW
+                // BEFORE running the VDBE program (which itself does the insert-or-
+                // update), fire the BEFORE UPDATE trigger here, and remember to fire
+                // AFTER UPDATE / suppress AFTER INSERT below. A non-conflicting row
+                // keeps the ordinary insert path (BEFORE/AFTER INSERT) unchanged.
+                let upsert_update_plan = if upsert_needs_conflict_plan
+                    && trigger_new_rows.len() == 1
+                {
+                    let clause = insert.upsert.iter().find_map(|clause| match &clause.action {
+                        fsqlite_ast::UpsertAction::Update {
+                            assignments,
+                            where_clause,
+                        } => Some((assignments, where_clause.as_deref(), clause.target.as_ref())),
+                        fsqlite_ast::UpsertAction::Nothing => None,
+                    });
+                    if let Some((assignments, do_update_where, target)) = clause {
+                        self.plan_upsert_update_trigger(
+                            insert,
+                            assignments,
+                            do_update_where,
+                            target,
+                            &trigger_new_rows[0],
+                            params,
+                        )
+                        .await?
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                // A conflict (plan present) always suppresses AFTER INSERT — whether
+                // the DO UPDATE ... WHERE applies (an update) or not (a no-op that
+                // still fired only BEFORE INSERT in stock).
+                let upsert_conflicted = upsert_update_plan.is_some();
+                let mut upsert_before_update_ignored = false;
+                if let Some((rowid, old_row, new_row, where_true)) = &upsert_update_plan
+                    && *where_true
+                    && has_before_update
+                {
+                    upsert_before_update_ignored = self
+                        .fire_before_triggers(
+                            table_name,
+                            &update_event,
+                            Some(old_row),
+                            Some(new_row),
+                            *rowid,
+                            *rowid,
+                        )
+                        .await?;
+                }
+                if upsert_before_update_ignored {
+                    // BEFORE UPDATE raised RAISE(IGNORE): skip this row's update
+                    // entirely (no mutation, no AFTER UPDATE, no AFTER INSERT).
+                    // BEFORE INSERT already fired above.
+                    self.reset_statement_change_count();
+                    return Ok(Vec::new());
+                }
+
                 // Phase 5B.2 (bd-1yi8): INSERT OR REPLACE / INSERT OR IGNORE
                 // routes through VDBE which has UPSERT semantics in the
                 // Insert opcode (table_move_to + delete + insert). The
@@ -36927,7 +37035,9 @@ impl Connection {
                 // INTEGER PRIMARY KEY carry the rowid in a snapshotted column and
                 // resolve the alias there; passing it additionally is harmless and
                 // makes `NEW.rowid` resolve on tables without an IPK column. (GH #205)
-                if has_after_insert {
+                // bd-y7old: a conflicting DO UPDATE upsert resolves to the UPDATE
+                // path, so it fires AFTER UPDATE (below) rather than AFTER INSERT.
+                if has_after_insert && !upsert_conflicted {
                     let after_insert_rowid = self.current_last_insert_rowid();
                     for new_values in &trigger_new_rows {
                         self.fire_after_triggers(
@@ -36940,6 +37050,23 @@ impl Connection {
                         )
                         .await?;
                     }
+                }
+                // bd-y7old: fire AFTER UPDATE for a conflicting DO UPDATE whose WHERE
+                // applied (the VDBE program performed the update above); a WHERE-false
+                // conflict is a no-op that fires neither AFTER INSERT nor AFTER UPDATE.
+                if let Some((rowid, old_row, new_row, where_true)) = &upsert_update_plan
+                    && *where_true
+                    && has_after_update
+                {
+                    self.fire_after_triggers(
+                        table_name,
+                        &update_event,
+                        Some(old_row),
+                        Some(new_row),
+                        *rowid,
+                        *rowid,
+                    )
+                    .await?;
                 }
 
                 if table_name.eq_ignore_ascii_case("sqlite_sequence") {
@@ -51951,6 +52078,255 @@ impl Connection {
             trigger_rows.push((row_rowid, old_values, new_values));
         }
         Ok(trigger_rows)
+    }
+
+    /// bd-y7old: For a DO UPDATE upsert whose single attempted row conflicts on
+    /// its conflict target, compute `(rowid, old_row, new_row, where_true)` so the
+    /// INSERT dispatch can fire BEFORE/AFTER UPDATE triggers around the VDBE apply
+    /// and suppress the AFTER INSERT trigger. Returns `Ok(None)` when the attempted
+    /// row does NOT conflict (the normal insert path runs) or when the conflict
+    /// target is a shape this helper does not reconstruct (an expression /
+    /// partial-index target, or an omitted target on a table without an INTEGER
+    /// PRIMARY KEY) — in which case the caller keeps its prior behavior.
+    ///
+    /// `new_row` / `where_true` reuse the same interpreted SET evaluation the plain
+    /// UPDATE trigger snapshot uses (`eval_join_expr`), with a combined column map
+    /// that resolves `excluded.*` against the attempted-insert values and
+    /// unqualified / target-table columns against the existing row.
+    async fn plan_upsert_update_trigger(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        assignments: &[fsqlite_ast::Assignment],
+        do_update_where: Option<&Expr>,
+        target: Option<&fsqlite_ast::UpsertTarget>,
+        attempted: &[SqliteValue],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<(Option<i64>, Vec<SqliteValue>, Vec<SqliteValue>, bool)>> {
+        let table_name = &insert.table.name;
+        let (column_names, is_rowid_table, ipk_idx) = {
+            let schema = self.schema.borrow();
+            let Some(table) = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            else {
+                return Ok(None);
+            };
+            let names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+            let ipk = table.columns.iter().position(|c| c.is_ipk);
+            (names, !table.without_rowid, ipk)
+        };
+        if attempted.len() != column_names.len() {
+            return Ok(None);
+        }
+
+        let Some(match_where) =
+            Self::build_upsert_conflict_match_expr(&column_names, ipk_idx, target, attempted)
+        else {
+            return Ok(None);
+        };
+
+        // Locate the conflicting existing row (if any). Rowid tables project the
+        // implicit rowid via the shadow-aware alias, mirroring the UPDATE trigger
+        // snapshot collector.
+        let table_ref = fsqlite_ast::QualifiedTableRef {
+            name: insert.table.clone(),
+            alias: insert.alias.clone(),
+            index_hint: None,
+            time_travel: None,
+        };
+        let projected = if is_rowid_table {
+            let rowid_alias = self.ignore_skip_rowid_alias(table_name);
+            vec![
+                ResultColumn::Expr {
+                    expr: Expr::Column(
+                        fsqlite_ast::ColumnRef::bare(rowid_alias),
+                        fsqlite_ast::Span::new(0, 0),
+                    ),
+                    alias: None,
+                },
+                ResultColumn::Star,
+            ]
+        } else {
+            vec![ResultColumn::Star]
+        };
+        let sel =
+            Self::build_single_table_select(&table_ref, projected, Some(&match_where), &[], None);
+        let matched = self
+            .execute_statement(&Statement::Select(sel), params)
+            .await?;
+        let Some(first) = matched.into_iter().next() else {
+            return Ok(None);
+        };
+        let values = first.values();
+        let (rowid, old_values): (Option<i64>, Vec<SqliteValue>) = if is_rowid_table {
+            let rowid = match values.first() {
+                Some(SqliteValue::Integer(n)) => Some(*n),
+                _ => None,
+            };
+            (
+                rowid,
+                values
+                    .get(1..)
+                    .map(<[SqliteValue]>::to_vec)
+                    .unwrap_or_default(),
+            )
+        } else {
+            (None, values.to_vec())
+        };
+        if old_values.len() != column_names.len() {
+            return Ok(None);
+        }
+
+        // Column map over the EXISTING row only. `excluded.*` references are
+        // substituted to literals below (rather than added to the map) so that an
+        // unqualified column stays unambiguous — a combined existing+excluded map
+        // would make the bare `v` in `v + excluded.v` match two entries.
+        let table_label = insert.alias.as_deref().unwrap_or(table_name).to_owned();
+        let col_map: Vec<(String, String, bool)> = column_names
+            .iter()
+            .map(|name| (table_label.clone(), name.clone(), false))
+            .collect();
+
+        // Bind placeholders (params may carry ?N), then splice `excluded.*` to the
+        // attempted-insert literals in the SET/WHERE expressions.
+        let (bound_assignments, bound_where) = if let Some(p) = params {
+            let mut bind_state = BindParamState::default();
+            let mut cloned = assignments.to_vec();
+            for assignment in &mut cloned {
+                bind_placeholders_in_expr(&mut assignment.value, &mut bind_state, p)?;
+            }
+            let bound_where = match do_update_where {
+                Some(where_expr) => {
+                    let mut where_expr = where_expr.clone();
+                    bind_placeholders_in_expr(&mut where_expr, &mut bind_state, p)?;
+                    Some(where_expr)
+                }
+                None => None,
+            };
+            (cloned, bound_where)
+        } else {
+            (assignments.to_vec(), do_update_where.cloned())
+        };
+
+        // NEW = existing row with the SET assignments applied. SQLite evaluates
+        // every SET RHS against the ORIGINAL row, so `old_values` is not mutated
+        // between assignments. An evaluation failure (e.g. a correlated
+        // `excluded.*` subquery in the SET that the interpreted evaluator does not
+        // support) falls back to `Ok(None)`: the VDBE program still applies the
+        // upsert correctly; only the trigger OLD/NEW snapshot is unavailable, so
+        // the caller keeps its prior (VDBE-only) behavior rather than erroring.
+        let mut new_values = old_values.clone();
+        for assignment in &bound_assignments {
+            match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(name) => {
+                    let Some(idx) = find_column_index_case_insensitive(&column_names, name) else {
+                        return Ok(None);
+                    };
+                    let mut value_expr = assignment.value.clone();
+                    substitute_excluded_columns_in_expr(&mut value_expr, &column_names, attempted);
+                    let Ok(value) =
+                        self.eval_join_expr_with_registry(&value_expr, &old_values, &col_map)
+                    else {
+                        return Ok(None);
+                    };
+                    new_values[idx] = value;
+                }
+                fsqlite_ast::AssignmentTarget::ColumnList(names) => {
+                    let value_exprs: Vec<Expr> = match &assignment.value {
+                        Expr::RowValue(values, _) if values.len() == names.len() => values.clone(),
+                        other if names.len() == 1 => vec![other.clone()],
+                        _ => return Ok(None),
+                    };
+                    for (name, mut value_expr) in names.iter().zip(value_exprs) {
+                        let Some(idx) = find_column_index_case_insensitive(&column_names, name)
+                        else {
+                            return Ok(None);
+                        };
+                        substitute_excluded_columns_in_expr(
+                            &mut value_expr,
+                            &column_names,
+                            attempted,
+                        );
+                        let Ok(value) =
+                            self.eval_join_expr_with_registry(&value_expr, &old_values, &col_map)
+                        else {
+                            return Ok(None);
+                        };
+                        new_values[idx] = value;
+                    }
+                }
+            }
+        }
+
+        let where_true = match bound_where {
+            Some(mut where_expr) => {
+                substitute_excluded_columns_in_expr(&mut where_expr, &column_names, attempted);
+                let Ok(value) =
+                    self.eval_join_expr_with_registry(&where_expr, &old_values, &col_map)
+                else {
+                    return Ok(None);
+                };
+                !value.is_null() && is_sqlite_truthy(&value)
+            }
+            None => true,
+        };
+
+        Ok(Some((rowid, old_values, new_values, where_true)))
+    }
+
+    /// Build the `col = <attempted literal> AND ...` predicate that locates the
+    /// row an UPSERT would conflict with, from its conflict target. Returns `None`
+    /// for targets this reconstruction does not cover (an expression /
+    /// partial-index target, or an omitted target on a table without an INTEGER
+    /// PRIMARY KEY) so the caller falls back to its prior behavior.
+    fn build_upsert_conflict_match_expr(
+        column_names: &[String],
+        ipk_idx: Option<usize>,
+        target: Option<&fsqlite_ast::UpsertTarget>,
+        attempted: &[SqliteValue],
+    ) -> Option<Expr> {
+        let match_cols: Vec<usize> = match target {
+            Some(target) => {
+                if target.where_clause.is_some() {
+                    return None; // partial-index target — unhandled.
+                }
+                let mut idxs = Vec::with_capacity(target.columns.len());
+                for indexed in &target.columns {
+                    let Expr::Column(col_ref, _) = &indexed.expr else {
+                        return None; // expression target — unhandled.
+                    };
+                    let idx = find_column_index_case_insensitive(column_names, &col_ref.column)?;
+                    idxs.push(idx);
+                }
+                if idxs.is_empty() {
+                    return None;
+                }
+                idxs
+            }
+            None => vec![ipk_idx?],
+        };
+        let mut predicate: Option<Expr> = None;
+        for &idx in &match_cols {
+            let eq = Expr::BinaryOp {
+                left: Box::new(Expr::Column(
+                    fsqlite_ast::ColumnRef::bare(column_names[idx].clone()),
+                    fsqlite_ast::Span::new(0, 0),
+                )),
+                op: fsqlite_ast::BinaryOp::Eq,
+                right: Box::new(value_to_literal_expr(attempted[idx].clone())),
+                span: fsqlite_ast::Span::new(0, 0),
+            };
+            predicate = Some(match predicate {
+                Some(existing) => Expr::BinaryOp {
+                    left: Box::new(existing),
+                    op: fsqlite_ast::BinaryOp::And,
+                    right: Box::new(eq),
+                    span: fsqlite_ast::Span::new(0, 0),
+                },
+                None => eq,
+            });
+        }
+        predicate
     }
 
     fn freeze_update_assignments_to_trigger_new_values(
@@ -110720,6 +111096,129 @@ fn value_to_literal_expr(val: SqliteValue) -> Expr {
         SqliteValue::Text(s) => Expr::Literal(Literal::String(s.to_string()), Span::ZERO),
         SqliteValue::Blob(b) => Expr::Literal(Literal::Blob(b.to_vec()), Span::ZERO),
         SqliteValue::Null => Expr::Literal(Literal::Null, Span::ZERO),
+    }
+}
+
+/// bd-y7old: Replace every `excluded.<col>` reference in `expr` with the literal
+/// attempted-insert value for that column. Used to evaluate an UPSERT DO UPDATE
+/// SET/WHERE expression against the existing row: after substitution the
+/// expression contains only target-table columns (which resolve against the
+/// existing row) and literals, so an unqualified column reference is unambiguous
+/// (a combined `existing`+`excluded` column map would make a bare `v` in
+/// `v + excluded.v` ambiguous). Subqueries/EXISTS are left untouched — a
+/// correlated `excluded.*` inside a SET subquery is a rare edge the caller
+/// handles by falling back to its prior behavior when evaluation errors.
+fn substitute_excluded_columns_in_expr(
+    expr: &mut Expr,
+    column_names: &[String],
+    attempted: &[SqliteValue],
+) {
+    match expr {
+        Expr::Column(col_ref, _) => {
+            if col_ref
+                .table
+                .as_deref()
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("excluded"))
+                && let Some(idx) = find_column_index_case_insensitive(column_names, &col_ref.column)
+                && let Some(value) = attempted.get(idx)
+            {
+                *expr = value_to_literal_expr(value.clone());
+            }
+        }
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _)
+        | Expr::Exists { .. }
+        | Expr::Subquery(_, _) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            substitute_excluded_columns_in_expr(left, column_names, attempted);
+            substitute_excluded_columns_in_expr(right, column_names, attempted);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => {
+            substitute_excluded_columns_in_expr(inner, column_names, attempted);
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            substitute_excluded_columns_in_expr(inner, column_names, attempted);
+            substitute_excluded_columns_in_expr(low, column_names, attempted);
+            substitute_excluded_columns_in_expr(high, column_names, attempted);
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            substitute_excluded_columns_in_expr(inner, column_names, attempted);
+            if let InSet::List(values) = set {
+                for value in values {
+                    substitute_excluded_columns_in_expr(value, column_names, attempted);
+                }
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            substitute_excluded_columns_in_expr(inner, column_names, attempted);
+            substitute_excluded_columns_in_expr(pattern, column_names, attempted);
+            if let Some(escape_expr) = escape {
+                substitute_excluded_columns_in_expr(escape_expr, column_names, attempted);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                substitute_excluded_columns_in_expr(operand, column_names, attempted);
+            }
+            for (when_expr, then_expr) in whens {
+                substitute_excluded_columns_in_expr(when_expr, column_names, attempted);
+                substitute_excluded_columns_in_expr(then_expr, column_names, attempted);
+            }
+            if let Some(else_expr) = else_expr {
+                substitute_excluded_columns_in_expr(else_expr, column_names, attempted);
+            }
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let FunctionArgs::List(arg_exprs) = args {
+                for arg in arg_exprs {
+                    substitute_excluded_columns_in_expr(arg, column_names, attempted);
+                }
+            }
+            for ordering in order_by {
+                substitute_excluded_columns_in_expr(&mut ordering.expr, column_names, attempted);
+            }
+            if let Some(filter_expr) = filter {
+                substitute_excluded_columns_in_expr(filter_expr, column_names, attempted);
+            }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            substitute_excluded_columns_in_expr(inner, column_names, attempted);
+            substitute_excluded_columns_in_expr(path, column_names, attempted);
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                substitute_excluded_columns_in_expr(value, column_names, attempted);
+            }
+        }
     }
 }
 
