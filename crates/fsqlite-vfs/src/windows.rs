@@ -1624,6 +1624,32 @@ impl WindowsFile {
             .ok_or_else(|| FrankenError::internal("windows lock files are closed"))
     }
 
+    /// Open the advisory lock sidecars on demand for a binding that was
+    /// admitted sidecar-less (bd-ypl7b: read-only opens leave `os_locks`
+    /// `None`).
+    ///
+    /// An external fence (`lock_external_shared_snapshot` /
+    /// `lock_external_maintenance`) is an explicit cross-process coordination
+    /// request, not a plain read, so materializing the cooperative sidecars
+    /// here is correct even on a read-only binding — the protocol needs the
+    /// shared artifacts, exactly as a read-write open would have created
+    /// them. Plain read-only opens stay sidecar-less. On read-only media the
+    /// sidecar creation surfaces the real filesystem error instead of the
+    /// misleading `windows lock files are closed` internal error that made
+    /// every `br` command fail on Windows (beads_rust GH#438; the regression
+    /// class bd-ypl7b's plan predicted for lock ops reached on an RO
+    /// binding).
+    fn ensure_os_locks(&mut self) -> Result<()> {
+        if self.os_locks.is_some() {
+            return Ok(());
+        }
+        if self.file.is_none() {
+            return Err(FrankenError::internal("windows file is closed"));
+        }
+        self.os_locks = Some(WindowsOsLockFiles::open(&self.path)?);
+        Ok(())
+    }
+
     fn ensure_stock_main_locks(&mut self) -> Result<()> {
         if self.stock_main_locks.is_none() {
             #[cfg(test)]
@@ -2493,6 +2519,10 @@ impl VfsFile for WindowsFile {
             ));
         }
 
+        // A read-only binding is admitted sidecar-less (bd-ypl7b); the fence
+        // needs the cooperative sidecars, so materialize them on demand
+        // before arming anything.
+        self.ensure_os_locks()?;
         self.ensure_stock_main_locks()?;
         let prior_level = self.lock_level;
         self.external_shared_snapshot_prior_level = Some(prior_level);
@@ -2520,6 +2550,10 @@ impl VfsFile for WindowsFile {
             ));
         }
 
+        // A read-only binding is admitted sidecar-less (bd-ypl7b); the fence
+        // needs the cooperative sidecars, so materialize them on demand
+        // before the attempt owns anything.
+        self.ensure_os_locks()?;
         // The dedicated stock-main handle is duplicated before any cooperative
         // slot is taken so an OS duplication failure is reported while the
         // attempt still owns nothing at all.
@@ -3216,6 +3250,56 @@ mod tests {
         let n = crate::block_on_test_io(&cx, file.read(&cx, &mut buf, 0)).expect("read");
         assert_eq!(n, 13);
         assert_eq!(&buf, b"hello windows");
+    }
+
+    #[test]
+    fn test_read_only_binding_materializes_sidecars_for_external_snapshot_fence() {
+        // beads_rust GH#438: a sidecar-less read-only binding (bd-ypl7b) must
+        // still be able to take the external shared-snapshot fence — the
+        // fence opens the advisory sidecars on demand instead of failing
+        // with "windows lock files are closed".
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("ro-fence.db");
+        {
+            let vfs = WindowsVfs::new();
+            let (file, _) = vfs
+                .open(&cx, Some(&path), open_flags_create())
+                .expect("create db rw");
+            crate::block_on_test_io(&cx, file.write(&cx, b"seed", 0)).expect("seed write");
+        }
+        // The rw open created sidecars; remove them so the RO open starts
+        // from the sidecar-less on-disk state a fresh checkout has.
+        for sidecar in [
+            sqlite_shared_lock_path(&path),
+            sqlite_reserved_lock_path(&path),
+            sqlite_pending_lock_path(&path),
+        ] {
+            let _ = fs::remove_file(&sidecar);
+        }
+
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), VfsOpenFlags::MAIN_DB)
+            .expect("open read-only");
+        assert!(
+            !sqlite_shared_lock_path(&path).exists(),
+            "read-only open must stay sidecar-less (bd-ypl7b)"
+        );
+
+        file.lock_external_shared_snapshot(&cx)
+            .expect("external snapshot fence on a read-only binding");
+        assert!(
+            sqlite_shared_lock_path(&path).exists(),
+            "fence acquisition materializes the advisory sidecars on demand"
+        );
+        file.restore_external_shared_snapshot_attempt(&cx)
+            .expect("restore fence");
+
+        let mut buf = [0_u8; 4];
+        let n = crate::block_on_test_io(&cx, file.read(&cx, &mut buf, 0)).expect("read");
+        assert_eq!(n, 4);
+        assert_eq!(&buf, b"seed");
     }
 
     #[test]
