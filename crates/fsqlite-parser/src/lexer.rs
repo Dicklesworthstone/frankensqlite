@@ -442,7 +442,10 @@ impl<'a> Lexer<'a> {
             _ => {
                 self.advance();
                 let s = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
-                TokenKind::Error(format!("unexpected character: {s}"))
+                // Stock SQLite's tokenizer reports any character that cannot start
+                // a token as `unrecognized token: "<char>"` (SQLITE_ERROR), not a
+                // frank-specific "unexpected character". bd-errmsg-parity-batch3-3brmm.
+                TokenKind::Error(format!("unrecognized token: \"{s}\""))
             }
         };
 
@@ -1048,7 +1051,11 @@ impl<'a> Lexer<'a> {
             }
         }
         if self.pos == name_start {
-            return TokenKind::Error(format!("empty parameter name after '{prefix}'"));
+            // A bare parameter prefix with no name (`:`, `@`, `$` followed by a
+            // non-name char or EOF) is reported by stock SQLite as
+            // `unrecognized token: "<prefix>"`, not a frank-specific message.
+            // bd-errmsg-parity-batch3-3brmm.
+            return TokenKind::Error(format!("unrecognized token: \"{prefix}\""));
         }
         let name = String::from_utf8_lossy(&self.src[name_start..self.pos]).into_owned();
         constructor(name)
@@ -1575,6 +1582,43 @@ mod tests {
             tokens[0]
         );
         assert_eq!(tokens[1], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_unexpected_char_is_unrecognized_token() {
+        // A byte that cannot start any token reports stock's
+        // `unrecognized token: "<char>"` (SQLITE_ERROR), not a frank-specific
+        // "unexpected character". bd-errmsg-parity-batch3-3brmm.
+        for input in ["#", "\\", "^", "{", "}", "]"] {
+            let tokens = kinds(input);
+            let expected = format!("unrecognized token: \"{input}\"");
+            assert!(
+                matches!(tokens[0], TokenKind::Error(ref e) if e.contains(&expected)),
+                "expected {input:?} -> {expected:?}, got {:?}",
+                tokens[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_lex_bare_param_prefix_is_unrecognized_token() {
+        // A parameter prefix (`:`, `@`, `$`) with no following name is reported by
+        // stock as `unrecognized token: "<prefix>"`, not "empty parameter name
+        // after '<prefix>'". bd-errmsg-parity-batch3-3brmm.
+        for input in [":", "@", "$"] {
+            let tokens = kinds(input);
+            let expected = format!("unrecognized token: \"{input}\"");
+            assert!(
+                matches!(tokens[0], TokenKind::Error(ref e) if e.contains(&expected)),
+                "expected bare {input:?} -> {expected:?}, got {:?}",
+                tokens[0]
+            );
+            assert_eq!(tokens[1], TokenKind::Eof);
+        }
+        // control: a prefix WITH a name still lexes as the named parameter.
+        assert_eq!(kinds(":foo")[0], TokenKind::ColonParam("foo".to_owned()));
+        assert_eq!(kinds("@bar")[0], TokenKind::AtParam("bar".to_owned()));
+        assert_eq!(kinds("$baz")[0], TokenKind::DollarParam("baz".to_owned()));
     }
 
     fn histogram_total(hist: &TokenizeDurationSecondsHistogram) -> u64 {

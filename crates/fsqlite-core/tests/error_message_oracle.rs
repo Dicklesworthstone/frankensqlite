@@ -774,6 +774,15 @@ fn tokenizer_error_surfaces_verbatim_end_to_end() {
             ("SELECT x'1G'", "unrecognized token: \"x'1G'\""),
             ("SELECT 'abc", "unrecognized token: \"'abc\""),
             ("SELECT [abc", "unrecognized token: \"[abc\""),
+            // A byte that cannot start any token, and a bare parameter prefix with
+            // no name, both surface as stock's `unrecognized token: "<text>"`
+            // rather than a frank-specific "unexpected character" / "empty
+            // parameter name". bd-errmsg-parity-batch3-3brmm.
+            ("SELECT #", "unrecognized token: \"#\""),
+            ("SELECT ^", "unrecognized token: \"^\""),
+            ("SELECT :", "unrecognized token: \":\""),
+            ("SELECT @", "unrecognized token: \"@\""),
+            ("SELECT $", "unrecognized token: \"$\""),
         ] {
             query_err_is(&[], sql, expected).await;
         }
