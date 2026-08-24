@@ -155,8 +155,7 @@ fn regression_check_missing_operation_in_current() {
 
     let current = BaselineReport::new("test");
     let results = old.check_regression(&current, DEFAULT_REGRESSION_THRESHOLD);
-    // Missing operation = no comparison = no regression.
-    assert!(results.is_empty());
+    assert_eq!(results.len(), 1, "missing evidence must not disappear");
 }
 
 #[test]
