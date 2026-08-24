@@ -2807,6 +2807,29 @@ pub fn write_segment(
     // Apply fsync policy
     if fsync_policy == FsyncPolicy::Full || fsync_policy == FsyncPolicy::Normal {
         writer.get_ref().sync_all()?;
+        // `sync_all` makes the segment's *bytes* durable, but for a
+        // newly-created file it does NOT make the directory entry that links
+        // it durable: POSIX `fsync(file)` says nothing about the parent
+        // directory. Without fsyncing the directory, a crash can leave the
+        // just-created segment unreachable even though `mark_epoch_durable`
+        // already reported the epoch durable — silently losing committed
+        // frames on the next `recover_segments`. Match SQLite, which fsyncs
+        // the containing directory after creating a journal/WAL sidecar.
+        // Windows persists the directory entry together with the file and has
+        // no portable directory-fsync via a file handle, so this is Unix-only.
+        #[cfg(unix)]
+        {
+            let parent = path.parent().unwrap_or_else(|| Path::new(""));
+            let dir = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            // A directory we cannot open/sync means we cannot prove the link
+            // durable; surface it so the caller treats the epoch as not-yet-
+            // durable rather than silently trusting an unlinked segment.
+            File::open(dir)?.sync_all()?;
+        }
     }
 
     Ok(total_bytes)
