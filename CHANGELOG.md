@@ -24,7 +24,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.9...main) | HEAD | 2026-08-23 | (no post-0.3.9 changes yet) |
-| [v0.3.9](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.9) | Release | 2026-08-23 | Windows read-only open regression fix (GH#438: `br` unusable on Windows at 0.3.7/0.3.8) + harness `native` feature repair (GH#378) + UPSERT `DO UPDATE` expression fixes + error-message parity continuation |
+| [v0.3.9](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.9) | Release | 2026-08-23 | **Expedited**: v0.3.8 prebuilt CLI could not open file databases (bd-slgya feature-pin regression) + Windows read-only open regression fix (GH#438) + async-api implies native (GH#379) + C API `sqlite3_bind_*` + UPSERT/trigger/parity continuation |
 | [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.8) | Release | 2026-08-22 | UPSERT clobber P1 fix + INSERT-ABORT atomicity + stock-error-message parity campaign + JSON5 + differential oracle keeper suite |
 | [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) | Release | 2026-08-20 | GH#345/#366/#368/#369/#370/#371/#244 + bd-xv5cm 7-facet concurrency hardening + REVIEW3 |
 | [v0.3.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.6) | Release | 2026-08-19 | FTS5 reopen/hydration + binary release |
@@ -47,7 +47,20 @@ Post-v0.3.9 development continues on `main` (see the compare link).
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.8...v0.3.9>
 
-49 non-merge commits in roughly one day after the [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.8) tag. A fast-follow patch release whose reason for existing is the Windows read-only-open regression: fsqlite 0.3.7/0.3.8 error on **every read-only open+close on Windows**, which made downstream `beads_rust` (`br`) v0.4.0 fail on all Windows machines before its first command completed ([beads_rust#438](https://github.com/Dicklesworthstone/beads_rust/issues/438)).
+68 non-merge commits in the day after the [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.8) tag. An **expedited** patch release with two ship-stopping reasons:
+
+1. **The v0.3.8 prebuilt CLI binaries cannot open file-backed databases at all** (bd-slgya): every file-DB open fails with `not implemented: file-backed pager not available on this platform` on all five release platforms. crates.io libraries were unaffected. See "Release-artifact integrity" below.
+2. The Windows read-only-open regression: fsqlite 0.3.7/0.3.8 error on **every read-only open+close on Windows**, which made downstream `beads_rust` (`br`) v0.4.0 fail on all Windows machines before its first command completed ([beads_rust#438](https://github.com/Dicklesworthstone/beads_rust/issues/438)).
+
+### Release-artifact integrity (bd-slgya)
+
+Delivered capability: the shipped shell and C API open file databases again, and the gap class is guarded at three layers.
+
+The 0.3.8 dep-pin hardening ([`3444c9a34`](https://github.com/Dicklesworthstone/frankensqlite/commit/3444c9a34)) set `default-features = false` on the workspace `fsqlite`/`fsqlite-core` specs. Leaf consumers relying on facade defaults (fsqlite-cli, fsqlite-c-api, fsqlite-harness; fsqlite-e2e transitively) silently lost `fsqlite-core/native`, compiling out the file-backed pager. Workspace-unified builds masked it (fsqlite-wasm's host-target dep re-enables the feature via unification); only solo `-p` builds — exactly what the dsr release build runs — exposed it, and the installer canary checked only `--version`.
+
+- Facade `native`/`linux-asupersync-uring` + extension features restored explicitly at all three leaf manifests. ([`63742e50f`](https://github.com/Dicklesworthstone/frankensqlite/commit/63742e50f))
+- `async-api` now implies fsqlite's own `native` feature, with a `compile_error!` tripwire in `fsqlite/src/lib.rs` rejecting any future `async-api`-without-`native` combination (GH#379). ([`b7807f90e`](https://github.com/Dicklesworthstone/frankensqlite/commit/b7807f90e))
+- Regression guards that run in solo `-p` builds: `test_file_backed_database_roundtrip` (fsqlite-cli) and `test_open_named_file_database_roundtrip` (fsqlite-c-api); the release gate now runs both crates' suites solo, and the release smoke includes a file-DB roundtrip.
 
 ### Windows read-only open regression (GH#438 downstream)
 
@@ -69,14 +82,23 @@ The 0.3.7 change that made Windows read-only opens sidecar-less (`os_locks: None
 ### SQL correctness & stock-parity continuation
 
 - UPSERT `DO UPDATE SET` evaluates correlated subqueries, `excluded.*` references, and CASE bare columns correctly. ([`bcaad2502`](https://github.com/Dicklesworthstone/frankensqlite/commit/bcaad2502))
+- UPSERT with multiple `ON CONFLICT` clauses routes each clause to its own conflict target — on rowid tables and on WITHOUT ROWID tables. ([`9847fb9d1`](https://github.com/Dicklesworthstone/frankensqlite/commit/9847fb9d1), [`900cfc283`](https://github.com/Dicklesworthstone/frankensqlite/commit/900cfc283))
+- A conflicting `ON CONFLICT DO UPDATE` fires BEFORE/AFTER **UPDATE** triggers (and suppresses AFTER INSERT), matching stock's resolved-action trigger semantics. ([`da07da1bd`](https://github.com/Dicklesworthstone/frankensqlite/commit/da07da1bd))
+- Row-value against a scalar subquery — `(a,b) = (SELECT x,y ...)` — compares the subquery's row value instead of never matching. ([`cde3a8e82`](https://github.com/Dicklesworthstone/frankensqlite/commit/cde3a8e82))
+- FTS5 `rank MATCH 'bm25(...)'` / `rank = '<ranking>'` custom-ranking assignment re-ranks instead of returning empty. ([`0c202552a`](https://github.com/Dicklesworthstone/frankensqlite/commit/0c202552a))
 - Three-part `schema.table.column` references resolve end to end. ([`b00c66feb`](https://github.com/Dicklesworthstone/frankensqlite/commit/b00c66feb))
 - Bounded integrity validation covers WITHOUT ROWID foreign keys (GH#341 part 3). ([`257da1f12`](https://github.com/Dicklesworthstone/frankensqlite/commit/257da1f12))
 - JOIN projections emit `Rowid` for integer-primary-key columns; shadowed-`main` resolution splits correctly when a `temp` table shares the name; attached-target UPDATEs materialize cross-schema subqueries; lateral `json_each` oracle tests activated. ([`0bbe20448`](https://github.com/Dicklesworthstone/frankensqlite/commit/0bbe20448), [`06d4f90c2`](https://github.com/Dicklesworthstone/frankensqlite/commit/06d4f90c2), [`194989b25`](https://github.com/Dicklesworthstone/frankensqlite/commit/194989b25), [`1cf28a433`](https://github.com/Dicklesworthstone/frankensqlite/commit/1cf28a433))
-- Error-message parity: parser expected/unexpected and row-value arity errors match stock `near "X"` / verbatim text; unexpected characters and bare parameter prefixes report `unrecognized token`; aggregate/window misuse validation runs on all prepared SELECT fast lanes. ([`901a30eaa`](https://github.com/Dicklesworthstone/frankensqlite/commit/901a30eaa), [`f99897c55`](https://github.com/Dicklesworthstone/frankensqlite/commit/f99897c55), [`555bb131c`](https://github.com/Dicklesworthstone/frankensqlite/commit/555bb131c), [`3b6e1fb31`](https://github.com/Dicklesworthstone/frankensqlite/commit/3b6e1fb31))
+- Error-message parity: parser expected/unexpected and row-value arity errors match stock `near "X"` / verbatim text; unexpected characters and bare parameter prefixes report `unrecognized token`; aggregate/window misuse validation runs on all prepared SELECT fast lanes; trigger-body DML restrictions match stock near-X/verbatim; `CREATE INDEX`/`VIEW`/`TRIGGER` with a reserved `sqlite_` name is rejected with stock text. ([`901a30eaa`](https://github.com/Dicklesworthstone/frankensqlite/commit/901a30eaa), [`f99897c55`](https://github.com/Dicklesworthstone/frankensqlite/commit/f99897c55), [`555bb131c`](https://github.com/Dicklesworthstone/frankensqlite/commit/555bb131c), [`3b6e1fb31`](https://github.com/Dicklesworthstone/frankensqlite/commit/3b6e1fb31), [`6bfba935b`](https://github.com/Dicklesworthstone/frankensqlite/commit/6bfba935b), [`10cb68269`](https://github.com/Dicklesworthstone/frankensqlite/commit/10cb68269))
+
+### C API & async surface
+
+- `sqlite3_bind_*` parameter surface added to the C API shim (int/int64/double/text/blob/null + parameter-count/name/index introspection), closing the prepare/step/column-only gap. ([`ba0c829fd`](https://github.com/Dicklesworthstone/frankensqlite/commit/ba0c829fd))
+- Session extension exposes an async-api surface behind the feature flag. ([`b7807f90e`](https://github.com/Dicklesworthstone/frankensqlite/commit/b7807f90e))
 
 ### Performance & observability
 
-- Trigger `WHEN` correlated-subquery guards no longer pay an unamortized linear `EXISTS` probe on large children (gated to small children; the planner index-seek remainder of GH#377 stays tracked). ([`778d96e24`](https://github.com/Dicklesworthstone/frankensqlite/commit/778d96e24))
+- Trigger `WHEN` correlated-subquery guards no longer pay an unamortized linear `EXISTS` probe on large children (gated to small children; the planner index-seek remainder of GH#377 stays tracked), and multi-conjunct `IndexEquality` directives lower via labeled conjunct extraction. ([`778d96e24`](https://github.com/Dicklesworthstone/frankensqlite/commit/778d96e24), [`dd210b763`](https://github.com/Dicklesworthstone/frankensqlite/commit/dd210b763))
 - The `/metrics` serve loop has a write timeout, so a stalled scraper cannot wedge the exporter. ([`2b6ead826`](https://github.com/Dicklesworthstone/frankensqlite/commit/2b6ead826))
 
 ---
