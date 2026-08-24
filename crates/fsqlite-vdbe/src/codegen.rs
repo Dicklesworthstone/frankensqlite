@@ -3848,6 +3848,51 @@ pub fn codegen_select(
         );
     }
 
+    // bd-nd2ju (#377, L2): WITHOUT ROWID PRIMARY KEY point lookup for the two
+    // shapes the single-column bare-`pk = const` L1 hoist above leaves as full
+    // scans — a composite full-key equality (`WHERE a = ? AND b = ?` on a
+    // multi-column PK) and `pk = <const> AND <residual>`. The PK is the table
+    // b-tree, so an equality on every PK column is one `NoConflict` probe; a
+    // trailing residual is re-applied per positioned row. Requires an equality
+    // target for EVERY PK column (a partial-key prefix is a range, not a point
+    // probe — future scope). Same guards as L1; only reached when L1 declined
+    // (multi-column PK, or a WHERE that is not a bare single equality). EQP
+    // flips SCAN->SEARCH through the same program-verified `FullTableScan` arm.
+    if table.without_rowid
+        && !is_aggregate
+        && from_index_hint.is_none()
+        && time_travel.is_none()
+        && stmt.order_by.is_empty()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && !has_window_columns(columns)
+        && ctx.planner_select_directive.as_ref().is_none_or(|d| {
+            d.table_name.eq_ignore_ascii_case(&table.name)
+                && matches!(d.access_kind, PlannerSelectAccessKind::FullTableScan)
+        })
+        && let Some((pk_targets, residual_filter)) =
+            wr_pk_point_seek_targets(table, where_clause.as_deref(), table_alias)
+    {
+        return codegen_select_without_rowid_pk_seek(
+            b,
+            cursor,
+            table,
+            table_alias,
+            time_travel,
+            schema,
+            columns,
+            where_clause.as_deref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            stmt.limit.as_ref(),
+            &pk_targets,
+            residual_filter,
+        );
+    }
+
     if let Some(directive) = ctx.planner_select_directive.as_ref() {
         let bypass_reason = if !directive.table_name.eq_ignore_ascii_case(&table.name) {
             Some("table_mismatch")
@@ -4751,6 +4796,133 @@ fn codegen_select_without_rowid_pk_lookup(
     // `NoConflict` jumps when no row carries this PK; a match falls through with
     // the table cursor positioned on that row (the WR table b-tree is PK-keyed).
     b.emit_jump_to_label(Opcode::NoConflict, cursor, pk_rec, done_label, P4::None, 0);
+
+    let skip_label = b.emit_label();
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+    b.resolve_label(skip_label);
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Point lookup on a WITHOUT ROWID table's (possibly composite) PRIMARY KEY,
+/// with an optional per-row residual filter (bd-nd2ju / #377, L2).
+///
+/// Generalizes [`codegen_select_without_rowid_pk_lookup`] (L1's sole
+/// single-column `pk = const` shape) to two further shapes the L1 hoist leaves
+/// as full scans:
+///  - a *composite* full-key equality (`WHERE a = ? AND b = ?` on `PRIMARY KEY
+///    (a, b)`): the table b-tree is keyed by the full PK, so an equality on
+///    every PK column is a single `NoConflict` probe against the
+///    multi-field key record;
+///  - `pk = <const> AND <residual>` (single- or multi-column PK plus extra
+///    conjunct(s)): the PK probe positions the cursor and the full WHERE is
+///    re-applied per row so the residual stays enforced.
+///
+/// The probe record is built in [`without_rowid_pk_indices`] order (PRIMARY KEY
+/// declared order), matching the physical key `emit_wr_record` stores and the
+/// `NoConflict` probe `emit_without_rowid_index_to_table_seek` already uses on
+/// the WR upsert / index-to-table paths. Each field takes its PK column's
+/// affinity so an integer key probed by text `'5'` (or the reverse) still hits.
+/// `residual_filter` re-runs the whole `where_clause` — including the PK
+/// equalities, which are then redundant but harmless — so the seek only has to
+/// *narrow* candidates, never fully implement the predicate.
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_without_rowid_pk_seek(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    time_travel: Option<&TimeTravelClause>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    limit_clause: Option<&LimitClause>,
+    pk_targets: &[&Expr],
+    residual_filter: bool,
+) -> Result<(), CodegenError> {
+    let pk_indices = without_rowid_pk_indices(table)?;
+    if pk_indices.len() != pk_targets.len() {
+        return Err(CodegenError::Unsupported(
+            "WITHOUT ROWID PK point seek requires one equality target per PK column".to_owned(),
+        ));
+    }
+    let n_pk = pk_indices.len();
+
+    // Capture the anon-placeholder counter BEFORE emitting the seek keys /
+    // LIMIT, mirroring `codegen_select_index_equality_scan`: the residual
+    // re-emits the full WHERE with the counter reset to this base so a `?`
+    // there numbers identically to the plain full-scan filter it stands in for.
+    let where_placeholder_base = b.current_anon_placeholder();
+
+    // `emit_limit_offset_registers` may jump to `done_label` for a literal
+    // `LIMIT 0`, reaching the `Close` below on a not-yet-open cursor — a no-op,
+    // the same benign ordering `codegen_select_without_rowid_pk_lookup` uses.
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
+
+    let pk_regs = b.alloc_regs(n_pk as i32);
+    for (j, (&col_idx, &target)) in pk_indices.iter().zip(pk_targets.iter()).enumerate() {
+        let dst = pk_regs + j as i32;
+        emit_expr(b, target, dst, None);
+        // Match the stored key's storage class (see the L1 lookup's affinity
+        // note); skip the op when the operand already carries it.
+        let pk_affinity = table.columns[col_idx].affinity;
+        if matches!(pk_affinity, 'B' | 'C' | 'D' | 'E') && !bound_matches_affinity(pk_affinity, target)
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                dst,
+                1,
+                0,
+                P4::Affinity(pk_affinity.to_string()),
+                0,
+            );
+        }
+    }
+
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    emit_set_snapshot(b, cursor, time_travel);
+
+    // Any NULL PK field cannot match a WITHOUT ROWID key (PK columns are NOT
+    // NULL): empty result. Emitted after `OpenRead` so the jump's `Close` sees
+    // an open cursor.
+    for j in 0..n_pk {
+        b.emit_jump_to_label(Opcode::IsNull, pk_regs + j as i32, 0, done_label, P4::None, 0);
+    }
+
+    let pk_rec = b.alloc_reg();
+    b.emit_op(Opcode::MakeRecord, pk_regs, n_pk as i32, pk_rec, P4::None, 0);
+    // `NoConflict` jumps when no row carries this full PK; a match falls through
+    // with the table cursor positioned on that row.
+    b.emit_jump_to_label(Opcode::NoConflict, cursor, pk_rec, done_label, P4::None, 0);
+
+    // Residual: re-apply the FULL WHERE on the positioned row so `pk = <const>
+    // AND <residual>` (and any duplicate-column equality) stays enforced. The
+    // probe matched at most one row, so this runs at most once.
+    if residual_filter && let Some(where_expr) = where_clause {
+        b.set_next_anon_placeholder(where_placeholder_base);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, done_label);
+    }
 
     let skip_label = b.emit_label();
     if let Some(off_r) = offset_reg {
@@ -30196,6 +30368,53 @@ fn extract_labeled_eq_conjunct_target<'a>(
         }
     }
     None
+}
+
+/// Resolve a WITHOUT ROWID PRIMARY KEY point-seek plan from a WHERE clause
+/// (bd-nd2ju / #377, L2).
+///
+/// A WITHOUT ROWID table's rows live in a b-tree keyed by the *full* PRIMARY
+/// KEY, so a `NoConflict` point probe requires an equality target for EVERY
+/// primary-key column — a partial-key prefix (`WHERE a = ?` on `PRIMARY KEY
+/// (a, b)`) is a b-tree range, not a point probe, and stays a scan (future
+/// scope). This walks the AND-tree for one `<pk-col> = <simple constant>`
+/// conjunct per PK column (via [`extract_labeled_eq_conjunct_target`], in
+/// PRIMARY KEY declared order to match [`without_rowid_pk_indices`] /
+/// `emit_wr_record` storage order); it returns `None` the moment any PK column
+/// is unconstrained.
+///
+/// The second tuple element is the residual-filter flag. Each PK column matched
+/// a *distinct* AND-leaf, so the flattened conjunct count is at least the PK
+/// width: it equals the width exactly when the WHERE is one equality per PK
+/// column and nothing else (the seek then fully implements the predicate,
+/// `residual = false`); a strict excess means extra conjunct(s) — `pk = <const>
+/// AND <residual>`, or a composite key with a trailing filter — that the caller
+/// re-applies per positioned row (`residual = true`). Residual re-application is
+/// always correctness-preserving (the point probe only narrows candidates), so
+/// `false` is reserved for the provably-complete shape.
+///
+/// The single-column bare `pk = const` shape is claimed earlier by the L1 hoist
+/// (`codegen_select_without_rowid_pk_lookup`) and never reaches here.
+fn wr_pk_point_seek_targets<'a>(
+    table: &TableSchema,
+    where_clause: Option<&'a Expr>,
+    table_alias: Option<&str>,
+) -> Option<(Vec<&'a Expr>, bool)> {
+    let where_expr = where_clause?;
+    let pk_group = table.primary_key_constraints.first()?;
+    if pk_group.is_empty() {
+        return None;
+    }
+    let mut targets = Vec::with_capacity(pk_group.len());
+    for pk_col in pk_group {
+        let target =
+            extract_labeled_eq_conjunct_target(Some(where_expr), table, table_alias, pk_col)?;
+        targets.push(target);
+    }
+    let mut conjuncts = Vec::new();
+    flatten_and_terms(where_expr, &mut conjuncts);
+    let residual_filter = conjuncts.len() != pk_group.len();
+    Some((targets, residual_filter))
 }
 
 fn extract_expression_index_equality_expr<'a>(
