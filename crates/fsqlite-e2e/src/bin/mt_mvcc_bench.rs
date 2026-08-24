@@ -2996,9 +2996,14 @@ fn valid_truth_settings(
     let null_c_b = uniform_effective_settings(&truth.null_c_b_samples, offered_writes_per_sample)?;
     let sqlite = uniform_effective_settings(&truth.sqlite_samples, offered_writes_per_sample)?;
     let fsqlite = uniform_effective_settings(&truth.fsqlite_samples, offered_writes_per_sample)?;
+    // bd-m80ic: the effective `synchronous` receipt is normalized lowercase
+    // (`SynchronousMode::receipt_value` / `normalized_synchronous`), so match
+    // the receipt form. a39fac896 introduced this arm checking uppercase
+    // "NORMAL"/"FULL", which never matched — the pass-over-pass gate then
+    // always fell through to no_prior_report.
     let synchronous = match sqlite.synchronous.as_str() {
-        "NORMAL" => SynchronousMode::Normal,
-        "FULL" => SynchronousMode::Full,
+        "normal" => SynchronousMode::Normal,
+        "full" => SynchronousMode::Full,
         _ => return None,
     };
     let expected_sqlite = expected_effective_settings(
