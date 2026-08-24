@@ -9093,6 +9093,22 @@ fn race_amplify_window_us() -> Option<u64> {
     })
 }
 
+/// bd-9inpb allocator-race hunt: env-gated RECLAMATION-COUNT amplifier
+/// (`FSQLITE_IOQ6X_RECLAIM_AMPLIFY`). When set, `adopt_in_range_disowned_pages`
+/// re-shares the in-range pages it just took back onto the shared ledger, so a
+/// concurrent peer's fold re-adopts the SAME pages. This deliberately breaks the
+/// "each disowned page is adopted by exactly one connection" invariant,
+/// recreating the reverted mirror cycle (adopt+re-share ~1000x/run) that cranks
+/// the number of cross-connection reclamation attempts on the same physical
+/// pages — the knob that surfaces the resurrection/double-grant face (one page
+/// granted to two b-trees: "2nd reference to page N" / "cell extends past usable
+/// page size"), as opposed to the window amplifier which surfaces the erasure
+/// face. `false` → inert (default). Diagnostic ONLY — never enable in prod/CI.
+fn reclaim_amplify_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FSQLITE_IOQ6X_RECLAIM_AMPLIFY").is_some())
+}
+
 fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling: u32) -> usize {
     if ioq6x_ledger_disabled() || inner.journal_mode != JournalMode::Wal {
         return 0;
@@ -9106,6 +9122,42 @@ fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling:
     let adopted = take_in_range_disowned_pages(&ledger, ceiling);
     if adopted.is_empty() {
         return 0;
+    }
+    // bd-9inpb reclamation-count amplifier (diagnostic, env-gated, default OFF).
+    // Re-share the just-taken in-range pages back onto the shared ledger so a
+    // concurrent peer's fold re-adopts the SAME pages: this recreates the
+    // reverted ~1000x mirror cycle and the multi-connection double-adopt that
+    // cranks reclamation attempts and surfaces the cross-connection double-grant.
+    // NEVER enable in prod/CI.
+    if reclaim_amplify_enabled() {
+        // Bounded to at most K re-shares PER PAGE (process-global counter) so the
+        // ledger eventually drains and the run terminates — an unbounded re-share
+        // livelocks (each reclaimed page is re-adopted forever, O(n^2) pool
+        // growth). K extra concurrent reclamations per page is enough to surface
+        // the cross-connection double-grant without the cycle.
+        const RECLAIM_AMPLIFY_K: u8 = 16;
+        static AMPLIFY_COUNT: OnceLock<Mutex<std::collections::HashMap<u32, u8>>> = OnceLock::new();
+        let counts = AMPLIFY_COUNT.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let mut cguard = counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut re_shared = 0_usize;
+        for page in &adopted {
+            let count = cguard.entry(page.get()).or_insert(0);
+            if *count < RECLAIM_AMPLIFY_K {
+                *count += 1;
+                guard.insert(page.get());
+                re_shared += 1;
+            }
+        }
+        drop(guard);
+        drop(cguard);
+        if re_shared > 0 && std::env::var_os("IOQ6X_TRACE").is_some() {
+            eprintln!("IOQ6X RECLAIM-AMPLIFY re_shared={re_shared}");
+        }
     }
     // Dedup against the current pool: two connections can disown the same
     // aborted EOF page (both optimistically grew to it, both rolled back), so a
