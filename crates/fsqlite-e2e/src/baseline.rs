@@ -29,7 +29,7 @@ pub const BENCHMARK_RECOVERY_REPORT_SCHEMA_V1: &str = "fsqlite-e2e.benchmark_rec
 pub const BASELINE_DIR: &str = "baselines/operations";
 
 /// Identifies one of the 9 primary database operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     /// Full table scan of N rows.
@@ -161,46 +161,206 @@ impl BaselineReport {
     ///
     /// Returns an error if the JSON is malformed or schema mismatches.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        let report: Self = serde_json::from_str(json)?;
+        if report.schema_version != BASELINE_SCHEMA_V1 {
+            return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                "unsupported operation baseline schema `{}`; expected `{BASELINE_SCHEMA_V1}`",
+                report.schema_version
+            )));
+        }
+        Ok(report)
     }
 
     /// Check for regressions between `self` (old baseline) and `current`
     /// (new measurements).
     ///
-    /// Returns a list of regressions where p50 latency increased by more
-    /// than `threshold` (e.g., 0.10 for 10%).
+    /// Returns one assessment for every unique operation-engine key present in
+    /// either report. A p50 latency increase greater than `threshold` (e.g.,
+    /// 0.10 for 10%) is a regression. Missing, duplicate, or incompatible
+    /// evidence is reported explicitly instead of being treated as green.
     #[must_use]
     pub fn check_regression(&self, current: &Self, threshold: f64) -> Vec<RegressionResult> {
-        let mut results = Vec::new();
+        let mut keys: Vec<(Operation, &str)> = self
+            .baselines
+            .iter()
+            .chain(&current.baselines)
+            .map(|baseline| (baseline.operation, baseline.engine.as_str()))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
 
-        for old in &self.baselines {
-            if let Some(new) = current
+        let mut report_findings = Vec::new();
+        if self.schema_version != BASELINE_SCHEMA_V1 || current.schema_version != BASELINE_SCHEMA_V1
+        {
+            report_findings.push(format!(
+                "both reports must use schema `{BASELINE_SCHEMA_V1}` (baseline: `{}`, current: `{}`)",
+                self.schema_version, current.schema_version
+            ));
+        }
+        if self.methodology != current.methodology {
+            report_findings.push("methodology metadata differs".to_owned());
+        }
+        if self.environment != current.environment {
+            report_findings.push("environment metadata differs".to_owned());
+        }
+        if !threshold.is_finite() || threshold < 0.0 {
+            report_findings
+                .push("regression threshold must be a finite, non-negative fraction".to_owned());
+        }
+        let report_finding = (!report_findings.is_empty()).then(|| report_findings.join("; "));
+
+        let mut results = Vec::with_capacity(keys.len());
+        for (operation, engine) in keys {
+            let baseline_entries: Vec<&OperationBaseline> = self
                 .baselines
                 .iter()
-                .find(|b| b.operation == old.operation && b.engine == old.engine)
-            {
-                let old_p50 = old.latency.p50_micros as f64;
-                let new_p50 = new.latency.p50_micros as f64;
+                .filter(|entry| entry.operation == operation && entry.engine == engine)
+                .collect();
+            let current_entries: Vec<&OperationBaseline> = current
+                .baselines
+                .iter()
+                .filter(|entry| entry.operation == operation && entry.engine == engine)
+                .collect();
 
-                let change = if old_p50 > 0.0 {
-                    (new_p50 - old_p50) / old_p50
-                } else {
-                    0.0
-                };
+            match (baseline_entries.as_slice(), current_entries.as_slice()) {
+                ([old], [new]) => {
+                    let mut incompatibilities = Vec::new();
+                    if let Some(report_finding) = &report_finding {
+                        incompatibilities.push(report_finding.clone());
+                    }
+                    if old.row_count != new.row_count {
+                        incompatibilities.push(format!(
+                            "row count differs (baseline: {}, current: {})",
+                            old.row_count, new.row_count
+                        ));
+                    }
+                    if old.iterations == 0 || new.iterations == 0 {
+                        incompatibilities
+                            .push("both reports must contain measured iterations".to_owned());
+                    } else if old.iterations != new.iterations {
+                        incompatibilities.push(format!(
+                            "measurement iteration count differs (baseline: {}, current: {})",
+                            old.iterations, new.iterations
+                        ));
+                    }
+                    if old.warmup_iterations != new.warmup_iterations {
+                        incompatibilities.push(format!(
+                            "warmup iteration count differs (baseline: {}, current: {})",
+                            old.warmup_iterations, new.warmup_iterations
+                        ));
+                    }
+                    if !latency_stats_are_ordered(&old.latency) {
+                        incompatibilities
+                            .push("baseline latency percentiles are not ordered".to_owned());
+                    }
+                    if !latency_stats_are_ordered(&new.latency) {
+                        incompatibilities
+                            .push("current latency percentiles are not ordered".to_owned());
+                    }
 
-                results.push(RegressionResult {
-                    operation: old.operation,
-                    engine: old.engine.clone(),
-                    baseline_p50_micros: old.latency.p50_micros,
-                    current_p50_micros: new.latency.p50_micros,
-                    change_pct: change * 100.0,
-                    regressed: change > threshold,
-                });
+                    if !incompatibilities.is_empty() {
+                        results.push(RegressionResult {
+                            operation,
+                            engine: engine.to_owned(),
+                            baseline_p50_micros: Some(old.latency.p50_micros),
+                            current_p50_micros: Some(new.latency.p50_micros),
+                            change_pct: None,
+                            status: RegressionStatus::NotComparable,
+                            reason: Some(incompatibilities.join("; ")),
+                        });
+                        continue;
+                    }
+
+                    let old_p50 = old.latency.p50_micros;
+                    let new_p50 = new.latency.p50_micros;
+                    let (change_pct, status, reason) = if old_p50 == 0 {
+                        if new_p50 == 0 {
+                            (Some(0.0), RegressionStatus::Ok, None)
+                        } else {
+                            (
+                                None,
+                                RegressionStatus::Regression,
+                                Some(
+                                    "baseline p50 is zero, so the positive current latency is an unbounded regression"
+                                        .to_owned(),
+                                ),
+                            )
+                        }
+                    } else {
+                        let change = if new_p50 >= old_p50 {
+                            (new_p50 - old_p50) as f64 / old_p50 as f64
+                        } else {
+                            -((old_p50 - new_p50) as f64 / old_p50 as f64)
+                        };
+                        let status = if change > threshold {
+                            RegressionStatus::Regression
+                        } else {
+                            RegressionStatus::Ok
+                        };
+                        (Some(change * 100.0), status, None)
+                    };
+
+                    results.push(RegressionResult {
+                        operation,
+                        engine: engine.to_owned(),
+                        baseline_p50_micros: Some(old_p50),
+                        current_p50_micros: Some(new_p50),
+                        change_pct,
+                        status,
+                        reason,
+                    });
+                }
+                (baseline_entries, current_entries) => {
+                    let mut findings = Vec::new();
+                    if let Some(finding) =
+                        invalid_entry_count_finding("baseline", baseline_entries.len())
+                    {
+                        findings.push(finding);
+                    }
+                    if let Some(finding) =
+                        invalid_entry_count_finding("current", current_entries.len())
+                    {
+                        findings.push(finding);
+                    }
+                    results.push(RegressionResult {
+                        operation,
+                        engine: engine.to_owned(),
+                        baseline_p50_micros: match baseline_entries {
+                            [entry] => Some(entry.latency.p50_micros),
+                            _ => None,
+                        },
+                        current_p50_micros: match current_entries {
+                            [entry] => Some(entry.latency.p50_micros),
+                            _ => None,
+                        },
+                        change_pct: None,
+                        status: RegressionStatus::Missing,
+                        reason: Some(findings.join("; ")),
+                    });
+                }
             }
         }
 
         results
     }
+}
+
+fn invalid_entry_count_finding(report: &str, count: usize) -> Option<String> {
+    match count {
+        1 => None,
+        0 => Some(format!(
+            "{report} report is missing this operation-engine key"
+        )),
+        _ => Some(format!(
+            "{report} report contains {count} entries for this operation-engine key; expected exactly one"
+        )),
+    }
+}
+
+const fn latency_stats_are_ordered(latency: &LatencyStats) -> bool {
+    latency.p50_micros <= latency.p95_micros
+        && latency.p95_micros <= latency.p99_micros
+        && latency.p99_micros <= latency.max_micros
 }
 
 /// Probe IDs for benchmark-catastrophe recovery slices that need explicit
@@ -591,6 +751,31 @@ pub fn render_benchmark_recovery_markdown(report: &BenchmarkRecoveryReport) -> S
     out
 }
 
+/// Verdict for one operation-engine baseline assessment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegressionStatus {
+    /// Comparable evidence stayed within the configured threshold.
+    Ok,
+    /// Comparable evidence exceeded the configured threshold.
+    Regression,
+    /// One side is absent or has ambiguous duplicate entries.
+    Missing,
+    /// Both sides exist, but their evidence contracts are incompatible.
+    NotComparable,
+}
+
+impl RegressionStatus {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Regression => "REGRESSION",
+            Self::Missing => "MISSING",
+            Self::NotComparable => "NOT COMPARABLE",
+        }
+    }
+}
+
 /// Result of comparing one operation's baseline against current measurements.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegressionResult {
@@ -598,32 +783,54 @@ pub struct RegressionResult {
     pub operation: Operation,
     /// Which engine.
     pub engine: String,
-    /// Baseline p50 latency in microseconds.
-    pub baseline_p50_micros: u64,
-    /// Current p50 latency in microseconds.
-    pub current_p50_micros: u64,
-    /// Percentage change (positive = slower).
-    pub change_pct: f64,
-    /// Whether this exceeds the regression threshold.
-    pub regressed: bool,
+    /// Baseline p50 latency in microseconds, when uniquely identified.
+    pub baseline_p50_micros: Option<u64>,
+    /// Current p50 latency in microseconds, when uniquely identified.
+    pub current_p50_micros: Option<u64>,
+    /// Percentage change (positive = slower), when comparison is defined.
+    pub change_pct: Option<f64>,
+    /// Assessment verdict.
+    pub status: RegressionStatus,
+    /// Explanation for non-numeric or otherwise exceptional assessments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl RegressionResult {
+    /// Whether this assessment prevents accepting the current report as green.
+    #[must_use]
+    pub const fn blocks_acceptance(&self) -> bool {
+        !matches!(self.status, RegressionStatus::Ok)
+    }
+
     /// Human-readable summary line.
     #[must_use]
     pub fn summary(&self) -> String {
-        let dir = if self.change_pct >= 0.0 { "+" } else { "" };
-        let status = if self.regressed { "REGRESSION" } else { "ok" };
-        format!(
-            "[{}] {} ({}): {}us -> {}us ({}{:.1}%)",
-            status,
-            self.operation.display_name(),
-            self.engine,
+        if let (Some(baseline), Some(current), Some(change)) = (
             self.baseline_p50_micros,
             self.current_p50_micros,
-            dir,
             self.change_pct,
-        )
+        ) {
+            let dir = if change >= 0.0 { "+" } else { "" };
+            format!(
+                "[{}] {} ({}): {}us -> {}us ({}{:.1}%)",
+                self.status.label(),
+                self.operation.display_name(),
+                self.engine,
+                baseline,
+                current,
+                dir,
+                change,
+            )
+        } else {
+            format!(
+                "[{}] {} ({}): {}",
+                self.status.label(),
+                self.operation.display_name(),
+                self.engine,
+                self.reason.as_deref().unwrap_or("comparison unavailable"),
+            )
+        }
     }
 }
 
@@ -739,6 +946,29 @@ fn percentile(sorted: &[u64], pct: u32) -> u64 {
 mod tests {
     use super::*;
 
+    fn test_baseline(row_count: u64, p50_micros: u64) -> OperationBaseline {
+        OperationBaseline {
+            operation: Operation::PointLookup,
+            engine: "frankensqlite".to_owned(),
+            row_count,
+            iterations: 100,
+            warmup_iterations: 10,
+            latency: LatencyStats {
+                p50_micros,
+                p95_micros: p50_micros.saturating_mul(2),
+                p99_micros: p50_micros.saturating_mul(3),
+                max_micros: p50_micros.saturating_mul(5),
+            },
+            throughput_ops_per_sec: 10_000.0,
+        }
+    }
+
+    fn report_with(baselines: Vec<OperationBaseline>) -> BaselineReport {
+        let mut report = BaselineReport::new("test");
+        report.baselines = baselines;
+        report
+    }
+
     #[test]
     fn operation_all_returns_nine() {
         assert_eq!(Operation::all().len(), 9);
@@ -783,6 +1013,218 @@ mod tests {
     }
 
     #[test]
+    fn baseline_report_rejects_unknown_schema() {
+        let report = BaselineReport::new("test");
+        let mut json = serde_json::to_value(report).unwrap();
+        json["schema_version"] =
+            serde_json::Value::String("fsqlite-e2e.operation_baseline.v999".to_owned());
+
+        let error = BaselineReport::from_json(&json.to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported operation baseline schema")
+        );
+        assert!(error.to_string().contains(BASELINE_SCHEMA_V1));
+    }
+
+    #[test]
+    fn regression_detection_reports_missing_current_evidence() {
+        let baseline = report_with(vec![test_baseline(1_000, 100)]);
+        let current = report_with(Vec::new());
+
+        let results = baseline.check_regression(&current, 0.10);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, RegressionStatus::Missing);
+        assert!(results[0].blocks_acceptance());
+        assert_eq!(results[0].baseline_p50_micros, Some(100));
+        assert_eq!(results[0].current_p50_micros, None);
+        assert!(
+            results[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("current report is missing"))
+        );
+    }
+
+    #[test]
+    fn regression_detection_reports_missing_baseline_evidence() {
+        let baseline = report_with(Vec::new());
+        let current = report_with(vec![test_baseline(1_000, 100)]);
+
+        let results = baseline.check_regression(&current, 0.10);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, RegressionStatus::Missing);
+        assert_eq!(results[0].baseline_p50_micros, None);
+        assert_eq!(results[0].current_p50_micros, Some(100));
+        assert!(
+            results[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("baseline report is missing"))
+        );
+    }
+
+    #[test]
+    fn regression_detection_reports_duplicate_evidence() {
+        let entry = test_baseline(1_000, 100);
+        let baseline = report_with(vec![entry.clone(), entry.clone()]);
+        let current = report_with(vec![entry.clone()]);
+
+        let results = baseline.check_regression(&current, 0.10);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, RegressionStatus::Missing);
+        assert_eq!(results[0].baseline_p50_micros, None);
+        assert_eq!(results[0].current_p50_micros, Some(100));
+        assert!(
+            results[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("baseline report contains 2 entries"))
+        );
+
+        let baseline = report_with(vec![entry.clone()]);
+        let current = report_with(vec![entry.clone(), entry]);
+        let results = baseline.check_regression(&current, 0.10);
+        assert_eq!(results[0].status, RegressionStatus::Missing);
+        assert!(
+            results[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("current report contains 2 entries"))
+        );
+    }
+
+    #[test]
+    fn regression_detection_rejects_incompatible_report_metadata() {
+        let baseline = report_with(vec![test_baseline(1_000, 100)]);
+
+        let mut methodology_mismatch = baseline.clone();
+        methodology_mismatch
+            .methodology
+            .version
+            .push_str(".different");
+        let methodology_results = baseline.check_regression(&methodology_mismatch, 0.10);
+        assert_eq!(
+            methodology_results[0].status,
+            RegressionStatus::NotComparable
+        );
+        assert!(
+            methodology_results[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("methodology metadata differs"))
+        );
+
+        let mut environment_mismatch = baseline.clone();
+        environment_mismatch.environment.arch.push_str("-different");
+        let environment_results = baseline.check_regression(&environment_mismatch, 0.10);
+        assert_eq!(
+            environment_results[0].status,
+            RegressionStatus::NotComparable
+        );
+        assert!(
+            environment_results[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("environment metadata differs"))
+        );
+    }
+
+    #[test]
+    fn regression_detection_rejects_incompatible_row_count() {
+        let baseline = report_with(vec![test_baseline(1_000, 100)]);
+        let current = report_with(vec![test_baseline(2_000, 120)]);
+
+        let results = baseline.check_regression(&current, 0.10);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, RegressionStatus::NotComparable);
+        assert_eq!(results[0].change_pct, None);
+        assert!(
+            results[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("row count differs"))
+        );
+    }
+
+    #[test]
+    fn regression_detection_rejects_incompatible_operation_methodology() {
+        let baseline = report_with(vec![test_baseline(1_000, 100)]);
+
+        let mut different_iterations = baseline.clone();
+        different_iterations.baselines[0].iterations += 1;
+        let results = baseline.check_regression(&different_iterations, 0.10);
+        assert_eq!(results[0].status, RegressionStatus::NotComparable);
+        assert!(
+            results[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("measurement iteration count differs"))
+        );
+
+        let mut different_warmup = baseline.clone();
+        different_warmup.baselines[0].warmup_iterations += 1;
+        let results = baseline.check_regression(&different_warmup, 0.10);
+        assert_eq!(results[0].status, RegressionStatus::NotComparable);
+        assert!(
+            results[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("warmup iteration count differs"))
+        );
+
+        let mut invalid_percentiles = baseline.clone();
+        invalid_percentiles.baselines[0].latency.p95_micros = 99;
+        let results = baseline.check_regression(&invalid_percentiles, 0.10);
+        assert_eq!(results[0].status, RegressionStatus::NotComparable);
+        assert!(
+            results[0].reason.as_deref().is_some_and(
+                |reason| reason.contains("current latency percentiles are not ordered")
+            )
+        );
+    }
+
+    #[test]
+    fn regression_detection_rejects_invalid_threshold() {
+        let baseline = report_with(vec![test_baseline(1_000, 100)]);
+        let current = baseline.clone();
+
+        for threshold in [f64::NAN, f64::INFINITY, -0.01] {
+            let results = baseline.check_regression(&current, threshold);
+            assert_eq!(results[0].status, RegressionStatus::NotComparable);
+            assert!(results[0].blocks_acceptance());
+        }
+    }
+
+    #[test]
+    fn regression_detection_treats_positive_latency_after_zero_as_unbounded() {
+        let baseline = report_with(vec![test_baseline(1_000, 0)]);
+        let current = report_with(vec![test_baseline(1_000, 1)]);
+
+        let results = baseline.check_regression(&current, 0.10);
+
+        assert_eq!(results[0].status, RegressionStatus::Regression);
+        assert_eq!(results[0].change_pct, None);
+        assert!(results[0].blocks_acceptance());
+    }
+
+    #[test]
+    fn regression_detection_preserves_tiny_change_at_max_latency() {
+        let baseline = report_with(vec![test_baseline(1_000, u64::MAX - 1)]);
+        let current = report_with(vec![test_baseline(1_000, u64::MAX)]);
+
+        let results = baseline.check_regression(&current, 0.0);
+
+        assert_eq!(results[0].status, RegressionStatus::Regression);
+        assert!(results[0].change_pct.is_some_and(|change| change > 0.0));
+    }
+
+    #[test]
     fn regression_detection_flags_increase() {
         let mut old = BaselineReport::new("test");
         old.baselines.push(OperationBaseline {
@@ -819,8 +1261,8 @@ mod tests {
 
         let results = old.check_regression(&current, 0.10);
         assert_eq!(results.len(), 1);
-        assert!(results[0].regressed);
-        assert!((results[0].change_pct - 20.0).abs() < 0.1);
+        assert_eq!(results[0].status, RegressionStatus::Regression);
+        assert!((results[0].change_pct.unwrap() - 20.0).abs() < 0.1);
     }
 
     #[test]
@@ -860,7 +1302,7 @@ mod tests {
 
         let results = old.check_regression(&current, 0.10);
         assert_eq!(results.len(), 1);
-        assert!(!results[0].regressed);
+        assert_eq!(results[0].status, RegressionStatus::Ok);
     }
 
     #[test]
@@ -900,7 +1342,7 @@ mod tests {
 
         let results = old.check_regression(&current, 0.10);
         assert_eq!(results.len(), 1);
-        assert!(!results[0].regressed);
+        assert_eq!(results[0].status, RegressionStatus::Ok);
     }
 
     #[test]
@@ -1081,10 +1523,11 @@ mod tests {
         let result = RegressionResult {
             operation: Operation::SequentialScan,
             engine: "frankensqlite".to_owned(),
-            baseline_p50_micros: 100,
-            current_p50_micros: 115,
-            change_pct: 15.0,
-            regressed: true,
+            baseline_p50_micros: Some(100),
+            current_p50_micros: Some(115),
+            change_pct: Some(15.0),
+            status: RegressionStatus::Regression,
+            reason: None,
         };
         let summary = result.summary();
         assert!(summary.contains("REGRESSION"));
