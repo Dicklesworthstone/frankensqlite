@@ -816,6 +816,9 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
         conn.query("PRAGMA wal_checkpoint(TRUNCATE)")
             .await
             .expect("GH#289 seed checkpoint");
+        conn.close()
+            .await
+            .expect("GH#289 awaited seed close before stock repack");
     });
 
     gh289_stock_repack(&path);
@@ -869,7 +872,7 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
                                     errors.lock().unwrap().push(format!(
                                         "reader {reader_id} observed out-of-order autoindex keys"
                                     ));
-                                    return;
+                                    break;
                                 }
                             }
                             Err(error) if cc_is_transient(&error) => {}
@@ -878,10 +881,16 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
                                     .lock()
                                     .unwrap()
                                     .push(format!("reader {reader_id} index scan failed: {error}"));
-                                return;
+                                break;
                             }
                         }
                         std::thread::yield_now();
+                    }
+                    if let Err(error) = conn.close().await {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("reader {reader_id} close failed: {error}"));
                     }
                 });
             })
@@ -955,6 +964,9 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
                     );
                 }
             }
+            conn.close()
+                .await
+                .expect("GH#289 awaited writer close before final checkpoint reopen");
         });
     }));
 
@@ -980,6 +992,10 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
             .query("PRAGMA wal_checkpoint(TRUNCATE)")
             .await
             .expect("GH#289 final FrankenSQLite checkpoint after readers stopped");
+        final_checkpoint
+            .close()
+            .await
+            .expect("GH#289 awaited final checkpoint close before stock verification");
     });
 
     gh289_assert_stock_canonical(&path, seed_rows + transactions * ROWS_PER_TRANSACTION);
