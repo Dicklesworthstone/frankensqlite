@@ -222541,6 +222541,72 @@ mod pager_routing_tests {
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(11));
         });
     }
+    // bd-kwaam (#377): the planner emits IndexEquality for a directive key
+    // column that appears as ONE CONJUNCT of a larger WHERE, but codegen's
+    // bare-Eq extractor only matched single-term predicates — every multi-term
+    // equality bypassed to a heuristic full scan, catastrophically on WITHOUT
+    // ROWID tables which have no other indexed path. The directive must lower
+    // through the residual-filtering seek emitter on BOTH shapes.
+    #[test]
+    fn test_wor_composite_unique_conjunct_equality_seeks_on_both_shapes() {
+        asupersync::test_utils::run_test(|| async {
+            for suffix in [" WITHOUT ROWID", ""] {
+                let conn = Connection::open(":memory:").await.unwrap();
+                conn.execute(&format!(
+                    "CREATE TABLE facts (id TEXT PRIMARY KEY NOT NULL, cap TEXT NOT NULL, \
+                     ord INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(cap, ord)){suffix};"
+                ))
+                .await
+                .unwrap();
+                conn.execute("INSERT INTO facts VALUES ('a','c',1,'keep1');")
+                    .await
+                    .unwrap();
+                conn.execute("INSERT INTO facts VALUES ('b','c',2,'drop2');")
+                    .await
+                    .unwrap();
+
+                let (statement, _) = fsqlite_parser::parse_first_statement_with_tail(
+                    "SELECT payload FROM facts WHERE cap = 'c' AND ord = 1",
+                )
+                .unwrap()
+                .unwrap();
+                let Statement::Select(select) = statement else {
+                    panic!("expected a SELECT statement");
+                };
+                let program = conn.compile_table_select(&select).await.unwrap();
+                let seeks =
+                    crate::explain::program_seeks_named_index(&program, "sqlite_autoindex_facts_2");
+                assert!(
+                    seeks,
+                    "composite conjunct equality must seek the UNIQUE autoindex ({suffix:?})"
+                );
+
+                let rows = conn
+                    .query("SELECT payload FROM facts WHERE cap = 'c' AND ord = 1")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "residual conjunct ord = 1 must filter the duplicate-cap run ({suffix:?})"
+                );
+                assert_eq!(
+                    rows[0].values(),
+                    &[SqliteValue::Text("keep1".into())],
+                    "wrong row returned by the residual-filtered seek ({suffix:?})"
+                );
+
+                let absent = conn
+                    .query("SELECT payload FROM facts WHERE cap = 'c' AND ord = 9")
+                    .await
+                    .unwrap();
+                assert!(
+                    absent.is_empty(),
+                    "no row may survive both conjuncts when none matches ({suffix:?})"
+                );
+            }
+        });
+    }
 
     #[test]
     fn test_ifnull_aggregate() {

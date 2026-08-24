@@ -3993,6 +3993,45 @@ pub fn codegen_select(
                                         false,
                                     );
                                 }
+                            } else if !directive.index_key_is_expression
+                                && let Some(label) = directive.index_key_label.as_deref()
+                                && let Some(conjunct_target_expr) =
+                                    extract_labeled_eq_conjunct_target(
+                                        where_clause.as_deref(),
+                                        table,
+                                        table_alias,
+                                        label,
+                                    )
+                            {
+                                // bd-kwaam (#377): the directive's key column matched one
+                                // conjunct of a larger AND-tree. Lower through the same seek
+                                // emitter with the FULL WHERE re-applied per row
+                                // (`residual_filter = true`), so the remaining conjuncts
+                                // stay enforced.
+                                log_planner_select_directive_outcome(
+                                    directive,
+                                    "honored",
+                                    "none",
+                                    "index_equality_probe_residual",
+                                );
+                                return codegen_select_index_equality_scan(
+                                    b,
+                                    cursor,
+                                    table,
+                                    table_alias,
+                                    schema,
+                                    columns,
+                                    where_clause.as_deref(),
+                                    stmt.limit.as_ref(),
+                                    out_regs,
+                                    out_col_count,
+                                    done_label,
+                                    end_label,
+                                    idx_schema,
+                                    conjunct_target_expr,
+                                    true,
+                                    false,
+                                );
                             } else {
                                 Some("index_equality_target_missing")
                             }
@@ -29947,6 +29986,61 @@ fn extract_column_eq_target<'a>(
             && is_simple_constant(left)
         {
             return Some((col_name, left));
+        }
+    }
+    None
+}
+
+/// Extract the `<directive-key-column> = <simple constant>` conjunct from a
+/// conjunction-shaped WHERE clause (bd-kwaam / #377).
+///
+/// The planner classifies equality terms inside AND-trees when it emits an
+/// `IndexEquality` directive, but [`extract_column_eq_target`] only matches
+/// single-term predicates, so every multi-term guard (`cap = ? AND ord = ?`
+/// against a composite UNIQUE index) used to bypass the seek to a heuristic
+/// full scan — catastrophically on WITHOUT ROWID tables, which have no other
+/// indexed path. This recovers the directive's own conjunct; callers lower it
+/// through the residual-filtering emitter so the remaining conjuncts stay
+/// enforced. OR subtrees are skipped: a disjunction is not an equality
+/// conjunct and must keep declining.
+fn extract_labeled_eq_conjunct_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    key_label: &str,
+) -> Option<&'a Expr> {
+    let mut stack = vec![where_clause?];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            Expr::BinaryOp {
+                op: fsqlite_ast::BinaryOp::And,
+                left,
+                right,
+                ..
+            } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::BinaryOp {
+                left,
+                op: fsqlite_ast::BinaryOp::Eq,
+                right,
+                ..
+            } => {
+                if let Some(col_name) = column_name(left, table, table_alias)
+                    && col_name.eq_ignore_ascii_case(key_label)
+                    && is_simple_constant(right)
+                {
+                    return Some(right);
+                }
+                if let Some(col_name) = column_name(right, table, table_alias)
+                    && col_name.eq_ignore_ascii_case(key_label)
+                    && is_simple_constant(left)
+                {
+                    return Some(left);
+                }
+            }
+            _ => {}
         }
     }
     None
