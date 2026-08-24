@@ -89,6 +89,10 @@ path = "src/bin/e2e_viewer.rs"
 required-features = ["tui"]
 
 [[bin]]
+name = "bench-report"
+path = "src/bin/bench_report.rs"
+
+[[bin]]
 name = "corruption-demo"
 path = "src/bin/corruption_demo.rs"
 
