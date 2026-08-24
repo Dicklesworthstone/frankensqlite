@@ -49,6 +49,35 @@ pub const PID_BIRTH_FILETIME_TAG: u64 = 1_u64 << 61;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 const PAYLOAD_MASK: u64 = !(PID_BIRTH_PROCFS_TAG | PID_BIRTH_SYSCTL_TAG | PID_BIRTH_FILETIME_TAG);
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+const fn has_exact_platform_tag(token: u64, expected_tag: u64) -> bool {
+    token & !PAYLOAD_MASK == expected_tag
+}
+
+/// Classification shared by the native probes after an OS call fails.
+///
+/// Only an error code that unambiguously means "no such process" may release
+/// shared ownership. Every other error remains ambiguous and therefore maps to
+/// [`ProcessLiveness::Unknown`] at the platform boundary.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeFailure {
+    Absent,
+    Ambiguous,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+const fn classify_probe_failure(
+    error_code: Option<i64>,
+    definitive_absence_code: i64,
+) -> ProbeFailure {
+    if matches!(error_code, Some(code) if code == definitive_absence_code) {
+        ProbeFailure::Absent
+    } else {
+        ProbeFailure::Ambiguous
+    }
+}
+
 /// The platform-tagged birth token for the current process, or `None` when the
 /// OS start time is unavailable (the caller then falls back to a time token).
 #[must_use]
@@ -99,7 +128,10 @@ pub fn process_alive(pid: u32, pid_birth: u64) -> ProcessLiveness {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{PAYLOAD_MASK, PID_BIRTH_SYSCTL_TAG, ProcessLiveness};
+    use super::{
+        PAYLOAD_MASK, PID_BIRTH_SYSCTL_TAG, ProbeFailure, ProcessLiveness, classify_probe_failure,
+        has_exact_platform_tag,
+    };
 
     /// Outcome of reading a process's start time via `sysctl`.
     enum StartTime {
@@ -115,37 +147,45 @@ mod macos {
     /// `proc_pidinfo(pid, PROC_PIDTBSDINFO)` -> `proc_bsdinfo.pbi_start_tv*`.
     /// (`libc` does not expose `kinfo_proc` on Darwin, so this uses libproc.)
     fn read_start_time_usec(pid: u32) -> StartTime {
-        // ubs:ignore - proc_bsdinfo is a plain-old-data C struct; a zeroed output
-        // buffer is the standard `proc_pidinfo` idiom, not an uninitialized read.
-        // SAFETY: `mem::zeroed()` is valid for `proc_bsdinfo` (all integer fields).
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        // SAFETY: `proc_pidinfo` writes at most `size` bytes into `info`, a live
-        // and correctly-sized `proc_bsdinfo`; it returns the byte count, or <= 0
-        // on error / no such process.
+        // `errno` is sticky. Clear this thread's Darwin errno slot so a zero
+        // return cannot inherit an unrelated earlier `ESRCH` and falsely
+        // authorize lease takeover.
+        // SAFETY: `__error` returns the current thread's writable errno slot.
+        unsafe { *libc::__error() = 0 };
+        // SAFETY: `proc_pidinfo` writes at most `size` bytes into the uninitialized,
+        // correctly sized output buffer; it returns the byte count, or <= 0 on
+        // error / no such process.
         let written = unsafe {
             libc::proc_pidinfo(
                 pid as libc::c_int,
                 libc::PROC_PIDTBSDINFO,
                 0,
-                std::ptr::from_mut(&mut info).cast(),
+                info.as_mut_ptr().cast(),
                 size,
             )
         };
+        // Apple libproc normalizes the underlying __proc_info -1 failure to a
+        // zero return, so errno must be captured immediately even when
+        // `written == 0`. A zero result alone does not prove that the PID is
+        // absent.
+        let error_code = (written <= 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten()
+            .map(i64::from);
         if written <= 0 {
-            // `proc_pidinfo` returns 0 or -1 (errno `ESRCH`) for a process that
-            // no longer exists; other errno values are ambiguous.
-            return if written == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
-                StartTime::Absent
-            } else {
-                StartTime::Error
+            return match classify_probe_failure(error_code, i64::from(libc::ESRCH)) {
+                ProbeFailure::Absent => StartTime::Absent,
+                ProbeFailure::Ambiguous => StartTime::Error,
             };
         }
         if written < size {
             return StartTime::Error;
         }
+        // SAFETY: a successful full-size `proc_pidinfo` result initialized the
+        // complete `proc_bsdinfo` output object.
+        let info = unsafe { info.assume_init() };
         let usec = info
             .pbi_start_tvsec
             .wrapping_mul(1_000_000)
@@ -165,9 +205,9 @@ mod macos {
             StartTime::Absent => ProcessLiveness::Dead,
             StartTime::Error => ProcessLiveness::Unknown,
             StartTime::Present(usec) => {
-                if pid_birth & PID_BIRTH_SYSCTL_TAG == 0 {
-                    // Untagged/legacy or foreign-platform token: cannot compare
-                    // start time, so stay conservative.
+                if !has_exact_platform_tag(pid_birth, PID_BIRTH_SYSCTL_TAG) {
+                    // Untagged/legacy, foreign-platform, or malformed multi-tag
+                    // token: cannot compare start time, so stay conservative.
                     return ProcessLiveness::Alive;
                 }
                 if (usec & PAYLOAD_MASK) == (pid_birth & PAYLOAD_MASK) {
@@ -182,9 +222,12 @@ mod macos {
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::{PAYLOAD_MASK, PID_BIRTH_FILETIME_TAG, ProcessLiveness};
+    use super::{
+        PAYLOAD_MASK, PID_BIRTH_FILETIME_TAG, ProbeFailure, ProcessLiveness,
+        classify_probe_failure, has_exact_platform_tag,
+    };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, FILETIME, GetLastError,
+        CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, GetLastError,
     };
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -194,9 +237,9 @@ mod windows_impl {
     enum Creation {
         /// Process exists; creation time in 100 ns ticks since 1601.
         Present(u64),
-        /// No such process (`OpenProcess` failed, not access-denied).
+        /// No such process (`OpenProcess` reported an invalid PID).
         Absent,
-        /// The probe failed ambiguously (access denied, or `GetProcessTimes`).
+        /// The probe failed ambiguously (`OpenProcess` or `GetProcessTimes`).
         Error,
     }
 
@@ -207,10 +250,12 @@ mod windows_impl {
         if handle.is_null() {
             // SAFETY: reads the calling thread's last-error, no arguments.
             let last = unsafe { GetLastError() };
-            return if last == ERROR_ACCESS_DENIED {
-                Creation::Error
-            } else {
-                Creation::Absent
+            return match classify_probe_failure(
+                Some(i64::from(last)),
+                i64::from(ERROR_INVALID_PARAMETER),
+            ) {
+                ProbeFailure::Absent => Creation::Absent,
+                ProbeFailure::Ambiguous => Creation::Error,
             };
         }
         let mut creation = FILETIME {
@@ -254,7 +299,7 @@ mod windows_impl {
             Creation::Absent => ProcessLiveness::Dead,
             Creation::Error => ProcessLiveness::Unknown,
             Creation::Present(ticks) => {
-                if pid_birth & PID_BIRTH_FILETIME_TAG == 0 {
+                if !has_exact_platform_tag(pid_birth, PID_BIRTH_FILETIME_TAG) {
                     return ProcessLiveness::Alive;
                 }
                 if (ticks & PAYLOAD_MASK) == (pid_birth & PAYLOAD_MASK) {
@@ -282,8 +327,62 @@ mod tests {
     }
 
     #[test]
+    fn platform_birth_tag_must_be_exact() {
+        assert!(has_exact_platform_tag(
+            PID_BIRTH_SYSCTL_TAG | 0x1234,
+            PID_BIRTH_SYSCTL_TAG
+        ));
+        assert!(!has_exact_platform_tag(0x1234, PID_BIRTH_SYSCTL_TAG));
+        assert!(!has_exact_platform_tag(
+            PID_BIRTH_FILETIME_TAG | 0x1234,
+            PID_BIRTH_SYSCTL_TAG
+        ));
+        assert!(!has_exact_platform_tag(
+            PID_BIRTH_SYSCTL_TAG | PID_BIRTH_FILETIME_TAG | 0x1234,
+            PID_BIRTH_SYSCTL_TAG
+        ));
+    }
+
+    #[test]
     fn pid_zero_is_dead() {
         assert_eq!(process_alive(0, 0), ProcessLiveness::Dead);
+    }
+
+    #[test]
+    fn macos_zero_probe_result_requires_esrch_to_prove_absence() {
+        assert_eq!(
+            classify_probe_failure(Some(i64::from(libc::ESRCH)), i64::from(libc::ESRCH)),
+            ProbeFailure::Absent
+        );
+        assert_eq!(
+            classify_probe_failure(Some(i64::from(libc::EACCES)), i64::from(libc::ESRCH)),
+            ProbeFailure::Ambiguous
+        );
+        assert_eq!(
+            classify_probe_failure(None, i64::from(libc::ESRCH)),
+            ProbeFailure::Ambiguous
+        );
+    }
+
+    #[test]
+    fn windows_open_process_resource_failure_is_ambiguous() {
+        const ERROR_INVALID_PARAMETER_CODE: i64 = 87;
+        const ERROR_NOT_ENOUGH_MEMORY_CODE: i64 = 8;
+
+        assert_eq!(
+            classify_probe_failure(
+                Some(ERROR_INVALID_PARAMETER_CODE),
+                ERROR_INVALID_PARAMETER_CODE
+            ),
+            ProbeFailure::Absent
+        );
+        assert_eq!(
+            classify_probe_failure(
+                Some(ERROR_NOT_ENOUGH_MEMORY_CODE),
+                ERROR_INVALID_PARAMETER_CODE
+            ),
+            ProbeFailure::Ambiguous
+        );
     }
 
     // The live probes below run only on the platforms they are implemented for;
@@ -329,10 +428,11 @@ mod tests {
     fn almost_certainly_dead_pid_reads_dead() {
         // A very high PID that is almost certainly not running. If it happens to
         // exist, the birth mismatch still yields Dead; either way, not Alive.
-        let verdict = process_alive(
-            0x7FFF_FFF0,
-            PID_BIRTH_SYSCTL_TAG | PID_BIRTH_FILETIME_TAG | 0x1234,
-        );
+        #[cfg(target_os = "macos")]
+        let platform_tag = PID_BIRTH_SYSCTL_TAG;
+        #[cfg(windows)]
+        let platform_tag = PID_BIRTH_FILETIME_TAG;
+        let verdict = process_alive(0x7FFF_FFF0, platform_tag | 0x1234);
         assert_ne!(verdict, ProcessLiveness::Alive);
     }
 }
