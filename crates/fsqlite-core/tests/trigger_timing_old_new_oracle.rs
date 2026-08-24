@@ -110,6 +110,30 @@ fn trigger_timing_common() {
 }
 
 #[test]
+fn trigger_body_table_aliases_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        state(
+            &[
+                "CREATE TABLE source(value INTEGER)",
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY, value INTEGER)",
+                "INSERT INTO audit VALUES (1, 10), (2, 20)",
+                "CREATE TRIGGER aliases AFTER INSERT ON source BEGIN \
+                 UPDATE audit AS update_target \
+                    SET value = update_target.value + NEW.value \
+                  WHERE update_target.id = 1; \
+                 INSERT INTO audit AS insert_target(id, value) VALUES (3, NEW.value); \
+                 DELETE FROM audit AS delete_target WHERE delete_target.id = 2; \
+                 END",
+            ],
+            "INSERT INTO source VALUES (7)",
+            "SELECT id, value FROM audit ORDER BY id",
+            "trigger-body INSERT, UPDATE, and DELETE aliases",
+        )
+        .await;
+    });
+}
+
+#[test]
 fn trigger_timing_adversarial() {
     asupersync::test_utils::run_test(|| async {
         state(&["CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)", AUD2, "INSERT INTO t VALUES (1, 10)",
