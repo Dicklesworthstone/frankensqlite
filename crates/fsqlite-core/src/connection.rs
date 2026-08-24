@@ -203175,6 +203175,17 @@ mod autocommit_txn_tests {
             })
         }
 
+        fn current_parallel_wal_db_size_floor<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<u32>> {
+            Box::pin(async move {
+                self.inner
+                    .current_parallel_wal_db_size_floor(cx)
+                    .await
+            })
+        }
+
         // Snapshot surface must mirror the real backend or the commit's
         // conflict metadata assembles without a publication snapshot and the
         // commit refuses before the injected append failure is reached
@@ -203432,6 +203443,17 @@ mod autocommit_txn_tests {
             Box::pin(async move {
                 self.inner
                     .latest_authorized_parallel_wal_commit_certificate(cx)
+                    .await
+            })
+        }
+
+        fn current_parallel_wal_db_size_floor<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<u32>> {
+            Box::pin(async move {
+                self.inner
+                    .current_parallel_wal_db_size_floor(cx)
                     .await
             })
         }
