@@ -305,7 +305,7 @@ tmp_rch_probe/
 .beads/*.backup.*
 .beads/*.bad_*
 .beads/*.backup_*
-.beads/*.rebuild_*
+.beads/*.rebuild*
 .beads/*.reindex_test_*
 .beads/*.vacuum_test_*
 .beads/recovery*/
@@ -413,4 +413,3 @@ crates/fsqlite-e2e/tests/*_ignored.rs
 # Skill-loop / repo-janitor scratch
 .skill-loop-progress.md
 .skill-loop-progress-*.md
-

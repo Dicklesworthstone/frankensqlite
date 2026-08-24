@@ -4,6 +4,7 @@
 *.db-wal
 *.db-wal-cert*
 *.db.schema-migration-*
+*.db.fsqlite-migration-state
 *.db-fsqlite-ns-gate
 *.db-fsqlite-ns-use
 *-fsqlite-ns-gate
