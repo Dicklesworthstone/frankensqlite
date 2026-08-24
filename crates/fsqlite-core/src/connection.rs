@@ -79007,6 +79007,79 @@ impl Connection {
         Some(Ok(SqliteValue::Integer(i64::from(truth))))
     }
 
+    /// bd-nd2ju (#377, L3): after outer-ref substitution, relax each correlated
+    /// equality `inner_col = <BoundOuterValue>` in a single-table EXISTS
+    /// subquery to `inner_col = <literal>` when the comparison contract is
+    /// provably the inner column's own — so the nested statement compiles to an
+    /// index / PRIMARY KEY seek instead of the full scan a `BoundOuterValue`
+    /// target forces (`is_simple_constant` deliberately excludes bound outer
+    /// values because their donor affinity/collation can otherwise skew a raw
+    /// b-tree probe into a subset/superset of the SQL equality result).
+    ///
+    /// A plain literal makes the comparison use the inner column's own affinity
+    /// and collation. That equals the bound-value comparison exactly when the
+    /// bound value donates the SAME collation the inner column already carries
+    /// (so operand order cannot change the winning collation) and no affinity —
+    /// or the same affinity as the inner column (so the applied comparison
+    /// affinity is the column's either way). Both are sufficient (conservative)
+    /// conditions: when either fails the bound value is left in place and the
+    /// interpreted per-row fallback still evaluates it correctly, just without
+    /// the seek. NULL targets are left alone.
+    ///
+    /// Scope is a single unqualified MAIN FROM table (no joins/CTE/compound)
+    /// with an AND-conjunction WHERE; each qualifying `col = bound` / `bound =
+    /// col` conjunct is relaxed in place.
+    fn relax_correlated_exists_equalities_for_seek(&self, select: &mut SelectStatement) {
+        if select.with.is_some() || !select.body.compounds.is_empty() {
+            return;
+        }
+        // Extract the single unqualified MAIN FROM table + binding name.
+        let (table_name, alias) = {
+            let SelectCore::Select {
+                from: Some(from),
+                where_clause: Some(_),
+                ..
+            } = &select.body.select
+            else {
+                return;
+            };
+            if !from.joins.is_empty() {
+                return;
+            }
+            match &from.source {
+                TableOrSubquery::Table { name, alias, .. } if name.schema.is_none() => {
+                    (name.name.clone(), alias.clone())
+                }
+                _ => return,
+            }
+        };
+        let table_key = table_name.to_ascii_lowercase();
+        // Namespace-shadowed / TEMP names need the resolver's routing; keep this
+        // to plain unshadowed MAIN tables (mirrors `try_direct_exists_probe`).
+        if self.temp_table_names.borrow().contains(&table_key)
+            || self.shadowed_main_tables.borrow().contains_key(&table_key)
+        {
+            return;
+        }
+        let Some(table) = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&table_name))
+            .cloned()
+        else {
+            return;
+        };
+        let SelectCore::Select {
+            where_clause: Some(where_expr),
+            ..
+        } = &mut select.body.select
+        else {
+            return;
+        };
+        relax_eq_conjunct_bound_outer(where_expr, &table, alias.as_deref());
+    }
+
     /// Substitute outer-row values with the connection's shadow-aware
     /// main/TEMP schema inventory available for unqualified name resolution.
     fn substitute_outer_refs_for_current_schema(
@@ -79226,6 +79299,12 @@ impl Connection {
                         col_map,
                         None,
                     );
+                    // bd-nd2ju (#377, L3): relax collation/affinity-safe correlated
+                    // equalities (`inner_col = <bound outer value>`) to plain literals
+                    // so the nested statement compiles to an index / PRIMARY KEY seek
+                    // instead of the full scan a bound-outer target otherwise forces —
+                    // the quadratic bulk-ingest half of the trigger-WHEN EXISTS guard.
+                    self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
                     if sub_clone.limit.is_none() {
                         sub_clone.limit = Some(fsqlite_ast::LimitClause {
                             limit: Expr::Literal(Literal::Integer(1), fsqlite_ast::Span::new(0, 0)),
@@ -111301,6 +111380,114 @@ fn rewrite_in_expr<'a>(
 }
 
 /// Convert a `SqliteValue` into a synthetic `Expr::Literal`.
+/// Walk the AND-conjunction of an EXISTS subquery WHERE, relaxing each
+/// collation/affinity-safe `col = <bound outer value>` conjunct to `col =
+/// <literal>` so the compiled nested statement can seek (bd-nd2ju / #377, L3).
+///
+/// Only descends `AND` nodes and rewrites `Eq` leaves; every other shape (OR,
+/// comparisons other than `=`, nested subqueries) is left untouched, so a
+/// disjunction or a residual predicate keeps its exact semantics.
+fn relax_eq_conjunct_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Option<&str>) {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            relax_eq_conjunct_bound_outer(&mut **left, table, alias);
+            relax_eq_conjunct_bound_outer(&mut **right, table, alias);
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } => {
+            // `col = bound` — relax the right operand.
+            if let Some(col) = eq_seek_column(&**left, table, alias)
+                && let Some(literal) = bound_outer_relaxable_to_literal(&**right, col)
+            {
+                **right = literal;
+            // `bound = col` — relax the left operand.
+            } else if let Some(col) = eq_seek_column(&**right, table, alias)
+                && let Some(literal) = bound_outer_relaxable_to_literal(&**left, col)
+            {
+                **left = literal;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// If `expr` is a bare column reference of `table` (unqualified, or qualified by
+/// the table name / `alias`), return its [`ColumnInfo`]. Schema-qualified or
+/// foreign references return `None`.
+fn eq_seek_column<'a>(
+    expr: &Expr,
+    table: &'a TableSchema,
+    alias: Option<&str>,
+) -> Option<&'a ColumnInfo> {
+    let Expr::Column(column, _) = expr else {
+        return None;
+    };
+    if column.schema.is_some() {
+        return None;
+    }
+    if let Some(qualifier) = column.table.as_deref()
+        && !qualifier.eq_ignore_ascii_case(&table.name)
+        && !alias.is_some_and(|a| qualifier.eq_ignore_ascii_case(a))
+    {
+        return None;
+    }
+    table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(column.column.as_ref()))
+}
+
+/// If `expr` is a non-NULL [`Expr::BoundOuterValue`] whose donor collation and
+/// affinity make a plain-literal comparison against `col` byte-identical to the
+/// bound comparison, return the equivalent literal (bd-nd2ju / #377, L3).
+///
+/// Sufficient (conservative) safety conditions — see
+/// `relax_correlated_exists_equalities_for_seek`:
+///   * the donor collation is a known name equal to `col`'s effective collation
+///     (default `BINARY`), so the winning collation is `col`'s in either operand
+///     order; and
+///   * the donor affinity is absent, or equal to `col`'s affinity, so the
+///     applied comparison affinity is `col`'s either way.
+fn bound_outer_relaxable_to_literal(expr: &Expr, col: &ColumnInfo) -> Option<Expr> {
+    let Expr::BoundOuterValue {
+        value,
+        collation,
+        affinity,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    if matches!(value, SqliteValue::Null) {
+        return None;
+    }
+    let col_collation = col.collation.as_deref().unwrap_or("BINARY");
+    if !collation
+        .as_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(col_collation))
+    {
+        return None;
+    }
+    let col_affinity = affinity_char_to_type(col.affinity);
+    let affinity_ok = match affinity {
+        None => true,
+        Some(donor) => *donor == col_affinity,
+    };
+    if !affinity_ok {
+        return None;
+    }
+    Some(value_to_literal_expr(value.clone()))
+}
+
 fn value_to_literal_expr(val: SqliteValue) -> Expr {
     use fsqlite_ast::Span;
     match val {
