@@ -68225,7 +68225,7 @@ impl Connection {
             } else {
                 None
             };
-            let concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut() {
+            let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut() {
                 self.plan_concurrent_commit_with_registry(
                     registry,
                     &pending_conflict_pages,
@@ -68272,7 +68272,35 @@ impl Connection {
                         {
                             break;
                         }
+                        // bd-39dla liveness: a COMMIT-time `Busy` means the pager
+                        // could not escalate its write lock, so nothing was
+                        // physically written or published — the Issue #115
+                        // validate→physical-write→publish critical section has not
+                        // begun. Do NOT hold the shared `concurrent_registry` guard
+                        // across the busy back-off sleep: every other writer blocks
+                        // on that guard for up to the full `busy_timeout` per stuck
+                        // committer, and the in-flight transactions they cannot
+                        // finish are exactly the read-marks a WAL checkpoint waits to
+                        // drain — a self-sustaining convoy that wedges all writers
+                        // for minutes (2-3/20 large-scale churn runs). Release the
+                        // guard across the handoff, then re-acquire and RE-VALIDATE
+                        // (re-plan) before retrying the physical commit so the #115
+                        // TOCTOU protection is fully restored: if a peer published a
+                        // conflicting page during the back-off, the re-plan observes
+                        // it via the CommitIndex and aborts first-committer-wins
+                        // (which the caller treats as a transient retry).
+                        let reacquire_registry = commit_registry_guard.is_some();
+                        drop(commit_registry_guard.take());
                         perform_begin_busy_retry_handoff(wait).await;
+                        if reacquire_registry {
+                            let mut registry = lock_registry_for_commit(&self.concurrent_registry);
+                            concurrent_commit_plan = self.plan_concurrent_commit_with_registry(
+                                &mut registry,
+                                &pending_conflict_pages,
+                                schema_cookie_to_publish.is_some(),
+                            )?;
+                            commit_registry_guard = Some(registry);
+                        }
                         commit_res = {
                             let mut txn_guard = self.active_txn.borrow_mut();
                             if let Some(txn) = txn_guard.as_mut() {
