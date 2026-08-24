@@ -131,7 +131,15 @@ impl BatchResult {
     /// `true` if every cell passed.
     #[must_use]
     pub fn all_passed(&self) -> bool {
-        self.mismatch_count == 0 && self.error_count == 0
+        self.total_cells > 0
+            && self.cells.len() == self.total_cells
+            && self.pass_count == self.total_cells
+            && self.mismatch_count == 0
+            && self.error_count == 0
+            && self
+                .cells
+                .iter()
+                .all(|cell| matches!(&cell.verdict, CellVerdict::Pass { .. }))
     }
 
     /// Serialize the batch result as a JSON string.
@@ -217,6 +225,20 @@ fn tier_satisfies(expected: EquivalenceTier, comparison: &TieredComparisonResult
         EquivalenceTier::Tier3Logical => {
             raw || comparison.canonical_match || comparison.logical_match
         }
+    }
+}
+
+fn strongest_matching_tier(comparison: &TieredComparisonResult) -> Option<ComparisonTier> {
+    if comparison.raw_match == Some(true) {
+        Some(ComparisonTier::RawIdentical)
+    } else if comparison.canonical_match {
+        Some(ComparisonTier::CanonicalMatch)
+    } else if comparison.logical_match {
+        Some(ComparisonTier::LogicalMatch)
+    } else if comparison.data_complete {
+        Some(ComparisonTier::DataComplete)
+    } else {
+        None
     }
 }
 
@@ -385,7 +407,7 @@ fn run_cell(
 
     // 6. Assert tier satisfaction.
     let expected_tier = equiv_tier_to_string(preset.expected_tier);
-    let achieved_tier = tier_to_string(comparison.tier);
+    let achieved_tier = strongest_matching_tier(&comparison).map(tier_to_string);
     let comparison_detail = comparison.detail.clone();
 
     let mut cell = if tier_satisfies(preset.expected_tier, &comparison) {
@@ -399,7 +421,10 @@ fn run_cell(
             sqlite_report: Some(sqlite_report),
             fsqlite_report: Some(fsqlite_report),
             tiered_comparison: Some(comparison),
-            verdict: CellVerdict::Pass { achieved_tier },
+            verdict: CellVerdict::Pass {
+                achieved_tier: achieved_tier
+                    .expect("a satisfying comparison must contain matching evidence"),
+            },
         }
     } else {
         CellResult {
@@ -414,7 +439,7 @@ fn run_cell(
             tiered_comparison: Some(comparison),
             verdict: CellVerdict::Mismatch {
                 expected_tier,
-                achieved_tier: Some(achieved_tier),
+                achieved_tier,
                 detail: comparison_detail,
             },
         }
@@ -484,17 +509,42 @@ fn make_error_cell(
 /// [`CellResult::verdict`].
 #[allow(clippy::too_many_lines)]
 pub fn run_matrix(config: &BatchConfig) -> E2eResult<BatchResult> {
+    if config.seeds.is_empty() {
+        return Err(E2eError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "batch matrix requires at least one seed",
+        )));
+    }
+    if config.concurrency_levels.contains(&0) {
+        return Err(E2eError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "batch matrix concurrency levels must be greater than zero",
+        )));
+    }
+
     let workspace_config = WorkspaceConfig::from_project_root(&config.project_root);
 
     // Resolve catalog.
     let catalog = oplog::preset_catalog();
+    let unknown_presets = config
+        .preset_names
+        .iter()
+        .filter(|name| !catalog.iter().any(|preset| &preset.name == *name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_presets.is_empty() {
+        return Err(E2eError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unknown batch preset(s): {}", unknown_presets.join(", ")),
+        )));
+    }
     let presets: Vec<&PresetMeta> = if config.preset_names.is_empty() {
         catalog.iter().collect()
     } else {
         config
             .preset_names
             .iter()
-            .filter_map(|name| catalog.iter().find(|p| &p.name == name))
+            .filter_map(|name| catalog.iter().find(|preset| &preset.name == name))
             .collect()
     };
 
@@ -502,6 +552,15 @@ pub fn run_matrix(config: &BatchConfig) -> E2eResult<BatchResult> {
         return Err(E2eError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "no matching presets found in catalog",
+        )));
+    }
+    if presets.iter().any(|preset| {
+        preset.concurrency_sweep.worker_counts.is_empty()
+            || preset.concurrency_sweep.worker_counts.contains(&0)
+    }) {
+        return Err(E2eError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "batch preset catalog contains an empty or zero concurrency sweep",
         )));
     }
 
@@ -639,7 +698,9 @@ pub fn render_batch_summary(result: &BatchResult) -> String {
         result.total_cells, result.pass_count, result.mismatch_count, result.error_count
     );
 
-    if result.all_passed() {
+    if result.total_cells == 0 {
+        md.push_str("> No cells were executed.\n\n");
+    } else if result.all_passed() {
         md.push_str("> All cells passed.\n\n");
     }
 
@@ -802,17 +863,53 @@ mod tests {
         assert!(!tier_satisfies(EquivalenceTier::Tier1Raw, &comp));
         assert!(!tier_satisfies(EquivalenceTier::Tier2Canonical, &comp));
         assert!(!tier_satisfies(EquivalenceTier::Tier3Logical, &comp));
+        assert_eq!(
+            strongest_matching_tier(&comp),
+            Some(ComparisonTier::DataComplete)
+        );
+    }
+
+    #[test]
+    fn failed_comparison_does_not_report_attempted_tier_as_achieved() {
+        let comp = TieredComparisonResult {
+            tier: ComparisonTier::DataComplete,
+            raw_sha256_a: Some("abc".to_owned()),
+            raw_sha256_b: Some("def".to_owned()),
+            raw_match: Some(false),
+            canonical_sha256_a: Some("ghi".to_owned()),
+            canonical_sha256_b: Some("jkl".to_owned()),
+            canonical_match: false,
+            logical_match: false,
+            data_complete: false,
+            detail: "all evidence differs".to_owned(),
+        };
+
+        assert_eq!(strongest_matching_tier(&comp), None);
     }
 
     #[test]
     fn test_batch_result_all_passed() {
+        let cell = CellResult {
+            fixture_id: "test".to_owned(),
+            preset_name: "deterministic_transform".to_owned(),
+            concurrency: 1,
+            seed: 42,
+            wall_time_ms: 1,
+            artifact_dir: None,
+            sqlite_report: None,
+            fsqlite_report: None,
+            tiered_comparison: None,
+            verdict: CellVerdict::Pass {
+                achieved_tier: "Raw Identical".to_owned(),
+            },
+        };
         let result = BatchResult {
             schema_version: "fsqlite-e2e.batch.v1".to_owned(),
             total_cells: 2,
             pass_count: 2,
             mismatch_count: 0,
             error_count: 0,
-            cells: vec![],
+            cells: vec![cell.clone(), cell],
         };
         assert!(result.all_passed());
     }
@@ -828,6 +925,80 @@ mod tests {
             cells: vec![],
         };
         assert!(!result.all_passed());
+    }
+
+    #[test]
+    fn empty_or_inconsistent_batch_is_not_a_pass() {
+        let empty = BatchResult {
+            schema_version: "fsqlite-e2e.batch.v1".to_owned(),
+            total_cells: 0,
+            pass_count: 0,
+            mismatch_count: 0,
+            error_count: 0,
+            cells: vec![],
+        };
+        assert!(!empty.all_passed());
+
+        let inconsistent = BatchResult {
+            schema_version: "fsqlite-e2e.batch.v1".to_owned(),
+            total_cells: 2,
+            pass_count: 1,
+            mismatch_count: 0,
+            error_count: 0,
+            cells: vec![],
+        };
+        assert!(!inconsistent.all_passed());
+
+        let mismatching_cell = CellResult {
+            fixture_id: "test".to_owned(),
+            preset_name: "deterministic_transform".to_owned(),
+            concurrency: 1,
+            seed: 42,
+            wall_time_ms: 1,
+            artifact_dir: None,
+            sqlite_report: None,
+            fsqlite_report: None,
+            tiered_comparison: None,
+            verdict: CellVerdict::Mismatch {
+                expected_tier: "Tier1Raw".to_owned(),
+                achieved_tier: None,
+                detail: "mismatch".to_owned(),
+            },
+        };
+        let inconsistent_verdict = BatchResult {
+            schema_version: "fsqlite-e2e.batch.v1".to_owned(),
+            total_cells: 1,
+            pass_count: 1,
+            mismatch_count: 0,
+            error_count: 0,
+            cells: vec![mismatching_cell],
+        };
+        assert!(!inconsistent_verdict.all_passed());
+    }
+
+    #[test]
+    fn run_matrix_rejects_empty_or_partial_matrix_configuration() {
+        let empty_seeds = BatchConfig {
+            seeds: Vec::new(),
+            ..BatchConfig::default()
+        };
+        assert!(run_matrix(&empty_seeds).is_err());
+
+        let zero_concurrency = BatchConfig {
+            concurrency_levels: vec![0],
+            ..BatchConfig::default()
+        };
+        assert!(run_matrix(&zero_concurrency).is_err());
+
+        let partial_presets = BatchConfig {
+            preset_names: vec![
+                "deterministic_transform".to_owned(),
+                "misspelled_preset".to_owned(),
+            ],
+            ..BatchConfig::default()
+        };
+        let error = run_matrix(&partial_presets).unwrap_err();
+        assert!(error.to_string().contains("misspelled_preset"));
     }
 
     #[test]
@@ -871,7 +1042,8 @@ mod tests {
         };
         let md = render_batch_summary(&result);
         assert!(md.contains("Batch Runner Results"));
-        assert!(md.contains("All cells passed"));
+        assert!(md.contains("No cells were executed"));
+        assert!(!md.contains("All cells passed"));
     }
 
     #[test]

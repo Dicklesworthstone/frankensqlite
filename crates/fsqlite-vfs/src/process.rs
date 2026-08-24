@@ -49,6 +49,11 @@ pub const PID_BIRTH_FILETIME_TAG: u64 = 1_u64 << 61;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 const PAYLOAD_MASK: u64 = !(PID_BIRTH_PROCFS_TAG | PID_BIRTH_SYSCTL_TAG | PID_BIRTH_FILETIME_TAG);
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+const fn has_exact_platform_tag(token: u64, expected_tag: u64) -> bool {
+    token & !PAYLOAD_MASK == expected_tag
+}
+
 /// Classification shared by the native probes after an OS call fails.
 ///
 /// Only an error code that unambiguously means "no such process" may release
@@ -125,6 +130,7 @@ pub fn process_alive(pid: u32, pid_birth: u64) -> ProcessLiveness {
 mod macos {
     use super::{
         PAYLOAD_MASK, PID_BIRTH_SYSCTL_TAG, ProbeFailure, ProcessLiveness, classify_probe_failure,
+        has_exact_platform_tag,
     };
 
     /// Outcome of reading a process's start time via `sysctl`.
@@ -199,9 +205,9 @@ mod macos {
             StartTime::Absent => ProcessLiveness::Dead,
             StartTime::Error => ProcessLiveness::Unknown,
             StartTime::Present(usec) => {
-                if pid_birth & PID_BIRTH_SYSCTL_TAG == 0 {
-                    // Untagged/legacy or foreign-platform token: cannot compare
-                    // start time, so stay conservative.
+                if !has_exact_platform_tag(pid_birth, PID_BIRTH_SYSCTL_TAG) {
+                    // Untagged/legacy, foreign-platform, or malformed multi-tag
+                    // token: cannot compare start time, so stay conservative.
                     return ProcessLiveness::Alive;
                 }
                 if (usec & PAYLOAD_MASK) == (pid_birth & PAYLOAD_MASK) {
@@ -217,7 +223,8 @@ mod macos {
 #[cfg(windows)]
 mod windows_impl {
     use super::{
-        PAYLOAD_MASK, PID_BIRTH_FILETIME_TAG, ProbeFailure, ProcessLiveness, classify_probe_failure,
+        PAYLOAD_MASK, PID_BIRTH_FILETIME_TAG, ProbeFailure, ProcessLiveness,
+        classify_probe_failure, has_exact_platform_tag,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, GetLastError,
@@ -292,7 +299,7 @@ mod windows_impl {
             Creation::Absent => ProcessLiveness::Dead,
             Creation::Error => ProcessLiveness::Unknown,
             Creation::Present(ticks) => {
-                if pid_birth & PID_BIRTH_FILETIME_TAG == 0 {
+                if !has_exact_platform_tag(pid_birth, PID_BIRTH_FILETIME_TAG) {
                     return ProcessLiveness::Alive;
                 }
                 if (ticks & PAYLOAD_MASK) == (pid_birth & PAYLOAD_MASK) {
@@ -317,6 +324,23 @@ mod tests {
         assert_eq!(PID_BIRTH_PROCFS_TAG & PAYLOAD_MASK, 0);
         assert_eq!(PID_BIRTH_SYSCTL_TAG & PAYLOAD_MASK, 0);
         assert_eq!(PID_BIRTH_FILETIME_TAG & PAYLOAD_MASK, 0);
+    }
+
+    #[test]
+    fn platform_birth_tag_must_be_exact() {
+        assert!(has_exact_platform_tag(
+            PID_BIRTH_SYSCTL_TAG | 0x1234,
+            PID_BIRTH_SYSCTL_TAG
+        ));
+        assert!(!has_exact_platform_tag(0x1234, PID_BIRTH_SYSCTL_TAG));
+        assert!(!has_exact_platform_tag(
+            PID_BIRTH_FILETIME_TAG | 0x1234,
+            PID_BIRTH_SYSCTL_TAG
+        ));
+        assert!(!has_exact_platform_tag(
+            PID_BIRTH_SYSCTL_TAG | PID_BIRTH_FILETIME_TAG | 0x1234,
+            PID_BIRTH_SYSCTL_TAG
+        ));
     }
 
     #[test]
@@ -404,10 +428,11 @@ mod tests {
     fn almost_certainly_dead_pid_reads_dead() {
         // A very high PID that is almost certainly not running. If it happens to
         // exist, the birth mismatch still yields Dead; either way, not Alive.
-        let verdict = process_alive(
-            0x7FFF_FFF0,
-            PID_BIRTH_SYSCTL_TAG | PID_BIRTH_FILETIME_TAG | 0x1234,
-        );
+        #[cfg(target_os = "macos")]
+        let platform_tag = PID_BIRTH_SYSCTL_TAG;
+        #[cfg(windows)]
+        let platform_tag = PID_BIRTH_FILETIME_TAG;
+        let verdict = process_alive(0x7FFF_FFF0, platform_tag | 0x1234);
         assert_ne!(verdict, ProcessLiveness::Alive);
     }
 }

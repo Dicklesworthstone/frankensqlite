@@ -59,6 +59,13 @@ pub struct CanonicalResult {
 /// **Never pass a golden database path directly** — always operate on a working
 /// copy.
 pub fn canonicalize(source: &Path, output_path: &Path) -> E2eResult<CanonicalResult> {
+    if paths_refer_to_same_file(source, output_path)? {
+        return Err(E2eError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "canonical output must not refer to the source database",
+        )));
+    }
+
     let flags =
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = rusqlite::Connection::open_with_flags(source, flags)?;
@@ -99,6 +106,32 @@ pub fn canonicalize(source: &Path, output_path: &Path) -> E2eResult<CanonicalRes
         sha256,
         size_bytes,
     })
+}
+
+fn paths_refer_to_same_file(source: &Path, output: &Path) -> std::io::Result<bool> {
+    if source == output {
+        return Ok(true);
+    }
+
+    let source_metadata = std::fs::metadata(source)?;
+    let output_metadata = match std::fs::metadata(output) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(source_metadata.dev() == output_metadata.dev()
+            && source_metadata.ino() == output_metadata.ino())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (source_metadata, output_metadata);
+        Ok(std::fs::canonicalize(source)? == std::fs::canonicalize(output)?)
+    }
 }
 
 /// Canonicalize a database and return only the SHA-256 hash.
@@ -175,7 +208,9 @@ impl std::fmt::Display for ComparisonTier {
 /// Result of a three-tier cross-engine database comparison.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TieredComparisonResult {
-    /// The highest tier that matched.
+    /// The comparison layer represented by this result. On a failed final
+    /// comparison this is the last layer attempted, not an achieved authority;
+    /// inspect the evidence booleans below to determine what actually matched.
     pub tier: ComparisonTier,
     /// SHA-256 of the first raw database file.
     pub raw_sha256_a: Option<String>,
@@ -379,10 +414,13 @@ fn open_readonly(path: &Path) -> E2eResult<rusqlite::Connection> {
     Ok(rusqlite::Connection::open_with_flags(path, flags)?)
 }
 
-/// List user tables (excluding `sqlite_*` internal tables), sorted by name.
+/// List application tables plus durable `sqlite_sequence` state, sorted by name.
 fn list_user_tables(conn: &rusqlite::Connection) -> E2eResult<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        "SELECT name FROM sqlite_master
+         WHERE type='table'
+           AND (name NOT GLOB 'sqlite_*' OR name = 'sqlite_sequence')
+         ORDER BY name",
     )?;
     let names: Vec<String> = stmt
         .query_map([], |row| row.get(0))?
@@ -390,12 +428,13 @@ fn list_user_tables(conn: &rusqlite::Connection) -> E2eResult<Vec<String>> {
     Ok(names)
 }
 
-/// Get the full user-defined schema catalog in deterministic order.
+/// Get the full application schema plus durable `sqlite_sequence` state.
 fn schema_sql(conn: &rusqlite::Connection) -> E2eResult<Vec<(String, String, String, String)>> {
     let mut stmt = conn.prepare(
         "SELECT type, name, tbl_name, sql
          FROM sqlite_master
-         WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
+         WHERE (name NOT GLOB 'sqlite_*' OR name = 'sqlite_sequence')
+           AND sql IS NOT NULL
          ORDER BY type, name",
     )?;
     let rows = stmt
@@ -406,7 +445,7 @@ fn schema_sql(conn: &rusqlite::Connection) -> E2eResult<Vec<(String, String, Str
     Ok(rows)
 }
 
-fn quoted_identifier(identifier: &str) -> String {
+pub(crate) fn quoted_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
@@ -446,7 +485,10 @@ fn compare_values(left: &rusqlite::types::Value, right: &rusqlite::types::Value)
     }
 }
 
-fn compare_rows(left: &[rusqlite::types::Value], right: &[rusqlite::types::Value]) -> Ordering {
+pub(crate) fn compare_rows(
+    left: &[rusqlite::types::Value],
+    right: &[rusqlite::types::Value],
+) -> Ordering {
     left.iter()
         .zip(right)
         .map(|(left, right)| compare_values(left, right))
@@ -831,6 +873,47 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_rejects_source_as_output_without_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("source.db");
+        create_db(
+            &source,
+            "CREATE TABLE t(v TEXT); INSERT INTO t VALUES ('preserve me');",
+        );
+        let before = std::fs::read(&source).unwrap();
+
+        let error = canonicalize(&source, &source).unwrap_err();
+        assert!(matches!(
+            error,
+            E2eError::Io(ref io_error)
+                if io_error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_rejects_hard_link_to_source_without_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("source.db");
+        let alias = tmp.path().join("alias.db");
+        create_db(
+            &source,
+            "CREATE TABLE t(v TEXT); INSERT INTO t VALUES ('preserve me');",
+        );
+        std::fs::hard_link(&source, &alias).unwrap();
+        let before = std::fs::read(&source).unwrap();
+
+        let error = canonicalize(&source, &alias).unwrap_err();
+        assert!(matches!(
+            error,
+            E2eError::Io(ref io_error)
+                if io_error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+    }
+
+    #[test]
     fn canonicalize_handles_wal_mode() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("wal_test.db");
@@ -1065,6 +1148,48 @@ mod tests {
 
         let result = try_tier2(&db_a, &db_b).unwrap();
         assert!(result.logical_match);
+    }
+
+    #[test]
+    fn logical_comparison_does_not_hide_sqlitex_user_tables() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_a = tmp.path().join("a.db");
+        let db_b = tmp.path().join("b.db");
+
+        create_db(
+            &db_a,
+            "CREATE TABLE sqliteXdata(v TEXT); INSERT INTO sqliteXdata VALUES ('a');",
+        );
+        create_db(
+            &db_b,
+            "CREATE TABLE sqliteXdata(v TEXT); INSERT INTO sqliteXdata VALUES ('b');",
+        );
+
+        let result = try_tier2(&db_a, &db_b).unwrap();
+        assert!(!result.logical_match);
+        assert!(result.detail.contains("sqliteXdata"));
+    }
+
+    #[test]
+    fn logical_comparison_checks_autoincrement_sequence_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_a = tmp.path().join("a.db");
+        let db_b = tmp.path().join("b.db");
+
+        create_db(
+            &db_a,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT); \
+             INSERT INTO t(id) VALUES (10); DELETE FROM t;",
+        );
+        create_db(
+            &db_b,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT); \
+             INSERT INTO t(id) VALUES (20); DELETE FROM t;",
+        );
+
+        let result = try_tier2(&db_a, &db_b).unwrap();
+        assert!(!result.logical_match);
+        assert!(result.detail.contains("sqlite_sequence"));
     }
 
     #[test]

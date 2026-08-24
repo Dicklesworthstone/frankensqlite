@@ -133,17 +133,17 @@ impl From<&HarnessSettings> for SettingsSnapshot {
 /// Schema difference between two databases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaDiff {
-    /// Tables only in database A (sqlite3).
+    /// Schema objects only in database A (sqlite3).
     pub only_in_a: Vec<String>,
-    /// Tables only in database B (fsqlite).
+    /// Schema objects only in database B (fsqlite).
     pub only_in_b: Vec<String>,
-    /// Tables present in both but with different CREATE SQL.
+    /// Schema objects present in both but with different CREATE SQL.
     pub sql_differs: Vec<TableSqlDiff>,
-    /// Tables that match exactly.
+    /// Schema objects that match exactly.
     pub matching_count: usize,
 }
 
-/// A single table whose schema SQL differs between engines.
+/// A single schema object whose SQL differs between engines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSqlDiff {
     pub table: String,
@@ -200,12 +200,15 @@ fn escape_bundle_component(component: &str) -> String {
     use std::fmt::Write as _;
 
     if component.is_empty() {
-        return "_00".to_owned();
+        // `%EMPTY` cannot be emitted by the byte encoder below (encoded percent
+        // sequences always carry exactly two hexadecimal digits), so the empty
+        // component remains distinct from every non-empty byte string.
+        return "%EMPTY".to_owned();
     }
 
     let mut escaped = String::with_capacity(component.len());
     for byte in component.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.') {
             escaped.push(char::from(byte));
         } else {
             // Writing into a String is infallible. Percent signs are escaped
@@ -214,6 +217,29 @@ fn escape_bundle_component(component: &str) -> String {
         }
     }
     escaped
+}
+
+fn create_bundle_dir(output_base: &Path, base_name: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(output_base)?;
+
+    let mut suffix = 0_u64;
+    loop {
+        let dir_name = if suffix == 0 {
+            base_name.to_owned()
+        } else {
+            format!("{base_name}__run{suffix}")
+        };
+        let candidate = output_base.join(dir_name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                suffix = suffix.checked_add(1).ok_or_else(|| {
+                    std::io::Error::other("exhausted mismatch bundle directory suffixes")
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Generate and write a mismatch artifact bundle to disk.
@@ -232,8 +258,7 @@ pub fn write_mismatch_bundle(
     config: &BundleConfig,
 ) -> E2eResult<PathBuf> {
     let dir_name = bundle_dir_name(cell);
-    let bundle_dir = config.output_base.join(&dir_name);
-    std::fs::create_dir_all(&bundle_dir)?;
+    let bundle_dir = create_bundle_dir(&config.output_base, &dir_name)?;
 
     // 1. Compute golden SHA-256 if path provided.
     let golden_sha256 = golden_db.and_then(|p| sha256_file(p).ok());
@@ -375,25 +400,26 @@ fn compute_schema_diff(db_a: &Path, db_b: &Path) -> E2eResult<SchemaDiff> {
     let mut sql_differs = Vec::new();
     let mut matching_count = 0usize;
 
-    for (name, sql_a) in &schema_a {
-        if let Some(sql_b) = schema_b.get(name) {
+    for ((object_type, name), sql_a) in &schema_a {
+        let object = format!("{object_type} {name:?}");
+        if let Some(sql_b) = schema_b.get(&(object_type.clone(), name.clone())) {
             if sql_a == sql_b {
                 matching_count += 1;
             } else {
                 sql_differs.push(TableSqlDiff {
-                    table: name.clone(),
+                    table: object,
                     sql_a: sql_a.clone(),
                     sql_b: sql_b.clone(),
                 });
             }
         } else {
-            only_in_a.push(name.clone());
+            only_in_a.push(object);
         }
     }
 
-    for name in schema_b.keys() {
-        if !schema_a.contains_key(name) {
-            only_in_b.push(name.clone());
+    for (object_type, name) in schema_b.keys() {
+        if !schema_a.contains_key(&(object_type.clone(), name.clone())) {
+            only_in_b.push(format!("{object_type} {name:?}"));
         }
     }
 
@@ -455,8 +481,8 @@ fn compute_dump_diffs(db_a: &Path, db_b: &Path, max_rows: usize) -> E2eResult<Ve
                 if diff_count < max_rows {
                     sample_diffs.push(RowDiff {
                         row_index: i,
-                        values_a: a.cloned(),
-                        values_b: b.cloned(),
+                        values_a: a.map(|row| row.iter().map(format_value).collect()),
+                        values_b: b.map(|row| row.iter().map(format_value).collect()),
                     });
                 }
                 diff_count += 1;
@@ -519,26 +545,26 @@ fn render_schema_diff(diff: &SchemaDiff) -> String {
     let mut out = String::new();
     out.push_str("=== Schema Diff ===\n\n");
 
-    let _ = writeln!(out, "Matching tables: {}", diff.matching_count);
+    let _ = writeln!(out, "Matching schema objects: {}", diff.matching_count);
 
     if !diff.only_in_a.is_empty() {
-        let _ = writeln!(out, "\nTables only in sqlite3:");
+        let _ = writeln!(out, "\nSchema objects only in sqlite3:");
         for t in &diff.only_in_a {
             let _ = writeln!(out, "  - {t}");
         }
     }
 
     if !diff.only_in_b.is_empty() {
-        let _ = writeln!(out, "\nTables only in fsqlite:");
+        let _ = writeln!(out, "\nSchema objects only in fsqlite:");
         for t in &diff.only_in_b {
             let _ = writeln!(out, "  - {t}");
         }
     }
 
     if !diff.sql_differs.is_empty() {
-        let _ = writeln!(out, "\nTables with different CREATE SQL:");
+        let _ = writeln!(out, "\nSchema objects with different CREATE SQL:");
         for d in &diff.sql_differs {
-            let _ = writeln!(out, "\n  Table: {}", d.table);
+            let _ = writeln!(out, "\n  Object: {}", d.table);
             let _ = writeln!(out, "  sqlite3: {}", d.sql_a);
             let _ = writeln!(out, "  fsqlite: {}", d.sql_b);
         }
@@ -613,6 +639,10 @@ fn render_pragma_diffs(diffs: &[PragmaDiff]) -> String {
     out
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 /// Render the REPRO.md file with copy-paste reproduction commands.
 #[must_use]
 fn render_repro_md(meta: &BundleMetadata, bundle_name: &str) -> String {
@@ -659,8 +689,8 @@ fn render_repro_md(meta: &BundleMetadata, bundle_name: &str) -> String {
         md,
         "cargo run --release -p fsqlite-e2e --bin realdb-e2e -- compare \\",
     );
-    let _ = writeln!(md, "  --fixture {} \\", meta.fixture_id);
-    let _ = writeln!(md, "  --preset {} \\", meta.preset_name);
+    let _ = writeln!(md, "  --fixture {} \\", shell_quote(&meta.fixture_id));
+    let _ = writeln!(md, "  --preset {} \\", shell_quote(&meta.preset_name));
     let _ = writeln!(md, "  --seed {} \\", meta.seed);
     let _ = writeln!(md, "  --concurrency {}", meta.concurrency);
     md.push_str("```\n");
@@ -712,28 +742,33 @@ fn open_readonly(path: &Path) -> E2eResult<rusqlite::Connection> {
     Ok(rusqlite::Connection::open_with_flags(path, flags)?)
 }
 
-/// Get schema SQL for all user tables as a map.
+/// Get application schema SQL plus durable `sqlite_sequence` state as a map.
 fn schema_sql_map(
     conn: &rusqlite::Connection,
-) -> E2eResult<std::collections::BTreeMap<String, String>> {
+) -> E2eResult<std::collections::BTreeMap<(String, String), String>> {
     let mut stmt = conn.prepare(
-        "SELECT name, sql FROM sqlite_master \
-         WHERE type='table' AND name NOT LIKE 'sqlite_%' \
-         ORDER BY name",
+        "SELECT type, name, sql FROM sqlite_master
+         WHERE (name NOT GLOB 'sqlite_*' OR name = 'sqlite_sequence')
+           AND sql IS NOT NULL
+         ORDER BY type, name",
     )?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+            ))
         })?
         .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
     Ok(rows)
 }
 
-/// List user table names, sorted.
+/// List application table names plus durable `sqlite_sequence` state, sorted.
 fn list_user_tables(conn: &rusqlite::Connection) -> E2eResult<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT name FROM sqlite_master \
-         WHERE type='table' AND name NOT LIKE 'sqlite_%' \
+        "SELECT name FROM sqlite_master
+         WHERE type='table'
+           AND (name NOT GLOB 'sqlite_*' OR name = 'sqlite_sequence')
          ORDER BY name",
     )?;
     let names: Vec<String> = stmt
@@ -742,29 +777,24 @@ fn list_user_tables(conn: &rusqlite::Connection) -> E2eResult<Vec<String>> {
     Ok(names)
 }
 
-/// Fetch all rows from a table, sorted by rowid (or first column fallback).
-fn fetch_all_rows_sorted(conn: &rusqlite::Connection, table: &str) -> E2eResult<Vec<Vec<String>>> {
-    let sql = format!("SELECT * FROM \"{table}\" ORDER BY rowid");
-    let fallback_sql = format!("SELECT * FROM \"{table}\" ORDER BY 1");
-
-    let sql_to_use = if conn.prepare(&sql).is_ok() {
-        sql
-    } else {
-        fallback_sql
-    };
-
-    let mut stmt = conn.prepare(&sql_to_use)?;
+/// Fetch all typed rows and sort independently of physical rowids.
+fn fetch_all_rows_sorted(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> E2eResult<Vec<Vec<rusqlite::types::Value>>> {
+    let table = crate::canonicalize::quoted_identifier(table);
+    let mut stmt = conn.prepare(&format!("SELECT * FROM {table}"))?;
     let col_count = stmt.column_count();
-    let rows: Vec<Vec<String>> = stmt
+    let mut rows: Vec<Vec<rusqlite::types::Value>> = stmt
         .query_map([], |row| {
             let mut vals = Vec::with_capacity(col_count);
             for i in 0..col_count {
-                let v: rusqlite::types::Value = row.get(i).unwrap_or(rusqlite::types::Value::Null);
-                vals.push(format_value(&v));
+                vals.push(row.get(i)?);
             }
             Ok(vals)
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    rows.sort_by(|left, right| crate::canonicalize::compare_rows(left, right));
     Ok(rows)
 }
 
@@ -772,17 +802,45 @@ fn fetch_all_rows_sorted(conn: &rusqlite::Connection, table: &str) -> E2eResult<
 fn format_value(v: &rusqlite::types::Value) -> String {
     match v {
         rusqlite::types::Value::Null => "NULL".to_owned(),
-        rusqlite::types::Value::Integer(i) => i.to_string(),
-        rusqlite::types::Value::Real(f) => format!("{f}"),
-        rusqlite::types::Value::Text(s) => s.clone(),
+        rusqlite::types::Value::Integer(i) => format!("INTEGER({i})"),
+        rusqlite::types::Value::Real(f) => format!("REAL({f:?})"),
+        rusqlite::types::Value::Text(s) => format!("TEXT({s:?})"),
         rusqlite::types::Value::Blob(b) => {
-            let mut hex = String::with_capacity(b.len() * 2 + 2);
-            hex.push_str("X'");
+            let mut hex = String::with_capacity(b.len() * 2 + 8);
+            hex.push_str("BLOB(X'");
             for byte in b {
                 let _ = write!(hex, "{byte:02X}");
             }
-            hex.push('\'');
+            hex.push_str("')");
             hex
+        }
+    }
+}
+
+fn sql_literal(value: &rusqlite::types::Value) -> String {
+    match value {
+        rusqlite::types::Value::Null => "NULL".to_owned(),
+        rusqlite::types::Value::Integer(value) => value.to_string(),
+        rusqlite::types::Value::Real(value) if value.is_infinite() => {
+            if value.is_sign_negative() {
+                "-9.0e999".to_owned()
+            } else {
+                "9.0e999".to_owned()
+            }
+        }
+        // SQLite normalizes bound NaNs to NULL, so this is the only replayable
+        // representation if a driver nevertheless exposes one as REAL.
+        rusqlite::types::Value::Real(value) if value.is_nan() => "NULL".to_owned(),
+        rusqlite::types::Value::Real(value) => format!("{value:?}"),
+        rusqlite::types::Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
+        rusqlite::types::Value::Blob(value) => {
+            let mut literal = String::with_capacity(value.len() * 2 + 3);
+            literal.push_str("X'");
+            for byte in value {
+                let _ = write!(literal, "{byte:02X}");
+            }
+            literal.push('\'');
+            literal
         }
     }
 }
@@ -790,8 +848,9 @@ fn format_value(v: &rusqlite::types::Value) -> String {
 /// Query a single PRAGMA value as a string.
 fn query_pragma(conn: &rusqlite::Connection, pragma: &str) -> String {
     conn.query_row(&format!("PRAGMA {pragma}"), [], |row| {
-        row.get::<_, String>(0)
+        row.get::<_, rusqlite::types::Value>(0)
     })
+    .map(|value| format_value(&value))
     .unwrap_or_else(|_| "<error>".to_owned())
 }
 
@@ -808,56 +867,79 @@ fn sha256_file(path: &Path) -> E2eResult<String> {
 
 /// Produce a deterministic SQL dump of a database.
 ///
-/// Generates `CREATE TABLE` + `INSERT` statements for all user tables,
-/// ordered by table name and rowid.
+/// Generates table definitions and typed rows first, then views, indexes, and
+/// triggers. Rows are ordered by typed values rather than physical rowid.
 fn dump_database(db_path: &Path) -> E2eResult<String> {
     let conn = open_readonly(db_path)?;
-    let tables = list_user_tables(&conn)?;
+    let mut tables = list_user_tables(&conn)?;
+    if let Some(sequence_index) = tables.iter().position(|table| table == "sqlite_sequence") {
+        let sequence = tables.remove(sequence_index);
+        tables.push(sequence);
+    }
 
     let mut dump = String::new();
     dump.push_str("-- Deterministic SQL dump\n");
-    let _ = writeln!(dump, "-- Source: {}", db_path.display());
+    let source = db_path
+        .display()
+        .to_string()
+        .replace('\r', "\\r")
+        .replace('\n', "\\n");
+    let _ = writeln!(dump, "-- Source: {source}");
     dump.push_str("BEGIN TRANSACTION;\n\n");
 
     for table in &tables {
+        let quoted_table = crate::canonicalize::quoted_identifier(table);
         // Schema.
-        let sql: String = conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
-            [table],
-            |row| row.get(0),
-        )?;
-        let _ = writeln!(dump, "{sql};\n");
+        if table == "sqlite_sequence" {
+            // AUTOINCREMENT table creation creates sqlite_sequence implicitly.
+            // Restore its durable high-water marks only after all application
+            // tables exist; replaying its internal CREATE TABLE is invalid.
+            dump.push_str("DELETE FROM sqlite_sequence;\n\n");
+        } else {
+            let sql: String = conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                [table],
+                |row| row.get(0),
+            )?;
+            let _ = writeln!(dump, "{sql};\n");
+        }
 
         // Data.
         let rows = fetch_all_rows_sorted(&conn, table)?;
         if !rows.is_empty() {
             // Get column names for INSERT statements.
             let col_names = {
-                let stmt = conn.prepare(&format!("SELECT * FROM \"{table}\" LIMIT 0"))?;
+                let stmt = conn.prepare(&format!("SELECT * FROM {quoted_table} LIMIT 0"))?;
                 (0..stmt.column_count())
-                    .map(|i| format!("\"{}\"", stmt.column_name(i).unwrap_or("?")))
+                    .map(|i| {
+                        crate::canonicalize::quoted_identifier(stmt.column_name(i).unwrap_or("?"))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             };
 
             for row in &rows {
-                let values = row
-                    .iter()
-                    .map(|v| {
-                        if v == "NULL" {
-                            "NULL".to_owned()
-                        } else {
-                            // Escape single quotes.
-                            format!("'{}'", v.replace('\'', "''"))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let values = row.iter().map(sql_literal).collect::<Vec<_>>().join(", ");
                 let _ = writeln!(
                     dump,
-                    "INSERT INTO \"{table}\" ({col_names}) VALUES ({values});"
+                    "INSERT INTO {quoted_table} ({col_names}) VALUES ({values});"
                 );
             }
+            dump.push('\n');
+        }
+    }
+
+    let schema = schema_sql_map(&conn)?;
+    for object_type in ["view", "index", "trigger"] {
+        for ((candidate_type, _name), sql) in &schema {
+            if candidate_type == object_type {
+                let _ = writeln!(dump, "{sql};");
+            }
+        }
+        if schema
+            .keys()
+            .any(|(candidate_type, _)| candidate_type == object_type)
+        {
             dump.push('\n');
         }
     }
@@ -894,7 +976,7 @@ mod tests {
         };
         assert_eq!(
             bundle_dir_name(&cell),
-            "chinook__hot_page_contention__c4__s42"
+            "chinook__hot%5Fpage%5Fcontention__c4__s42"
         );
 
         let mut malicious = cell;
@@ -903,8 +985,22 @@ mod tests {
         let dir_name = bundle_dir_name(&malicious);
         assert!(!dir_name.contains('/'));
         assert!(!dir_name.contains('\\'));
-        assert!(dir_name.starts_with("%2F..%2F..%2Ffixture_name__"));
+        assert!(dir_name.starts_with("%2F..%2F..%2Ffixture%5Fname__"));
         assert_ne!(escape_bundle_component("%2F"), escape_bundle_component("/"));
+        assert_ne!(
+            escape_bundle_component(""),
+            escape_bundle_component("%EMPTY")
+        );
+        let mut delimiter_left = malicious.clone();
+        delimiter_left.fixture_id = "a__b".to_owned();
+        delimiter_left.preset_name = "c".to_owned();
+        let mut delimiter_right = malicious;
+        delimiter_right.fixture_id = "a".to_owned();
+        delimiter_right.preset_name = "b__c".to_owned();
+        assert_ne!(
+            bundle_dir_name(&delimiter_left),
+            bundle_dir_name(&delimiter_right)
+        );
         assert_eq!(std::path::Path::new(&dir_name).components().count(), 1);
     }
 
@@ -918,7 +1014,7 @@ mod tests {
         };
         let rendered = render_schema_diff(&diff);
         assert!(rendered.contains("Schemas are identical"));
-        assert!(rendered.contains("Matching tables: 5"));
+        assert!(rendered.contains("Matching schema objects: 5"));
     }
 
     #[test]
@@ -935,7 +1031,7 @@ mod tests {
         };
         let rendered = render_schema_diff(&diff);
         assert!(rendered.contains("extra_table"));
-        assert!(rendered.contains("Tables with different CREATE SQL"));
+        assert!(rendered.contains("Schema objects with different CREATE SQL"));
         assert!(rendered.contains("users"));
     }
 
@@ -1019,6 +1115,129 @@ mod tests {
         assert!(md.contains("raw_a"));
         assert!(md.contains("sha_a"));
         assert!(md.contains("sha_b"));
+    }
+
+    #[test]
+    fn repro_arguments_are_shell_quoted() {
+        assert_eq!(shell_quote("simple"), "'simple'");
+        assert_eq!(shell_quote("a b;echo nope"), "'a b;echo nope'");
+        assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
+    }
+
+    #[test]
+    fn schema_diff_includes_non_table_objects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_a = tmp.path().join("a.db");
+        let db_b = tmp.path().join("b.db");
+        let conn_a = rusqlite::Connection::open(&db_a).unwrap();
+        conn_a
+            .execute_batch("CREATE TABLE t(v); CREATE INDEX t_v ON t(v);")
+            .unwrap();
+        drop(conn_a);
+        let conn_b = rusqlite::Connection::open(&db_b).unwrap();
+        conn_b.execute_batch("CREATE TABLE t(v);").unwrap();
+        drop(conn_b);
+
+        let diff = compute_schema_diff(&db_a, &db_b).unwrap();
+        assert!(diff.only_in_a.iter().any(|object| object.contains("t_v")));
+    }
+
+    #[test]
+    fn dumps_preserve_storage_classes_and_quote_identifiers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("typed.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE \"odd\"\"name\"(\"odd\"\"column\");
+             INSERT INTO \"odd\"\"name\" VALUES
+               (NULL), ('NULL'), (1), ('1'), (X'00FF');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dump = dump_database(&db).unwrap();
+        assert!(dump.contains("INSERT INTO \"odd\"\"name\" (\"odd\"\"column\")"));
+        assert!(dump.contains("VALUES (NULL);"));
+        assert!(dump.contains("VALUES ('NULL');"));
+        assert!(dump.contains("VALUES (1);"));
+        assert!(dump.contains("VALUES ('1');"));
+        assert!(dump.contains("VALUES (X'00FF');"));
+
+        let conn = open_readonly(&db).unwrap();
+        assert!(query_pragma(&conn, "page_size").starts_with("INTEGER("));
+        assert_ne!(query_pragma(&conn, "page_size"), "<error>");
+    }
+
+    #[test]
+    fn dump_replays_autoincrement_sequence_after_application_schema() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("source.db");
+        let replay = tmp.path().join("replay.db");
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+             INSERT INTO t(id, v) VALUES (10, 'high');
+             DELETE FROM t;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dump = dump_database(&source).unwrap();
+        let create_position = dump.find("CREATE TABLE t").unwrap();
+        let sequence_position = dump.find("DELETE FROM sqlite_sequence").unwrap();
+        assert!(create_position < sequence_position);
+
+        let replay_conn = rusqlite::Connection::open(&replay).unwrap();
+        replay_conn.execute_batch(&dump).unwrap();
+        let sequence: i64 = replay_conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='t'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence, 10);
+    }
+
+    #[test]
+    fn dump_replays_views_indexes_and_triggers_after_table_data() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("source.db");
+        let replay = tmp.path().join("replay.db");
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(v INTEGER);
+             INSERT INTO t VALUES (1);
+             CREATE VIEW t_view AS SELECT v FROM t;
+             CREATE INDEX t_v ON t(v);
+             CREATE TRIGGER t_view_insert INSTEAD OF INSERT ON t_view
+             BEGIN INSERT INTO t VALUES (new.v); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dump = dump_database(&source).unwrap();
+        let data_position = dump.find("INSERT INTO \"t\"").unwrap();
+        let view_position = dump.find("CREATE VIEW t_view").unwrap();
+        let index_position = dump.find("CREATE INDEX t_v").unwrap();
+        let trigger_position = dump.find("CREATE TRIGGER t_view_insert").unwrap();
+        assert!(data_position < view_position);
+        assert!(view_position < index_position);
+        assert!(index_position < trigger_position);
+
+        let replay_conn = rusqlite::Connection::open(&replay).unwrap();
+        replay_conn.execute_batch(&dump).unwrap();
+        replay_conn
+            .execute("INSERT INTO t_view VALUES (2)", [])
+            .unwrap();
+        let values = replay_conn
+            .prepare("SELECT v FROM t ORDER BY v")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values, [1, 2]);
     }
 
     #[test]
@@ -1122,6 +1341,14 @@ mod tests {
 
         // Verify REPRO.md has repro commands.
         let repro = std::fs::read_to_string(bundle_dir.join("REPRO.md")).unwrap();
-        assert!(repro.contains("--preset basic"));
+        assert!(repro.contains("--preset 'basic'"));
+
+        let mut no_dump_config = config;
+        no_dump_config.include_dumps = false;
+        let second_bundle =
+            write_mismatch_bundle(&cell, &db_a, &db_b, None, &settings, &no_dump_config).unwrap();
+        assert_ne!(second_bundle, bundle_dir);
+        assert!(bundle_dir.join("sqlite3_dump.sql").exists());
+        assert!(!second_bundle.join("sqlite3_dump.sql").exists());
     }
 }
