@@ -732,13 +732,14 @@ impl Parser {
         context: DmlParseContext,
     ) -> Result<QualifiedTableRef, ParseError> {
         let name = self.parse_dml_target_name(context)?;
-        if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwAs) {
-            return Err(self.err_msg("table aliases are not allowed in trigger body statements"));
-        }
-        let alias = if context == DmlParseContext::TopLevel {
-            self.try_table_alias()?
+        let alias = if context == DmlParseContext::TriggerBody {
+            if self.eat_kw(&TokenKind::KwAs) {
+                Some(self.parse_identifier()?)
+            } else {
+                None
+            }
         } else {
-            None
+            self.try_table_alias()?
         };
         if context == DmlParseContext::TriggerBody
             && (self.check_kw(&TokenKind::KwIndexed)
@@ -1527,9 +1528,6 @@ impl Parser {
         };
         self.eat_kw(&TokenKind::KwInto);
         let table = self.parse_dml_target_name(context)?;
-        if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwAs) {
-            return Err(self.err_msg("table aliases are not allowed in trigger body statements"));
-        }
         let alias = if self.eat_kw(&TokenKind::KwAs) {
             Some(self.parse_identifier()?)
         } else {
@@ -4148,6 +4146,63 @@ mod tests {
     }
 
     #[test]
+    fn test_trigger_body_accepts_explicit_table_aliases_only() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+                   UPDATE audit AS update_target SET value = 1; \
+                   INSERT INTO audit AS insert_target(value) VALUES (2); \
+                   DELETE FROM audit AS delete_target WHERE delete_target.value = 3; \
+                   END";
+        let Statement::CreateTrigger(trigger) = parse_one(sql) else {
+            panic!("expected CREATE TRIGGER");
+        };
+
+        assert!(matches!(
+            &trigger.body[0],
+            Statement::Update(UpdateStatement {
+                table: QualifiedTableRef {
+                    alias: Some(alias),
+                    ..
+                },
+                ..
+            }) if alias == "update_target"
+        ));
+        assert!(matches!(
+            &trigger.body[1],
+            Statement::Insert(InsertStatement {
+                alias: Some(alias),
+                ..
+            }) if alias == "insert_target"
+        ));
+        assert!(matches!(
+            &trigger.body[2],
+            Statement::Delete(DeleteStatement {
+                table: QualifiedTableRef {
+                    alias: Some(alias),
+                    ..
+                },
+                ..
+            }) if alias == "delete_target"
+        ));
+
+        for (body_statement, rejected) in [
+            ("UPDATE audit target SET value = 1", "target"),
+            ("INSERT INTO audit target(value) VALUES (1)", "target"),
+            ("DELETE FROM audit target", "target"),
+        ] {
+            let sql = format!(
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN {body_statement}; END"
+            );
+            let error = parse_first_statement_with_tail(&sql)
+                .expect_err("trigger-body table aliases without AS must remain rejected");
+            assert_eq!(
+                &sql[error.span.start as usize..error.span.end as usize],
+                rejected,
+                "the diagnostic for `{sql}` must identify the bare alias"
+            );
+        }
+    }
+
+    #[test]
     fn test_trigger_body_rejects_empty_missing_semicolon_and_non_dml_commands() {
         for (sql, rejected) in [
             ("CREATE TRIGGER trg AFTER INSERT ON t BEGIN END", "END"),
@@ -4248,21 +4303,6 @@ mod tests {
             ),
             (
                 "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
-                 INSERT INTO audit AS target VALUES (1); END",
-                "AS",
-            ),
-            (
-                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
-                 UPDATE audit AS target SET value = 1; END",
-                "AS",
-            ),
-            (
-                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
-                 DELETE FROM audit AS target; END",
-                "AS",
-            ),
-            (
-                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
                  INSERT INTO audit DEFAULT VALUES; END",
                 "DEFAULT",
             ),
@@ -4334,10 +4374,7 @@ mod tests {
             // own behavior: near-X grammar errors (UnexpectedToken: DEFAULT
             // VALUES, ORDER BY/LIMIT, WITH..INSERT, UPDATE/DELETE RETURNING),
             // fixed verbatim messages (Semantic: qualified names, INDEXED BY /
-            // NOT INDEXED, INSERT RETURNING), or frank's still-too-strict
-            // table-alias rejection (Syntax: `AS`, a separate validation-gap bug
-            // — stock 3.53 actually accepts a trigger-body table alias). The
-            // exact user-facing messages are pinned in the end-to-end keeper
+            // NOT INDEXED, INSERT RETURNING). The exact user-facing messages are pinned in the end-to-end keeper
             // (bd_parser_syntax_error_near_x). bd-parser-syntax-error-format-6w6kp.
             assert!(
                 matches!(
