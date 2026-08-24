@@ -48,6 +48,33 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-24 - ARCHIVED LOCAL-ONLY: stale `zz_*` probes removed from Cargo integration-test discovery
+
+- Cleanup target: the 29 ignored `zz_*_bench.rs` files and the ignored
+  `zz_seekgap_probe.rs` left directly under `crates/fsqlite/tests/`. Although
+  Git correctly treated them as machine-local scratch, Cargo still discovered
+  every top-level `.rs` file as an integration-test target; their synchronous
+  `Connection::{open,query,execute}` calls therefore broke workspace
+  `--all-targets` checks after those APIs became async.
+- Triage: three independent source/history passes confirmed that all 30 files
+  were never tracked, their only inbound references were the preserved
+  2026-07-22/24 ledger records below, and every useful query/DML opcode shape
+  already has a landed C-SQLite differential oracle. The original probes remain
+  unsuitable as correctness or performance authority: single-shot `Instant`
+  timing, no interleaved null control, no repeated-sample uncertainty, and no
+  general differential oracle.
+- Action: moved all 30 files byte-for-byte to the ignored, Cargo-inert local
+  archive `tests/artifacts/perf/rowid-index-seek-probes-20260713/`. Its local
+  `manifest.tsv` records all original paths, sizes, and SHA-256 digests; all 30
+  entries verified after the move (71,951 source bytes total). No probe was
+  edited, deleted, promoted, or committed.
+- Result classification: repository hygiene only, not a performance KEEP or
+  REJECT and not new benchmark evidence. Retry/promotion conditions remain the
+  2026-07-22 contract below: demonstrate an uncovered semantic shape, rename
+  out of the `zz_` namespace, add differential behavioral assertions, and use
+  controlled interleaved sampling for any numeric claim. Do not restore these
+  files under a Cargo `tests/` discovery root merely to repair their old API.
+
 ## 2026-08-17 - DEFERRED (no A/B data): Row values SmallVec-backed to kill the per-row Row Vec malloc (bd-el6ax, bd-rr46j companion)
 
 - Lever: make `Row { values: Vec<SqliteValue> }` (connection.rs:5372) a
