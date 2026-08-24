@@ -15909,6 +15909,19 @@ where
             // main database into a silently created empty replacement.
             flags.remove(VfsOpenFlags::CREATE);
         }
+        // bd-dd24l (GH#376): snapshot which Windows advisory-lock sidecars
+        // pre-exist BEFORE the VFS open below. That open — not the later
+        // cooperative lock — is what actually creates our own
+        // `-lock-shared/-reserved/-pending` sidecars (WindowsOsLockFiles::open).
+        // The prior snapshot site sat AFTER this open, so on Windows the witness
+        // captured our OWN freshly created sidecars and the reserved-bootstrap
+        // AllowExpected check rejected the target, deterministically breaking
+        // `VACUUM INTO` (no output file). Taken here the witness is exactly "what
+        // pre-existed our touch": a foreign/stale reservation is still rejected
+        // (bd-mnane), while the sidecars our own open creates are permitted.
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let pre_open_lock_sidecars = (disposition == ReadWriteOpenDisposition::ReservedEmpty)
+            .then(|| PreOpenLockSidecars::snapshot(&db_path));
         let (db_file, _actual_flags) = match (disposition, effective_expected_identity) {
             (ReadWriteOpenDisposition::ReservedEmpty, Some(expected_identity)) => {
                 // bd-qgh42 (GH#366): the reserved (empty-slot) open rejects a slot
@@ -16233,13 +16246,12 @@ where
                 return Err(FrankenError::CannotOpen { path: db_path });
             }
             let reserved_bootstrap = disposition == ReadWriteOpenDisposition::ReservedEmpty;
-            // bd-mnane: snapshot which Windows advisory-lock sidecars pre-exist
-            // BEFORE we take any cooperative lock (which creates our own), so the
-            // AllowExpected reserved validation below rejects a foreign/stale
-            // reservation while permitting the sidecars our own open creates.
-            #[cfg(all(feature = "native", any(unix, windows)))]
-            let pre_open_lock_sidecars =
-                reserved_bootstrap.then(|| PreOpenLockSidecars::snapshot(&db_path));
+            // bd-dd24l (GH#376): `pre_open_lock_sidecars` is snapshotted ABOVE,
+            // before the VFS open that creates our own advisory-lock sidecars.
+            // Snapshotting it HERE (after that open) captured our own sidecars
+            // and made the AllowExpected reserved validation reject the target,
+            // breaking Windows `VACUUM INTO`. The reserved bootstrap still runs
+            // the cooperative lock below; only the witness capture moved earlier.
             let mut bootstrap_lock = reserved_bootstrap.then(|| {
                 BeginExternalLockState::new(&group_commit_queue, Arc::clone(&db_file), cx)
             });
