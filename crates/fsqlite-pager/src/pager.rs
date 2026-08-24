@@ -17477,12 +17477,13 @@ where
                 });
             }
 
-            let records_offset = section_header_offset
-                .checked_add(hdr_padded)
-                .ok_or_else(|| FrankenError::OutOfRange {
-                    what: "rollback-journal section records offset".to_owned(),
-                    value: section_header_offset.to_string(),
-                })?;
+            let records_offset =
+                section_header_offset
+                    .checked_add(hdr_padded)
+                    .ok_or_else(|| FrankenError::OutOfRange {
+                        what: "rollback-journal section records offset".to_owned(),
+                        value: section_header_offset.to_string(),
+                    })?;
             if records_offset > jrnl_size {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -17560,13 +17561,12 @@ where
                 });
             }
 
-            let next_header_offset = records_end
-                .checked_add(hdr_padded - 1)
-                .ok_or_else(|| FrankenError::OutOfRange {
+            let next_header_offset = records_end.checked_add(hdr_padded - 1).ok_or_else(|| {
+                FrankenError::OutOfRange {
                     what: "rollback-journal next section alignment".to_owned(),
                     value: records_end.to_string(),
-                })?
-                / hdr_padded
+                }
+            })? / hdr_padded
                 * hdr_padded;
             if next_header_offset > jrnl_size {
                 tracing::warn!(
@@ -17576,25 +17576,12 @@ where
                 );
                 return Err(FrankenError::Unsupported);
             }
-            if next_header_offset > records_end {
-                let padding_len = usize::try_from(next_header_offset - records_end).map_err(|_| {
-                    FrankenError::OutOfRange {
-                        what: "rollback-journal inter-section padding".to_owned(),
-                        value: (next_header_offset - records_end).to_string(),
-                    }
-                })?;
-                let mut padding = vec![0_u8; padding_len];
-                let padding_read = jrnl_file.read(cx, &mut padding, records_end).await?;
-                if padding_read != padding_len || padding.iter().any(|&byte| byte != 0) {
-                    tracing::warn!(
-                        journal = %journal_path.display(),
-                        "refusing unsupported external rollback journal with nonzero inter-section padding"
-                    );
-                    return Err(FrankenError::Unsupported);
-                }
-                if next_header_offset == jrnl_size {
-                    break;
-                }
+            // Stock playback advances directly to the next sector boundary.
+            // In persistent-journal mode the skipped gap may retain bytes from
+            // an older transaction, so its contents are not part of the hot
+            // journal's authenticated recovery surface.
+            if next_header_offset == jrnl_size {
+                break;
             }
 
             if jrnl_size - next_header_offset < header_size {
@@ -17671,11 +17658,11 @@ where
                         detail: format!("invalid rollback-journal record: {err}"),
                     }
                 })?;
-                record
-                    .verify_checksum(section.nonce)
-                    .map_err(|err| FrankenError::DatabaseCorrupt {
+                record.verify_checksum(section.nonce).map_err(|err| {
+                    FrankenError::DatabaseCorrupt {
                         detail: format!("rollback-journal checksum mismatch: {err}"),
-                    })?;
+                    }
+                })?;
                 let page_no = PageNumber::new(record.page_number).ok_or_else(|| {
                     FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -17706,12 +17693,13 @@ where
                         ),
                     });
                 }
-                validation_offset = validation_offset
-                    .checked_add(record_size_u64)
-                    .ok_or_else(|| FrankenError::OutOfRange {
-                        what: "rollback-journal validation offset".to_owned(),
-                        value: validation_offset.to_string(),
-                    })?;
+                validation_offset =
+                    validation_offset
+                        .checked_add(record_size_u64)
+                        .ok_or_else(|| FrankenError::OutOfRange {
+                            what: "rollback-journal validation offset".to_owned(),
+                            value: validation_offset.to_string(),
+                        })?;
             }
         }
 
@@ -17736,11 +17724,11 @@ where
                 })?;
 
                 // Verify checksum before applying.
-                record
-                    .verify_checksum(section.nonce)
-                    .map_err(|err| FrankenError::DatabaseCorrupt {
+                record.verify_checksum(section.nonce).map_err(|err| {
+                    FrankenError::DatabaseCorrupt {
                         detail: format!("rollback-journal checksum mismatch: {err}"),
-                    })?;
+                    }
+                })?;
 
                 // Write the pre-image back to the database file.
                 let Some(page_no) = PageNumber::new(record.page_number) else {
@@ -32948,7 +32936,7 @@ mod tests {
             journal
                 .write(
                     &cx,
-                    &vec![0_u8; (second_header_offset - first_section_end) as usize],
+                    &vec![0xA5_u8; (second_header_offset - first_section_end) as usize],
                     first_section_end,
                 )
                 .await
@@ -33089,7 +33077,8 @@ mod tests {
                 None,
             )
             .await
-            .expect_err("duplicate record in a later section must fail recovery");
+            .err()
+            .expect("duplicate record in a later section must fail recovery");
             assert!(
                 matches!(
                     error,
