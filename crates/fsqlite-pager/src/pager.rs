@@ -9075,6 +9075,24 @@ fn ioq6x_ledger_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("FSQLITE_IOQ6X_LEDGER_OFF").is_some())
 }
 
+/// bd-9inpb allocator-race hunt: env-gated microsecond delay injected into the
+/// commit guard→append TOCTOU window (`FSQLITE_RACE_AMPLIFY_US`). The freelist
+/// resurrection/erasure/double-consumption guards validate against the physical
+/// WAL tail read under PER-CONNECTION locks; cross-connection serialization only
+/// happens inside `prepare_persisted_epoch`. Widening that window makes the
+/// otherwise ~1e-6 cross-connection double-grant (one physical page granted to
+/// two b-trees) reproduce reliably under concurrent churn. `None`/0 → inert
+/// (default). Diagnostic ONLY — never enable in prod or CI.
+fn race_amplify_window_us() -> Option<u64> {
+    static US: OnceLock<Option<u64>> = OnceLock::new();
+    *US.get_or_init(|| {
+        std::env::var("FSQLITE_RACE_AMPLIFY_US")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&us| us > 0)
+    })
+}
+
 fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling: u32) -> usize {
     if ioq6x_ledger_disabled() || inner.journal_mode != JournalMode::Wal {
         return 0;
@@ -21441,6 +21459,22 @@ where
                                                 .join(","),
                                         });
                                     }
+                                }
+                                // bd-9inpb allocator-race hunt: env-gated
+                                // guard→append TOCTOU-window amplifier. Every
+                                // freelist guard above validated against the
+                                // physical WAL tail under PER-CONNECTION locks
+                                // only (backend rwlock + per-connection-key
+                                // physical_lock_window); cross-connection
+                                // serialization happens INSIDE
+                                // prepare_persisted_epoch below. A sleep here
+                                // holds no cross-connection lock, so it widens
+                                // the window in which a concurrent peer epoch
+                                // validates against the SAME pre-append tail
+                                // and both grant the same freelist page. Inert
+                                // unless FSQLITE_RACE_AMPLIFY_US is set.
+                                if let Some(us) = race_amplify_window_us() {
+                                    std::thread::sleep(std::time::Duration::from_micros(us));
                                 }
                                 let durable_db_size_floor =
                                     wal.current_parallel_wal_db_size_floor(cx).await?;
