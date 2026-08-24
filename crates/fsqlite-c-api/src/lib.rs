@@ -1107,6 +1107,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
 /// # Safety
 /// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_lines)]
 pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
     COMPAT_STEP.fetch_add(1, Ordering::Relaxed);
     let _span = tracing::info_span!("compat_api", api_func = "step").entered();
@@ -1305,7 +1306,7 @@ unsafe fn run_bind_destructor(xdel: SqliteDestructor, ptr: *const c_void) {
     if addr == SQLITE_TRANSIENT {
         return; // SQLITE_TRANSIENT sentinel is not a callable pointer.
     }
-    func(ptr as *mut c_void);
+    func(ptr.cast_mut());
 }
 
 /// Resolve a 1-based parameter index to its 0-based binding slot, or `None`
@@ -1522,9 +1523,10 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_index(
     0
 }
 
-/// Name (with sigil) of the parameter at 1-based `index`, or NULL for the
-/// nameless `?` / `?NNN` forms or an out-of-range index. The returned pointer is
-/// owned by the statement and valid until it is finalized.
+/// Name (with sigil) of the parameter at 1-based `index`.
+///
+/// NULL for the nameless `?` / `?NNN` forms or an out-of-range index. The
+/// returned pointer is owned by the statement and valid until it is finalized.
 ///
 /// # Safety
 /// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
