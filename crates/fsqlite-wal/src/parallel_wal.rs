@@ -2621,8 +2621,7 @@ const SEGMENT_HEADER_SIZE: usize = 24;
 const SEGMENT_RECORD_CHECKSUM_SIZE: usize = std::mem::size_of::<u32>();
 
 /// Fixed record bytes for a record without `end_seq` and without page images.
-const SEGMENT_RECORD_MIN_SIZE: usize =
-    8 + 4 + 8 + 4 + 8 + 1 + 4 + 4 + SEGMENT_RECORD_CHECKSUM_SIZE;
+const SEGMENT_RECORD_MIN_SIZE: usize = 8 + 4 + 8 + 4 + 8 + 1 + 4 + 4 + SEGMENT_RECORD_CHECKSUM_SIZE;
 
 /// Largest supported page image in a segment record.
 const MAX_SEGMENT_RECORD_IMAGE_BYTES: usize = limits::MAX_PAGE_SIZE as usize;
@@ -3284,8 +3283,7 @@ fn deserialize_record(buf: &[u8]) -> Result<WalRecord, String> {
         read_record_bytes(payload, &mut offset, before_len, "before_image")?.to_vec();
     let after_len = read_record_u32(payload, &mut offset, "after_image length")? as usize;
     validate_segment_image_len("after_image", after_len)?;
-    let after_image =
-        read_record_bytes(payload, &mut offset, after_len, "after_image")?.to_vec();
+    let after_image = read_record_bytes(payload, &mut offset, after_len, "after_image")?.to_vec();
     if offset != payload.len() {
         return Err(format!(
             "trailing bytes after WAL record: {}",
