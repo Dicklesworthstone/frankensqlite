@@ -13,7 +13,7 @@ async fn one(conn: &Connection, sql: &str) -> String {
             .map(|r| {
                 r.values()
                     .iter()
-                    .map(|v| v.to_text().to_string())
+                    .map(|v| v.to_text().clone())
                     .collect::<Vec<_>>()
                     .join("|")
             })

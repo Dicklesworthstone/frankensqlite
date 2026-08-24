@@ -49,7 +49,7 @@ fn bd_s12cm_pqauo_behavior_probe() {
             "INSERT INTO aux.t(id,tag) SELECT id, name FROM main.t WHERE id=1",
         ] {
             let r = f.execute(s).await;
-            eprintln!("SETUP {s:?} -> {}", if r.is_ok() { "ok".to_owned() } else { format!("ERR: {}", r.unwrap_err()) });
+            eprintln!("SETUP {s:?} -> {}", match r { Ok(_) => "ok".to_owned(), Err(e) => format!("ERR: {e}") });
         }
         eprintln!("--- initial aux.t ---");
         eprintln!("{}", dump(&f, "SELECT id,tag FROM aux.t ORDER BY id").await);
@@ -61,7 +61,7 @@ fn bd_s12cm_pqauo_behavior_probe() {
         // bd-s12cm (retraction test): UPDATE with non-correlated cross-schema WHERE subquery
         let u = "UPDATE aux.t SET tag='UPD' WHERE id IN (SELECT id FROM main.t)";
         let ur = f.execute(u).await;
-        eprintln!("--- bd-s12cm UPDATE {u:?} -> {} ---", if ur.is_ok() { "ok".to_owned() } else { format!("ERR: {}", ur.unwrap_err()) });
+        eprintln!("--- bd-s12cm UPDATE {u:?} -> {} ---", match ur { Ok(_) => "ok".to_owned(), Err(e) => format!("ERR: {e}") });
         eprintln!("aux.t after UPDATE: {}", dump(&f, "SELECT id,tag FROM aux.t ORDER BY id").await);
 
         // reset tag values via a plain aux update so DELETE test is independent
@@ -70,7 +70,7 @@ fn bd_s12cm_pqauo_behavior_probe() {
         // bd-s12cm case B: DELETE anti-join against real main
         let d = "DELETE FROM aux.t WHERE id NOT IN (SELECT id FROM main.t)";
         let dr = f.execute(d).await;
-        eprintln!("--- bd-s12cm DELETE {d:?} -> {} ---", if dr.is_ok() { "ok".to_owned() } else { format!("ERR: {}", dr.unwrap_err()) });
+        eprintln!("--- bd-s12cm DELETE {d:?} -> {} ---", match dr { Ok(_) => "ok".to_owned(), Err(e) => format!("ERR: {e}") });
         eprintln!("aux.t after DELETE (expect id=4 gone): {}", dump(&f, "SELECT id FROM aux.t ORDER BY id").await);
 
         eprintln!("main.t untouched: {}", dump(&f, "SELECT id,name FROM main.t ORDER BY id").await);
