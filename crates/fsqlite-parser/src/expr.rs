@@ -1244,7 +1244,7 @@ impl<'a> ParseMachine<'a> {
             } => {
                 let inner = self.pop_expr()?;
                 self.parser.expect_kind(&TokenKind::KwAs)?;
-                let type_name = self.parser.parse_type_name()?;
+                let type_name = self.parser.parse_cast_type_name()?;
                 let end = self.parser.expect_kind(&TokenKind::RightParen)?;
                 let height = inner.height;
                 let is_constant = inner.is_constant;
@@ -4038,7 +4038,7 @@ impl Parser {
                 self.expect_kind(&TokenKind::LeftParen)?;
                 let inner = self.parse_expr_bp(0)?;
                 self.expect_kind(&TokenKind::KwAs)?;
-                let type_name = self.parse_type_name()?;
+                let type_name = self.parse_cast_type_name()?;
                 let end = self.expect_kind(&TokenKind::RightParen)?;
                 let span = token_span.merge(end);
                 let height = inner.height;
@@ -4970,6 +4970,25 @@ impl Parser {
             }
         };
         Ok((action, Some(message)))
+    }
+
+    /// Parse the type name of a `CAST(expr AS <type>)`, permitting an EMPTY
+    /// type name (`CAST(x AS)`). SQLite accepts an empty CAST type: its
+    /// affinity is the `sqlite3AffinityType` default, NUMERIC, so `CAST(x AS)`
+    /// behaves exactly like `CAST(x AS NUMERIC)` (verified vs rusqlite 3.53.2).
+    /// Represented as an empty `TypeName`; the affinity mappers
+    /// (`type_name_to_affinity`, `apply_cast`) route an empty name to NUMERIC.
+    /// Only CAST admits this — `parse_type_name` (column defs, etc.) stays
+    /// strict. bd-errmsg-parity-batch4-deqcb (cast-incomplete).
+    fn parse_cast_type_name(&mut self) -> Result<TypeName, ParseError> {
+        if matches!(self.peek_kind(), TokenKind::RightParen) {
+            return Ok(TypeName {
+                name: String::new(),
+                arg1: None,
+                arg2: None,
+            });
+        }
+        self.parse_type_name()
     }
 
     fn parse_type_name(&mut self) -> Result<TypeName, ParseError> {
