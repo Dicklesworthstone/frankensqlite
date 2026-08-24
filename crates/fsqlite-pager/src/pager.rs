@@ -7099,8 +7099,10 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// by every connection to the same file). On `PagerInner::drop` any still-
     /// parked `abandoned_eof_reservations` are moved here so a surviving
     /// connection reconciles them at its next commit/checkpoint fold instead of
-    /// losing them; the fold sites drain it back into their pool via
-    /// `adopt_disowned_pages_into_pool`. `None` only for construction paths
+    /// losing them; the fold sites pull the in-range holes back into their pool
+    /// via `adopt_in_range_disowned_pages`, and above-extent holes are HELD here
+    /// persistently (`preserve_above_extent_at_generation_boundary`) until a
+    /// later grow makes them reclaimable. `None` only for construction paths
     /// with no bound queue (which are single-connection shapes that never
     /// populate the pool), so the cross-connection sweep is simply inert there.
     disowned_page_ledger: Option<Arc<Mutex<HashSet<u32>>>>,
@@ -9005,6 +9007,7 @@ fn disown_pages(
 /// The take is done under the ledger mutex so two connections folding
 /// concurrently each receive a disjoint slice — a page is adopted by exactly
 /// one connection, never double-reconciled.
+#[cfg(test)]
 fn take_disowned_pages(ledger: &Mutex<HashSet<u32>>) -> Vec<PageNumber> {
     let drained = std::mem::take(
         &mut *ledger
@@ -9014,17 +9017,55 @@ fn take_disowned_pages(ledger: &Mutex<HashSet<u32>>) -> Vec<PageNumber> {
     drained.into_iter().filter_map(PageNumber::new).collect()
 }
 
-/// bd-ioq6x Face-2: adopt every page from the shared per-file disowned-page
-/// ledger into this connection's own abandonment pool so the EXISTING
-/// no-committed-frame fold (commit-time and checkpoint-time) reconciles the
-/// provable holes into the durable freelist under the same double-grant guard
-/// the per-connection pool already trusts. Adopted pages thereby inherit the
-/// full per-connection machinery: an eligible frameless in-range page is
-/// promoted to the freelist, a page a committed peer has since framed is
-/// dropped, an above-extent page is retained (and handed back to the ledger if
-/// this connection itself later drops). Only meaningful in WAL mode — the
-/// rollback-journal path has no commit-fold to drain the pool. Returns the
-/// number of pages adopted.
+/// bd-ioq6x Face-2: atomically remove only the IN-RANGE (`<= ceiling`) pages
+/// from the shared disowned-page ledger, leaving above-extent entries in place.
+///
+/// This is the in-place reclaim that replaces the earlier drain-everything
+/// adopt. Above-extent pages (`> ceiling`) are reissuable-from-EOF and provably
+/// not live (a live page is always `<= db_size`), so their reclaimability is
+/// generation-independent and they are HELD in the shared ledger persistently —
+/// visible to every connection — until a later grow brings them in-range. The
+/// two failure modes this avoids:
+///   * draining an above-extent page into ONE connection's private pool stranded
+///     it there, invisible to the peer that later grew db_size past it (the
+///     `page N is never used` residual: disown==adopt yet leaked);
+///   * re-sharing the retained set back to the ledger each commit was the
+///     reverted mirror cycle (adopt+re-share ~1000x/run, amplifying bd-84rh4).
+/// Holding above-extent entries in place does neither: they never enter a
+/// private pool and never get re-shared, they simply wait in the ledger.
+///
+/// The retain runs under the ledger mutex so two folding connections still
+/// receive disjoint in-range slices — a given page is adopted by exactly one.
+fn take_in_range_disowned_pages(ledger: &Mutex<HashSet<u32>>, ceiling: u32) -> Vec<PageNumber> {
+    let mut guard = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = Vec::new();
+    guard.retain(|&page| {
+        if page <= ceiling {
+            if let Some(page) = PageNumber::new(page) {
+                taken.push(page);
+            }
+            false
+        } else {
+            true
+        }
+    });
+    taken
+}
+
+/// bd-ioq6x Face-2: adopt the IN-RANGE (`<= ceiling`) pages from the shared
+/// per-file disowned-page ledger into this connection's own abandonment pool so
+/// the EXISTING no-committed-frame fold (commit-time and checkpoint-time)
+/// reconciles the provable holes into the durable freelist under the same
+/// double-grant guard the per-connection pool already trusts. An eligible
+/// frameless in-range page is promoted to the freelist; a page a committed peer
+/// has since framed is dropped. Above-extent (`> ceiling`) entries are left in
+/// the shared ledger untouched — never drained into this connection's private
+/// pool (which stranded them from the peer that later grew past them) and never
+/// re-shared each commit (the reverted mirror cycle). Only meaningful in WAL
+/// mode — the rollback-journal path has no commit-fold to drain the pool.
+/// Returns the number of pages adopted.
 /// bd-ioq6x Face-2: runtime kill-switch for the shared disowned-page ledger
 /// (diagnostics / safety valve). When `FSQLITE_IOQ6X_LEDGER_OFF` is set, disown
 /// and adopt become no-ops, reverting exactly to the pre-ledger behavior (a
@@ -9034,14 +9075,17 @@ fn ioq6x_ledger_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("FSQLITE_IOQ6X_LEDGER_OFF").is_some())
 }
 
-fn adopt_disowned_pages_into_pool<F: VfsFile>(inner: &mut PagerInner<F>) -> usize {
+fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling: u32) -> usize {
     if ioq6x_ledger_disabled() || inner.journal_mode != JournalMode::Wal {
         return 0;
     }
     let Some(ledger) = inner.disowned_page_ledger.clone() else {
         return 0;
     };
-    let adopted = take_disowned_pages(&ledger);
+    // Take only the pages this fold can actually reconcile now (`<= ceiling`);
+    // above-extent entries stay in the shared ledger for a later in-range fold
+    // by whichever connection grows past them.
+    let adopted = take_in_range_disowned_pages(&ledger, ceiling);
     if adopted.is_empty() {
         return 0;
     }
@@ -9090,6 +9134,57 @@ fn clear_disowned_ledger<F: VfsFile>(inner: &PagerInner<F>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+    }
+}
+
+/// bd-ioq6x Face-2: reconcile the abandonment pool and shared ledger at a WAL-
+/// generation boundary (checkpoint completion) WITHOUT discarding above-extent
+/// holes — the residual Face-2 leak.
+///
+/// The no-committed-frame reconciliation is generation-scoped only for IN-RANGE
+/// pages: a page that was live and just got checkpointed carries no frame in the
+/// new generation, so a post-reset fold would misjudge a frameless in-range page
+/// as a hole and double-grant it. That is why the pool (and, since 9dc723dc2,
+/// the ledger) were cleared here — but the blanket clear also threw away
+/// ABOVE-EXTENT entries (`> db_size`), and those are a different animal: a live
+/// page is always `<= db_size`, so an above-extent entry is provably not live
+/// and its reclaimability is generation-INDEPENDENT. Discarding it was the leak
+/// — a later grow brings it in-range as an untracked hole ("page N is never
+/// used"). Preserve above-extent entries in the SHARED ledger (never a private
+/// pool, which would strand them from the peer that grows past them) so any
+/// connection reclaims them once in-range, guarded by the same no-frame test
+/// that correctly drops any the meantime made live. In-range entries are still
+/// dropped: the checkpoint-fold already reclaimed the provable frameless holes
+/// among them while their frames were visible, and keeping the rest would
+/// reintroduce the very generation-crossing double-grant the clear guards.
+fn preserve_above_extent_at_generation_boundary<F: VfsFile>(inner: &mut PagerInner<F>) {
+    if ioq6x_ledger_disabled() {
+        // Kill-switch: revert exactly to the pre-ledger behavior (discard the
+        // parked pool; the ledger is inert because disown/adopt are no-ops).
+        inner.abandoned_eof_reservations.clear();
+        clear_disowned_ledger(inner);
+        return;
+    }
+    let db_size = inner.db_size;
+    // Pool: hand this connection's own above-extent entries to the shared ledger
+    // (cross-connection visible); drop the generation-scoped in-range remainder.
+    let pool = std::mem::take(&mut inner.abandoned_eof_reservations);
+    let mut carried = 0_usize;
+    if let Some(ledger) = inner.disowned_page_ledger.as_ref() {
+        let mut guard = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Ledger: keep above-extent entries across the boundary, drop in-range.
+        guard.retain(|&page| page > db_size);
+        for page in pool {
+            if page.get() > db_size {
+                guard.insert(page.get());
+                carried += 1;
+            }
+        }
+    }
+    if carried > 0 && std::env::var_os("IOQ6X_TRACE").is_some() {
+        eprintln!("IOQ6X CKPT-PRESERVE carried_above_extent={carried} db_size={db_size}");
     }
 }
 
@@ -23483,13 +23578,15 @@ where
             // gh302 exactness guard and cross-process conflict machinery
             // apply unchanged.
             if self.journal_mode == JournalMode::Wal {
-                // bd-ioq6x Face-2: adopt pages disowned by connections that
-                // dropped before reconciling their own pool. They flow through
-                // the identical no-committed-frame fold below (same eligibility
-                // + double-grant guard), so a provable hole is published into
-                // this commit's durable freelist while a peer-framed page is
-                // dropped.
-                adopt_disowned_pages_into_pool(&mut inner);
+                // bd-ioq6x Face-2: adopt the in-range pages disowned by
+                // connections that dropped before reconciling their own pool.
+                // They flow through the identical no-committed-frame fold below
+                // (same eligibility + double-grant guard), so a provable hole is
+                // published into this commit's durable freelist while a
+                // peer-framed page is dropped. Above-extent disowned entries stay
+                // in the shared ledger (reclaimed by whichever commit later grows
+                // past them), never stranded in this connection's private pool.
+                adopt_in_range_disowned_pages(&mut inner, committed_db_size);
                 inner
                     .abandoned_eof_reservations
                     .append(&mut self.reclaimed_abandoned_reservations);
@@ -26169,8 +26266,11 @@ where
                 };
                 let _mask = self.cleanup_cx.masked();
                 inner.checkpoint_active = false;
-                inner.abandoned_eof_reservations.clear();
-                clear_disowned_ledger(&inner);
+                // bd-ioq6x Face-2: preserve above-extent disowned holes across
+                // the WAL-generation boundary in the shared ledger instead of
+                // discarding them (the residual "page N is never used" leak);
+                // in-range entries are still dropped (generation-scoped).
+                preserve_above_extent_at_generation_boundary(&mut inner);
                 self.published.publish_metadata_only(
                     &self.cleanup_cx,
                     PublishedPagerUpdate {
@@ -26242,12 +26342,15 @@ where
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
-            // bd-ioq6x Face-2: adopt pages disowned by dropped connections
-            // BEFORE this checkpoint reconciles/clears the pool. Under the
+            // bd-ioq6x Face-2: adopt the in-range pages disowned by dropped
+            // connections BEFORE this checkpoint reconciles the pool. Under the
             // exclusive maintenance fence (active_transactions == 0) they are
             // reconciled by the same no-committed-frame promotion below; the
-            // guard then clears the remainder at the WAL-generation boundary.
-            adopt_disowned_pages_into_pool(&mut inner);
+            // guard then preserves any above-extent remainder in the shared
+            // ledger across the WAL-generation boundary (rather than discarding
+            // it, the residual Face-2 leak).
+            let ckpt_ceiling = inner.db_size;
+            adopt_in_range_disowned_pages(&mut inner, ckpt_ceiling);
             if inner.journal_mode == JournalMode::Wal
                 && inner.db_size >= 2
                 && !inner.abandoned_eof_reservations.is_empty()
@@ -40905,11 +41008,13 @@ mod tests {
 
     #[test]
     fn test_ioq6x_face2_surviving_connection_adopts_disowned_pages() {
-        // bd-ioq6x Face-2: the surviving half — a connection drains the shared
-        // disowned-page ledger into its own abandonment pool at fold time,
-        // where the existing no-committed-frame reconciliation reclaims the
-        // in-range holes. The take is atomic so exactly one connection adopts a
-        // given page (never double-reconciled), and only WAL mode participates.
+        // bd-ioq6x Face-2: the surviving half — a connection pulls only the
+        // IN-RANGE (`<= ceiling`) pages from the shared disowned-page ledger into
+        // its own abandonment pool at fold time, where the existing
+        // no-committed-frame reconciliation reclaims the holes. Above-extent
+        // entries stay in the shared ledger (never stranded in a private pool),
+        // the take is atomic so exactly one connection adopts a given in-range
+        // page, and only WAL mode participates.
         asupersync::test_utils::run_test(|| async {
             let vfs = MemoryVfs::new();
             let path = PathBuf::from("/ioq6x_face2_adopt.db");
@@ -40927,34 +41032,111 @@ mod tests {
                 .disowned_page_ledger
                 .clone()
                 .expect("an open pager binds the shared disowned-page ledger");
-            // A previously-dropped peer left holes on the shared ledger.
+            // A previously-dropped peer left holes on the shared ledger: 57/58
+            // are in-range for the ceiling below, 90 is above-extent.
             disown_pages(
                 &ledger,
-                [PageNumber::new(57).unwrap(), PageNumber::new(58).unwrap()],
+                [
+                    PageNumber::new(57).unwrap(),
+                    PageNumber::new(58).unwrap(),
+                    PageNumber::new(90).unwrap(),
+                ],
             );
             assert!(inner.abandoned_eof_reservations.is_empty());
 
-            let adopted = adopt_disowned_pages_into_pool(&mut inner);
-            assert_eq!(adopted, 2, "both disowned pages are adopted into the pool");
+            // Ceiling 64: 57/58 are reclaimable now, 90 is not.
+            let adopted = adopt_in_range_disowned_pages(&mut inner, 64);
+            assert_eq!(
+                adopted, 2,
+                "only the in-range disowned pages are adopted into the pool"
+            );
             let mut pool: Vec<u32> = inner
                 .abandoned_eof_reservations
                 .iter()
                 .map(|page| page.get())
                 .collect();
             pool.sort_unstable();
-            assert_eq!(pool, vec![57, 58], "adopted pages joined this connection's pool");
-            assert!(
-                take_disowned_pages(&ledger).is_empty(),
-                "adoption drains the shared ledger so no peer double-reconciles the same page"
+            assert_eq!(
+                pool,
+                vec![57, 58],
+                "adopted in-range pages joined this connection's pool"
             );
+            assert_eq!(
+                take_disowned_pages(&ledger),
+                vec![PageNumber::new(90).unwrap()],
+                "the above-extent page is HELD in the shared ledger, not stranded in a private pool"
+            );
+
+            // Restore the above-extent entry for the non-WAL check below.
+            disown_pages(&ledger, [PageNumber::new(90).unwrap()]);
 
             // A non-WAL connection never participates in the pool machinery.
             inner.journal_mode = JournalMode::Delete;
             disown_pages(&ledger, [PageNumber::new(59).unwrap()]);
             assert_eq!(
-                adopt_disowned_pages_into_pool(&mut inner),
+                adopt_in_range_disowned_pages(&mut inner, 64),
                 0,
                 "a non-WAL connection never adopts disowned pages"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ioq6x_face2_checkpoint_boundary_preserves_above_extent_holes() {
+        // bd-ioq6x Face-2 (the residual orphan face): the WAL-generation boundary
+        // (checkpoint completion) must NOT discard above-extent disowned holes.
+        // A page `> db_size` is provably not live, so its reclaimability is
+        // generation-independent — dropping it here was the leak: a later grow
+        // brings it in-range as an untracked "page N is never used" orphan.
+        // In-range entries ARE dropped (generation-scoped: a live page that just
+        // got checkpointed carries no frame in the new generation).
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/ioq6x_face2_ckpt_boundary.db");
+            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+
+            let mut inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.journal_mode = JournalMode::Wal;
+            let ledger = inner
+                .disowned_page_ledger
+                .clone()
+                .expect("an open pager binds the shared disowned-page ledger");
+
+            // db_size = 60. Ledger has an in-range (50) and an above-extent (90)
+            // entry; the private pool has an in-range (40) and an above-extent
+            // (80) entry.
+            inner.db_size = 60;
+            disown_pages(
+                &ledger,
+                [PageNumber::new(50).unwrap(), PageNumber::new(90).unwrap()],
+            );
+            inner.abandoned_eof_reservations =
+                vec![PageNumber::new(40).unwrap(), PageNumber::new(80).unwrap()];
+
+            preserve_above_extent_at_generation_boundary(&mut inner);
+
+            // The private pool is fully drained (its above-extent entry moved to
+            // the shared ledger; its in-range entry dropped).
+            assert!(
+                inner.abandoned_eof_reservations.is_empty(),
+                "the pool is drained at the generation boundary"
+            );
+            // The ledger keeps ONLY the above-extent entries (90 held, 80 carried
+            // over from the pool); both in-range entries (50, 40) are gone.
+            let mut held: Vec<u32> = take_disowned_pages(&ledger)
+                .iter()
+                .map(|page| page.get())
+                .collect();
+            held.sort_unstable();
+            assert_eq!(
+                held,
+                vec![80, 90],
+                "above-extent holes survive the checkpoint boundary in the shared ledger; in-range holes are dropped"
             );
         });
     }
