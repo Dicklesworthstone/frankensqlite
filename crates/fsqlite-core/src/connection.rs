@@ -152794,9 +152794,10 @@ mod tests {
                 .query_with_params("SELECT ?0;", &[])
                 .await
                 .expect_err("?0 must be rejected during parsing");
-            assert!(
-                matches!(error, FrankenError::ParseError { ref detail, .. } if detail.contains("between ?1 and ?32766")),
-                "unexpected error: {error:?}"
+            assert_eq!(
+                error.to_string(),
+                "variable number must be between ?1 and ?32766",
+                "stock emits the bare range message with no got-suffix"
             );
         });
     }
