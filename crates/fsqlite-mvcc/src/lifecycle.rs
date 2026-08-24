@@ -1375,11 +1375,22 @@ impl TransactionManager {
             return Ok(CommitSeq::ZERO);
         }
 
-        if txn.mode == TransactionMode::Serialized {
+        let result = if txn.mode == TransactionMode::Serialized {
             self.commit_serialized(txn)
         } else {
             self.commit_concurrent(txn)
+        };
+        // bd-zywqc.11.1: count a write-conflict aborted as busy-snapshot on the
+        // direct MVCC-engine commit path. This path is disjoint from the CORE
+        // SQL commit path (which counts its own busy-snapshot conflicts); the
+        // `rebased` resolution occurs only here and is counted at its success
+        // site inside `commit_concurrent`.
+        if matches!(result, Err(MvccError::BusySnapshot)) {
+            fsqlite_observability::metrics::global()
+                .conflicts_busy_snapshot_total
+                .inc();
         }
+        result
     }
 
     /// Abort a transaction, releasing all held resources.
@@ -2260,6 +2271,16 @@ impl TransactionManager {
             rebased,
             "concurrent commit succeeded"
         );
+
+        // bd-zywqc.11.1: a concurrent commit that succeeded by rebasing at least
+        // one conflicting page onto newer state. This is the only place the
+        // rebased resolution occurs (the CORE SQL commit path aborts busy rather
+        // than rebasing), so count it once here, gated on the flag.
+        if rebased {
+            fsqlite_observability::metrics::global()
+                .conflicts_rebased_total
+                .inc();
+        }
 
         Ok(commit_seq)
     }
