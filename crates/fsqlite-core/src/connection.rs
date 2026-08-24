@@ -68225,7 +68225,7 @@ impl Connection {
             } else {
                 None
             };
-            let concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut() {
+            let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut() {
                 self.plan_concurrent_commit_with_registry(
                     registry,
                     &pending_conflict_pages,
@@ -68272,7 +68272,35 @@ impl Connection {
                         {
                             break;
                         }
+                        // bd-39dla liveness: a COMMIT-time `Busy` means the pager
+                        // could not escalate its write lock, so nothing was
+                        // physically written or published — the Issue #115
+                        // validate→physical-write→publish critical section has not
+                        // begun. Do NOT hold the shared `concurrent_registry` guard
+                        // across the busy back-off sleep: every other writer blocks
+                        // on that guard for up to the full `busy_timeout` per stuck
+                        // committer, and the in-flight transactions they cannot
+                        // finish are exactly the read-marks a WAL checkpoint waits to
+                        // drain — a self-sustaining convoy that wedges all writers
+                        // for minutes (2-3/20 large-scale churn runs). Release the
+                        // guard across the handoff, then re-acquire and RE-VALIDATE
+                        // (re-plan) before retrying the physical commit so the #115
+                        // TOCTOU protection is fully restored: if a peer published a
+                        // conflicting page during the back-off, the re-plan observes
+                        // it via the CommitIndex and aborts first-committer-wins
+                        // (which the caller treats as a transient retry).
+                        let reacquire_registry = commit_registry_guard.is_some();
+                        drop(commit_registry_guard.take());
                         perform_begin_busy_retry_handoff(wait).await;
+                        if reacquire_registry {
+                            let mut registry = lock_registry_for_commit(&self.concurrent_registry);
+                            concurrent_commit_plan = self.plan_concurrent_commit_with_registry(
+                                &mut registry,
+                                &pending_conflict_pages,
+                                schema_cookie_to_publish.is_some(),
+                            )?;
+                            commit_registry_guard = Some(registry);
+                        }
                         commit_res = {
                             let mut txn_guard = self.active_txn.borrow_mut();
                             if let Some(txn) = txn_guard.as_mut() {
@@ -79007,6 +79035,79 @@ impl Connection {
         Some(Ok(SqliteValue::Integer(i64::from(truth))))
     }
 
+    /// bd-nd2ju (#377, L3): after outer-ref substitution, relax each correlated
+    /// equality `inner_col = <BoundOuterValue>` in a single-table EXISTS
+    /// subquery to `inner_col = <literal>` when the comparison contract is
+    /// provably the inner column's own — so the nested statement compiles to an
+    /// index / PRIMARY KEY seek instead of the full scan a `BoundOuterValue`
+    /// target forces (`is_simple_constant` deliberately excludes bound outer
+    /// values because their donor affinity/collation can otherwise skew a raw
+    /// b-tree probe into a subset/superset of the SQL equality result).
+    ///
+    /// A plain literal makes the comparison use the inner column's own affinity
+    /// and collation. That equals the bound-value comparison exactly when the
+    /// bound value donates the SAME collation the inner column already carries
+    /// (so operand order cannot change the winning collation) and no affinity —
+    /// or the same affinity as the inner column (so the applied comparison
+    /// affinity is the column's either way). Both are sufficient (conservative)
+    /// conditions: when either fails the bound value is left in place and the
+    /// interpreted per-row fallback still evaluates it correctly, just without
+    /// the seek. NULL targets are left alone.
+    ///
+    /// Scope is a single unqualified MAIN FROM table (no joins/CTE/compound)
+    /// with an AND-conjunction WHERE; each qualifying `col = bound` / `bound =
+    /// col` conjunct is relaxed in place.
+    fn relax_correlated_exists_equalities_for_seek(&self, select: &mut SelectStatement) {
+        if select.with.is_some() || !select.body.compounds.is_empty() {
+            return;
+        }
+        // Extract the single unqualified MAIN FROM table + binding name.
+        let (table_name, alias) = {
+            let SelectCore::Select {
+                from: Some(from),
+                where_clause: Some(_),
+                ..
+            } = &select.body.select
+            else {
+                return;
+            };
+            if !from.joins.is_empty() {
+                return;
+            }
+            match &from.source {
+                TableOrSubquery::Table { name, alias, .. } if name.schema.is_none() => {
+                    (name.name.clone(), alias.clone())
+                }
+                _ => return,
+            }
+        };
+        let table_key = table_name.to_ascii_lowercase();
+        // Namespace-shadowed / TEMP names need the resolver's routing; keep this
+        // to plain unshadowed MAIN tables (mirrors `try_direct_exists_probe`).
+        if self.temp_table_names.borrow().contains(&table_key)
+            || self.shadowed_main_tables.borrow().contains_key(&table_key)
+        {
+            return;
+        }
+        let Some(table) = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&table_name))
+            .cloned()
+        else {
+            return;
+        };
+        let SelectCore::Select {
+            where_clause: Some(where_expr),
+            ..
+        } = &mut select.body.select
+        else {
+            return;
+        };
+        relax_eq_conjunct_bound_outer(where_expr, &table, alias.as_deref());
+    }
+
     /// Substitute outer-row values with the connection's shadow-aware
     /// main/TEMP schema inventory available for unqualified name resolution.
     fn substitute_outer_refs_for_current_schema(
@@ -79226,6 +79327,12 @@ impl Connection {
                         col_map,
                         None,
                     );
+                    // bd-nd2ju (#377, L3): relax collation/affinity-safe correlated
+                    // equalities (`inner_col = <bound outer value>`) to plain literals
+                    // so the nested statement compiles to an index / PRIMARY KEY seek
+                    // instead of the full scan a bound-outer target otherwise forces —
+                    // the quadratic bulk-ingest half of the trigger-WHEN EXISTS guard.
+                    self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
                     if sub_clone.limit.is_none() {
                         sub_clone.limit = Some(fsqlite_ast::LimitClause {
                             limit: Expr::Literal(Literal::Integer(1), fsqlite_ast::Span::new(0, 0)),
@@ -89381,29 +89488,40 @@ impl Connection {
                     let verified = match directive.access_kind {
                         PlannerSelectAccessKind::FullTableScan => {
                             // bd-2fong red 3 (bd-jyyae family): a FullTableScan
-                            // directive was trusted unconditionally, but the
-                            // native IN-probe lane (bd-2dgf5) upgrades
-                            // `ipk IN (SELECT ...)` to rowid seeks at codegen —
-                            // EQP printed `SCAN t` for a program whose first
-                            // act is SeekGE. Verify scan directives against the
-                            // program like every other access kind and report
-                            // the path the program actually performs (stock:
-                            // `SEARCH t USING INTEGER PRIMARY KEY (rowid=?)`).
-                            if let Ok(program) = self.compile_table_select(select).await
-                                && crate::explain::program_seeks_rowid_on_table(
+                            // directive was trusted unconditionally, but codegen
+                            // may upgrade it to a seek — the native IN-probe lane
+                            // (bd-2dgf5) turns `ipk IN (SELECT ...)` into rowid
+                            // seeks, and a WITHOUT ROWID single-column PRIMARY KEY
+                            // equality becomes a direct table-b-tree seek
+                            // (bd-nd2ju / #377) — so EQP printed `SCAN t` for a
+                            // program whose first act is a seek. Verify scan
+                            // directives against the program like every other
+                            // access kind and report the path the program
+                            // actually performs.
+                            if let Ok(program) = self.compile_table_select(select).await {
+                                if crate::explain::program_seeks_rowid_on_table(
                                     &program,
                                     &directive.table_name,
-                                )
-                            {
-                                return vec![to_row(
-                                    2,
-                                    0,
-                                    0,
-                                    format!(
-                                        "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                                        directive.table_name
-                                    ),
-                                )];
+                                ) {
+                                    return vec![to_row(
+                                        2,
+                                        0,
+                                        0,
+                                        format!(
+                                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                                            directive.table_name
+                                        ),
+                                    )];
+                                }
+                                if crate::explain::program_seeks_without_rowid_pk_on_table(
+                                    &program,
+                                    &directive.table_name,
+                                ) && let Some(detail) = without_rowid_pk_eqp_detail(
+                                    &directive.table_name,
+                                    &self.schema.borrow(),
+                                ) {
+                                    return vec![to_row(2, 0, 0, detail)];
+                                }
                             }
                             true
                         }
@@ -111290,6 +111408,140 @@ fn rewrite_in_expr<'a>(
 }
 
 /// Convert a `SqliteValue` into a synthetic `Expr::Literal`.
+/// Walk the AND-conjunction of an EXISTS subquery WHERE, relaxing each
+/// collation/affinity-safe `col = <bound outer value>` conjunct to `col =
+/// <literal>` so the compiled nested statement can seek (bd-nd2ju / #377, L3).
+///
+/// Only descends `AND` nodes and rewrites `Eq` leaves; every other shape (OR,
+/// comparisons other than `=`, nested subqueries) is left untouched, so a
+/// disjunction or a residual predicate keeps its exact semantics.
+fn relax_eq_conjunct_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Option<&str>) {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            relax_eq_conjunct_bound_outer(&mut **left, table, alias);
+            relax_eq_conjunct_bound_outer(&mut **right, table, alias);
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } => {
+            // `col = bound` — relax the right operand.
+            if let Some(col) = eq_seek_column(&**left, table, alias)
+                && let Some(literal) = bound_outer_relaxable_to_literal(&**right, col)
+            {
+                **right = literal;
+            // `bound = col` — relax the left operand.
+            } else if let Some(col) = eq_seek_column(&**right, table, alias)
+                && let Some(literal) = bound_outer_relaxable_to_literal(&**left, col)
+            {
+                **left = literal;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// If `expr` is a bare column reference of `table` (unqualified, or qualified by
+/// the table name / `alias`), return its [`ColumnInfo`]. Schema-qualified or
+/// foreign references return `None`.
+fn eq_seek_column<'a>(
+    expr: &Expr,
+    table: &'a TableSchema,
+    alias: Option<&str>,
+) -> Option<&'a ColumnInfo> {
+    let Expr::Column(column, _) = expr else {
+        return None;
+    };
+    if column.schema.is_some() {
+        return None;
+    }
+    if let Some(qualifier) = column.table.as_deref()
+        && !qualifier.eq_ignore_ascii_case(&table.name)
+        && !alias.is_some_and(|a| qualifier.eq_ignore_ascii_case(a))
+    {
+        return None;
+    }
+    table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(column.column.as_ref()))
+}
+
+/// If `expr` is a non-NULL [`Expr::BoundOuterValue`] whose donor collation,
+/// affinity, AND runtime storage class make a plain-literal comparison against
+/// `col` byte-identical to the bound comparison, return the equivalent literal
+/// (bd-nd2ju / #377, L3).
+///
+/// The subtlety a plain literal loses is that a bound outer value CARRIES its
+/// donor affinity, so `col(A) = bound(A, v)` resolves to "no affinity applied"
+/// (both operands already have affinity `A`) and compares `v` *as stored*, while
+/// `col(A) = literal(v)` — a literal has no affinity — resolves to "apply `A` to
+/// the literal" and compares the COERCED `v`. Those diverge whenever coercing
+/// `v` to `A` is not a no-op: e.g. `text_col = <bound TEXT-affinity value 1>`
+/// leaves the integer `1` uncoerced (no match against `'1'`), but `text_col = 1`
+/// coerces `1`→`'1'` (spurious match). So relaxation is admitted ONLY when:
+///   * the donor collation is a known name equal to `col`'s effective collation
+///     (default `BINARY`), so the winning collation is `col`'s in either operand
+///     order;
+///   * the donor affinity equals `col`'s affinity (so the bound comparison
+///     applies no affinity — the same treatment the coerced-literal path lands
+///     on once the next condition holds); AND
+///   * the runtime value's storage class is already in `col`'s affinity class,
+///     so `col`'s affinity coercion of the literal is a no-op and both paths
+///     compare the value as stored.
+/// When any condition fails the bound value is left in place and the interpreted
+/// per-row fallback still evaluates it with full SQLite comparison semantics.
+fn bound_outer_relaxable_to_literal(expr: &Expr, col: &ColumnInfo) -> Option<Expr> {
+    let Expr::BoundOuterValue {
+        value,
+        collation,
+        affinity,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    if matches!(value, SqliteValue::Null) {
+        return None;
+    }
+    let col_collation = col.collation.as_deref().unwrap_or("BINARY");
+    if !collation
+        .as_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(col_collation))
+    {
+        return None;
+    }
+    let col_affinity = affinity_char_to_type(col.affinity);
+    // Donor affinity must equal the column's (a mismatch, or an absent donor
+    // affinity, can change which operand SQLite coerces).
+    if *affinity != Some(col_affinity) {
+        return None;
+    }
+    // The value must already be in the column's affinity class, so applying that
+    // affinity is a no-op and the literal path compares the value as stored —
+    // matching the bound path's no-coercion comparison.
+    let value_in_affinity_class = match col_affinity {
+        TypeAffinity::Text => matches!(value, SqliteValue::Text(_)),
+        TypeAffinity::Integer | TypeAffinity::Real | TypeAffinity::Numeric => {
+            matches!(value, SqliteValue::Integer(_) | SqliteValue::Float(_))
+        }
+        // A no-affinity (BLOB) column never coerces either operand, so the
+        // comparison is the value as stored on both paths regardless of class.
+        TypeAffinity::Blob => true,
+    };
+    if !value_in_affinity_class {
+        return None;
+    }
+    Some(value_to_literal_expr(value.clone()))
+}
+
 fn value_to_literal_expr(val: SqliteValue) -> Expr {
     use fsqlite_ast::Span;
     match val {
@@ -124307,6 +124559,29 @@ fn planner_directive_covering_access_kind(
     } else {
         None
     }
+}
+
+/// EQP detail for a WITHOUT ROWID PRIMARY KEY point lookup (bd-nd2ju / #377).
+///
+/// Renders `SEARCH <table> USING PRIMARY KEY (<col>=? [AND <col>=?]...)`,
+/// matching stock SQLite. The PK is the table b-tree, not a `sqlite_autoindex_*`
+/// entry, so this is built from the table's declared PRIMARY KEY columns rather
+/// than an index name. Only reached after the program is verified to actually
+/// perform the seek (`program_seeks_without_rowid_pk_on_table`).
+fn without_rowid_pk_eqp_detail(table_name: &str, schema: &[TableSchema]) -> Option<String> {
+    let table = schema
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(table_name))?;
+    let pk_columns = table.primary_key_constraints.first()?;
+    if pk_columns.is_empty() {
+        return None;
+    }
+    let key_terms = pk_columns
+        .iter()
+        .map(|column| format!("{column}=?"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    Some(format!("SEARCH {table_name} USING PRIMARY KEY ({key_terms})"))
 }
 
 fn explain_query_plan_detail_from_directive(directive: &SelectPlannerDirective) -> String {

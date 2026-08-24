@@ -371,6 +371,40 @@ pub fn program_seeks_rowid_on_table(program: &VdbeProgram, table_name: &str) -> 
     })
 }
 
+/// True when the emitted program probes a cursor opened on `table_name`
+/// directly by a record key via `NoConflict`/`NotFound`.
+///
+/// This is a WITHOUT ROWID PRIMARY KEY point lookup, whose table b-tree IS
+/// keyed by the PK (bd-nd2ju / #377).
+/// Companion to [`program_seeks_named_index`] / [`program_seeks_rowid_on_table`]
+/// for the `SEARCH ... USING PRIMARY KEY` directive claim. The probe must target
+/// a cursor opened on the named table so a record-key seek elsewhere (an index's
+/// table-lookup leg on a WITHOUT ROWID secondary index) cannot vouch for a
+/// direct-PK claim. Only invoked under a `FullTableScan` directive, where the
+/// sole table-cursor record probe a compiled SELECT can carry is the WR-PK
+/// lookup (a WR secondary-index equality compiles to an `IndexEquality`
+/// directive instead and is verified by the named-index path).
+#[must_use]
+pub fn program_seeks_without_rowid_pk_on_table(program: &VdbeProgram, table_name: &str) -> bool {
+    let ops = program.ops();
+    let mut table_cursors: HashSet<i32> = HashSet::new();
+    for op in ops {
+        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite)
+            && let P4::Table(name) = &op.p4
+            && name == table_name
+        {
+            table_cursors.insert(op.p1);
+        }
+    }
+    if table_cursors.is_empty() {
+        return false;
+    }
+    ops.iter().any(|op| {
+        matches!(op.opcode, Opcode::NoConflict | Opcode::NotFound)
+            && table_cursors.contains(&op.p1)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
