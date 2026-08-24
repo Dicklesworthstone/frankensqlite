@@ -361,47 +361,43 @@ pub fn measure_fsqlite_baseline(
     };
 
     // 3. Attempt WAL-FEC recovery for WAL strategies.
-    let (recovery_attempted, recovery_succeeded, pages_recovered, recovery_log_summary) =
-        if entry.category == CorruptionCategory::Wal {
-            if let Some(ref info) = wal_info {
-                let wal_path = db_path.with_extension("db-wal");
-                let corrupted_frames =
-                    identify_corrupted_frames(&wal_path, &original_pages, info.page_size);
+    let (recovery_attempted, recovery_succeeded, pages_recovered, recovery_log_summary) = if entry
+        .category
+        == CorruptionCategory::Wal
+    {
+        if let Some(ref info) = wal_info {
+            let wal_path = db_path.with_extension("db-wal");
+            let corrupted_frames =
+                identify_corrupted_frames(&wal_path, &original_pages, info.page_size);
 
-                let config = RecoveryDemoConfig {
-                    recovery_enabled: true,
-                    repair_symbols: BASELINE_REPAIR_SYMBOLS,
-                };
+            let config = RecoveryDemoConfig {
+                recovery_enabled: true,
+                repair_symbols: BASELINE_REPAIR_SYMBOLS,
+            };
 
-                match attempt_wal_fec_recovery_with_config(
-                    &wal_path,
-                    info,
-                    original_pages,
-                    &corrupted_frames,
-                    &config,
-                ) {
-                    Ok((outcome, log)) => {
-                        let (succeeded, pages) = match &outcome {
-                            fsqlite_wal::WalFecRecoveryOutcome::Recovered(group) => {
-                                // Write recovered pages back to WAL for reading.
-                                let _ =
-                                    write_recovered_wal(&wal_path, info, &group.recovered_pages);
-                                (true, group.recovered_pages.len())
-                            }
-                            fsqlite_wal::WalFecRecoveryOutcome::TruncateBeforeGroup { .. } => {
-                                (false, 0)
-                            }
-                        };
-                        (true, succeeded, pages, Some(format!("{log:?}")))
-                    }
-                    Err(_) => (true, false, 0, None),
+            match attempt_wal_fec_recovery_with_config(&wal_path, info, &corrupted_frames, &config)
+            {
+                Ok((outcome, log)) => {
+                    let (succeeded, pages) = match &outcome {
+                        fsqlite_wal::WalFecRecoveryOutcome::Recovered(group) => {
+                            // Write recovered pages back to WAL for reading.
+                            let _ = write_recovered_wal(&wal_path, info, &group.recovered_pages);
+                            (true, group.recovered_pages.len())
+                        }
+                        fsqlite_wal::WalFecRecoveryOutcome::TruncateBeforeGroup { .. } => {
+                            (false, 0)
+                        }
+                    };
+                    (true, succeeded, pages, Some(format!("{log:?}")))
                 }
-            } else {
-                (false, false, 0, None)
+                Err(_) => (true, false, 0, None),
             }
         } else {
             (false, false, 0, None)
-        };
+        }
+    } else {
+        (false, false, 0, None)
+    };
 
     // 4. Try to open and inspect the (possibly recovered) database.
     let open_result = Connection::open(&db_path);

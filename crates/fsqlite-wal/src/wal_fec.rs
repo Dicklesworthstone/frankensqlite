@@ -782,12 +782,40 @@ impl WalFecRepairSource {
     }
 }
 
-/// Witness triple proving repair integrity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Content witness triple for a WAL-FEC repair action.
+///
+/// Each hash is a BLAKE3 fingerprint over the **actual per-page xxh3-128 content
+/// hashes** (see [`content_fingerprint`]), computed with an identical domain
+/// prefix for all three roles. Because the domain is shared, equality is
+/// meaningful data evidence, not a label artifact:
+///
+/// - `repaired_hash_blake3 == expected_hash_blake3` iff every recovered page's
+///   content hash matches the encoder-time fingerprint stored in the sidecar
+///   meta — i.e. the repair genuinely restored the expected bytes.
+/// - `corrupted_hash_blake3 != expected_hash_blake3` iff the pre-repair WAL
+///   frames observed on disk deviated from those fingerprints — i.e. corruption
+///   or loss was actually witnessed.
+///
+/// A repaired hash of all-zero bytes marks "no recovered payload" (a fallback /
+/// truncation outcome), distinct from any real content fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WalFecRepairWitnessTriple {
     pub corrupted_hash_blake3: [u8; 32],
     pub repaired_hash_blake3: [u8; 32],
     pub expected_hash_blake3: [u8; 32],
+}
+
+impl WalFecRepairWitnessTriple {
+    /// All-zero witness: no content was observed or recovered (e.g. a bailout
+    /// before any page bytes were available).
+    #[must_use]
+    pub const fn zeroed() -> Self {
+        Self {
+            corrupted_hash_blake3: [0_u8; 32],
+            repaired_hash_blake3: [0_u8; 32],
+            expected_hash_blake3: [0_u8; 32],
+        }
+    }
 }
 
 /// One append-only evidence card for a RaptorQ repair action.
@@ -1124,28 +1152,6 @@ fn compute_corruption_signature(log: &WalFecRecoveryLog, event: &WalFecRepairEve
     blake3_hash_to_array(&hasher)
 }
 
-fn compute_witness_hash(
-    label: &[u8],
-    log: &WalFecRecoveryLog,
-    event: &WalFecRepairEvent,
-    corruption_signature: [u8; 32],
-) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"fsqlite:wal_fec:repair_witness:v1");
-    hasher.update(label);
-    hasher.update(&corruption_signature);
-    hasher.update(&log.group_id.wal_salt1.to_le_bytes());
-    hasher.update(&log.group_id.wal_salt2.to_le_bytes());
-    hasher.update(&log.group_id.end_frame_no.to_le_bytes());
-    hasher.update(&event.symbols_used.to_le_bytes());
-    hasher.update(&event.budget_utilization_pct.to_le_bytes());
-    hasher.update(&log.required_symbols.to_le_bytes());
-    hasher.update(&log.available_symbols.to_le_bytes());
-    hasher.update(&[u8::from(log.outcome_is_recovered)]);
-    hasher.update(&[u8::from(log.decode_succeeded)]);
-    blake3_hash_to_array(&hasher)
-}
-
 fn compute_evidence_chain_hash(
     previous_tip: [u8; 32],
     card: &WalFecRepairEvidenceCard,
@@ -1186,16 +1192,15 @@ fn compute_evidence_chain_hash(
 fn build_repair_evidence_card(
     log: &WalFecRecoveryLog,
     event: &WalFecRepairEvent,
+    witness: WalFecRepairWitnessTriple,
     latency: Duration,
     previous_chain_tip: [u8; 32],
     ledger_epoch: u64,
 ) -> WalFecRepairEvidenceCard {
     let corruption_signature = compute_corruption_signature(log, event);
-    let witness = WalFecRepairWitnessTriple {
-        corrupted_hash_blake3: compute_witness_hash(b"corrupted", log, event, corruption_signature),
-        repaired_hash_blake3: compute_witness_hash(b"repaired", log, event, corruption_signature),
-        expected_hash_blake3: compute_witness_hash(b"expected", log, event, corruption_signature),
-    };
+    // `witness` is the byte-derived content triple computed at recovery time
+    // (see `build_content_witness`) and threaded in from the decode proof — NOT
+    // a relabelled digest of these telemetry counters.
     let repair_latency_ns = u64::try_from(latency.as_nanos()).unwrap_or(u64::MAX);
     let bit_error_pattern = if log.corruption_observations > 0 {
         Some(format!(
@@ -1234,7 +1239,25 @@ fn build_repair_evidence_card(
 /// Record one recovery log into the global telemetry ledger.
 ///
 /// This is non-blocking aside from a short in-process mutex critical section.
+///
+/// The evidence card's content witness is left all-zero — use
+/// [`record_raptorq_recovery_log_with_witness`] to attach the byte-derived
+/// witness from the decode proof. Synthetic / telemetry-only callers that hold
+/// no page bytes correctly record "no content witnessed".
 pub fn record_raptorq_recovery_log(log: &WalFecRecoveryLog, latency: Duration) {
+    record_raptorq_recovery_log_with_witness(log, WalFecRepairWitnessTriple::zeroed(), latency);
+}
+
+/// Record one recovery log with its byte-derived content `witness` attached.
+///
+/// The `witness` (the content triple carried on the decode proof) is written
+/// verbatim into the evidence card, so the audit ledger reflects real page
+/// bytes. Non-blocking aside from a short in-process mutex critical section.
+pub fn record_raptorq_recovery_log_with_witness(
+    log: &WalFecRecoveryLog,
+    witness: WalFecRepairWitnessTriple,
+    latency: Duration,
+) {
     let Some(event) = build_repair_event(log, latency) else {
         return;
     };
@@ -1260,8 +1283,14 @@ pub fn record_raptorq_recovery_log(log: &WalFecRecoveryLog, latency: Duration) {
     state.events.push_back(event.clone());
 
     let ledger_epoch = state.next_evidence_epoch.max(1);
-    let evidence_card =
-        build_repair_evidence_card(log, &event, latency, state.evidence_chain_tip, ledger_epoch);
+    let evidence_card = build_repair_evidence_card(
+        log,
+        &event,
+        witness,
+        latency,
+        state.evidence_chain_tip,
+        ledger_epoch,
+    );
     state.next_evidence_epoch = ledger_epoch.saturating_add(1);
     state.evidence_chain_tip = evidence_card.chain_hash;
     if state.evidence_cards.len() == RAPTORQ_REPAIR_EVIDENCE_CAPACITY {
@@ -1402,6 +1431,10 @@ pub struct WalFecDecodeProof {
     pub decode_succeeded: bool,
     pub recovered_frame_nos: Vec<u32>,
     pub fallback_reason: Option<WalFecRecoveryFallbackReason>,
+    /// Byte-derived content witness (see [`WalFecRepairWitnessTriple`]): hashes
+    /// the actual observed / recovered / expected page content, not telemetry
+    /// counters. All-zero `repaired` marks a non-recovery outcome.
+    pub content_witness: WalFecRepairWitnessTriple,
 }
 
 /// Successful recovery payload for one commit group.
@@ -2562,9 +2595,16 @@ where
             group_id = %group_id,
             "wal-fec group salt mismatch; rejecting sidecar group and truncating"
         );
+        // W5 (bd-kyba9): the mismatching group is from a different WAL
+        // generation, so its `start_frame_no` is meaningless for this WAL and
+        // could sit AFTER the observed chain break — retaining corrupt frames.
+        // Truncate at the earlier of the two so no post-break frame survives.
         return Ok(truncate_outcome(
             group_id,
-            group.meta.start_frame_no,
+            group
+                .meta
+                .start_frame_no
+                .min(first_checksum_mismatch_frame_no),
             WalFecRecoveryFallbackReason::SaltMismatch,
             RecoveryProofStats::new(group.meta.k_source),
         ));
@@ -2679,7 +2719,15 @@ where
         "wal-fec recovery decision"
     );
 
-    record_raptorq_recovery_log(&log, elapsed);
+    // Thread the byte-derived content witness from the decode proof into the
+    // evidence ledger so the card reflects real page bytes (bd-kyba9 W3).
+    let content_witness = match &outcome {
+        WalFecRecoveryOutcome::Recovered(group) => group.decode_proof.content_witness,
+        WalFecRecoveryOutcome::TruncateBeforeGroup { decode_proof, .. } => {
+            decode_proof.content_witness
+        }
+    };
+    record_raptorq_recovery_log_with_witness(&log, content_witness, elapsed);
     crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS
         .record_repair(log.outcome_is_recovered, duration_us);
     Ok((outcome, log))
@@ -2776,6 +2824,7 @@ where
             available_symbols = stats.available_symbols,
             "insufficient symbols for wal-fec decode; truncating before group"
         );
+        stats.content_witness = build_content_witness(meta, &frame_payload_by_no, None);
         return Ok(insufficient_symbols_outcome(meta, group_id, stats));
     }
 
@@ -2787,6 +2836,15 @@ where
             validated_source_symbols = stats.validated_source_symbols,
             "wal-fec recovery fast path: group fully intact"
         );
+        // Fast path returns every source page unchanged; witness them against
+        // their expected fingerprints so the ledger reflects the real bytes.
+        let recovered: Vec<Vec<u8>> = source_collection
+            .source_pages
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        stats.content_witness = build_content_witness(meta, &frame_payload_by_no, Some(&recovered));
         return Ok(fast_path_outcome(
             meta,
             group_id,
@@ -2805,6 +2863,7 @@ where
                 error = %err,
                 "wal-fec decode failed; truncating before group"
             );
+            stats.content_witness = build_content_witness(meta, &frame_payload_by_no, None);
             return Ok(decode_failed_outcome(meta, group_id, stats));
         }
     };
@@ -2815,9 +2874,14 @@ where
             group_id = %group_id,
             "decoded payload failed structural/hash verification; truncating before group"
         );
+        // Record the (mismatching) decoded bytes so `repaired != expected`
+        // faithfully surfaces the failed repair.
+        stats.content_witness =
+            build_content_witness(meta, &frame_payload_by_no, Some(&decoded_pages));
         return Ok(decoded_mismatch_outcome(meta, group_id, stats));
     }
 
+    stats.content_witness = build_content_witness(meta, &frame_payload_by_no, Some(&decoded_pages));
     Ok(finalize_decoded_success_outcome(
         meta,
         group_id,
@@ -2941,6 +3005,7 @@ struct RecoveryProofStats {
     decode_attempted: bool,
     decode_succeeded: bool,
     recovered_frame_nos: Vec<u32>,
+    content_witness: WalFecRepairWitnessTriple,
 }
 
 impl RecoveryProofStats {
@@ -2954,6 +3019,7 @@ impl RecoveryProofStats {
             decode_attempted: false,
             decode_succeeded: false,
             recovered_frame_nos: Vec::new(),
+            content_witness: WalFecRepairWitnessTriple::zeroed(),
         }
     }
 }
@@ -3032,26 +3098,23 @@ fn collect_valid_source_symbols(
             );
             continue;
         }
-        if frame_no >= first_checksum_mismatch_frame_no
-            && !verify_wal_fec_source_hash(payload, meta.source_page_xxh3_128[index])
-        {
+        // W2 (bd-kyba9): verify the independent per-page xxh3 for EVERY source
+        // frame, not only those at/after the caller-reported chain break. The
+        // expected hashes are already in `meta`, so the check is free, and doing
+        // it unconditionally stops a caller that miscomputes the break frame
+        // (reports it too high) from smuggling a corrupt pre-break page into a
+        // "Recovered" fast-path result. `first_checksum_mismatch_frame_no` now
+        // only annotates the diagnostic (WAL chain already flagged it vs. not).
+        if !verify_wal_fec_source_hash(payload, meta.source_page_xxh3_128[index]) {
             warn!(
                 bead_id = BD_1HI_11_BEAD_ID,
                 group_id = %group_id,
                 frame_no,
                 esi = source_esi,
-                "source frame hash mismatch at/after wal chain break; excluding from decoder input"
+                after_chain_break = frame_no >= first_checksum_mismatch_frame_no,
+                "source frame xxh3 mismatch; excluding from decoder input"
             );
             continue;
-        }
-        if frame_no >= first_checksum_mismatch_frame_no {
-            debug!(
-                bead_id = BD_1HI_11_BEAD_ID,
-                group_id = %group_id,
-                frame_no,
-                esi = source_esi,
-                "source frame validated via independent xxh3 hash"
-            );
         }
         let payload_vec = payload.to_vec();
         source_pages[index] = Some(payload_vec.clone());
@@ -3127,6 +3190,71 @@ fn decoded_pages_match_expected(
         payload.len() == page_len
             && verify_wal_fec_source_hash(payload, meta.source_page_xxh3_128[index])
     })
+}
+
+/// BLAKE3 fingerprint over a sequence of per-page xxh3-128 content hashes.
+///
+/// The domain prefix is fixed and shared across every witness role, so two
+/// fingerprints are equal iff their underlying per-page content hashes are
+/// identical. This is what gives [`WalFecRepairWitnessTriple`] real forensic
+/// weight (see its docs): equality reflects actual page bytes, not labels.
+fn content_fingerprint(page_hashes: &[[u8; 16]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fsqlite:wal_fec:content_fingerprint:v1");
+    for hash in page_hashes {
+        hasher.update(hash);
+    }
+    blake3_hash_to_array(&hasher)
+}
+
+/// Build a byte-derived [`WalFecRepairWitnessTriple`] for a recovery attempt.
+///
+/// - `expected` hashes the encoder-time per-page content fingerprints held in
+///   the sidecar meta.
+/// - `corrupted` hashes the xxh3-128 of the WAL frame payloads actually
+///   observed on disk at each source position (missing frames use a `0xFF`
+///   sentinel), i.e. the pre-repair state.
+/// - `repaired` hashes the xxh3-128 of the recovered pages when a payload
+///   exists, otherwise all-zero to mark a non-recovery outcome.
+fn build_content_witness(
+    meta: &WalFecGroupMeta,
+    frame_payload_by_no: &BTreeMap<u32, &[u8]>,
+    recovered_pages: Option<&[Vec<u8>]>,
+) -> WalFecRepairWitnessTriple {
+    let expected: Vec<[u8; 16]> = meta
+        .source_page_xxh3_128
+        .iter()
+        .map(|hash| hash.to_le_bytes())
+        .collect();
+
+    let mut corrupted = Vec::with_capacity(expected.len());
+    for source_esi in 0..meta.k_source {
+        let observed = meta
+            .start_frame_no
+            .checked_add(source_esi)
+            .and_then(|frame_no| frame_payload_by_no.get(&frame_no).copied())
+            .map_or([0xFF_u8; 16], |payload| {
+                wal_fec_source_hash_xxh3_128(payload).to_le_bytes()
+            });
+        corrupted.push(observed);
+    }
+
+    let repaired_hash_blake3 = match recovered_pages {
+        Some(pages) if pages.len() == expected.len() => {
+            let hashes: Vec<[u8; 16]> = pages
+                .iter()
+                .map(|page| wal_fec_source_hash_xxh3_128(page).to_le_bytes())
+                .collect();
+            content_fingerprint(&hashes)
+        }
+        _ => [0_u8; 32],
+    };
+
+    WalFecRepairWitnessTriple {
+        corrupted_hash_blake3: content_fingerprint(&corrupted),
+        repaired_hash_blake3,
+        expected_hash_blake3: content_fingerprint(&expected),
+    }
 }
 
 fn repair_symbol_matches_meta(meta: &WalFecGroupMeta, symbol: &SymbolRecord) -> bool {
@@ -3223,6 +3351,7 @@ fn build_decode_proof(
         decode_succeeded: stats.decode_succeeded,
         recovered_frame_nos: stats.recovered_frame_nos,
         fallback_reason,
+        content_witness: stats.content_witness,
     }
 }
 
@@ -3954,7 +4083,18 @@ mod tests {
             decode_attempted: true,
             decode_succeeded: true,
         };
-        record_raptorq_recovery_log(&first_log, Duration::from_micros(10));
+        // The real byte-derived witness travels alongside the log via the
+        // `_with_witness` entry point (production passes the decode proof's).
+        let first_witness = WalFecRepairWitnessTriple {
+            corrupted_hash_blake3: [0x11_u8; 32],
+            repaired_hash_blake3: [0x22_u8; 32],
+            expected_hash_blake3: [0x22_u8; 32],
+        };
+        record_raptorq_recovery_log_with_witness(
+            &first_log,
+            first_witness,
+            Duration::from_micros(10),
+        );
 
         let second_group = WalFecGroupId {
             wal_salt1: 0x1A1A_1B1B,
@@ -3988,7 +4128,17 @@ mod tests {
         assert_eq!(cards[1].frame_id, second_group.end_frame_no);
         assert_eq!(cards[0].confidence_per_mille, 1_000);
         assert_eq!(cards[1].confidence_per_mille, 666);
-        assert_ne!(cards[0].witness.corrupted_hash_blake3, [0_u8; 32]);
+        // The evidence card carries the byte-derived content witness verbatim
+        // (no relabelled telemetry digest): corrupted != expected proves
+        // corruption was observed, repaired == expected proves the recovered
+        // bytes matched their fingerprints.
+        assert_eq!(cards[0].witness.corrupted_hash_blake3, [0x11_u8; 32]);
+        assert_eq!(cards[0].witness.repaired_hash_blake3, [0x22_u8; 32]);
+        assert_eq!(cards[0].witness.expected_hash_blake3, [0x22_u8; 32]);
+        assert_ne!(
+            cards[0].witness.corrupted_hash_blake3,
+            cards[0].witness.expected_hash_blake3
+        );
     }
 
     #[test]
@@ -4378,6 +4528,7 @@ mod tests {
             decode_succeeded: true,
             recovered_frame_nos: vec![3, 4],
             fallback_reason: None,
+            content_witness: WalFecRepairWitnessTriple::zeroed(),
         };
         let meta = WalFecGroupMeta::from_init(make_test_init(3)).expect("from_init");
         let outcome = WalFecRecoveryOutcome::Recovered(WalFecRecoveredGroup {
@@ -4416,6 +4567,7 @@ mod tests {
             decode_succeeded: false,
             recovered_frame_nos: vec![],
             fallback_reason: Some(WalFecRecoveryFallbackReason::InsufficientSymbols),
+            content_witness: WalFecRepairWitnessTriple::zeroed(),
         };
         let outcome = WalFecRecoveryOutcome::TruncateBeforeGroup {
             truncate_before_frame_no: 3,
@@ -4653,6 +4805,7 @@ mod tests {
             decode_succeeded: true,
             recovered_frame_nos: vec![1, 2, 3, 4],
             fallback_reason: None,
+            content_witness: WalFecRepairWitnessTriple::zeroed(),
         };
         let cloned = proof.clone();
         assert_eq!(cloned, proof);

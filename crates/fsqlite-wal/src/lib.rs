@@ -151,9 +151,10 @@ pub use wal_fec::{
     persist_wal_fec_raptorq_repair_symbols, query_raptorq_repair_evidence,
     raptorq_repair_events_snapshot, raptorq_repair_evidence_snapshot,
     raptorq_repair_metrics_snapshot, read_wal_fec_raptorq_repair_symbols,
-    record_raptorq_recovery_log, recover_wal_fec_group_with_config,
-    recover_wal_fec_group_with_decoder, recovery_log_from_outcome, reset_raptorq_repair_telemetry,
-    scan_wal_fec, wal_fec_path_for_wal,
+    record_raptorq_recovery_log, record_raptorq_recovery_log_with_witness,
+    recover_wal_fec_group_with_config, recover_wal_fec_group_with_decoder,
+    recovery_log_from_outcome, reset_raptorq_repair_telemetry, scan_wal_fec, wal_fec_path_for_wal,
+    wal_fec_raptorq_decode,
 };
 pub use wal_index::{
     WAL_CKPT_INFO_BYTES, WAL_CKPT_LOCK, WAL_INDEX_HASH_MASK, WAL_INDEX_HASH_MULTIPLIER,
