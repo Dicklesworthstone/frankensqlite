@@ -9193,6 +9193,32 @@ enum TriggerStatementOutcome {
     SkipDml,
 }
 
+/// bd-bwm0x: Result of probing whether an attempted upsert row conflicts on one
+/// ON CONFLICT clause's conflict target. Used to route multi-clause upserts to
+/// the taken clause for BEFORE/AFTER UPDATE trigger firing, mirroring the VDBE
+/// (bd-aap9u/xa2qv): the first clause whose target is violated is the one applied.
+enum UpsertConflictProbe {
+    /// The clause's conflict target cannot be reconstructed here (an expression /
+    /// partial-index target, or an omitted target on a table without an INTEGER
+    /// PRIMARY KEY). Routing cannot proceed past this clause; the caller keeps its
+    /// prior VDBE-only trigger behavior.
+    Indeterminate,
+    /// No existing row conflicts on this clause's target; try the next clause.
+    NoConflict,
+    /// An existing row conflicts; carries its rowid (rowid tables only) and column
+    /// values, so this clause is the one the VDBE applies.
+    Conflict {
+        rowid: Option<i64>,
+        old_values: Vec<SqliteValue>,
+    },
+}
+
+/// bd-y7old / bd-bwm0x: `(rowid, old_row, new_row, where_true)` snapshot for firing
+/// BEFORE/AFTER UPDATE triggers around a conflicting DO UPDATE upsert's VDBE apply.
+/// `where_true` is the truthiness of the clause's `DO UPDATE ... WHERE` (always
+/// true when omitted); a false value means the update is a no-op.
+type UpsertUpdatePlan = (Option<i64>, Vec<SqliteValue>, Vec<SqliteValue>, bool);
+
 /// Describes the action to take when a FK-referenced parent row is deleted.
 #[allow(dead_code)]
 enum FkDeleteAction {
@@ -36631,42 +36657,45 @@ impl Connection {
                 let is_do_update_upsert = insert.upsert.iter().any(|clause| {
                     matches!(clause.action, fsqlite_ast::UpsertAction::Update { .. })
                 });
-                // `UPDATE OF <cols>` triggers match on the SET-assigned columns, so
-                // build the event from the first DO-UPDATE clause's assignments
-                // (mirroring the plain-UPDATE arm). Empty when not a DO-UPDATE
-                // upsert; then it is never consulted.
-                let update_event = fsqlite_ast::TriggerEvent::Update(
-                    insert
-                        .upsert
-                        .iter()
-                        .find_map(|clause| match &clause.action {
-                            fsqlite_ast::UpsertAction::Update { assignments, .. } => {
-                                Some(Self::assignment_target_column_names(assignments))
-                            }
-                            fsqlite_ast::UpsertAction::Nothing => None,
-                        })
-                        .unwrap_or_default(),
-                );
-                let has_before_update = is_do_update_upsert
-                    && self.has_matching_triggers(
+                // `UPDATE OF <cols>` triggers match on the SET-assigned columns.
+                // The exact event depends on WHICH ON CONFLICT clause is taken,
+                // which is only known after conflict routing (bd-bwm0x): with
+                // multiple DO-UPDATE clauses a LATER clause with different SET
+                // columns can be the one applied. Here we only need a COARSE gate —
+                // whether ANY DO-UPDATE clause could fire a BEFORE/AFTER UPDATE
+                // trigger — to decide whether the (potentially expensive) conflict
+                // routing runs at all. Use the union of every DO-UPDATE clause's
+                // SET columns; the precise taken-clause event is derived below.
+                let upsert_all_update_cols: Vec<String> = insert
+                    .upsert
+                    .iter()
+                    .filter_map(|clause| match &clause.action {
+                        fsqlite_ast::UpsertAction::Update { assignments, .. } => {
+                            Some(Self::assignment_target_column_names(assignments))
+                        }
+                        fsqlite_ast::UpsertAction::Nothing => None,
+                    })
+                    .flatten()
+                    .collect();
+                let coarse_update_event =
+                    fsqlite_ast::TriggerEvent::Update(upsert_all_update_cols);
+                let table_has_upsert_update_trigger = is_do_update_upsert
+                    && (self.has_matching_triggers(
                         table_name,
                         fsqlite_ast::TriggerTiming::Before,
-                        &update_event,
-                    );
-                let has_after_update = is_do_update_upsert
-                    && self.has_matching_triggers(
+                        &coarse_update_event,
+                    ) || self.has_matching_triggers(
                         table_name,
                         fsqlite_ast::TriggerTiming::After,
-                        &update_event,
-                    );
-                let has_upsert_update_triggers = has_before_update || has_after_update;
+                        &coarse_update_event,
+                    ));
                 // The conflict/OLD-NEW plan is needed whenever a conflicting row
                 // would change which triggers fire: BEFORE/AFTER UPDATE must fire
                 // for the update, and AFTER INSERT must be SUPPRESSED because no
                 // insert happened — the latter matters even with no UPDATE triggers
                 // (stock fires only BEFORE INSERT on a conflict/update path).
                 let upsert_needs_conflict_plan =
-                    is_do_update_upsert && (has_after_insert || has_upsert_update_triggers);
+                    is_do_update_upsert && (has_after_insert || table_has_upsert_update_trigger);
                 if is_live_vtab {
                     if !insert.returning.is_empty() {
                         return Err(FrankenError::NotImplemented(
@@ -36924,43 +36953,59 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
-                // bd-y7old: a DO UPDATE upsert whose single attempted row conflicts
-                // resolves to the UPDATE path. Determine the conflict + OLD/NEW
-                // BEFORE running the VDBE program (which itself does the insert-or-
-                // update), fire the BEFORE UPDATE trigger here, and remember to fire
-                // AFTER UPDATE / suppress AFTER INSERT below. A non-conflicting row
-                // keeps the ordinary insert path (BEFORE/AFTER INSERT) unchanged.
-                let upsert_update_plan = if upsert_needs_conflict_plan
-                    && trigger_new_rows.len() == 1
-                {
-                    let clause = insert
-                        .upsert
-                        .iter()
-                        .find_map(|clause| match &clause.action {
-                            fsqlite_ast::UpsertAction::Update {
-                                assignments,
-                                where_clause,
-                            } => {
-                                Some((assignments, where_clause.as_deref(), clause.target.as_ref()))
+                // bd-y7old / bd-bwm0x: a DO UPDATE upsert whose single attempted row
+                // conflicts resolves to the UPDATE path. Determine the conflict +
+                // OLD/NEW BEFORE running the VDBE program (which itself does the
+                // insert-or-update), fire the BEFORE UPDATE trigger here, and
+                // remember to fire AFTER UPDATE / suppress AFTER INSERT below. A
+                // non-conflicting row keeps the ordinary insert path unchanged.
+                //
+                // Routing mirrors the VDBE (bd-aap9u/xa2qv): the FIRST ON CONFLICT
+                // clause whose conflict target is violated is the one applied, so
+                // `route_upsert_conflict` walks the clauses in order and returns the
+                // TAKEN clause's SET columns (for `UPDATE OF <col>` matching) plus
+                // its OLD/NEW plan — not always the first DO-UPDATE clause. Returns
+                // None (fall back to VDBE-only triggers) when no clause conflicts, a
+                // DO NOTHING conflict is taken (AFTER INSERT is then suppressed by
+                // the affected==0 path), an indeterminate conflict target is reached
+                // (expression/partial index, or an omitted target on a table without
+                // an INTEGER PRIMARY KEY), or the taken clause's OLD/NEW cannot be
+                // evaluated.
+                let (update_event, has_before_update, has_after_update, upsert_update_plan) =
+                    if upsert_needs_conflict_plan && trigger_new_rows.len() == 1 {
+                        match self
+                            .route_upsert_conflict(insert, &trigger_new_rows[0], params)
+                            .await?
+                        {
+                            Some((event_cols, plan)) => {
+                                let event = fsqlite_ast::TriggerEvent::Update(event_cols);
+                                let hbu = self.has_matching_triggers(
+                                    table_name,
+                                    fsqlite_ast::TriggerTiming::Before,
+                                    &event,
+                                );
+                                let hau = self.has_matching_triggers(
+                                    table_name,
+                                    fsqlite_ast::TriggerTiming::After,
+                                    &event,
+                                );
+                                (event, hbu, hau, Some(plan))
                             }
-                            fsqlite_ast::UpsertAction::Nothing => None,
-                        });
-                    if let Some((assignments, do_update_where, target)) = clause {
-                        self.plan_upsert_update_trigger(
-                            insert,
-                            assignments,
-                            do_update_where,
-                            target,
-                            &trigger_new_rows[0],
-                            params,
-                        )
-                        .await?
+                            None => (
+                                fsqlite_ast::TriggerEvent::Update(Vec::new()),
+                                false,
+                                false,
+                                None,
+                            ),
+                        }
                     } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                        (
+                            fsqlite_ast::TriggerEvent::Update(Vec::new()),
+                            false,
+                            false,
+                            None,
+                        )
+                    };
                 // A conflict (plan present) always suppresses AFTER INSERT — whether
                 // the DO UPDATE ... WHERE applies (an update) or not (a no-op that
                 // still fired only BEFORE INSERT in stock).
@@ -52133,28 +52178,17 @@ impl Connection {
         Ok(trigger_rows)
     }
 
-    /// bd-y7old: For a DO UPDATE upsert whose single attempted row conflicts on
-    /// its conflict target, compute `(rowid, old_row, new_row, where_true)` so the
-    /// INSERT dispatch can fire BEFORE/AFTER UPDATE triggers around the VDBE apply
-    /// and suppress the AFTER INSERT trigger. Returns `Ok(None)` when the attempted
-    /// row does NOT conflict (the normal insert path runs) or when the conflict
-    /// target is a shape this helper does not reconstruct (an expression /
-    /// partial-index target, or an omitted target on a table without an INTEGER
-    /// PRIMARY KEY) — in which case the caller keeps its prior behavior.
-    ///
-    /// `new_row` / `where_true` reuse the same interpreted SET evaluation the plain
-    /// UPDATE trigger snapshot uses (`eval_join_expr`), with a combined column map
-    /// that resolves `excluded.*` against the attempted-insert values and
-    /// unqualified / target-table columns against the existing row.
-    async fn plan_upsert_update_trigger(
+    /// bd-bwm0x: Probe whether the attempted upsert row conflicts on ONE ON
+    /// CONFLICT clause's conflict `target`, locating the existing row (and its
+    /// rowid on rowid tables). See [`UpsertConflictProbe`] for the tri-state
+    /// result; the row lookup mirrors the DO UPDATE trigger snapshot collector.
+    async fn probe_upsert_conflict_row(
         &self,
         insert: &fsqlite_ast::InsertStatement,
-        assignments: &[fsqlite_ast::Assignment],
-        do_update_where: Option<&Expr>,
         target: Option<&fsqlite_ast::UpsertTarget>,
         attempted: &[SqliteValue],
         params: Option<&[SqliteValue]>,
-    ) -> Result<Option<(Option<i64>, Vec<SqliteValue>, Vec<SqliteValue>, bool)>> {
+    ) -> Result<UpsertConflictProbe> {
         let table_name = &insert.table.name;
         let (column_names, is_rowid_table, ipk_idx) = {
             let schema = self.schema.borrow();
@@ -52162,20 +52196,20 @@ impl Connection {
                 .iter()
                 .find(|table| table.name.eq_ignore_ascii_case(table_name))
             else {
-                return Ok(None);
+                return Ok(UpsertConflictProbe::Indeterminate);
             };
             let names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
             let ipk = table.columns.iter().position(|c| c.is_ipk);
             (names, !table.without_rowid, ipk)
         };
         if attempted.len() != column_names.len() {
-            return Ok(None);
+            return Ok(UpsertConflictProbe::Indeterminate);
         }
 
         let Some(match_where) =
             Self::build_upsert_conflict_match_expr(&column_names, ipk_idx, target, attempted)
         else {
-            return Ok(None);
+            return Ok(UpsertConflictProbe::Indeterminate);
         };
 
         // Locate the conflicting existing row (if any). Rowid tables project the
@@ -52208,7 +52242,7 @@ impl Connection {
             .execute_statement(&Statement::Select(sel), params)
             .await?;
         let Some(first) = matched.into_iter().next() else {
-            return Ok(None);
+            return Ok(UpsertConflictProbe::NoConflict);
         };
         let values = first.values();
         let (rowid, old_values): (Option<i64>, Vec<SqliteValue>) = if is_rowid_table {
@@ -52227,8 +52261,44 @@ impl Connection {
             (None, values.to_vec())
         };
         if old_values.len() != column_names.len() {
-            return Ok(None);
+            return Ok(UpsertConflictProbe::Indeterminate);
         }
+        Ok(UpsertConflictProbe::Conflict { rowid, old_values })
+    }
+
+    /// bd-y7old / bd-bwm0x: Given the conflicting existing row (`rowid`,
+    /// `old_values`) a taken DO UPDATE clause updates, compute
+    /// `(rowid, old_row, new_row, where_true)` so the INSERT dispatch can fire
+    /// BEFORE/AFTER UPDATE triggers around the VDBE apply. Returns `Ok(None)` when
+    /// the SET / WHERE cannot be evaluated by the interpreted evaluator (e.g. a
+    /// correlated `excluded.*` subquery) — the caller then keeps its prior
+    /// (VDBE-only) behavior rather than erroring.
+    ///
+    /// `new_row` / `where_true` reuse the same interpreted SET evaluation the plain
+    /// UPDATE trigger snapshot uses (`eval_join_expr`), with a column map that
+    /// resolves unqualified / target-table columns against the existing row;
+    /// `excluded.*` references are spliced to the attempted-insert literals.
+    async fn compute_upsert_update_row(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        assignments: &[fsqlite_ast::Assignment],
+        do_update_where: Option<&Expr>,
+        rowid: Option<i64>,
+        old_values: Vec<SqliteValue>,
+        attempted: &[SqliteValue],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<UpsertUpdatePlan>> {
+        let table_name = &insert.table.name;
+        let column_names: Vec<String> = {
+            let schema = self.schema.borrow();
+            let Some(table) = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            else {
+                return Ok(None);
+            };
+            table.columns.iter().map(|c| c.name.clone()).collect()
+        };
 
         // Column map over the EXISTING row only. `excluded.*` references are
         // substituted to literals below (rather than added to the map) so that an
@@ -52325,6 +52395,67 @@ impl Connection {
         };
 
         Ok(Some((rowid, old_values, new_values, where_true)))
+    }
+
+    /// bd-bwm0x: Route a (single-row) upsert to the ON CONFLICT clause the VDBE
+    /// would apply, and return that TAKEN clause's `UPDATE OF` columns plus its
+    /// OLD/NEW plan for BEFORE/AFTER UPDATE trigger firing.
+    ///
+    /// Mirrors the VDBE clause routing (bd-aap9u/xa2qv): each clause probes its own
+    /// conflict target in written order, and the first clause whose target is
+    /// violated is applied. Returns `Ok(None)` — the caller then keeps its prior
+    /// VDBE-only trigger behavior (BEFORE INSERT fired; AFTER INSERT decided by the
+    /// affected-row count) — when:
+    ///   * no clause's target conflicts (a plain insert),
+    ///   * the taken clause is DO NOTHING (no update triggers; the VDBE writes no
+    ///     row, so the affected==0 path already suppresses AFTER INSERT),
+    ///   * an indeterminate conflict target is reached before any conflict (routing
+    ///     cannot know which clause the VDBE picks), or
+    ///   * the taken DO UPDATE clause's OLD/NEW cannot be evaluated.
+    async fn route_upsert_conflict(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        attempted: &[SqliteValue],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<(Vec<String>, UpsertUpdatePlan)>> {
+        for clause in &insert.upsert {
+            match self
+                .probe_upsert_conflict_row(insert, clause.target.as_ref(), attempted, params)
+                .await?
+            {
+                // Cannot determine whether the VDBE routes to this clause; stop and
+                // keep the prior behavior rather than risk firing the wrong clause.
+                UpsertConflictProbe::Indeterminate => return Ok(None),
+                // This clause's target is not violated; the VDBE moves to the next.
+                UpsertConflictProbe::NoConflict => {}
+                UpsertConflictProbe::Conflict { rowid, old_values } => {
+                    // The VDBE applies THIS clause. A DO NOTHING conflict writes no
+                    // row (AFTER INSERT is then suppressed by the affected==0 path),
+                    // so there is no UPDATE trigger plan to build.
+                    let fsqlite_ast::UpsertAction::Update {
+                        assignments,
+                        where_clause,
+                    } = &clause.action
+                    else {
+                        return Ok(None);
+                    };
+                    let plan = self
+                        .compute_upsert_update_row(
+                            insert,
+                            assignments,
+                            where_clause.as_deref(),
+                            rowid,
+                            old_values,
+                            attempted,
+                            params,
+                        )
+                        .await?;
+                    return Ok(plan
+                        .map(|plan| (Self::assignment_target_column_names(assignments), plan)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Build the `col = <attempted literal> AND ...` predicate that locates the
