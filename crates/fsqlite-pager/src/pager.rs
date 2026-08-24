@@ -1416,6 +1416,22 @@ struct GroupCommitQueue {
     /// logical Phase C. Each record carries its own process-root attempt and
     /// remains queued across cancellation until transaction exit is terminal.
     pending_logical_cleanups: Mutex<VecDeque<PendingGroupCommitLogicalCleanup>>,
+    /// bd-ioq6x Face-2: shared per-file ledger of EOF pages disowned by a
+    /// connection that dropped before reconciling its per-connection
+    /// abandonment pool (`PagerInner::abandoned_eof_reservations`) into the
+    /// durable freelist. This queue is identity-bound — every pager that
+    /// opened the same underlying file shares this exact Arc — so a page a
+    /// dropping connection parked is not lost: a SURVIVING connection adopts
+    /// it into its own pool at the next commit/checkpoint fold, where the
+    /// existing no-committed-frame guard promotes a provable hole into the
+    /// durable freelist (a page a committed peer has since made live carries a
+    /// frame and is correctly dropped). Without this, a connection dropped
+    /// under churn (drop_close) silently orphaned its parked holes, which a
+    /// later grow turned into durable "page N is never used" leaks. In-memory
+    /// and process-scoped: it closes the single-process concurrent-churn
+    /// residual the reproduction exercises; cross-process reclamation of such
+    /// holes still relies on VACUUM, exactly as in stock SQLite.
+    disowned_pages: Arc<Mutex<Vec<PageNumber>>>,
     /// Test-local proof that a resolved wake dropped during post-wake
     /// finalization is classified instead of being silently discarded.
     #[cfg(test)]
@@ -1843,6 +1859,7 @@ impl GroupCommitQueue {
             in_doubt_epochs: Mutex::new(HashMap::new()),
             epoch_resolution_claims_in_flight: AtomicUsize::new(0),
             pending_logical_cleanups: Mutex::new(VecDeque::new()),
+            disowned_pages: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             unaccounted_epoch_wake_drops: AtomicUsize::new(0),
         }
@@ -7075,6 +7092,16 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// boundaries — the no-committed-frame publication filter is only sound
     /// within one WAL generation.
     abandoned_eof_reservations: Vec<PageNumber>,
+    /// bd-ioq6x Face-2: handle to the shared per-file disowned-page ledger
+    /// (`GroupCommitQueue::disowned_pages`, identity-bound and therefore shared
+    /// by every connection to the same file). On `PagerInner::drop` any still-
+    /// parked `abandoned_eof_reservations` are moved here so a surviving
+    /// connection reconciles them at its next commit/checkpoint fold instead of
+    /// losing them; the fold sites drain it back into their pool via
+    /// `adopt_disowned_pages_into_pool`. `None` only for construction paths
+    /// with no bound queue (which are single-connection shapes that never
+    /// populate the pool), so the cross-connection sweep is simply inert there.
+    disowned_page_ledger: Option<Arc<Mutex<Vec<PageNumber>>>>,
     /// bd-r82et: the pager's last-known CURRENT durable freelist content —
     /// exactly the pages recorded free in durable page-1/trunk metadata. It
     /// is refreshed wherever durable freelist state is actually read
@@ -7140,6 +7167,25 @@ pub(crate) struct PagerInner<F: VfsFile> {
 
 impl<F: VfsFile> Drop for PagerInner<F> {
     fn drop(&mut self) {
+        // bd-ioq6x Face-2: a connection dropped before a reconciling
+        // commit/checkpoint would otherwise silently discard its still-parked
+        // abandonment pool, turning those EOF holes into durable "page N is
+        // never used" orphans once a later grow brings them within
+        // `[2..=db_size]`. Hand them to the shared per-file disowned-page
+        // ledger so a surviving connection adopts and reconciles them at its
+        // next fold. Sync-mutex only — safe in Drop; a no-op when the pool is
+        // empty (the overwhelming common case) or no shared ledger is bound.
+        if !self.abandoned_eof_reservations.is_empty()
+            && let Some(ledger) = self.disowned_page_ledger.as_ref()
+        {
+            if std::env::var_os("IOQ6X_TRACE").is_some() {
+                eprintln!(
+                    "IOQ6X DISOWN pool={} -> shared ledger",
+                    self.abandoned_eof_reservations.len(),
+                );
+            }
+            disown_pages(ledger, self.abandoned_eof_reservations.drain(..));
+        }
         if let Some(owner) = self.rollback_journal_recovery_owner {
             // Never expose a clean identity atomic merely because this one
             // PagerInner disappeared. Other handles may still have transactions
@@ -8937,6 +8983,65 @@ fn merge_descending_unique_freelists(left: &[PageNumber], right: &[PageNumber]) 
     merged
 }
 
+/// bd-ioq6x Face-2: append pages onto the shared per-file disowned-page ledger.
+/// Called from `PagerInner::drop` when a connection dies with a non-empty
+/// abandonment pool — the parked EOF holes are handed to a surviving connection
+/// instead of being silently discarded. Sync-mutex only, so it is safe to call
+/// from a `Drop` impl.
+fn disown_pages(
+    ledger: &Mutex<Vec<PageNumber>>,
+    pages: impl IntoIterator<Item = PageNumber>,
+) {
+    let mut guard = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.extend(pages);
+}
+
+/// bd-ioq6x Face-2: drain the shared per-file disowned-page ledger atomically.
+/// The take is done under the ledger mutex so two connections folding
+/// concurrently each receive a disjoint slice — a page is adopted by exactly
+/// one connection, never double-reconciled.
+fn take_disowned_pages(ledger: &Mutex<Vec<PageNumber>>) -> Vec<PageNumber> {
+    std::mem::take(
+        &mut *ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// bd-ioq6x Face-2: adopt every page from the shared per-file disowned-page
+/// ledger into this connection's own abandonment pool so the EXISTING
+/// no-committed-frame fold (commit-time and checkpoint-time) reconciles the
+/// provable holes into the durable freelist under the same double-grant guard
+/// the per-connection pool already trusts. Adopted pages thereby inherit the
+/// full per-connection machinery: an eligible frameless in-range page is
+/// promoted to the freelist, a page a committed peer has since framed is
+/// dropped, an above-extent page is retained (and handed back to the ledger if
+/// this connection itself later drops). Only meaningful in WAL mode — the
+/// rollback-journal path has no commit-fold to drain the pool. Returns the
+/// number of pages adopted.
+fn adopt_disowned_pages_into_pool<F: VfsFile>(inner: &mut PagerInner<F>) -> usize {
+    if inner.journal_mode != JournalMode::Wal {
+        return 0;
+    }
+    let Some(ledger) = inner.disowned_page_ledger.clone() else {
+        return 0;
+    };
+    let adopted = take_disowned_pages(&ledger);
+    let adopted_count = adopted.len();
+    if adopted_count > 0 {
+        inner.abandoned_eof_reservations.extend(adopted);
+        if std::env::var_os("IOQ6X_TRACE").is_some() {
+            eprintln!(
+                "IOQ6X ADOPT adopted={adopted_count} pool={}",
+                inner.abandoned_eof_reservations.len(),
+            );
+        }
+    }
+    adopted_count
+}
+
 fn return_pages_to_freelist(
     freelist: &mut Vec<PageNumber>,
     pages: impl IntoIterator<Item = PageNumber>,
@@ -9800,6 +9905,65 @@ fn promote_group_commit_page_one_freelist_headers(
         }
     }
     promoted
+}
+
+/// bd-ioq6x (GH#346): the freelist header (page-1 bytes 32..40) published by
+/// THIS group commit's own freelist-publication batch, if any.
+///
+/// A group carries at most one publication (the resurrection/erasure guard
+/// fails closed on two), and a publication batch always rewrites page 1 via
+/// [`serialize_freelist_to_write_set`]. Non-publication batches in the SAME
+/// group built page 1 from their begin-time snapshot; promoting them to the
+/// *pre-group* durable header (which does not yet reflect this group's own
+/// publication) lets a later-appended non-publication page-1 frame overwrite
+/// the publication's freelist head/count back to the pre-group value. That
+/// intra-group erasure is why `freelist_count` stayed pinned at 0 under
+/// concurrent INSERT(grow)/DELETE(free) churn: almost every group that frees a
+/// page also grows, and the grow batch's page-1 frame, appended after the
+/// DELETE's, republished `count=0` — orphaning any freed page not reused before
+/// the file was finalized ("page N is never used"). The correct promote/
+/// validate target for non-publication batches is this in-group publication
+/// header when the group carries one.
+fn group_publication_page_one_freelist_header(
+    batches: &[TransactionFrameBatch],
+) -> Option<[u8; 8]> {
+    for batch in batches {
+        if batch.published_durable_freelist.is_none() {
+            continue;
+        }
+        for frame in &batch.frames {
+            if frame.page_number == 1 && frame.page_data.len() >= DATABASE_HEADER_SIZE {
+                let mut header = [0_u8; 8];
+                header.copy_from_slice(&frame.page_data[32..40]);
+                return Some(header);
+            }
+        }
+    }
+    None
+}
+
+/// bd-ioq6x: append-gate check for the intra-group case — a non-publication
+/// page-1 frame whose freelist header bytes differ from the group's own
+/// publication header (`expected`) would erase that publication when appended
+/// after it. Fail closed so the owner retries and re-promotes.
+fn nonpublication_page_one_freelist_header_differs(
+    batches: &[TransactionFrameBatch],
+    expected: [u8; 8],
+) -> bool {
+    for batch in batches {
+        if batch.published_durable_freelist.is_some() {
+            continue;
+        }
+        for frame in &batch.frames {
+            if frame.page_number == 1
+                && frame.page_data.len() >= DATABASE_HEADER_SIZE
+                && frame.page_data[32..40] != expected[..]
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// bd-dw8oe: append-gate check for the promote→append window — a
@@ -16526,6 +16690,7 @@ where
                 durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
+                disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
                 journal_mode: initial_journal_mode,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -16935,6 +17100,7 @@ where
                     .collect(),
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
+                disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
                 journal_mode: JournalMode::Delete,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -20505,33 +20671,23 @@ where
                         .next()
                         .unwrap_or(0);
                     if frame_page_size >= DATABASE_HEADER_SIZE {
-                        let db_file = {
-                            let inner = inner_arc.lock().map_err(|_| {
-                                FrankenError::internal("SimpleTransaction lock poisoned")
-                            })?;
-                            Arc::clone(&inner.db_file)
-                        };
-                        let durable_page_one = {
-                            let backend = wal_backend_handle(wal_backend)?;
-                            let mut wal_guard =
-                                async_rwlock_write(&backend, cx, "WAL backend").await?;
-                            read_durable_page_under_gate(
-                                cx,
-                                wal_guard.as_mut(),
-                                &db_file,
-                                frame_page_size,
-                                1,
-                            )
-                            .await?
-                        };
-                        if let Some(image) = durable_page_one
-                            && image.len() >= DATABASE_HEADER_SIZE
+                        // bd-ioq6x: when a batch in THIS group publishes a
+                        // freelist, non-publication page-1 rewrites must carry
+                        // that publication's header — not the pre-group durable
+                        // one — or a later-appended grow/change-counter page-1
+                        // frame erases the in-group publication and the durable
+                        // freelist stays empty, orphaning freed pages ("page N
+                        // is never used", GH#346). Fall back to the current
+                        // durable header only when the group carries no
+                        // publication of its own (bd-dw8oe cross-group case).
+                        if let Some(header) =
+                            group_publication_page_one_freelist_header(&batches)
                         {
                             let head = u32::from_be_bytes(
-                                image[32..36].try_into().expect("durable head slice"),
+                                header[0..4].try_into().expect("in-group head slice"),
                             );
                             let count = u32::from_be_bytes(
-                                image[36..40].try_into().expect("durable count slice"),
+                                header[4..8].try_into().expect("in-group count slice"),
                             );
                             let changed = promote_group_commit_page_one_freelist_headers(
                                 &mut batches,
@@ -20540,11 +20696,51 @@ where
                             );
                             if std::env::var_os("DW8OE_TRACE").is_some() {
                                 eprintln!(
-                                    "DW8OE PROMOTE durable_head={head} durable_count={count} changed={changed}"
+                                    "DW8OE PROMOTE in_group_head={head} in_group_count={count} changed={changed}"
                                 );
                             }
-                        } else if std::env::var_os("DW8OE_TRACE").is_some() {
-                            eprintln!("DW8OE PROMOTE no-durable-page1");
+                        } else {
+                            let db_file = {
+                                let inner = inner_arc.lock().map_err(|_| {
+                                    FrankenError::internal("SimpleTransaction lock poisoned")
+                                })?;
+                                Arc::clone(&inner.db_file)
+                            };
+                            let durable_page_one = {
+                                let backend = wal_backend_handle(wal_backend)?;
+                                let mut wal_guard =
+                                    async_rwlock_write(&backend, cx, "WAL backend").await?;
+                                read_durable_page_under_gate(
+                                    cx,
+                                    wal_guard.as_mut(),
+                                    &db_file,
+                                    frame_page_size,
+                                    1,
+                                )
+                                .await?
+                            };
+                            if let Some(image) = durable_page_one
+                                && image.len() >= DATABASE_HEADER_SIZE
+                            {
+                                let head = u32::from_be_bytes(
+                                    image[32..36].try_into().expect("durable head slice"),
+                                );
+                                let count = u32::from_be_bytes(
+                                    image[36..40].try_into().expect("durable count slice"),
+                                );
+                                let changed = promote_group_commit_page_one_freelist_headers(
+                                    &mut batches,
+                                    head,
+                                    count,
+                                );
+                                if std::env::var_os("DW8OE_TRACE").is_some() {
+                                    eprintln!(
+                                        "DW8OE PROMOTE durable_head={head} durable_count={count} changed={changed}"
+                                    );
+                                }
+                            } else if std::env::var_os("DW8OE_TRACE").is_some() {
+                                eprintln!("DW8OE PROMOTE no-durable-page1");
+                            }
                         }
                     }
                 }
@@ -20842,33 +21038,58 @@ where
                                         }
                                     }
                                     if carries_synthetic_page_one {
-                                        let durable_page_one = read_durable_page_under_gate(
-                                            cx,
-                                            wal,
-                                            &db_file,
-                                            frame_page_size,
-                                            1,
-                                        )
-                                        .await?;
-                                        if std::env::var_os("DW8OE_TRACE").is_some() {
-                                            eprintln!(
-                                                "DW8OE GATE durable32_40={}",
-                                                durable_page_one
-                                                    .as_deref()
-                                                    .map_or_else(|| "none".to_owned(), |d| hex_bytes(
-                                                        &d[32..40]
-                                                    )),
-                                            );
-                                        }
-                                        if stale_synthetic_page_one_freelist_header(
-                                            &batches,
-                                            durable_page_one.as_deref(),
-                                        ) {
+                                        // bd-ioq6x: non-publication page-1 frames
+                                        // must match THIS group's own publication
+                                        // header when present — the publication
+                                        // batch is separately validated against
+                                        // fresh durable by the resurrection/
+                                        // erasure guard below. Only when the group
+                                        // carries no publication of its own do the
+                                        // frames have to match the CURRENT durable
+                                        // header (bd-dw8oe promote→append window
+                                        // against a peer publication).
+                                        let stale = if let Some(header) =
+                                            group_publication_page_one_freelist_header(&batches)
+                                        {
+                                            if std::env::var_os("DW8OE_TRACE").is_some() {
+                                                eprintln!(
+                                                    "DW8OE GATE in_group32_40={}",
+                                                    hex_bytes(&header),
+                                                );
+                                            }
+                                            nonpublication_page_one_freelist_header_differs(
+                                                &batches, header,
+                                            )
+                                        } else {
+                                            let durable_page_one = read_durable_page_under_gate(
+                                                cx,
+                                                wal,
+                                                &db_file,
+                                                frame_page_size,
+                                                1,
+                                            )
+                                            .await?;
+                                            if std::env::var_os("DW8OE_TRACE").is_some() {
+                                                eprintln!(
+                                                    "DW8OE GATE durable32_40={}",
+                                                    durable_page_one.as_deref().map_or_else(
+                                                        || "none".to_owned(),
+                                                        |d| hex_bytes(&d[32..40])
+                                                    ),
+                                                );
+                                            }
+                                            stale_synthetic_page_one_freelist_header(
+                                                &batches,
+                                                durable_page_one.as_deref(),
+                                            )
+                                        };
+                                        if stale {
                                             tracing::debug!(
                                                 target: "fsqlite.wal.conflict",
                                                 "synthetic page-1 freelist header is stale \
-                                                 against the current durable page 1; failing \
-                                                 closed with BusySnapshot (bd-dw8oe)"
+                                                 against the current durable/in-group page 1; \
+                                                 failing closed with BusySnapshot \
+                                                 (bd-dw8oe/bd-ioq6x)"
                                             );
                                             return Err(FrankenError::BusySnapshot {
                                                 conflicting_pages: "1".to_owned(),
@@ -23035,6 +23256,13 @@ where
             // gh302 exactness guard and cross-process conflict machinery
             // apply unchanged.
             if self.journal_mode == JournalMode::Wal {
+                // bd-ioq6x Face-2: adopt pages disowned by connections that
+                // dropped before reconciling their own pool. They flow through
+                // the identical no-committed-frame fold below (same eligibility
+                // + double-grant guard), so a provable hole is published into
+                // this commit's durable freelist while a peer-framed page is
+                // dropped.
+                adopt_disowned_pages_into_pool(&mut inner);
                 inner
                     .abandoned_eof_reservations
                     .append(&mut self.reclaimed_abandoned_reservations);
@@ -25786,6 +26014,12 @@ where
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            // bd-ioq6x Face-2: adopt pages disowned by dropped connections
+            // BEFORE this checkpoint reconciles/clears the pool. Under the
+            // exclusive maintenance fence (active_transactions == 0) they are
+            // reconciled by the same no-committed-frame promotion below; the
+            // guard then clears the remainder at the WAL-generation boundary.
+            adopt_disowned_pages_into_pool(&mut inner);
             if inner.journal_mode == JournalMode::Wal
                 && inner.db_size >= 2
                 && !inner.abandoned_eof_reservations.is_empty()
@@ -40016,6 +40250,228 @@ mod tests {
                 written.len(),
                 2,
                 "bead_id=bd-3wop3.1.2 case=disjoint_writers_commit_all_frames"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ioq6x_intragroup_publication_header_wins_over_stale_grow() {
+        // bd-ioq6x (GH#346): a group commit that mixes a freelist-publishing
+        // batch (a DELETE that durably freed pages) with a later-appended
+        // non-publication grow batch must NOT let the grow batch's page-1 frame
+        // republish the pre-group (empty) freelist header. Before the fix,
+        // non-publication page-1 frames were promoted only to the DURABLE header
+        // — still empty, because this group's own publication has not landed yet
+        // — so the grow frame, appended after the publication frame, erased the
+        // freelist back to count=0 and orphaned any freed page not reused before
+        // the file was finalized ("page N is never used"; freelist_count pinned
+        // at 0 under concurrent INSERT/DELETE churn).
+        const PS: usize = 4096;
+        let make_page_one = |trunk: u32, count: u32| -> Vec<u8> {
+            let mut p = vec![0_u8; PS];
+            p[32..36].copy_from_slice(&trunk.to_be_bytes());
+            p[36..40].copy_from_slice(&count.to_be_bytes());
+            p
+        };
+        // Freelist (trunk, count) of the LAST page-1 frame in append order —
+        // this is what a reader sees after the group's frames are appended.
+        let last_page_one_freelist = |batches: &[TransactionFrameBatch]| -> (u32, u32) {
+            let mut last = None;
+            for batch in batches {
+                for frame in &batch.frames {
+                    if frame.page_number == 1 {
+                        let t = u32::from_be_bytes(frame.page_data[32..36].try_into().unwrap());
+                        let c = u32::from_be_bytes(frame.page_data[36..40].try_into().unwrap());
+                        last = Some((t, c));
+                    }
+                }
+            }
+            last.unwrap()
+        };
+
+        // Publication batch: a DELETE freed pages 7 and 9 -> trunk head 7,
+        // count 2, and serialized them into its page-1 + trunk frames.
+        let pub_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+            page_number: 1,
+            page_data: make_page_one(7, 2),
+            db_size_if_commit: 20,
+        }])
+        .with_freelist_publication(Some(vec![7, 9]), vec![7, 9], Vec::new(), Vec::new());
+
+        // Non-publication grow batch: its begin-time snapshot saw an empty
+        // freelist, so its page-1 rewrite carries head=0,count=0 and is appended
+        // AFTER the publication (worst-case ordering for erasure).
+        let grow_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+            page_number: 1,
+            page_data: make_page_one(0, 0),
+            db_size_if_commit: 21,
+        }]);
+
+        let mut batches = vec![pub_batch, grow_batch];
+
+        // The group carries exactly one publication; its header is (7, 2).
+        let header = group_publication_page_one_freelist_header(&batches)
+            .expect("group carries an in-group publication header");
+        assert_eq!(
+            u32::from_be_bytes(header[0..4].try_into().unwrap()),
+            7,
+            "publication trunk head"
+        );
+        assert_eq!(
+            u32::from_be_bytes(header[4..8].try_into().unwrap()),
+            2,
+            "publication freelist count"
+        );
+
+        // Before promotion the grow batch's stale (0,0) header differs from the
+        // publication header — the erasure hazard — and the LAST page-1 frame
+        // (the grow) would publish count=0, dropping the freed pages.
+        assert!(
+            nonpublication_page_one_freelist_header_differs(&batches, header),
+            "pre-promote: grow batch still carries the erasing (0,0) header"
+        );
+        assert_eq!(
+            last_page_one_freelist(&batches),
+            (0, 0),
+            "pre-promote: last page-1 frame would erase the freelist to count=0"
+        );
+
+        // The fix promotes non-publication page-1 frames to the IN-GROUP
+        // publication header (not the pre-group durable one).
+        let head = u32::from_be_bytes(header[0..4].try_into().unwrap());
+        let count = u32::from_be_bytes(header[4..8].try_into().unwrap());
+        let changed = promote_group_commit_page_one_freelist_headers(&mut batches, head, count);
+        assert!(changed, "promote rewrote the grow batch's stale header");
+
+        // After promotion no non-publication frame can erase the publication,
+        // and the last page-1 frame (whatever the order) now publishes count=2 —
+        // the freed pages stay durably on the freelist.
+        assert!(
+            !nonpublication_page_one_freelist_header_differs(&batches, header),
+            "post-promote: grow batch carries the publication header"
+        );
+        assert_eq!(
+            last_page_one_freelist(&batches),
+            (7, 2),
+            "post-promote: durable page-1 preserves the freed pages on the freelist"
+        );
+    }
+
+    #[test]
+    fn test_ioq6x_face2_dropped_connection_disowns_pool_to_shared_ledger() {
+        // bd-ioq6x Face-2: a connection that dies with a non-empty abandonment
+        // pool (EOF holes an aborted concurrent txn parked) must NOT silently
+        // discard those pages — `PagerInner::drop` hands them to the shared
+        // per-file disowned-page ledger so a surviving connection can reconcile
+        // them. Without this, a `drop_close` under churn orphaned the holes and
+        // a later grow turned them into durable "page N is never used" leaks.
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/ioq6x_face2_disown.db");
+            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+
+            let inner_arc = Arc::clone(&pager.inner);
+            let ledger = {
+                let mut inner = inner_arc
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // The abandonment pool is a WAL-mode concept; mark this
+                // connection WAL directly (no live backend needed — the drop
+                // handoff itself is mode-agnostic).
+                inner.journal_mode = JournalMode::Wal;
+                let ledger = inner
+                    .disowned_page_ledger
+                    .clone()
+                    .expect("an open pager binds the shared disowned-page ledger");
+                // Simulate a concurrent transaction having parked aborted EOF
+                // reservations that a later grow would bring in-range.
+                inner.abandoned_eof_reservations =
+                    vec![PageNumber::new(57).unwrap(), PageNumber::new(58).unwrap()];
+                ledger
+            };
+            assert!(
+                take_disowned_pages(&ledger).is_empty(),
+                "the shared ledger starts empty"
+            );
+
+            // Drop the connection WITHOUT a reconciling commit/checkpoint. The
+            // pager and our probe clone are the only `PagerInner` holders, so
+            // releasing both runs `PagerInner::drop` deterministically here.
+            assert_eq!(
+                Arc::strong_count(&pager.inner),
+                2,
+                "only the pager and this test hold the inner; dropping both must run PagerInner::drop"
+            );
+            drop(pager);
+            drop(inner_arc);
+
+            let mut disowned: Vec<u32> = take_disowned_pages(&ledger)
+                .iter()
+                .map(|page| page.get())
+                .collect();
+            disowned.sort_unstable();
+            assert_eq!(
+                disowned,
+                vec![57, 58],
+                "a dropped connection disowns its still-parked pool to the shared ledger"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ioq6x_face2_surviving_connection_adopts_disowned_pages() {
+        // bd-ioq6x Face-2: the surviving half — a connection drains the shared
+        // disowned-page ledger into its own abandonment pool at fold time,
+        // where the existing no-committed-frame reconciliation reclaims the
+        // in-range holes. The take is atomic so exactly one connection adopts a
+        // given page (never double-reconciled), and only WAL mode participates.
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/ioq6x_face2_adopt.db");
+            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+
+            let mut inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Mark WAL directly (no live backend needed for the fold-adopt path).
+            inner.journal_mode = JournalMode::Wal;
+            let ledger = inner
+                .disowned_page_ledger
+                .clone()
+                .expect("an open pager binds the shared disowned-page ledger");
+            // A previously-dropped peer left holes on the shared ledger.
+            disown_pages(
+                &ledger,
+                [PageNumber::new(57).unwrap(), PageNumber::new(58).unwrap()],
+            );
+            assert!(inner.abandoned_eof_reservations.is_empty());
+
+            let adopted = adopt_disowned_pages_into_pool(&mut inner);
+            assert_eq!(adopted, 2, "both disowned pages are adopted into the pool");
+            let mut pool: Vec<u32> = inner
+                .abandoned_eof_reservations
+                .iter()
+                .map(|page| page.get())
+                .collect();
+            pool.sort_unstable();
+            assert_eq!(pool, vec![57, 58], "adopted pages joined this connection's pool");
+            assert!(
+                take_disowned_pages(&ledger).is_empty(),
+                "adoption drains the shared ledger so no peer double-reconciles the same page"
+            );
+
+            // A non-WAL connection never participates in the pool machinery.
+            inner.journal_mode = JournalMode::Delete;
+            disown_pages(&ledger, [PageNumber::new(59).unwrap()]);
+            assert_eq!(
+                adopt_disowned_pages_into_pool(&mut inner),
+                0,
+                "a non-WAL connection never adopts disowned pages"
             );
         });
     }
