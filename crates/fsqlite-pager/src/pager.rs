@@ -17620,35 +17620,16 @@ where
             section_header = match JournalHeader::decode(&next_header_bytes) {
                 Ok(next_header) => next_header,
                 Err(error) => {
-                    let mut trailer_offset = next_header_offset;
-                    let mut trailer_chunk = vec![0_u8; 64 * 1024];
-                    let mut all_zero = true;
-                    while trailer_offset < jrnl_size {
-                        let remaining = usize::try_from(jrnl_size - trailer_offset)
-                            .unwrap_or(usize::MAX);
-                        let chunk_len = remaining.min(trailer_chunk.len());
-                        let trailer_read = jrnl_file
-                            .read(cx, &mut trailer_chunk[..chunk_len], trailer_offset)
-                            .await?;
-                        if trailer_read != chunk_len {
-                            return Err(FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "short rollback-journal trailer read: got {trailer_read} of {chunk_len} bytes"
-                                ),
-                            });
-                        }
-                        if trailer_chunk[..chunk_len].iter().any(|&byte| byte != 0) {
-                            all_zero = false;
-                            break;
-                        }
-                        trailer_offset = trailer_offset
-                            .checked_add(u64::try_from(chunk_len).expect("trailer chunk fits u64"))
-                            .ok_or_else(|| FrankenError::OutOfRange {
-                                what: "rollback-journal zero trailer scan".to_owned(),
-                                value: trailer_offset.to_string(),
-                            })?;
-                    }
-                    if all_zero {
+                    // Before syncing a new section, SQLite deliberately leaves
+                    // both its eight-byte magic and four-byte nRec field zero.
+                    // The nonce, size fields, and even following unsynced page
+                    // records may already be nonzero. Hot-journal playback stops
+                    // at that exact marker and ignores the unfinished suffix.
+                    let unsynced_header_prefix_len = JOURNAL_MAGIC.len() + 4;
+                    if next_header_bytes[..unsynced_header_prefix_len]
+                        .iter()
+                        .all(|&byte| byte == 0)
+                    {
                         break;
                     }
                     tracing::warn!(
@@ -33011,10 +32992,122 @@ mod tests {
             assert_eq!(restored_page_one, original_page_one);
             assert_eq!(restored_page_two, original_page_two);
             assert!(
-                !vfs.access(&cx, &journal_path, AccessFlags::EXISTS)
-                    .unwrap(),
+                !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
                 "bead_id=bd-f2tw5 case=all_stock_journal_sections_replayed"
             );
+        });
+    }
+
+    #[test]
+    fn malformed_later_stock_journal_section_is_failure_atomic() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/malformed_later_stock_journal_section.db");
+            let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+            let page_size = PageSize::DEFAULT;
+            let ps = page_size.as_usize();
+            drop(
+                SimplePager::open(vfs.clone(), &path, page_size)
+                    .await
+                    .unwrap(),
+            );
+
+            let db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+            let (mut main_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+            let mut original_page = vec![0_u8; ps];
+            assert_eq!(
+                main_file.read(&cx, &mut original_page, 0).await.unwrap(),
+                ps
+            );
+            let mut changed_page = original_page.clone();
+            changed_page[100] ^= 0xA5;
+            main_file.write(&cx, &changed_page, 0).await.unwrap();
+            main_file.close(&cx).unwrap();
+
+            let sector_size = 4096_u32;
+            let first_nonce = 0xA11C_E311;
+            let first_header = JournalHeader {
+                page_count: 1,
+                nonce: first_nonce,
+                initial_db_size: 1,
+                sector_size,
+                page_size: page_size.get(),
+            };
+            let second_nonce = 0xA11C_E312;
+            let second_header = JournalHeader {
+                page_count: 1,
+                nonce: second_nonce,
+                ..first_header
+            };
+            let first_header_bytes = first_header.encode_padded();
+            let first_record =
+                JournalPageRecord::new(1, original_page.clone(), first_nonce).encode();
+            let first_section_end = first_header_bytes.len() as u64 + first_record.len() as u64;
+            let sector_size_u64 = u64::from(sector_size);
+            let second_header_offset =
+                first_section_end.div_ceil(sector_size_u64) * sector_size_u64;
+            let second_header_bytes = second_header.encode_padded();
+            let duplicate_record = JournalPageRecord::new(1, original_page, second_nonce).encode();
+
+            let journal_flags =
+                VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+            journal.write(&cx, &first_header_bytes, 0).await.unwrap();
+            journal
+                .write(&cx, &first_record, first_header_bytes.len() as u64)
+                .await
+                .unwrap();
+            journal
+                .write(
+                    &cx,
+                    &vec![0_u8; (second_header_offset - first_section_end) as usize],
+                    first_section_end,
+                )
+                .await
+                .unwrap();
+            journal
+                .write(&cx, &second_header_bytes, second_header_offset)
+                .await
+                .unwrap();
+            journal
+                .write(
+                    &cx,
+                    &duplicate_record,
+                    second_header_offset + second_header_bytes.len() as u64,
+                )
+                .await
+                .unwrap();
+            journal.close(&cx).unwrap();
+
+            let error = SimplePager::open_existing_with_cx_and_page_buffer_max(
+                &cx,
+                vfs.clone(),
+                &path,
+                page_size,
+                None,
+                None,
+            )
+            .await
+            .expect_err("duplicate record in a later section must fail recovery");
+            assert!(
+                matches!(
+                    error,
+                    FrankenError::DatabaseCorrupt { ref detail }
+                        if detail.contains("duplicate page record 1")
+                ),
+                "unexpected malformed-section error: {error}"
+            );
+
+            let (mut after_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+            let mut after = vec![0_u8; ps];
+            assert_eq!(after_file.read(&cx, &mut after, 0).await.unwrap(), ps);
+            after_file.close(&cx).unwrap();
+            assert_eq!(
+                after, changed_page,
+                "a malformed later section must not replay an earlier valid prefix"
+            );
+            assert!(vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap());
         });
     }
 
