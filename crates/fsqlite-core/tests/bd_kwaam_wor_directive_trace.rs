@@ -89,29 +89,29 @@ where
 
 fn run_shape(label: &str, suffix: &str) {
     let events = Arc::new(Mutex::new(Vec::new()));
-    // Separate integration-test binary: a global subscriber here cannot leak
-    // into the lib-test binary's hot-path lane assertions.
-    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(FieldCollector {
+    let subscriber = tracing_subscriber::registry().with(FieldCollector {
         events: Arc::clone(&events),
-    }))
-    .unwrap();
+    });
+    let dispatch = tracing::Dispatch::new(subscriber);
 
-    asupersync::test_utils::run_test(|| async {
-        let conn = Connection::open(":memory:").await.unwrap();
-        conn.execute(&format!(
-            "CREATE TABLE facts (id TEXT PRIMARY KEY NOT NULL, cap TEXT NOT NULL, \
-             ord INTEGER NOT NULL, UNIQUE(cap, ord)){suffix};"
-        ))
-        .await
-        .unwrap();
-        conn.execute("INSERT INTO facts VALUES ('a','c',1);")
+    tracing::dispatcher::with_default(&dispatch, || {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(&format!(
+                "CREATE TABLE facts (id TEXT PRIMARY KEY NOT NULL, cap TEXT NOT NULL, \
+                 ord INTEGER NOT NULL, UNIQUE(cap, ord)){suffix};"
+            ))
             .await
             .unwrap();
-        let rows = conn
-            .query("SELECT 1 FROM facts WHERE cap = 'c' AND ord = 1")
-            .await
-            .unwrap();
-        println!("[{label}] rows={}", rows.len());
+            conn.execute("INSERT INTO facts VALUES ('a','c',1);")
+                .await
+                .unwrap();
+            let rows = conn
+                .query("SELECT 1 FROM facts WHERE cap = 'c' AND ord = 1")
+                .await
+                .unwrap();
+            println!("[{label}] rows={}", rows.len());
+        });
     });
 
     let captured = drain(&events);
