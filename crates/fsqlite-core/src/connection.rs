@@ -5652,18 +5652,36 @@ impl VirtualTableCursor for CachePagesCursor {
 ///
 /// Encoding: A..E maps to BLOB, TEXT, NUMERIC, INTEGER, REAL:
 /// `'A'` = BLOB, `'B'` = TEXT, `'C'` = NUMERIC, `'D'` = INTEGER, `'E'` = REAL.
+/// CAST target affinity from a type name (sole caller: the `Expr::Cast`
+/// emitter). An EMPTY type name (`CAST(x AS)`) is NOT BLOB — it takes SQLite's
+/// `sqlite3AffinityType` default, NUMERIC, so it behaves like
+/// `CAST(x AS NUMERIC)`. bd-errmsg-parity-batch4-deqcb.
 fn type_name_to_affinity(name: &str) -> u8 {
     let upper = name.to_uppercase();
     if upper.contains("INT") {
         b'D' // INTEGER affinity
     } else if upper.contains("CHAR") || upper.contains("TEXT") || upper.contains("CLOB") {
         b'B' // TEXT affinity
-    } else if upper.contains("BLOB") || upper.is_empty() {
+    } else if upper.contains("BLOB") {
         b'A' // BLOB affinity
     } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
         b'E' // REAL affinity
     } else {
-        b'C' // NUMERIC affinity
+        b'C' // NUMERIC affinity (also the empty-type-name default)
+    }
+}
+
+/// Type affinity of a `CAST(x AS <type>)` target expression. Unlike a column
+/// declaration — where an omitted/empty type has BLOB affinity — an EMPTY CAST
+/// type name (`CAST(x AS)`) takes SQLite's `sqlite3AffinityType` default of
+/// NUMERIC, so it behaves like `CAST(x AS NUMERIC)`. Use this (not the
+/// column-oriented `TypeAffinity::from_type_name`) for every `Expr::Cast`
+/// affinity computation. bd-errmsg-parity-batch4-deqcb.
+fn cast_type_affinity(type_name: &str) -> TypeAffinity {
+    if type_name.is_empty() {
+        TypeAffinity::Numeric
+    } else {
+        TypeAffinity::from_type_name(type_name)
     }
 }
 
@@ -93967,7 +93985,7 @@ impl<'a> CteResultMetadataResolver<'a> {
             Expr::Column(column, _) => cte_lookup_column_metadata(from_lookup, column)
                 .or_else(|| cte_lookup_column_metadata(outer_lookup, column))
                 .and_then(|metadata| metadata.affinity),
-            Expr::Cast { type_name, .. } => Some(TypeAffinity::from_type_name(&type_name.name)),
+            Expr::Cast { type_name, .. } => Some(cast_type_affinity(&type_name.name)),
             Expr::Collate { expr, .. } => {
                 self.resolve_expr_affinity_term(expr, from_lookup, outer_lookup)
                     .affinity
@@ -94534,7 +94552,7 @@ fn select_expr_affinity(
         Expr::Column(col_ref, _) => from_lookup
             .and_then(|lookup| resolve_from_clause_projection_affinity(lookup, col_ref))
             .unwrap_or(TypeAffinity::Blob),
-        Expr::Cast { type_name, .. } => TypeAffinity::from_type_name(&type_name.name),
+        Expr::Cast { type_name, .. } => cast_type_affinity(&type_name.name),
         Expr::Collate { expr, .. } => select_expr_affinity(expr, from_lookup),
         _ => TypeAffinity::Blob,
     }
@@ -122592,7 +122610,7 @@ fn resolve_operand_affinity(expr: &Expr, schemas: &[TableSchema]) -> TypeAffinit
         return affinity.unwrap_or(TypeAffinity::Blob);
     }
     if let Expr::Cast { type_name, .. } = expr {
-        return TypeAffinity::from_type_name(&type_name.name);
+        return cast_type_affinity(&type_name.name);
     }
     if let Expr::Collate { expr: inner, .. } = expr {
         return resolve_operand_affinity(inner, schemas);
@@ -141372,7 +141390,7 @@ fn join_expr_affinity(
                 })
                 .unwrap_or(TypeAffinity::Blob)
         }
-        Expr::Cast { type_name, .. } => TypeAffinity::from_type_name(&type_name.name),
+        Expr::Cast { type_name, .. } => cast_type_affinity(&type_name.name),
         Expr::Collate { expr, .. } => join_expr_affinity(expr, col_map, context),
         _ => TypeAffinity::Blob,
     }
@@ -143439,7 +143457,10 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
             SqliteValue::Blob(bytes) => SqliteValue::Text(blob_cast_text(bytes, db_encoding)),
             other => SqliteValue::Text(other.to_text().into()),
         }
-    } else if upper.contains("BLOB") || upper.is_empty() {
+    } else if upper.contains("BLOB") {
+        // NB: an EMPTY CAST type name (`CAST(x AS)`) is NOT BLOB — it has
+        // NUMERIC affinity (SQLite's sqlite3AffinityType default) and falls
+        // through to the NUMERIC branch below. bd-errmsg-parity-batch4-deqcb.
         match val {
             SqliteValue::Blob(_) => val,
             SqliteValue::Text(s) => SqliteValue::Blob(s.as_bytes_direct().to_vec().into()),

@@ -37213,12 +37213,15 @@ fn type_name_to_affinity(type_name: &fsqlite_ast::TypeName) -> u8 {
         b'D' // INTEGER affinity
     } else if name.contains("CHAR") || name.contains("TEXT") || name.contains("CLOB") {
         b'B' // TEXT affinity
-    } else if name.contains("BLOB") || name.is_empty() {
+    } else if name.contains("BLOB") {
         b'A' // BLOB affinity
     } else if name.contains("REAL") || name.contains("FLOA") || name.contains("DOUB") {
         b'E' // REAL affinity
     } else {
-        b'C' // NUMERIC affinity
+        // NUMERIC affinity — also the SQLite default for an EMPTY CAST type
+        // name (`CAST(x AS)`), which is `sqlite3AffinityType`'s fallback:
+        // it behaves like `CAST(x AS NUMERIC)`. bd-errmsg-parity-batch4-deqcb.
+        b'C'
     }
 }
 
