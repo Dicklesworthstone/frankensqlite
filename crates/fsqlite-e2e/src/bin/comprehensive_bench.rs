@@ -104,7 +104,7 @@ impl WorkMeterSnapshot {
     /// before the measured region. Returns `(statements, rows)` executed since
     /// `earlier`. Saturating so a wrap can never fabricate a huge count (the
     /// meter is monotonic in practice).
-    fn delta_since(self, earlier: WorkMeterSnapshot) -> (u64, u64) {
+    fn delta_since(self, earlier: Self) -> (u64, u64) {
         (
             self.statements.saturating_sub(earlier.statements),
             self.rows.saturating_sub(earlier.rows),
