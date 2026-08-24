@@ -123,6 +123,57 @@ pub use fsqlite_pager::page_cache::PageCachePeakSnapshot;
 pub use fsqlite_pager::pager::DatabaseImageReceipt;
 pub use fsqlite_pager::pager::WriteSetStats;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
+
+/// GH#303: structured result of [`Connection::backup_exact_to`] — a byte-exact
+/// copy whose integrity has been verified against the source image receipt.
+///
+/// Returned only when the copy's logical image hash, byte length, and page
+/// geometry match the source exactly; a mismatch is a hard error, never a
+/// silently-degraded report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BackupReport {
+    /// Number of database pages in the copied image.
+    pub page_count: u32,
+    /// Page size (bytes) of the copied image.
+    pub page_size: u32,
+    /// Total byte length of the copied file.
+    pub byte_len: u64,
+    /// Lowercase hex of the blake3 logical-image hash shared by source and copy.
+    pub logical_hash_hex: String,
+}
+
+/// GH#303: structured result of [`Connection::compact_verified_into`] — a
+/// `VACUUM INTO`-backed compaction whose output passed `quick_check` +
+/// `integrity_check` before this report was produced.
+///
+/// The compacted image is content-equivalent to the source but NOT byte- or
+/// hash-identical (compaction rewrites page layout and drops free pages), so the
+/// source and compacted logical hashes are reported separately. Compaction is
+/// not guaranteed to reach a stock-`VACUUM` byte-for-byte fixed point (GH#301);
+/// `reclaimed_pages` / `reclaimed_bytes` report the realized reduction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CompactionReport {
+    /// Page count of the source image before compaction.
+    pub source_page_count: u32,
+    /// Page count of the compacted output image.
+    pub compacted_page_count: u32,
+    /// Page size (bytes); preserved by compaction.
+    pub page_size: u32,
+    /// Byte length of the source image.
+    pub source_byte_len: u64,
+    /// Byte length of the compacted output image.
+    pub compacted_byte_len: u64,
+    /// Lowercase hex of the source image's logical hash.
+    pub source_logical_hash_hex: String,
+    /// Lowercase hex of the compacted image's logical hash.
+    pub compacted_logical_hash_hex: String,
+    /// Pages reclaimed by compaction (`source_page_count - compacted_page_count`, saturating).
+    pub reclaimed_pages: u32,
+    /// Bytes reclaimed by compaction (`source_byte_len - compacted_byte_len`, saturating).
+    pub reclaimed_bytes: u64,
+}
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
     PagerCommitProfileSnapshot, PagerCommitState, PagerPublishedSnapshot, RollbackCleanup,
@@ -3330,6 +3381,20 @@ impl PagerBackend {
             Self::Unix(p) => p.inspect_self_contained_database_image(cx, path).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.inspect_self_contained_database_image(cx, path).await,
+        }
+    }
+
+    /// GH#303: byte-exact export of the pager's main database file to a
+    /// create-new target. Backs `Connection::backup_exact_to`.
+    async fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.copy_database_to(cx, target_path).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.copy_database_to(cx, target_path).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.copy_database_to(cx, target_path).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.copy_database_to(cx, target_path).await,
         }
     }
 
@@ -14224,6 +14289,110 @@ impl Connection {
         self.pager.capture_vacuum_source_image(&cx).await
     }
 
+    /// GH#303: make a byte-exact, integrity-verified backup copy of this
+    /// connection's database at `target_path`, returning a [`BackupReport`].
+    ///
+    /// `target_path` must not already exist; it is created new, and in WAL mode
+    /// the source is checkpointed first so the copy is a self-contained
+    /// rollback-mode image. After copying, the source and copy image receipts
+    /// are compared by logical image hash, byte length, and page geometry — the
+    /// copy is only reported as a backup when those match exactly.
+    ///
+    /// # Errors
+    ///
+    /// [`FrankenError::Unsupported`] for a memory-backed connection,
+    /// [`FrankenError::CannotOpen`] when `target_path` already exists or equals
+    /// the source, [`FrankenError::Busy`] when a transaction or checkpoint is in
+    /// flight, and any propagated pager error. Returns an internal error if the
+    /// post-copy verification finds the copy is not byte-exact.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn backup_exact_to(&self, target_path: impl AsRef<Path>) -> Result<BackupReport> {
+        if !self.pager.is_file_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+        let target = target_path.as_ref();
+        // Source receipt first: quiesces publication state and checkpoints WAL
+        // to Truncate so the byte-exact copy is a self-contained image.
+        let source = self.capture_database_image_receipt().await?;
+        let cx = self.op_cx()?;
+        self.pager.copy_database_to(&cx, target).await?;
+        // Receipt the freshly written copy as a self-contained image.
+        let copy = self
+            .pager
+            .inspect_self_contained_database_image(&cx, target)
+            .await?;
+        // Verify byte-exactness. A `DatabaseImageReceipt`'s own `==` includes
+        // file identity (the copy is a new inode), so compare the
+        // content-bearing fields explicitly.
+        if source.logical_hash() != copy.logical_hash()
+            || source.file_size() != copy.file_size()
+            || source.header().page_count != copy.header().page_count
+            || source.header().page_size.get() != copy.header().page_size.get()
+        {
+            return Err(FrankenError::internal(
+                "backup_exact_to: copy is not byte-exact with the source image",
+            ));
+        }
+        Ok(BackupReport {
+            page_count: copy.header().page_count,
+            page_size: copy.header().page_size.get(),
+            byte_len: copy.file_size(),
+            logical_hash_hex: hex_encode_blake3(copy.logical_hash()),
+        })
+    }
+
+    /// GH#303: compact this connection's database into a new file at
+    /// `target_path` using the shared `VACUUM INTO` engine, returning a
+    /// [`CompactionReport`].
+    ///
+    /// The output is produced by `VACUUM INTO`, which rebuilds the database into
+    /// a self-contained, integrity-checked (`quick_check` + `integrity_check`)
+    /// compact image that preserves page size and header pragmas. The output is
+    /// content-equivalent to the source but not byte-identical (see
+    /// [`CompactionReport`]).
+    ///
+    /// # Errors
+    ///
+    /// [`FrankenError::Unsupported`] for a memory-backed connection,
+    /// [`FrankenError::CannotOpen`] when `target_path` already exists or equals
+    /// the source, an error when a transaction is open, and any error surfaced
+    /// by `VACUUM INTO` (including an integrity-check failure, which leaves the
+    /// source untouched).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn compact_verified_into(
+        &self,
+        target_path: impl AsRef<Path>,
+    ) -> Result<CompactionReport> {
+        if !self.pager.is_file_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+        let target = target_path.as_ref();
+        let source = self.capture_database_image_receipt().await?;
+        let target_text = target.to_string_lossy().into_owned();
+        // The shared VACUUM engine runs quick_check + integrity_check on the
+        // output before it is finalized; a failure leaves the source untouched.
+        self.execute_with_params("VACUUM INTO ?1;", &[SqliteValue::Text(target_text.into())])
+            .await?;
+        let cx = self.op_cx()?;
+        let compacted = self
+            .pager
+            .inspect_self_contained_database_image(&cx, target)
+            .await?;
+        let source_pages = source.header().page_count;
+        let compacted_pages = compacted.header().page_count;
+        Ok(CompactionReport {
+            source_page_count: source_pages,
+            compacted_page_count: compacted_pages,
+            page_size: compacted.header().page_size.get(),
+            source_byte_len: source.file_size(),
+            compacted_byte_len: compacted.file_size(),
+            source_logical_hash_hex: hex_encode_blake3(source.logical_hash()),
+            compacted_logical_hash_hex: hex_encode_blake3(compacted.logical_hash()),
+            reclaimed_pages: source_pages.saturating_sub(compacted_pages),
+            reclaimed_bytes: source.file_size().saturating_sub(compacted.file_size()),
+        })
+    }
+
     /// Atomically claim a pathname for a replacement image and retain the
     /// descriptor that created it.
     ///
@@ -20825,7 +20994,7 @@ impl Connection {
         // diverges from stock (which reads the source). Read the source table by
         // rowid here and project the real column values. A true contentless table
         // (`content=''`) has no source and correctly keeps the NULL projection.
-        let content_source = self.fts5_external_content_source_schema(src);
+        let content_source = self.fts5_external_content_source_schema(src)?;
         let rowid_alias_columns = self.rowid_alias_columns.borrow().clone();
         let col_count = src.col_names.len();
 
@@ -20897,32 +21066,52 @@ impl Connection {
     }
 
     /// bd-plxob: resolve the external content SOURCE table for a `content='<table>'`
-    /// FTS5 vtab so lazy scans can project real column bodies from it. Returns
-    /// `None` for internal-content (`_content`-backed) or true contentless
+    /// FTS5 vtab so lazy scans can project real column bodies from it.
+    /// `Ok(None)` for internal-content (`_content`-backed) or true contentless
     /// (`content=''`) tables — neither has an external source to read.
+    ///
+    /// bd-oi482/GH#211: a `content='<table>'` whose configured source table is
+    /// ABSENT (e.g. renamed away by `ALTER TABLE <table> RENAME TO ...`) is a
+    /// query-time, table-local error in stock FTS5 (`no such table: main.<table>`
+    /// when the content is read), NOT a silent empty projection. Surface that
+    /// error here instead of mapping the missing table to `None`.
     #[cfg(feature = "ext-fts5")]
-    fn fts5_external_content_source_schema(&self, src: &JoinTableSource) -> Option<TableSchema> {
+    fn fts5_external_content_source_schema(
+        &self,
+        src: &JoinTableSource,
+    ) -> Result<Option<TableSchema>> {
         let content_name = {
             let ddl = self.original_ddl_sql.borrow();
-            let create_sql = ddl.get(&src.table_name.to_ascii_lowercase())?;
+            let Some(create_sql) = ddl.get(&src.table_name.to_ascii_lowercase()) else {
+                return Ok(None);
+            };
             let Ok(Statement::CreateVirtualTable(create_stmt)) = parse_single_statement(create_sql)
             else {
-                return None;
+                return Ok(None);
             };
             if !create_stmt.module.eq_ignore_ascii_case("fts5") {
-                return None;
+                return Ok(None);
             }
-            let name = virtual_table_option_value(&create_stmt.args, "content")?;
+            let Some(name) = virtual_table_option_value(&create_stmt.args, "content") else {
+                return Ok(None); // internal content (`_content`-backed): no external source
+            };
             if name.is_empty() {
-                return None; // contentless: no source
+                return Ok(None); // contentless: no source
             }
             name
         };
-        self.schema
+        match self
+            .schema
             .borrow()
             .iter()
             .find(|table| table.name.eq_ignore_ascii_case(&content_name))
             .cloned()
+        {
+            Some(content_table) => Ok(Some(content_table)),
+            None => Err(FrankenError::FunctionError(format!(
+                "no such table: main.{content_name}"
+            ))),
+        }
     }
 
     /// bd-plxob(b): read the EXTERNAL content SOURCE rows for a `'rebuild'`,
@@ -20956,6 +21145,11 @@ impl Connection {
                 return Ok(None); // contentless: no source
             }
             let col_count = parse_virtual_table_column_infos(&create_stmt.args).len();
+            // bd-oi482/GH#211: `'rebuild'` re-indexes the external content SOURCE;
+            // if that configured table is absent (renamed away), stock FTS5 errors
+            // `no such table: main.<content>` rather than rebuilding to an empty
+            // index. Surface the same error instead of falling back to the
+            // (empty) in-memory documents.
             let Some(content_table) = self
                 .schema
                 .borrow()
@@ -20963,7 +21157,9 @@ impl Connection {
                 .find(|table| table.name.eq_ignore_ascii_case(&content_name))
                 .cloned()
             else {
-                return Ok(None);
+                return Err(FrankenError::FunctionError(format!(
+                    "no such table: main.{content_name}"
+                )));
             };
             (content_table, col_count)
         };
