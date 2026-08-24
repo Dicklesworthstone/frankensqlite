@@ -9802,6 +9802,65 @@ fn promote_group_commit_page_one_freelist_headers(
     promoted
 }
 
+/// bd-ioq6x (GH#346): the freelist header (page-1 bytes 32..40) published by
+/// THIS group commit's own freelist-publication batch, if any.
+///
+/// A group carries at most one publication (the resurrection/erasure guard
+/// fails closed on two), and a publication batch always rewrites page 1 via
+/// [`serialize_freelist_to_write_set`]. Non-publication batches in the SAME
+/// group built page 1 from their begin-time snapshot; promoting them to the
+/// *pre-group* durable header (which does not yet reflect this group's own
+/// publication) lets a later-appended non-publication page-1 frame overwrite
+/// the publication's freelist head/count back to the pre-group value. That
+/// intra-group erasure is why `freelist_count` stayed pinned at 0 under
+/// concurrent INSERT(grow)/DELETE(free) churn: almost every group that frees a
+/// page also grows, and the grow batch's page-1 frame, appended after the
+/// DELETE's, republished `count=0` — orphaning any freed page not reused before
+/// the file was finalized ("page N is never used"). The correct promote/
+/// validate target for non-publication batches is this in-group publication
+/// header when the group carries one.
+fn group_publication_page_one_freelist_header(
+    batches: &[TransactionFrameBatch],
+) -> Option<[u8; 8]> {
+    for batch in batches {
+        if batch.published_durable_freelist.is_none() {
+            continue;
+        }
+        for frame in &batch.frames {
+            if frame.page_number == 1 && frame.page_data.len() >= DATABASE_HEADER_SIZE {
+                let mut header = [0_u8; 8];
+                header.copy_from_slice(&frame.page_data[32..40]);
+                return Some(header);
+            }
+        }
+    }
+    None
+}
+
+/// bd-ioq6x: append-gate check for the intra-group case — a non-publication
+/// page-1 frame whose freelist header bytes differ from the group's own
+/// publication header (`expected`) would erase that publication when appended
+/// after it. Fail closed so the owner retries and re-promotes.
+fn nonpublication_page_one_freelist_header_differs(
+    batches: &[TransactionFrameBatch],
+    expected: &[u8; 8],
+) -> bool {
+    for batch in batches {
+        if batch.published_durable_freelist.is_some() {
+            continue;
+        }
+        for frame in &batch.frames {
+            if frame.page_number == 1
+                && frame.page_data.len() >= DATABASE_HEADER_SIZE
+                && frame.page_data[32..40] != expected[..]
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// bd-dw8oe: append-gate check for the promote→append window — a
 /// non-publication batch whose page-1 frame still carries freelist header
 /// bytes different from the CURRENT durable page-1 must fail closed (the
@@ -20505,33 +20564,23 @@ where
                         .next()
                         .unwrap_or(0);
                     if frame_page_size >= DATABASE_HEADER_SIZE {
-                        let db_file = {
-                            let inner = inner_arc.lock().map_err(|_| {
-                                FrankenError::internal("SimpleTransaction lock poisoned")
-                            })?;
-                            Arc::clone(&inner.db_file)
-                        };
-                        let durable_page_one = {
-                            let backend = wal_backend_handle(wal_backend)?;
-                            let mut wal_guard =
-                                async_rwlock_write(&backend, cx, "WAL backend").await?;
-                            read_durable_page_under_gate(
-                                cx,
-                                wal_guard.as_mut(),
-                                &db_file,
-                                frame_page_size,
-                                1,
-                            )
-                            .await?
-                        };
-                        if let Some(image) = durable_page_one
-                            && image.len() >= DATABASE_HEADER_SIZE
+                        // bd-ioq6x: when a batch in THIS group publishes a
+                        // freelist, non-publication page-1 rewrites must carry
+                        // that publication's header — not the pre-group durable
+                        // one — or a later-appended grow/change-counter page-1
+                        // frame erases the in-group publication and the durable
+                        // freelist stays empty, orphaning freed pages ("page N
+                        // is never used", GH#346). Fall back to the current
+                        // durable header only when the group carries no
+                        // publication of its own (bd-dw8oe cross-group case).
+                        if let Some(header) =
+                            group_publication_page_one_freelist_header(&batches)
                         {
                             let head = u32::from_be_bytes(
-                                image[32..36].try_into().expect("durable head slice"),
+                                header[0..4].try_into().expect("in-group head slice"),
                             );
                             let count = u32::from_be_bytes(
-                                image[36..40].try_into().expect("durable count slice"),
+                                header[4..8].try_into().expect("in-group count slice"),
                             );
                             let changed = promote_group_commit_page_one_freelist_headers(
                                 &mut batches,
@@ -20540,11 +20589,51 @@ where
                             );
                             if std::env::var_os("DW8OE_TRACE").is_some() {
                                 eprintln!(
-                                    "DW8OE PROMOTE durable_head={head} durable_count={count} changed={changed}"
+                                    "DW8OE PROMOTE in_group_head={head} in_group_count={count} changed={changed}"
                                 );
                             }
-                        } else if std::env::var_os("DW8OE_TRACE").is_some() {
-                            eprintln!("DW8OE PROMOTE no-durable-page1");
+                        } else {
+                            let db_file = {
+                                let inner = inner_arc.lock().map_err(|_| {
+                                    FrankenError::internal("SimpleTransaction lock poisoned")
+                                })?;
+                                Arc::clone(&inner.db_file)
+                            };
+                            let durable_page_one = {
+                                let backend = wal_backend_handle(wal_backend)?;
+                                let mut wal_guard =
+                                    async_rwlock_write(&backend, cx, "WAL backend").await?;
+                                read_durable_page_under_gate(
+                                    cx,
+                                    wal_guard.as_mut(),
+                                    &db_file,
+                                    frame_page_size,
+                                    1,
+                                )
+                                .await?
+                            };
+                            if let Some(image) = durable_page_one
+                                && image.len() >= DATABASE_HEADER_SIZE
+                            {
+                                let head = u32::from_be_bytes(
+                                    image[32..36].try_into().expect("durable head slice"),
+                                );
+                                let count = u32::from_be_bytes(
+                                    image[36..40].try_into().expect("durable count slice"),
+                                );
+                                let changed = promote_group_commit_page_one_freelist_headers(
+                                    &mut batches,
+                                    head,
+                                    count,
+                                );
+                                if std::env::var_os("DW8OE_TRACE").is_some() {
+                                    eprintln!(
+                                        "DW8OE PROMOTE durable_head={head} durable_count={count} changed={changed}"
+                                    );
+                                }
+                            } else if std::env::var_os("DW8OE_TRACE").is_some() {
+                                eprintln!("DW8OE PROMOTE no-durable-page1");
+                            }
                         }
                     }
                 }
@@ -20842,33 +20931,58 @@ where
                                         }
                                     }
                                     if carries_synthetic_page_one {
-                                        let durable_page_one = read_durable_page_under_gate(
-                                            cx,
-                                            wal,
-                                            &db_file,
-                                            frame_page_size,
-                                            1,
-                                        )
-                                        .await?;
-                                        if std::env::var_os("DW8OE_TRACE").is_some() {
-                                            eprintln!(
-                                                "DW8OE GATE durable32_40={}",
-                                                durable_page_one
-                                                    .as_deref()
-                                                    .map_or_else(|| "none".to_owned(), |d| hex_bytes(
-                                                        &d[32..40]
-                                                    )),
-                                            );
-                                        }
-                                        if stale_synthetic_page_one_freelist_header(
-                                            &batches,
-                                            durable_page_one.as_deref(),
-                                        ) {
+                                        // bd-ioq6x: non-publication page-1 frames
+                                        // must match THIS group's own publication
+                                        // header when present — the publication
+                                        // batch is separately validated against
+                                        // fresh durable by the resurrection/
+                                        // erasure guard below. Only when the group
+                                        // carries no publication of its own do the
+                                        // frames have to match the CURRENT durable
+                                        // header (bd-dw8oe promote→append window
+                                        // against a peer publication).
+                                        let stale = if let Some(header) =
+                                            group_publication_page_one_freelist_header(&batches)
+                                        {
+                                            if std::env::var_os("DW8OE_TRACE").is_some() {
+                                                eprintln!(
+                                                    "DW8OE GATE in_group32_40={}",
+                                                    hex_bytes(&header),
+                                                );
+                                            }
+                                            nonpublication_page_one_freelist_header_differs(
+                                                &batches, &header,
+                                            )
+                                        } else {
+                                            let durable_page_one = read_durable_page_under_gate(
+                                                cx,
+                                                wal,
+                                                &db_file,
+                                                frame_page_size,
+                                                1,
+                                            )
+                                            .await?;
+                                            if std::env::var_os("DW8OE_TRACE").is_some() {
+                                                eprintln!(
+                                                    "DW8OE GATE durable32_40={}",
+                                                    durable_page_one.as_deref().map_or_else(
+                                                        || "none".to_owned(),
+                                                        |d| hex_bytes(&d[32..40])
+                                                    ),
+                                                );
+                                            }
+                                            stale_synthetic_page_one_freelist_header(
+                                                &batches,
+                                                durable_page_one.as_deref(),
+                                            )
+                                        };
+                                        if stale {
                                             tracing::debug!(
                                                 target: "fsqlite.wal.conflict",
                                                 "synthetic page-1 freelist header is stale \
-                                                 against the current durable page 1; failing \
-                                                 closed with BusySnapshot (bd-dw8oe)"
+                                                 against the current durable/in-group page 1; \
+                                                 failing closed with BusySnapshot \
+                                                 (bd-dw8oe/bd-ioq6x)"
                                             );
                                             return Err(FrankenError::BusySnapshot {
                                                 conflicting_pages: "1".to_owned(),
@@ -40018,6 +40132,109 @@ mod tests {
                 "bead_id=bd-3wop3.1.2 case=disjoint_writers_commit_all_frames"
             );
         });
+    }
+
+    #[test]
+    fn test_ioq6x_intragroup_publication_header_wins_over_stale_grow() {
+        // bd-ioq6x (GH#346): a group commit that mixes a freelist-publishing
+        // batch (a DELETE that durably freed pages) with a later-appended
+        // non-publication grow batch must NOT let the grow batch's page-1 frame
+        // republish the pre-group (empty) freelist header. Before the fix,
+        // non-publication page-1 frames were promoted only to the DURABLE header
+        // — still empty, because this group's own publication has not landed yet
+        // — so the grow frame, appended after the publication frame, erased the
+        // freelist back to count=0 and orphaned any freed page not reused before
+        // the file was finalized ("page N is never used"; freelist_count pinned
+        // at 0 under concurrent INSERT/DELETE churn).
+        const PS: usize = 4096;
+        let make_page_one = |trunk: u32, count: u32| -> Vec<u8> {
+            let mut p = vec![0_u8; PS];
+            p[32..36].copy_from_slice(&trunk.to_be_bytes());
+            p[36..40].copy_from_slice(&count.to_be_bytes());
+            p
+        };
+        // Freelist (trunk, count) of the LAST page-1 frame in append order —
+        // this is what a reader sees after the group's frames are appended.
+        let last_page_one_freelist = |batches: &[TransactionFrameBatch]| -> (u32, u32) {
+            let mut last = None;
+            for batch in batches {
+                for frame in &batch.frames {
+                    if frame.page_number == 1 {
+                        let t = u32::from_be_bytes(frame.page_data[32..36].try_into().unwrap());
+                        let c = u32::from_be_bytes(frame.page_data[36..40].try_into().unwrap());
+                        last = Some((t, c));
+                    }
+                }
+            }
+            last.unwrap()
+        };
+
+        // Publication batch: a DELETE freed pages 7 and 9 -> trunk head 7,
+        // count 2, and serialized them into its page-1 + trunk frames.
+        let pub_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+            page_number: 1,
+            page_data: make_page_one(7, 2),
+            db_size_if_commit: 20,
+        }])
+        .with_freelist_publication(Some(vec![7, 9]), vec![7, 9], Vec::new(), Vec::new());
+
+        // Non-publication grow batch: its begin-time snapshot saw an empty
+        // freelist, so its page-1 rewrite carries head=0,count=0 and is appended
+        // AFTER the publication (worst-case ordering for erasure).
+        let grow_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+            page_number: 1,
+            page_data: make_page_one(0, 0),
+            db_size_if_commit: 21,
+        }]);
+
+        let mut batches = vec![pub_batch, grow_batch];
+
+        // The group carries exactly one publication; its header is (7, 2).
+        let header = group_publication_page_one_freelist_header(&batches)
+            .expect("group carries an in-group publication header");
+        assert_eq!(
+            u32::from_be_bytes(header[0..4].try_into().unwrap()),
+            7,
+            "publication trunk head"
+        );
+        assert_eq!(
+            u32::from_be_bytes(header[4..8].try_into().unwrap()),
+            2,
+            "publication freelist count"
+        );
+
+        // Before promotion the grow batch's stale (0,0) header differs from the
+        // publication header — the erasure hazard — and the LAST page-1 frame
+        // (the grow) would publish count=0, dropping the freed pages.
+        assert!(
+            nonpublication_page_one_freelist_header_differs(&batches, &header),
+            "pre-promote: grow batch still carries the erasing (0,0) header"
+        );
+        assert_eq!(
+            last_page_one_freelist(&batches),
+            (0, 0),
+            "pre-promote: last page-1 frame would erase the freelist to count=0"
+        );
+
+        // The fix promotes non-publication page-1 frames to the IN-GROUP
+        // publication header (not the pre-group durable one).
+        let head = u32::from_be_bytes(header[0..4].try_into().unwrap());
+        let count = u32::from_be_bytes(header[4..8].try_into().unwrap());
+        let changed = promote_group_commit_page_one_freelist_headers(&mut batches, head, count);
+        assert!(changed, "promote rewrote the grow batch's stale header");
+
+        // After promotion no non-publication frame can erase the publication,
+        // and the last page-1 frame (whatever the order) now publishes count=2 —
+        // the freed pages stay durably on the freelist.
+        assert!(
+            !nonpublication_page_one_freelist_header_differs(&batches, &header),
+            "post-promote: grow batch carries the publication header"
+        );
+        assert_eq!(
+            last_page_one_freelist(&batches),
+            (7, 2),
+            "post-promote: durable page-1 preserves the freed pages on the freelist"
+        );
     }
 
     #[test]
