@@ -89381,29 +89381,40 @@ impl Connection {
                     let verified = match directive.access_kind {
                         PlannerSelectAccessKind::FullTableScan => {
                             // bd-2fong red 3 (bd-jyyae family): a FullTableScan
-                            // directive was trusted unconditionally, but the
-                            // native IN-probe lane (bd-2dgf5) upgrades
-                            // `ipk IN (SELECT ...)` to rowid seeks at codegen —
-                            // EQP printed `SCAN t` for a program whose first
-                            // act is SeekGE. Verify scan directives against the
-                            // program like every other access kind and report
-                            // the path the program actually performs (stock:
-                            // `SEARCH t USING INTEGER PRIMARY KEY (rowid=?)`).
-                            if let Ok(program) = self.compile_table_select(select).await
-                                && crate::explain::program_seeks_rowid_on_table(
+                            // directive was trusted unconditionally, but codegen
+                            // may upgrade it to a seek — the native IN-probe lane
+                            // (bd-2dgf5) turns `ipk IN (SELECT ...)` into rowid
+                            // seeks, and a WITHOUT ROWID single-column PRIMARY KEY
+                            // equality becomes a direct table-b-tree seek
+                            // (bd-nd2ju / #377) — so EQP printed `SCAN t` for a
+                            // program whose first act is a seek. Verify scan
+                            // directives against the program like every other
+                            // access kind and report the path the program
+                            // actually performs.
+                            if let Ok(program) = self.compile_table_select(select).await {
+                                if crate::explain::program_seeks_rowid_on_table(
                                     &program,
                                     &directive.table_name,
-                                )
-                            {
-                                return vec![to_row(
-                                    2,
-                                    0,
-                                    0,
-                                    format!(
-                                        "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                                        directive.table_name
-                                    ),
-                                )];
+                                ) {
+                                    return vec![to_row(
+                                        2,
+                                        0,
+                                        0,
+                                        format!(
+                                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                                            directive.table_name
+                                        ),
+                                    )];
+                                }
+                                if crate::explain::program_seeks_without_rowid_pk_on_table(
+                                    &program,
+                                    &directive.table_name,
+                                ) && let Some(detail) = without_rowid_pk_eqp_detail(
+                                    &directive.table_name,
+                                    &self.schema.borrow(),
+                                ) {
+                                    return vec![to_row(2, 0, 0, detail)];
+                                }
                             }
                             true
                         }
@@ -124307,6 +124318,29 @@ fn planner_directive_covering_access_kind(
     } else {
         None
     }
+}
+
+/// EQP detail for a WITHOUT ROWID PRIMARY KEY point lookup (bd-nd2ju / #377).
+///
+/// Renders `SEARCH <table> USING PRIMARY KEY (<col>=? [AND <col>=?]...)`,
+/// matching stock SQLite. The PK is the table b-tree, not a `sqlite_autoindex_*`
+/// entry, so this is built from the table's declared PRIMARY KEY columns rather
+/// than an index name. Only reached after the program is verified to actually
+/// perform the seek (`program_seeks_without_rowid_pk_on_table`).
+fn without_rowid_pk_eqp_detail(table_name: &str, schema: &[TableSchema]) -> Option<String> {
+    let table = schema
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(table_name))?;
+    let pk_columns = table.primary_key_constraints.first()?;
+    if pk_columns.is_empty() {
+        return None;
+    }
+    let key_terms = pk_columns
+        .iter()
+        .map(|column| format!("{column}=?"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    Some(format!("SEARCH {table_name} USING PRIMARY KEY ({key_terms})"))
 }
 
 fn explain_query_plan_detail_from_directive(directive: &SelectPlannerDirective) -> String {

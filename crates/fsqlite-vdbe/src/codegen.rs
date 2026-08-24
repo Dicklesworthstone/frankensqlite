@@ -3798,6 +3798,56 @@ pub fn codegen_select(
         );
     }
 
+    // bd-nd2ju (#377): WITHOUT ROWID single-column PRIMARY KEY equality point
+    // lookup. A WITHOUT ROWID table's PK is the table b-tree itself and is
+    // never a `table.indexes` entry, so the planner has no index candidate for
+    // it and falls back to a `FullTableScan` directive -> `codegen_select_full_scan`
+    // reads every row (O(n) per probe; quadratic under a bulk-ingest trigger
+    // guard, GH#377). Seek the table b-tree directly by the PK key using the
+    // same `NoConflict` positioning the WR index-to-table / upsert / delete PK
+    // probes use. Gated to a sole `pk = <const>` WHERE over a single-column PK,
+    // so no residual filter and no key-order / placeholder reconciliation is
+    // needed; composite PKs and `pk = <const> AND <residual>` keep the scan
+    // (future scope). EQP flips SCAN->SEARCH via the program-verified
+    // `FullTableScan` arm in `execute_explain_query_plan`. Hoisted before the
+    // directive, mirroring `bd-rowid-range-before-directive`.
+    if table.without_rowid
+        && !is_aggregate
+        && from_index_hint.is_none()
+        && time_travel.is_none()
+        && stmt.order_by.is_empty()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && !has_window_columns(columns)
+        && ctx.planner_select_directive.as_ref().is_none_or(|d| {
+            d.table_name.eq_ignore_ascii_case(&table.name)
+                && matches!(d.access_kind, PlannerSelectAccessKind::FullTableScan)
+        })
+        && let Some((eq_col, eq_target)) = index_eq_target.as_ref()
+        && let Some(pk_cols) = table.primary_key_constraints.first()
+        && pk_cols.len() == 1
+        && pk_cols[0].eq_ignore_ascii_case(eq_col)
+    {
+        return codegen_select_without_rowid_pk_lookup(
+            b,
+            cursor,
+            table,
+            table_alias,
+            time_travel,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            stmt.limit.as_ref(),
+            // `eq_target` is `&&Expr` from `index_eq_target.as_ref()`; it
+            // auto-derefs to the callee's `&Expr`.
+            eq_target,
+        );
+    }
+
     if let Some(directive) = ctx.planner_select_directive.as_ref() {
         let bypass_reason = if !directive.table_name.eq_ignore_ascii_case(&table.name) {
             Some("table_mismatch")
@@ -4600,6 +4650,108 @@ fn codegen_select_rowid_lookup(
             done_label,
         );
     }
+    let skip_label = b.emit_label();
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+    b.resolve_label(skip_label);
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Point lookup on a WITHOUT ROWID table's single-column PRIMARY KEY
+/// (bd-nd2ju / #377).
+///
+/// A WITHOUT ROWID table stores rows in a b-tree keyed by the PRIMARY KEY, so
+/// the PK is not a separate `table.indexes` entry — the table cursor itself IS
+/// the PK index. This seeks that cursor directly by the PK record via
+/// `NoConflict` (the same positioning `emit_without_rowid_index_to_table_seek`
+/// and the WR upsert/delete PK probes use), emitting at most one row, instead
+/// of the `FullTableScan` the planner otherwise falls back to. Caller gates to
+/// a single-column PK equated by a sole `pk = <const>` WHERE, so the seek fully
+/// implements the predicate (no residual filter).
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_without_rowid_pk_lookup(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    time_travel: Option<&TimeTravelClause>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    limit_clause: Option<&LimitClause>,
+    target_expr: &Expr,
+) -> Result<(), CodegenError> {
+    let pk_indices = without_rowid_pk_indices(table)?;
+    // The caller gates to a single-column PK; guard defensively so a wider PK
+    // never emits a truncated single-field probe against a composite key.
+    let [pk_col] = pk_indices.as_slice() else {
+        return Err(CodegenError::Unsupported(
+            "WITHOUT ROWID PK point lookup requires a single-column primary key".to_owned(),
+        ));
+    };
+
+    // `emit_limit_zero_guard` (inside) may jump to `done_label` for a literal
+    // `LIMIT 0`, which reaches the `Close` below on a not-yet-open cursor — the
+    // same benign ordering `codegen_select_rowid_lookup` uses (`Close` on an
+    // unopened cursor is a no-op).
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
+
+    let pk_reg = b.alloc_reg();
+    emit_expr(b, target_expr, pk_reg, None);
+    // Match the stored key's storage class: `emit_without_rowid_row_insert`
+    // coerces the row through `table.affinity_string()` before building the PK
+    // key, so a raw literal / bound placeholder probe must take the PK column's
+    // affinity — otherwise an INTEGER key probed by text `'5'` (or the reverse)
+    // would miss a row that is present. Skip the op when the operand already
+    // carries the column's affinity (byte-identical to no coercion).
+    let pk_affinity = table.columns[*pk_col].affinity;
+    if matches!(pk_affinity, 'B' | 'C' | 'D' | 'E')
+        && !bound_matches_affinity(pk_affinity, target_expr)
+    {
+        b.emit_op(
+            Opcode::Affinity,
+            pk_reg,
+            1,
+            0,
+            P4::Affinity(pk_affinity.to_string()),
+            0,
+        );
+    }
+
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    emit_set_snapshot(b, cursor, time_travel);
+
+    // A NULL probe cannot match a WITHOUT ROWID PK column (PK is NOT NULL):
+    // empty result. Emitted after `OpenRead` so the jump's `Close` sees an open
+    // cursor; it also keeps `NoConflict`'s own NULL-jump unreachable.
+    b.emit_jump_to_label(Opcode::IsNull, pk_reg, 0, done_label, P4::None, 0);
+
+    let pk_rec = b.alloc_reg();
+    b.emit_op(Opcode::MakeRecord, pk_reg, 1, pk_rec, P4::None, 0);
+    // `NoConflict` jumps when no row carries this PK; a match falls through with
+    // the table cursor positioned on that row (the WR table b-tree is PK-keyed).
+    b.emit_jump_to_label(Opcode::NoConflict, cursor, pk_rec, done_label, P4::None, 0);
+
     let skip_label = b.emit_label();
     if let Some(off_r) = offset_reg {
         b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
