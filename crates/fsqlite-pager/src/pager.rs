@@ -1430,8 +1430,10 @@ struct GroupCommitQueue {
     /// later grow turned into durable "page N is never used" leaks. In-memory
     /// and process-scoped: it closes the single-process concurrent-churn
     /// residual the reproduction exercises; cross-process reclamation of such
-    /// holes still relies on VACUUM, exactly as in stock SQLite.
-    disowned_pages: Arc<Mutex<Vec<PageNumber>>>,
+    /// holes still relies on VACUUM, exactly as in stock SQLite. A `HashSet`
+    /// (not a `Vec`) so the fold-time re-share of still-abandoned pages is
+    /// idempotent and the ledger cannot accumulate duplicates.
+    disowned_pages: Arc<Mutex<HashSet<u32>>>,
     /// Test-local proof that a resolved wake dropped during post-wake
     /// finalization is classified instead of being silently discarded.
     #[cfg(test)]
@@ -1859,7 +1861,7 @@ impl GroupCommitQueue {
             in_doubt_epochs: Mutex::new(HashMap::new()),
             epoch_resolution_claims_in_flight: AtomicUsize::new(0),
             pending_logical_cleanups: Mutex::new(VecDeque::new()),
-            disowned_pages: Arc::new(Mutex::new(Vec::new())),
+            disowned_pages: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             unaccounted_epoch_wake_drops: AtomicUsize::new(0),
         }
@@ -7101,7 +7103,7 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// `adopt_disowned_pages_into_pool`. `None` only for construction paths
     /// with no bound queue (which are single-connection shapes that never
     /// populate the pool), so the cross-connection sweep is simply inert there.
-    disowned_page_ledger: Option<Arc<Mutex<Vec<PageNumber>>>>,
+    disowned_page_ledger: Option<Arc<Mutex<HashSet<u32>>>>,
     /// bd-r82et: the pager's last-known CURRENT durable freelist content —
     /// exactly the pages recorded free in durable page-1/trunk metadata. It
     /// is refreshed wherever durable freelist state is actually read
@@ -7175,7 +7177,8 @@ impl<F: VfsFile> Drop for PagerInner<F> {
         // ledger so a surviving connection adopts and reconciles them at its
         // next fold. Sync-mutex only — safe in Drop; a no-op when the pool is
         // empty (the overwhelming common case) or no shared ledger is bound.
-        if !self.abandoned_eof_reservations.is_empty()
+        if !ioq6x_ledger_disabled()
+            && !self.abandoned_eof_reservations.is_empty()
             && let Some(ledger) = self.disowned_page_ledger.as_ref()
         {
             if std::env::var_os("IOQ6X_TRACE").is_some() {
@@ -8989,25 +8992,26 @@ fn merge_descending_unique_freelists(left: &[PageNumber], right: &[PageNumber]) 
 /// instead of being silently discarded. Sync-mutex only, so it is safe to call
 /// from a `Drop` impl.
 fn disown_pages(
-    ledger: &Mutex<Vec<PageNumber>>,
+    ledger: &Mutex<HashSet<u32>>,
     pages: impl IntoIterator<Item = PageNumber>,
 ) {
     let mut guard = ledger
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.extend(pages);
+    guard.extend(pages.into_iter().map(|page| page.get()));
 }
 
 /// bd-ioq6x Face-2: drain the shared per-file disowned-page ledger atomically.
 /// The take is done under the ledger mutex so two connections folding
 /// concurrently each receive a disjoint slice — a page is adopted by exactly
 /// one connection, never double-reconciled.
-fn take_disowned_pages(ledger: &Mutex<Vec<PageNumber>>) -> Vec<PageNumber> {
-    std::mem::take(
+fn take_disowned_pages(ledger: &Mutex<HashSet<u32>>) -> Vec<PageNumber> {
+    let drained = std::mem::take(
         &mut *ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
+    );
+    drained.into_iter().filter_map(PageNumber::new).collect()
 }
 
 /// bd-ioq6x Face-2: adopt every page from the shared per-file disowned-page
@@ -9021,25 +9025,72 @@ fn take_disowned_pages(ledger: &Mutex<Vec<PageNumber>>) -> Vec<PageNumber> {
 /// this connection itself later drops). Only meaningful in WAL mode — the
 /// rollback-journal path has no commit-fold to drain the pool. Returns the
 /// number of pages adopted.
+/// bd-ioq6x Face-2: runtime kill-switch for the shared disowned-page ledger
+/// (diagnostics / safety valve). When `FSQLITE_IOQ6X_LEDGER_OFF` is set, disown
+/// and adopt become no-ops, reverting exactly to the pre-ledger behavior (a
+/// dropped connection's parked pool is discarded). Cached once per process.
+fn ioq6x_ledger_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("FSQLITE_IOQ6X_LEDGER_OFF").is_some())
+}
+
 fn adopt_disowned_pages_into_pool<F: VfsFile>(inner: &mut PagerInner<F>) -> usize {
-    if inner.journal_mode != JournalMode::Wal {
+    if ioq6x_ledger_disabled() || inner.journal_mode != JournalMode::Wal {
         return 0;
     }
     let Some(ledger) = inner.disowned_page_ledger.clone() else {
         return 0;
     };
     let adopted = take_disowned_pages(&ledger);
-    let adopted_count = adopted.len();
-    if adopted_count > 0 {
-        inner.abandoned_eof_reservations.extend(adopted);
-        if std::env::var_os("IOQ6X_TRACE").is_some() {
-            eprintln!(
-                "IOQ6X ADOPT adopted={adopted_count} pool={}",
-                inner.abandoned_eof_reservations.len(),
-            );
+    if adopted.is_empty() {
+        return 0;
+    }
+    // Dedup against the current pool: two connections can disown the same
+    // aborted EOF page (both optimistically grew to it, both rolled back), so a
+    // page freshly drained from the shared ledger may already sit in this
+    // connection's own pool — add it once. The frame guard keeps a duplicate
+    // reclamation benign regardless, but this keeps the pool from accreting.
+    let existing: HashSet<u32> = inner
+        .abandoned_eof_reservations
+        .iter()
+        .map(|page| page.get())
+        .collect();
+    let mut adopted_count = 0_usize;
+    for page in adopted {
+        if existing.contains(&page.get()) {
+            continue;
         }
+        inner.abandoned_eof_reservations.push(page);
+        adopted_count += 1;
+    }
+    if adopted_count > 0 && std::env::var_os("IOQ6X_TRACE").is_some() {
+        eprintln!(
+            "IOQ6X ADOPT adopted={adopted_count} pool={}",
+            inner.abandoned_eof_reservations.len(),
+        );
     }
     adopted_count
+}
+
+/// bd-ioq6x Face-2: clear the shared disowned-page ledger at a WAL-generation
+/// boundary (checkpoint). The no-committed-frame guard that reconciles adopted
+/// pages is only sound WITHIN one WAL generation: after a checkpoint resets the
+/// WAL, a page that was live and got checkpointed carries no frame in the new
+/// generation and would be wrongly reclaimed. The per-connection pool is
+/// cleared at every checkpoint for exactly this reason (the "sound only within
+/// one WAL generation" discipline); the shared ledger must be too, else a page
+/// disowned around the checkpoint boundary could strand a stale-generation
+/// entry for a later fold to misjudge — a double-grant hazard. Genuine in-range
+/// holes were already reconciled by the checkpoint-fold before the WAL reset;
+/// whatever remains is either reissuable (>db_size) or a live checkpointed page,
+/// both correct to forget here.
+fn clear_disowned_ledger<F: VfsFile>(inner: &PagerInner<F>) {
+    if let Some(ledger) = inner.disowned_page_ledger.as_ref() {
+        ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 fn return_pages_to_freelist(
@@ -13421,6 +13472,7 @@ where
                 let _mask = self.cleanup_cx.masked();
                 inner.checkpoint_active = false;
                 inner.abandoned_eof_reservations.clear();
+                clear_disowned_ledger(&inner);
                 self.published.publish_metadata_only(
                     &self.cleanup_cx,
                     PublishedPagerUpdate {
@@ -13526,6 +13578,7 @@ where
         drop(external_lock);
         inner.checkpoint_active = false;
         inner.abandoned_eof_reservations.clear();
+        clear_disowned_ledger(&inner);
         self.published.publish_metadata_only(
             &cleanup_cx,
             PublishedPagerUpdate {
@@ -25943,6 +25996,7 @@ where
                 let _mask = self.cleanup_cx.masked();
                 inner.checkpoint_active = false;
                 inner.abandoned_eof_reservations.clear();
+                clear_disowned_ledger(&inner);
                 self.published.publish_metadata_only(
                     &self.cleanup_cx,
                     PublishedPagerUpdate {
