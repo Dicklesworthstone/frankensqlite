@@ -1416,6 +1416,22 @@ struct GroupCommitQueue {
     /// logical Phase C. Each record carries its own process-root attempt and
     /// remains queued across cancellation until transaction exit is terminal.
     pending_logical_cleanups: Mutex<VecDeque<PendingGroupCommitLogicalCleanup>>,
+    /// bd-ioq6x Face-2: shared per-file ledger of EOF pages disowned by a
+    /// connection that dropped before reconciling its per-connection
+    /// abandonment pool (`PagerInner::abandoned_eof_reservations`) into the
+    /// durable freelist. This queue is identity-bound — every pager that
+    /// opened the same underlying file shares this exact Arc — so a page a
+    /// dropping connection parked is not lost: a SURVIVING connection adopts
+    /// it into its own pool at the next commit/checkpoint fold, where the
+    /// existing no-committed-frame guard promotes a provable hole into the
+    /// durable freelist (a page a committed peer has since made live carries a
+    /// frame and is correctly dropped). Without this, a connection dropped
+    /// under churn (drop_close) silently orphaned its parked holes, which a
+    /// later grow turned into durable "page N is never used" leaks. In-memory
+    /// and process-scoped: it closes the single-process concurrent-churn
+    /// residual the reproduction exercises; cross-process reclamation of such
+    /// holes still relies on VACUUM, exactly as in stock SQLite.
+    disowned_pages: Arc<Mutex<Vec<PageNumber>>>,
     /// Test-local proof that a resolved wake dropped during post-wake
     /// finalization is classified instead of being silently discarded.
     #[cfg(test)]
@@ -1843,6 +1859,7 @@ impl GroupCommitQueue {
             in_doubt_epochs: Mutex::new(HashMap::new()),
             epoch_resolution_claims_in_flight: AtomicUsize::new(0),
             pending_logical_cleanups: Mutex::new(VecDeque::new()),
+            disowned_pages: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             unaccounted_epoch_wake_drops: AtomicUsize::new(0),
         }
@@ -7075,6 +7092,16 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// boundaries — the no-committed-frame publication filter is only sound
     /// within one WAL generation.
     abandoned_eof_reservations: Vec<PageNumber>,
+    /// bd-ioq6x Face-2: handle to the shared per-file disowned-page ledger
+    /// (`GroupCommitQueue::disowned_pages`, identity-bound and therefore shared
+    /// by every connection to the same file). On `PagerInner::drop` any still-
+    /// parked `abandoned_eof_reservations` are moved here so a surviving
+    /// connection reconciles them at its next commit/checkpoint fold instead of
+    /// losing them; the fold sites drain it back into their pool via
+    /// `adopt_disowned_pages_into_pool`. `None` only for construction paths
+    /// with no bound queue (which are single-connection shapes that never
+    /// populate the pool), so the cross-connection sweep is simply inert there.
+    disowned_page_ledger: Option<Arc<Mutex<Vec<PageNumber>>>>,
     /// bd-r82et: the pager's last-known CURRENT durable freelist content —
     /// exactly the pages recorded free in durable page-1/trunk metadata. It
     /// is refreshed wherever durable freelist state is actually read
@@ -7140,6 +7167,25 @@ pub(crate) struct PagerInner<F: VfsFile> {
 
 impl<F: VfsFile> Drop for PagerInner<F> {
     fn drop(&mut self) {
+        // bd-ioq6x Face-2: a connection dropped before a reconciling
+        // commit/checkpoint would otherwise silently discard its still-parked
+        // abandonment pool, turning those EOF holes into durable "page N is
+        // never used" orphans once a later grow brings them within
+        // `[2..=db_size]`. Hand them to the shared per-file disowned-page
+        // ledger so a surviving connection adopts and reconciles them at its
+        // next fold. Sync-mutex only — safe in Drop; a no-op when the pool is
+        // empty (the overwhelming common case) or no shared ledger is bound.
+        if !self.abandoned_eof_reservations.is_empty()
+            && let Some(ledger) = self.disowned_page_ledger.as_ref()
+        {
+            if std::env::var_os("IOQ6X_TRACE").is_some() {
+                eprintln!(
+                    "IOQ6X DISOWN pool={} -> shared ledger",
+                    self.abandoned_eof_reservations.len(),
+                );
+            }
+            disown_pages(ledger, self.abandoned_eof_reservations.drain(..));
+        }
         if let Some(owner) = self.rollback_journal_recovery_owner {
             // Never expose a clean identity atomic merely because this one
             // PagerInner disappeared. Other handles may still have transactions
@@ -8935,6 +8981,65 @@ fn merge_descending_unique_freelists(left: &[PageNumber], right: &[PageNumber]) 
     merged.extend_from_slice(&left[left_index..]);
     merged.extend_from_slice(&right[right_index..]);
     merged
+}
+
+/// bd-ioq6x Face-2: append pages onto the shared per-file disowned-page ledger.
+/// Called from `PagerInner::drop` when a connection dies with a non-empty
+/// abandonment pool — the parked EOF holes are handed to a surviving connection
+/// instead of being silently discarded. Sync-mutex only, so it is safe to call
+/// from a `Drop` impl.
+fn disown_pages(
+    ledger: &Mutex<Vec<PageNumber>>,
+    pages: impl IntoIterator<Item = PageNumber>,
+) {
+    let mut guard = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.extend(pages);
+}
+
+/// bd-ioq6x Face-2: drain the shared per-file disowned-page ledger atomically.
+/// The take is done under the ledger mutex so two connections folding
+/// concurrently each receive a disjoint slice — a page is adopted by exactly
+/// one connection, never double-reconciled.
+fn take_disowned_pages(ledger: &Mutex<Vec<PageNumber>>) -> Vec<PageNumber> {
+    std::mem::take(
+        &mut *ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// bd-ioq6x Face-2: adopt every page from the shared per-file disowned-page
+/// ledger into this connection's own abandonment pool so the EXISTING
+/// no-committed-frame fold (commit-time and checkpoint-time) reconciles the
+/// provable holes into the durable freelist under the same double-grant guard
+/// the per-connection pool already trusts. Adopted pages thereby inherit the
+/// full per-connection machinery: an eligible frameless in-range page is
+/// promoted to the freelist, a page a committed peer has since framed is
+/// dropped, an above-extent page is retained (and handed back to the ledger if
+/// this connection itself later drops). Only meaningful in WAL mode — the
+/// rollback-journal path has no commit-fold to drain the pool. Returns the
+/// number of pages adopted.
+fn adopt_disowned_pages_into_pool<F: VfsFile>(inner: &mut PagerInner<F>) -> usize {
+    if inner.journal_mode != JournalMode::Wal {
+        return 0;
+    }
+    let Some(ledger) = inner.disowned_page_ledger.clone() else {
+        return 0;
+    };
+    let adopted = take_disowned_pages(&ledger);
+    let adopted_count = adopted.len();
+    if adopted_count > 0 {
+        inner.abandoned_eof_reservations.extend(adopted);
+        if std::env::var_os("IOQ6X_TRACE").is_some() {
+            eprintln!(
+                "IOQ6X ADOPT adopted={adopted_count} pool={}",
+                inner.abandoned_eof_reservations.len(),
+            );
+        }
+    }
+    adopted_count
 }
 
 fn return_pages_to_freelist(
@@ -16585,6 +16690,7 @@ where
                 durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
+                disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
                 journal_mode: initial_journal_mode,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -16994,6 +17100,7 @@ where
                     .collect(),
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
+                disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
                 journal_mode: JournalMode::Delete,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -23149,6 +23256,13 @@ where
             // gh302 exactness guard and cross-process conflict machinery
             // apply unchanged.
             if self.journal_mode == JournalMode::Wal {
+                // bd-ioq6x Face-2: adopt pages disowned by connections that
+                // dropped before reconciling their own pool. They flow through
+                // the identical no-committed-frame fold below (same eligibility
+                // + double-grant guard), so a provable hole is published into
+                // this commit's durable freelist while a peer-framed page is
+                // dropped.
+                adopt_disowned_pages_into_pool(&mut inner);
                 inner
                     .abandoned_eof_reservations
                     .append(&mut self.reclaimed_abandoned_reservations);
@@ -25900,6 +26014,12 @@ where
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            // bd-ioq6x Face-2: adopt pages disowned by dropped connections
+            // BEFORE this checkpoint reconciles/clears the pool. Under the
+            // exclusive maintenance fence (active_transactions == 0) they are
+            // reconciled by the same no-committed-frame promotion below; the
+            // guard then clears the remainder at the WAL-generation boundary.
+            adopt_disowned_pages_into_pool(&mut inner);
             if inner.journal_mode == JournalMode::Wal
                 && inner.db_size >= 2
                 && !inner.abandoned_eof_reservations.is_empty()
@@ -40235,6 +40355,125 @@ mod tests {
             (7, 2),
             "post-promote: durable page-1 preserves the freed pages on the freelist"
         );
+    }
+
+    #[test]
+    fn test_ioq6x_face2_dropped_connection_disowns_pool_to_shared_ledger() {
+        // bd-ioq6x Face-2: a connection that dies with a non-empty abandonment
+        // pool (EOF holes an aborted concurrent txn parked) must NOT silently
+        // discard those pages — `PagerInner::drop` hands them to the shared
+        // per-file disowned-page ledger so a surviving connection can reconcile
+        // them. Without this, a `drop_close` under churn orphaned the holes and
+        // a later grow turned them into durable "page N is never used" leaks.
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/ioq6x_face2_disown.db");
+            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+
+            let inner_arc = Arc::clone(&pager.inner);
+            let ledger = {
+                let mut inner = inner_arc
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // The abandonment pool is a WAL-mode concept; mark this
+                // connection WAL directly (no live backend needed — the drop
+                // handoff itself is mode-agnostic).
+                inner.journal_mode = JournalMode::Wal;
+                let ledger = inner
+                    .disowned_page_ledger
+                    .clone()
+                    .expect("an open pager binds the shared disowned-page ledger");
+                // Simulate a concurrent transaction having parked aborted EOF
+                // reservations that a later grow would bring in-range.
+                inner.abandoned_eof_reservations =
+                    vec![PageNumber::new(57).unwrap(), PageNumber::new(58).unwrap()];
+                ledger
+            };
+            assert!(
+                take_disowned_pages(&ledger).is_empty(),
+                "the shared ledger starts empty"
+            );
+
+            // Drop the connection WITHOUT a reconciling commit/checkpoint. The
+            // pager and our probe clone are the only `PagerInner` holders, so
+            // releasing both runs `PagerInner::drop` deterministically here.
+            assert_eq!(
+                Arc::strong_count(&pager.inner),
+                2,
+                "only the pager and this test hold the inner; dropping both must run PagerInner::drop"
+            );
+            drop(pager);
+            drop(inner_arc);
+
+            let mut disowned: Vec<u32> = take_disowned_pages(&ledger)
+                .iter()
+                .map(|page| page.get())
+                .collect();
+            disowned.sort_unstable();
+            assert_eq!(
+                disowned,
+                vec![57, 58],
+                "a dropped connection disowns its still-parked pool to the shared ledger"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ioq6x_face2_surviving_connection_adopts_disowned_pages() {
+        // bd-ioq6x Face-2: the surviving half — a connection drains the shared
+        // disowned-page ledger into its own abandonment pool at fold time,
+        // where the existing no-committed-frame reconciliation reclaims the
+        // in-range holes. The take is atomic so exactly one connection adopts a
+        // given page (never double-reconciled), and only WAL mode participates.
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/ioq6x_face2_adopt.db");
+            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+
+            let mut inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Mark WAL directly (no live backend needed for the fold-adopt path).
+            inner.journal_mode = JournalMode::Wal;
+            let ledger = inner
+                .disowned_page_ledger
+                .clone()
+                .expect("an open pager binds the shared disowned-page ledger");
+            // A previously-dropped peer left holes on the shared ledger.
+            disown_pages(
+                &ledger,
+                [PageNumber::new(57).unwrap(), PageNumber::new(58).unwrap()],
+            );
+            assert!(inner.abandoned_eof_reservations.is_empty());
+
+            let adopted = adopt_disowned_pages_into_pool(&mut inner);
+            assert_eq!(adopted, 2, "both disowned pages are adopted into the pool");
+            let mut pool: Vec<u32> = inner
+                .abandoned_eof_reservations
+                .iter()
+                .map(|page| page.get())
+                .collect();
+            pool.sort_unstable();
+            assert_eq!(pool, vec![57, 58], "adopted pages joined this connection's pool");
+            assert!(
+                take_disowned_pages(&ledger).is_empty(),
+                "adoption drains the shared ledger so no peer double-reconciles the same page"
+            );
+
+            // A non-WAL connection never participates in the pool machinery.
+            inner.journal_mode = JournalMode::Delete;
+            disown_pages(&ledger, [PageNumber::new(59).unwrap()]);
+            assert_eq!(
+                adopt_disowned_pages_into_pool(&mut inner),
+                0,
+                "a non-WAL connection never adopts disowned pages"
+            );
+        });
     }
 
     #[test]
