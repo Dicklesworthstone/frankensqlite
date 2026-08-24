@@ -531,6 +531,10 @@ pub struct ReusableTableExecutionState {
     pub rowid_alias_col_by_root_page: Arc<HashMap<i32, usize>>,
     pub table_column_count_by_root_page: Arc<HashMap<i32, usize>>,
     pub first_not_null_non_ipk_col_by_root_page: Arc<HashMap<i32, usize>>,
+    /// bd-977wx: qualified "table.ipkcol" label per root page (IPK tables), so
+    /// the Insert conflict handler can report a rowid/IPK collision as
+    /// `UNIQUE constraint failed: t.k` instead of `PRIMARY KEY constraint failed`.
+    pub ipk_label_by_root_page: Arc<HashMap<i32, String>>,
     pub column_defaults_by_root_page: Arc<HashMap<i32, Vec<Option<SqliteValue>>>>,
     pub index_desc_flags_by_root_page: Arc<HashMap<i32, Vec<bool>>>,
     pub index_collations_by_root_page: Arc<HashMap<i32, Vec<Option<String>>>>,
@@ -6390,6 +6394,10 @@ pub struct VdbeEngine {
     table_column_count_by_root_page: Arc<HashMap<i32, usize>>,
     /// Earliest non-IPK NOT NULL column keyed by root page number.
     first_not_null_non_ipk_col_by_root_page: Arc<HashMap<i32, usize>>,
+    /// bd-977wx: qualified "table.ipkcol" label keyed by root page (IPK tables).
+    /// Read only on the Insert default-conflict path to name the collided IPK
+    /// column in the constraint error (matches stock `UNIQUE constraint failed`).
+    ipk_label_by_root_page: Arc<HashMap<i32, String>>,
     /// Column default values by root page number (for ALTER TABLE ADD COLUMN).
     /// When a row has fewer columns than the schema expects, defaults from this
     /// map are applied instead of returning NULL.
@@ -6955,6 +6963,7 @@ impl VdbeEngine {
             rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
             table_column_count_by_root_page: Arc::new(HashMap::new()),
             first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
+            ipk_label_by_root_page: Arc::new(HashMap::new()),
             column_defaults_by_root_page: Arc::new(HashMap::new()),
             index_desc_flags_by_root_page: Arc::new(HashMap::new()),
             index_collations_by_root_page: Arc::new(HashMap::new()),
@@ -7303,6 +7312,7 @@ impl VdbeEngine {
             rowid_alias_col_by_root_page,
             table_column_count_by_root_page,
             first_not_null_non_ipk_col_by_root_page,
+            ipk_label_by_root_page,
             column_defaults_by_root_page,
             index_desc_flags_by_root_page,
             index_collations_by_root_page,
@@ -7382,6 +7392,13 @@ impl VdbeEngine {
             self.first_not_null_non_ipk_col_by_root_page = first_not_null_non_ipk_col_by_root_page;
         }
         note_rebind(first_not_null_changed);
+
+        let ipk_label_changed =
+            !Arc::ptr_eq(&self.ipk_label_by_root_page, &ipk_label_by_root_page);
+        if ipk_label_changed {
+            self.ipk_label_by_root_page = ipk_label_by_root_page;
+        }
+        note_rebind(ipk_label_changed);
 
         let column_defaults_changed = !Arc::ptr_eq(
             &self.column_defaults_by_root_page,
@@ -10950,9 +10967,19 @@ impl VdbeEngine {
                                             )
                                             .await?;
                                         }
+                                        // bd-977wx: a rowid/IPK collision is a
+                                        // UNIQUE violation on the IPK column in
+                                        // stock; name it when the label is known.
+                                        let message = self
+                                            .ipk_label_by_root_page
+                                            .get(&root_page)
+                                            .map_or_else(
+                                                || "PRIMARY KEY constraint failed".to_owned(),
+                                                |label| format!("UNIQUE constraint failed: {label}"),
+                                            );
                                         return Ok(Some(ExecOutcome::Error {
                                             code: ErrorCode::Constraint as i32,
-                                            message: "PRIMARY KEY constraint failed".to_owned(),
+                                            message,
                                         }));
                                     }
                                 } else {
@@ -11112,9 +11139,23 @@ impl VdbeEngine {
                                                 )
                                                 .await?;
                                             }
+                                            // bd-977wx: name the IPK column so a
+                                            // rowid/IPK collision reads as
+                                            // `UNIQUE constraint failed: t.k`.
+                                            let message = self
+                                                .ipk_label_by_root_page
+                                                .get(&root)
+                                                .map_or_else(
+                                                    || {
+                                                        "PRIMARY KEY constraint failed".to_owned()
+                                                    },
+                                                    |label| {
+                                                        format!("UNIQUE constraint failed: {label}")
+                                                    },
+                                                );
                                             return Ok(Some(ExecOutcome::Error {
                                                 code: ErrorCode::Constraint as i32,
-                                                message: "PRIMARY KEY constraint failed".to_owned(),
+                                                message,
                                             }));
                                         }
                                     }
@@ -22785,6 +22826,7 @@ mod tests {
             rowid_alias_col_by_root_page: Arc::new(HashMap::from([(5, 0)])),
             table_column_count_by_root_page: Arc::new(HashMap::from([(5, 2)])),
             first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::from([(5, 1)])),
+            ipk_label_by_root_page: Arc::new(HashMap::from([(5, "t.k".to_owned())])),
             column_defaults_by_root_page: Arc::new(HashMap::new()),
             index_desc_flags_by_root_page: Arc::new(HashMap::from([(9, vec![false, true])])),
             index_collations_by_root_page: Arc::new(HashMap::from([(
@@ -22837,6 +22879,7 @@ mod tests {
             rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
             table_column_count_by_root_page: Arc::new(HashMap::new()),
             first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
+            ipk_label_by_root_page: Arc::new(HashMap::new()),
             column_defaults_by_root_page: Arc::new(HashMap::new()),
             index_desc_flags_by_root_page: Arc::new(HashMap::new()),
             index_collations_by_root_page: Arc::new(HashMap::new()),
@@ -22888,6 +22931,7 @@ mod tests {
                 rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
                 table_column_count_by_root_page: Arc::new(HashMap::new()),
                 first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
+                ipk_label_by_root_page: Arc::new(HashMap::new()),
                 column_defaults_by_root_page: Arc::new(HashMap::new()),
                 index_desc_flags_by_root_page: Arc::new(HashMap::new()),
                 index_collations_by_root_page: Arc::new(HashMap::new()),

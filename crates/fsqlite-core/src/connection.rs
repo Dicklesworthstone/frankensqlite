@@ -8171,6 +8171,7 @@ impl PreparedStatement<'_> {
             runtime_inputs.rowid_alias_col_by_root_page,
             runtime_inputs.table_column_count_by_root_page,
             runtime_inputs.first_not_null_non_ipk_col_by_root_page,
+            runtime_inputs.ipk_label_by_root_page,
             runtime_inputs.column_defaults_by_root_page,
             runtime_inputs.index_desc_flags_by_root_page,
             runtime_inputs.index_collations_by_root_page,
@@ -8350,6 +8351,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.rowid_alias_col_by_root_page,
                 runtime_inputs.table_column_count_by_root_page,
                 runtime_inputs.first_not_null_non_ipk_col_by_root_page,
+                runtime_inputs.ipk_label_by_root_page,
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
@@ -8402,6 +8404,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.rowid_alias_col_by_root_page,
                 runtime_inputs.table_column_count_by_root_page,
                 runtime_inputs.first_not_null_non_ipk_col_by_root_page,
+                runtime_inputs.ipk_label_by_root_page,
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
@@ -8535,6 +8538,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.rowid_alias_col_by_root_page,
                 runtime_inputs.table_column_count_by_root_page,
                 runtime_inputs.first_not_null_non_ipk_col_by_root_page,
+                runtime_inputs.ipk_label_by_root_page,
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
@@ -8590,6 +8594,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.rowid_alias_col_by_root_page,
                 runtime_inputs.table_column_count_by_root_page,
                 runtime_inputs.first_not_null_non_ipk_col_by_root_page,
+                runtime_inputs.ipk_label_by_root_page,
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
@@ -10763,6 +10768,11 @@ struct TableExecutionMetadataCacheEntry {
     rowid_alias_col_by_root_page: Arc<HbHashMap<i32, usize>>,
     table_column_count_by_root_page: Arc<HbHashMap<i32, usize>>,
     first_not_null_non_ipk_col_by_root_page: Arc<HbHashMap<i32, usize>>,
+    /// bd-977wx: qualified "table.ipkcol" label keyed by root page, for tables
+    /// with an INTEGER PRIMARY KEY alias. Lets the VDBE Insert conflict handler
+    /// report a rowid/IPK collision as `UNIQUE constraint failed: t.k` (matching
+    /// stock) instead of the bare `PRIMARY KEY constraint failed`.
+    ipk_label_by_root_page: Arc<HbHashMap<i32, String>>,
     column_default_sql_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
@@ -10780,6 +10790,8 @@ struct TableExecutionRuntimeInputs {
     rowid_alias_col_by_root_page: Arc<HbHashMap<i32, usize>>,
     table_column_count_by_root_page: Arc<HbHashMap<i32, usize>>,
     first_not_null_non_ipk_col_by_root_page: Arc<HbHashMap<i32, usize>>,
+    // bd-977wx: qualified "table.ipkcol" label keyed by root page (IPK tables).
+    ipk_label_by_root_page: Arc<HbHashMap<i32, String>>,
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
@@ -44455,6 +44467,7 @@ impl Connection {
             first_not_null_non_ipk_col_by_root_page: Arc::clone(
                 &metadata.first_not_null_non_ipk_col_by_root_page,
             ),
+            ipk_label_by_root_page: Arc::clone(&metadata.ipk_label_by_root_page),
             column_defaults_by_root_page: empty_column_defaults_arc(),
             index_desc_flags_by_root_page: Arc::clone(&metadata.index_desc_flags_by_root_page),
             index_collations_by_root_page: Arc::clone(&metadata.index_collations_by_root_page),
@@ -58503,6 +58516,7 @@ impl Connection {
             first_not_null_non_ipk_col_by_root_page: Arc::clone(
                 &metadata.first_not_null_non_ipk_col_by_root_page,
             ),
+            ipk_label_by_root_page: Arc::clone(&metadata.ipk_label_by_root_page),
             column_defaults_by_root_page,
             index_desc_flags_by_root_page: Arc::clone(&metadata.index_desc_flags_by_root_page),
             index_collations_by_root_page: Arc::clone(&metadata.index_collations_by_root_page),
@@ -58530,6 +58544,9 @@ impl Connection {
         let mut rowid_alias_col_by_root_page = HbHashMap::new();
         let mut table_column_count_by_root_page = HbHashMap::with_capacity(schema.len());
         let mut first_not_null_non_ipk_col_by_root_page = HbHashMap::with_capacity(schema.len());
+        // bd-977wx: "table.ipkcol" per root page, populated only for tables that
+        // have an INTEGER PRIMARY KEY alias column.
+        let mut ipk_label_by_root_page: HbHashMap<i32, String> = HbHashMap::new();
         let mut column_default_sql_by_root_page = HbHashMap::new();
         let index_count: usize = schema.iter().map(|table| table.indexes.len()).sum();
         let mut index_desc_flags_by_root_page = HbHashMap::with_capacity(index_count);
@@ -58553,6 +58570,12 @@ impl Connection {
                 .find(|(_, column)| !column.is_ipk && column.notnull)
             {
                 first_not_null_non_ipk_col_by_root_page.insert(table.root_page, col_idx);
+            }
+            // bd-977wx: record the qualified IPK label so a rowid/IPK collision
+            // is reported as `UNIQUE constraint failed: <table>.<ipk>`.
+            if let Some(ipk_column) = table.columns.iter().find(|column| column.is_ipk) {
+                ipk_label_by_root_page
+                    .insert(table.root_page, format!("{}.{}", table.name, ipk_column.name));
             }
             let column_default_sqls: Vec<Option<String>> = table
                 .columns
@@ -58635,6 +58658,7 @@ impl Connection {
         let table_column_count_by_root_page = Arc::new(table_column_count_by_root_page);
         let first_not_null_non_ipk_col_by_root_page =
             Arc::new(first_not_null_non_ipk_col_by_root_page);
+        let ipk_label_by_root_page = Arc::new(ipk_label_by_root_page);
         let column_default_sql_by_root_page = Arc::new(column_default_sql_by_root_page);
         let index_desc_flags_by_root_page = Arc::new(index_desc_flags_by_root_page);
         let index_collations_by_root_page = Arc::new(index_collations_by_root_page);
@@ -58648,6 +58672,7 @@ impl Connection {
                 first_not_null_non_ipk_col_by_root_page: Arc::clone(
                     &first_not_null_non_ipk_col_by_root_page,
                 ),
+                ipk_label_by_root_page: Arc::clone(&ipk_label_by_root_page),
                 column_defaults_by_root_page: empty_column_defaults_arc(),
                 index_desc_flags_by_root_page: Arc::clone(&index_desc_flags_by_root_page),
                 index_collations_by_root_page: Arc::clone(&index_collations_by_root_page),
@@ -58660,6 +58685,7 @@ impl Connection {
             rowid_alias_col_by_root_page,
             table_column_count_by_root_page,
             first_not_null_non_ipk_col_by_root_page,
+            ipk_label_by_root_page,
             column_default_sql_by_root_page,
             index_desc_flags_by_root_page,
             index_collations_by_root_page,
@@ -89607,6 +89633,7 @@ impl Connection {
             runtime_inputs.rowid_alias_col_by_root_page,
             runtime_inputs.table_column_count_by_root_page,
             runtime_inputs.first_not_null_non_ipk_col_by_root_page,
+            runtime_inputs.ipk_label_by_root_page,
             runtime_inputs.column_defaults_by_root_page,
             runtime_inputs.index_desc_flags_by_root_page,
             runtime_inputs.index_collations_by_root_page,
@@ -124562,6 +124589,7 @@ async fn execute_table_program_with_db(
     rowid_alias_col_by_root_page: Arc<HbHashMap<i32, usize>>,
     table_column_count_by_root_page: Arc<HbHashMap<i32, usize>>,
     first_not_null_non_ipk_col_by_root_page: Arc<HbHashMap<i32, usize>>,
+    ipk_label_by_root_page: Arc<HbHashMap<i32, String>>,
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
@@ -124643,6 +124671,7 @@ async fn execute_table_program_with_db(
         rowid_alias_col_by_root_page,
         table_column_count_by_root_page,
         first_not_null_non_ipk_col_by_root_page,
+        ipk_label_by_root_page,
         column_defaults_by_root_page,
         index_desc_flags_by_root_page,
         index_collations_by_root_page,
@@ -124830,6 +124859,7 @@ async fn execute_table_program_exactly_one_row_with_db(
     rowid_alias_col_by_root_page: Arc<HbHashMap<i32, usize>>,
     table_column_count_by_root_page: Arc<HbHashMap<i32, usize>>,
     first_not_null_non_ipk_col_by_root_page: Arc<HbHashMap<i32, usize>>,
+    ipk_label_by_root_page: Arc<HbHashMap<i32, String>>,
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
@@ -124898,6 +124928,7 @@ async fn execute_table_program_exactly_one_row_with_db(
         rowid_alias_col_by_root_page,
         table_column_count_by_root_page,
         first_not_null_non_ipk_col_by_root_page,
+        ipk_label_by_root_page,
         column_defaults_by_root_page,
         index_desc_flags_by_root_page,
         index_collations_by_root_page,
