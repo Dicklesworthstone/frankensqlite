@@ -232,9 +232,9 @@ fn render_markdown(report: &Report) -> String {
         } else {
             format!("{:.2}x (slower)", c.speedup)
         };
-        let _ = write!(
+        let _ = writeln!(
             md,
-            "| {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} |",
             c.group,
             format_ns(c.csqlite_mean_ns),
             format_ns(c.frank_mean_ns),
@@ -247,9 +247,9 @@ fn render_markdown(report: &Report) -> String {
         md.push_str("| Benchmark | Function | Mean |\n");
         md.push_str("|-----------|----------|------|\n");
         for u in &report.unpaired {
-            let _ = write!(
+            let _ = writeln!(
                 md,
-                "| {} | {} | {} |\n",
+                "| {} | {} | {} |",
                 u.group,
                 u.function,
                 format_ns(u.mean_ns),
@@ -303,12 +303,12 @@ fn main() {
     }
 
     // Also check CARGO_TARGET_DIR env for non-standard target dirs.
-    if !criterion_dir.is_dir() {
-        if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
-            let alt = PathBuf::from(target).join("criterion");
-            if alt.is_dir() {
-                criterion_dir = alt;
-            }
+    if !criterion_dir.is_dir()
+        && let Ok(target) = std::env::var("CARGO_TARGET_DIR")
+    {
+        let alt = PathBuf::from(target).join("criterion");
+        if alt.is_dir() {
+            criterion_dir = alt;
         }
     }
 
