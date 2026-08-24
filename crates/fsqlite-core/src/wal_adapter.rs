@@ -4932,6 +4932,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gh346_exact_certificate_db_size_must_match_commit_marker() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let committed_page = sample_page(0x49);
+        let mut certificate = sample_certificate(1, 1, vec![1]);
+        certificate.db_size_pages = 9;
+        certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &committed_page, 5);
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            .expect("persist internally inconsistent certificate fixture");
+        backend
+            .append_frame(&cx, 1, &committed_page, 5)
+            .expect("append commit marker covered by fixture digest");
+        backend.sync(&cx).expect("sync commit marker");
+
+        let error = backend
+            .current_parallel_wal_db_size_floor(&cx)
+            .expect_err("certificate and commit-marker size mismatch must fail closed");
+        assert!(
+            matches!(
+                error,
+                FrankenError::WalCorrupt { ref detail }
+                    if detail.contains("certificate db_size 9")
+                        && detail.contains("commit marker db_size 5")
+            ),
+            "unexpected mismatch error: {error}"
+        );
+    }
+
     struct AuthoritativeWalSnapshot {
         generation: WalGenerationIdentity,
         frame_count: usize,
