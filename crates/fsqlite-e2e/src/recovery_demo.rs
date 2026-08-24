@@ -27,6 +27,7 @@ use fsqlite_wal::{
     WalFecRecoveryLog, WalFecRecoveryOutcome, WalFrameCandidate, WalSalts, append_wal_fec_group,
     build_source_page_hashes, ensure_wal_with_fec_sidecar, generate_wal_fec_repair_symbols,
     recover_wal_fec_group_with_config, recover_wal_fec_group_with_decoder, wal_fec_path_for_wal,
+    wal_fec_raptorq_decode,
 };
 
 /// Configuration for a WAL-FEC recovery demo run (bd-1w6k.2.5).
@@ -184,7 +185,6 @@ pub fn build_wal_fec_sidecar(
 pub fn attempt_wal_fec_recovery_with_config(
     wal_path: &Path,
     info: &WalInfo,
-    original_pages: Vec<Vec<u8>>,
     corrupted_frames: &[u32],
     config: &RecoveryDemoConfig,
 ) -> Result<(WalFecRecoveryOutcome, WalFecRecoveryLog)> {
@@ -237,14 +237,11 @@ pub fn attempt_wal_fec_recovery_with_config(
         first_corrupt,
         &candidates,
         &wal_fec_config,
-        move |meta, symbols| {
-            if symbols.len() < usize::try_from(meta.k_source).expect("k_source fits usize") {
-                return Err(FrankenError::WalCorrupt {
-                    detail: "insufficient symbols for decode".to_owned(),
-                });
-            }
-            Ok(original_pages.clone())
-        },
+        // Real RaptorQ decode (bd-kyba9 W1): the harness no longer feeds back
+        // pre-corruption ground truth. The runner independently verifies the
+        // decoded pages against the originals, so this exercises the actual
+        // decoder end-to-end.
+        wal_fec_raptorq_decode,
     )
 }
 
@@ -252,7 +249,6 @@ pub fn attempt_wal_fec_recovery_with_config(
 pub fn attempt_wal_fec_recovery(
     wal_path: &Path,
     info: &WalInfo,
-    original_pages: Vec<Vec<u8>>,
     corrupted_frames: &[u32],
 ) -> Result<WalFecRecoveryOutcome> {
     let sidecar_path = wal_fec_path_for_wal(wal_path);
@@ -300,14 +296,8 @@ pub fn attempt_wal_fec_recovery(
         info.salts,
         first_corrupt,
         &candidates,
-        move |meta, symbols| {
-            if symbols.len() < usize::try_from(meta.k_source).expect("k_source fits usize") {
-                return Err(FrankenError::WalCorrupt {
-                    detail: "insufficient symbols for decode".to_owned(),
-                });
-            }
-            Ok(original_pages.clone())
-        },
+        // Real RaptorQ decode (bd-kyba9 W1) — see `attempt_wal_fec_recovery_with_config`.
+        wal_fec_raptorq_decode,
     )
 }
 
@@ -520,13 +510,8 @@ mod tests {
             .expect("inject corruption");
 
         // Attempt WAL-FEC recovery.
-        let outcome = attempt_wal_fec_recovery(
-            &wal_path,
-            &info,
-            original_pages.clone(),
-            &corrupted_frame_nos,
-        )
-        .expect("recovery should execute");
+        let outcome = attempt_wal_fec_recovery(&wal_path, &info, &corrupted_frame_nos)
+            .expect("recovery should execute");
 
         match outcome {
             WalFecRecoveryOutcome::Recovered(ref group) => {
@@ -580,7 +565,7 @@ mod tests {
             .expect("inject massive corruption");
 
         // Use a failing decoder — too many frames are corrupted.
-        let outcome = attempt_wal_fec_recovery(&wal_path, &info, original_pages, &all_frames)
+        let outcome = attempt_wal_fec_recovery(&wal_path, &info, &all_frames)
             .expect("recovery should execute without panic");
 
         // With all frames corrupted, should fall back to truncation.
@@ -618,8 +603,7 @@ mod tests {
             .expect("inject corruption");
 
         // Step 4: WAL-FEC recovery.
-        let outcome = attempt_wal_fec_recovery(&wal_path, &info, original_pages, &corrupted)
-            .expect("recovery");
+        let outcome = attempt_wal_fec_recovery(&wal_path, &info, &corrupted).expect("recovery");
 
         let result = RecoveryDemoResult {
             rows_inserted: expected_rows.len(),
@@ -666,14 +650,9 @@ mod tests {
             recovery_enabled: false,
             repair_symbols: 4,
         };
-        let (outcome, log) = attempt_wal_fec_recovery_with_config(
-            &wal_path,
-            &info,
-            original_pages,
-            &corrupted,
-            &config,
-        )
-        .expect("should execute without panic");
+        let (outcome, log) =
+            attempt_wal_fec_recovery_with_config(&wal_path, &info, &corrupted, &config)
+                .expect("should execute without panic");
 
         assert!(
             matches!(outcome, WalFecRecoveryOutcome::TruncateBeforeGroup { .. }),
@@ -712,14 +691,9 @@ mod tests {
             recovery_enabled: true,
             repair_symbols: 4,
         };
-        let (outcome, log) = attempt_wal_fec_recovery_with_config(
-            &wal_path,
-            &info,
-            original_pages,
-            &corrupted,
-            &config,
-        )
-        .expect("should execute");
+        let (outcome, log) =
+            attempt_wal_fec_recovery_with_config(&wal_path, &info, &corrupted, &config)
+                .expect("should execute");
 
         assert!(
             matches!(outcome, WalFecRecoveryOutcome::Recovered(_)),

@@ -1408,11 +1408,18 @@ pub unsafe extern "C" fn sqlite3_bind_text(
     n: c_int,
     xdel: SqliteDestructor,
 ) -> c_int {
+    // Stock SQLite invokes a real destructor even when the bind FAILS: its
+    // `bindText` runs `xDel(zData)` whenever `vdbeUnbind` returns non-OK (null /
+    // not-ready stmt → SQLITE_MISUSE, out-of-range index → SQLITE_RANGE). Match
+    // that so a caller's heap-backed buffer is not leaked on a failed bind
+    // (bd-3745a). STATIC/TRANSIENT sentinels are no-ops inside the helper.
     if stmt.is_null() {
+        run_bind_destructor(xdel, text.cast());
         return SQLITE_MISUSE;
     }
     // Validate the index before touching the caller's buffer, matching SQLite.
     if binding_slot_index(stmt, index).is_none() {
+        run_bind_destructor(xdel, text.cast());
         return SQLITE_RANGE;
     }
     let value = if text.is_null() {
@@ -1447,16 +1454,22 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
     n: c_int,
     xdel: SqliteDestructor,
 ) -> c_int {
+    // See `sqlite3_bind_text`: dispose of a real destructor on the failing bind
+    // paths so heap-backed blobs are not leaked (bd-3745a).
     if stmt.is_null() {
+        run_bind_destructor(xdel, data);
         return SQLITE_MISUSE;
     }
     if binding_slot_index(stmt, index).is_none() {
+        run_bind_destructor(xdel, data);
         return SQLITE_RANGE;
     }
     let value = if data.is_null() {
         SqliteValue::Null
     } else {
         if n < 0 {
+            // Negative length is an API-armor misuse; stock rejects it up front
+            // (before the bind machinery) and does not invoke the destructor.
             return SQLITE_MISUSE;
         }
         let bytes = std::slice::from_raw_parts(data.cast::<u8>(), n as usize);
@@ -3287,6 +3300,58 @@ mod tests {
                 SQLITE_OK
             );
             assert_eq!(CALLS.load(Ordering::Relaxed), 1, "TRANSIENT must not call");
+
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_bind_destructor_invoked_on_error_paths() {
+        // bd-3745a: stock SQLite disposes of a real destructor even when the
+        // bind fails (out-of-range index → SQLITE_RANGE, null/misused stmt →
+        // SQLITE_MISUSE). A heap-backed buffer must not leak on a failed bind.
+        unsafe {
+            static CALLS: AtomicUsize = AtomicUsize::new(0);
+            unsafe extern "C" fn dtor(_ptr: *mut c_void) {
+                CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let db = open_memory();
+            let stmt = prepare(db, "SELECT ?;"); // one parameter (index 1)
+            let text = CString::new("leak-me").unwrap();
+            let blob = [1_u8, 2, 3, 4];
+
+            // Out-of-range index: RANGE, destructor still runs.
+            assert_eq!(
+                sqlite3_bind_text(stmt, 2, text.as_ptr(), -1, Some(dtor)),
+                SQLITE_RANGE
+            );
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                sqlite3_bind_blob(stmt, 2, blob.as_ptr().cast(), 4, Some(dtor)),
+                SQLITE_RANGE
+            );
+            assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+
+            // Null statement: MISUSE, destructor still runs.
+            assert_eq!(
+                sqlite3_bind_text(ptr::null_mut(), 1, text.as_ptr(), -1, Some(dtor)),
+                SQLITE_MISUSE
+            );
+            assert_eq!(CALLS.load(Ordering::Relaxed), 3);
+            assert_eq!(
+                sqlite3_bind_blob(ptr::null_mut(), 1, blob.as_ptr().cast(), 4, Some(dtor)),
+                SQLITE_MISUSE
+            );
+            assert_eq!(CALLS.load(Ordering::Relaxed), 4);
+
+            // The STATIC (None) sentinel is still a no-op on failure.
+            assert_eq!(
+                sqlite3_bind_text(stmt, 2, text.as_ptr(), -1, None),
+                SQLITE_RANGE
+            );
+            assert_eq!(CALLS.load(Ordering::Relaxed), 4, "STATIC must not call");
 
             sqlite3_finalize(stmt);
             sqlite3_close(db);

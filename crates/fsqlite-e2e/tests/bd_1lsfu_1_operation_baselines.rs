@@ -15,7 +15,8 @@ use fsqlite_core::connection::{
 use fsqlite_e2e::baseline::{
     BaselineReport, BenchmarkRecoveryMeasurement, BenchmarkRecoveryProbeId,
     DEFAULT_REGRESSION_THRESHOLD, LatencyStats, Operation, OperationBaseline, RegressionResult,
-    evaluate_bd_wwqen_in_subquery_recovery, measure_operation, render_benchmark_recovery_markdown,
+    RegressionStatus, evaluate_bd_wwqen_in_subquery_recovery, measure_operation,
+    render_benchmark_recovery_markdown,
 };
 use fsqlite_types::SqliteValue;
 use std::sync::{Mutex, OnceLock};
@@ -155,8 +156,10 @@ fn regression_check_missing_operation_in_current() {
 
     let current = BaselineReport::new("test");
     let results = old.check_regression(&current, DEFAULT_REGRESSION_THRESHOLD);
-    // Missing operation = no comparison = no regression.
-    assert!(results.is_empty());
+    assert_eq!(results.len(), 1, "missing evidence must not disappear");
+    assert_eq!(results[0].status, RegressionStatus::Missing);
+    assert!(results[0].blocks_acceptance());
+    assert!(results[0].summary().contains("current report is missing"));
 }
 
 #[test]
@@ -183,8 +186,9 @@ fn regression_check_exact_match() {
 
     let results = old.check_regression(&current, DEFAULT_REGRESSION_THRESHOLD);
     assert_eq!(results.len(), 1);
-    assert!(!results[0].regressed);
-    assert!((results[0].change_pct).abs() < 0.01);
+    assert_eq!(results[0].status, RegressionStatus::Ok);
+    assert!(!results[0].blocks_acceptance());
+    assert!(results[0].change_pct.unwrap().abs() < 0.01);
 }
 
 #[test]
@@ -192,10 +196,11 @@ fn regression_result_summary_contains_key_info() {
     let result = RegressionResult {
         operation: Operation::BatchInsert,
         engine: "frankensqlite".to_owned(),
-        baseline_p50_micros: 1000,
-        current_p50_micros: 1200,
-        change_pct: 20.0,
-        regressed: true,
+        baseline_p50_micros: Some(1000),
+        current_p50_micros: Some(1200),
+        change_pct: Some(20.0),
+        status: RegressionStatus::Regression,
+        reason: None,
     };
     let summary = result.summary();
     assert!(summary.contains("REGRESSION"));
@@ -604,7 +609,7 @@ fn capture_all_nine_baselines_frankensqlite() {
         let results = report.check_regression(&parsed, DEFAULT_REGRESSION_THRESHOLD);
         for r in &results {
             assert!(
-                !r.regressed,
+                !r.blocks_acceptance(),
                 "self-comparison should not regress: {}",
                 r.summary()
             );

@@ -128,19 +128,24 @@ fn lcc7b_inline_unique_plus_named_unique_index_then_add_column() {
                 "REPRO: autoindex vanished after 2nd ADD COLUMN"
             );
 
-            eprintln!("integrity_check (in-conn): {}", integrity(&conn).await);
+            let integrity = integrity(&conn).await;
+            eprintln!("integrity_check (in-conn): {integrity}");
+            assert_eq!(integrity, "ok", "integrity_check failed before close");
             conn.close().await.unwrap();
         }
         // Reopen: this is where the field DB failed ("missing implicit autoindex slot 1").
         let conn = Connection::open(&p).await.unwrap();
         let master = dump_master(&conn, "after REOPEN").await;
-        eprintln!("integrity_check (reopen): {}", integrity(&conn).await);
+        let integrity = integrity(&conn).await;
+        eprintln!("integrity_check (reopen): {integrity}");
+        assert_eq!(integrity, "ok", "integrity_check failed after reopen");
         assert!(
             master
                 .iter()
                 .any(|(t, n, _)| t == "index" && n == "sqlite_autoindex_conversations_1"),
             "REPRO: sqlite_autoindex_conversations_1 missing after reopen"
         );
+        conn.close().await.unwrap();
     });
 }
 
@@ -349,17 +354,22 @@ fn lcc7b_cass_v5_rebuild_then_provenance_index_then_add_columns() {
                 dump_master(&conn, &format!("after {col}")).await;
                 assert!(ok, "REPRO: autoindex master row vanished after `{col}`");
             }
-            eprintln!("integrity_check (in-conn): {}", integrity(&conn).await);
+            let integrity = integrity(&conn).await;
+            eprintln!("integrity_check (in-conn): {integrity}");
+            assert_eq!(integrity, "ok", "integrity_check failed before close");
             conn.close().await.unwrap();
         }
         let conn = Connection::open(&p).await.unwrap();
         let master = dump_master(&conn, "after REOPEN").await;
-        eprintln!("integrity_check (reopen): {}", integrity(&conn).await);
+        let integrity = integrity(&conn).await;
+        eprintln!("integrity_check (reopen): {integrity}");
+        assert_eq!(integrity, "ok", "integrity_check failed after reopen");
         assert!(
             master
                 .iter()
                 .any(|(t, n, _)| t == "index" && n == "sqlite_autoindex_conversations_1"),
             "REPRO: sqlite_autoindex_conversations_1 missing after reopen (cass V5 path)"
         );
+        conn.close().await.unwrap();
     });
 }

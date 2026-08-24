@@ -330,13 +330,8 @@ fn run_wal_corruption_recovery(scenario: &CorruptionScenario, dir: &Path) -> Rec
         repair_symbols: scenario.setup_repair_symbols,
     };
 
-    let recovery_result = attempt_wal_fec_recovery_with_config(
-        &wal_path,
-        &info,
-        original_pages.clone(),
-        &corrupted_frames,
-        &config,
-    );
+    let recovery_result =
+        attempt_wal_fec_recovery_with_config(&wal_path, &info, &corrupted_frames, &config);
 
     match recovery_result {
         Ok((outcome, log)) => classify_wal_outcome(
