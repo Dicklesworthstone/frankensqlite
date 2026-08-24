@@ -9843,7 +9843,7 @@ fn group_publication_page_one_freelist_header(
 /// after it. Fail closed so the owner retries and re-promotes.
 fn nonpublication_page_one_freelist_header_differs(
     batches: &[TransactionFrameBatch],
-    expected: &[u8; 8],
+    expected: [u8; 8],
 ) -> bool {
     for batch in batches {
         if batch.published_durable_freelist.is_some() {
@@ -20951,7 +20951,7 @@ where
                                                 );
                                             }
                                             nonpublication_page_one_freelist_header_differs(
-                                                &batches, &header,
+                                                &batches, header,
                                             )
                                         } else {
                                             let durable_page_one = read_durable_page_under_gate(
@@ -40207,7 +40207,7 @@ mod tests {
         // publication header — the erasure hazard — and the LAST page-1 frame
         // (the grow) would publish count=0, dropping the freed pages.
         assert!(
-            nonpublication_page_one_freelist_header_differs(&batches, &header),
+            nonpublication_page_one_freelist_header_differs(&batches, header),
             "pre-promote: grow batch still carries the erasing (0,0) header"
         );
         assert_eq!(
@@ -40227,7 +40227,7 @@ mod tests {
         // and the last page-1 frame (whatever the order) now publishes count=2 —
         // the freed pages stay durably on the freelist.
         assert!(
-            !nonpublication_page_one_freelist_header_differs(&batches, &header),
+            !nonpublication_page_one_freelist_header_differs(&batches, header),
             "post-promote: grow batch carries the publication header"
         );
         assert_eq!(
