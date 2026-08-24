@@ -13794,6 +13794,11 @@ impl Connection {
         pager: PagerBackend,
         storage_was_empty: bool,
     ) -> Result<Self> {
+        // bd-zywqc.11.1: bring up the Prometheus `/metrics` HTTP endpoint from
+        // `FRANKENSQLITE_METRICS_BIND` the first time any connection opens.
+        // Idempotent (binds at most once per process) and a no-op when metrics
+        // are disabled or the env var is unset, so it is safe on every open.
+        fsqlite_observability::metrics_net::autostart_from_env();
         let attach_env = env.clone();
         let pager_is_memory = pager.is_memory();
         let file_identity = if pager_is_memory {
@@ -52658,6 +52663,10 @@ impl Connection {
         }
         if started {
             self.note_connection_transaction_started();
+            // bd-zywqc.11.1: every transaction is born a reader; a later
+            // `txn_metrics_note_write` reclassifies it to a writer on first
+            // write. Balanced by the decrement in `txn_metrics_mark_finished`.
+            fsqlite_observability::metrics::global().active_readers.inc();
         }
     }
 
@@ -52672,12 +52681,23 @@ impl Connection {
     }
 
     fn txn_metrics_note_write(&self) {
-        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
-        if metrics.active_started_at.is_some() {
-            metrics.active_write_ops = metrics.active_write_ops.saturating_add(1);
-            if metrics.active_first_write_at.is_none() {
-                metrics.active_first_write_at = Some(Instant::now());
+        let mut first_write = false;
+        {
+            let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+            if metrics.active_started_at.is_some() {
+                metrics.active_write_ops = metrics.active_write_ops.saturating_add(1);
+                if metrics.active_first_write_at.is_none() {
+                    metrics.active_first_write_at = Some(Instant::now());
+                    first_write = true;
+                }
             }
+        }
+        if first_write {
+            // bd-zywqc.11.1: first write of this transaction — reclassify it from
+            // reader to writer for the active-{readers,writers} gauges.
+            let m = fsqlite_observability::metrics::global();
+            m.active_readers.dec();
+            m.active_writers.inc();
         }
     }
 
@@ -52697,11 +52717,16 @@ impl Connection {
     }
 
     fn txn_metrics_mark_finished(&self) {
+        let was_writer;
         {
             let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
             let Some(started_at) = metrics.active_started_at.take() else {
                 return;
             };
+            // bd-zywqc.11.1: capture the reader/writer class BEFORE the counters
+            // are reset below, so the active-gauge decrement matches the
+            // increment side (reader at start, flipped to writer on first write).
+            was_writer = metrics.active_write_ops > 0;
 
             let elapsed_ms_u128 = started_at.elapsed().as_millis();
             let elapsed_ms = u64::try_from(elapsed_ms_u128).unwrap_or(u64::MAX);
@@ -52719,6 +52744,13 @@ impl Connection {
             metrics.active_write_ops = 0;
             metrics.active_savepoint_depth = 0;
             metrics.active_rollbacks = 0;
+        }
+        // bd-zywqc.11.1: balance the active-gauge increment from this txn's start.
+        let m = fsqlite_observability::metrics::global();
+        if was_writer {
+            m.active_writers.dec();
+        } else {
+            m.active_readers.dec();
         }
         self.note_connection_transaction_finished();
     }
@@ -53850,7 +53882,15 @@ impl Connection {
 
         let mut gc_todo = self.gc_todo.borrow_mut();
         if let Some(version_store) = self.version_store.get() {
-            version_store.gc_tick(&mut gc_todo, horizon)
+            let result = version_store.gc_tick(&mut gc_todo, horizon);
+            // bd-zywqc.11.1: count a version-sweeper clear only when the pass
+            // actually reclaimed something (an empty tick is not a clear event).
+            if result.versions_freed > 0 || result.pages_pruned > 0 {
+                fsqlite_observability::metrics::global()
+                    .sweeper_clears_total
+                    .inc();
+            }
+            result
         } else {
             GcTickResult {
                 pages_pruned: 0,
@@ -68087,6 +68127,14 @@ impl Connection {
             Err((err, fcw_result)) => {
                 let error = Self::map_mvcc_commit_error(err, fcw_result);
                 record_concurrent_commit_plan_error(&error);
+                // bd-zywqc.11.1: a concurrent-commit-plan conflict on the CORE
+                // (engine) path — surfaced to the caller as a busy-snapshot
+                // retry. The `rebased` resolution does not occur on this path
+                // (it exists only in the lifecycle.rs MVCC engine), so it is
+                // counted there; here every conflict is a busy_snapshot.
+                fsqlite_observability::metrics::global()
+                    .conflicts_busy_snapshot_total
+                    .inc();
                 if let Some(shared_handle) = registry.remove(session_id) {
                     {
                         let mut handle = shared_handle.lock();
@@ -68200,6 +68248,9 @@ impl Connection {
                 "cannot commit - no transaction is active".to_owned(),
             ));
         }
+        // bd-zywqc.11.1: start of the real commit work; end-to-end commit latency
+        // is recorded on the success path only via commit_duration_seconds.
+        let commit_span_start = Instant::now();
         // AAC-P6: txn boundary — the micro-batch epoch ends at COMMIT.
         self.stmt_microbatch_flush();
         self.discard_cached_vdbe_engine();
@@ -68625,6 +68676,17 @@ impl Connection {
         };
 
         // Commit succeeded; now consume and drop the handle.
+        // bd-zywqc.11.1: exactly one commit is counted here per successful COMMIT
+        // — the busy-retry and in-doubt loops resolved above and any failure
+        // returned Err earlier (NotCommitted arm), so this never double-counts on
+        // retry or counts a rollback. The end-to-end latency is recorded on this
+        // success path only.
+        {
+            let m = fsqlite_observability::metrics::global();
+            m.commits_total.inc();
+            m.commit_duration_seconds
+                .observe(commit_span_start.elapsed().as_secs_f64());
+        }
         let finalize_post_publish_start = hot_path_profile_enabled().then(Instant::now);
         let commit_handle_finalize_start = hot_path_profile_enabled().then(Instant::now);
         *self.active_txn.borrow_mut() = None;
@@ -68807,7 +68869,16 @@ impl Connection {
         // Tell execute_join_select to read from self.db (the historical
         // snapshot) instead of calling self.query() which goes through pager.
         let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
-        self.execute_join_select(&bound, None).await
+        // bd-zywqc.11.1: an AS-OF/historical snapshot is pinned for the duration
+        // of this query. Count the open once and hold the active-pin gauge up
+        // across the query, then release it (no early return sits between the
+        // inc and dec, so the gauge stays balanced on the Ok and Err paths).
+        let metrics = fsqlite_observability::metrics::global();
+        metrics.historical_snapshots_opened_total.inc();
+        metrics.historical_pins_active.inc();
+        let result = self.execute_join_select(&bound, None).await;
+        metrics.historical_pins_active.dec();
+        result
     }
 
     /// Handle ROLLBACK [TO SAVEPOINT name].
@@ -71864,6 +71935,40 @@ impl Connection {
             return Ok(vec![Row {
                 values: vec![SqliteValue::Integer(i64::from(
                     self.defer_foreign_keys.get(),
+                ))],
+            }]);
+        }
+
+        // bd-zywqc.11.1: `PRAGMA enable_metrics_http[=1|=<bind-addr>]` starts the
+        // process-wide Prometheus `/metrics` HTTP endpoint (a side effect, not
+        // stored connection state, so it is handled here rather than in the vdbe
+        // pragma-state layer). `=1`/true binds the env override or the default
+        // `localhost:9009`; a string value is used verbatim as the bind address;
+        // a falsy value is a no-op (the endpoint has no runtime unbind). The
+        // no-value query form reports whether the endpoint is currently bound.
+        if pragma_name == "enable_metrics_http" {
+            if let Some(value) = pragma.value.as_ref() {
+                let expr = match value {
+                    PragmaValue::Assign(expr) | PragmaValue::Call(expr) => expr,
+                };
+                let bind = match expr {
+                    Expr::Literal(Literal::String(addr), _) => addr.clone(),
+                    _ => {
+                        if parse_pragma_bool(value)? {
+                            fsqlite_observability::metrics_net::default_bind()
+                        } else {
+                            return Ok(Vec::new());
+                        }
+                    }
+                };
+                // A bind failure must never fail the PRAGMA (a metrics endpoint
+                // never takes down the engine); it is swallowed like autostart.
+                let _ = fsqlite_observability::metrics_net::ensure_metrics_http(&bind);
+                return Ok(Vec::new());
+            }
+            return Ok(vec![Row {
+                values: vec![SqliteValue::Integer(i64::from(
+                    fsqlite_observability::metrics_net::metrics_http_bound(),
                 ))],
             }]);
         }
@@ -90099,6 +90204,11 @@ impl Connection {
         *self.schema_cookie.borrow_mut() = new_cookie;
         self.schema_generation
             .set(self.schema_generation.get().wrapping_add(1));
+        // bd-zywqc.11.1: a DDL just advanced the schema epoch (cookie + generation
+        // both moved above); count the bump on this success path.
+        fsqlite_observability::metrics::global()
+            .schema_epoch_bumps_total
+            .inc();
         // Same-connection DDL: advance the local DDL epoch so prepared
         // statements captured before this change re-prepare transparently
         // (GH #239). Cross-connection reloads bump schema_generation but never

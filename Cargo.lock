@@ -1510,6 +1510,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "fsqlite-error",
+ "fsqlite-observability",
  "fsqlite-types",
  "fsqlite-vfs",
  "parking_lot",
