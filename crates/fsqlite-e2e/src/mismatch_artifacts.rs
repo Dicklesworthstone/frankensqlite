@@ -92,6 +92,10 @@ pub struct BundleMetadata {
     pub achieved_tier: Option<String>,
     /// Human-readable mismatch detail.
     pub mismatch_detail: String,
+    /// SHA-256 of the standalone sqlite3 database file, if authoritative.
+    pub sqlite3_raw_sha256: Option<String>,
+    /// SHA-256 of the standalone FrankenSQLite database file, if authoritative.
+    pub fsqlite_raw_sha256: Option<String>,
     /// SHA-256 of sqlite3 canonical output, if computed.
     pub sqlite3_canonical_sha256: Option<String>,
     /// SHA-256 of fsqlite canonical output, if computed.
@@ -185,8 +189,31 @@ pub struct PragmaDiff {
 pub fn bundle_dir_name(cell: &CellResult) -> String {
     format!(
         "{}__{}__c{}__s{}",
-        cell.fixture_id, cell.preset_name, cell.concurrency, cell.seed
+        escape_bundle_component(&cell.fixture_id),
+        escape_bundle_component(&cell.preset_name),
+        cell.concurrency,
+        cell.seed
     )
+}
+
+fn escape_bundle_component(component: &str) -> String {
+    use std::fmt::Write as _;
+
+    if component.is_empty() {
+        return "_00".to_owned();
+    }
+
+    let mut escaped = String::with_capacity(component.len());
+    for byte in component.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            escaped.push(char::from(byte));
+        } else {
+            // Writing into a String is infallible. Percent signs are escaped
+            // too, so this byte encoding cannot collide with literal input.
+            let _ = write!(escaped, "%{byte:02X}");
+        }
+    }
+    escaped
 }
 
 /// Generate and write a mismatch artifact bundle to disk.
@@ -225,7 +252,7 @@ pub fn write_mismatch_bundle(
     };
 
     let metadata = BundleMetadata {
-        schema_version: "fsqlite-e2e.mismatch_bundle.v1".to_owned(),
+        schema_version: "fsqlite-e2e.mismatch_bundle.v2".to_owned(),
         fixture_id: cell.fixture_id.clone(),
         golden_sha256,
         preset_name: cell.preset_name.clone(),
@@ -235,14 +262,24 @@ pub fn write_mismatch_bundle(
         expected_tier,
         achieved_tier,
         mismatch_detail,
+        sqlite3_raw_sha256: cell
+            .tiered_comparison
+            .as_ref()
+            .filter(|tc| tc.raw_match.is_some())
+            .and_then(|tc| tc.raw_sha256_a.clone()),
+        fsqlite_raw_sha256: cell
+            .tiered_comparison
+            .as_ref()
+            .filter(|tc| tc.raw_match.is_some())
+            .and_then(|tc| tc.raw_sha256_b.clone()),
         sqlite3_canonical_sha256: cell
             .tiered_comparison
             .as_ref()
-            .and_then(|tc| tc.sha256_a.clone()),
+            .and_then(|tc| tc.canonical_sha256_a.clone()),
         fsqlite_canonical_sha256: cell
             .tiered_comparison
             .as_ref()
-            .and_then(|tc| tc.sha256_b.clone()),
+            .and_then(|tc| tc.canonical_sha256_b.clone()),
         wall_time_ms: cell.wall_time_ms,
     };
 
@@ -643,6 +680,16 @@ fn render_repro_md(meta: &BundleMetadata, bundle_name: &str) -> String {
     let _ = writeln!(md, "cat reports/mismatches/{bundle_name}/pragma_diff.txt");
     md.push_str("```\n");
 
+    if meta.sqlite3_raw_sha256.is_some() || meta.fsqlite_raw_sha256.is_some() {
+        md.push_str("\n## Raw Standalone Hashes\n\n");
+        if let Some(ref sha) = meta.sqlite3_raw_sha256 {
+            let _ = writeln!(md, "- sqlite3: `{sha}`");
+        }
+        if let Some(ref sha) = meta.fsqlite_raw_sha256 {
+            let _ = writeln!(md, "- fsqlite: `{sha}`");
+        }
+    }
+
     if meta.sqlite3_canonical_sha256.is_some() || meta.fsqlite_canonical_sha256.is_some() {
         md.push_str("\n## Canonical Hashes\n\n");
         if let Some(ref sha) = meta.sqlite3_canonical_sha256 {
@@ -849,6 +896,16 @@ mod tests {
             bundle_dir_name(&cell),
             "chinook__hot_page_contention__c4__s42"
         );
+
+        let mut malicious = cell;
+        malicious.fixture_id = "/../../fixture_name".to_owned();
+        malicious.preset_name = "..\\preset/name".to_owned();
+        let dir_name = bundle_dir_name(&malicious);
+        assert!(!dir_name.contains('/'));
+        assert!(!dir_name.contains('\\'));
+        assert!(dir_name.starts_with("%2F..%2F..%2Ffixture_name__"));
+        assert_ne!(escape_bundle_component("%2F"), escape_bundle_component("/"));
+        assert_eq!(std::path::Path::new(&dir_name).components().count(), 1);
     }
 
     #[test]
@@ -929,7 +986,7 @@ mod tests {
     #[test]
     fn test_render_repro_md() {
         let meta = BundleMetadata {
-            schema_version: "fsqlite-e2e.mismatch_bundle.v1".to_owned(),
+            schema_version: "fsqlite-e2e.mismatch_bundle.v2".to_owned(),
             fixture_id: "chinook".to_owned(),
             golden_sha256: Some("abc123".to_owned()),
             preset_name: "hot_page_contention".to_owned(),
@@ -946,6 +1003,8 @@ mod tests {
             expected_tier: "Tier1Raw".to_owned(),
             achieved_tier: Some("Tier 2: Logical Match".to_owned()),
             mismatch_detail: "canonical SHA-256 differs".to_owned(),
+            sqlite3_raw_sha256: Some("raw_a".to_owned()),
+            fsqlite_raw_sha256: Some("raw_b".to_owned()),
             sqlite3_canonical_sha256: Some("sha_a".to_owned()),
             fsqlite_canonical_sha256: Some("sha_b".to_owned()),
             wall_time_ms: 250,
@@ -957,6 +1016,7 @@ mod tests {
         assert!(md.contains("--concurrency 4"));
         assert!(md.contains("abc123"));
         assert!(md.contains("journal_mode = wal"));
+        assert!(md.contains("raw_a"));
         assert!(md.contains("sha_a"));
         assert!(md.contains("sha_b"));
     }
@@ -1011,11 +1071,14 @@ mod tests {
             fsqlite_report: None,
             tiered_comparison: Some(TieredComparisonResult {
                 tier: crate::canonicalize::ComparisonTier::LogicalMatch,
-                sha256_a: Some("aaa".to_owned()),
-                sha256_b: Some("bbb".to_owned()),
-                byte_match: false,
+                raw_sha256_a: Some("raw-a".to_owned()),
+                raw_sha256_b: Some("raw-b".to_owned()),
+                raw_match: Some(false),
+                canonical_sha256_a: Some("aaa".to_owned()),
+                canonical_sha256_b: Some("bbb".to_owned()),
+                canonical_match: false,
                 logical_match: false,
-                row_counts_match: true,
+                data_complete: true,
                 detail: "row mismatch".to_owned(),
             }),
             verdict: CellVerdict::Mismatch {

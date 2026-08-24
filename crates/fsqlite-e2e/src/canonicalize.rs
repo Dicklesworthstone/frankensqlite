@@ -10,14 +10,16 @@
 //! 3. `VACUUM INTO <canonical_path>` to produce a defragmented, single-file copy
 //! 4. SHA-256 hash the canonical file
 //!
-//! ## Three-Tier Comparison (bd-1opl)
+//! ## Layered Comparison (bd-1opl, bd-sfzqn)
 //!
-//! For cross-engine comparison, three tiers with automatic fallback:
+//! For cross-engine comparison, independent evidence is recorded for:
 //!
-//! - **Tier 1 (`ByteIdentical`):** VACUUM INTO both databases, compare SHA-256.
-//! - **Tier 2 (`LogicalMatch`):** Row-level comparison via `SELECT * ORDER BY rowid`.
-//! - **Tier 3 (`DataComplete`):** Row counts + spot checks + integrity check.
+//! - raw database-file SHA-256;
+//! - canonical `VACUUM INTO` SHA-256;
+//! - type-preserving row-level equality;
+//! - weaker row-count, spot-check, and integrity evidence.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -84,7 +86,7 @@ pub fn canonicalize(source: &Path, output_path: &Path) -> E2eResult<CanonicalRes
         .to_str()
         .ok_or_else(|| E2eError::Io(std::io::Error::other("output path is not valid UTF-8")))?;
 
-    conn.execute_batch(&format!("VACUUM INTO '{output_str}';"))?;
+    conn.execute("VACUUM INTO ?1", [output_str])?;
     drop(conn);
 
     // Compute SHA-256 of the canonical file.
@@ -149,20 +151,23 @@ fn sha256_hex(data: &[u8]) -> String {
 /// Which comparison tier produced the result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComparisonTier {
-    /// Tier 1: SHA-256 of VACUUM INTO output matches byte-for-byte.
-    ByteIdentical,
-    /// Tier 2: Row-level logical comparison matches across all tables.
+    /// Original standalone database files have identical SHA-256 digests.
+    RawIdentical,
+    /// SHA-256 of canonical `VACUUM INTO` output matches byte-for-byte.
+    CanonicalMatch,
+    /// Row-level logical comparison matches across all tables.
     LogicalMatch,
-    /// Tier 3: Row counts and spot-check rows match; minimum bar.
+    /// Row counts and spot-check rows match; weaker than logical equality.
     DataComplete,
 }
 
 impl std::fmt::Display for ComparisonTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ByteIdentical => write!(f, "Tier 1: Byte-Identical (SHA-256)"),
-            Self::LogicalMatch => write!(f, "Tier 2: Logical Match (row-level)"),
-            Self::DataComplete => write!(f, "Tier 3: Data Complete (counts + spot checks)"),
+            Self::RawIdentical => write!(f, "Raw Identical (standalone file SHA-256)"),
+            Self::CanonicalMatch => write!(f, "Canonical Match (VACUUM INTO SHA-256)"),
+            Self::LogicalMatch => write!(f, "Logical Match (typed row-level)"),
+            Self::DataComplete => write!(f, "Data Complete (counts + spot checks)"),
         }
     }
 }
@@ -172,55 +177,169 @@ impl std::fmt::Display for ComparisonTier {
 pub struct TieredComparisonResult {
     /// The highest tier that matched.
     pub tier: ComparisonTier,
-    /// SHA-256 of the first database (after VACUUM INTO), if Tier 1 was attempted.
-    pub sha256_a: Option<String>,
-    /// SHA-256 of the second database (after VACUUM INTO), if Tier 1 was attempted.
-    pub sha256_b: Option<String>,
-    /// Whether Tier 1 (byte-identical) matched.
-    pub byte_match: bool,
-    /// Whether Tier 2 (logical row-level) matched.
+    /// SHA-256 of the first raw database file.
+    pub raw_sha256_a: Option<String>,
+    /// SHA-256 of the second raw database file.
+    pub raw_sha256_b: Option<String>,
+    /// Whether the original database files matched byte-for-byte.
+    pub raw_match: Option<bool>,
+    /// SHA-256 of the first canonical `VACUUM INTO` database, when attempted.
+    pub canonical_sha256_a: Option<String>,
+    /// SHA-256 of the second canonical `VACUUM INTO` database, when attempted.
+    pub canonical_sha256_b: Option<String>,
+    /// Whether canonical database files matched.
+    pub canonical_match: bool,
+    /// Whether the type-preserving logical row comparison matched.
     pub logical_match: bool,
-    /// Whether Tier 3 (row counts) matched.
-    pub row_counts_match: bool,
+    /// Whether weaker row-count, spot-check, and integrity evidence matched.
+    pub data_complete: bool,
     /// Human-readable description of how the result was determined.
     pub detail: String,
 }
 
-/// Compare two on-disk databases using the three-tier fallback strategy.
+/// Compare two on-disk databases using independent, layered evidence.
 ///
-/// Attempts Tier 1 (VACUUM INTO + SHA-256) first.  If that fails (e.g.
-/// VACUUM INTO not supported by one engine), falls back to Tier 2 (logical
-/// row-level comparison).  If Tier 2 fails, falls back to Tier 3 (row
-/// counts + spot checks + integrity check).
+/// Raw file hashes are always recorded. The comparator then attempts canonical
+/// `VACUUM INTO` hashes, type-preserving logical rows, and finally weaker data
+/// completeness checks. A mismatch at one layer continues to the next so the
+/// result describes the strongest authority that actually matched.
 ///
 /// Both paths are opened via rusqlite (read-only) so this works for any
 /// SQLite-compatible database file, regardless of which engine produced it.
 ///
 /// # Errors
 ///
-/// Returns `E2eError` on I/O or database errors that prevent even Tier 3.
+/// Returns `E2eError` on I/O or database errors that prevent even the final
+/// data-completeness comparison.
 pub fn canonicalize_and_compare(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
-    // --- Tier 1: VACUUM INTO + SHA-256 ---
-    match try_tier1(db_a, db_b) {
-        Ok(result) => return Ok(result),
-        Err(e) => {
-            tracing::info!(error = %e, "Tier 1 (VACUUM INTO) failed, falling back to Tier 2");
-        }
-    }
+    let raw_sha256_a = file_sha256(db_a)?;
+    let raw_sha256_b = file_sha256(db_b)?;
+    let raw_match = if raw_file_is_standalone(db_a)? && raw_file_is_standalone(db_b)? {
+        Some(raw_sha256_a == raw_sha256_b)
+    } else {
+        None
+    };
 
-    // --- Tier 2: Logical row-level comparison ---
-    match try_tier2(db_a, db_b) {
-        Ok(result) => return Ok(result),
-        Err(e) => {
-            tracing::info!(error = %e, "Tier 2 (logical) failed, falling back to Tier 3");
+    // --- Canonical VACUUM INTO + SHA-256 ---
+    let canonical_attempt = match try_tier1(db_a, db_b) {
+        Ok(result) if result.canonical_match => {
+            return Ok(with_raw_evidence(
+                result,
+                raw_sha256_a,
+                raw_sha256_b,
+                raw_match,
+            ));
         }
-    }
+        Ok(result) => Some(result),
+        Err(e) => {
+            tracing::info!(error = %e, "canonical comparison failed, falling back to logical comparison");
+            None
+        }
+    };
 
-    // --- Tier 3: Data completeness ---
-    try_tier3(db_a, db_b)
+    // --- Type-preserving logical row-level comparison ---
+    let logical_attempt = match try_tier2(db_a, db_b) {
+        Ok(mut result) => {
+            carry_canonical_evidence(&mut result, canonical_attempt.as_ref());
+            if result.logical_match {
+                return Ok(with_raw_evidence(
+                    result,
+                    raw_sha256_a,
+                    raw_sha256_b,
+                    raw_match,
+                ));
+            }
+            Some(result)
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "logical comparison failed, falling back to data-completeness checks");
+            None
+        }
+    };
+
+    // --- Weaker data-completeness evidence ---
+    let mut result = try_tier3(db_a, db_b)?;
+    carry_canonical_evidence(&mut result, canonical_attempt.as_ref());
+    if let Some(logical) = logical_attempt {
+        result.logical_match = logical.logical_match;
+        result.detail = format!("{}; {}", logical.detail, result.detail);
+    }
+    Ok(with_raw_evidence(
+        result,
+        raw_sha256_a,
+        raw_sha256_b,
+        raw_match,
+    ))
 }
 
-/// Tier 1: VACUUM INTO both databases, compare SHA-256 hashes.
+fn file_sha256(path: &Path) -> E2eResult<String> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
+fn raw_file_is_standalone(path: &Path) -> E2eResult<bool> {
+    for suffix in ["-wal", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        match std::fs::metadata(PathBuf::from(sidecar)) {
+            Ok(metadata) if metadata.len() > 0 => return Ok(false),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(true)
+}
+
+fn with_raw_evidence(
+    mut result: TieredComparisonResult,
+    raw_sha256_a: String,
+    raw_sha256_b: String,
+    raw_match: Option<bool>,
+) -> TieredComparisonResult {
+    result.raw_match = raw_match;
+    result.raw_sha256_a = Some(raw_sha256_a);
+    result.raw_sha256_b = Some(raw_sha256_b);
+    if raw_match == Some(true) {
+        result.tier = ComparisonTier::RawIdentical;
+        result.detail = format!("Raw PASS: standalone file SHA-256 match; {}", result.detail);
+    }
+    result
+}
+
+fn carry_canonical_evidence(
+    result: &mut TieredComparisonResult,
+    canonical_attempt: Option<&TieredComparisonResult>,
+) {
+    if let Some(canonical) = canonical_attempt {
+        result
+            .canonical_sha256_a
+            .clone_from(&canonical.canonical_sha256_a);
+        result
+            .canonical_sha256_b
+            .clone_from(&canonical.canonical_sha256_b);
+        result.canonical_match = canonical.canonical_match;
+    }
+}
+
+/// Canonical layer: VACUUM INTO both databases, compare SHA-256 hashes.
 fn try_tier1(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
     let tmp_dir = tempfile::TempDir::new()?;
     let out_a = tmp_dir.path().join("canonical_a.db");
@@ -229,20 +348,23 @@ fn try_tier1(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
     let result_a = canonicalize(db_a, &out_a)?;
     let result_b = canonicalize(db_b, &out_b)?;
 
-    let byte_match = result_a.sha256 == result_b.sha256;
+    let canonical_match = result_a.sha256 == result_b.sha256;
 
     Ok(TieredComparisonResult {
-        tier: ComparisonTier::ByteIdentical,
-        sha256_a: Some(result_a.sha256.clone()),
-        sha256_b: Some(result_b.sha256.clone()),
-        byte_match,
-        logical_match: byte_match,
-        row_counts_match: byte_match,
-        detail: if byte_match {
-            format!("Tier 1 PASS: SHA-256 match ({})", &result_a.sha256[..16])
+        tier: ComparisonTier::CanonicalMatch,
+        raw_sha256_a: None,
+        raw_sha256_b: None,
+        raw_match: None,
+        canonical_sha256_a: Some(result_a.sha256.clone()),
+        canonical_sha256_b: Some(result_b.sha256.clone()),
+        canonical_match,
+        logical_match: false,
+        data_complete: false,
+        detail: if canonical_match {
+            format!("Canonical PASS: SHA-256 match ({})", &result_a.sha256[..16])
         } else {
             format!(
-                "Tier 1 FAIL: SHA-256 mismatch (a={}, b={})",
+                "Canonical FAIL: SHA-256 mismatch (a={}, b={})",
                 &result_a.sha256[..16],
                 &result_b.sha256[..16]
             )
@@ -268,72 +390,91 @@ fn list_user_tables(conn: &rusqlite::Connection) -> E2eResult<Vec<String>> {
     Ok(names)
 }
 
-/// Get schema SQL for all user tables, sorted by name.
-fn schema_sql(conn: &rusqlite::Connection) -> E2eResult<Vec<(String, String)>> {
+/// Get the full user-defined schema catalog in deterministic order.
+fn schema_sql(conn: &rusqlite::Connection) -> E2eResult<Vec<(String, String, String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        "SELECT type, name, tbl_name, sql
+         FROM sqlite_master
+         WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
+         ORDER BY type, name",
     )?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get::<_, String>(1)?)))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-/// Get row count for a table.
-fn row_count(conn: &rusqlite::Connection, table: &str) -> E2eResult<i64> {
-    let count: i64 = conn.query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |r| {
-        r.get(0)
-    })?;
-    Ok(count)
-}
-
-/// Fetch all rows from a table, sorted by rowid (or first column as fallback).
-fn fetch_all_rows_sorted(conn: &rusqlite::Connection, table: &str) -> E2eResult<Vec<Vec<String>>> {
-    let sql = format!("SELECT * FROM \"{table}\" ORDER BY rowid");
-    let fallback_sql = format!("SELECT * FROM \"{table}\" ORDER BY 1");
-
-    let sql_to_use = if conn.prepare(&sql).is_ok() {
-        sql
-    } else {
-        fallback_sql
-    };
-
-    let mut stmt = conn.prepare(&sql_to_use)?;
-    let col_count = stmt.column_count();
-    let rows: Vec<Vec<String>> = stmt
+    let rows = stmt
         .query_map([], |row| {
-            let mut vals = Vec::with_capacity(col_count);
-            for i in 0..col_count {
-                let v: rusqlite::types::Value = row.get(i).unwrap_or(rusqlite::types::Value::Null);
-                vals.push(format_value(&v));
-            }
-            Ok(vals)
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
-/// Format a rusqlite value as a deterministic string for comparison.
-fn format_value(v: &rusqlite::types::Value) -> String {
-    match v {
-        rusqlite::types::Value::Null => "NULL".to_owned(),
-        rusqlite::types::Value::Integer(i) => i.to_string(),
-        rusqlite::types::Value::Real(f) => format!("{f}"),
-        rusqlite::types::Value::Text(s) => s.clone(),
-        rusqlite::types::Value::Blob(b) => {
-            use std::fmt::Write as _;
-            let mut hex = String::with_capacity(b.len() * 2 + 2);
-            hex.push_str("X'");
-            for byte in b {
-                let _ = write!(hex, "{byte:02X}");
-            }
-            hex.push('\'');
-            hex
-        }
+fn quoted_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// Get row count for a table.
+fn row_count(conn: &rusqlite::Connection, table: &str) -> E2eResult<i64> {
+    let table = quoted_identifier(table);
+    let count: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+    Ok(count)
+}
+
+fn storage_class_rank(value: &rusqlite::types::Value) -> u8 {
+    match value {
+        rusqlite::types::Value::Null => 0,
+        rusqlite::types::Value::Integer(_) => 1,
+        rusqlite::types::Value::Real(_) => 2,
+        rusqlite::types::Value::Text(_) => 3,
+        rusqlite::types::Value::Blob(_) => 4,
     }
 }
 
-/// Tier 2: Logical row-level comparison across all tables.
+fn compare_values(left: &rusqlite::types::Value, right: &rusqlite::types::Value) -> Ordering {
+    match (left, right) {
+        (rusqlite::types::Value::Null, rusqlite::types::Value::Null) => Ordering::Equal,
+        (rusqlite::types::Value::Integer(left), rusqlite::types::Value::Integer(right)) => {
+            left.cmp(right)
+        }
+        (rusqlite::types::Value::Real(left), rusqlite::types::Value::Real(right)) => {
+            left.total_cmp(right)
+        }
+        (rusqlite::types::Value::Text(left), rusqlite::types::Value::Text(right)) => {
+            left.cmp(right)
+        }
+        (rusqlite::types::Value::Blob(left), rusqlite::types::Value::Blob(right)) => {
+            left.cmp(right)
+        }
+        _ => storage_class_rank(left).cmp(&storage_class_rank(right)),
+    }
+}
+
+fn compare_rows(left: &[rusqlite::types::Value], right: &[rusqlite::types::Value]) -> Ordering {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| compare_values(left, right))
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
+}
+
+/// Fetch every row and sort the typed values independently of physical rowids.
+fn fetch_all_rows_sorted(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> E2eResult<Vec<Vec<rusqlite::types::Value>>> {
+    let mut stmt = conn.prepare(&format!("SELECT * FROM {}", quoted_identifier(table)))?;
+    let col_count = stmt.column_count();
+    let mut rows: Vec<Vec<rusqlite::types::Value>> = stmt
+        .query_map([], |row| {
+            let mut vals = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                vals.push(row.get(i)?);
+            }
+            Ok(vals)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.sort_by(|left, right| compare_rows(left, right));
+    Ok(rows)
+}
+
+/// Logical layer: type-preserving row comparison across all tables.
 fn try_tier2(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
     let conn_a = open_readonly(db_a)?;
     let conn_b = open_readonly(db_b)?;
@@ -345,12 +486,15 @@ fn try_tier2(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
     if schema_a != schema_b {
         return Ok(TieredComparisonResult {
             tier: ComparisonTier::LogicalMatch,
-            sha256_a: None,
-            sha256_b: None,
-            byte_match: false,
+            raw_sha256_a: None,
+            raw_sha256_b: None,
+            raw_match: None,
+            canonical_sha256_a: None,
+            canonical_sha256_b: None,
+            canonical_match: false,
             logical_match: false,
-            row_counts_match: false,
-            detail: "Tier 2 FAIL: schema mismatch".to_owned(),
+            data_complete: false,
+            detail: "Logical FAIL: schema mismatch".to_owned(),
         });
     }
 
@@ -364,13 +508,16 @@ fn try_tier2(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
         if rows_a != rows_b {
             return Ok(TieredComparisonResult {
                 tier: ComparisonTier::LogicalMatch,
-                sha256_a: None,
-                sha256_b: None,
-                byte_match: false,
+                raw_sha256_a: None,
+                raw_sha256_b: None,
+                raw_match: None,
+                canonical_sha256_a: None,
+                canonical_sha256_b: None,
+                canonical_match: false,
                 logical_match: false,
-                row_counts_match: rows_a.len() == rows_b.len(),
+                data_complete: false,
                 detail: format!(
-                    "Tier 2 FAIL: row mismatch in table \"{table}\" (a={} rows, b={} rows)",
+                    "Logical FAIL: row mismatch in table \"{table}\" (a={} rows, b={} rows)",
                     rows_a.len(),
                     rows_b.len()
                 ),
@@ -380,19 +527,22 @@ fn try_tier2(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
 
     Ok(TieredComparisonResult {
         tier: ComparisonTier::LogicalMatch,
-        sha256_a: None,
-        sha256_b: None,
-        byte_match: false,
+        raw_sha256_a: None,
+        raw_sha256_b: None,
+        raw_match: None,
+        canonical_sha256_a: None,
+        canonical_sha256_b: None,
+        canonical_match: false,
         logical_match: true,
-        row_counts_match: true,
+        data_complete: false,
         detail: format!(
-            "Tier 2 PASS: all {} table(s) match row-by-row",
+            "Logical PASS: all {} table(s) match row-by-row",
             tables.len()
         ),
     })
 }
 
-/// Tier 3: Data completeness — row counts, spot checks, integrity check.
+/// Data-completeness layer: row counts, spot checks, and integrity checks.
 fn try_tier3(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
     let conn_a = open_readonly(db_a)?;
     let conn_b = open_readonly(db_b)?;
@@ -404,15 +554,15 @@ fn try_tier3(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
     if tables_a != tables_b {
         return Ok(TieredComparisonResult {
             tier: ComparisonTier::DataComplete,
-            sha256_a: None,
-            sha256_b: None,
-            byte_match: false,
+            raw_sha256_a: None,
+            raw_sha256_b: None,
+            raw_match: None,
+            canonical_sha256_a: None,
+            canonical_sha256_b: None,
+            canonical_match: false,
             logical_match: false,
-            row_counts_match: false,
-            detail: format!(
-                "Tier 3 FAIL: table list mismatch (a={:?}, b={:?})",
-                tables_a, tables_b
-            ),
+            data_complete: false,
+            detail: format!("Data FAIL: table list mismatch (a={tables_a:?}, b={tables_b:?})"),
         });
     }
 
@@ -435,12 +585,15 @@ fn try_tier3(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
     if !all_counts_match {
         return Ok(TieredComparisonResult {
             tier: ComparisonTier::DataComplete,
-            sha256_a: None,
-            sha256_b: None,
-            byte_match: false,
+            raw_sha256_a: None,
+            raw_sha256_b: None,
+            raw_match: None,
+            canonical_sha256_a: None,
+            canonical_sha256_b: None,
+            canonical_match: false,
             logical_match: false,
-            row_counts_match: false,
-            detail: format!("Tier 3 FAIL: {}", detail_parts.join("; ")),
+            data_complete: false,
+            detail: format!("Data FAIL: {}", detail_parts.join("; ")),
         });
     }
 
@@ -482,22 +635,25 @@ fn try_tier3(db_a: &Path, db_b: &Path) -> E2eResult<TieredComparisonResult> {
         ));
     }
 
-    let row_counts_match = all_counts_match && spot_checks_pass && integrity_ok;
+    let data_complete = all_counts_match && spot_checks_pass && integrity_ok;
 
     Ok(TieredComparisonResult {
         tier: ComparisonTier::DataComplete,
-        sha256_a: None,
-        sha256_b: None,
-        byte_match: false,
+        raw_sha256_a: None,
+        raw_sha256_b: None,
+        raw_match: None,
+        canonical_sha256_a: None,
+        canonical_sha256_b: None,
+        canonical_match: false,
         logical_match: false,
-        row_counts_match,
-        detail: if row_counts_match {
+        data_complete,
+        detail: if data_complete {
             format!(
-                "Tier 3 PASS: {} table(s), counts match, spot checks pass, integrity ok",
+                "Data PASS: {} table(s), counts match, spot checks pass, integrity ok",
                 tables_a.len()
             )
         } else {
-            format!("Tier 3 FAIL: {}", detail_parts.join("; "))
+            format!("Data FAIL: {}", detail_parts.join("; "))
         },
     })
 }
@@ -508,24 +664,23 @@ fn spot_check_rows(
     table: &str,
     order: &str,
     limit: usize,
-) -> E2eResult<Vec<Vec<String>>> {
-    let sql = format!("SELECT * FROM \"{table}\" ORDER BY rowid {order} LIMIT {limit}");
-    let fallback = format!("SELECT * FROM \"{table}\" ORDER BY 1 {order} LIMIT {limit}");
+) -> E2eResult<Vec<Vec<rusqlite::types::Value>>> {
+    let table = quoted_identifier(table);
+    let col_count = conn
+        .prepare(&format!("SELECT * FROM {table}"))?
+        .column_count();
+    let ordering = (1..=col_count)
+        .map(|position| format!("{position} {order}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT * FROM {table} ORDER BY {ordering} LIMIT {limit}");
 
-    let sql_to_use = if conn.prepare(&sql).is_ok() {
-        sql
-    } else {
-        fallback
-    };
-
-    let mut stmt = conn.prepare(&sql_to_use)?;
-    let col_count = stmt.column_count();
-    let rows: Vec<Vec<String>> = stmt
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<Vec<rusqlite::types::Value>> = stmt
         .query_map([], |row| {
             let mut vals = Vec::with_capacity(col_count);
             for i in 0..col_count {
-                let v: rusqlite::types::Value = row.get(i).unwrap_or(rusqlite::types::Value::Null);
-                vals.push(format_value(&v));
+                vals.push(row.get(i)?);
             }
             Ok(vals)
         })?
@@ -661,6 +816,21 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_accepts_quote_in_output_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("source.db");
+        let output = tmp.path().join("canonical'copy.db");
+        create_db(
+            &source,
+            "CREATE TABLE t(v TEXT); INSERT INTO t VALUES ('ok');",
+        );
+
+        let result = canonicalize(&source, &output).unwrap();
+        assert_eq!(result.canonical_path, output);
+        assert!(output.is_file());
+    }
+
+    #[test]
     fn canonicalize_handles_wal_mode() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("wal_test.db");
@@ -690,7 +860,7 @@ mod tests {
         }
     }
 
-    // ─── Three-Tier Comparison Tests (bd-1opl) ──────────────────────────
+    // ─── Layered Comparison Tests (bd-1opl, bd-sfzqn) ───────────────────
 
     /// Helper: create a database at `path` and run `sql` inside it.
     fn create_db(path: &Path, sql: &str) {
@@ -700,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identical_databases_tier1_match() {
+    fn test_identical_databases_preserve_raw_and_canonical_evidence() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_a = tmp.path().join("a.db");
         let db_b = tmp.path().join("b.db");
@@ -713,12 +883,12 @@ mod tests {
         create_db(&db_b, sql);
 
         let result = canonicalize_and_compare(&db_a, &db_b).unwrap();
-        assert_eq!(result.tier, ComparisonTier::ByteIdentical);
-        assert!(result.byte_match);
-        assert!(result.logical_match);
-        assert!(result.row_counts_match);
-        assert!(result.sha256_a.is_some());
-        assert_eq!(result.sha256_a, result.sha256_b);
+        assert_eq!(result.tier, ComparisonTier::RawIdentical);
+        assert_eq!(result.raw_match, Some(true));
+        assert!(result.canonical_match);
+        assert!(result.raw_sha256_a.is_some());
+        assert_eq!(result.raw_sha256_a, result.raw_sha256_b);
+        assert_eq!(result.canonical_sha256_a, result.canonical_sha256_b);
     }
 
     #[test]
@@ -743,8 +913,47 @@ mod tests {
         );
 
         let result = canonicalize_and_compare(&db_a, &db_b).unwrap();
-        assert_eq!(result.tier, ComparisonTier::ByteIdentical);
-        assert!(result.byte_match);
+        assert_eq!(result.tier, ComparisonTier::CanonicalMatch);
+        assert!(result.canonical_match);
+    }
+
+    #[test]
+    fn canonical_match_does_not_claim_raw_file_equality() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_a = tmp.path().join("page-1024.db");
+        let db_b = tmp.path().join("page-4096.db");
+
+        create_db(
+            &db_a,
+            "PRAGMA page_size=1024;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t VALUES (1, 'same');",
+        );
+        create_db(
+            &db_b,
+            "PRAGMA page_size=4096;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t VALUES (1, 'same');",
+        );
+
+        let result = canonicalize_and_compare(&db_a, &db_b).unwrap();
+        assert_eq!(result.raw_match, Some(false));
+        assert!(result.canonical_match);
+        assert_ne!(result.raw_sha256_a, result.raw_sha256_b);
+        assert_eq!(result.canonical_sha256_a, result.canonical_sha256_b);
+    }
+
+    #[test]
+    fn nonempty_journal_sidecar_makes_raw_authority_unavailable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("sidecar.db");
+        create_db(&db, "CREATE TABLE t(id INTEGER PRIMARY KEY);");
+        assert!(raw_file_is_standalone(&db).unwrap());
+
+        let mut journal = db.as_os_str().to_owned();
+        journal.push("-journal");
+        std::fs::write(PathBuf::from(journal), [1_u8]).unwrap();
+        assert!(!raw_file_is_standalone(&db).unwrap());
     }
 
     #[test]
@@ -765,8 +974,8 @@ mod tests {
         create_db(&db_b, sql);
 
         let result = canonicalize_and_compare(&db_a, &db_b).unwrap();
-        assert_eq!(result.tier, ComparisonTier::ByteIdentical);
-        assert!(result.byte_match);
+        assert_eq!(result.tier, ComparisonTier::RawIdentical);
+        assert!(result.canonical_match);
     }
 
     #[test]
@@ -793,8 +1002,69 @@ mod tests {
         let result = try_tier2(&db_a, &db_b).unwrap();
         assert_eq!(result.tier, ComparisonTier::LogicalMatch);
         assert!(result.logical_match);
-        assert!(result.row_counts_match);
+        assert!(!result.data_complete);
         assert!(result.detail.contains("PASS"));
+    }
+
+    #[test]
+    fn logical_comparison_preserves_sqlite_storage_classes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_a = tmp.path().join("null.db");
+        let db_b = tmp.path().join("text.db");
+
+        create_db(&db_a, "CREATE TABLE t(v); INSERT INTO t VALUES (NULL);");
+        create_db(&db_b, "CREATE TABLE t(v); INSERT INTO t VALUES ('NULL');");
+
+        let result = try_tier2(&db_a, &db_b).unwrap();
+        assert!(!result.logical_match, "NULL must not equal text 'NULL'");
+        assert!(result.detail.contains("row mismatch"));
+    }
+
+    #[test]
+    fn logical_comparison_ignores_physical_rowid_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_a = tmp.path().join("forward.db");
+        let db_b = tmp.path().join("reverse.db");
+
+        create_db(
+            &db_a,
+            "CREATE TABLE t(v TEXT); INSERT INTO t VALUES ('a'), ('b');",
+        );
+        create_db(
+            &db_b,
+            "CREATE TABLE t(v TEXT); INSERT INTO t VALUES ('b'), ('a');",
+        );
+
+        let result = try_tier2(&db_a, &db_b).unwrap();
+        assert!(result.logical_match);
+    }
+
+    #[test]
+    fn logical_comparison_checks_non_table_schema_objects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_a = tmp.path().join("indexed.db");
+        let db_b = tmp.path().join("plain.db");
+
+        create_db(&db_a, "CREATE TABLE t(v TEXT); CREATE INDEX t_v ON t(v);");
+        create_db(&db_b, "CREATE TABLE t(v TEXT);");
+
+        let result = try_tier2(&db_a, &db_b).unwrap();
+        assert!(!result.logical_match);
+        assert!(result.detail.contains("schema mismatch"));
+    }
+
+    #[test]
+    fn logical_comparison_quotes_table_identifiers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_a = tmp.path().join("quoted-a.db");
+        let db_b = tmp.path().join("quoted-b.db");
+        let sql = "CREATE TABLE \"odd\"\"name\"(v TEXT); \
+                   INSERT INTO \"odd\"\"name\" VALUES ('ok');";
+        create_db(&db_a, sql);
+        create_db(&db_b, sql);
+
+        let result = try_tier2(&db_a, &db_b).unwrap();
+        assert!(result.logical_match);
     }
 
     #[test]
@@ -820,7 +1090,7 @@ mod tests {
 
         let result = try_tier3(&db_a, &db_b).unwrap();
         assert_eq!(result.tier, ComparisonTier::DataComplete);
-        assert!(result.row_counts_match);
+        assert!(result.data_complete);
         assert!(result.detail.contains("PASS"));
 
         // Now test a mismatch: different row counts.
@@ -832,7 +1102,7 @@ mod tests {
         );
 
         let mismatch = try_tier3(&db_a, &db_c).unwrap();
-        assert!(!mismatch.row_counts_match);
+        assert!(!mismatch.data_complete);
         assert!(mismatch.detail.contains("FAIL"));
     }
 
@@ -847,7 +1117,7 @@ mod tests {
         create_db(&db_b, "SELECT 1;");
 
         let result = canonicalize_and_compare(&db_a, &db_b).unwrap();
-        assert!(result.byte_match || result.logical_match || result.row_counts_match);
+        assert!(result.canonical_match || result.logical_match || result.data_complete);
 
         // Also test with matching empty tables.
         let db_c = tmp.path().join("c.db");
@@ -856,8 +1126,8 @@ mod tests {
         create_db(&db_d, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);");
 
         let result2 = canonicalize_and_compare(&db_c, &db_d).unwrap();
-        assert_eq!(result2.tier, ComparisonTier::ByteIdentical);
-        assert!(result2.byte_match);
+        assert_eq!(result2.tier, ComparisonTier::RawIdentical);
+        assert!(result2.canonical_match);
     }
 
     #[test]
@@ -873,8 +1143,8 @@ mod tests {
         create_db(&db_b, sql);
 
         let result = canonicalize_and_compare(&db_a, &db_b).unwrap();
-        assert_eq!(result.tier, ComparisonTier::ByteIdentical);
-        assert!(result.byte_match);
+        assert_eq!(result.tier, ComparisonTier::RawIdentical);
+        assert!(result.canonical_match);
     }
 
     #[test]
@@ -891,17 +1161,17 @@ mod tests {
         create_db(&db_a, sql);
         create_db(&db_b, sql);
 
-        // Tier 1: byte-identical should work.
+        // Canonical comparison should work.
         let result = canonicalize_and_compare(&db_a, &db_b).unwrap();
-        assert_eq!(result.tier, ComparisonTier::ByteIdentical);
-        assert!(result.byte_match);
+        assert_eq!(result.tier, ComparisonTier::RawIdentical);
+        assert!(result.canonical_match);
 
-        // Also verify Tier 2 handles NULLs correctly.
+        // Also verify logical comparison handles NULLs correctly.
         let tier2 = try_tier2(&db_a, &db_b).unwrap();
         assert!(tier2.logical_match);
 
-        // And Tier 3.
+        // And weaker data-completeness checks.
         let tier3 = try_tier3(&db_a, &db_b).unwrap();
-        assert!(tier3.row_counts_match);
+        assert!(tier3.data_complete);
     }
 }

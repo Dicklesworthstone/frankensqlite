@@ -210,14 +210,12 @@ fn generate_oplog(
 /// The tier hierarchy is Tier1Raw > Tier2Canonical > Tier3Logical.
 /// Achieving a *stronger* tier than expected is always a pass.
 fn tier_satisfies(expected: EquivalenceTier, comparison: &TieredComparisonResult) -> bool {
-    // A comparison result of ByteIdentical satisfies any expected tier.
-    // LogicalMatch satisfies Tier2 or Tier3.
-    // DataComplete satisfies Tier3 only.
+    let raw = comparison.raw_match == Some(true);
     match expected {
-        EquivalenceTier::Tier1Raw => comparison.byte_match,
-        EquivalenceTier::Tier2Canonical => comparison.byte_match || comparison.logical_match,
+        EquivalenceTier::Tier1Raw => raw,
+        EquivalenceTier::Tier2Canonical => raw || comparison.canonical_match,
         EquivalenceTier::Tier3Logical => {
-            comparison.byte_match || comparison.logical_match || comparison.row_counts_match
+            raw || comparison.canonical_match || comparison.logical_match
         }
     }
 }
@@ -752,12 +750,15 @@ mod tests {
     #[test]
     fn test_tier_satisfies_tier1() {
         let comp = TieredComparisonResult {
-            tier: ComparisonTier::ByteIdentical,
-            sha256_a: Some("abc".to_owned()),
-            sha256_b: Some("abc".to_owned()),
-            byte_match: true,
-            logical_match: true,
-            row_counts_match: true,
+            tier: ComparisonTier::RawIdentical,
+            raw_sha256_a: Some("abc".to_owned()),
+            raw_sha256_b: Some("abc".to_owned()),
+            raw_match: Some(true),
+            canonical_sha256_a: None,
+            canonical_sha256_b: None,
+            canonical_match: false,
+            logical_match: false,
+            data_complete: false,
             detail: "match".to_owned(),
         };
         assert!(tier_satisfies(EquivalenceTier::Tier1Raw, &comp));
@@ -768,13 +769,16 @@ mod tests {
     #[test]
     fn test_tier_satisfies_tier2_only() {
         let comp = TieredComparisonResult {
-            tier: ComparisonTier::LogicalMatch,
-            sha256_a: Some("abc".to_owned()),
-            sha256_b: Some("def".to_owned()),
-            byte_match: false,
-            logical_match: true,
-            row_counts_match: true,
-            detail: "logical match".to_owned(),
+            tier: ComparisonTier::CanonicalMatch,
+            raw_sha256_a: Some("abc".to_owned()),
+            raw_sha256_b: Some("def".to_owned()),
+            raw_match: Some(false),
+            canonical_sha256_a: Some("same".to_owned()),
+            canonical_sha256_b: Some("same".to_owned()),
+            canonical_match: true,
+            logical_match: false,
+            data_complete: false,
+            detail: "canonical match".to_owned(),
         };
         assert!(!tier_satisfies(EquivalenceTier::Tier1Raw, &comp));
         assert!(tier_satisfies(EquivalenceTier::Tier2Canonical, &comp));
@@ -782,19 +786,22 @@ mod tests {
     }
 
     #[test]
-    fn test_tier_satisfies_tier3_only() {
+    fn test_data_complete_does_not_satisfy_logical_requirement() {
         let comp = TieredComparisonResult {
             tier: ComparisonTier::DataComplete,
-            sha256_a: None,
-            sha256_b: None,
-            byte_match: false,
+            raw_sha256_a: None,
+            raw_sha256_b: None,
+            raw_match: None,
+            canonical_sha256_a: None,
+            canonical_sha256_b: None,
+            canonical_match: false,
             logical_match: false,
-            row_counts_match: true,
+            data_complete: true,
             detail: "counts match".to_owned(),
         };
         assert!(!tier_satisfies(EquivalenceTier::Tier1Raw, &comp));
         assert!(!tier_satisfies(EquivalenceTier::Tier2Canonical, &comp));
-        assert!(tier_satisfies(EquivalenceTier::Tier3Logical, &comp));
+        assert!(!tier_satisfies(EquivalenceTier::Tier3Logical, &comp));
     }
 
     #[test]
