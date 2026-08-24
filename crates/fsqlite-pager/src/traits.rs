@@ -492,6 +492,22 @@ pub trait WalBackend: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Return the durable database-size floor for the current committed WAL
+    /// horizon.
+    ///
+    /// An exact authorized certificate may supply the floor. If an external
+    /// SQLite writer appends a later commit without a certificate, that
+    /// commit's database-size marker supersedes the older certificate in
+    /// either direction, including a shrinking `VACUUM`. The older
+    /// certificate can remain valid solely as a writer-clock seed. Backends
+    /// without exact current-horizon proof must return `None`.
+    fn current_parallel_wal_db_size_floor<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+    ) -> WalFuture<'a, Option<u32>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Look up the latest version of a page in the current visible WAL snapshot.
     ///
     /// Implementations should prefer an authoritative per-generation lookup

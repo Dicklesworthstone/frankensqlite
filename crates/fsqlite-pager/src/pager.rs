@@ -17325,7 +17325,7 @@ where
         let hdr_padded = u64::from(header.sector_size).max(header_size);
         let ps = page_size.as_usize();
         let record_size = 4 + ps + 4;
-        let mut offset = hdr_padded;
+        let record_size_u64 = u64::try_from(record_size).expect("journal record size fits u64");
 
         if jrnl_size < hdr_padded {
             return Err(FrankenError::DatabaseCorrupt {
@@ -17336,60 +17336,218 @@ where
             });
         }
         let is_local_journal = local_journal_marker_present(cx, &jrnl_file, hdr_padded).await?;
-        let record_size_u64 = u64::try_from(record_size).expect("journal record size fits u64");
-        if header.page_count < 0 && (jrnl_size - hdr_padded) % record_size_u64 != 0 {
-            if is_local_journal {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "local hot journal has a partial trailing page record".to_owned(),
-                });
-            }
-            tracing::warn!(
-                journal = %journal_path.display(),
-                "refusing unsupported external rollback journal with a trailing section or master-journal payload"
-            );
-            return Err(FrankenError::Unsupported);
+
+        #[derive(Clone, Copy)]
+        struct JournalSection {
+            records_offset: u64,
+            page_count: u32,
+            nonce: u32,
         }
-        let page_count = if header.page_count < 0 {
-            header.compute_page_count_from_file_size(jrnl_size)
-        } else {
-            #[allow(clippy::cast_sign_loss)]
-            let c = header.page_count as u32;
-            c
-        };
-        let required_size = hdr_padded
-            .checked_add(
-                u64::from(page_count)
-                    .checked_mul(record_size_u64)
-                    .ok_or_else(|| FrankenError::OutOfRange {
-                        what: "rollback-journal record span".to_owned(),
-                        value: page_count.to_string(),
-                    })?,
-            )
-            .ok_or_else(|| FrankenError::OutOfRange {
-                what: "rollback-journal required length".to_owned(),
-                value: page_count.to_string(),
-            })?;
-        if jrnl_size < required_size {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "hot journal is truncated at {jrnl_size} bytes, expected {required_size}"
-                ),
-            });
-        }
-        if jrnl_size > required_size {
-            if is_local_journal {
+
+        // Discover every sector-aligned section before validating or applying
+        // a single pre-image. Stock SQLite may append a new header after a
+        // cache-spill sync; each section has its own checksum nonce and nRec.
+        // FrankenSQLite's own journals remain deliberately single-section, so
+        // any local-marker tail is corruption rather than an extension point.
+        let mut sections = Vec::new();
+        let mut section_header = header;
+        let mut section_header_offset = 0_u64;
+        loop {
+            if section_header.page_size != header.page_size
+                || section_header.sector_size != header.sector_size
+                || section_header.initial_db_size != header.initial_db_size
+            {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
-                        "local hot journal length is {jrnl_size} bytes, expected exactly {required_size}"
+                        "rollback-journal section at offset {section_header_offset} does not match the initial page size, sector size, and database size"
                     ),
                 });
             }
-            tracing::warn!(
-                journal = %journal_path.display(),
-                trailing_bytes = jrnl_size - required_size,
-                "refusing unsupported external rollback journal with additional sections or a master-journal payload"
-            );
-            return Err(FrankenError::Unsupported);
+
+            let records_offset = section_header_offset
+                .checked_add(hdr_padded)
+                .ok_or_else(|| FrankenError::OutOfRange {
+                    what: "rollback-journal section records offset".to_owned(),
+                    value: section_header_offset.to_string(),
+                })?;
+            if records_offset > jrnl_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "hot journal section at offset {section_header_offset} extends beyond {jrnl_size} bytes"
+                    ),
+                });
+            }
+
+            let page_count = if section_header.page_count < 0 {
+                if section_header_offset != 0 {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "only the initial rollback-journal header may use the -1 record-count sentinel"
+                            .to_owned(),
+                    });
+                }
+                let record_bytes = jrnl_size - records_offset;
+                if record_bytes % record_size_u64 != 0 {
+                    if is_local_journal {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: "local hot journal has a partial trailing page record"
+                                .to_owned(),
+                        });
+                    }
+                    tracing::warn!(
+                        journal = %journal_path.display(),
+                        "refusing unsupported external rollback journal with a trailer after a -1 record-count section"
+                    );
+                    return Err(FrankenError::Unsupported);
+                }
+                u32::try_from(record_bytes / record_size_u64).map_err(|_| {
+                    FrankenError::OutOfRange {
+                        what: "rollback-journal derived record count".to_owned(),
+                        value: (record_bytes / record_size_u64).to_string(),
+                    }
+                })?
+            } else {
+                #[allow(clippy::cast_sign_loss)]
+                let count = section_header.page_count as u32;
+                count
+            };
+            let records_end = records_offset
+                .checked_add(
+                    u64::from(page_count)
+                        .checked_mul(record_size_u64)
+                        .ok_or_else(|| FrankenError::OutOfRange {
+                            what: "rollback-journal section record span".to_owned(),
+                            value: page_count.to_string(),
+                        })?,
+                )
+                .ok_or_else(|| FrankenError::OutOfRange {
+                    what: "rollback-journal section end".to_owned(),
+                    value: page_count.to_string(),
+                })?;
+            if records_end > jrnl_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "hot journal is truncated at {jrnl_size} bytes, section at {section_header_offset} requires {records_end} bytes"
+                    ),
+                });
+            }
+            sections.push(JournalSection {
+                records_offset,
+                page_count,
+                nonce: section_header.nonce,
+            });
+
+            if records_end == jrnl_size || section_header.page_count < 0 {
+                break;
+            }
+            if is_local_journal {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "local hot journal length is {jrnl_size} bytes, expected exactly {records_end}"
+                    ),
+                });
+            }
+
+            let next_header_offset = records_end
+                .checked_add(hdr_padded - 1)
+                .ok_or_else(|| FrankenError::OutOfRange {
+                    what: "rollback-journal next section alignment".to_owned(),
+                    value: records_end.to_string(),
+                })?
+                / hdr_padded
+                * hdr_padded;
+            if next_header_offset > jrnl_size {
+                tracing::warn!(
+                    journal = %journal_path.display(),
+                    trailing_bytes = jrnl_size - records_end,
+                    "refusing unsupported external rollback journal with a partial aligned trailer"
+                );
+                return Err(FrankenError::Unsupported);
+            }
+            if next_header_offset > records_end {
+                let padding_len = usize::try_from(next_header_offset - records_end).map_err(|_| {
+                    FrankenError::OutOfRange {
+                        what: "rollback-journal inter-section padding".to_owned(),
+                        value: (next_header_offset - records_end).to_string(),
+                    }
+                })?;
+                let mut padding = vec![0_u8; padding_len];
+                let padding_read = jrnl_file.read(cx, &mut padding, records_end).await?;
+                if padding_read != padding_len || padding.iter().any(|&byte| byte != 0) {
+                    tracing::warn!(
+                        journal = %journal_path.display(),
+                        "refusing unsupported external rollback journal with nonzero inter-section padding"
+                    );
+                    return Err(FrankenError::Unsupported);
+                }
+                if next_header_offset == jrnl_size {
+                    break;
+                }
+            }
+
+            if jrnl_size - next_header_offset < header_size {
+                tracing::warn!(
+                    journal = %journal_path.display(),
+                    trailing_bytes = jrnl_size - next_header_offset,
+                    "refusing unsupported external rollback journal with a partial trailing section header"
+                );
+                return Err(FrankenError::Unsupported);
+            }
+            let mut next_header_bytes = vec![0_u8; crate::journal::JOURNAL_HEADER_SIZE];
+            let next_header_read = jrnl_file
+                .read(cx, &mut next_header_bytes, next_header_offset)
+                .await?;
+            if next_header_read != next_header_bytes.len() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "short rollback-journal section header read: got {next_header_read} of {} bytes",
+                        next_header_bytes.len()
+                    ),
+                });
+            }
+            section_header = match JournalHeader::decode(&next_header_bytes) {
+                Ok(next_header) => next_header,
+                Err(error) => {
+                    let mut trailer_offset = next_header_offset;
+                    let mut trailer_chunk = vec![0_u8; 64 * 1024];
+                    let mut all_zero = true;
+                    while trailer_offset < jrnl_size {
+                        let remaining = usize::try_from(jrnl_size - trailer_offset)
+                            .unwrap_or(usize::MAX);
+                        let chunk_len = remaining.min(trailer_chunk.len());
+                        let trailer_read = jrnl_file
+                            .read(cx, &mut trailer_chunk[..chunk_len], trailer_offset)
+                            .await?;
+                        if trailer_read != chunk_len {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "short rollback-journal trailer read: got {trailer_read} of {chunk_len} bytes"
+                                ),
+                            });
+                        }
+                        if trailer_chunk[..chunk_len].iter().any(|&byte| byte != 0) {
+                            all_zero = false;
+                            break;
+                        }
+                        trailer_offset = trailer_offset
+                            .checked_add(u64::try_from(chunk_len).expect("trailer chunk fits u64"))
+                            .ok_or_else(|| FrankenError::OutOfRange {
+                                what: "rollback-journal zero trailer scan".to_owned(),
+                                value: trailer_offset.to_string(),
+                            })?;
+                    }
+                    if all_zero {
+                        break;
+                    }
+                    tracing::warn!(
+                        journal = %journal_path.display(),
+                        offset = next_header_offset,
+                        %error,
+                        "refusing unsupported external rollback-journal trailer or super-journal payload"
+                    );
+                    return Err(FrankenError::Unsupported);
+                }
+            };
+            section_header_offset = next_header_offset;
         }
 
         // Validate the complete recovery surface before changing the first
@@ -17398,115 +17556,125 @@ where
         // The caller holds the database EXCLUSIVE lock throughout recovery,
         // so no legitimate SQLite writer can replace this journal between the
         // validation and application passes.
-        let mut validation_offset = hdr_padded;
         // Do not reserve from attacker-controlled nRec. Capacity grows only
         // after each record has been read, decoded, and checksum-validated.
         let mut validated_pages = HashSet::new();
-        for _ in 0..page_count {
-            let mut rec_buf = vec![0u8; record_size];
-            let bytes_read = jrnl_file.read(cx, &mut rec_buf, validation_offset).await?;
-            if bytes_read != record_size {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "short rollback-journal record during validation: got {bytes_read} of {record_size} bytes"
-                    ),
-                });
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let record = JournalPageRecord::decode(&rec_buf, ps as u32).map_err(|err| {
-                FrankenError::DatabaseCorrupt {
-                    detail: format!("invalid rollback-journal record: {err}"),
+        for section in &sections {
+            let mut validation_offset = section.records_offset;
+            for _ in 0..section.page_count {
+                let mut rec_buf = vec![0u8; record_size];
+                let bytes_read = jrnl_file.read(cx, &mut rec_buf, validation_offset).await?;
+                if bytes_read != record_size {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "short rollback-journal record during validation: got {bytes_read} of {record_size} bytes"
+                        ),
+                    });
                 }
-            })?;
-            record
-                .verify_checksum(header.nonce)
-                .map_err(|err| FrankenError::DatabaseCorrupt {
-                    detail: format!("rollback-journal checksum mismatch: {err}"),
+                #[allow(clippy::cast_possible_truncation)]
+                let record = JournalPageRecord::decode(&rec_buf, ps as u32).map_err(|err| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!("invalid rollback-journal record: {err}"),
+                    }
                 })?;
-            let page_no = PageNumber::new(record.page_number).ok_or_else(|| {
-                FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "hot journal contains invalid page number {}",
-                        record.page_number
-                    ),
+                record
+                    .verify_checksum(section.nonce)
+                    .map_err(|err| FrankenError::DatabaseCorrupt {
+                        detail: format!("rollback-journal checksum mismatch: {err}"),
+                    })?;
+                let page_no = PageNumber::new(record.page_number).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "hot journal contains invalid page number {}",
+                            record.page_number
+                        ),
+                    }
+                })?;
+                if page_no.get() == crate::journal::lock_byte_page(page_size) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "rollback journal contains the reserved lock-byte page".to_owned(),
+                    });
                 }
-            })?;
-            if page_no.get() == crate::journal::lock_byte_page(page_size) {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "rollback journal contains the reserved lock-byte page".to_owned(),
-                });
+                if page_no.get() > header.initial_db_size {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "rollback journal page {} exceeds its initial database size {}",
+                            page_no.get(),
+                            header.initial_db_size
+                        ),
+                    });
+                }
+                if !validated_pages.insert(page_no) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "rollback journal contains duplicate page record {}",
+                            page_no.get()
+                        ),
+                    });
+                }
+                validation_offset = validation_offset
+                    .checked_add(record_size_u64)
+                    .ok_or_else(|| FrankenError::OutOfRange {
+                        what: "rollback-journal validation offset".to_owned(),
+                        value: validation_offset.to_string(),
+                    })?;
             }
-            if page_no.get() > header.initial_db_size {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "rollback journal page {} exceeds its initial database size {}",
-                        page_no.get(),
-                        header.initial_db_size
-                    ),
-                });
-            }
-            if !validated_pages.insert(page_no) {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "rollback journal contains duplicate page record {}",
-                        page_no.get()
-                    ),
-                });
-            }
-            validation_offset = validation_offset
-                .checked_add(u64::try_from(record_size).expect("journal record size fits u64"))
-                .ok_or_else(|| FrankenError::OutOfRange {
-                    what: "rollback-journal validation offset".to_owned(),
-                    value: validation_offset.to_string(),
-                })?;
         }
 
-        for _ in 0..page_count {
-            let mut rec_buf = vec![0u8; record_size];
-            let bytes_read = jrnl_file.read(cx, &mut rec_buf, offset).await?;
-            if bytes_read < record_size {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "short rollback-journal record: got {bytes_read} of {record_size} bytes"
-                    ),
-                });
-            }
-
-            #[allow(clippy::cast_possible_truncation)]
-            let record = JournalPageRecord::decode(&rec_buf, ps as u32).map_err(|err| {
-                FrankenError::DatabaseCorrupt {
-                    detail: format!("invalid rollback-journal record: {err}"),
+        for section in &sections {
+            let mut offset = section.records_offset;
+            for _ in 0..section.page_count {
+                let mut rec_buf = vec![0u8; record_size];
+                let bytes_read = jrnl_file.read(cx, &mut rec_buf, offset).await?;
+                if bytes_read != record_size {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "short rollback-journal record: got {bytes_read} of {record_size} bytes"
+                        ),
+                    });
                 }
-            })?;
 
-            // Verify checksum before applying.
-            record
-                .verify_checksum(header.nonce)
-                .map_err(|err| FrankenError::DatabaseCorrupt {
-                    detail: format!("rollback-journal checksum mismatch: {err}"),
+                #[allow(clippy::cast_possible_truncation)]
+                let record = JournalPageRecord::decode(&rec_buf, ps as u32).map_err(|err| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!("invalid rollback-journal record: {err}"),
+                    }
                 })?;
 
-            // Write the pre-image back to the database file.
-            let Some(page_no) = PageNumber::new(record.page_number) else {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "hot journal contains invalid page number {}",
-                        record.page_number
-                    ),
-                });
-            };
-            if page_no.get() == crate::journal::lock_byte_page(page_size) {
-                // SQLite reserves this page number as the super-journal
-                // sentinel. It is never database content and must never be
-                // replayed over the process-lock byte range.
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "rollback journal contains the reserved lock-byte page".to_owned(),
-                });
-            }
-            let page_offset = u64::from(page_no.get() - 1) * ps as u64;
-            db_file.write(cx, &record.content, page_offset).await?;
+                // Verify checksum before applying.
+                record
+                    .verify_checksum(section.nonce)
+                    .map_err(|err| FrankenError::DatabaseCorrupt {
+                        detail: format!("rollback-journal checksum mismatch: {err}"),
+                    })?;
 
-            offset += record_size as u64;
+                // Write the pre-image back to the database file.
+                let Some(page_no) = PageNumber::new(record.page_number) else {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "hot journal contains invalid page number {}",
+                            record.page_number
+                        ),
+                    });
+                };
+                if page_no.get() == crate::journal::lock_byte_page(page_size) {
+                    // SQLite reserves this page number as the super-journal
+                    // sentinel. It is never database content and must never be
+                    // replayed over the process-lock byte range.
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "rollback journal contains the reserved lock-byte page".to_owned(),
+                    });
+                }
+                let page_offset = u64::from(page_no.get() - 1) * ps as u64;
+                db_file.write(cx, &record.content, page_offset).await?;
+
+                offset = offset.checked_add(record_size_u64).ok_or_else(|| {
+                    FrankenError::OutOfRange {
+                        what: "rollback-journal replay offset".to_owned(),
+                        value: offset.to_string(),
+                    }
+                })?;
+            }
         }
 
         // Sync the database after replaying.
@@ -17537,74 +17705,78 @@ where
                 });
             }
 
-            let mut verification_offset = hdr_padded;
             let mut restored_page = vec![0_u8; ps];
-            for _ in 0..page_count {
-                let mut rec_buf = vec![0_u8; record_size];
-                let bytes_read = jrnl_file
-                    .read(cx, &mut rec_buf, verification_offset)
-                    .await?;
-                if bytes_read != record_size {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "short rollback-journal record during restored-image verification: got {bytes_read} of {record_size} bytes"
-                        ),
-                    });
-                }
-                #[allow(clippy::cast_possible_truncation)]
-                let record = JournalPageRecord::decode(&rec_buf, ps as u32).map_err(|error| {
-                    FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "invalid rollback-journal record during restored-image verification: {error}"
-                        ),
+            for section in &sections {
+                let mut verification_offset = section.records_offset;
+                for _ in 0..section.page_count {
+                    let mut rec_buf = vec![0_u8; record_size];
+                    let bytes_read = jrnl_file
+                        .read(cx, &mut rec_buf, verification_offset)
+                        .await?;
+                    if bytes_read != record_size {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short rollback-journal record during restored-image verification: got {bytes_read} of {record_size} bytes"
+                            ),
+                        });
                     }
-                })?;
-                record
-                    .verify_checksum(header.nonce)
-                    .map_err(|error| FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "rollback-journal checksum mismatch during restored-image verification: {error}"
-                        ),
+                    #[allow(clippy::cast_possible_truncation)]
+                    let record =
+                        JournalPageRecord::decode(&rec_buf, ps as u32).map_err(|error| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "invalid rollback-journal record during restored-image verification: {error}"
+                                ),
+                            }
+                        })?;
+                    record.verify_checksum(section.nonce).map_err(|error| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "rollback-journal checksum mismatch during restored-image verification: {error}"
+                            ),
+                        }
                     })?;
-                let page_no = PageNumber::new(record.page_number).ok_or_else(|| {
-                    FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "rollback journal contains invalid page number {} during restored-image verification",
-                            record.page_number
-                        ),
+                    let page_no = PageNumber::new(record.page_number).ok_or_else(|| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "rollback journal contains invalid page number {} during restored-image verification",
+                                record.page_number
+                            ),
+                        }
+                    })?;
+                    if page_no.get() == crate::journal::lock_byte_page(page_size) {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: "rollback journal contains the reserved lock-byte page"
+                                .to_owned(),
+                        });
                     }
-                })?;
-                if page_no.get() == crate::journal::lock_byte_page(page_size) {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: "rollback journal contains the reserved lock-byte page".to_owned(),
-                    });
+                    let page_offset = u64::from(page_no.get() - 1)
+                        .checked_mul(u64::try_from(ps).map_err(|_| FrankenError::OutOfRange {
+                            what: "rollback recovery page size".to_owned(),
+                            value: ps.to_string(),
+                        })?)
+                        .ok_or_else(|| FrankenError::OutOfRange {
+                            what: "rollback recovery verification page offset".to_owned(),
+                            value: page_no.get().to_string(),
+                        })?;
+                    let restored_read = db_file
+                        .read(cx, &mut restored_page, page_offset)
+                        .await?;
+                    if restored_read != ps || restored_page != record.content {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "rollback recovery verification mismatch on page {}",
+                                page_no.get()
+                            ),
+                        });
+                    }
+                    verification_offset = verification_offset
+                        .checked_add(record_size_u64)
+                        .ok_or_else(|| FrankenError::OutOfRange {
+                            what: "rollback recovery verification record offset".to_owned(),
+                            value: verification_offset.to_string(),
+                        })?;
                 }
-                let page_offset = u64::from(page_no.get() - 1)
-                    .checked_mul(u64::try_from(ps).map_err(|_| FrankenError::OutOfRange {
-                        what: "rollback recovery page size".to_owned(),
-                        value: ps.to_string(),
-                    })?)
-                    .ok_or_else(|| FrankenError::OutOfRange {
-                        what: "rollback recovery verification page offset".to_owned(),
-                        value: page_no.get().to_string(),
-                    })?;
-                let restored_read = db_file
-                    .read(cx, &mut restored_page, page_offset)
-                    .await?;
-                if restored_read != ps || restored_page != record.content {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "rollback recovery verification mismatch on page {}",
-                            page_no.get()
-                        ),
-                    });
-                }
-                verification_offset = verification_offset
-                    .checked_add(u64::try_from(record_size).expect("journal record size fits u64"))
-                    .ok_or_else(|| FrankenError::OutOfRange {
-                        what: "rollback recovery verification record offset".to_owned(),
-                        value: verification_offset.to_string(),
-                    })?;
             }
 
             validate_restored(cx, db_file, page_size).await
@@ -20693,11 +20865,11 @@ where
                             match async_rwlock_write(&backend, cx, "WAL backend").await {
                                 Ok(mut wal_guard) => wal_guard
                                     .as_mut()
-                                    .latest_authorized_parallel_wal_commit_certificate(cx)
+                                    .current_parallel_wal_db_size_floor(cx)
                                     .await
                                     .ok()
                                     .flatten()
-                                    .map_or(0, |cert| cert.db_size_pages),
+                                    .unwrap_or(0),
                                 Err(_) => 0,
                             }
                         }
@@ -21175,6 +21347,8 @@ where
                                         });
                                     }
                                 }
+                                let durable_db_size_floor =
+                                    wal.current_parallel_wal_db_size_floor(cx).await?;
                                 let authorized_seed = wal
                                     .latest_authorized_parallel_wal_commit_certificate(cx)
                                     .await?;
@@ -21186,13 +21360,13 @@ where
                                 // growth away. Fail closed pre-durability —
                                 // the statement retry re-preps against the
                                 // fresh durable floor.
-                                if let Some(seed) = authorized_seed.as_ref()
-                                    && seed.db_size_pages > final_db_size
+                                if let Some(durable_db_size_floor) = durable_db_size_floor
+                                    && durable_db_size_floor > final_db_size
                                 {
                                     tracing::warn!(
                                         target: "fsqlite.pager.commit",
                                         certified_db_size = final_db_size,
-                                        durable_db_size = seed.db_size_pages,
+                                        durable_db_size = durable_db_size_floor,
                                         "commit refused: batch would regress durable db_size (bd-vnxjd)"
                                     );
                                     return Err(FrankenError::BusySnapshot {
@@ -32568,6 +32742,261 @@ mod tests {
     }
 
     #[test]
+    fn stock_two_section_hot_journal_replays_every_preimage() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/stock_two_section_hot_journal.db");
+            let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+            let page_size = PageSize::DEFAULT;
+            let ps = page_size.as_usize();
+
+            {
+                let pager = SimplePager::open(vfs.clone(), &path, page_size)
+                    .await
+                    .unwrap();
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page_two = txn.allocate_page(&cx).await.unwrap();
+                assert_eq!(page_two.get(), 2);
+                txn.write_page(&cx, page_two, &vec![0x21; ps])
+                    .await
+                    .unwrap();
+                txn.commit(&cx).await.unwrap();
+            }
+
+            let db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+            let (mut main_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+            let mut original_page_one = vec![0_u8; ps];
+            let mut original_page_two = vec![0_u8; ps];
+            assert_eq!(
+                main_file
+                    .read(&cx, &mut original_page_one, 0)
+                    .await
+                    .unwrap(),
+                ps
+            );
+            assert_eq!(
+                main_file
+                    .read(&cx, &mut original_page_two, ps as u64)
+                    .await
+                    .unwrap(),
+                ps
+            );
+
+            let mut changed_page_one = original_page_one.clone();
+            changed_page_one[100] ^= 0x5A;
+            main_file.write(&cx, &changed_page_one, 0).await.unwrap();
+            main_file
+                .write(&cx, &vec![0x92; ps], ps as u64)
+                .await
+                .unwrap();
+            main_file.close(&cx).unwrap();
+
+            let sector_size = 4096_u32;
+            let first_nonce = 0xA11C_E301;
+            let first_header = JournalHeader {
+                page_count: 1,
+                nonce: first_nonce,
+                initial_db_size: 2,
+                sector_size,
+                page_size: page_size.get(),
+            };
+            let second_nonce = 0xA11C_E302;
+            let second_header = JournalHeader {
+                page_count: 1,
+                nonce: second_nonce,
+                ..first_header
+            };
+            let first_header_bytes = first_header.encode_padded();
+            let first_record =
+                JournalPageRecord::new(1, original_page_one.clone(), first_nonce).encode();
+            let first_section_end = first_header_bytes.len() as u64 + first_record.len() as u64;
+            let sector_size_u64 = u64::from(sector_size);
+            let second_header_offset =
+                first_section_end.div_ceil(sector_size_u64) * sector_size_u64;
+            let second_header_bytes = second_header.encode_padded();
+            let second_record =
+                JournalPageRecord::new(2, original_page_two.clone(), second_nonce).encode();
+
+            let journal_flags =
+                VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+            journal.truncate(&cx, 0).unwrap();
+            journal.write(&cx, &first_header_bytes, 0).await.unwrap();
+            journal
+                .write(&cx, &first_record, first_header_bytes.len() as u64)
+                .await
+                .unwrap();
+            journal
+                .write(
+                    &cx,
+                    &vec![0_u8; (second_header_offset - first_section_end) as usize],
+                    first_section_end,
+                )
+                .await
+                .unwrap();
+            journal
+                .write(&cx, &second_header_bytes, second_header_offset)
+                .await
+                .unwrap();
+            journal
+                .write(
+                    &cx,
+                    &second_record,
+                    second_header_offset + second_header_bytes.len() as u64,
+                )
+                .await
+                .unwrap();
+            journal.close(&cx).unwrap();
+
+            drop(
+                SimplePager::open_existing_with_cx_and_page_buffer_max(
+                    &cx,
+                    vfs.clone(),
+                    &path,
+                    page_size,
+                    None,
+                    None,
+                )
+                .await
+                .expect("stock two-section hot journal should recover"),
+            );
+
+            let (mut restored, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+            let mut restored_page_one = vec![0_u8; ps];
+            let mut restored_page_two = vec![0_u8; ps];
+            restored.read(&cx, &mut restored_page_one, 0).await.unwrap();
+            restored
+                .read(&cx, &mut restored_page_two, ps as u64)
+                .await
+                .unwrap();
+            restored.close(&cx).unwrap();
+            assert_eq!(restored_page_one, original_page_one);
+            assert_eq!(restored_page_two, original_page_two);
+            assert!(
+                !vfs.access(&cx, &journal_path, AccessFlags::EXISTS)
+                    .unwrap(),
+                "bead_id=bd-f2tw5 case=all_stock_journal_sections_replayed"
+            );
+        });
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    #[ignore = "subprocess helper for stock_multisection_hot_journal_recovers"]
+    fn stock_multisection_hot_journal_crash_child() {
+        let Some(database_path) = std::env::var_os("FSQLITE_STOCK_JOURNAL_CRASH_DB") else {
+            return;
+        };
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 PRAGMA synchronous=FULL;
+                 PRAGMA cache_size=8;
+                 PRAGMA cache_spill=ON;
+                 BEGIN IMMEDIATE;
+                 UPDATE spill_pages SET payload=randomblob(400);",
+            )
+            .unwrap();
+
+        // Deliberately bypass Connection::drop(), which would roll the open
+        // transaction back and delete the exact hot journal under test.
+        std::process::exit(86);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn stock_multisection_hot_journal_recovers() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let database_path = directory.path().join("stock-spill.db");
+            let journal_path = SimplePager::<UnixVfs>::journal_path(&database_path);
+
+            {
+                let mut connection = rusqlite::Connection::open(&database_path).unwrap();
+                connection
+                    .execute_batch(
+                        "PRAGMA page_size=512;
+                         PRAGMA journal_mode=DELETE;
+                         PRAGMA synchronous=FULL;
+                         CREATE TABLE spill_pages(
+                           id INTEGER PRIMARY KEY,
+                           payload BLOB NOT NULL
+                         );",
+                    )
+                    .unwrap();
+                let transaction = connection.transaction().unwrap();
+                {
+                    let mut insert = transaction
+                        .prepare("INSERT INTO spill_pages VALUES(?1, zeroblob(400))")
+                        .unwrap();
+                    for row_id in 1..=2_048_i64 {
+                        insert.execute([row_id]).unwrap();
+                    }
+                }
+                transaction.commit().unwrap();
+            }
+
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--ignored")
+                .arg("--exact")
+                .arg("pager::tests::stock_multisection_hot_journal_crash_child")
+                .arg("--nocapture")
+                .env("FSQLITE_STOCK_JOURNAL_CRASH_DB", &database_path)
+                .status()
+                .unwrap();
+            assert_eq!(
+                child.code(),
+                Some(86),
+                "stock crash helper must bypass rollback"
+            );
+
+            let journal_bytes = std::fs::read(&journal_path).unwrap();
+            let first_header = JournalHeader::decode(&journal_bytes).unwrap();
+            let sector_size = usize::try_from(first_header.sector_size).unwrap();
+            let aligned_header_count = journal_bytes
+                .chunks(sector_size)
+                .filter(|chunk| chunk.starts_with(&JOURNAL_MAGIC))
+                .count();
+            assert!(
+                aligned_header_count >= 2,
+                "stock spill fixture must contain multiple aligned journal headers, got {aligned_header_count}"
+            );
+
+            let cx = Cx::new();
+            let page_size = PageSize::new(first_header.page_size).unwrap();
+            drop(
+                SimplePager::open_existing_with_cx_and_page_buffer_max(
+                    &cx,
+                    UnixVfs::new(),
+                    &database_path,
+                    page_size,
+                    None,
+                    None,
+                )
+                .await
+                .expect("FrankenSQLite should recover the stock spill journal"),
+            );
+            assert!(!journal_path.exists());
+
+            let connection = rusqlite::Connection::open(&database_path).unwrap();
+            let integrity: String = connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            let changed_rows: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM spill_pages WHERE payload != zeroblob(400)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(changed_rows, 0, "every spilled stock page must roll back");
+        });
+    }
+
+    #[test]
     fn external_journal_with_additional_structure_is_refused_without_replay() {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
@@ -32600,7 +33029,7 @@ mod tests {
             let (mut journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
             journal.write(&cx, &header_bytes, 0).await.unwrap();
             journal
-                .write(&cx, &vec![0_u8; 4096], header_bytes.len() as u64)
+                .write(&cx, &vec![0xA5_u8; 4096], header_bytes.len() as u64)
                 .await
                 .unwrap();
             journal.close(&cx).unwrap();

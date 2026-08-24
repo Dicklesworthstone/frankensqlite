@@ -60,6 +60,7 @@ asupersync.workspace = true
 # `asupersync::test_utils::run_test`, which lives behind `test-internals`.
 asupersync = { workspace = true, features = ["test-internals"] }
 proptest = { workspace = true }
+rusqlite = { workspace = true }
 tempfile = { workspace = true }
 # Dev-only, and fsqlite-mvcc depends on fsqlite-pager. Keep this local path
 # versionless so Cargo strips the dev edge when packaging and avoids a publish

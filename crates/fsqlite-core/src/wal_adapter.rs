@@ -4197,6 +4197,52 @@ where
         })
     }
 
+    fn current_parallel_wal_db_size_floor<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> WalFuture<'a, Option<u32>> {
+        Box::pin(async move {
+            self.ensure_current_wal_path(cx).await?;
+            let current = self.inner.refresh_published_snapshot(cx).await?;
+            let Some(current_commit_frame) = current.last_commit_frame else {
+                return Ok(None);
+            };
+            let current_commit_frame_end = u64::try_from(current_commit_frame)
+                .ok()
+                .and_then(|frame| frame.checked_add(1));
+            let current_commit_header = self
+                .inner
+                .inner()
+                .read_frame_header(cx, current_commit_frame)
+                .await?;
+            if !current_commit_header.is_commit() {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "published WAL commit horizon {current_commit_frame} is not a commit frame"
+                    ),
+                });
+            }
+            let authorized = self
+                .latest_authorized_durable_certificate_record(cx)
+                .await?;
+            if let Some(record) = authorized
+                && current.generation == record.wal_generation
+                && current_commit_frame_end == Some(record.wal_frame_end)
+            {
+                if record.certificate.db_size_pages != current_commit_header.db_size {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: format!(
+                            "parallel WAL certificate db_size {} disagrees with covered commit marker db_size {}",
+                            record.certificate.db_size_pages, current_commit_header.db_size
+                        ),
+                    });
+                }
+                return Ok(Some(record.certificate.db_size_pages));
+            }
+            Ok(Some(current_commit_header.db_size))
+        })
+    }
+
     fn read_page<'a>(&'a mut self, cx: &'a Cx, page_number: u32) -> WalFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
             self.ensure_current_wal_path(cx).await?;
@@ -4817,6 +4863,73 @@ mod tests {
             .expect("append matching commit marker");
         backend.sync(cx).expect("sync matching commit marker");
         (backend, certificate)
+    }
+
+    #[test]
+    fn gh346_external_horizon_supersedes_older_certificate_db_size() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let original_page = sample_page(0x46);
+        let mut certificate = sample_certificate(1, 1, vec![1]);
+        certificate.db_size_pages = 9;
+        certificate.wal_frame_payload_digest =
+            test_frame_payload_digest(1, &original_page, certificate.db_size_pages);
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            .expect("persist original authorized certificate");
+        backend
+            .append_frame(&cx, 1, &original_page, certificate.db_size_pages)
+            .expect("append original certified commit");
+        backend.sync(&cx).expect("sync original certified commit");
+
+        assert_eq!(
+            backend
+                .current_parallel_wal_db_size_floor(&cx)
+                .expect("read current certified db-size floor"),
+            Some(9)
+        );
+
+        // Stock SQLite does not write FrankenSQLite's certificate sidecar. A
+        // later shrinking commit therefore leaves the older certificate valid
+        // as a clock seed, but it no longer covers the current WAL horizon.
+        let vacuumed_page = sample_page(0x47);
+        backend
+            .append_frame(&cx, 1, &vacuumed_page, 5)
+            .expect("append later uncertified shrinking commit");
+        backend
+            .sync(&cx)
+            .expect("sync later uncertified shrinking commit");
+
+        assert_eq!(
+            backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .expect("older certificate remains a valid clock seed"),
+            Some(certificate)
+        );
+        assert_eq!(
+            backend
+                .current_parallel_wal_db_size_floor(&cx)
+                .expect("classify db-size floor at the latest commit horizon"),
+            Some(5),
+            "an older certificate must not re-expand a later shrinking commit"
+        );
+
+        let grown_page = sample_page(0x48);
+        backend
+            .append_frame(&cx, 1, &grown_page, 12)
+            .expect("append later uncertified growing commit");
+        backend
+            .sync(&cx)
+            .expect("sync later uncertified growing commit");
+        assert_eq!(
+            backend
+                .current_parallel_wal_db_size_floor(&cx)
+                .expect("classify growing external db-size floor"),
+            Some(12),
+            "the current external horizon must still protect later growth"
+        );
     }
 
     struct AuthoritativeWalSnapshot {
