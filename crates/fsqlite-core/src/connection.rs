@@ -15903,7 +15903,11 @@ impl Connection {
                         ),
                     });
                 }
-                Ok(self.bounded_leading_terms_equal(&collations, &stored[..pk_count], parent_values))
+                Ok(self.bounded_leading_terms_equal(
+                    &collations,
+                    &stored[..pk_count],
+                    parent_values,
+                ))
             }
         }
     }
@@ -15930,7 +15934,11 @@ impl Connection {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for idx in 0..lhs.len() {
-            let ord = match (collations.get(idx).and_then(Option::as_deref), &lhs[idx], &rhs[idx]) {
+            let ord = match (
+                collations.get(idx).and_then(Option::as_deref),
+                &lhs[idx],
+                &rhs[idx],
+            ) {
                 (Some(coll_name), SqliteValue::Text(left), SqliteValue::Text(right)) => {
                     match registry.find(coll_name) {
                         Some(collation) => collation.compare(left.as_bytes(), right.as_bytes()),
@@ -16037,8 +16045,8 @@ impl Connection {
                         bounded_increment_validation_counter(
                             &mut counters.foreign_key_child_rows_checked,
                         )?;
-                        if let Some(parent_values) =
-                            self.bounded_foreign_key_parent_values(&child, &parent, check, &inflated)?
+                        if let Some(parent_values) = self
+                            .bounded_foreign_key_parent_values(&child, &parent, check, &inflated)?
                         {
                             pending.push((format!("row {position}"), parent_values));
                         }
@@ -16075,16 +16083,15 @@ impl Connection {
             )
             .await?
             {
-                let payload_values = parse_record_with_encoding(
-                    &payload,
-                    self.db_text_encoding.get(),
-                )
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "FOREIGN KEY child table `{}` rowid {rowid} has an invalid record",
-                        child.name
-                    ),
-                })?;
+                let payload_values =
+                    parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(
+                        || FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "FOREIGN KEY child table `{}` rowid {rowid} has an invalid record",
+                                child.name
+                            ),
+                        },
+                    )?;
                 if payload_values.len() > child.columns.len() {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -18339,7 +18346,9 @@ impl Connection {
         if let Some(where_clause) = materialized.where_clause.as_mut()
             && expr_has_any_subquery(where_clause)
         {
-            let inlined = self.inline_subqueries_in_expr(where_clause, &[], &[]).await?;
+            let inlined = self
+                .inline_subqueries_in_expr(where_clause, &[], &[])
+                .await?;
             *where_clause = inlined;
         }
         Ok(Some(materialized))
@@ -18361,7 +18370,9 @@ impl Connection {
         if !expr_has_any_subquery(where_clause) {
             return Ok(None);
         }
-        let inlined = self.inline_subqueries_in_expr(where_clause, &[], &[]).await?;
+        let inlined = self
+            .inline_subqueries_in_expr(where_clause, &[], &[])
+            .await?;
         let mut materialized = delete.clone();
         materialized.where_clause = Some(inlined);
         Ok(Some(materialized))
@@ -18692,9 +18703,7 @@ impl Connection {
                                 determine_attached_update_schema(&materialized, &registry)
                             };
                             match reresolved {
-                                Ok(Some(schema))
-                                    if schema.eq_ignore_ascii_case(&target_schema) =>
-                                {
+                                Ok(Some(schema)) if schema.eq_ignore_ascii_case(&target_schema) => {
                                     (schema, Cow::Owned(materialized))
                                 }
                                 _ => return Err(mixed_error),
@@ -18794,9 +18803,7 @@ impl Connection {
                                 determine_attached_delete_schema(&materialized, &registry)
                             };
                             match reresolved {
-                                Ok(Some(schema))
-                                    if schema.eq_ignore_ascii_case(&target_schema) =>
-                                {
+                                Ok(Some(schema)) if schema.eq_ignore_ascii_case(&target_schema) => {
                                     (schema, Cow::Owned(materialized))
                                 }
                                 _ => return Err(mixed_error),
@@ -36621,10 +36628,9 @@ impl Connection {
                 // bd-y7old: a conflicting ON CONFLICT DO UPDATE resolves to the
                 // UPDATE path, so it must fire BEFORE/AFTER UPDATE triggers (and
                 // NOT AFTER INSERT). Compute their presence for the DO-UPDATE case.
-                let is_do_update_upsert = insert
-                    .upsert
-                    .iter()
-                    .any(|clause| matches!(clause.action, fsqlite_ast::UpsertAction::Update { .. }));
+                let is_do_update_upsert = insert.upsert.iter().any(|clause| {
+                    matches!(clause.action, fsqlite_ast::UpsertAction::Update { .. })
+                });
                 // `UPDATE OF <cols>` triggers match on the SET-assigned columns, so
                 // build the event from the first DO-UPDATE clause's assignments
                 // (mirroring the plain-UPDATE arm). Empty when not a DO-UPDATE
@@ -36927,13 +36933,18 @@ impl Connection {
                 let upsert_update_plan = if upsert_needs_conflict_plan
                     && trigger_new_rows.len() == 1
                 {
-                    let clause = insert.upsert.iter().find_map(|clause| match &clause.action {
-                        fsqlite_ast::UpsertAction::Update {
-                            assignments,
-                            where_clause,
-                        } => Some((assignments, where_clause.as_deref(), clause.target.as_ref())),
-                        fsqlite_ast::UpsertAction::Nothing => None,
-                    });
+                    let clause = insert
+                        .upsert
+                        .iter()
+                        .find_map(|clause| match &clause.action {
+                            fsqlite_ast::UpsertAction::Update {
+                                assignments,
+                                where_clause,
+                            } => {
+                                Some((assignments, where_clause.as_deref(), clause.target.as_ref()))
+                            }
+                            fsqlite_ast::UpsertAction::Nothing => None,
+                        });
                     if let Some((assignments, do_update_where, target)) = clause {
                         self.plan_upsert_update_trigger(
                             insert,
@@ -36954,22 +36965,27 @@ impl Connection {
                 // the DO UPDATE ... WHERE applies (an update) or not (a no-op that
                 // still fired only BEFORE INSERT in stock).
                 let upsert_conflicted = upsert_update_plan.is_some();
-                let mut upsert_before_update_ignored = false;
-                if let Some((rowid, old_row, new_row, where_true)) = &upsert_update_plan
+                let upsert_before_update_ignored = if let Some((
+                    rowid,
+                    old_row,
+                    new_row,
+                    where_true,
+                )) = &upsert_update_plan
                     && *where_true
                     && has_before_update
                 {
-                    upsert_before_update_ignored = self
-                        .fire_before_triggers(
-                            table_name,
-                            &update_event,
-                            Some(old_row),
-                            Some(new_row),
-                            *rowid,
-                            *rowid,
-                        )
-                        .await?;
-                }
+                    self.fire_before_triggers(
+                        table_name,
+                        &update_event,
+                        Some(old_row),
+                        Some(new_row),
+                        *rowid,
+                        *rowid,
+                    )
+                    .await?
+                } else {
+                    false
+                };
                 if upsert_before_update_ignored {
                     // BEFORE UPDATE raised RAISE(IGNORE): skip this row's update
                     // entirely (no mutation, no AFTER UPDATE, no AFTER INSERT).
@@ -40000,8 +40016,12 @@ const BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH: usize = 512;
 
 #[derive(Debug, Clone, Copy)]
 enum BoundedForeignKeyParentProbe {
-    IntegerPrimaryKey { column_index: usize },
-    UniqueIndex { index_index: usize },
+    IntegerPrimaryKey {
+        column_index: usize,
+    },
+    UniqueIndex {
+        index_index: usize,
+    },
     /// The parent is a WITHOUT ROWID table and the foreign key references its
     /// full PRIMARY KEY in PRIMARY KEY order. The parent row is resolved by
     /// seeking the table's own b-tree (an index b-tree keyed by the PK) on the
@@ -63457,7 +63477,8 @@ impl Connection {
         let trigger_name = &stmt.name.name;
         // Stock reserves "sqlite_"-prefixed object names for internal use.
         // bd-errmsg-parity-batch2-g8v6e.
-        if trigger_name.len() >= 7 && trigger_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_") {
+        if trigger_name.len() >= 7 && trigger_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_")
+        {
             return Err(FrankenError::FunctionError(format!(
                 "object name reserved for internal use: {trigger_name}"
             )));
@@ -75504,7 +75525,7 @@ impl Connection {
             if has_nonmain_from_ref {
                 let synthetic = format!("\u{0}main\u{0}{name_lc}");
                 let mut main_entry = main_table.clone();
-                main_entry.name = synthetic.clone();
+                main_entry.name.clone_from(&synthetic);
                 schema.push(main_entry);
                 retarget_main_qualified_from_sources(select, name_lc, &synthetic);
             } else if let Some(slot) = schema
@@ -87016,11 +87037,10 @@ impl Connection {
             }
         };
         #[cfg(feature = "ext-fts5")]
-        let effective_where_clause_for_eval: Option<&Expr> =
-            match &rank_directive_stripped_where {
-                Some(stripped) => stripped.as_ref(),
-                None => effective_where_clause,
-            };
+        let effective_where_clause_for_eval: Option<&Expr> = match &rank_directive_stripped_where {
+            Some(stripped) => stripped.as_ref(),
+            None => effective_where_clause,
+        };
         #[cfg(not(feature = "ext-fts5"))]
         let effective_where_clause_for_eval = effective_where_clause;
         let fts5_aux_context = {
@@ -87274,8 +87294,9 @@ impl Connection {
                     }
                     _ => unreachable!("lateral_tvf flag implies a TableFunction source"),
                 };
-                let include_hidden_rowid =
-                    table_sources[join_idx + 1].hidden_rowid_projection.is_some();
+                let include_hidden_rowid = table_sources[join_idx + 1]
+                    .hidden_rowid_projection
+                    .is_some();
                 combined = self
                     .execute_lateral_table_function_join(
                         &combined,
@@ -87734,9 +87755,7 @@ impl Connection {
                 scratch.extend_from_slice(&right_row[..right_width]);
                 let passes = match constraint {
                     None => true,
-                    Some(JoinConstraint::On(expr)) => {
-                        eval_join_predicate(expr, &scratch, col_map)?
-                    }
+                    Some(JoinConstraint::On(expr)) => eval_join_predicate(expr, &scratch, col_map)?,
                     Some(JoinConstraint::Using(cols)) => {
                         eval_using_constraint(cols, &scratch, col_map, left_width)
                     }
@@ -98431,7 +98450,7 @@ fn retarget_main_qualified_from_sources(
                 .is_some_and(|s| s.eq_ignore_ascii_case("main"))
         {
             qn.schema = None;
-            qn.name = synthetic.to_owned();
+            synthetic.clone_into(&mut qn.name);
         }
     });
 }
@@ -123721,9 +123740,7 @@ fn expr_references_any_column(expr: &Expr) -> bool {
                 || whens.iter().any(|(when, then)| {
                     expr_references_any_column(when) || expr_references_any_column(then)
                 })
-                || else_expr
-                    .as_deref()
-                    .is_some_and(expr_references_any_column)
+                || else_expr.as_deref().is_some_and(expr_references_any_column)
         }
         Expr::JsonAccess { expr, path, .. } => {
             expr_references_any_column(expr) || expr_references_any_column(path)
@@ -221790,7 +221807,9 @@ mod pager_routing_tests {
             // Negative control: the guard must still fire on a duplicate id —
             // falling through to the statement path may not weaken it.
             let duplicate = conn
-                .execute("INSERT INTO guarded_facts (id, cap, ord) VALUES ('fact_000000', 'other', 9);")
+                .execute(
+                    "INSERT INTO guarded_facts (id, cap, ord) VALUES ('fact_000000', 'other', 9);",
+                )
                 .await;
             let error = duplicate.expect_err("duplicate id must RAISE(ABORT)");
             assert!(
