@@ -1015,10 +1015,11 @@ impl<'a> Lexer<'a> {
             let text = String::from_utf8_lossy(&self.src[num_start..self.pos]);
             match text.parse::<u32>() {
                 Ok(n) if (1..=MAX_VARIABLE_NUMBER).contains(&n) => TokenKind::QuestionNum(n),
-                Ok(n) => TokenKind::Error(format!(
-                    "variable number must be between ?1 and ?{MAX_VARIABLE_NUMBER}, got ?{n}"
+                // Stock emits the bare range message with no got-suffix, for
+                // out-of-range and unparseably-large numbers alike.
+                Ok(_) | Err(_) => TokenKind::Error(format!(
+                    "variable number must be between ?1 and ?{MAX_VARIABLE_NUMBER}"
                 )),
-                Err(_) => TokenKind::Error("invalid parameter number".to_owned()),
             }
         } else {
             TokenKind::Question
