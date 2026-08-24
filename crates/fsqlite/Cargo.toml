@@ -40,7 +40,14 @@ rtree = ["dep:fsqlite-ext-rtree", "fsqlite-core/ext-rtree"]
 session = ["dep:fsqlite-ext-session"]
 icu = ["dep:fsqlite-ext-icu", "fsqlite-core/ext-icu"]
 misc = ["dep:fsqlite-ext-misc", "fsqlite-core/ext-misc"]
-async-api = ["dep:asupersync", "dep:futures-lite", "fsqlite-types/native"]
+# `async-api` implies the full `native` stack (fsqlite#379): the async surface
+# is only meaningful with a working native context (engine + VFS + types), and
+# enabling only `fsqlite-types/native` let `default-features = false` consumers
+# silently build an engine with the whole `fsqlite-core`/`fsqlite-vfs` native
+# stack missing. `native` already covers `dep:asupersync` and
+# `fsqlite-types/native`; `dep:asupersync` is kept explicit because
+# `async_api.rs` uses it directly.
+async-api = ["native", "dep:asupersync", "dep:futures-lite"]
 raptorq = []
 mvcc = []
 

@@ -1123,6 +1123,7 @@ dependencies = [
  "fsqlite-types",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
