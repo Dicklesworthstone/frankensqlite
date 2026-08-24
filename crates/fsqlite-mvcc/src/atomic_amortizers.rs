@@ -379,6 +379,21 @@ mod tests {
         assert!(b > a);
     }
 
+    /// Reserving the final partial batch must never wrap the shared watermark
+    /// and reissue low timestamp values.
+    #[test]
+    fn cicada_id_space_exhaustion_does_not_wrap() {
+        let batcher = ReadTsBatcher::new(u64::MAX - 1, 4);
+        let first = batcher.next_read_ts();
+        assert_eq!(first, u64::MAX - 1);
+
+        let second = batcher.next_read_ts();
+        assert!(
+            second > first,
+            "timestamp allocation wrapped from {first} back to {second}"
+        );
+    }
+
     // ------- Hekaton -------
 
     /// 10 reserved gaps are pairwise non-overlapping.
@@ -480,5 +495,20 @@ mod tests {
         assert_eq!(g.capacity(), 1);
         assert_eq!(g.next_tid(), Some(5));
         assert_eq!(g.next_tid(), None);
+    }
+
+    /// Reserving the final partial gap must leave the allocator exhausted,
+    /// rather than wrapping its shared watermark to a reusable low value.
+    #[test]
+    fn hekaton_id_space_exhaustion_does_not_wrap() {
+        let alloc = TidGapAllocator::new(u64::MAX - 1, 4);
+        let gap = alloc.reserve_gap();
+        assert_eq!(gap.start(), u64::MAX - 1);
+        assert_eq!(gap.end(), u64::MAX);
+        assert_eq!(
+            alloc.watermark(),
+            u64::MAX,
+            "gap reservation wrapped the shared watermark"
+        );
     }
 }
