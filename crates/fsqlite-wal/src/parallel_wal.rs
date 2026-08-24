@@ -1,22 +1,27 @@
-//! Parallel WAL coordinator (D1: bd-3wop3.1).
+//! Parallel WAL durability and publication primitives (D1: bd-3wop3.1).
 //!
-//! This module provides a lock-free parallel WAL write path using per-thread
-//! buffers and epoch-based group commit. It replaces the global WAL append
-//! mutex with cooperative per-thread buffering.
+//! This module contains two distinct mechanisms:
 //!
-//! # Architecture
+//! - [`ParallelWalDurabilityCombiner`] is the live engine path. The pager uses it
+//!   to order commit certificates, cross the durability barrier, and publish
+//!   visibility without restoring SQLite's global writer lock.
+//! - [`ParallelWalCoordinator`] is a standalone, public segment-file coordinator.
+//!   It is re-exported for direct consumers but is not currently called by the
+//!   pager or `Connection`; its segment files are therefore not part of normal
+//!   database recovery unless a consumer explicitly wires the coordinator in.
 //!
-//! 1. Each writer thread appends WAL frames to its own buffer with NO global lock.
+//! # Standalone segment coordinator
+//!
+//! 1. Each writer thread appends records to a slot-local buffer without a global
+//!    append lock.
 //! 2. A background epoch ticker advances the global epoch every ~10ms.
 //! 3. On epoch advance, slot-local buffer locks make sealing wait for any
 //!    in-flight batch append to complete, then the previous epoch is flushed.
-//! 4. Commit durability: transaction waits until its epoch is durable.
+//! 4. A transaction using this coordinator waits until its epoch is durable.
 //!
-//! # Key Benefits
-//!
-//! - Eliminates the #1 contention point (global WAL append mutex).
-//! - WAL writes are now embarrassingly parallel.
-//! - Epoch mechanism provides natural group commit semantics (Silo/Aether pattern).
+//! The segment coordinator is designed to remove a global append contention
+//! point and provide epoch-based group commit. Those properties describe this
+//! standalone API; they must not be read as claims about the live pager path.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
@@ -2630,15 +2635,19 @@ const MAX_SEGMENT_RECORD_IMAGE_BYTES: usize = limits::MAX_PAGE_SIZE as usize;
 const MAX_SEGMENT_RECORD_SIZE: usize =
     SEGMENT_RECORD_MIN_SIZE + 8 + 2 * MAX_SEGMENT_RECORD_IMAGE_BYTES;
 
-/// fsync policy for segment files.
+/// Durability policy for the standalone coordinator's segment files.
+///
+/// This does not configure the live pager's WAL durability combiner. Segment
+/// writes occur at epoch flush boundaries, so `Full` and `Normal` currently take
+/// the same file-and-directory durability fence for each written segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FsyncPolicy {
-    /// Full fsync after every write (safest, slowest).
+    /// Sync the segment and, on Unix, its parent directory after every segment write.
     #[default]
     Full,
-    /// Fsync at epoch boundaries only.
+    /// Sync the segment and, on Unix, its parent directory at the epoch boundary.
     Normal,
-    /// No fsync (fastest, least safe).
+    /// Do not request an fsync for the segment or its directory.
     Off,
 }
 
