@@ -4189,9 +4189,7 @@ mod tests {
             ("INSERT INTO audit target(value) VALUES (1)", "target"),
             ("DELETE FROM audit target", "target"),
         ] {
-            let sql = format!(
-                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN {body_statement}; END"
-            );
+            let sql = format!("CREATE TRIGGER trg AFTER INSERT ON t BEGIN {body_statement}; END");
             let error = parse_first_statement_with_tail(&sql)
                 .expect_err("trigger-body table aliases without AS must remain rejected");
             assert_eq!(
@@ -4374,7 +4372,8 @@ mod tests {
             // own behavior: near-X grammar errors (UnexpectedToken: DEFAULT
             // VALUES, ORDER BY/LIMIT, WITH..INSERT, UPDATE/DELETE RETURNING),
             // fixed verbatim messages (Semantic: qualified names, INDEXED BY /
-            // NOT INDEXED, INSERT RETURNING). The exact user-facing messages are pinned in the end-to-end keeper
+            // NOT INDEXED, INSERT RETURNING). The exact user-facing messages
+            // are pinned in the end-to-end keeper
             // (bd_parser_syntax_error_near_x). bd-parser-syntax-error-format-6w6kp.
             assert!(
                 matches!(
