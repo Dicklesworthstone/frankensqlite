@@ -151908,10 +151908,9 @@ mod tests {
             let bare = conn
                 .query("VALUES (3, 'c'), (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 2;")
                 .await;
-            assert!(
-                matches!(bare, Err(FrankenError::ParseError { .. })),
-                "stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
-            );
+            let bare_err = bare
+                .expect_err("stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term");
+            assert_eq!(bare_err.to_string(), "near \"ORDER\": syntax error");
         });
     }
 
@@ -151932,10 +151931,9 @@ mod tests {
             let bare = conn
                 .query("VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 1 OFFSET 1;")
                 .await;
-            assert!(
-                matches!(bare, Err(FrankenError::ParseError { .. })),
-                "stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
-            );
+            let bare_err = bare
+                .expect_err("stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term");
+            assert_eq!(bare_err.to_string(), "near \"ORDER\": syntax error");
         });
     }
 
@@ -151966,10 +151964,9 @@ mod tests {
                 assert!(rows.is_empty(), "unexpected rows for `{sql}`");
             }
             let bare = conn.query("VALUES (42) LIMIT 0 OFFSET NULL;").await;
-            assert!(
-                matches!(bare, Err(FrankenError::ParseError { .. })),
-                "stock SQLite (3.46.1 oracle) rejects LIMIT after a bare VALUES term: {bare:?}"
-            );
+            let bare_err = bare
+                .expect_err("stock SQLite (3.46.1 oracle) rejects LIMIT after a bare VALUES term");
+            assert_eq!(bare_err.to_string(), "near \"LIMIT\": syntax error");
         });
     }
 
@@ -152028,10 +152025,10 @@ mod tests {
                     ],
                 )
                 .await;
-            assert!(
-                matches!(bare, Err(FrankenError::ParseError { .. })),
-                "stock SQLite (3.46.1 oracle) rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
+            let bare_err = bare.expect_err(
+                "stock SQLite (3.46.1 oracle) rejects ORDER BY/LIMIT after a bare VALUES term",
             );
+            assert_eq!(bare_err.to_string(), "near \"ORDER\": syntax error");
 
             let literal_text = conn.query("SELECT 42 LIMIT '1' OFFSET '0';").await.unwrap();
             assert_eq!(literal_text[0].values(), &[SqliteValue::Integer(42)]);
@@ -152544,10 +152541,9 @@ mod tests {
             let bare = conn
                 .query_with_params("VALUES (1, 2), (2, 1) ORDER BY ? LIMIT ?;", &params)
                 .await;
-            assert!(
-                matches!(bare, Err(FrankenError::ParseError { .. })),
-                "stock SQLite (3.46.1 oracle) rejects ORDER BY after a bare VALUES term: {bare:?}"
-            );
+            let bare_err = bare
+                .expect_err("stock SQLite (3.46.1 oracle) rejects ORDER BY after a bare VALUES term");
+            assert_eq!(bare_err.to_string(), "near \"ORDER\": syntax error");
         });
     }
 
@@ -152696,10 +152692,9 @@ mod tests {
             let bare = conn
                 .query("VALUES (1), (2) ORDER BY 1 LIMIT 10 OFFSET 99;")
                 .await;
-            assert!(
-                matches!(bare, Err(FrankenError::ParseError { .. })),
-                "stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term: {bare:?}"
-            );
+            let bare_err = bare
+                .expect_err("stock SQLite 3.46.1 rejects ORDER BY/LIMIT after a bare VALUES term");
+            assert_eq!(bare_err.to_string(), "near \"ORDER\": syntax error");
         });
     }
 
@@ -171027,9 +171022,10 @@ mod tests {
                 )
                 .await
                 .expect_err("RETURNING in a trigger body must be rejected (stock parity)");
-            assert!(
-                matches!(&err, FrankenError::ParseError { detail, .. } if detail.contains("RETURNING")),
-                "expected a RETURNING-in-trigger rejection, got: {err:?}"
+            assert_eq!(
+                err.to_string(),
+                "cannot use RETURNING in a trigger",
+                "expected the stock RETURNING-in-trigger rejection"
             );
         });
     }
@@ -171230,11 +171226,11 @@ mod tests {
                 .execute("CREATE TRIGGER trg_bad AFTER INSERT ON t BEGIN ROLLBACK; END;")
                 .await
                 .expect_err("transaction control statements inside trigger bodies must fail");
-            assert!(matches!(
-                err,
-                FrankenError::ParseError { ref detail, .. }
-                    if detail.contains("trigger body statement")
-            ));
+            assert_eq!(
+                err.to_string(),
+                "near \"ROLLBACK\": syntax error",
+                "stock rejects transaction control in a trigger body as a parse error"
+            );
 
             // The rejected trigger was never installed, so ordinary DML works
             // and nothing rolls it back.
@@ -173628,11 +173624,10 @@ mod tests {
                 )
                 .await
                 .expect_err("DETACH inside a trigger body must fail closed at parse");
-            assert!(
-                error
-                    .to_string()
-                    .contains("trigger body statement must be SELECT, INSERT, UPDATE, or DELETE"),
-                "unexpected trigger-body DETACH rejection: {error}"
+            assert_eq!(
+                error.to_string(),
+                "near \"DETACH\": syntax error",
+                "stock's trigger grammar cannot express DETACH"
             );
             assert!(
                 conn.attached_schemas.borrow().find("aux").is_some(),
@@ -173647,11 +173642,10 @@ mod tests {
                 ))
                 .await
                 .expect_err("ATTACH inside a trigger body must fail closed at parse");
-            assert!(
-                error
-                    .to_string()
-                    .contains("trigger body statement must be SELECT, INSERT, UPDATE, or DELETE"),
-                "unexpected trigger-body ATTACH rejection: {error}"
+            assert_eq!(
+                error.to_string(),
+                "near \"ATTACH\": syntax error",
+                "stock's trigger grammar cannot express ATTACH"
             );
             assert!(
                 conn.attached_schemas.borrow().find("extra").is_none(),
@@ -225779,16 +225773,13 @@ mod pager_routing_tests {
                 .query("SELECT id, name, score FROM explicit_stmt_skip_opt_in ORDER BY id")
                 .await
                 .unwrap();
-            assert_eq!(
-                rows.iter()
-                    .map(|row| row.values().to_vec())
-                    .collect::<Vec<_>>(),
-                vec![vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("first".into()),
-                    SqliteValue::Integer(10)
-                ]],
-                "skip API makes the explicit transaction the rollback boundary"
+            // bd-q2bju/bd-01qa9 (8cd725668): the skip fast path is only sound
+            // for a single-row direct insert, so a multi-row INSERT takes the
+            // statement savepoint even under the skip API — the failed
+            // statement leaves no partial rows in either mode.
+            assert!(
+                rows.is_empty(),
+                "multi-row INSERT stays statement-atomic even under the skip API (bd-q2bju)"
             );
             conn.execute("ROLLBACK").await.unwrap();
             let rows = conn
@@ -225797,7 +225788,7 @@ mod pager_routing_tests {
                 .unwrap();
             assert!(
                 rows.is_empty(),
-                "caller rollback must discard partial effects from the skip API"
+                "caller rollback leaves the table empty"
             );
         });
     }
