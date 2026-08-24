@@ -52479,7 +52479,7 @@ impl Connection {
     /// UPDATE trigger snapshot uses (`eval_join_expr`), with a column map that
     /// resolves unqualified / target-table columns against the existing row;
     /// `excluded.*` references are spliced to the attempted-insert literals.
-    async fn compute_upsert_update_row(
+    fn compute_upsert_update_row(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         assignments: &[fsqlite_ast::Assignment],
@@ -52640,17 +52640,15 @@ impl Connection {
                     else {
                         return Ok(None);
                     };
-                    let plan = self
-                        .compute_upsert_update_row(
-                            insert,
-                            assignments,
-                            where_clause.as_deref(),
-                            rowid,
-                            old_values,
-                            attempted,
-                            params,
-                        )
-                        .await?;
+                    let plan = self.compute_upsert_update_row(
+                        insert,
+                        assignments,
+                        where_clause.as_deref(),
+                        rowid,
+                        old_values,
+                        attempted,
+                        params,
+                    )?;
                     return Ok(plan
                         .map(|plan| (Self::assignment_target_column_names(assignments), plan)));
                 }
@@ -111860,8 +111858,8 @@ fn relax_eq_conjunct_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Op
             right,
             ..
         } => {
-            relax_eq_conjunct_bound_outer(&mut **left, table, alias);
-            relax_eq_conjunct_bound_outer(&mut **right, table, alias);
+            relax_eq_conjunct_bound_outer(left, table, alias);
+            relax_eq_conjunct_bound_outer(right, table, alias);
         }
         Expr::BinaryOp {
             op: BinaryOp::Eq,
@@ -111870,13 +111868,13 @@ fn relax_eq_conjunct_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Op
             ..
         } => {
             // `col = bound` — relax the right operand.
-            if let Some(col) = eq_seek_column(&**left, table, alias)
-                && let Some(literal) = bound_outer_relaxable_to_literal(&**right, col)
+            if let Some(col) = eq_seek_column(left, table, alias)
+                && let Some(literal) = bound_outer_relaxable_to_literal(right, col)
             {
                 **right = literal;
             // `bound = col` — relax the left operand.
-            } else if let Some(col) = eq_seek_column(&**right, table, alias)
-                && let Some(literal) = bound_outer_relaxable_to_literal(&**left, col)
+            } else if let Some(col) = eq_seek_column(right, table, alias)
+                && let Some(literal) = bound_outer_relaxable_to_literal(left, col)
             {
                 **left = literal;
             }
