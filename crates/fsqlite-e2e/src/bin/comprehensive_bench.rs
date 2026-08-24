@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -43,6 +44,73 @@ use rand::seq::SliceRandom as _;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing_subscriber::prelude::*;
+
+// ─── Executed-work meter (Gate 0, bd-h9pzn / bd-i8pt6) ─────────────────
+//
+// bd-i8pt6 was a reader loop that constructed a query future and dropped it
+// unpolled — it timed future *construction*, executed zero statements, and
+// reported a throughput number with the dangerous sign (FrankenSQLite looked
+// fast). A green compile hid it. The defense is an executed-work receipt: a
+// process-global meter that only the FrankenSQLite execution primitives bump
+// when a statement *actually runs* (i.e. its future is polled to completion
+// and its result observed). The `measure*` harness snapshots the meter around
+// each timed arm, so every FrankenSQLite arm carries a genuine per-arm count
+// of statements executed and rows returned. Artifact emission fails closed
+// when an emitted FrankenSQLite arm ran but executed zero statements.
+//
+// The meter counts the *subject under test* (FrankenSQLite) only — that is the
+// arm whose zero-work would forge a release claim; the C SQLite reference arm
+// uses raw rusqlite calls and is the oracle, not the claim. A dropped/unpolled
+// FrankenSQLite future never reaches these record points, so it reads as zero
+// executed work and is refused. Relaxed ordering is sufficient: concurrent
+// sections publish their worker increments through the thread `join` that ends
+// each sample, which establishes the happens-before the snapshot relies on.
+static FS_STATEMENTS_EXECUTED: AtomicU64 = AtomicU64::new(0);
+static FS_ROWS_RETURNED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one FrankenSQLite statement that ran to completion (execute or
+/// query). Call this only *after* the operation's future has been polled to
+/// completion and its result observed.
+#[inline]
+fn record_fsqlite_statement() {
+    FS_STATEMENTS_EXECUTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record `rows` rows genuinely materialised from a completed FrankenSQLite
+/// query. Pair with [`record_fsqlite_statement`] at each query site.
+#[inline]
+fn record_fsqlite_rows(rows: u64) {
+    FS_ROWS_RETURNED.fetch_add(rows, Ordering::Relaxed);
+}
+
+/// A snapshot of the executed-work meter. Diffing two snapshots yields the
+/// FrankenSQLite work performed between them.
+#[derive(Debug, Clone, Copy)]
+struct WorkMeterSnapshot {
+    statements: u64,
+    rows: u64,
+}
+
+/// Read the current executed-work meter.
+fn work_meter_snapshot() -> WorkMeterSnapshot {
+    WorkMeterSnapshot {
+        statements: FS_STATEMENTS_EXECUTED.load(Ordering::Relaxed),
+        rows: FS_ROWS_RETURNED.load(Ordering::Relaxed),
+    }
+}
+
+impl WorkMeterSnapshot {
+    /// `self` is the later (current) reading; `earlier` is the baseline taken
+    /// before the measured region. Returns `(statements, rows)` executed since
+    /// `earlier`. Saturating so a wrap can never fabricate a huge count (the
+    /// meter is monotonic in practice).
+    fn delta_since(self, earlier: WorkMeterSnapshot) -> (u64, u64) {
+        (
+            self.statements.saturating_sub(earlier.statements),
+            self.rows.saturating_sub(earlier.rows),
+        )
+    }
+}
 
 // ─── Configuration ─────────────────────────────────────────────────────
 
@@ -220,6 +288,15 @@ struct Measurement {
     label: String,
     durations: Vec<Duration>,
     row_count: usize,
+    // bd-h9pzn Gate 0 executed-work receipt: FrankenSQLite statements executed
+    // and rows returned inside this arm's *timed* region, captured by diffing
+    // the process-global work meter across each measured sample. Zero for the C
+    // SQLite reference arm (it never touches the FrankenSQLite meter) and for
+    // arms whose timed body executed no FrankenSQLite statement at all — the
+    // latter is the bd-i8pt6 "measured future construction" failure the
+    // emission gate refuses.
+    fs_statements_executed: u64,
+    fs_rows_returned: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -322,6 +399,8 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
 
     let mut durations = Vec::new();
     let mut total_elapsed = Duration::ZERO;
+    // bd-h9pzn: meter FrankenSQLite work across the measured region only.
+    let work_before = work_meter_snapshot();
 
     for iter in 0..MAX_ITERS {
         eprint!(
@@ -339,12 +418,16 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
             break;
         }
     }
+    let (fs_statements_executed, fs_rows_returned) =
+        work_meter_snapshot().delta_since(work_before);
     eprint!("\r{:80}\r", ""); // Clear progress line.
 
     Measurement {
         label: label.to_string(),
         durations,
         row_count,
+        fs_statements_executed,
+        fs_rows_returned,
     }
 }
 
@@ -401,6 +484,9 @@ where
     let mut fsqlite_durations = Vec::new();
     let mut csqlite_total = Duration::ZERO;
     let mut fsqlite_total = Duration::ZERO;
+    // bd-h9pzn: only the FrankenSQLite closure bumps the work meter, so the
+    // whole measured loop's delta is exactly the FrankenSQLite arm's work.
+    let work_before = work_meter_snapshot();
     for measured_iteration in 0..config.max_iters {
         eprint!(
             "\r    [{csqlite_label} / {fsqlite_label}] iter {}/{} \
@@ -442,6 +528,8 @@ where
             break;
         }
     }
+    let (fs_statements_executed, fs_rows_returned) =
+        work_meter_snapshot().delta_since(work_before);
     eprint!("\r{:80}\r", "");
 
     (
@@ -449,11 +537,15 @@ where
             label: csqlite_label.to_owned(),
             durations: csqlite_durations,
             row_count,
+            fs_statements_executed: 0,
+            fs_rows_returned: 0,
         },
         Measurement {
             label: fsqlite_label.to_owned(),
             durations: fsqlite_durations,
             row_count,
+            fs_statements_executed,
+            fs_rows_returned,
         },
     )
 }
@@ -531,6 +623,9 @@ where
     let mut fsqlite_durations = Vec::new();
     let mut csqlite_total = Duration::ZERO;
     let mut fsqlite_total = Duration::ZERO;
+    // bd-h9pzn: only the FrankenSQLite closure/teardown bumps the work meter,
+    // so the whole measured loop's delta is the FrankenSQLite arm's work.
+    let work_before = work_meter_snapshot();
     for measured_iteration in 0..config.max_iters {
         eprint!(
             "\r    [{csqlite_label} / {fsqlite_label}] iter {}/{} \
@@ -579,6 +674,8 @@ where
             break;
         }
     }
+    let (fs_statements_executed, fs_rows_returned) =
+        work_meter_snapshot().delta_since(work_before);
     eprint!("\r{:80}\r", "");
 
     (
@@ -586,11 +683,15 @@ where
             label: csqlite_label.to_owned(),
             durations: csqlite_durations,
             row_count,
+            fs_statements_executed: 0,
+            fs_rows_returned: 0,
         },
         Measurement {
             label: fsqlite_label.to_owned(),
             durations: fsqlite_durations,
             row_count,
+            fs_statements_executed,
+            fs_rows_returned,
         },
     )
 }
@@ -675,6 +776,10 @@ where
     let mut fsqlite_durations = Vec::new();
     let mut csqlite_total = Duration::ZERO;
     let mut fsqlite_total = Duration::ZERO;
+    // bd-h9pzn: only the FrankenSQLite workers bump the meter (their increments
+    // publish through the per-sample thread join), so the measured loop's delta
+    // is the FrankenSQLite arm's work.
+    let work_before = work_meter_snapshot();
     for measured_iteration in 0..config.max_iters {
         eprint!(
             "\r    [{csqlite_label} / {fsqlite_label}] iter {}/{} \
@@ -721,6 +826,8 @@ where
             break;
         }
     }
+    let (fs_statements_executed, fs_rows_returned) =
+        work_meter_snapshot().delta_since(work_before);
     eprint!("\r{:80}\r", "");
 
     (
@@ -729,6 +836,8 @@ where
                 label: csqlite_label.to_owned(),
                 durations: csqlite_durations,
                 row_count,
+                fs_statements_executed: 0,
+                fs_rows_returned: 0,
             },
             csqlite_readiness,
         ),
@@ -737,6 +846,8 @@ where
                 label: fsqlite_label.to_owned(),
                 durations: fsqlite_durations,
                 row_count,
+                fs_statements_executed,
+                fs_rows_returned,
             },
             fsqlite_readiness,
         ),
@@ -810,8 +921,11 @@ where
 
 /// `conn.execute(sql)` with BusySnapshot/Busy retry.
 fn fs_execute(conn: &fsqlite::Connection, sql: &str) -> usize {
-    retry_on_busy(|| fsqlite_e2e::block_on(conn.execute(sql)))
-        .unwrap_or_else(|e| panic!("fsqlite execute failed after retries: {e} (sql={sql})"))
+    let affected = retry_on_busy(|| fsqlite_e2e::block_on(conn.execute(sql)))
+        .unwrap_or_else(|e| panic!("fsqlite execute failed after retries: {e} (sql={sql})"));
+    // bd-h9pzn: count only after the execute future ran to completion.
+    record_fsqlite_statement();
+    affected
 }
 
 /// `conn.prepare(sql)` driven to completion on the crate-local runtime.
@@ -832,9 +946,13 @@ fn fs_stmt_execute_with_params(
     stmt: &fsqlite::PreparedStatement<'_>,
     params: &[fsqlite::SqliteValue],
 ) -> usize {
-    retry_on_busy(|| fsqlite_e2e::block_on(stmt.execute_with_params(params))).unwrap_or_else(|e| {
-        panic!("fsqlite prepared execute_with_params failed after retries: {e}")
-    })
+    let affected = retry_on_busy(|| fsqlite_e2e::block_on(stmt.execute_with_params(params)))
+        .unwrap_or_else(|e| {
+            panic!("fsqlite prepared execute_with_params failed after retries: {e}")
+        });
+    // bd-h9pzn: count only after the execute future ran to completion.
+    record_fsqlite_statement();
+    affected
 }
 
 /// Async twin of [`retry_on_busy`] for bodies that run inside a single
@@ -868,9 +986,12 @@ where
 /// operation — the per-op entry cost ~333 ns was inflating every
 /// FrankenSQLite write sample while the rusqlite arm paid nothing).
 async fn fs_execute_async(conn: &fsqlite::Connection, sql: &str) -> usize {
-    retry_on_busy_async(|| conn.execute(sql))
+    let affected = retry_on_busy_async(|| conn.execute(sql))
         .await
-        .unwrap_or_else(|e| panic!("fsqlite execute failed after retries: {e} (sql={sql})"))
+        .unwrap_or_else(|e| panic!("fsqlite execute failed after retries: {e} (sql={sql})"));
+    // bd-h9pzn: count only after the execute future ran to completion.
+    record_fsqlite_statement();
+    affected
 }
 
 /// Async twin of [`fs_prepare`].
@@ -888,11 +1009,103 @@ async fn fs_stmt_execute_with_params_async(
     stmt: &fsqlite::PreparedStatement<'_>,
     params: &[fsqlite::SqliteValue],
 ) -> usize {
-    retry_on_busy_async(|| stmt.execute_with_params(params))
+    let affected = retry_on_busy_async(|| stmt.execute_with_params(params))
         .await
         .unwrap_or_else(|e| {
             panic!("fsqlite prepared execute_with_params failed after retries: {e}")
-        })
+        });
+    // bd-h9pzn: count only after the execute future ran to completion.
+    record_fsqlite_statement();
+    affected
+}
+
+// ─── Metered FrankenSQLite read helpers (Gate 0, bd-h9pzn) ─────────────
+//
+// Every timed FrankenSQLite read goes through one of these so the
+// executed-work meter records a statement and the rows genuinely
+// materialised. A dropped/unpolled query future never reaches the record
+// call, so a reader arm that measured future construction (bd-i8pt6) reads
+// as zero executed work and is refused at artifact emission.
+
+/// `block_on(stmt.query())`, metered. Returns the materialised rows.
+fn fs_stmt_query(stmt: &fsqlite::PreparedStatement<'_>) -> Vec<fsqlite::Row> {
+    let rows = fsqlite_e2e::block_on(stmt.query())
+        .unwrap_or_else(|e| panic!("fsqlite query failed: {e}"));
+    record_fsqlite_statement();
+    record_fsqlite_rows(rows.len() as u64);
+    rows
+}
+
+/// `block_on(stmt.query_with_params(params))`, metered.
+fn fs_stmt_query_with_params(
+    stmt: &fsqlite::PreparedStatement<'_>,
+    params: &[fsqlite::SqliteValue],
+) -> Vec<fsqlite::Row> {
+    let rows = fsqlite_e2e::block_on(stmt.query_with_params(params))
+        .unwrap_or_else(|e| panic!("fsqlite query_with_params failed: {e}"));
+    record_fsqlite_statement();
+    record_fsqlite_rows(rows.len() as u64);
+    rows
+}
+
+/// `block_on(stmt.query_row())`, metered.
+fn fs_stmt_query_row(stmt: &fsqlite::PreparedStatement<'_>) -> fsqlite::Row {
+    let row = fsqlite_e2e::block_on(stmt.query_row())
+        .unwrap_or_else(|e| panic!("fsqlite query_row failed: {e}"));
+    record_fsqlite_statement();
+    record_fsqlite_rows(1);
+    row
+}
+
+/// `block_on(stmt.query_row_with_params(params))`, metered.
+fn fs_stmt_query_row_with_params(
+    stmt: &fsqlite::PreparedStatement<'_>,
+    params: &[fsqlite::SqliteValue],
+) -> fsqlite::Row {
+    let row = fsqlite_e2e::block_on(stmt.query_row_with_params(params))
+        .unwrap_or_else(|e| panic!("fsqlite query_row_with_params failed: {e}"));
+    record_fsqlite_statement();
+    record_fsqlite_rows(1);
+    row
+}
+
+/// Async twin of [`fs_stmt_query_with_params`].
+async fn fs_stmt_query_with_params_async(
+    stmt: &fsqlite::PreparedStatement<'_>,
+    params: &[fsqlite::SqliteValue],
+) -> Vec<fsqlite::Row> {
+    let rows = stmt
+        .query_with_params(params)
+        .await
+        .unwrap_or_else(|e| panic!("fsqlite query_with_params failed: {e}"));
+    record_fsqlite_statement();
+    record_fsqlite_rows(rows.len() as u64);
+    rows
+}
+
+/// Async twin of [`fs_stmt_query_row`].
+async fn fs_stmt_query_row_async(stmt: &fsqlite::PreparedStatement<'_>) -> fsqlite::Row {
+    let row = stmt
+        .query_row()
+        .await
+        .unwrap_or_else(|e| panic!("fsqlite query_row failed: {e}"));
+    record_fsqlite_statement();
+    record_fsqlite_rows(1);
+    row
+}
+
+/// Async twin for `stmt.query_row_with_params(params).await`.
+async fn fs_stmt_query_row_with_params_async(
+    stmt: &fsqlite::PreparedStatement<'_>,
+    params: &[fsqlite::SqliteValue],
+) -> fsqlite::Row {
+    let row = stmt
+        .query_row_with_params(params)
+        .await
+        .unwrap_or_else(|e| panic!("fsqlite query_row_with_params failed: {e}"));
+    record_fsqlite_statement();
+    record_fsqlite_rows(1);
+    row
 }
 
 fn bench_env_flag(name: &str) -> bool {
@@ -1340,9 +1553,14 @@ fn collect_fsqlite_oracle_rows(
     sql: &str,
     context: &str,
 ) -> Vec<Vec<ExactOracleValue>> {
-    fsqlite_e2e::block_on(conn.query(sql))
-        .unwrap_or_else(|error| panic!("{context}: FrankenSQLite query failed: {error}"))
-        .iter()
+    let rows = fsqlite_e2e::block_on(conn.query(sql))
+        .unwrap_or_else(|error| panic!("{context}: FrankenSQLite query failed: {error}"));
+    // bd-h9pzn: oracle queries run outside the timed window, but metering them
+    // keeps the work meter a faithful count of every FrankenSQLite statement
+    // executed and never under-counts an arm that reads through this helper.
+    record_fsqlite_statement();
+    record_fsqlite_rows(rows.len() as u64);
+    rows.iter()
         .map(|row| {
             row.values()
                 .iter()
@@ -2519,6 +2737,14 @@ struct JsonMeasurement {
     rows_per_sec: f64,
     us_per_row: f64,
     iterations: usize,
+    // bd-h9pzn Gate 0 executed-work receipt. `fs_statements_executed` is the
+    // number of FrankenSQLite statements this arm ran to completion inside its
+    // timed region; `fs_rows_returned` is the rows those queries materialised.
+    // Zero on the C SQLite reference arm by construction. Artifact emission is
+    // refused when a FrankenSQLite arm that produced timing samples executed
+    // zero statements (the bd-i8pt6 "measured future construction" failure).
+    fs_statements_executed: u64,
+    fs_rows_returned: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -2990,6 +3216,8 @@ impl JsonMeasurement {
             rows_per_sec: measurement.rows_per_sec(),
             us_per_row: measurement.us_per_row(),
             iterations: measurement.iter_count(),
+            fs_statements_executed: measurement.fs_statements_executed,
+            fs_rows_returned: measurement.fs_rows_returned,
         }
     }
 }
@@ -5116,7 +5344,7 @@ fn benchmark_json_schema() -> serde_json::Value {
             "measurement": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["samples_ns", "median_ms", "mean_ms", "min_ms", "p95_ms", "p99_ms", "stddev_ms", "cv_pct", "rows_per_sec", "us_per_row", "iterations"],
+                "required": ["samples_ns", "median_ms", "mean_ms", "min_ms", "p95_ms", "p99_ms", "stddev_ms", "cv_pct", "rows_per_sec", "us_per_row", "iterations", "fs_statements_executed", "fs_rows_returned"],
                 "properties": {
                     "samples_ns": {
                         "type": "array",
@@ -5132,7 +5360,9 @@ fn benchmark_json_schema() -> serde_json::Value {
                     "cv_pct": {"type": "number", "minimum": 0},
                     "rows_per_sec": {"type": "number", "minimum": 0},
                     "us_per_row": {"type": "number", "minimum": 0},
-                    "iterations": {"type": "integer", "minimum": 1}
+                    "iterations": {"type": "integer", "minimum": 1},
+                    "fs_statements_executed": {"type": "integer", "minimum": 0},
+                    "fs_rows_returned": {"type": "integer", "minimum": 0}
                 }
             },
             "fsqlite_concurrent_profile": {
@@ -8303,7 +8533,10 @@ fn execute_fsqlite_concurrent_transaction(
                     .execute_with_params(&[fsqlite::SqliteValue::Integer(base + row_index)])
                     .await
                 {
-                    Ok(1) => {}
+                    Ok(1) => {
+                        // bd-h9pzn: count each committed-path INSERT that ran.
+                        record_fsqlite_statement();
+                    }
                     Ok(affected) => {
                         let _ = conn.execute("ROLLBACK").await;
                         return Err(format!(
@@ -9147,7 +9380,73 @@ mod tests {
                 .map(|ms| Duration::from_millis(*ms))
                 .collect(),
             row_count,
+            // Plausible nonzero executed-work receipt so fixtures pass the
+            // bd-h9pzn fail-closed gate; zero-work arms are built explicitly.
+            fs_statements_executed: (row_count as u64).max(1),
+            fs_rows_returned: row_count as u64,
         }
+    }
+
+    /// A FrankenSQLite arm that produced timing samples but recorded zero
+    /// executed statements — the bd-i8pt6 "measured future construction"
+    /// failure the Gate 0 receipt exists to catch.
+    fn zero_work_fsqlite_measurement(label: &str, durations_ms: &[u64]) -> Measurement {
+        Measurement {
+            fs_statements_executed: 0,
+            fs_rows_returned: 0,
+            ..sample_measurement(label, 100, durations_ms)
+        }
+    }
+
+    #[test]
+    fn fsqlite_executed_work_gate_refuses_zero_work_arm() {
+        // A well-formed arm (nonzero executed work) passes the gate.
+        let mut healthy = BenchReport::new();
+        healthy.add_section("Read-after-write", "full scan").add_row(
+            "100 rows / full table scan",
+            Some(sample_measurement("cs_scan", 100, &[5, 6])),
+            Some(sample_measurement("fs_scan", 100, &[7, 8])),
+        );
+        assert!(
+            fsqlite_executed_work_errors(&healthy).is_empty(),
+            "an arm with a nonzero executed-work receipt must be citable"
+        );
+
+        // A FrankenSQLite arm that produced timing samples yet executed zero
+        // statements must be refused, and the error must name the arm.
+        let mut zero_work = BenchReport::new();
+        zero_work.add_section("Read-after-write", "full scan").add_row(
+            "100 rows / full table scan",
+            Some(sample_measurement("cs_scan", 100, &[5, 6])),
+            Some(zero_work_fsqlite_measurement("fs_scan", &[7, 8])),
+        );
+        let errors = fsqlite_executed_work_errors(&zero_work);
+        assert_eq!(
+            errors.len(),
+            1,
+            "a zero-work FrankenSQLite arm must produce exactly one fail-closed error"
+        );
+        assert!(
+            errors[0].contains("fs_scan") && errors[0].contains("zero FrankenSQLite statements"),
+            "the fail-closed error must name the offending arm: {}",
+            errors[0]
+        );
+
+        // The C SQLite reference arm carries a zero receipt by construction and
+        // must never be gated; and a FrankenSQLite arm with no timing samples
+        // did not run and makes no claim to back.
+        let mut reference_only = BenchReport::new();
+        reference_only
+            .add_section("Read-after-write", "full scan")
+            .add_row(
+                "100 rows / full table scan",
+                Some(zero_work_fsqlite_measurement("cs_scan", &[5, 6])),
+                Some(zero_work_fsqlite_measurement("fs_scan", &[])),
+            );
+        assert!(
+            fsqlite_executed_work_errors(&reference_only).is_empty(),
+            "a reference-only zero receipt and an unmeasured arm must not fail closed"
+        );
     }
 
     fn sample_fsqlite_concurrent_profile() -> JsonFsqliteConcurrentProfile {
@@ -11818,7 +12117,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut cs_stmt, []).unwrap();
             },
             || {
-                let _rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
+                let _rows = fs_stmt_query(&fs_stmt);
             },
         );
         drop(cs_stmt);
@@ -11856,10 +12155,11 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 // (bd-zavyn hoist); both arms run identical statements.
                 fsqlite_e2e::block_on(async {
                     for _ in 0..TINY_READ_QUERIES_PER_SAMPLE {
-                        let _row = fs_stmt
-                            .query_row_with_params(&[fsqlite::SqliteValue::Integer(target_id)])
-                            .await
-                            .unwrap();
+                        let _row = fs_stmt_query_row_with_params_async(
+                            &fs_stmt,
+                            &[fsqlite::SqliteValue::Integer(target_id)],
+                        )
+                        .await;
                     }
                 });
             },
@@ -11897,11 +12197,13 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                         .unwrap();
             },
             || {
-                let _rows = fsqlite_e2e::block_on(fs_stmt.query_with_params(&[
-                    fsqlite::SqliteValue::Integer(range_start),
-                    fsqlite::SqliteValue::Integer(range_end),
-                ]))
-                .unwrap();
+                let _rows = fs_stmt_query_with_params(
+                    &fs_stmt,
+                    &[
+                        fsqlite::SqliteValue::Integer(range_start),
+                        fsqlite::SqliteValue::Integer(range_end),
+                    ],
+                );
             },
         );
         drop(cs_stmt);
@@ -11935,7 +12237,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 // (bd-zavyn hoist); both arms run identical statements.
                 fsqlite_e2e::block_on(async {
                     for _ in 0..TINY_READ_QUERIES_PER_SAMPLE {
-                        let _row = fs_stmt.query_row().await.unwrap();
+                        let _row = fs_stmt_query_row_async(&fs_stmt).await;
                     }
                 });
             },
@@ -11967,7 +12269,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut cs_stmt, []).unwrap();
             },
             || {
-                let _rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
+                let _rows = fs_stmt_query(&fs_stmt);
             },
         );
         drop(cs_stmt);
@@ -12017,7 +12319,8 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 // (bd-zavyn hoist); both arms run identical statements.
                 fsqlite_e2e::block_on(async {
                     for _ in 0..TINY_READ_QUERIES_PER_SAMPLE {
-                        let _rows = fs_stmt.query_with_params(&target_name_param).await.unwrap();
+                        let _rows =
+                            fs_stmt_query_with_params_async(&fs_stmt, &target_name_param).await;
                     }
                 });
             },
@@ -12080,7 +12383,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut cs_stmt, []).unwrap();
             },
             || {
-                let _rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
+                let _rows = fs_stmt_query(&fs_stmt);
             },
         );
         drop(cs_stmt);
@@ -12699,59 +13002,62 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
                     if roll < 40 {
                         let id = (rng.next_usize(seed_rows) + 1) as i64;
                         std::hint::black_box(
-                            select_pt
-                                .query_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                                .await
-                                .unwrap(),
+                            fs_stmt_query_with_params_async(
+                                &select_pt,
+                                &[fsqlite::SqliteValue::Integer(id)],
+                            )
+                            .await,
                         );
                     } else if roll < 60 {
                         let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
                         std::hint::black_box(
-                            select_range
-                                .query_row_with_params(&[
+                            fs_stmt_query_row_with_params_async(
+                                &select_range,
+                                &[
                                     fsqlite::SqliteValue::Integer(start),
                                     fsqlite::SqliteValue::Integer(start + 50),
-                                ])
-                                .await
-                                .unwrap(),
+                                ],
+                            )
+                            .await,
                         );
                     } else if roll < 80 {
-                        std::hint::black_box(select_agg.query_row().await.unwrap());
+                        std::hint::black_box(fs_stmt_query_row_async(&select_agg).await);
                     } else if roll < 95 {
                         std::hint::black_box(
-                            insert
-                                .execute_with_params(&[fsqlite::SqliteValue::Integer(next_id)])
-                                .await
-                                .unwrap(),
+                            fs_stmt_execute_with_params_async(
+                                &insert,
+                                &[fsqlite::SqliteValue::Integer(next_id)],
+                            )
+                            .await,
                         );
                         next_id += 1;
                     } else if roll < 98 {
                         let id = (rng.next_usize(seed_rows) + 1) as i64;
                         std::hint::black_box(
-                            update
-                                .execute_with_params(&[
+                            fs_stmt_execute_with_params_async(
+                                &update,
+                                &[
                                     fsqlite::SqliteValue::Integer(id),
                                     fsqlite::SqliteValue::Integer(id * 99),
-                                ])
-                                .await
-                                .unwrap(),
+                                ],
+                            )
+                            .await,
                         );
                     } else {
                         let id = (rng.next_usize(seed_rows) + 1) as i64;
                         std::hint::black_box(
-                            delete
-                                .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                                .await
-                                .unwrap(),
+                            fs_stmt_execute_with_params_async(
+                                &delete,
+                                &[fsqlite::SqliteValue::Integer(id)],
+                            )
+                            .await,
                         );
                     }
                 }
-                let final_state =
+                let final_stmt =
                     fs_prepare_async(&conn, "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench")
-                        .await
-                        .query_row()
-                        .await
-                        .unwrap();
+                        .await;
+                let final_state = fs_stmt_query_row_async(&final_stmt).await;
                 std::hint::black_box(final_state);
             });
         },
@@ -12881,7 +13187,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut cs_stmt, []).unwrap();
             },
             || {
-                std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
+                std::hint::black_box(fs_stmt_query(&fs_stmt));
             },
         );
         drop(cs_stmt);
@@ -12914,7 +13220,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut cs_stmt, []).unwrap();
             },
             || {
-                std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
+                std::hint::black_box(fs_stmt_query(&fs_stmt));
             },
         );
         drop(cs_stmt);
@@ -12946,7 +13252,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut cs_stmt, []).unwrap();
             },
             || {
-                std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
+                std::hint::black_box(fs_stmt_query(&fs_stmt));
             },
         );
         drop(cs_stmt);
@@ -12984,7 +13290,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut cs_stmt, []).unwrap();
             },
             || {
-                std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
+                std::hint::black_box(fs_stmt_query(&fs_stmt));
             },
         );
         drop(cs_stmt);
@@ -13104,7 +13410,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut cs_stmt, []).unwrap();
             },
             || {
-                std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
+                std::hint::black_box(fs_stmt_query(&fs_stmt));
             },
         );
         drop(cs_stmt);
@@ -13150,10 +13456,10 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                 std::hint::black_box(value);
             },
             |threshold| {
-                let row = fsqlite_e2e::block_on(
-                    fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
-                )
-                .unwrap();
+                let row = fs_stmt_query_row_with_params(
+                    &fs_stmt,
+                    &[fsqlite::SqliteValue::Integer(threshold)],
+                );
                 std::hint::black_box(fsqlite_integer(&row, 0, "EXISTS measurement"));
             },
         );
@@ -13196,10 +13502,10 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                 std::hint::black_box(value);
             },
             |threshold| {
-                let row = fsqlite_e2e::block_on(
-                    fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
-                )
-                .unwrap();
+                let row = fs_stmt_query_row_with_params(
+                    &fs_stmt,
+                    &[fsqlite::SqliteValue::Integer(threshold)],
+                );
                 std::hint::black_box(fsqlite_integer(&row, 0, "IN-subquery measurement"));
             },
         );
@@ -13235,7 +13541,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut cs_stmt, []).unwrap();
             },
             || {
-                std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
+                std::hint::black_box(fs_stmt_query(&fs_stmt));
             },
         );
         drop(cs_stmt);
@@ -13274,7 +13580,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             std::hint::black_box(value);
         },
         || {
-            let row = fsqlite_e2e::block_on(fs_stmt.query_row()).unwrap();
+            let row = fs_stmt_query_row(&fs_stmt);
             let value = fsqlite_integer(&row, 0, "specialized recursive CTE");
             assert_eq!(value, 500_500);
             std::hint::black_box(value);
@@ -13317,7 +13623,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             std::hint::black_box(value);
         },
         || {
-            let row = fsqlite_e2e::block_on(fs_stmt.query_row()).unwrap();
+            let row = fs_stmt_query_row(&fs_stmt);
             let value = fsqlite_integer(&row, 0, "general recursive CTE");
             assert_eq!(value, 1_000);
             std::hint::black_box(value);
@@ -13423,7 +13729,7 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 std::hint::black_box(value);
             },
             || {
-                let row = fsqlite_e2e::block_on(fs_stmt.query_row()).unwrap();
+                let row = fs_stmt_query_row(&fs_stmt);
                 std::hint::black_box(fsqlite_integer(&row, 0, "LIKE prefix COUNT"));
             },
         );
@@ -13458,7 +13764,7 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 std::hint::black_box(value);
             },
             || {
-                let row = fsqlite_e2e::block_on(fs_stmt.query_row()).unwrap();
+                let row = fs_stmt_query_row(&fs_stmt);
                 std::hint::black_box(fsqlite_integer(&row, 0, "LIKE wildcard COUNT"));
             },
         );
@@ -13493,7 +13799,7 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 std::hint::black_box(rows);
             },
             || {
-                let rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
+                let rows = fs_stmt_query(&fs_stmt);
                 std::hint::black_box(rows);
             },
         );
@@ -13528,7 +13834,7 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 std::hint::black_box(rows);
             },
             || {
-                let rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
+                let rows = fs_stmt_query(&fs_stmt);
                 std::hint::black_box(rows);
             },
         );
@@ -16964,6 +17270,42 @@ fn print_json_report<T: Serialize>(report: &T) {
     }
 }
 
+/// bd-h9pzn Gate 0: one error per emitted FrankenSQLite arm that produced
+/// timing samples yet executed zero FrankenSQLite statements. A benchmark arm
+/// that timed future construction rather than execution (bd-i8pt6) surfaces
+/// here as a zero-work receipt and is refused before any artifact is written.
+///
+/// Only FrankenSQLite (subject-under-test) arms are gated: their zero-work is
+/// what would forge a release claim. The C SQLite reference arm never touches
+/// the FrankenSQLite work meter, so its receipt is zero by construction and is
+/// intentionally not gated. An arm with no timing samples did not run (e.g. a
+/// `--filter` excluded it) and makes no throughput claim, so it is skipped.
+fn fsqlite_executed_work_errors(report: &BenchReport) -> Vec<String> {
+    let mut errors = Vec::new();
+    for section in &report.sections {
+        for row in &section.rows {
+            let Some(fsqlite) = &row.fsqlite else {
+                continue;
+            };
+            if fsqlite.durations.is_empty() {
+                continue;
+            }
+            if fsqlite.fs_statements_executed == 0 {
+                errors.push(format!(
+                    "FrankenSQLite arm `{}` (section `{}`, scenario `{}`) produced {} timing \
+                     sample(s) but executed zero FrankenSQLite statements — bd-h9pzn/bd-i8pt6: \
+                     the arm measured work it never performed",
+                    fsqlite.label,
+                    section.title,
+                    row.scenario,
+                    fsqlite.durations.len(),
+                ));
+            }
+        }
+    }
+    errors
+}
+
 fn main() {
     // bd-b4mwn: opt-in engine-warning capture for contention diagnosis. The
     // bench deliberately runs subscriber-free for timing (RUST_LOG has no
@@ -17171,12 +17513,22 @@ fn main() {
         report.print(total_elapsed, &environment);
     }
     provenance.verify_runtime_source_unchanged();
+    // bd-h9pzn Gate 0: a FrankenSQLite arm that produced timing samples but
+    // executed zero statements measured future construction, not execution
+    // (bd-i8pt6). Fold those into the provenance validation errors so the
+    // existing fail-closed emission gate refuses the artifact.
+    if artifact_requested {
+        for error in fsqlite_executed_work_errors(&report) {
+            provenance.validation_errors.push(error);
+        }
+        provenance.refresh_validation_status();
+    }
     if artifact_requested && !provenance.citable {
         if options.allow_unverified_provenance {
             provenance.mark_explicit_override();
         } else {
             eprintln!(
-                "ERROR: source provenance changed during the benchmark; no artifact emitted:"
+                "ERROR: benchmark provenance is not citable; no artifact emitted:"
             );
             for error in &provenance.validation_errors {
                 eprintln!("  - {error}");

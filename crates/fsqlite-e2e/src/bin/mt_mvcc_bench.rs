@@ -1738,6 +1738,9 @@ struct WorkAccounting {
     failed_writes: usize,
     /// Failure count independently reported by the worker loops.
     worker_reported_failed_writes: usize,
+    // Physical INSERT statement executions whose affected-row result was actually consumed — proves the statement ran rather than a future being constructed and dropped (bd-h9pzn/bd-i8pt6).
+    #[serde(default)]
+    statements_executed: u64,
     exact: bool,
     diagnostics: Vec<String>,
 }
@@ -2267,6 +2270,10 @@ struct WorkerWork {
     attempted_writes: usize,
     retried_operations: usize,
     reported_failed_writes: usize,
+    // Successful physical INSERT executions this worker actually performed
+    // (each with its affected-row result consumed) — proves statements ran
+    // rather than futures being constructed and dropped (bd-h9pzn/bd-i8pt6).
+    statements_executed: u64,
     workload_finished: Instant,
 }
 
@@ -2294,6 +2301,7 @@ struct WorkerAggregate {
     attempted_writes: usize,
     retried_operations: usize,
     reported_failed_writes: usize,
+    statements_executed: u64,
     workload_finished: Instant,
 }
 
@@ -2347,6 +2355,7 @@ fn join_worker_handles(
     let mut attempted_writes = 0usize;
     let mut retried_operations = 0usize;
     let mut reported_failed_writes = 0usize;
+    let mut statements_executed = 0u64;
     let mut workload_finished = None::<Instant>;
     let mut errors = Vec::new();
 
@@ -2381,6 +2390,10 @@ fn join_worker_handles(
             Some(total) => reported_failed_writes = total,
             None => errors.push(format!("{engine} aggregate failure overflow")),
         }
+        match statements_executed.checked_add(work.statements_executed) {
+            Some(total) => statements_executed = total,
+            None => errors.push(format!("{engine} aggregate executed-statement overflow")),
+        }
         workload_finished = Some(workload_finished.map_or(work.workload_finished, |current| {
             current.max(work.workload_finished)
         }));
@@ -2395,6 +2408,7 @@ fn join_worker_handles(
         attempted_writes,
         retried_operations,
         reported_failed_writes,
+        statements_executed,
         workload_finished,
     })
 }
@@ -2906,6 +2920,8 @@ fn sample_evidence_is_valid(sample: &SampleEvidence) -> bool {
         && accounting.succeeded_writes == accounting.offered_writes
         && accounting.failed_writes == 0
         && accounting.worker_reported_failed_writes == 0
+        && accounting.statements_executed > 0
+        && accounting.statements_executed >= accounting.succeeded_writes as u64
         && committed.valid
         && committed.diagnostics.is_empty()
         && committed.expected_rows == accounting.succeeded_writes
@@ -4029,6 +4045,7 @@ fn build_work_accounting(
     retried_operations: usize,
     worker_reported_failed_writes: usize,
     committed_writes: usize,
+    statements_executed: u64,
 ) -> WorkAccounting {
     let mut diagnostics = Vec::new();
     let failed_writes = if committed_writes <= offered_writes {
@@ -4064,6 +4081,7 @@ fn build_work_accounting(
         retried_operations,
         failed_writes,
         worker_reported_failed_writes,
+        statements_executed,
         exact: diagnostics.is_empty(),
         diagnostics,
     }
@@ -4214,9 +4232,10 @@ fn run_fsqlite_one_row_transactions(
     base: i64,
     rows_per_thread: usize,
     worker_retry_deadline: OneRowWorkerRetryDeadline,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize, u64), String> {
     let mut attempted_writes = 0usize;
     let mut retried_transactions = 0usize;
+    let mut statements_executed = 0u64;
     for row_index in 0..rows_per_thread {
         let row_index = i64::try_from(row_index)
             .map_err(|_| format!("[fsqlite t{tid}] row index exceeds i64"))?;
@@ -4251,11 +4270,24 @@ fn run_fsqlite_one_row_transactions(
                 attempted_writes = attempted_writes
                     .checked_add(1)
                     .ok_or_else(|| format!("[fsqlite t{tid}] write-attempt counter overflow"))?;
-                if let Err(error) = stmt.execute_with_params(&params).await {
-                    return Ok(OneRowAttempt::RollbackRequired {
-                        stage: OneRowRetryStage::Insert,
-                        error,
-                    });
+                match stmt.execute_with_params(&params).await {
+                    Ok(affected) => {
+                        // Consume the affected-row result so this INSERT is
+                        // proven to have physically executed rather than a
+                        // future being constructed and dropped unpolled
+                        // (bd-h9pzn/bd-i8pt6).
+                        let _affected = affected;
+                        statements_executed =
+                            statements_executed.checked_add(1).ok_or_else(|| {
+                                format!("[fsqlite t{tid}] executed-statement counter overflow")
+                            })?;
+                    }
+                    Err(error) => {
+                        return Ok(OneRowAttempt::RollbackRequired {
+                            stage: OneRowRetryStage::Insert,
+                            error,
+                        });
+                    }
                 }
 
                 match conn.execute("COMMIT").await {
@@ -4331,7 +4363,7 @@ fn run_fsqlite_one_row_transactions(
             thread::sleep(wait);
         }
     }
-    Ok((attempted_writes, retried_transactions))
+    Ok((attempted_writes, retried_transactions, statements_executed))
 }
 
 fn run_rusqlite_one_row_transactions(
@@ -4341,9 +4373,10 @@ fn run_rusqlite_one_row_transactions(
     base: i64,
     rows_per_thread: usize,
     retry_timeout: Duration,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize, u64), String> {
     let mut attempted_writes = 0usize;
     let mut retried_transactions = 0usize;
+    let mut statements_executed = 0u64;
     let worker_retry_deadline = OneRowWorkerRetryDeadline::new(retry_timeout);
     for row_index in 0..rows_per_thread {
         let row_index = i64::try_from(row_index)
@@ -4379,32 +4412,43 @@ fn run_rusqlite_one_row_transactions(
             attempted_writes = attempted_writes
                 .checked_add(1)
                 .ok_or_else(|| format!("[sqlite t{tid}] write-attempt counter overflow"))?;
-            if let Err(error) = stmt.execute(rusqlite::params![id, &payload]) {
-                conn.execute_batch("ROLLBACK").map_err(|rollback_error| {
-                    format!(
-                        "[sqlite t{tid}] one-row INSERT failed for id {id}: {error}; mandatory \
-                         rollback also failed: {rollback_error}"
-                    )
-                })?;
-                if one_row_failure_disposition(
-                    OneRowRetryStage::Insert,
-                    csqlite_error_is_retryable(&error),
-                    Some(true),
-                ) == OneRowFailureDisposition::Retry
-                    && worker_retry_deadline.allows_retry(retries)
-                {
-                    retries += 1;
-                    retried_transactions = retried_transactions
+            match stmt.execute(rusqlite::params![id, &payload]) {
+                Ok(affected) => {
+                    // Consume the affected-row result so this INSERT is proven
+                    // to have physically executed rather than a future being
+                    // constructed and dropped unpolled (bd-h9pzn/bd-i8pt6).
+                    let _affected = affected;
+                    statements_executed = statements_executed
                         .checked_add(1)
-                        .ok_or_else(|| format!("[sqlite t{tid}] retry counter overflow"))?;
-                    thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
-                    continue;
+                        .ok_or_else(|| format!("[sqlite t{tid}] executed-statement counter overflow"))?;
                 }
-                return Err(format!(
-                    "[sqlite t{tid}] one-row INSERT failed for id {id} after {retries} retries: \
-                     {error}; duplicate and constraint errors are fail-closed and are never \
-                     accepted as proof of the intended id+payload"
-                ));
+                Err(error) => {
+                    conn.execute_batch("ROLLBACK").map_err(|rollback_error| {
+                        format!(
+                            "[sqlite t{tid}] one-row INSERT failed for id {id}: {error}; mandatory \
+                             rollback also failed: {rollback_error}"
+                        )
+                    })?;
+                    if one_row_failure_disposition(
+                        OneRowRetryStage::Insert,
+                        csqlite_error_is_retryable(&error),
+                        Some(true),
+                    ) == OneRowFailureDisposition::Retry
+                        && worker_retry_deadline.allows_retry(retries)
+                    {
+                        retries += 1;
+                        retried_transactions = retried_transactions
+                            .checked_add(1)
+                            .ok_or_else(|| format!("[sqlite t{tid}] retry counter overflow"))?;
+                        thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
+                        continue;
+                    }
+                    return Err(format!(
+                        "[sqlite t{tid}] one-row INSERT failed for id {id} after {retries} retries: \
+                         {error}; duplicate and constraint errors are fail-closed and are never \
+                         accepted as proof of the intended id+payload"
+                    ));
+                }
             }
 
             match conn.execute_batch("COMMIT") {
@@ -4439,7 +4483,7 @@ fn run_rusqlite_one_row_transactions(
             }
         }
     }
-    Ok((attempted_writes, retried_transactions))
+    Ok((attempted_writes, retried_transactions, statements_executed))
 }
 
 fn open_fsqlite_worker(
@@ -4553,14 +4597,15 @@ fn run_fsqlite(
                     worker_retry_deadline,
                     |worker_conn| fsqlite_e2e::block_on(worker_conn.prepare(&insert_sql)),
                 )?;
-                let (attempted_writes, transaction_retries) = run_fsqlite_one_row_transactions(
-                    &conn,
-                    &stmt,
-                    tid,
-                    base,
-                    rows_per_thread,
-                    worker_retry_deadline,
-                )?;
+                let (attempted_writes, transaction_retries, statements_executed) =
+                    run_fsqlite_one_row_transactions(
+                        &conn,
+                        &stmt,
+                        tid,
+                        base,
+                        rows_per_thread,
+                        worker_retry_deadline,
+                    )?;
                 let retried_operations = prepare_retries
                     .checked_add(transaction_retries)
                     .ok_or_else(|| format!("[fsqlite t{tid}] retry counter overflow"))?;
@@ -4569,6 +4614,7 @@ fn run_fsqlite(
                     attempted_writes,
                     retried_operations,
                     reported_failed_writes: 0,
+                    statements_executed,
                     workload_finished: Instant::now(),
                 });
             }
@@ -4593,6 +4639,7 @@ fn run_fsqlite(
             let mut retry_budget = FsqliteRetryBudget::new(retry_timeout);
             let mut attempted_writes = 0usize;
             let mut retried_operations = 0usize;
+            let mut statements_executed = 0u64;
             let final_failed = loop {
                 let mut attempt_failed = 0usize;
                 let outcome = fsqlite_e2e::block_on(async {
@@ -4626,7 +4673,19 @@ fn run_fsqlite(
                             format!("[fsqlite t{tid}] write-attempt counter overflow")
                         })?;
                         match stmt.execute_with_params(&params).await {
-                            Ok(_) => {}
+                            Ok(affected) => {
+                                // Consume the affected-row result so this INSERT
+                                // is proven to have physically executed rather
+                                // than a future being constructed and dropped
+                                // unpolled (bd-h9pzn/bd-i8pt6).
+                                let _affected = affected;
+                                statements_executed =
+                                    statements_executed.checked_add(1).ok_or_else(|| {
+                                        format!(
+                                            "[fsqlite t{tid}] executed-statement counter overflow"
+                                        )
+                                    })?;
+                            }
                             Err(e) if fsqlite_error_is_retryable(&e) => {
                                 let _ = conn.execute("ROLLBACK").await;
                                 return Ok(Some((TxnRetry::Insert(id), e.to_string())));
@@ -4698,6 +4757,7 @@ fn run_fsqlite(
                 attempted_writes,
                 retried_operations,
                 reported_failed_writes: final_failed,
+                statements_executed,
                 workload_finished: Instant::now(),
             })
         });
@@ -4748,6 +4808,7 @@ fn run_fsqlite(
         work.retried_operations,
         work.reported_failed_writes,
         committed_state.observed_rows,
+        work.statements_executed,
     );
 
     Ok(RunResult {
@@ -4854,25 +4915,28 @@ fn run_rusqlite(
             let mut failed = 0usize;
             let mut attempted_writes = 0usize;
             let mut retried_operations = 0usize;
+            let mut statements_executed = 0u64;
             let insert_sql = worker_insert_sql(tid, separate_tables);
 
             if transaction_granularity == TransactionGranularity::OneRow {
                 let mut stmt = conn
                     .prepare(&insert_sql)
                     .map_err(|error| format!("[sqlite t{tid}] prepare failed: {error}"))?;
-                let (attempted_writes, retried_operations) = run_rusqlite_one_row_transactions(
-                    &conn,
-                    &mut stmt,
-                    tid,
-                    base,
-                    rows_per_thread,
-                    retry_timeout,
-                )?;
+                let (attempted_writes, retried_operations, statements_executed) =
+                    run_rusqlite_one_row_transactions(
+                        &conn,
+                        &mut stmt,
+                        tid,
+                        base,
+                        rows_per_thread,
+                        retry_timeout,
+                    )?;
                 return Ok(WorkerWork {
                     settings,
                     attempted_writes,
                     retried_operations,
                     reported_failed_writes: 0,
+                    statements_executed,
                     workload_finished: Instant::now(),
                 });
             }
@@ -4893,7 +4957,20 @@ fn run_rusqlite(
                             format!("[sqlite t{tid}] write-attempt counter overflow")
                         })?;
                         match stmt.execute(rusqlite::params![id, &payload]) {
-                            Ok(_) => break,
+                            Ok(affected) => {
+                                // Consume the affected-row result so this INSERT
+                                // is proven to have physically executed rather
+                                // than a future being constructed and dropped
+                                // unpolled (bd-h9pzn/bd-i8pt6).
+                                let _affected = affected;
+                                statements_executed =
+                                    statements_executed.checked_add(1).ok_or_else(|| {
+                                        format!(
+                                            "[sqlite t{tid}] executed-statement counter overflow"
+                                        )
+                                    })?;
+                                break;
+                            }
                             Err(e) => {
                                 if retry < MAX_RETRIES && csqlite_error_is_retryable(&e) {
                                     retry += 1;
@@ -4941,6 +5018,7 @@ fn run_rusqlite(
                 attempted_writes,
                 retried_operations,
                 reported_failed_writes: failed,
+                statements_executed,
                 workload_finished: Instant::now(),
             })
         });
@@ -4991,6 +5069,7 @@ fn run_rusqlite(
         work.retried_operations,
         work.reported_failed_writes,
         committed_state.observed_rows,
+        work.statements_executed,
     );
 
     Ok(RunResult {
@@ -6179,6 +6258,7 @@ mod tests {
                 retried_operations: 0,
                 failed_writes: failed_rows,
                 worker_reported_failed_writes: failed_rows,
+                statements_executed: committed_rows as u64,
                 exact: true,
                 diagnostics: Vec::new(),
             },
@@ -6632,14 +6712,40 @@ mod tests {
 
     #[test]
     fn work_accounting_uses_database_commits_as_successes() {
-        let accounting = build_work_accounting(100, 125, 2, 3, 97);
+        let accounting = build_work_accounting(100, 125, 2, 3, 97, 123);
 
         assert_eq!(accounting.offered_writes, 100);
         assert_eq!(accounting.attempted_writes, 125);
         assert_eq!(accounting.succeeded_writes, 97);
         assert_eq!(accounting.retried_operations, 2);
         assert_eq!(accounting.failed_writes, 3);
+        assert_eq!(accounting.statements_executed, 123);
         assert!(accounting.exact);
+    }
+
+    #[test]
+    fn sample_evidence_rejects_zero_executed_statements() {
+        // A sample that is otherwise fully valid must still fail closed when it
+        // claims committed throughput with zero physically-executed statements —
+        // that is exactly the bd-i8pt6 failure mode (futures constructed and
+        // dropped instead of run).
+        let mut sample = sample_result(10, 1_000, 0).sample_evidence();
+        assert!(
+            sample_evidence_is_valid(&sample),
+            "baseline sample must be valid before mutating the executed-statement receipt"
+        );
+
+        sample.accounting.statements_executed = 0;
+        assert!(
+            !sample_evidence_is_valid(&sample),
+            "zero executed statements while claiming committed writes must fail closed"
+        );
+
+        sample.accounting.statements_executed = sample.accounting.succeeded_writes as u64;
+        assert!(
+            sample_evidence_is_valid(&sample),
+            "an executed-statement receipt covering every committed write must be accepted"
+        );
     }
 
     #[test]
@@ -6699,6 +6805,7 @@ mod tests {
                     attempted_writes: 1,
                     retried_operations: 0,
                     reported_failed_writes: 0,
+                    statements_executed: 1,
                     workload_finished: Instant::now(),
                 })
             }),
