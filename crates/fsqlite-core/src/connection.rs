@@ -111474,17 +111474,30 @@ fn eq_seek_column<'a>(
         .find(|c| c.name.eq_ignore_ascii_case(column.column.as_ref()))
 }
 
-/// If `expr` is a non-NULL [`Expr::BoundOuterValue`] whose donor collation and
-/// affinity make a plain-literal comparison against `col` byte-identical to the
-/// bound comparison, return the equivalent literal (bd-nd2ju / #377, L3).
+/// If `expr` is a non-NULL [`Expr::BoundOuterValue`] whose donor collation,
+/// affinity, AND runtime storage class make a plain-literal comparison against
+/// `col` byte-identical to the bound comparison, return the equivalent literal
+/// (bd-nd2ju / #377, L3).
 ///
-/// Sufficient (conservative) safety conditions — see
-/// `relax_correlated_exists_equalities_for_seek`:
+/// The subtlety a plain literal loses is that a bound outer value CARRIES its
+/// donor affinity, so `col(A) = bound(A, v)` resolves to "no affinity applied"
+/// (both operands already have affinity `A`) and compares `v` *as stored*, while
+/// `col(A) = literal(v)` — a literal has no affinity — resolves to "apply `A` to
+/// the literal" and compares the COERCED `v`. Those diverge whenever coercing
+/// `v` to `A` is not a no-op: e.g. `text_col = <bound TEXT-affinity value 1>`
+/// leaves the integer `1` uncoerced (no match against `'1'`), but `text_col = 1`
+/// coerces `1`→`'1'` (spurious match). So relaxation is admitted ONLY when:
 ///   * the donor collation is a known name equal to `col`'s effective collation
 ///     (default `BINARY`), so the winning collation is `col`'s in either operand
-///     order; and
-///   * the donor affinity is absent, or equal to `col`'s affinity, so the
-///     applied comparison affinity is `col`'s either way.
+///     order;
+///   * the donor affinity equals `col`'s affinity (so the bound comparison
+///     applies no affinity — the same treatment the coerced-literal path lands
+///     on once the next condition holds); AND
+///   * the runtime value's storage class is already in `col`'s affinity class,
+///     so `col`'s affinity coercion of the literal is a no-op and both paths
+///     compare the value as stored.
+/// When any condition fails the bound value is left in place and the interpreted
+/// per-row fallback still evaluates it with full SQLite comparison semantics.
 fn bound_outer_relaxable_to_literal(expr: &Expr, col: &ColumnInfo) -> Option<Expr> {
     let Expr::BoundOuterValue {
         value,
@@ -111506,11 +111519,24 @@ fn bound_outer_relaxable_to_literal(expr: &Expr, col: &ColumnInfo) -> Option<Exp
         return None;
     }
     let col_affinity = affinity_char_to_type(col.affinity);
-    let affinity_ok = match affinity {
-        None => true,
-        Some(donor) => *donor == col_affinity,
+    // Donor affinity must equal the column's (a mismatch, or an absent donor
+    // affinity, can change which operand SQLite coerces).
+    if *affinity != Some(col_affinity) {
+        return None;
+    }
+    // The value must already be in the column's affinity class, so applying that
+    // affinity is a no-op and the literal path compares the value as stored —
+    // matching the bound path's no-coercion comparison.
+    let value_in_affinity_class = match col_affinity {
+        TypeAffinity::Text => matches!(value, SqliteValue::Text(_)),
+        TypeAffinity::Integer | TypeAffinity::Real | TypeAffinity::Numeric => {
+            matches!(value, SqliteValue::Integer(_) | SqliteValue::Float(_))
+        }
+        // A no-affinity (BLOB) column never coerces either operand, so the
+        // comparison is the value as stored on both paths regardless of class.
+        TypeAffinity::Blob => true,
     };
-    if !affinity_ok {
+    if !value_in_affinity_class {
         return None;
     }
     Some(value_to_literal_expr(value.clone()))
