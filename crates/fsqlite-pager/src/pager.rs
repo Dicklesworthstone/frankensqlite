@@ -9109,6 +9109,24 @@ fn reclaim_amplify_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("FSQLITE_IOQ6X_RECLAIM_AMPLIFY").is_some())
 }
 
+/// bd-9inpb allocator-race hunt: env-gated relaxation of the sole-current-snapshot
+/// committed-freelist reuse gate (`FSQLITE_IOQ6X_SNAPSHOT_AMPLIFY`). The gated
+/// reuse arms require BOTH `active_transactions == 1` AND a CURRENT snapshot
+/// (`published_visible_commit_seq == commit_seq`); under high concurrency a peer
+/// commit makes the snapshot stale, closing the gate and structurally starving the
+/// cross-connection double-consumption race (two connections popping the same
+/// durable-free page). When set, this drops ONLY the snapshot-currency half of the
+/// gate (still requires `active_transactions == 1`), so stale-snapshot connections
+/// also reuse committed-free pages — maximal stress on the append-gate
+/// double-consumption guard (`resurrected_or_erased_freelist_pages`) that is meant
+/// to catch exactly this. If the guard is sound the run just churns BusySnapshot
+/// retries; if it has the cur=true window hole, a double-grant results. `false` →
+/// inert (default). Diagnostic ONLY — never enable in prod/CI.
+fn snapshot_gate_amplify_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FSQLITE_IOQ6X_SNAPSHOT_AMPLIFY").is_some())
+}
+
 fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling: u32) -> usize {
     if ioq6x_ledger_disabled() || inner.journal_mode != JournalMode::Wal {
         return 0;
@@ -23182,7 +23200,8 @@ where
                     // commit through WAL first-committer-wins conflict
                     // detection, exactly as for EOF growth.
                     let sole_current_snapshot = inner.active_transactions == 1
-                        && self.published_visible_commit_seq.get() == inner.commit_seq;
+                        && (snapshot_gate_amplify_enabled()
+                            || self.published_visible_commit_seq.get() == inner.commit_seq);
                     if sole_current_snapshot
                         && let Some(idx) = inner
                             .freelist
