@@ -53,9 +53,12 @@ fn bd_dd24l_vacuum_into_writes_reserved_target_gh376() {
 
         {
             let conn = Connection::open(&src_str).await.expect("reopen source");
-            conn.execute(&format!("VACUUM INTO '{}';", target_str.replace('\'', "''")))
-                .await
-                .expect("VACUUM INTO must succeed and open its reserved target (GH#376)");
+            conn.execute(&format!(
+                "VACUUM INTO '{}';",
+                target_str.replace('\'', "''")
+            ))
+            .await
+            .expect("VACUUM INTO must succeed and open its reserved target (GH#376)");
             conn.close().await.expect("close source");
         }
 

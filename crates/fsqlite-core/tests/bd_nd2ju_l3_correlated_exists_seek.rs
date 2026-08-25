@@ -94,11 +94,7 @@ const TRIGGER_2TERM: &str = "CREATE TRIGGER trg BEFORE INSERT ON t \
 /// rows inserted EARLIER IN THE SAME UNCOMMITTED TRANSACTION (exactly the
 /// bulk-ingest shape the timing probe measures), so a same-txn duplicate is
 /// rejected just as the interpreted MemDB-mirror probe rejected it.
-async fn assert_trigger_dedup_matches_oracle_txn(
-    setup: &str,
-    trigger: &str,
-    inserts: &[&str],
-) {
+async fn assert_trigger_dedup_matches_oracle_txn(setup: &str, trigger: &str, inserts: &[&str]) {
     let c = Connection::open(":memory:").await.unwrap();
     c.execute(setup).await.unwrap();
     c.execute(trigger).await.unwrap();

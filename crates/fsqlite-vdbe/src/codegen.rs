@@ -4882,7 +4882,8 @@ fn codegen_select_without_rowid_pk_seek(
         // Match the stored key's storage class (see the L1 lookup's affinity
         // note); skip the op when the operand already carries it.
         let pk_affinity = table.columns[col_idx].affinity;
-        if matches!(pk_affinity, 'B' | 'C' | 'D' | 'E') && !bound_matches_affinity(pk_affinity, target)
+        if matches!(pk_affinity, 'B' | 'C' | 'D' | 'E')
+            && !bound_matches_affinity(pk_affinity, target)
         {
             b.emit_op(
                 Opcode::Affinity,
@@ -4909,11 +4910,25 @@ fn codegen_select_without_rowid_pk_seek(
     // NULL): empty result. Emitted after `OpenRead` so the jump's `Close` sees
     // an open cursor.
     for j in 0..n_pk {
-        b.emit_jump_to_label(Opcode::IsNull, pk_regs + j as i32, 0, done_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::IsNull,
+            pk_regs + j as i32,
+            0,
+            done_label,
+            P4::None,
+            0,
+        );
     }
 
     let pk_rec = b.alloc_reg();
-    b.emit_op(Opcode::MakeRecord, pk_regs, n_pk as i32, pk_rec, P4::None, 0);
+    b.emit_op(
+        Opcode::MakeRecord,
+        pk_regs,
+        n_pk as i32,
+        pk_rec,
+        P4::None,
+        0,
+    );
     // `NoConflict` jumps when no row carries this full PK; a match falls through
     // with the table cursor positioned on that row.
     b.emit_jump_to_label(Opcode::NoConflict, cursor, pk_rec, done_label, P4::None, 0);
@@ -4923,7 +4938,15 @@ fn codegen_select_without_rowid_pk_seek(
     // probe matched at most one row, so this runs at most once.
     if residual_filter && let Some(where_expr) = where_clause {
         b.set_next_anon_placeholder(where_placeholder_base);
-        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, done_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            done_label,
+        );
     }
 
     let skip_label = b.emit_label();
@@ -20624,7 +20647,14 @@ fn emit_upsert_probe(
 
         // Conflict: extract existing row's rowid from index.
         let existing_rowid_reg = b.alloc_reg();
-        b.emit_op(Opcode::IdxRowid, idx_cursor, existing_rowid_reg, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::IdxRowid,
+            idx_cursor,
+            existing_rowid_reg,
+            0,
+            P4::None,
+            0,
+        );
 
         // Seek table cursor to the existing row.
         b.emit_jump_to_label(
@@ -20693,7 +20723,14 @@ fn emit_upsert_probe(
                 P4::None,
                 0,
             );
-            b.emit_op(Opcode::IdxRowid, idx_cursor, found_rowid_reg, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::IdxRowid,
+                idx_cursor,
+                found_rowid_reg,
+                0,
+                P4::None,
+                0,
+            );
             b.emit_jump_to_label(
                 Opcode::NotExists,
                 cursor,
@@ -20711,7 +20748,14 @@ fn emit_upsert_probe(
     } else {
         // PK conflict check (explicit PK/rowid target, or omitted target on a
         // table with no UNIQUE indexes).
-        b.emit_jump_to_label(Opcode::NotExists, cursor, rowid_reg, no_conflict_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::NotExists,
+            cursor,
+            rowid_reg,
+            no_conflict_label,
+            P4::None,
+            0,
+        );
         rowid_reg
     }
 }
@@ -20750,7 +20794,14 @@ fn emit_upsert_do_update_apply(
         if table.columns.get(col_idx).is_some_and(|c| c.is_ipk) {
             b.emit_op(Opcode::Rowid, cursor, existing_regs + col_i, 0, P4::None, 0);
         } else {
-            b.emit_op(Opcode::Column, cursor, col_i, existing_regs + col_i, P4::None, 0);
+            b.emit_op(
+                Opcode::Column,
+                cursor,
+                col_i,
+                existing_regs + col_i,
+                P4::None,
+                0,
+            );
         }
     }
 
@@ -22839,7 +22890,12 @@ fn emit_column_from_cursor(
 /// bd-xjfrt) copies the attempted-insert value from `register_base + col_idx`.
 /// The IPK column register is kept in sync with the rowid at INSERT codegen, so
 /// a plain copy is correct for it too.
-fn emit_secondary_column(b: &mut ProgramBuilder, col_name: &str, sec: &SecondaryScan<'_>, reg: i32) {
+fn emit_secondary_column(
+    b: &mut ProgramBuilder,
+    col_name: &str,
+    sec: &SecondaryScan<'_>,
+    reg: i32,
+) {
     if let Some(base) = sec.register_base {
         if let Some(col_idx) = sec.table.column_index(col_name) {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -56062,10 +56118,7 @@ mod tests {
             }],
             from: None,
             where_clause: Some(Expr::BinaryOp {
-                left: Box::new(Expr::Column(
-                    fsqlite_ast::ColumnRef::bare("b"),
-                    Span::ZERO,
-                )),
+                left: Box::new(Expr::Column(fsqlite_ast::ColumnRef::bare("b"), Span::ZERO)),
                 op: fsqlite_ast::BinaryOp::Eq,
                 right: Box::new(placeholder(2)),
                 span: Span::ZERO,

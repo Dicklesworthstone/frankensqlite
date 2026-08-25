@@ -408,8 +408,7 @@ pub fn program_seeks_without_rowid_pk_on_table(program: &VdbeProgram, table_name
         return false;
     }
     ops.iter().any(|op| {
-        matches!(op.opcode, Opcode::NoConflict | Opcode::NotFound)
-            && table_cursors.contains(&op.p1)
+        matches!(op.opcode, Opcode::NoConflict | Opcode::NotFound) && table_cursors.contains(&op.p1)
     })
 }
 

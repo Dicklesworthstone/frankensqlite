@@ -35,7 +35,9 @@ fn parser_syntax_errors_match_stock_near_x() {
         // Valid SQL is unaffected.
         let c = Connection::open(":memory:").await.unwrap();
         c.execute("CREATE TABLE t(a, b)").await.unwrap();
-        c.query("SELECT a FROM t").await.expect("valid query must succeed");
+        c.query("SELECT a FROM t")
+            .await
+            .expect("valid query must succeed");
     });
 }
 
@@ -50,9 +52,18 @@ fn parser_expected_family_and_generic_match_stock_near_x() {
         // (parser diagnostics are version-stable). bd-parser-syntax-error-format-6w6kp.
 
         // ── expected-X expression family (err_here) → near "<lexeme>" ──
-        assert_eq!(err_of("SELECT 1 BETWEEN 2 3").await, "near \"3\": syntax error");
-        assert_eq!(err_of("SELECT CASE WHEN 1 2 END").await, "near \"2\": syntax error");
-        assert_eq!(err_of("SELECT 1 COLLATE 2").await, "near \"2\": syntax error");
+        assert_eq!(
+            err_of("SELECT 1 BETWEEN 2 3").await,
+            "near \"3\": syntax error"
+        );
+        assert_eq!(
+            err_of("SELECT CASE WHEN 1 2 END").await,
+            "near \"2\": syntax error"
+        );
+        assert_eq!(
+            err_of("SELECT 1 COLLATE 2").await,
+            "near \"2\": syntax error"
+        );
         assert_eq!(
             err_of("SELECT count(* ORDER BY 1)").await,
             "near \"ORDER\": syntax error",
@@ -65,7 +76,10 @@ fn parser_expected_family_and_generic_match_stock_near_x() {
             "near \"FOO\": syntax error",
         );
         assert_eq!(err_of("CREATE FOO").await, "near \"FOO\": syntax error");
-        assert_eq!(err_of("ALTER TABLE t FOO").await, "near \"FOO\": syntax error");
+        assert_eq!(
+            err_of("ALTER TABLE t FOO").await,
+            "near \"FOO\": syntax error"
+        );
 
         // ── EOF within the expected-X family → incomplete input ──
         assert_eq!(err_of("SELECT 1 BETWEEN 2").await, "incomplete input");
