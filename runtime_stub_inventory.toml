@@ -2054,7 +2054,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "CodegenError::Unsupported("
 enclosing_item = "emit_update_assignments"
-payload = "multi-column SET subquery source must be a single SELECT with \\ explicit result columns (no '*' or compound SELECT)"
+payload = "multi-column SET subquery source must be a single SELECT with explicit result columns (no '*' or compound SELECT)"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0057"
@@ -2096,7 +2096,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "TableOrSubquery::Subquery { .. } => Err(CodegenError::Unsupported("
 enclosing_item = "resolve_from_table"
-payload = "UPDATE ... FROM subquery sources are not yet supported (only named tables; \\ a single FROM (subquery) is flattened before codegen)"
+payload = "UPDATE ... FROM subquery sources are not yet supported (only named tables; a single FROM (subquery) is flattened before codegen)"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0060"
@@ -2250,7 +2250,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
 enclosing_item = "emit_without_rowid_insert_select"
-payload = "INSERT ... SELECT with a compound (UNION/INTERSECT/EXCEPT) into WITHOUT ROWID tables \\ is not yet supported"
+payload = "INSERT ... SELECT with a compound (UNION/INTERSECT/EXCEPT) into WITHOUT ROWID tables is not yet supported"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0071"
@@ -2278,7 +2278,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
 enclosing_item = "emit_without_rowid_insert_select"
-payload = "INSERT ... SELECT with a VALUES body into WITHOUT ROWID tables is not yet \\ supported"
+payload = "INSERT ... SELECT with a VALUES body into WITHOUT ROWID tables is not yet supported"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0073"
@@ -2292,7 +2292,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
 enclosing_item = "emit_without_rowid_insert_select"
-payload = "INSERT ... SELECT with DISTINCT/GROUP BY/HAVING/window into WITHOUT ROWID tables is \\ not yet supported"
+payload = "INSERT ... SELECT with DISTINCT/GROUP BY/HAVING/window into WITHOUT ROWID tables is not yet supported"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0074"
@@ -2320,7 +2320,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
 enclosing_item = "emit_without_rowid_insert_select"
-payload = "INSERT ... SELECT from a non-table source into WITHOUT ROWID tables is not \\ yet supported"
+payload = "INSERT ... SELECT from a non-table source into WITHOUT ROWID tables is not yet supported"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0076"
@@ -2334,7 +2334,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
 enclosing_item = "emit_without_rowid_insert_select"
-payload = "INSERT ... SELECT where the source is the target WITHOUT ROWID table is not yet \\ supported"
+payload = "INSERT ... SELECT where the source is the target WITHOUT ROWID table is not yet supported"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0077"
@@ -2460,7 +2460,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
 enclosing_item = "codegen_update_from_without_rowid"
-payload = "UPDATE ... FROM with an OUTER JOIN source is not yet supported on WITHOUT \\ ROWID tables"
+payload = "UPDATE ... FROM with an OUTER JOIN source is not yet supported on WITHOUT ROWID tables"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0086"
@@ -2474,7 +2474,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
 enclosing_item = "codegen_update_from_without_rowid"
-payload = "UPDATE ... FROM with a USING(...) join constraint is not yet supported on \\ WITHOUT ROWID tables"
+payload = "UPDATE ... FROM with a USING(...) join constraint is not yet supported on WITHOUT ROWID tables"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0087"

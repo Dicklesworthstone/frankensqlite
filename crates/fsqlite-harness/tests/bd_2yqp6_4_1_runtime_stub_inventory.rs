@@ -248,15 +248,12 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Normalize diagnostic text after Rust has joined a `"... \\` continued
-/// string literal. Older inventory entries retained the standalone source-level
-/// continuation slash; it is not part of the runtime diagnostic and therefore
-/// is not part of semantic identity.
+/// Normalize runtime diagnostic whitespace without discarding semantic
+/// characters. Rust already removes source-level string-continuation slashes
+/// when `LitStr::value` is decoded, so dropping standalone `\` characters here
+/// would make distinct runtime messages share a fingerprint.
 fn normalize_payload(s: &str) -> String {
-    s.split_whitespace()
-        .filter(|part| *part != "\\")
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalize_ws(s)
 }
 
 fn declared_stub_kinds(source_patterns: &[String]) -> BTreeSet<StubKind> {
@@ -1137,6 +1134,25 @@ fn fingerprint_detects_payload_change() {
     let before = scan_source_markers("fixture.rs", before, &unsupported_only());
     let after = scan_source_markers("fixture.rs", after, &unsupported_only());
     assert_ne!(before[0].fingerprint(), after[0].fingerprint());
+}
+
+#[test]
+fn fingerprint_preserves_semantic_backslash() {
+    let with_backslash = r#"fn emit_thing() {
+        return Err(CodegenError::Unsupported("path \\ segment".to_owned()));
+    }"#;
+    let without_backslash = r#"fn emit_thing() {
+        return Err(CodegenError::Unsupported("path segment".to_owned()));
+    }"#;
+    let with_backslash = scan_source_markers("fixture.rs", with_backslash, &unsupported_only());
+    let without_backslash =
+        scan_source_markers("fixture.rs", without_backslash, &unsupported_only());
+    assert_eq!(with_backslash[0].payload, r"path \ segment");
+    assert_ne!(
+        with_backslash[0].fingerprint(),
+        without_backslash[0].fingerprint(),
+        "a semantic backslash must participate in runtime-stub identity"
+    );
 }
 
 #[test]
