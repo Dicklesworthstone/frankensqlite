@@ -19,13 +19,16 @@ use std::str::FromStr;
 
 use proc_macro2::{Span, TokenStream, TokenTree};
 use serde::Deserialize;
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Attribute, Expr, ImplItem, Item, LitStr, TraitItem};
+use syn::{Attribute, Expr, ImplItem, Item, Lit, LitStr, Meta, Token, TraitItem};
 
 const BEAD_ID: &str = "bd-2yqp6.4.1";
+const IDENTITY_MODEL: &str = "fingerprint (file, kind, enclosing_item, normalized_payload); line is a hint (bd-y7otm/GH#136 item 2)";
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InventoryDocument {
     meta: InventoryMeta,
     runtime_stubs: Vec<RuntimeStub>,
@@ -33,6 +36,7 @@ struct InventoryDocument {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InventoryMeta {
     schema_version: String,
     bead_id: String,
@@ -41,6 +45,7 @@ struct InventoryMeta {
     generated_at: String,
     contract_owner: String,
     inventory_scope: String,
+    identity_model: String,
     source_patterns: Vec<String>,
     parity_critical_severities: Vec<String>,
     // bd-y7otm: next allocatable active ordinal, so additions never reuse a
@@ -97,6 +102,7 @@ impl StubKind {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeStub {
     stub_id: String,
     file: String,
@@ -110,8 +116,9 @@ struct RuntimeStub {
     closure_strategy: String,
     /// Raw marker line text (human-readable hint).
     anchor: String,
-    /// Fingerprint component: nearest enclosing `fn` item. `#[serde(default)]`
-    /// only for bootstrap loading; the gate asserts it is non-empty.
+    /// Fingerprint component: nearest enclosing function or method.
+    /// `#[serde(default)]` only for bootstrap loading; the gate asserts it is
+    /// non-empty.
     #[serde(default)]
     enclosing_item: String,
     /// Fingerprint component: normalized diagnostic payload. `#[serde(default)]`
@@ -121,6 +128,7 @@ struct RuntimeStub {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResolvedRuntimeStub {
     stub_id: String,
     superseded_stub_id: Option<String>,
@@ -166,6 +174,12 @@ struct ScannedMarker {
     payload: String,
 }
 
+struct RegeneratedEntry<'a> {
+    marker: &'a ScannedMarker,
+    existing: Option<&'a RuntimeStub>,
+    stub_id: String,
+}
+
 impl ScannedMarker {
     fn fingerprint(&self) -> Fingerprint {
         Fingerprint {
@@ -175,6 +189,23 @@ impl ScannedMarker {
             payload: self.payload.clone(),
         }
     }
+}
+
+fn active_id_ordinal(stub_id: &str) -> Option<u32> {
+    let digits = stub_id.strip_prefix("RSTUB-ACTIVE-")?;
+    (digits.len() == 4 && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+fn stable_id_has_valid_format(stub_id: &str) -> bool {
+    if active_id_ordinal(stub_id).is_some() {
+        return true;
+    }
+    let Some(digits) = stub_id.strip_prefix("RSTUB-") else {
+        return false;
+    };
+    digits.len() == 4 && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn workspace_root() -> PathBuf {
@@ -217,6 +248,17 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Normalize diagnostic text after Rust has joined a `"... \\` continued
+/// string literal. Older inventory entries retained the standalone source-level
+/// continuation slash; it is not part of the runtime diagnostic and therefore
+/// is not part of semantic identity.
+fn normalize_payload(s: &str) -> String {
+    s.split_whitespace()
+        .filter(|part| *part != "\\")
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn declared_stub_kinds(source_patterns: &[String]) -> BTreeSet<StubKind> {
     let mut kinds = BTreeSet::new();
     for pattern in source_patterns {
@@ -235,12 +277,34 @@ fn declared_stub_kinds(source_patterns: &[String]) -> BTreeSet<StubKind> {
     kinds
 }
 
+fn cfg_expression_requires_test(meta: &Meta) -> bool {
+    match meta {
+        Meta::Path(path) => path.is_ident("test"),
+        Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            let terms = list
+                .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                .unwrap_or_else(|error| panic!("failed to parse cfg expression: {error}"));
+            if list.path.is_ident("all") {
+                terms.iter().any(cfg_expression_requires_test)
+            } else {
+                !terms.is_empty() && terms.iter().all(cfg_expression_requires_test)
+            }
+        }
+        // `not(test)` is specifically enabled outside tests, and an unknown
+        // predicate must remain in scope rather than being hidden by the gate.
+        Meta::List(_) | Meta::NameValue(_) => false,
+    }
+}
+
 fn is_cfg_test(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| {
-        attr.path().is_ident("cfg")
-            && attr
-                .parse_args::<syn::Ident>()
-                .is_ok_and(|ident| ident == "test")
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        let terms = attr
+            .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            .unwrap_or_else(|error| panic!("failed to parse cfg attribute: {error}"));
+        terms.len() == 1 && terms.first().is_some_and(cfg_expression_requires_test)
     })
 }
 
@@ -261,7 +325,6 @@ fn item_attrs(item: &Item) -> Option<&[Attribute]> {
         Item::Type(item) => Some(&item.attrs),
         Item::Union(item) => Some(&item.attrs),
         Item::Use(item) => Some(&item.attrs),
-        Item::Verbatim(_) => None,
         _ => None,
     }
 }
@@ -272,7 +335,6 @@ fn impl_item_attrs(item: &ImplItem) -> Option<&[Attribute]> {
         ImplItem::Fn(item) => Some(&item.attrs),
         ImplItem::Type(item) => Some(&item.attrs),
         ImplItem::Macro(item) => Some(&item.attrs),
-        ImplItem::Verbatim(_) => None,
         _ => None,
     }
 }
@@ -283,7 +345,6 @@ fn trait_item_attrs(item: &TraitItem) -> Option<&[Attribute]> {
         TraitItem::Fn(item) => Some(&item.attrs),
         TraitItem::Type(item) => Some(&item.attrs),
         TraitItem::Macro(item) => Some(&item.attrs),
-        TraitItem::Verbatim(_) => None,
         _ => None,
     }
 }
@@ -302,23 +363,44 @@ fn call_kind(expr: &Expr) -> Option<StubKind> {
     }
 }
 
-#[derive(Default)]
-struct FirstStringLiteral {
-    value: Option<String>,
+fn leading_string_literal_in_tokens(tokens: TokenStream) -> Option<String> {
+    let TokenTree::Literal(literal) = tokens.into_iter().next()? else {
+        return None;
+    };
+    let literal = syn::parse_str::<LitStr>(&literal.to_string()).ok()?;
+    Some(normalize_payload(&literal.value()))
 }
 
-impl<'ast> Visit<'ast> for FirstStringLiteral {
-    fn visit_lit_str(&mut self, literal: &'ast LitStr) {
-        if self.value.is_none() {
-            self.value = Some(normalize_ws(&literal.value()));
+/// Extract the diagnostic template only from expression shapes whose runtime
+/// value is directly derived from that template. An arbitrary nested literal
+/// inside a helper call is not the diagnostic and must fall back to the whole
+/// argument source instead.
+fn direct_diagnostic_literal(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Lit(expr) => match &expr.lit {
+            Lit::Str(literal) => Some(normalize_payload(&literal.value())),
+            _ => None,
+        },
+        Expr::Paren(expr) => direct_diagnostic_literal(&expr.expr),
+        Expr::Group(expr) => direct_diagnostic_literal(&expr.expr),
+        Expr::Reference(expr) => direct_diagnostic_literal(&expr.expr),
+        Expr::MethodCall(expr)
+            if expr.args.is_empty()
+                && (expr.method == "into"
+                    || expr.method == "to_owned"
+                    || expr.method == "to_string") =>
+        {
+            direct_diagnostic_literal(&expr.receiver)
         }
+        Expr::Macro(expr)
+            if expr.mac.path.segments.last().is_some_and(|segment| {
+                segment.ident == "format" || segment.ident == "format_args"
+            }) =>
+        {
+            leading_string_literal_in_tokens(expr.mac.tokens.clone())
+        }
+        _ => None,
     }
-}
-
-fn first_string_literal(expr: &Expr) -> Option<String> {
-    let mut visitor = FirstStringLiteral::default();
-    visitor.visit_expr(expr);
-    visitor.value
 }
 
 fn source_line(source: &str, span: Span) -> (usize, String) {
@@ -337,6 +419,7 @@ struct RuntimeStubVisitor<'source> {
     source: &'source str,
     enabled_kinds: &'source BTreeSet<StubKind>,
     enclosing_items: Vec<String>,
+    test_only_ranges: Vec<std::ops::Range<usize>>,
     found: Vec<ScannedMarker>,
 }
 
@@ -358,6 +441,7 @@ impl RuntimeStubVisitor<'_> {
 impl<'ast> Visit<'ast> for RuntimeStubVisitor<'_> {
     fn visit_item(&mut self, item: &'ast Item) {
         if item_attrs(item).is_some_and(is_cfg_test) {
+            self.test_only_ranges.push(item.span().byte_range());
             return;
         }
         visit::visit_item(self, item);
@@ -365,6 +449,7 @@ impl<'ast> Visit<'ast> for RuntimeStubVisitor<'_> {
 
     fn visit_impl_item(&mut self, item: &'ast ImplItem) {
         if impl_item_attrs(item).is_some_and(is_cfg_test) {
+            self.test_only_ranges.push(item.span().byte_range());
             return;
         }
         visit::visit_impl_item(self, item);
@@ -372,6 +457,7 @@ impl<'ast> Visit<'ast> for RuntimeStubVisitor<'_> {
 
     fn visit_trait_item(&mut self, item: &'ast TraitItem) {
         if trait_item_attrs(item).is_some_and(is_cfg_test) {
+            self.test_only_ranges.push(item.span().byte_range());
             return;
         }
         visit::visit_trait_item(self, item);
@@ -400,11 +486,18 @@ impl<'ast> Visit<'ast> for RuntimeStubVisitor<'_> {
             && self.enabled_kinds.contains(&kind)
         {
             let (line, anchor) = source_line(self.source, call.span());
-            let payload = call
-                .args
-                .first()
-                .and_then(first_string_literal)
-                .unwrap_or_else(|| normalize_ws(&anchor));
+            let payload = call.args.first().map_or_else(
+                || normalize_ws(&anchor),
+                |argument| {
+                    direct_diagnostic_literal(argument).unwrap_or_else(|| {
+                        let range = argument.span().byte_range();
+                        let argument_source = self.source.get(range.clone()).unwrap_or_else(|| {
+                            panic!("argument span {range:?} is outside parsed source")
+                        });
+                        normalize_ws(argument_source)
+                    })
+                },
+            );
             self.found.push(ScannedMarker {
                 file: self.file.to_owned(),
                 line,
@@ -428,7 +521,11 @@ fn collect_literal_ranges(tokens: TokenStream, ranges: &mut Vec<std::ops::Range<
     }
 }
 
-fn scan_todo_placeholders(file: &str, source: &str) -> Vec<ScannedMarker> {
+fn scan_todo_placeholders(
+    file: &str,
+    source: &str,
+    test_only_ranges: &[std::ops::Range<usize>],
+) -> Vec<ScannedMarker> {
     let tokens = TokenStream::from_str(source)
         .unwrap_or_else(|error| panic!("failed to tokenize {file}: {error}"));
     let mut literal_ranges = Vec::new();
@@ -436,13 +533,15 @@ fn scan_todo_placeholders(file: &str, source: &str) -> Vec<ScannedMarker> {
     let marker = StubKind::TodoPlaceholder.marker();
     source
         .match_indices(marker)
-        .filter(|(offset, _)| !literal_ranges.iter().any(|range| range.contains(offset)))
+        .filter(|(offset, _)| {
+            !literal_ranges.iter().any(|range| range.contains(offset))
+                && !test_only_ranges.iter().any(|range| range.contains(offset))
+        })
         .map(|(offset, _)| {
-            let line = source[..offset]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count()
-                + 1;
+            let prefix = source
+                .get(..offset)
+                .expect("match_indices must return a UTF-8 boundary");
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
             let anchor = source
                 .lines()
                 .nth(line - 1)
@@ -473,11 +572,16 @@ fn scan_source_markers(
         source,
         enabled_kinds,
         enclosing_items: Vec::new(),
+        test_only_ranges: Vec::new(),
         found: Vec::new(),
     };
     visitor.visit_file(&syntax);
     if enabled_kinds.contains(&StubKind::TodoPlaceholder) {
-        visitor.found.extend(scan_todo_placeholders(file, source));
+        visitor.found.extend(scan_todo_placeholders(
+            file,
+            source,
+            &visitor.test_only_ranges,
+        ));
     }
     visitor.found.sort_by_key(|marker| marker.line);
     visitor.found
@@ -507,7 +611,7 @@ fn inventory_fingerprints(doc: &InventoryDocument) -> Vec<Fingerprint> {
             file: stub.file.clone(),
             kind: stub.kind,
             enclosing_item: stub.enclosing_item.clone(),
-            payload: stub.payload.clone(),
+            payload: normalize_payload(&stub.payload),
         })
         .collect()
 }
@@ -518,6 +622,147 @@ fn multiset(items: impl IntoIterator<Item = Fingerprint>) -> BTreeMap<String, u3
         *counts.entry(fp.render()).or_insert(0) += 1;
     }
     counts
+}
+
+fn reconcile_stable_ids<'a>(
+    existing: &'a InventoryDocument,
+    scanned: &'a [ScannedMarker],
+) -> (Vec<RegeneratedEntry<'a>>, u32) {
+    let mut old_by_fingerprint: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, stub) in existing.runtime_stubs.iter().enumerate() {
+        let fingerprint = Fingerprint {
+            file: stub.file.clone(),
+            kind: stub.kind,
+            enclosing_item: stub.enclosing_item.clone(),
+            payload: normalize_payload(&stub.payload),
+        };
+        old_by_fingerprint
+            .entry(fingerprint.render())
+            .or_default()
+            .push(index);
+    }
+
+    let mut new_by_fingerprint: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, marker) in scanned.iter().enumerate() {
+        new_by_fingerprint
+            .entry(marker.fingerprint().render())
+            .or_default()
+            .push(index);
+    }
+
+    let mut matched: Vec<Option<&RuntimeStub>> = vec![None; scanned.len()];
+    let mut disappeared = Vec::new();
+    for (fingerprint, old_indices) in &old_by_fingerprint {
+        let Some(new_indices) = new_by_fingerprint.get(fingerprint) else {
+            disappeared.push(format!(
+                "{fingerprint} (ids {:?})",
+                old_indices
+                    .iter()
+                    .map(|index| existing.runtime_stubs[*index].stub_id.as_str())
+                    .collect::<Vec<_>>()
+            ));
+            continue;
+        };
+        assert_eq!(
+            old_indices.len(),
+            new_indices.len(),
+            "runtime-stub fingerprint multiplicity changed; explicit review is required for {fingerprint} (old {}, new {})",
+            old_indices.len(),
+            new_indices.len()
+        );
+
+        if old_indices.len() == 1 {
+            matched[new_indices[0]] = Some(&existing.runtime_stubs[old_indices[0]]);
+            continue;
+        }
+
+        // A duplicated semantic fingerprint cannot be paired safely after line
+        // drift. Preserve IDs only when every old hint still identifies one
+        // unique current occurrence; otherwise fail for explicit review.
+        let mut old_by_line = BTreeMap::new();
+        for old_index in old_indices {
+            let old = &existing.runtime_stubs[*old_index];
+            assert!(
+                old_by_line.insert(old.line, old).is_none(),
+                "ambiguous duplicate fingerprint {fingerprint}: multiple old IDs share line {}",
+                old.line
+            );
+        }
+        for new_index in new_indices {
+            let marker = &scanned[*new_index];
+            let old = old_by_line.remove(&marker.line).unwrap_or_else(|| {
+                panic!(
+                    "ambiguous duplicate fingerprint {fingerprint} moved away from its line hints; explicit old-to-new ID mapping is required"
+                )
+            });
+            matched[*new_index] = Some(old);
+        }
+    }
+    assert!(
+        disappeared.is_empty(),
+        "existing runtime-stub fingerprints disappeared; resolve each explicitly instead of silently retiring or renumbering: {disappeared:#?}"
+    );
+
+    let mut used_ids: BTreeSet<String> = existing
+        .runtime_stubs
+        .iter()
+        .map(|stub| stub.stub_id.clone())
+        .chain(
+            existing
+                .resolved_runtime_stubs
+                .iter()
+                .map(|stub| stub.stub_id.clone()),
+        )
+        .collect();
+    assert_eq!(
+        used_ids.len(),
+        existing.runtime_stubs.len() + existing.resolved_runtime_stubs.len(),
+        "existing active/resolved stable IDs must be globally unique before regeneration"
+    );
+    let mut next_active_id = existing.meta.next_active_id;
+    let mut entries = Vec::with_capacity(scanned.len());
+    for (index, marker) in scanned.iter().enumerate() {
+        if let Some(old) = matched[index] {
+            entries.push(RegeneratedEntry {
+                marker,
+                existing: Some(old),
+                stub_id: old.stub_id.clone(),
+            });
+            continue;
+        }
+
+        let stub_id = format!("RSTUB-ACTIVE-{next_active_id:04}");
+        assert!(
+            used_ids.insert(stub_id.clone()),
+            "meta.next_active_id would reuse existing stable ID {stub_id}"
+        );
+        next_active_id = next_active_id
+            .checked_add(1)
+            .expect("active runtime-stub ID space exhausted");
+        entries.push(RegeneratedEntry {
+            marker,
+            existing: None,
+            stub_id,
+        });
+    }
+    let existing_order: BTreeMap<&str, usize> = existing
+        .runtime_stubs
+        .iter()
+        .enumerate()
+        .map(|(index, stub)| (stub.stub_id.as_str(), index))
+        .collect();
+    entries.sort_by_key(|entry| {
+        existing_order
+            .get(entry.stub_id.as_str())
+            .copied()
+            .unwrap_or_else(|| {
+                let ordinal = active_id_ordinal(&entry.stub_id)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(usize::MAX);
+                existing.runtime_stubs.len().saturating_add(ordinal)
+            })
+    });
+    (entries, next_active_id)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -531,7 +776,8 @@ fn inventory_meta_contract_matches_bead() {
     assert_eq!(doc.meta.sqlite_target, "3.52.0");
     assert!(!doc.meta.generated_at.trim().is_empty());
     assert!(!doc.meta.contract_owner.trim().is_empty());
-    assert!(!doc.meta.inventory_scope.trim().is_empty());
+    assert_eq!(doc.meta.inventory_scope, "runtime-items-excluding-cfg-test");
+    assert_eq!(doc.meta.identity_model, IDENTITY_MODEL);
     assert!(!doc.meta.source_patterns.is_empty());
     assert!(!doc.meta.parity_critical_severities.is_empty());
     assert!(!doc.meta.scanned_files.is_empty());
@@ -556,18 +802,18 @@ fn inventory_entries_are_unique_and_well_formed() {
     let mut max_active_ordinal = 0u32;
 
     for stub in &doc.runtime_stubs {
+        let ordinal = active_id_ordinal(&stub.stub_id).unwrap_or_else(|| {
+            panic!(
+                "active stub_id must use RSTUB-ACTIVE-NNNN format: {}",
+                stub.stub_id
+            )
+        });
         assert!(
             seen_stub_ids.insert(stub.stub_id.as_str()),
             "duplicate stub_id: {}",
             stub.stub_id
         );
-        if let Some(ordinal) = stub
-            .stub_id
-            .strip_prefix("RSTUB-ACTIVE-")
-            .and_then(|n| n.parse::<u32>().ok())
-        {
-            max_active_ordinal = max_active_ordinal.max(ordinal);
-        }
+        max_active_ordinal = max_active_ordinal.max(ordinal);
 
         assert!(stub.line > 0, "line must be > 0 for {}", stub.stub_id);
         assert!(
@@ -615,15 +861,15 @@ fn inventory_entries_are_unique_and_well_formed() {
         );
     }
 
-    // The next allocatable id must be strictly beyond every active ordinal so a
-    // future addition never collides with an existing entry (bd-y7otm AC5).
-    assert!(
-        doc.meta.next_active_id > max_active_ordinal,
-        "meta.next_active_id ({}) must exceed the highest active ordinal ({max_active_ordinal})",
-        doc.meta.next_active_id
-    );
-
     for stub in &doc.resolved_runtime_stubs {
+        assert!(
+            stable_id_has_valid_format(&stub.stub_id),
+            "resolved stub_id has invalid stable-ID format: {}",
+            stub.stub_id
+        );
+        if let Some(ordinal) = active_id_ordinal(&stub.stub_id) {
+            max_active_ordinal = max_active_ordinal.max(ordinal);
+        }
         assert!(
             seen_stub_ids.insert(stub.stub_id.as_str()),
             "duplicate stub_id across active and resolved entries: {}",
@@ -631,6 +877,11 @@ fn inventory_entries_are_unique_and_well_formed() {
         );
         match (&stub.superseded_stub_id, &stub.identity_note) {
             (Some(superseded), Some(note)) => {
+                assert!(
+                    stable_id_has_valid_format(superseded),
+                    "{} has invalid superseded stable-ID format: {superseded}",
+                    stub.stub_id
+                );
                 assert_ne!(
                     superseded, &stub.stub_id,
                     "renumbered stub {} must supersede a different ID",
@@ -649,6 +900,12 @@ fn inventory_entries_are_unique_and_well_formed() {
             ),
         }
     }
+
+    assert!(
+        doc.meta.next_active_id > max_active_ordinal,
+        "meta.next_active_id ({}) must exceed every active-format ID in active and resolved history ({max_active_ordinal})",
+        doc.meta.next_active_id
+    );
 }
 
 #[test]
@@ -707,7 +964,7 @@ fn inventory_fingerprints_match_current_source() {
             file: stub.file.clone(),
             kind: stub.kind,
             enclosing_item: stub.enclosing_item.clone(),
-            payload: stub.payload.clone(),
+            payload: normalize_payload(&stub.payload),
         };
         assert!(
             scanned_set.contains_key(&fp.render()),
@@ -871,6 +1128,31 @@ fn live() {
 }
 
 #[test]
+fn nested_literal_in_computed_payload_uses_the_whole_argument() {
+    let src = r#"
+fn live() {
+    return Err(CodegenError::Unsupported(build_message("prefix", detail)));
+}
+"#;
+    let markers = scan_source_markers("fixture.rs", src, &unsupported_only());
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].payload, "build_message(\"prefix\", detail)");
+}
+
+#[test]
+fn nested_literal_in_a_computed_format_template_is_not_the_payload() {
+    let src = r#"
+fn live() {
+    return Err(CodegenError::Unsupported(format!(concat!("prefix", "{detail}"), detail = detail)));
+}
+"#;
+    let markers = scan_source_markers("fixture.rs", src, &unsupported_only());
+    assert_eq!(markers.len(), 1);
+    assert!(markers[0].payload.starts_with("format!(concat!"));
+    assert_ne!(markers[0].payload, "prefix");
+}
+
+#[test]
 fn multiple_same_kind_markers_on_one_line_are_distinct() {
     let src = r#"fn live() { let _ = (CodegenError::Unsupported("left".into()), CodegenError::Unsupported("right".into())); }"#;
     let markers = scan_source_markers("fixture.rs", src, &unsupported_only());
@@ -888,6 +1170,10 @@ const TEXT: &str = "#[cfg(test)]";
 fn before() { let _ = CodegenError::Unsupported("before".into()); }
 #[cfg(test)]
 fn test_only() { let _ = CodegenError::Unsupported("test-only".into()); }
+#[cfg(all(test, unix))]
+fn test_only_on_unix() { let _ = CodegenError::Unsupported("test-only-unix".into()); }
+#[cfg(any(test, feature = "fixture-live"))]
+fn live_in_a_feature_build() { let _ = CodegenError::Unsupported("feature-or-test".into()); }
 fn after() { let _ = CodegenError::Unsupported("after".into()); }
 "##;
     let markers = scan_source_markers("fixture.rs", src, &unsupported_only());
@@ -896,7 +1182,7 @@ fn after() { let _ = CodegenError::Unsupported("after".into()); }
             .iter()
             .map(|marker| marker.payload.as_str())
             .collect::<Vec<_>>(),
-        ["before", "after"]
+        ["before", "feature-or-test", "after"]
     );
 }
 
@@ -905,6 +1191,10 @@ fn todo_placeholder_in_a_string_is_not_a_comment_marker() {
     let src = r#"
 const TEXT: &str = "TODO: Apply collation from P4 if present.";
 // TODO: Apply collation from P4 if present.
+#[cfg(test)]
+fn test_only() {
+    // TODO: Apply collation from P4 if present.
+}
 "#;
     let markers = scan_source_markers(
         "fixture.rs",
@@ -913,6 +1203,96 @@ const TEXT: &str = "TODO: Apply collation from P4 if present.";
     );
     assert_eq!(markers.len(), 1);
     assert_eq!(markers[0].line, 3);
+}
+
+fn reconciliation_fixture(stubs: Vec<RuntimeStub>, next_active_id: u32) -> InventoryDocument {
+    InventoryDocument {
+        meta: InventoryMeta {
+            schema_version: "1.1.0".to_owned(),
+            bead_id: BEAD_ID.to_owned(),
+            track_id: "bd-2yqp6.4".to_owned(),
+            sqlite_target: "3.52.0".to_owned(),
+            generated_at: "fixture".to_owned(),
+            contract_owner: "fixture".to_owned(),
+            inventory_scope: "runtime-items-excluding-cfg-test".to_owned(),
+            identity_model: IDENTITY_MODEL.to_owned(),
+            source_patterns: vec![StubKind::UnsupportedCodegen.marker().to_owned()],
+            parity_critical_severities: vec!["critical".to_owned()],
+            next_active_id,
+            scanned_files: vec!["fixture.rs".to_owned()],
+        },
+        runtime_stubs: stubs,
+        resolved_runtime_stubs: Vec::new(),
+    }
+}
+
+fn reconciliation_stub(stub_id: &str, line: usize, payload: &str) -> RuntimeStub {
+    RuntimeStub {
+        stub_id: stub_id.to_owned(),
+        file: "fixture.rs".to_owned(),
+        line,
+        kind: StubKind::UnsupportedCodegen,
+        kind_description: "fixture".to_owned(),
+        severity: "critical".to_owned(),
+        feature_id: "SURF-SQL-CORE-001".to_owned(),
+        owner: "fixture".to_owned(),
+        closure_strategy: "implement".to_owned(),
+        anchor: "fixture".to_owned(),
+        enclosing_item: "emit".to_owned(),
+        payload: payload.to_owned(),
+    }
+}
+
+fn reconciliation_marker(line: usize, payload: &str) -> ScannedMarker {
+    ScannedMarker {
+        file: "fixture.rs".to_owned(),
+        line,
+        kind: StubKind::UnsupportedCodegen,
+        enclosing_item: "emit".to_owned(),
+        anchor: "fixture".to_owned(),
+        payload: payload.to_owned(),
+    }
+}
+
+#[test]
+fn stable_id_reconciliation_preserves_ids_and_allocates_monotonically() {
+    let existing = reconciliation_fixture(
+        vec![reconciliation_stub("RSTUB-ACTIVE-0042", 10, "existing")],
+        94,
+    );
+    let scanned = vec![
+        reconciliation_marker(20, "existing"),
+        reconciliation_marker(30, "new"),
+    ];
+    let (entries, next_active_id) = reconcile_stable_ids(&existing, &scanned);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.stub_id.as_str())
+            .collect::<Vec<_>>(),
+        ["RSTUB-ACTIVE-0042", "RSTUB-ACTIVE-0094"]
+    );
+    assert_eq!(next_active_id, 95);
+}
+
+#[test]
+fn duplicate_fingerprint_line_drift_requires_explicit_mapping() {
+    let existing = reconciliation_fixture(
+        vec![
+            reconciliation_stub("RSTUB-ACTIVE-0042", 10, "duplicate"),
+            reconciliation_stub("RSTUB-ACTIVE-0043", 20, "duplicate"),
+        ],
+        94,
+    );
+    let scanned = vec![
+        reconciliation_marker(30, "duplicate"),
+        reconciliation_marker(40, "duplicate"),
+    ];
+    let result = std::panic::catch_unwind(|| reconcile_stable_ids(&existing, &scanned));
+    assert!(
+        result.is_err(),
+        "duplicate fingerprints must not be paired by source order after line drift"
+    );
 }
 
 // ─── Canonical regeneration (bd-y7otm) ───────────────────────────────────
@@ -928,12 +1308,9 @@ fn toml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-#[test]
-#[ignore = "operator-run regenerator; prints the canonical inventory TOML"]
-fn regenerate_inventory_toml() {
-    // Preserve the existing meta + resolved history; re-baseline the active list
-    // from the current scan (uniform metadata, fingerprint identity).
-    let existing = load_inventory();
+fn render_inventory_toml(existing: &InventoryDocument) -> String {
+    // Preserve existing metadata, classifications, IDs, and resolved history;
+    // refresh source hints and append only genuinely new fingerprints.
     let scan_files: Vec<String> = if existing.meta.scanned_files.is_empty() {
         BOOTSTRAP_SCANNED_FILES
             .iter()
@@ -943,30 +1320,41 @@ fn regenerate_inventory_toml() {
         existing.meta.scanned_files.clone()
     };
     let scanned = scan_markers(&scan_files, &existing.meta.source_patterns);
+    let (entries, next_active_id) = reconcile_stable_ids(existing, &scanned);
 
     let mut out = String::new();
     out.push_str("[meta]\n");
-    out.push_str("schema_version = \"1.1.0\"\n");
-    out.push_str(&format!("bead_id = \"{}\"\n", existing.meta.bead_id));
-    out.push_str(&format!("track_id = \"{}\"\n", existing.meta.track_id));
+    out.push_str(&format!(
+        "schema_version = \"{}\"\n",
+        toml_escape(&existing.meta.schema_version)
+    ));
+    out.push_str(&format!(
+        "bead_id = \"{}\"\n",
+        toml_escape(&existing.meta.bead_id)
+    ));
+    out.push_str(&format!(
+        "track_id = \"{}\"\n",
+        toml_escape(&existing.meta.track_id)
+    ));
     out.push_str(&format!(
         "sqlite_target = \"{}\"\n",
-        existing.meta.sqlite_target
+        toml_escape(&existing.meta.sqlite_target)
     ));
     out.push_str(&format!(
         "generated_at = \"{}\"\n",
-        existing.meta.generated_at
+        toml_escape(&existing.meta.generated_at)
     ));
     out.push_str(&format!(
         "contract_owner = \"{}\"\n",
-        existing.meta.contract_owner
+        toml_escape(&existing.meta.contract_owner)
     ));
     out.push_str(&format!(
         "inventory_scope = \"{}\"\n",
-        existing.meta.inventory_scope
+        toml_escape(&existing.meta.inventory_scope)
     ));
     out.push_str(&format!(
-        "identity_model = \"fingerprint (file, kind, enclosing_item, normalized_payload); line is a hint (bd-y7otm/GH#136 item 2)\"\n"
+        "identity_model = \"{}\"\n",
+        toml_escape(&existing.meta.identity_model)
     ));
     let source_patterns = existing
         .meta
@@ -990,26 +1378,63 @@ fn regenerate_inventory_toml() {
         .collect::<Vec<_>>()
         .join(", ");
     out.push_str(&format!("scanned_files = [{files}]\n"));
-    out.push_str(&format!("next_active_id = {}\n", scanned.len() + 1));
+    out.push_str(&format!("next_active_id = {next_active_id}\n"));
 
-    // Active entries in source order; ordinals assigned 1..=N.
-    for (index, marker) in scanned.iter().enumerate() {
+    // Existing entries remain in document order and keep stable IDs and
+    // classifications. Genuinely new fingerprints are appended and consume
+    // `meta.next_active_id`.
+    for entry in entries {
+        let marker = entry.marker;
+        let kind_description = entry.existing.map_or_else(
+            || match marker.kind {
+                StubKind::NotImplemented => {
+                    "FrankenError::NotImplemented runtime fallback".to_owned()
+                }
+                StubKind::UnsupportedCodegen => {
+                    "CodegenError::Unsupported compiler fallback".to_owned()
+                }
+                StubKind::TodoPlaceholder => "runtime TODO placeholder".to_owned(),
+            },
+            |stub| stub.kind_description.clone(),
+        );
+        let severity = entry
+            .existing
+            .map_or("critical", |stub| stub.severity.as_str());
+        let feature_id = entry
+            .existing
+            .map_or("SURF-SQL-CORE-001", |stub| stub.feature_id.as_str());
+        let owner = entry
+            .existing
+            .map_or("track-d-engine-runtime", |stub| stub.owner.as_str());
+        let closure_strategy = entry
+            .existing
+            .map_or("implement", |stub| stub.closure_strategy.as_str());
+
         out.push_str("\n[[runtime_stubs]]\n");
-        out.push_str(&format!("stub_id = \"RSTUB-ACTIVE-{:04}\"\n", index + 1));
+        out.push_str(&format!("stub_id = \"{}\"\n", entry.stub_id));
         out.push_str(&format!("file = \"{}\"\n", toml_escape(&marker.file)));
         out.push_str(&format!("line = {}\n", marker.line));
         out.push_str(&format!("kind = \"{}\"\n", kind_str(marker.kind)));
-        out.push_str("kind_description = \"CodegenError::Unsupported compiler fallback\"\n");
-        out.push_str("severity = \"critical\"\n");
-        out.push_str("feature_id = \"SURF-SQL-CORE-001\"\n");
-        out.push_str("owner = \"track-d-engine-runtime\"\n");
-        out.push_str("closure_strategy = \"implement\"\n");
+        out.push_str(&format!(
+            "kind_description = \"{}\"\n",
+            toml_escape(&kind_description)
+        ));
+        out.push_str(&format!("severity = \"{}\"\n", toml_escape(severity)));
+        out.push_str(&format!("feature_id = \"{}\"\n", toml_escape(feature_id)));
+        out.push_str(&format!("owner = \"{}\"\n", toml_escape(owner)));
+        out.push_str(&format!(
+            "closure_strategy = \"{}\"\n",
+            toml_escape(closure_strategy)
+        ));
         out.push_str(&format!("anchor = \"{}\"\n", toml_escape(&marker.anchor)));
         out.push_str(&format!(
             "enclosing_item = \"{}\"\n",
             toml_escape(&marker.enclosing_item)
         ));
-        out.push_str(&format!("payload = \"{}\"\n", toml_escape(&marker.payload)));
+        let payload = entry
+            .existing
+            .map_or(marker.payload.as_str(), |stub| stub.payload.as_str());
+        out.push_str(&format!("payload = \"{}\"\n", toml_escape(payload)));
     }
 
     // Preserve resolved history verbatim.
@@ -1029,6 +1454,14 @@ fn regenerate_inventory_toml() {
             out.push_str(&format!("identity_note = \"{}\"\n", toml_escape(note)));
         }
     }
+
+    out
+}
+
+#[test]
+#[ignore = "operator-run regenerator; prints the canonical inventory TOML"]
+fn regenerate_inventory_toml() {
+    let out = render_inventory_toml(&load_inventory());
 
     println!("=====BEGIN_CANONICAL_INVENTORY_TOML=====");
     print!("{out}");

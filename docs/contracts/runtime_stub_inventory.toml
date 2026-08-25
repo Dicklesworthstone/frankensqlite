@@ -5,12 +5,1272 @@ track_id = "bd-2yqp6.4"
 sqlite_target = "3.52.0"
 generated_at = "2026-08-04"
 contract_owner = "track-d-engine-runtime"
-inventory_scope = "runtime-src-only-pre-cfgtest"
+inventory_scope = "runtime-items-excluding-cfg-test"
 identity_model = "fingerprint (file, kind, enclosing_item, normalized_payload); line is a hint (bd-y7otm/GH#136 item 2)"
 source_patterns = ["FrankenError::NotImplemented(", "CodegenError::Unsupported(", "TODO: Apply collation from P4 if present."]
 parity_critical_severities = ["critical", "high"]
 scanned_files = ["crates/fsqlite-core/src/connection.rs", "crates/fsqlite-planner/src/codegen.rs", "crates/fsqlite-vdbe/src/codegen.rs", "crates/fsqlite-vdbe/src/engine.rs"]
-next_active_id = 94
+next_active_id = 184
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0094"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 3284
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "Err(FrankenError::NotImplemented("
+enclosing_item = "resolve_stable_database_path"
+payload = "file-backed pager not available on this platform"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0095"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 3813
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "Err(FrankenError::NotImplemented("
+enclosing_item = "open_with_requested_page_size_and_page_buffer_max"
+payload = "file-backed pager not available on this platform"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0096"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 3876
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "Err(FrankenError::NotImplemented("
+enclosing_item = "open_existing_with_page_buffer_max"
+payload = "file-backed pager not available on this platform"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0097"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 3957
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "Err(FrankenError::NotImplemented("
+enclosing_item = "open_readonly_with_page_buffer_max"
+payload = "file-backed pager not available on this platform"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0098"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 18031
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "validate_attached_target_schema"
+payload = "{action} against attached schema {schema} is not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0099"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 27088
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "decode_table_row_values_from_payload"
+payload = "retained autocommit overlay does not support WITHOUT ROWID table `{}`"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0100"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 27127
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "projected_table_row_numeric_sum_value_from_payload"
+payload = "retained autocommit overlay does not support WITHOUT ROWID table `{}`"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0101"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 27256
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "projected_table_row_value_from_payload"
+payload = "retained autocommit overlay does not support WITHOUT ROWID table `{}`"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0102"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 33760
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "parse_single_statement_with_statement_scratch"
+payload = "multiple statements are not supported in this API path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0103"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 36902
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_statement_dispatch_impl"
+payload = "RETURNING is not supported for live virtual-table INSERT"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0104"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 36916
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_statement_dispatch_impl"
+payload = "UPSERT and conflict clauses are not supported for live virtual-table INSERT"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0105"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 37460
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_statement_dispatch_impl"
+payload = "RETURNING is not supported for live virtual-table UPDATE"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0106"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 37976
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_statement_dispatch_impl"
+payload = "RETURNING is not supported for live virtual-table DELETE"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0107"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 38258
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented("
+enclosing_item = "execute_statement_dispatch_impl"
+payload = "unsupported statement type"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0108"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 38281
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "rewrite_subquery_statement"
+payload = "ordered DISTINCT function projection in an IN subquery requires deferred projection semantics"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0109"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 38937
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_materialized_create_table_as_select_statement"
+payload = "CREATE TABLE ... AS SELECT ... STRICT is not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0110"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 42249
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_insert_or_conflict"
+payload = "STORED generated columns are not yet supported in the INSERT OR REPLACE fallback path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0111"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 42985
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented("
+enclosing_item = "compile_and_wrap"
+payload = "prepare() supports SELECT, INSERT, UPDATE, DELETE, and PRAGMA statements only"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0112"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 49105
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "materialize_update_limit_scope"
+payload = "UPDATE ... FROM with ORDER BY/LIMIT is not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0113"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 49199
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "Err(FrankenError::NotImplemented(format!("
+enclosing_item = "resolve_dml_limit_key"
+payload = "ORDER BY/LIMIT for UPDATE/DELETE requires rowid or INTEGER PRIMARY KEY on table `{table_name}`"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0114"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 57219
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "\"rowid\" | \"_rowid_\" | \"oid\" => Err(FrankenError::NotImplemented("
+enclosing_item = "sqlite_master_column_index"
+payload = "writable_schema rowid writes are not supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0115"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 57461
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_writable_schema_insert"
+payload = "writable_schema INSERT supports plain INSERT INTO sqlite_master only"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0116"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 57481
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_writable_schema_insert"
+payload = "writable_schema INSERT DEFAULT VALUES is not supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0117"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 57510
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_writable_schema_update"
+payload = "writable_schema UPDATE supports simple UPDATE sqlite_master SET ... only"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0118"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 57526
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_writable_schema_update"
+payload = "writable_schema UPDATE does not support column-list assignment"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0119"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 57575
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_writable_schema_delete"
+payload = "writable_schema DELETE supports simple DELETE FROM sqlite_master only"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0120"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 59308
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_create_table"
+payload = "CREATE TABLE ... WITHOUT ROWID requires a PRIMARY KEY"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0121"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 59313
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_create_table"
+payload = "AUTOINCREMENT on WITHOUT ROWID tables is not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0122"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 59806
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_create_table"
+payload = "CREATE TABLE ... AS SELECT ... STRICT is not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0123"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 59850
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_create_virtual_table"
+payload = "recreating live virtual table {table_name} in the same transaction after DROP is not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0124"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 59951
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_create_virtual_table"
+payload = "CREATE VIRTUAL TABLE USING {} is not supported — no module registered"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0125"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 63509
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_create_index"
+payload = "UNIQUE expression indexes on TEMP tables are not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0126"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 71185
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented(format!("
+enclosing_item = "bounded_validation_refusal"
+payload = "bounded whole-image validation refused unsupported candidate shape: {}"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0127"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 75301
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "register_differential_view_subscriber"
+payload = "differential subscribers require PRAGMA fsqlite_differential_views = ON"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0128"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 75312
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "register_differential_view_subscriber"
+payload = "differential subscribers currently require autocommit mode"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0129"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 76582
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_group_by_join_select"
+payload = "GROUP BY JOIN on non-SELECT core"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0130"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 76677
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_group_by_join_select"
+payload = "{func}(*) is not supported in GROUP BY+JOIN path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0131"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 76686
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_group_by_join_select"
+payload = "{func}() with no args is not supported in GROUP BY+JOIN path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0132"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 76748
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_group_by_join_select"
+payload = "{func}() with multiple args is not supported in GROUP BY+JOIN path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0133"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 76776
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented(\"SELECT * with GROUP BY+JOIN\".to_owned()),"
+enclosing_item = "execute_group_by_join_select"
+payload = "SELECT * with GROUP BY+JOIN"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0134"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 77028
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_group_by_join_select"
+payload = "aggregate {name}(*) is not registered"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0135"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 77138
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_group_by_join_select"
+payload = "aggregate {name} requires an argument"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0136"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 79089
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented("
+enclosing_item = "resolve_expression_only_order_terms"
+payload = "expression-only ORDER BY currently supports output-column positions or aliases only"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0137"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 80875
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented(format!("
+enclosing_item = "execute_table_function_rows"
+payload = "table-valued function {name} is not supported — no module registered"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0138"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 80895
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_table_function_rows"
+payload = "table-valued function {name} is not supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0139"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 81032
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_group_by_select"
+payload = "compound SELECT is not supported with GROUP BY in this connection path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0140"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 81072
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_group_by_select"
+payload = "GROUP BY on non-SELECT core"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0141"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 81078
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_group_by_select"
+payload = "WINDOW is not supported in this GROUP BY connection path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0142"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 81092
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_group_by_select"
+payload = "GROUP BY with non-table source"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0143"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 81098
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_group_by_select"
+payload = "GROUP BY without FROM"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0144"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 81268
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_group_by_select"
+payload = "{func}(*) is not supported in this GROUP BY connection path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0145"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 81277
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_group_by_select"
+payload = "{func}() with no args is not supported in this GROUP BY connection path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0146"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 81338
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_group_by_select"
+payload = "{func}() with multiple args is not supported in this GROUP BY connection path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0147"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 81371
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented(\"SELECT * with GROUP BY\".to_owned()),"
+enclosing_item = "execute_group_by_select"
+payload = "SELECT * with GROUP BY"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0148"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 82014
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_group_by_select"
+payload = "aggregate {name}(*) is not registered"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0149"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 82117
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_group_by_select"
+payload = "aggregate {name} requires an argument in this GROUP BY connection path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0150"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 82636
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_group_by_window_select"
+payload = "GROUP BY + window on non-SELECT core"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0151"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 83569
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_window_select"
+payload = "window functions on VALUES"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0152"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 83627
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_window_select"
+payload = "window functions with non-table source"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0153"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 83633
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_window_select"
+payload = "window functions without FROM"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0154"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 86852
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "materialize_recursive_cte"
+payload = "recursive CTE supports only UNION and UNION ALL"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0155"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 86888
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "materialize_recursive_cte"
+payload = "INTERSECT/EXCEPT in recursive CTE not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0156"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 86979
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "materialize_recursive_cte"
+payload = "INTERSECT/EXCEPT in recursive CTE not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0157"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 87288
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "execute_join_select"
+payload = "JOIN on non-SELECT core"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0158"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 87361
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented(format!("
+enclosing_item = "execute_join_select"
+payload = "table-valued function {name} is not supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0159"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 87381
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented("
+enclosing_item = "execute_join_select"
+payload = "only named tables, table-valued functions, and subqueries are supported in JOIN"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0160"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 98841
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(multi_message.to_owned()));"
+enclosing_item = "resolve_attached_schema_usage"
+payload = "multi_message.to_owned()"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0161"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 98844
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(mixed_message.to_owned()));"
+enclosing_item = "resolve_attached_schema_usage"
+payload = "mixed_message.to_owned()"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0162"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 111559
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "rewrite_in_expr"
+payload = "ordered DISTINCT function projection in an IN subquery requires deferred projection semantics"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0163"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 122962
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "other => Err(FrankenError::NotImplemented(format!("
+enclosing_item = "compute_aggregate"
+payload = "aggregate {other}() is not implemented in the grouped-fallback evaluator"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0164"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 123790
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(msg) => FrankenError::NotImplemented(msg),"
+enclosing_item = "codegen_error_to_franken"
+payload = "msg"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0165"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 129785
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "validate_relation"
+payload = "qualified relation {schema_name}.{} is not supported while a same-name CTE is active"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0166"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 135060
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented("
+enclosing_item = "resolve_order_terms"
+payload = "expression-only ORDER BY currently supports output-column positions or aliases only"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0167"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 135116
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented("
+enclosing_item = "parse_limit_offset_expr"
+payload = "expression-only LIMIT/OFFSET currently supports integer literals only"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0168"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 135270
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "parse_single_statement"
+payload = "multiple statements are not supported in this API path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0169"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 136785
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "compile_expression_select"
+payload = "compound SELECT is not supported in this connection path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0170"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 136840
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "compile_expression_select"
+payload = "SELECT ... FROM is not supported in this connection path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0171"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 136845
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "compile_expression_select"
+payload = "GROUP BY is not supported in this connection path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0172"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 136850
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "compile_expression_select"
+payload = "HAVING is not supported in this connection path"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0173"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 136891
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "compile_expression_select"
+payload = "function modifiers (DISTINCT/FILTER/OVER) are not supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0174"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 136958
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "compile_expression_select"
+payload = "star expansion requires name resolution and FROM sources"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0175"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 137171
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented(format!("
+enclosing_item = "emit_expr"
+payload = "expression form is not supported in this connection path: {expr:?}"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0176"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 137459
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "emit_function_call"
+payload = "function modifiers (FILTER/OVER) are not supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0177"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 139609
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "emit_in_expr"
+payload = "IN (SELECT ...) subquery is not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0178"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 139614
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "emit_in_expr"
+payload = "IN table_name is not yet supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0179"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 142826
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "eval_join_expr"
+payload = "multi-column IN with subquery not supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0180"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 142934
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+enclosing_item = "eval_join_expr"
+payload = "IN subquery in JOIN not supported"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0181"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 143099
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "other => Err(FrankenError::NotImplemented(format!("
+enclosing_item = "eval_join_expr"
+payload = "eval_join_expr: unsupported expression type: {other:?}"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0182"
+file = "crates/fsqlite-vdbe/src/engine.rs"
+line = 9713
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_with_borrowed_bindings_internal"
+payload = "ATTACH DATABASE (db number {}) not yet supported — use the main database or :memory:"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-ACTIVE-0183"
+file = "crates/fsqlite-vdbe/src/engine.rs"
+line = 9758
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime fallback"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+enclosing_item = "execute_with_borrowed_bindings_internal"
+payload = "ATTACH DATABASE (db number {}) not yet supported — use the main database or :memory:"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0001"
@@ -863,7 +2123,7 @@ feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
-enclosing_item = "resolve_from_table"
+enclosing_item = "codegen_update_from"
 payload = "UPDATE ... FROM with NATURAL JOIN is not yet supported"
 
 [[runtime_stubs]]
@@ -877,7 +2137,7 @@ feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
-enclosing_item = "resolve_from_table"
+enclosing_item = "codegen_update_from"
 payload = "UPDATE ... FROM with an OUTER JOIN source is not yet supported"
 
 [[runtime_stubs]]
@@ -891,7 +2151,7 @@ feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
-enclosing_item = "resolve_from_table"
+enclosing_item = "codegen_update_from"
 payload = "UPDATE ... FROM with a USING(...) join constraint is not yet supported"
 
 [[runtime_stubs]]
@@ -1185,7 +2445,7 @@ feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
-enclosing_item = "resolve_from_table"
+enclosing_item = "codegen_update_from_without_rowid"
 payload = "UPDATE ... FROM with NATURAL JOIN is not yet supported on WITHOUT ROWID tables"
 
 [[runtime_stubs]]
@@ -1199,7 +2459,7 @@ feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
-enclosing_item = "resolve_from_table"
+enclosing_item = "codegen_update_from_without_rowid"
 payload = "UPDATE ... FROM with an OUTER JOIN source is not yet supported on WITHOUT \\ ROWID tables"
 
 [[runtime_stubs]]
@@ -1213,7 +2473,7 @@ feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(CodegenError::Unsupported("
-enclosing_item = "resolve_from_table"
+enclosing_item = "codegen_update_from_without_rowid"
 payload = "UPDATE ... FROM with a USING(...) join constraint is not yet supported on \\ WITHOUT ROWID tables"
 
 [[runtime_stubs]]
