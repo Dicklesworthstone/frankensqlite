@@ -60,6 +60,16 @@ impl WalMetrics {
         }
     }
 
+    /// Whether this registry owns the process-global SLO gauge mirror.
+    ///
+    /// Only [`GLOBAL_WAL_METRICS`] may publish its current-frame value into
+    /// `fsqlite-observability`; independent registries are snapshots/test
+    /// fixtures and must remain isolated from process-global telemetry.
+    #[must_use]
+    fn owns_process_global_slo_mirror(&self) -> bool {
+        std::ptr::eq(self, &raw const GLOBAL_WAL_METRICS)
+    }
+
     /// Record a frame write.
     pub fn record_frame_write(&self, frame_bytes: u64) {
         self.frames_written_total.fetch_add(1, Ordering::Relaxed);
@@ -75,9 +85,11 @@ impl WalMetrics {
         // SLO registry so `/metrics` exposes `wal_frames_pending_checkpoint`.
         // Every frame append and the checkpoint reset already funnel through
         // here, so one mirror keeps the two gauges in lock-step.
-        fsqlite_observability::metrics::global()
-            .wal_frames_pending_checkpoint
-            .set(i64::try_from(frame_count).unwrap_or(i64::MAX));
+        if self.owns_process_global_slo_mirror() {
+            fsqlite_observability::metrics::global()
+                .wal_frames_pending_checkpoint
+                .set(i64::try_from(frame_count).unwrap_or(i64::MAX));
+        }
     }
 
     /// Record a completed checkpoint.
@@ -125,7 +137,10 @@ impl WalMetrics {
     pub fn reset(&self) {
         self.frames_written_total.store(0, Ordering::Relaxed);
         self.bytes_written_total.store(0, Ordering::Relaxed);
-        self.wal_frames_current.store(0, Ordering::Relaxed);
+        // Route the gauge reset through the regular setter so resetting the
+        // process-global WAL registry also clears its SLO mirror. Independent
+        // registries remain isolated by `owns_process_global_slo_mirror`.
+        self.set_wal_frames_current(0);
         self.checkpoint_count.store(0, Ordering::Relaxed);
         self.checkpoint_frames_backfilled_total
             .store(0, Ordering::Relaxed);
@@ -943,6 +958,15 @@ mod tests {
         assert_eq!(m.snapshot().wal_frames_current, 42);
         m.set_wal_frames_current(0);
         assert_eq!(m.snapshot().wal_frames_current, 0);
+    }
+
+    #[test]
+    fn only_global_wal_metrics_owns_process_slo_mirror() {
+        assert!(GLOBAL_WAL_METRICS.owns_process_global_slo_mirror());
+        assert!(
+            !WalMetrics::new().owns_process_global_slo_mirror(),
+            "an independent WAL registry must not overwrite process-global telemetry"
+        );
     }
 
     #[test]
