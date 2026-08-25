@@ -451,20 +451,6 @@ fn add_vdbe_duration_if(enabled: bool, counter: &AtomicU64, started: Instant) {
     }
 }
 
-/// bd-zywqc.11.1.1: mirror a completed page-lock acquire wait into the
-/// Prometheus `page_lock_acquire_duration_seconds` histogram. Only the
-/// genuinely-blocking wait path calls this — an uncontended CAS acquire never
-/// waits — so the histogram stays empty under no contention rather than
-/// recording a pile of near-zero samples. `.observe()` is internally gated by
-/// `metrics_disabled()`, so this is zero-overhead when the /metrics subsystem
-/// is off; the only work when disabled is the (contended-path-only) elapsed()
-/// read already computed for the internal ns counter.
-fn observe_page_lock_acquire_wait(started: Instant) {
-    fsqlite_observability::metrics::global()
-        .page_lock_acquire_duration_seconds
-        .observe(started.elapsed().as_secs_f64());
-}
-
 #[derive(Debug, Clone, Copy)]
 struct BtreeCursorPageLayout {
     usable_size: u32,
@@ -3072,7 +3058,6 @@ fn wait_for_page_lock_holder_change(
                 &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAIT_TIME_NS_TOTAL,
                 started,
             );
-            observe_page_lock_acquire_wait(started);
             return Ok(true);
         }
 
@@ -3083,7 +3068,6 @@ fn wait_for_page_lock_holder_change(
                 &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAIT_TIME_NS_TOTAL,
                 started,
             );
-            observe_page_lock_acquire_wait(started);
             return Ok(false);
         }
     }
@@ -30517,84 +30501,6 @@ mod tests {
                 .write_witness_keys()
                 .contains(&WitnessKey::Page(PageNumber::ONE)),
             "retained clone must record writes on the refilled concurrent session"
-        );
-    }
-
-    /// bd-zywqc.11.1.1: a genuinely-blocking page-lock acquire wait records its
-    /// total duration into the `page_lock_acquire_duration_seconds` histogram.
-    /// A foreign txn holds the page; a releaser thread frees it after a short
-    /// delay so the waiter parks, is woken, and returns `Ok(true)` via the
-    /// success path that observes the histogram. Asserts the observation count
-    /// strictly increases — the histogram is a process-global shared by every
-    /// engine test running in parallel, so an exact delta would be flaky, and an
-    /// uncontended acquire never calls this path at all (so it is not near-zero
-    /// noise, it is simply absent).
-    #[test]
-    fn page_lock_acquire_wait_records_duration_histogram() {
-        use fsqlite_mvcc::{CommitIndex, ConcurrentRegistry, InProcessPageLockTable};
-        use fsqlite_observability::metrics::{global, metrics_disabled};
-        use fsqlite_types::{CommitSeq, PageNumber, SchemaEpoch, Snapshot, TxnId};
-
-        // Histograms are no-ops when the subsystem is disabled; the count
-        // assertion only holds when metrics are on (the default).
-        if metrics_disabled() {
-            return;
-        }
-
-        let cx = Cx::new();
-        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
-        let lock_table = Arc::new(InProcessPageLockTable::new());
-        let commit_index = Arc::new(CommitIndex::new());
-        let (session_id, handle) = {
-            let mut guard = registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let session = guard
-                .begin_concurrent(Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1)))
-                .expect("session should register");
-            let handle = guard.handle(session).expect("session handle should exist");
-            (session, handle)
-        };
-        let ctx = ConcurrentContext::new(
-            session_id,
-            handle,
-            Arc::clone(&lock_table),
-            Arc::clone(&commit_index),
-            5000,
-        );
-
-        // A foreign txn holds the contended page so the waiter observes a holder
-        // and blocks, instead of taking the immediate no-holder fast path.
-        let page = PageNumber::new(42).expect("valid page number");
-        let holder_txn = TxnId::new(999_999).expect("valid txn id");
-        assert!(
-            lock_table.try_acquire(page, holder_txn).is_ok(),
-            "the foreign holder should acquire the page lock cleanly"
-        );
-
-        // Release from another thread after a short delay so the main thread
-        // parks in the wait loop and is woken by the release.
-        let releaser_lock_table = Arc::clone(&lock_table);
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            releaser_lock_table.release(page, holder_txn);
-        });
-
-        let before = global().page_lock_acquire_duration_seconds.count();
-        let acquired =
-            wait_for_page_lock_holder_change(&cx, &ctx, page, std::time::Duration::from_secs(2))
-                .expect("wait must not error");
-        releaser.join().expect("releaser thread should finish");
-
-        assert!(
-            acquired,
-            "the waiter must observe the holder change once the lock is released"
-        );
-        let after = global().page_lock_acquire_duration_seconds.count();
-        assert!(
-            after > before,
-            "a completed blocking page-lock wait must record a duration sample \
-             (before={before}, after={after})"
         );
     }
 
