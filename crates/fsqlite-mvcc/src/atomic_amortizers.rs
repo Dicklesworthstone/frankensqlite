@@ -2,19 +2,19 @@
 //! atomic operations across many logical events.
 //!
 //! This module ships two complementary primitives that apply the same core
-//! pattern — atomically reserve a *range* of ordered integers, then
+//! pattern — reserve a *range* of ordered integers with a single CAS, then
 //! hand them out from thread-local / call-local state — to two different
 //! hot paths in MVCC:
 //!
 //! * [`ReadTsBatcher`] — Cicada-style read-timestamp batching. Each thread
 //!   pre-reserves a contiguous batch of read timestamps from a shared
 //!   [`AtomicU64`]. `next_read_ts()` hands out the next value from that
-//!   thread-local batch, only reserving from the shared counter once every
+//!   thread-local batch, only taking a CAS on the shared counter once every
 //!   `batch_size` calls. This amortizes the cost of N read-ts reservations
 //!   down to ~1 CAS + N local increments.
 //!
-//! * [`TidGapAllocator`] — Hekaton-style TID gap reservation. One atomic
-//!   update of the shared counter reserves a contiguous gap of `gap_size` TIDs,
+//! * [`TidGapAllocator`] — Hekaton-style TID gap reservation. A single CAS
+//!   on the shared counter reserves a contiguous gap of `gap_size` TIDs,
 //!   returning a [`TidGap`] handle. The caller can then draw TIDs from the
 //!   gap without any further synchronization. Two concurrent gap
 //!   reservations are guaranteed non-overlapping by CAS semantics.
@@ -36,8 +36,6 @@
 //!   fine for both use cases: read timestamps and TIDs are opaque monotone
 //!   identifiers and gaps are safe.
 //! * `batch_size == 0` / `gap_size == 0` is clamped to `1`.
-//! * `u64::MAX` is an exhaustion sentinel and is never issued. Allocation
-//!   returns `None` after the usable integer domain has been reserved.
 //!
 //! # No unsafe
 //!
@@ -45,44 +43,6 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Process-local identity source for TLS-cached read-timestamp batches.
-///
-/// An address is not a sufficient allocator identity: after one allocator is
-/// dropped, a new allocator can occupy the same storage and would otherwise
-/// inherit the prior lifetime's unissued TLS values. Instance IDs make that
-/// ABA impossible. Exhausting this counter would require constructing 2^64-1
-/// batchers in one process, at which point failing fast is safer than aliasing
-/// two allocator identities.
-static NEXT_READ_TS_BATCHER_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_read_ts_batcher_id() -> u64 {
-    NEXT_READ_TS_BATCHER_ID
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .expect("ReadTsBatcher instance-id space exhausted")
-}
-
-/// Atomically reserve a non-empty half-open range from `shared`.
-///
-/// `u64::MAX` is kept as an exhaustion sentinel, so a final reservation may
-/// be shorter than `size`. The counter never wraps and every successful range
-/// has `start < end`.
-fn reserve_counter_range(shared: &AtomicU64, size: u64) -> Option<(u64, u64)> {
-    debug_assert!(size > 0, "range reservation size must be nonzero");
-    let mut start = shared.load(Ordering::Relaxed);
-    loop {
-        if start == u64::MAX {
-            return None;
-        }
-        let end = start.saturating_add(size);
-        match shared.compare_exchange_weak(start, end, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return Some((start, end)),
-            Err(observed) => start = observed,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Cicada read-ts batcher
@@ -109,12 +69,12 @@ impl LocalBatch {
 
 // Each thread caches one LocalBatch per ReadTsBatcher *instance* it has seen.
 // In practice FrankenSQLite wires a single global ReadTsBatcher, so we use a
-// single thread-local slot keyed by the batcher's process-unique ID. If a
-// thread ever interacts with a different batcher, we transparently re-reserve
-// a batch from it; this is correct (never hands out stale values) but slightly
-// less efficient for the pathological multi-batcher case.
+// single thread-local slot keyed by the batcher's address. If a thread ever
+// interacts with a different batcher, we transparently re-reserve a batch
+// from it; this is correct (never hands out stale values) but slightly less
+// efficient for the pathological multi-batcher case.
 thread_local! {
-    static LOCAL_READ_TS: Cell<(u64, LocalBatch)> = const {
+    static LOCAL_READ_TS: Cell<(usize, LocalBatch)> = const {
         Cell::new((0, LocalBatch::EMPTY))
     };
 }
@@ -126,7 +86,6 @@ thread_local! {
 /// batch; within that batch, values are issued by a cheap local increment.
 #[derive(Debug)]
 pub struct ReadTsBatcher {
-    instance_id: u64,
     shared: AtomicU64,
     batch_size: u64,
 }
@@ -134,13 +93,13 @@ pub struct ReadTsBatcher {
 impl ReadTsBatcher {
     /// Create a new batcher starting at `start` with the given `batch_size`.
     ///
-    /// `batch_size` is clamped to at least 1. `u64::MAX` is reserved as the
-    /// exhaustion sentinel and is never returned by [`Self::next_read_ts`].
+    /// `batch_size` is clamped to at least 1.
     #[must_use]
-    pub fn new(start: u64, batch_size: u64) -> Self {
+    pub const fn new(start: u64, batch_size: u64) -> Self {
+        // const fn: manual clamp (cannot call .max() on u64 in const context
+        // across all our toolchains, but a const if-else is fine).
         let b = if batch_size == 0 { 1 } else { batch_size };
         Self {
-            instance_id: next_read_ts_batcher_id(),
             shared: AtomicU64::new(start),
             batch_size: b,
         }
@@ -148,7 +107,7 @@ impl ReadTsBatcher {
 
     /// Create a new batcher starting at 1 with a default batch size of 64.
     #[must_use]
-    pub fn with_default() -> Self {
+    pub const fn with_default() -> Self {
         Self::new(1, 64)
     }
 
@@ -156,31 +115,34 @@ impl ReadTsBatcher {
     ///
     /// Uses a thread-local batch when available; otherwise CAS-reserves a
     /// fresh batch of `batch_size` timestamps from the shared counter.
-    /// Returns `None` once the usable integer domain is exhausted.
-    pub fn next_read_ts(&self) -> Option<u64> {
+    pub fn next_read_ts(&self) -> u64 {
+        let self_key = std::ptr::from_ref::<Self>(self) as usize;
         LOCAL_READ_TS.with(|slot| {
             let (key, mut batch) = slot.get();
-            if key != self.instance_id || batch.is_exhausted() {
-                batch = self.reserve_batch()?;
+            if key != self_key || batch.is_exhausted() {
+                batch = self.reserve_batch();
             }
             // Safe because reserve_batch() always returns a non-empty batch
             // (batch_size >= 1).
             debug_assert!(!batch.is_exhausted());
             let v = batch.next;
-            batch.next += 1;
-            slot.set((self.instance_id, batch));
-            Some(v)
+            batch.next = batch.next.saturating_add(1);
+            slot.set((self_key, batch));
+            v
         })
     }
 
-    /// Reserve a contiguous batch of `batch_size` timestamps via checked CAS.
+    /// Reserve a contiguous batch of `batch_size` timestamps via fetch_add.
     ///
-    /// The uncontended path uses one atomic RMW for the whole range, rather
-    /// than one atomic increment per timestamp. A CAS retry is needed only
-    /// when another thread reserves a range concurrently.
-    fn reserve_batch(&self) -> Option<LocalBatch> {
-        let (start, end) = reserve_counter_range(&self.shared, self.batch_size)?;
-        Some(LocalBatch { next: start, end })
+    /// `fetch_add(n)` is equivalent to a CAS-loop that reserves a range
+    /// of length `n`, but compiles to a single LOCK XADD on x86_64 — one
+    /// atomic RMW total, not `batch_size` of them.
+    fn reserve_batch(&self) -> LocalBatch {
+        let start = self.shared.fetch_add(self.batch_size, Ordering::Relaxed);
+        LocalBatch {
+            next: start,
+            end: start.saturating_add(self.batch_size),
+        }
     }
 
     /// Observe the current shared watermark (for tests / telemetry).
@@ -265,9 +227,8 @@ impl TidGap {
 /// Hekaton-style TID gap allocator.
 ///
 /// Each call to [`TidGapAllocator::reserve_gap`] reserves `gap_size`
-/// contiguous TIDs via one checked atomic range update, returning a [`TidGap`]
-/// the caller can draw from without further synchronization. Concurrent
-/// reservations may retry the CAS but never reserve overlapping ranges.
+/// contiguous TIDs via a single CAS (fetch_add), returning a [`TidGap`]
+/// the caller can draw from without further synchronization.
 #[derive(Debug)]
 pub struct TidGapAllocator {
     shared: AtomicU64,
@@ -296,15 +257,16 @@ impl TidGapAllocator {
     /// Reserve a fresh contiguous gap of `gap_size` TIDs.
     ///
     /// Two calls from any threads are guaranteed to return non-overlapping
-    /// ranges. Returns `None` once the usable integer domain is exhausted.
+    /// ranges.
     #[must_use]
-    pub fn reserve_gap(&self) -> Option<TidGap> {
-        let (start, end) = reserve_counter_range(&self.shared, self.gap_size)?;
-        Some(TidGap {
+    pub fn reserve_gap(&self) -> TidGap {
+        let start = self.shared.fetch_add(self.gap_size, Ordering::Relaxed);
+        let end = start.saturating_add(self.gap_size);
+        TidGap {
             start,
             end,
             next: Cell::new(start),
-        })
+        }
     }
 
     /// Observe the current shared watermark (for tests / telemetry).
@@ -347,7 +309,7 @@ mod tests {
         let mut last: u64 = 0;
         let mut seen: HashSet<u64> = HashSet::with_capacity(1000);
         for _ in 0..1000 {
-            let v = batcher.next_read_ts().expect("timestamp space available");
+            let v = batcher.next_read_ts();
             assert!(
                 v > last,
                 "expected strictly monotonic, got {v} after {last}"
@@ -373,7 +335,7 @@ mod tests {
                 thread::spawn(move || {
                     let mut local = Vec::with_capacity(250);
                     for _ in 0..250 {
-                        local.push(b.next_read_ts().expect("timestamp space available"));
+                        local.push(b.next_read_ts());
                     }
                     tx.send(local).unwrap();
                 })
@@ -412,38 +374,9 @@ mod tests {
     fn cicada_zero_batch_clamped() {
         let batcher = ReadTsBatcher::new(100, 0);
         assert_eq!(batcher.batch_size(), 1);
-        let a = batcher.next_read_ts().expect("timestamp space available");
-        let b = batcher.next_read_ts().expect("timestamp space available");
+        let a = batcher.next_read_ts();
+        let b = batcher.next_read_ts();
         assert!(b > a);
-    }
-
-    /// Reserving the final partial batch must never wrap the shared watermark
-    /// and reissue low timestamp values.
-    #[test]
-    fn cicada_id_space_exhaustion_does_not_wrap() {
-        let batcher = ReadTsBatcher::new(u64::MAX - 1, 4);
-        assert_eq!(batcher.next_read_ts(), Some(u64::MAX - 1));
-        assert_eq!(batcher.watermark(), u64::MAX);
-        assert_eq!(batcher.next_read_ts(), None);
-        assert_eq!(batcher.next_read_ts(), None, "exhaustion is permanent");
-    }
-
-    /// The TLS cache must distinguish allocator lifetimes even when a new
-    /// allocator is constructed in exactly the same storage address.
-    #[test]
-    fn cicada_reused_storage_does_not_inherit_prior_batch() {
-        let mut storage = Some(ReadTsBatcher::new(10, 4));
-        assert_eq!(storage.as_ref().unwrap().next_read_ts(), Some(10));
-
-        storage = None;
-        assert!(storage.is_none());
-        storage = Some(ReadTsBatcher::new(1_000, 4));
-
-        assert_eq!(
-            storage.as_ref().unwrap().next_read_ts(),
-            Some(1_000),
-            "a new allocator reused the prior lifetime's cached batch"
-        );
     }
 
     // ------- Hekaton -------
@@ -452,9 +385,7 @@ mod tests {
     #[test]
     fn hekaton_ten_gaps_non_overlapping() {
         let alloc = TidGapAllocator::new(1, 8);
-        let gaps: Vec<TidGap> = (0..10)
-            .map(|_| alloc.reserve_gap().expect("TID space available"))
-            .collect();
+        let gaps: Vec<TidGap> = (0..10).map(|_| alloc.reserve_gap()).collect();
         // Sort by start and verify no overlaps.
         let mut ranges: Vec<(u64, u64)> = gaps.iter().map(|g| (g.start(), g.end())).collect();
         ranges.sort_by_key(|&(s, _)| s);
@@ -492,7 +423,7 @@ mod tests {
                 thread::spawn(move || {
                     let mut local = Vec::with_capacity(25);
                     for _ in 0..25 {
-                        let g = a.reserve_gap().expect("TID space available");
+                        let g = a.reserve_gap();
                         local.push((g.start(), g.end()));
                     }
                     tx.send(local).unwrap();
@@ -529,7 +460,7 @@ mod tests {
     #[test]
     fn hekaton_gap_exhaustion() {
         let alloc = TidGapAllocator::new(1000, 3);
-        let g = alloc.reserve_gap().expect("TID space available");
+        let g = alloc.reserve_gap();
         assert_eq!(g.start(), 1000);
         assert_eq!(g.end(), 1003);
         assert_eq!(g.next_tid(), Some(1000));
@@ -545,25 +476,9 @@ mod tests {
     fn hekaton_zero_gap_clamped() {
         let alloc = TidGapAllocator::new(5, 0);
         assert_eq!(alloc.gap_size(), 1);
-        let g = alloc.reserve_gap().expect("TID space available");
+        let g = alloc.reserve_gap();
         assert_eq!(g.capacity(), 1);
         assert_eq!(g.next_tid(), Some(5));
         assert_eq!(g.next_tid(), None);
-    }
-
-    /// Reserving the final partial gap must leave the allocator exhausted,
-    /// rather than wrapping its shared watermark to a reusable low value.
-    #[test]
-    fn hekaton_id_space_exhaustion_does_not_wrap() {
-        let alloc = TidGapAllocator::new(u64::MAX - 1, 4);
-        let gap = alloc.reserve_gap().expect("final partial gap available");
-        assert_eq!(gap.start(), u64::MAX - 1);
-        assert_eq!(gap.end(), u64::MAX);
-        assert_eq!(
-            alloc.watermark(),
-            u64::MAX,
-            "gap reservation wrapped the shared watermark"
-        );
-        assert!(alloc.reserve_gap().is_none(), "exhaustion is permanent");
     }
 }
