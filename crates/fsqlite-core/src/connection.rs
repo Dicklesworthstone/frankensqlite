@@ -6188,10 +6188,10 @@ struct QuotientFilterEntry {
     /// `!built`, consultation MUST NOT short-circuit — a present row
     /// would otherwise be mis-classified as absent.
     built: bool,
-    /// Set when the one-shot build scan observes a row count exceeding
-    /// `QUOTIENT_FILTER_BUILD_ROW_CAP`. Once set, consultation stays
-    /// disabled for the remainder of this connection's lifetime for
-    /// this root page, to avoid paying the scan cost on every call.
+    /// Set when the one-shot build scan exceeds
+    /// `QUOTIENT_FILTER_BUILD_ROW_CAP` or live maintenance exhausts the
+    /// filter geometry. While set, consultation stays disabled until the
+    /// entry is reset or invalidated.
     too_large_to_build: bool,
     /// Set on any mutation (insert / remove) made during an active
     /// transaction. Cleared at explicit COMMIT. Used by the rollback
@@ -32140,19 +32140,24 @@ impl Connection {
     /// Record a successful INSERT of `rowid` into the table rooted at
     /// `root_page`. No-op while the quotient-filter map is dormant. If a future
     /// re-enablement explicitly creates a built entry, this keeps it current so
-    /// the next consultation sees the new row.
+    /// the next consultation sees the new row. Capacity exhaustion invalidates
+    /// the entry: leaving it built without the new row would make a `contains`
+    /// miss an unsafe false-negative short-circuit.
     fn qf_record_insert(&self, root_page: i32, rowid: i64) {
         if !self.quotient_filters_may_have_entries.get() {
             return;
         }
         let mut filters = self.quotient_filters.borrow_mut();
         if let Some(entry) = filters.get_mut(&root_page) {
-            if entry.built {
-                // Ignore Err(()): capacity exhaustion just means the
-                // filter is no longer a reliable accelerator; the
-                // next consultation will still descend the B-tree
-                // normally if contains() answers "maybe".
-                let _ = entry.filter.insert(quotient_filter_hash_rowid(rowid));
+            if entry.built
+                && entry
+                    .filter
+                    .insert(quotient_filter_hash_rowid(rowid))
+                    .is_err()
+            {
+                entry.filter.clear();
+                entry.built = false;
+                entry.too_large_to_build = true;
             }
             if self.in_transaction.get() {
                 entry.modified_in_txn = true;
