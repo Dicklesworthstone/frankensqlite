@@ -410,8 +410,9 @@ pub use begin_concurrent::{
     concurrent_write_metadata_page, concurrent_write_page,
     finalize_prepared_concurrent_commit_with_ssi, is_concurrent_mode,
     prepare_concurrent_commit_fcw_only, prepare_concurrent_commit_with_ssi,
-    record_registry_commit_lock_hold, record_registry_commit_lock_wait,
-    registry_commit_lock_metrics, reset_registry_commit_lock_metrics,
+    record_registry_commit_lock_hold, record_registry_commit_lock_hold_decomposed,
+    record_registry_commit_lock_wait, registry_commit_lock_metrics,
+    reset_registry_commit_lock_metrics,
     validate_first_committer_wins,
 };
 pub use bocpd::{BocpdConfig, BocpdMonitor, ConjugateModel, HazardFunction, RegimeStats};

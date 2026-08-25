@@ -1,0 +1,174 @@
+mt-mvcc-bench: rows_per_thread=1000 threads=[1, 8, 32, 64, 128] paired_rounds=11 bootstrap_reps=10000 synchronous=NORMAL wal_autocheckpoint=1000 available_parallelism=Some(64) apples_to_apples=false separate_tables=false transaction_granularity=one_bulk_transaction_per_worker
+mt-mvcc-bench: NON-CITABLE: v7 binds the running executable, build/runtime source identity, Cargo.lock, invocation, toolchain, and measurement host to this same-invocation comparison, but bd-uh1fv still requires external watchdog, sanitized environment, matched retry/deadline semantics, external validation (and, when absent, capture) of a build-attested resolved dependency/feature-graph digest, counterbalanced topology receipts, immutable manifest, retained baseline history, and independent verification.
+mt-mvcc-bench: settings contract: Both engines proved the listed effective PRAGMA values; equal names and readbacks do not establish cross-engine semantic equivalence.
+mt-mvcc-bench: accounting contract: offered and committed writes share one row unit; attempted_writes counts physical INSERT calls; retried_operations records the existing engine-specific retry unit and is provenance only, not a cross-engine comparison metric.
+mt-mvcc-bench: timing contract: workload_elapsed_ns begins only after every worker has opened and proved its effective settings, and ends at the last worker's transaction terminal point before connection teardown; worker_startup_elapsed_ns is reported separately.
+registry_lock threads=1 holds=2 wait_ns_total=100 wait_ns_max=50 hold_ns_total=3979377 hold_ns_max=2672748 mean_hold_us=1989.7 mean_wait_us=0.1
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=7.77 mean_io_us=1974.17 mean_publish_us=7.75 io_ns_max=2660236 io_frac=0.992
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=6 exclusive_lock_us=9 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=1 holds=2 wait_ns_total=171 wait_ns_max=131 hold_ns_total=1924919 hold_ns_max=1377571 mean_hold_us=962.5 mean_wait_us=0.1
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=10.06 mean_io_us=943.50 mean_publish_us=8.90 io_ns_max=1358686 io_frac=0.980
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=1 exclusive_lock_us=8 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=1 holds=2 wait_ns_total=200 wait_ns_max=150 hold_ns_total=3051603 hold_ns_max=1669694 mean_hold_us=1525.8 mean_wait_us=0.1
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=10.07 mean_io_us=1506.19 mean_publish_us=9.54 io_ns_max=1648785 io_frac=0.987
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=1 exclusive_lock_us=8 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=1 holds=2 wait_ns_total=321 wait_ns_max=191 hold_ns_total=1972227 hold_ns_max=1438424 mean_hold_us=986.1 mean_wait_us=0.2
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=11.95 mean_io_us=965.26 mean_publish_us=8.90 io_ns_max=1418377 io_frac=0.979
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=1 exclusive_lock_us=6 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=1 holds=2 wait_ns_total=70 wait_ns_max=40 hold_ns_total=3931439 hold_ns_max=2386016 mean_hold_us=1965.7 mean_wait_us=0.0
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=6.79 mean_io_us=1952.61 mean_publish_us=6.31 io_ns_max=2378631 io_frac=0.993
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=1 exclusive_lock_us=6 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=1 holds=2 wait_ns_total=241 wait_ns_max=201 hold_ns_total=2304995 hold_ns_max=1769269 mean_hold_us=1152.5 mean_wait_us=0.1
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=9.30 mean_io_us=1134.68 mean_publish_us=8.51 io_ns_max=1750635 io_frac=0.985
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=1 exclusive_lock_us=7 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=1 holds=2 wait_ns_total=101 wait_ns_max=61 hold_ns_total=2173139 hold_ns_max=1614491 mean_hold_us=1086.6 mean_wait_us=0.1
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=7.69 mean_io_us=1071.11 mean_publish_us=7.76 io_ns_max=1596087 io_frac=0.986
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=1 exclusive_lock_us=7 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=1 holds=2 wait_ns_total=200 wait_ns_max=110 hold_ns_total=4417071 hold_ns_max=3098570 mean_hold_us=2208.5 mean_wait_us=0.1
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=6.99 mean_io_us=2194.33 mean_publish_us=7.21 io_ns_max=3085596 io_frac=0.994
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=0 exclusive_lock_us=6 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=1 holds=2 wait_ns_total=60 wait_ns_max=30 hold_ns_total=2779718 hold_ns_max=1441590 mean_hold_us=1389.9 mean_wait_us=0.0
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=8.11 mean_io_us=1374.07 mean_publish_us=7.68 io_ns_max=1427814 io_frac=0.989
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=1 exclusive_lock_us=9 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=1 holds=2 wait_ns_total=140 wait_ns_max=100 hold_ns_total=4587167 hold_ns_max=3346180 mean_hold_us=2293.6 mean_wait_us=0.1
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=5.98 mean_io_us=2281.27 mean_publish_us=6.34 io_ns_max=3333086 io_frac=0.995
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=0 exclusive_lock_us=6 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=1 holds=2 wait_ns_total=330 wait_ns_max=180 hold_ns_total=2083093 hold_ns_max=1561753 mean_hold_us=1041.5 mean_wait_us=0.2
+registry_lock_decomp threads=1 decomposed_holds=2 mean_validate_us=10.17 mean_io_us=1022.94 mean_publish_us=8.44 io_ns_max=1541877 io_frac=0.982
+commit_lock_decomp threads=1 arrival_wait_us=16 consolidator_lock_wait_us=0 inner_lock_wait_us=1 exclusive_lock_us=6 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=2 waiter_commits=0 page_lock_waits=0 page_lock_wait_us=0
+registry_lock threads=8 holds=9 wait_ns_total=1742 wait_ns_max=301 hold_ns_total=24608626 hold_ns_max=7391480 mean_hold_us=2734.3 mean_wait_us=0.2
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=449.77 mean_io_us=1733.83 mean_publish_us=550.69 io_ns_max=5670892 io_frac=0.634
+commit_lock_decomp threads=8 arrival_wait_us=73 consolidator_lock_wait_us=0 inner_lock_wait_us=8 exclusive_lock_us=48 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=11 page_lock_wait_us=52488
+registry_lock threads=8 holds=9 wait_ns_total=1804 wait_ns_max=551 hold_ns_total=17096113 hold_ns_max=2557855 mean_hold_us=1899.6 mean_wait_us=0.2
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=375.22 mean_io_us=1051.58 mean_publish_us=472.77 io_ns_max=1671938 io_frac=0.554
+commit_lock_decomp threads=8 arrival_wait_us=72 consolidator_lock_wait_us=0 inner_lock_wait_us=5 exclusive_lock_us=42 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=25 page_lock_wait_us=79304
+registry_lock threads=8 holds=9 wait_ns_total=1672 wait_ns_max=290 hold_ns_total=21248671 hold_ns_max=6712107 mean_hold_us=2361.0 mean_wait_us=0.2
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=320.68 mean_io_us=1598.39 mean_publish_us=441.89 io_ns_max=5405578 io_frac=0.677
+commit_lock_decomp threads=8 arrival_wait_us=72 consolidator_lock_wait_us=0 inner_lock_wait_us=7 exclusive_lock_us=43 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=8 page_lock_wait_us=35272
+registry_lock threads=8 holds=10 wait_ns_total=1903 wait_ns_max=250 hold_ns_total=18647563 hold_ns_max=4962435 mean_hold_us=1864.8 mean_wait_us=0.2
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=258.03 mean_io_us=1369.47 mean_publish_us=386.74 io_ns_max=3563214 io_frac=0.680
+commit_lock_decomp threads=8 arrival_wait_us=72 consolidator_lock_wait_us=0 inner_lock_wait_us=5 exclusive_lock_us=49 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=13 page_lock_wait_us=42765
+registry_lock threads=8 holds=10 wait_ns_total=1933 wait_ns_max=390 hold_ns_total=14658772 hold_ns_max=2362232 mean_hold_us=1465.9 mean_wait_us=0.2
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=224.90 mean_io_us=945.28 mean_publish_us=384.44 io_ns_max=1676056 io_frac=0.608
+commit_lock_decomp threads=8 arrival_wait_us=72 consolidator_lock_wait_us=0 inner_lock_wait_us=5 exclusive_lock_us=33 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=29 page_lock_wait_us=89461
+registry_lock threads=8 holds=9 wait_ns_total=1554 wait_ns_max=291 hold_ns_total=23183138 hold_ns_max=11736248 mean_hold_us=2575.9 mean_wait_us=0.2
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=191.15 mean_io_us=2116.78 mean_publish_us=267.97 io_ns_max=10422235 io_frac=0.822
+commit_lock_decomp threads=8 arrival_wait_us=72 consolidator_lock_wait_us=0 inner_lock_wait_us=7 exclusive_lock_us=46 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=8 page_lock_wait_us=47799
+registry_lock threads=8 holds=9 wait_ns_total=1211 wait_ns_max=351 hold_ns_total=20126715 hold_ns_max=10532881 mean_hold_us=2236.3 mean_wait_us=0.1
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=97.93 mean_io_us=2007.68 mean_publish_us=130.69 io_ns_max=10306990 io_frac=0.898
+commit_lock_decomp threads=8 arrival_wait_us=72 consolidator_lock_wait_us=0 inner_lock_wait_us=4 exclusive_lock_us=37 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=6 page_lock_wait_us=33414
+registry_lock threads=8 holds=13 wait_ns_total=2146 wait_ns_max=321 hold_ns_total=56931246 hold_ns_max=35678075 mean_hold_us=4379.3 mean_wait_us=0.2
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=244.47 mean_io_us=5496.85 mean_publish_us=329.52 io_ns_max=34454461 io_frac=0.905
+commit_lock_decomp threads=8 arrival_wait_us=72 consolidator_lock_wait_us=0 inner_lock_wait_us=4 exclusive_lock_us=39 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=34 page_lock_wait_us=169555
+registry_lock threads=8 holds=10 wait_ns_total=1724 wait_ns_max=290 hold_ns_total=16428882 hold_ns_max=3881004 mean_hold_us=1642.9 mean_wait_us=0.2
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=283.93 mean_io_us=1097.18 mean_publish_us=389.53 io_ns_max=1959553 io_frac=0.620
+commit_lock_decomp threads=8 arrival_wait_us=78 consolidator_lock_wait_us=0 inner_lock_wait_us=6 exclusive_lock_us=39 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=28 page_lock_wait_us=97946
+registry_lock threads=8 holds=10 wait_ns_total=1212 wait_ns_max=250 hold_ns_total=21586951 hold_ns_max=10216652 mean_hold_us=2158.7 mean_wait_us=0.1
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=116.05 mean_io_us=2056.42 mean_publish_us=174.12 io_ns_max=9207246 io_frac=0.876
+commit_lock_decomp threads=8 arrival_wait_us=72 consolidator_lock_wait_us=0 inner_lock_wait_us=7 exclusive_lock_us=34 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=8 page_lock_wait_us=45548
+registry_lock threads=8 holds=10 wait_ns_total=1802 wait_ns_max=260 hold_ns_total=12740604 hold_ns_max=2399651 mean_hold_us=1274.1 mean_wait_us=0.2
+registry_lock_decomp threads=8 decomposed_holds=9 mean_validate_us=138.51 mean_io_us=1037.11 mean_publish_us=185.83 io_ns_max=1946979 io_frac=0.762
+commit_lock_decomp threads=8 arrival_wait_us=72 consolidator_lock_wait_us=0 inner_lock_wait_us=9 exclusive_lock_us=50 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=9 waiter_commits=0 page_lock_waits=11 page_lock_wait_us=23187
+registry_lock threads=32 holds=40 wait_ns_total=8976 wait_ns_max=391 hold_ns_total=242124937 hold_ns_max=18611559 mean_hold_us=6053.1 mean_wait_us=0.2
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=498.56 mean_io_us=5714.39 mean_publish_us=977.37 io_ns_max=17247153 io_frac=0.795
+commit_lock_decomp threads=32 arrival_wait_us=291 consolidator_lock_wait_us=0 inner_lock_wait_us=25 exclusive_lock_us=204 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=1168 page_lock_wait_us=3199730
+registry_lock threads=32 holds=122 wait_ns_total=24502 wait_ns_max=360 hold_ns_total=483115323 hold_ns_max=52241066 mean_hold_us=3960.0 mean_wait_us=0.2
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=519.66 mean_io_us=11559.57 mean_publish_us=772.52 io_ns_max=52142113 io_frac=0.899
+commit_lock_decomp threads=32 arrival_wait_us=301 consolidator_lock_wait_us=0 inner_lock_wait_us=30 exclusive_lock_us=218 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=1458 page_lock_wait_us=12333095
+registry_lock threads=32 holds=36 wait_ns_total=8668 wait_ns_max=521 hold_ns_total=275521388 hold_ns_max=25572701 mean_hold_us=7653.4 mean_wait_us=0.2
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=664.04 mean_io_us=6689.51 mean_publish_us=938.63 io_ns_max=25439443 io_frac=0.807
+commit_lock_decomp threads=32 arrival_wait_us=316 consolidator_lock_wait_us=0 inner_lock_wait_us=23 exclusive_lock_us=204 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=503 page_lock_wait_us=2738528
+registry_lock threads=32 holds=96 wait_ns_total=20147 wait_ns_max=401 hold_ns_total=438986503 hold_ns_max=45121473 mean_hold_us=4572.8 mean_wait_us=0.2
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=437.89 mean_io_us=10939.73 mean_publish_us=676.20 io_ns_max=43915652 io_frac=0.908
+commit_lock_decomp threads=32 arrival_wait_us=309 consolidator_lock_wait_us=0 inner_lock_wait_us=28 exclusive_lock_us=200 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=974 page_lock_wait_us=9945018
+registry_lock threads=32 holds=40 wait_ns_total=10738 wait_ns_max=1202 hold_ns_total=222585029 hold_ns_max=24632695 mean_hold_us=5564.6 mean_wait_us=0.3
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=537.29 mean_io_us=5261.12 mean_publish_us=803.11 io_ns_max=24608129 io_frac=0.797
+commit_lock_decomp threads=32 arrival_wait_us=301 consolidator_lock_wait_us=0 inner_lock_wait_us=30 exclusive_lock_us=214 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=540 page_lock_wait_us=2621537
+registry_lock threads=32 holds=35 wait_ns_total=8179 wait_ns_max=1042 hold_ns_total=237386032 hold_ns_max=20003850 mean_hold_us=6782.5 mean_wait_us=0.2
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=530.78 mean_io_us=5762.55 mean_publish_us=863.28 io_ns_max=17517737 io_frac=0.805
+commit_lock_decomp threads=32 arrival_wait_us=327 consolidator_lock_wait_us=0 inner_lock_wait_us=24 exclusive_lock_us=224 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=795 page_lock_wait_us=2738186
+registry_lock threads=32 holds=125 wait_ns_total=23354 wait_ns_max=521 hold_ns_total=488755504 hold_ns_max=53095662 mean_hold_us=3910.0 mean_wait_us=0.2
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=453.56 mean_io_us=11833.18 mean_publish_us=776.93 io_ns_max=52979576 io_frac=0.906
+commit_lock_decomp threads=32 arrival_wait_us=330 consolidator_lock_wait_us=0 inner_lock_wait_us=25 exclusive_lock_us=235 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=1554 page_lock_wait_us=13612711
+registry_lock threads=32 holds=37 wait_ns_total=7807 wait_ns_max=331 hold_ns_total=232605022 hold_ns_max=20419924 mean_hold_us=6286.6 mean_wait_us=0.2
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=481.47 mean_io_us=5690.15 mean_publish_us=810.03 io_ns_max=19215966 io_frac=0.815
+commit_lock_decomp threads=32 arrival_wait_us=299 consolidator_lock_wait_us=0 inner_lock_wait_us=25 exclusive_lock_us=234 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=648 page_lock_wait_us=2433478
+registry_lock threads=32 holds=40 wait_ns_total=7917 wait_ns_max=360 hold_ns_total=370748172 hold_ns_max=39215598 mean_hold_us=9268.7 mean_wait_us=0.2
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=636.75 mean_io_us=9554.69 mean_publish_us=841.60 io_ns_max=37551103 io_frac=0.866
+commit_lock_decomp threads=32 arrival_wait_us=301 consolidator_lock_wait_us=0 inner_lock_wait_us=29 exclusive_lock_us=236 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=690 page_lock_wait_us=3765054
+registry_lock threads=32 holds=45 wait_ns_total=6846 wait_ns_max=271 hold_ns_total=411941496 hold_ns_max=34583216 mean_hold_us=9154.3 mean_wait_us=0.2
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=548.98 mean_io_us=10763.79 mean_publish_us=876.41 io_ns_max=34463353 io_frac=0.883
+commit_lock_decomp threads=32 arrival_wait_us=298 consolidator_lock_wait_us=0 inner_lock_wait_us=19 exclusive_lock_us=213 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=1062 page_lock_wait_us=5020394
+registry_lock threads=32 holds=61 wait_ns_total=9887 wait_ns_max=291 hold_ns_total=316081401 hold_ns_max=35376963 mean_hold_us=5181.7 mean_wait_us=0.2
+registry_lock_decomp threads=32 decomposed_holds=33 mean_validate_us=519.84 mean_io_us=7813.15 mean_publish_us=720.77 io_ns_max=35360613 io_frac=0.863
+commit_lock_decomp threads=32 arrival_wait_us=291 consolidator_lock_wait_us=0 inner_lock_wait_us=23 exclusive_lock_us=204 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=33 waiter_commits=0 page_lock_waits=699 page_lock_wait_us=5237638
+registry_lock threads=64 holds=71 wait_ns_total=15611 wait_ns_max=401 hold_ns_total=1658459156 hold_ns_max=96355658 mean_hold_us=23358.6 mean_wait_us=0.2
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=664.87 mean_io_us=23293.72 mean_publish_us=1474.13 io_ns_max=94926682 io_frac=0.916
+commit_lock_decomp threads=64 arrival_wait_us=666 consolidator_lock_wait_us=0 inner_lock_wait_us=57 exclusive_lock_us=455 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=4641 page_lock_wait_us=22079047
+registry_lock threads=64 holds=89 wait_ns_total=15486 wait_ns_max=331 hold_ns_total=2018566603 hold_ns_max=108914470 mean_hold_us=22680.5 mean_wait_us=0.2
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=591.08 mean_io_us=29108.87 mean_publish_us=1091.45 io_ns_max=108783787 io_frac=0.945
+commit_lock_decomp threads=64 arrival_wait_us=642 consolidator_lock_wait_us=0 inner_lock_wait_us=46 exclusive_lock_us=449 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=5360 page_lock_wait_us=32919551
+registry_lock threads=64 holds=83 wait_ns_total=118988 wait_ns_max=103333 hold_ns_total=1698257492 hold_ns_max=93322627 mean_hold_us=20460.9 mean_wait_us=1.4
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=651.54 mean_io_us=24162.86 mean_publish_us=1086.57 io_ns_max=92043037 io_frac=0.933
+commit_lock_decomp threads=64 arrival_wait_us=645 consolidator_lock_wait_us=0 inner_lock_wait_us=49 exclusive_lock_us=478 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=5124 page_lock_wait_us=23197317
+registry_lock threads=64 holds=88 wait_ns_total=17658 wait_ns_max=571 hold_ns_total=1807948803 hold_ns_max=104582232 mean_hold_us=20544.9 mean_wait_us=0.2
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=598.61 mean_io_us=25763.06 mean_publish_us=1173.41 io_ns_max=102794769 io_frac=0.936
+commit_lock_decomp threads=64 arrival_wait_us=711 consolidator_lock_wait_us=0 inner_lock_wait_us=59 exclusive_lock_us=477 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=3804 page_lock_wait_us=25882463
+registry_lock threads=64 holds=65 wait_ns_total=160044 wait_ns_max=116717 hold_ns_total=1794257215 hold_ns_max=95819846 mean_hold_us=27604.0 mean_wait_us=2.5
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=550.12 mean_io_us=25699.49 mean_publish_us=1354.34 io_ns_max=95481026 io_frac=0.931
+commit_lock_decomp threads=64 arrival_wait_us=657 consolidator_lock_wait_us=0 inner_lock_wait_us=52 exclusive_lock_us=460 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=4468 page_lock_wait_us=21030229
+registry_lock threads=64 holds=69 wait_ns_total=78272 wait_ns_max=65562 hold_ns_total=1253884384 hold_ns_max=61186009 mean_hold_us=18172.2 mean_wait_us=1.1
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=502.12 mean_io_us=17455.43 mean_publish_us=1298.85 io_ns_max=59808447 io_frac=0.906
+commit_lock_decomp threads=64 arrival_wait_us=622 consolidator_lock_wait_us=0 inner_lock_wait_us=38 exclusive_lock_us=453 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=8450 page_lock_wait_us=20822392
+registry_lock threads=64 holds=84 wait_ns_total=19347 wait_ns_max=1152 hold_ns_total=1770312966 hold_ns_max=80449782 mean_hold_us=21075.2 mean_wait_us=0.2
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=716.52 mean_io_us=25112.33 mean_publish_us=1161.47 io_ns_max=79066770 io_frac=0.930
+commit_lock_decomp threads=64 arrival_wait_us=673 consolidator_lock_wait_us=0 inner_lock_wait_us=56 exclusive_lock_us=468 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=5891 page_lock_wait_us=31630971
+registry_lock threads=64 holds=70 wait_ns_total=11608 wait_ns_max=351 hold_ns_total=1295496825 hold_ns_max=70334254 mean_hold_us=18507.1 mean_wait_us=0.2
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=554.73 mean_io_us=18047.23 mean_publish_us=1273.95 io_ns_max=68970067 io_frac=0.908
+commit_lock_decomp threads=64 arrival_wait_us=633 consolidator_lock_wait_us=0 inner_lock_wait_us=51 exclusive_lock_us=466 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=6286 page_lock_wait_us=16509130
+registry_lock threads=64 holds=66 wait_ns_total=9998 wait_ns_max=431 hold_ns_total=1678847785 hold_ns_max=91606062 mean_hold_us=25437.1 mean_wait_us=0.2
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=550.08 mean_io_us=24043.13 mean_publish_us=1223.64 io_ns_max=89916621 io_frac=0.931
+commit_lock_decomp threads=64 arrival_wait_us=627 consolidator_lock_wait_us=0 inner_lock_wait_us=51 exclusive_lock_us=413 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=4512 page_lock_wait_us=17498737
+registry_lock threads=64 holds=128 wait_ns_total=147364 wait_ns_max=129551 hold_ns_total=2122026167 hold_ns_max=115661544 mean_hold_us=16578.3 mean_wait_us=1.2
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=529.37 mean_io_us=30575.09 mean_publish_us=872.39 io_ns_max=115514031 io_frac=0.956
+commit_lock_decomp threads=64 arrival_wait_us=650 consolidator_lock_wait_us=0 inner_lock_wait_us=41 exclusive_lock_us=468 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=5308 page_lock_wait_us=44451118
+registry_lock threads=64 holds=82 wait_ns_total=13412 wait_ns_max=501 hold_ns_total=2208478249 hold_ns_max=117122147 mean_hold_us=26932.7 mean_wait_us=0.2
+registry_lock_decomp threads=64 decomposed_holds=65 mean_validate_us=521.51 mean_io_us=32301.26 mean_publish_us=986.24 io_ns_max=116968120 io_frac=0.955
+commit_lock_decomp threads=64 arrival_wait_us=715 consolidator_lock_wait_us=0 inner_lock_wait_us=42 exclusive_lock_us=512 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=65 waiter_commits=0 page_lock_waits=4549 page_lock_wait_us=28320959
+registry_lock threads=128 holds=130 wait_ns_total=1601121 wait_ns_max=506692 hold_ns_total=11267689345 hold_ns_max=309735603 mean_hold_us=86674.5 mean_wait_us=12.3
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=867.05 mean_io_us=83840.31 mean_publish_us=2633.44 io_ns_max=308164222 io_frac=0.960
+commit_lock_decomp threads=128 arrival_wait_us=1786 consolidator_lock_wait_us=0 inner_lock_wait_us=139 exclusive_lock_us=1111 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=28535 page_lock_wait_us=301485304
+registry_lock threads=128 holds=196 wait_ns_total=1473031 wait_ns_max=403901 hold_ns_total=12599467066 hold_ns_max=391076034 mean_hold_us=64283.0 mean_wait_us=7.5
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=751.65 mean_io_us=94401.06 mean_publish_us=1979.66 io_ns_max=389799190 io_frac=0.972
+commit_lock_decomp threads=128 arrival_wait_us=1615 consolidator_lock_wait_us=0 inner_lock_wait_us=148 exclusive_lock_us=1076 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=34718 page_lock_wait_us=364144514
+registry_lock threads=128 holds=518 wait_ns_total=4013276 wait_ns_max=1169314 hold_ns_total=12687261561 hold_ns_max=562674628 mean_hold_us=24492.8 mean_wait_us=7.7
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=698.96 mean_io_us=92433.08 mean_publish_us=2111.84 io_ns_max=561386392 io_frac=0.970
+commit_lock_decomp threads=128 arrival_wait_us=1674 consolidator_lock_wait_us=0 inner_lock_wait_us=131 exclusive_lock_us=1097 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=42461 page_lock_wait_us=546320641
+registry_lock threads=128 holds=177 wait_ns_total=2632827 wait_ns_max=558469 hold_ns_total=9945665953 hold_ns_max=276349682 mean_hold_us=56190.2 mean_wait_us=14.9
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=820.06 mean_io_us=73358.09 mean_publish_us=2479.07 io_ns_max=274625065 io_frac=0.957
+commit_lock_decomp threads=128 arrival_wait_us=1773 consolidator_lock_wait_us=0 inner_lock_wait_us=134 exclusive_lock_us=1063 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=38649 page_lock_wait_us=344095637
+registry_lock threads=128 holds=145 wait_ns_total=3546682 wait_ns_max=1130873 hold_ns_total=8660509609 hold_ns_max=246604872 mean_hold_us=59727.7 mean_wait_us=24.5
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=826.06 mean_io_us=64157.63 mean_publish_us=2028.52 io_ns_max=244973258 io_frac=0.957
+commit_lock_decomp threads=128 arrival_wait_us=1467 consolidator_lock_wait_us=0 inner_lock_wait_us=121 exclusive_lock_us=1063 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=40193 page_lock_wait_us=257815184
+registry_lock threads=128 holds=139 wait_ns_total=5048286 wait_ns_max=1010880 hold_ns_total=10453081430 hold_ns_max=321697896 mean_hold_us=75202.0 mean_wait_us=36.3
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=849.45 mean_io_us=77503.89 mean_publish_us=2588.37 io_ns_max=320329561 io_frac=0.958
+commit_lock_decomp threads=128 arrival_wait_us=1698 consolidator_lock_wait_us=0 inner_lock_wait_us=133 exclusive_lock_us=1159 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=32992 page_lock_wait_us=285163611
+registry_lock threads=128 holds=130 wait_ns_total=1542052 wait_ns_max=574038 hold_ns_total=10799094273 hold_ns_max=288913910 mean_hold_us=83070.0 mean_wait_us=11.9
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=810.24 mean_io_us=80614.03 mean_publish_us=2284.94 io_ns_max=288635913 io_frac=0.963
+commit_lock_decomp threads=128 arrival_wait_us=1685 consolidator_lock_wait_us=0 inner_lock_wait_us=159 exclusive_lock_us=1281 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=23699 page_lock_wait_us=279361689
+registry_lock threads=128 holds=211 wait_ns_total=7943954 wait_ns_max=1432424 hold_ns_total=10181035882 hold_ns_max=300290062 mean_hold_us=48251.4 mean_wait_us=37.6
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=853.18 mean_io_us=74518.20 mean_publish_us=2683.91 io_ns_max=300060976 io_frac=0.955
+commit_lock_decomp threads=128 arrival_wait_us=2041 consolidator_lock_wait_us=0 inner_lock_wait_us=195 exclusive_lock_us=1159 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=40719 page_lock_wait_us=364000023
+registry_lock threads=128 holds=217 wait_ns_total=3213868 wait_ns_max=919881 hold_ns_total=9948244011 hold_ns_max=330264841 mean_hold_us=45844.4 mean_wait_us=14.8
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=800.36 mean_io_us=72290.97 mean_publish_us=3104.93 io_ns_max=327988697 io_frac=0.949
+commit_lock_decomp threads=128 arrival_wait_us=1632 consolidator_lock_wait_us=0 inner_lock_wait_us=123 exclusive_lock_us=1119 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=38205 page_lock_wait_us=319244202
+registry_lock threads=128 holds=145 wait_ns_total=1992985 wait_ns_max=347266 hold_ns_total=10667638889 hold_ns_max=336264934 mean_hold_us=73569.9 mean_wait_us=13.7
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=685.36 mean_io_us=79418.00 mean_publish_us=2483.14 io_ns_max=334898122 io_frac=0.962
+commit_lock_decomp threads=128 arrival_wait_us=1601 consolidator_lock_wait_us=0 inner_lock_wait_us=137 exclusive_lock_us=1122 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=38474 page_lock_wait_us=278093669
+registry_lock threads=128 holds=146 wait_ns_total=2477763 wait_ns_max=1845423 hold_ns_total=10020679147 hold_ns_max=259785878 mean_hold_us=68634.8 mean_wait_us=17.0
+registry_lock_decomp threads=128 decomposed_holds=129 mean_validate_us=757.37 mean_io_us=74612.28 mean_publish_us=2210.08 io_ns_max=258419226 io_frac=0.962
+commit_lock_decomp threads=128 arrival_wait_us=1570 consolidator_lock_wait_us=0 inner_lock_wait_us=130 exclusive_lock_us=1085 wal_append_us=0 wal_sync_us=0 waiter_epoch_wait_us=0 flusher_commits=129 waiter_commits=0 page_lock_waits=24941 page_lock_wait_us=286119256
+mt-mvcc-bench: pass-over-pass status=disabled_non_citable comparable_pairs=0 previous_report_found=true
+mt-mvcc-bench: wrote json report /data/tmp/claude-1000/-data-projects-frankensqlite/82d079f9-ad95-4b43-a3a2-c86f1155ae95/scratchpad/wt-i0tn6/tests/artifacts/perf/highwriter-decomp-20260825/matrix-normal.json
+mt-mvcc-bench: wrote markdown summary /data/tmp/claude-1000/-data-projects-frankensqlite/82d079f9-ad95-4b43-a3a2-c86f1155ae95/scratchpad/wt-i0tn6/tests/artifacts/perf/highwriter-decomp-20260825/summary-normal.md
+error: benchmark evidence is non-comparable or invalid; inspect configuration receipts, committed-state oracles, work accounting, and provenance receipts

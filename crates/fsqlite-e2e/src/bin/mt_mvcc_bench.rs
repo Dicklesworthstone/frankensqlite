@@ -5307,6 +5307,25 @@ fn run(opts: Options) -> Result<(), String> {
                         m.wait_ns_total as f64 / m.holds_total as f64 / 1_000.0,
                     );
                 }
+                // bd-i0tn6 GATE: validate/io/publish decomposition of the hold.
+                // `io_frac` is the share of the mean hold spent in the physical
+                // WAL/pager write under the lock — the fraction moving the write
+                // outside the guard (S3) can recover. Printed only when the
+                // steady-state concurrent-write path recorded a decomposition.
+                if m.decomposed_holds > 0 {
+                    let d = m.decomposed_holds as f64;
+                    let val_us = m.validate_ns_total as f64 / d / 1_000.0;
+                    let io_us = m.io_ns_total as f64 / d / 1_000.0;
+                    let pub_us = m.publish_ns_total as f64 / d / 1_000.0;
+                    let sum_us = val_us + io_us + pub_us;
+                    let io_frac = if sum_us > 0.0 { io_us / sum_us } else { 0.0 };
+                    eprintln!(
+                        "registry_lock_decomp threads={n} decomposed_holds={} \
+                         mean_validate_us={:.2} mean_io_us={:.2} mean_publish_us={:.2} \
+                         io_ns_max={} io_frac={:.3}",
+                        m.decomposed_holds, val_us, io_us, pub_us, m.io_ns_max, io_frac,
+                    );
+                }
                 let cons = fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.snapshot();
                 let vdbe = fsqlite_vdbe::engine::vdbe_metrics_snapshot();
                 eprintln!(

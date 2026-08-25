@@ -48,6 +48,83 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-08-25 - MEASURED (bd-i0tn6 GATE): commit registry-guard HOLD decomposed into validate/io/publish — physical write is 85-96% of the hold at the writer counts the convoy bites; validate+publish are a non-trivial residual under contention
+
+- Target: the bd-i0tn6 landing GATE — "land [S3] only after RegistryCommitLockMetrics
+  decomposes hold into validate/IO/publish" — and the "next measurement refinement"
+  the 2026-07-28 attribution (see the `registry-hold-decomposition-20260728T1620Z`
+  entry below) explicitly deferred. That entry quantified the *total* guard hold
+  (713-2340us @64w) but could not say how much was validation vs the physical
+  write vs publish. This entry closes that: two phase-boundary marks inside the
+  commit critical section split the single hold into validate / io / publish.
+- Change (telemetry ONLY, landed): `RegistryCommitLockMetrics` gains
+  decomposed_holds + validate/io/publish ns totals (+ io max) and a
+  `record_registry_commit_lock_hold_decomposed` sink; `TimedRegistryCommitGuard`
+  carries `mark_validate_done` (after `plan_concurrent_commit_with_registry` Ok)
+  and `mark_io_done` (after `txn.commit` Ok) at BOTH commit-guard paths
+  (`connection.rs` 56553 + `execute_commit_with_cx` 68620, incl. the busy-retry
+  re-acquire). Drop records the split only when both marks fired (steady-state
+  concurrent-write path); every other exit records the total hold exactly as
+  before. `mt_mvcc_bench` prints a `registry_lock_decomp` line (per-phase means +
+  io_frac). **TOCTOU invariant preserved**: the guard still spans
+  validate -> physical write -> publish as one critical section; only observation
+  timestamps were added. Nothing here moves I/O outside the lock (that is S3,
+  still gated on the S1 typed-outcome / DatabaseCommitRoot work — RusticBasin's
+  lease, orphaned/unregistered as of this session — plus the full deterministic
+  matrix).
+- Evidence: `tests/artifacts/perf/highwriter-decomp-20260825/` (matrix-normal.json,
+  stderr-normal.log, summary-normal.md). Tree at HEAD 9983798bf; fast release-perf
+  (LTO off, cgu=16); THIS host (NOT the 2026-07-28 superserver); shared table,
+  1000 rows/thread, synchronous=normal, 11 iters. Per-writer means over 11 rounds:
+
+  | thr | validate us | io us   | publish us | io_frac | F wps  | F/C   |
+  |-----|-------------|---------|------------|---------|--------|-------|
+  |   1 |         8.6 |  1492.7 |        7.9 |   0.987 | 240197 | 2.69x |
+  |   8 |       245.5 |  1864.6 |      337.7 |   0.731 | 115897 | 2.75x |
+  |  32 |       529.9 |  8325.6 |      823.4 |   0.849 |  47319 | 3.71x |
+  |  64 |       584.6 | 25051.1 |     1181.5 |   0.932 |  22381 | 1.76x |
+  | 128*|       792.7 | 78831.6 |     2417.1 |   0.960 |   9252 | 0.73x |
+
+  (* 128w is OVERSUBSCRIBED on this box — F falls below C; not compared to the
+  superserver's historical 4.08x. Under oversubscription deschedule stalls inflate
+  the longest phase (io), so 64-128w io_frac is an upper bound.)
+- Findings:
+  1. **Convoy confirmed at HEAD** (~1 month after the 2026-07-28 receipts): F
+     declines 240k -> 22k wps across 1 -> 64w (the valid, non-oversubscribed range).
+     The premise of bd-i0tn6 still holds on current main.
+  2. **The physical write dominates the hold, and its share GROWS with writers**:
+     io_frac 0.99 (1w, uncontended) dips to 0.73 (8w) then climbs 0.85 -> 0.93
+     (32 -> 64w) as io explodes (1.5ms -> 8ms -> 25ms) far faster than validate
+     (saturates ~0.5-0.6ms) or publish (0.8-1.2ms). At 32-64w — where the convoy
+     actually bites — io is **85-93%** of the hold. Moving the physical write
+     outside the guard (S3) is therefore the correct primary lever and would
+     recover ~85-93% of an 8-25ms hold.
+  3. **Validate + publish are a non-trivial residual under contention** (~27% at
+     8w, ~15% at 32w; both O(concurrent writers): validate = FCW/SSI conflict
+     check, publish = registry insert/visibility flip). S3 alone leaves a residual
+     validate/publish critical section. This is exactly the bead's "prove the
+     bottleneck moved rather than hid" telemetry requirement: after S3, re-run
+     this decomposition to confirm validate/publish do not become the new convoy
+     (feeds bd-15hxt SSI-history windowing on the validate side).
+- Result: NOT a rejected optimization — this is the GATE evidence that unblocks
+  the S3 go/no-go with a per-phase, per-writer-count breakdown. The instrumentation
+  is landed (telemetry-only, zero behavior change).
+- Zero-regression gate for the telemetry itself: the change adds ~2 `Instant::now`
+  (~40ns, vDSO CLOCK_MONOTONIC) + one Drop branch + ~5 Relaxed atomic adds **per
+  commit** (not per row) — 3-4 orders of magnitude below the measured 1.5ms-25ms
+  hold, and the marks fire only on the concurrent-write path. Measured 1w/8w
+  throughput (2.69x/2.75x C) sits in/above the historical healthy band (2.11x/2.70x,
+  f1ab7663), i.e. no throughput degradation. A separate same-profile HEAD-vs-candidate
+  A/B was NOT run this session due to disk pressure (16G free; the box is saturated
+  by other lanes' warm target dirs — mtdt-olivestream 259G / cargo-target 114G /
+  orch-verify 33G — which must not be deleted). Flagged for a follow-up A/B when disk
+  clears; the analytical bound makes a measurable regression implausible.
+- Retry/follow-up conditions: (a) re-run the decomposition on the 2026-07-28
+  superserver at the canonical release-perf profile for absolute-time comparability;
+  (b) after S3 lands, re-run to prove io_frac collapses and validate/publish did not
+  inherit the convoy; (c) run the same matrix at synchronous=full — the fsync moves
+  into the io phase and should push io_frac back toward 1.0, widening the S3 win.
+
 ## 2026-08-24 - ARCHIVED LOCAL-ONLY: stale `zz_*` probes removed from Cargo integration-test discovery
 
 - Cleanup target: the 29 ignored `zz_*_bench.rs` files and the ignored
