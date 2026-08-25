@@ -16,10 +16,6 @@ fault-injection = []
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-vfs = { workspace = true, default-features = false }
-# bd-zywqc.11.1: mirror WAL fsync latency + pending-frame count into the global
-# SLO metrics registry (observability depends only on fsqlite-types, so this
-# adds no dependency cycle).
-fsqlite-observability = { workspace = true }
 xxhash-rust = { workspace = true }
 crc32c = { workspace = true }
 blake3 = { workspace = true }

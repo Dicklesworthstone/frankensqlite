@@ -207,7 +207,6 @@ insta = { version = "1.48", features = ["json", "yaml"] }
 tempfile = "3.27"
 toml = "1.1"
 syn = { version = "2.0.117", features = ["full", "visit"] }
-proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 
 [profile.release]
 opt-level = "z"

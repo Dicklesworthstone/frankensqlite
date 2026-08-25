@@ -1,27 +1,22 @@
-//! Parallel WAL durability and publication primitives (D1: bd-3wop3.1).
+//! Parallel WAL coordinator (D1: bd-3wop3.1).
 //!
-//! This module contains two distinct mechanisms:
+//! This module provides a lock-free parallel WAL write path using per-thread
+//! buffers and epoch-based group commit. It replaces the global WAL append
+//! mutex with cooperative per-thread buffering.
 //!
-//! - [`ParallelWalDurabilityCombiner`] is the live engine path. The pager uses it
-//!   to order commit certificates, cross the durability barrier, and publish
-//!   visibility without restoring SQLite's global writer lock.
-//! - [`ParallelWalCoordinator`] is a standalone, public segment-file coordinator.
-//!   It is re-exported for direct consumers but is not currently called by the
-//!   pager or `Connection`; its segment files are therefore not part of normal
-//!   database recovery unless a consumer explicitly wires the coordinator in.
+//! # Architecture
 //!
-//! # Standalone segment coordinator
-//!
-//! 1. Each writer thread appends records to a slot-local buffer without a global
-//!    append lock.
+//! 1. Each writer thread appends WAL frames to its own buffer with NO global lock.
 //! 2. A background epoch ticker advances the global epoch every ~10ms.
 //! 3. On epoch advance, slot-local buffer locks make sealing wait for any
 //!    in-flight batch append to complete, then the previous epoch is flushed.
-//! 4. A transaction using this coordinator waits until its epoch is durable.
+//! 4. Commit durability: transaction waits until its epoch is durable.
 //!
-//! The segment coordinator is designed to remove a global append contention
-//! point and provide epoch-based group commit. Those properties describe this
-//! standalone API; they must not be read as claims about the live pager path.
+//! # Key Benefits
+//!
+//! - Eliminates the #1 contention point (global WAL append mutex).
+//! - WAL writes are now embarrassingly parallel.
+//! - Epoch mechanism provides natural group commit semantics (Silo/Aether pattern).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
@@ -2614,19 +2609,13 @@ pub struct ParallelWalDecisionRecord {
 const SEGMENT_MAGIC: u32 = 0x5057_414C; // "PWAL"
 
 /// Version of the segment file format.
-///
-/// Version 2 appends a CRC32C to every record payload so recovery rejects
-/// media corruption in record metadata and page images instead of applying it.
-const SEGMENT_VERSION: u16 = 2;
+const SEGMENT_VERSION: u16 = 1;
 
 /// Segment file header size in bytes.
 const SEGMENT_HEADER_SIZE: usize = 24;
 
-/// Size of the CRC32C appended to every serialized segment record.
-const SEGMENT_RECORD_CHECKSUM_SIZE: usize = std::mem::size_of::<u32>();
-
 /// Fixed record bytes for a record without `end_seq` and without page images.
-const SEGMENT_RECORD_MIN_SIZE: usize = 8 + 4 + 8 + 4 + 8 + 1 + 4 + 4 + SEGMENT_RECORD_CHECKSUM_SIZE;
+const SEGMENT_RECORD_MIN_SIZE: usize = 8 + 4 + 8 + 4 + 8 + 1 + 4 + 4;
 
 /// Largest supported page image in a segment record.
 const MAX_SEGMENT_RECORD_IMAGE_BYTES: usize = limits::MAX_PAGE_SIZE as usize;
@@ -2635,19 +2624,15 @@ const MAX_SEGMENT_RECORD_IMAGE_BYTES: usize = limits::MAX_PAGE_SIZE as usize;
 const MAX_SEGMENT_RECORD_SIZE: usize =
     SEGMENT_RECORD_MIN_SIZE + 8 + 2 * MAX_SEGMENT_RECORD_IMAGE_BYTES;
 
-/// Durability policy for the standalone coordinator's segment files.
-///
-/// This does not configure the live pager's WAL durability combiner. Segment
-/// writes occur at epoch flush boundaries, so `Full` and `Normal` currently take
-/// the same file-and-directory durability fence for each written segment.
+/// fsync policy for segment files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FsyncPolicy {
-    /// Sync the segment and, on Unix, its parent directory after every segment write.
+    /// Full fsync after every write (safest, slowest).
     #[default]
     Full,
-    /// Sync the segment and, on Unix, its parent directory at the epoch boundary.
+    /// Fsync at epoch boundaries only.
     Normal,
-    /// Do not request an fsync for the segment or its directory.
+    /// No fsync (fastest, least safe).
     Off,
 }
 
@@ -2761,7 +2746,7 @@ pub fn list_segments(db_path: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 ///
 /// The segment file contains:
 /// 1. Header with epoch and record count
-/// 2. Length-prefixed records with a trailing per-record CRC32C
+/// 2. Serialized records (length-prefixed bincode)
 ///
 /// Returns the number of bytes written.
 pub fn write_segment(
@@ -3171,16 +3156,13 @@ fn serialize_record(record: &WalRecord) -> Result<Vec<u8>, String> {
     // [N] before_image
     // [4] after_image_len
     // [N] after_image
-    // [4] CRC32C of every preceding byte in this record
     validate_segment_record_images(record)?;
     let before_len = u32::try_from(record.before_image.len())
         .map_err(|_| "before_image length exceeds u32 length prefix".to_string())?;
     let after_len = u32::try_from(record.after_image.len())
         .map_err(|_| "after_image length exceeds u32 length prefix".to_string())?;
 
-    let mut buf = Vec::with_capacity(
-        64 + record.before_image.len() + record.after_image.len() + SEGMENT_RECORD_CHECKSUM_SIZE,
-    );
+    let mut buf = Vec::with_capacity(64 + record.before_image.len() + record.after_image.len());
 
     buf.extend_from_slice(&record.txn_token.id.get().to_le_bytes());
     buf.extend_from_slice(&record.txn_token.epoch.get().to_le_bytes());
@@ -3197,8 +3179,6 @@ fn serialize_record(record: &WalRecord) -> Result<Vec<u8>, String> {
     buf.extend_from_slice(&record.before_image);
     buf.extend_from_slice(&after_len.to_le_bytes());
     buf.extend_from_slice(&record.after_image);
-    let checksum = crc32c::crc32c(&buf);
-    buf.extend_from_slice(&checksum.to_le_bytes());
 
     Ok(buf)
 }
@@ -3251,52 +3231,34 @@ fn deserialize_record(buf: &[u8]) -> Result<WalRecord, String> {
         return Err("record too short".to_string());
     }
 
-    let checksum_offset = buf
-        .len()
-        .checked_sub(SEGMENT_RECORD_CHECKSUM_SIZE)
-        .ok_or_else(|| "record checksum truncated".to_string())?;
-    let (payload, checksum_bytes) = buf.split_at(checksum_offset);
-    let stored_checksum = u32::from_le_bytes(
-        checksum_bytes
-            .try_into()
-            .map_err(|_| "record checksum truncated".to_string())?,
-    );
-    let computed_checksum = crc32c::crc32c(payload);
-    if stored_checksum != computed_checksum {
-        return Err(format!(
-            "segment record checksum mismatch: stored={stored_checksum:#x}, computed={computed_checksum:#x}"
-        ));
-    }
-
     let mut offset = 0;
 
-    let txn_id = read_record_u64(payload, &mut offset, "txn_id")?;
-    let txn_epoch = read_record_u32(payload, &mut offset, "txn_epoch")?;
-    let record_epoch = read_record_u64(payload, &mut offset, "record_epoch")?;
-    let page_id = read_record_u32(payload, &mut offset, "page_id")?;
-    let begin_seq = read_record_u64(payload, &mut offset, "begin_seq")?;
-    let has_end_seq = *read_record_bytes(payload, &mut offset, 1, "end_seq flag")?
+    let txn_id = read_record_u64(buf, &mut offset, "txn_id")?;
+    let txn_epoch = read_record_u32(buf, &mut offset, "txn_epoch")?;
+    let record_epoch = read_record_u64(buf, &mut offset, "record_epoch")?;
+    let page_id = read_record_u32(buf, &mut offset, "page_id")?;
+    let begin_seq = read_record_u64(buf, &mut offset, "begin_seq")?;
+    let has_end_seq = *read_record_bytes(buf, &mut offset, 1, "end_seq flag")?
         .first()
         .ok_or_else(|| "end_seq flag truncated".to_string())?;
     let end_seq = if has_end_seq == 1 {
-        let seq = read_record_u64(payload, &mut offset, "end_seq")?;
+        let seq = read_record_u64(buf, &mut offset, "end_seq")?;
         Some(CommitSeq::new(seq))
     } else if has_end_seq == 0 {
         None
     } else {
         return Err(format!("invalid end_seq flag: {has_end_seq}"));
     };
-    let before_len = read_record_u32(payload, &mut offset, "before_image length")? as usize;
+    let before_len = read_record_u32(buf, &mut offset, "before_image length")? as usize;
     validate_segment_image_len("before_image", before_len)?;
-    let before_image =
-        read_record_bytes(payload, &mut offset, before_len, "before_image")?.to_vec();
-    let after_len = read_record_u32(payload, &mut offset, "after_image length")? as usize;
+    let before_image = read_record_bytes(buf, &mut offset, before_len, "before_image")?.to_vec();
+    let after_len = read_record_u32(buf, &mut offset, "after_image length")? as usize;
     validate_segment_image_len("after_image", after_len)?;
-    let after_image = read_record_bytes(payload, &mut offset, after_len, "after_image")?.to_vec();
-    if offset != payload.len() {
+    let after_image = read_record_bytes(buf, &mut offset, after_len, "after_image")?.to_vec();
+    if offset != buf.len() {
         return Err(format!(
             "trailing bytes after WAL record: {}",
-            payload.len().saturating_sub(offset)
+            buf.len().saturating_sub(offset)
         ));
     }
 
@@ -3837,15 +3799,6 @@ mod tests {
 
     fn test_cx() -> Cx {
         Cx::default()
-    }
-
-    fn refresh_serialized_record_checksum(bytes: &mut [u8]) {
-        let checksum_offset = bytes
-            .len()
-            .checked_sub(SEGMENT_RECORD_CHECKSUM_SIZE)
-            .expect("serialized record should contain a checksum");
-        let checksum = crc32c::crc32c(&bytes[..checksum_offset]);
-        bytes[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
     }
 
     #[test]
@@ -4507,52 +4460,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_segment_rejects_page_image_checksum_mismatch() {
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("create temp dir");
-        let db_path = dir.path().join("corrupt-page-image.db");
-        let after_image = vec![0xA5; 32];
-        let batch = EpochFlushBatch {
-            epoch: 5,
-            records: vec![WalRecord {
-                txn_token: TxnToken::new(
-                    fsqlite_types::TxnId::new(1).expect("txn id should be non-zero"),
-                    fsqlite_types::TxnEpoch::new(0),
-                ),
-                epoch: 5,
-                page_id: PageNumber::new(1).expect("page should be non-zero"),
-                begin_seq: CommitSeq::new(100),
-                end_seq: Some(CommitSeq::new(100)),
-                before_image: Vec::new(),
-                after_image: after_image.clone(),
-            }],
-            records_per_core: vec![1],
-        };
-        write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
-
-        let seg_path = segment_path(&db_path, 5);
-        let mut bytes = std::fs::read(&seg_path).expect("read segment bytes");
-        let record_payload = bytes
-            .get_mut(SEGMENT_HEADER_SIZE + 4..)
-            .expect("segment should contain one record payload");
-        let after_image_offset = record_payload
-            .windows(after_image.len())
-            .position(|window| window == after_image)
-            .expect("serialized record should contain the after-image bytes");
-        record_payload[after_image_offset] ^= 0x01;
-        std::fs::write(&seg_path, bytes).expect("persist corrupted segment bytes");
-
-        let error = read_segment(&seg_path)
-            .expect_err("page-image bit flip must make the segment unreadable");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(
-            error.to_string().contains("checksum mismatch"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
     fn test_deserialize_record_rejects_invalid_end_seq_flag() {
         let record = WalRecord {
             txn_token: TxnToken::new(
@@ -4569,7 +4476,6 @@ mod tests {
         let mut bytes = serialize_record(&record).expect("sample record should serialize");
         let end_seq_flag_offset = 8 + 4 + 8 + 4 + 8;
         bytes[end_seq_flag_offset] = 2;
-        refresh_serialized_record_checksum(&mut bytes);
 
         let error = deserialize_record(&bytes)
             .expect_err("invalid end_seq flag must reject corrupt record bytes");
@@ -4594,12 +4500,7 @@ mod tests {
             after_image: vec![0xAA; 8],
         };
         let mut bytes = serialize_record(&record).expect("sample record should serialize");
-        let checksum_offset = bytes
-            .len()
-            .checked_sub(SEGMENT_RECORD_CHECKSUM_SIZE)
-            .expect("serialized record should contain a checksum");
-        bytes.splice(checksum_offset..checksum_offset, *b"junk");
-        refresh_serialized_record_checksum(&mut bytes);
+        bytes.extend_from_slice(b"junk");
 
         let error =
             deserialize_record(&bytes).expect_err("record decoder must reject trailing bytes");

@@ -1477,12 +1477,7 @@ impl<F: VfsFile> WalFile<F> {
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)?;
 
-        // bd-zywqc.11.1: time the WAL durability barrier for fsync_duration_seconds.
-        let sync_start = std::time::Instant::now();
         self.file.sync(cx, flags)?;
-        fsqlite_observability::metrics::global()
-            .fsync_duration_seconds
-            .observe(sync_start.elapsed().as_secs_f64());
         self.last_fsynced_frame_count = self.frame_count;
         Ok(())
     }
@@ -1534,12 +1529,7 @@ impl<F: VfsFile> WalFile<F> {
             crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)?;
         }
 
-        // bd-zywqc.11.1: time the WAL durability barrier for fsync_duration_seconds.
-        let sync_start = std::time::Instant::now();
         self.file.durable_sync(cx, kind)?;
-        fsqlite_observability::metrics::global()
-            .fsync_duration_seconds
-            .observe(sync_start.elapsed().as_secs_f64());
         self.last_fsynced_frame_count = self.frame_count;
 
         debug!(

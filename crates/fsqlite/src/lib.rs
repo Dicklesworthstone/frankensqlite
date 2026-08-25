@@ -26,8 +26,8 @@ pub use fsqlite_core::connection::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use fsqlite_core::connection::{
-    BackupReport, BoundedStructuralSnapshot, CompactionReport, DatabaseBuilderReservation,
-    DatabaseImagePublication, PendingDatabaseImagePublication,
+    BoundedStructuralSnapshot, DatabaseBuilderReservation, DatabaseImagePublication,
+    PendingDatabaseImagePublication,
 };
 pub use fsqlite_core::connection::{
     Connection, ConnectionEnv, DatabaseImageReceipt, IoPollStrategy, PreparedStatement, Row,
